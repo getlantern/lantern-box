@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/network"
+	"github.com/tetratelabs/wazero"
 )
 
 // RegisterOutbound registers the WATER outbound adapter with the given registry.
@@ -37,12 +39,12 @@ func RegisterOutbound(registry *outbound.Registry) {
 // Outbound represents a WATER outbound adapter.
 type Outbound struct {
 	outbound.Adapter
-	logger                     logger.ContextLogger
-	serverAddr                 string
-	skipHandshake              bool
-	dialerConfig               *water.Config
-	transportModuleConfig      map[string]any
-	transportModuleConfigMutex *sync.Mutex
+	logger                logger.ContextLogger
+	serverAddr            string
+	skipHandshake         bool
+	dialerConfig          *water.Config
+	transportModuleConfig map[string]any
+	dialMutex             sync.Mutex
 }
 
 // NewOutbound creates a new WATER outbound adapter.
@@ -52,8 +54,22 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 
+	if options.WASMStorageDir == "" {
+		return nil, E.New("provided an empty storage directory for WASM files")
+	}
+
+	if options.WazeroCompilationCacheDir == "" {
+		return nil, E.New("provided an empty storage directory for wazero compilation cache")
+	}
+
+	for _, dir := range []string{options.WASMStorageDir, options.WazeroCompilationCacheDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, err
+		}
+	}
+
 	slogLogger := slog.New(L.NewLogHandler(logger))
-	vc := waterVC.NewWaterVersionControl(options.Dir, slogLogger)
+	vc := waterVC.NewWaterVersionControl(options.WASMStorageDir, slogLogger)
 	d, err := waterDownloader.NewWASMDownloader(options.WASMAvailableAt, &http.Client{Timeout: timeout})
 	if err != nil {
 		return nil, E.New("failed to create WASM downloader", err)
@@ -70,13 +86,20 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 
-	logger.DebugContext(ctx, "downloaded WASM with len: ", len(b), " bytes")
-
 	outboundDialer, err := dialer.New(ctx, options.DialerOptions)
 	if err != nil {
 		return nil, err
 	}
 	serverAddr := options.ServerOptions.Build()
+
+	// We're creating the compilation cache dir and setting the global value so during runtime
+	// it won't need to create one at a temp directory
+	compilationCache, err := wazero.NewCompilationCacheWithDir(options.WazeroCompilationCacheDir)
+	if err != nil {
+		return nil, err
+	}
+
+	water.SetGlobalCompilationCache(compilationCache)
 
 	cfg := &water.Config{
 		TransportModuleBin: b,
@@ -87,13 +110,13 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 
 	outbound := &Outbound{
-		Adapter:                    outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{network.NetworkTCP}, options.DialerOptions),
-		logger:                     logger,
-		serverAddr:                 serverAddr.String(),
-		dialerConfig:               cfg,
-		transportModuleConfig:      options.Config,
-		transportModuleConfigMutex: new(sync.Mutex),
-		skipHandshake:              options.SkipHandshake,
+		Adapter:               outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{network.NetworkTCP}, options.DialerOptions),
+		logger:                logger,
+		serverAddr:            serverAddr.String(),
+		dialerConfig:          cfg,
+		transportModuleConfig: options.Config,
+		dialMutex:             sync.Mutex{},
+		skipHandshake:         options.SkipHandshake,
 	}
 
 	return outbound, nil
@@ -101,10 +124,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (water.Dialer, error) {
 	cfg := o.dialerConfig.Clone()
-	if o.transportModuleConfig != nil {
-		o.transportModuleConfigMutex.Lock()
-		defer o.transportModuleConfigMutex.Unlock()
 
+	if o.transportModuleConfig != nil {
 		// currently this is the only way to share the destination with the WATER module.
 		addr := destination.AddrPort()
 		o.transportModuleConfig["remote_addr"] = addr.Addr().String()
@@ -122,6 +143,8 @@ func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (wate
 
 // DialContext dials a connection to the specified network and destination.
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	o.dialMutex.Lock()
+	defer o.dialMutex.Unlock()
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination

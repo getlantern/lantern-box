@@ -20,7 +20,7 @@ type slogHandler struct {
 }
 
 // NewLogHandler returns a new slog.Handler that writes log records to the given log.ContextLogger
-func NewLogHandler(logger log.ContextLogger) *slogHandler {
+func NewLogHandler(logger log.ContextLogger) slog.Handler {
 	return &slogHandler{logger: logger}
 }
 

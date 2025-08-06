@@ -4,7 +4,9 @@ go 1.23.6
 
 toolchain go1.24.1
 
-replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.11.11-lantern
+replace github.com/sagernet/sing => github.com/getlantern/sing v0.6.13-0.20250613222345-ef046611f2e9
+
+replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.11.12-0.20250616155750-74188abad925
 
 replace github.com/tetratelabs/wazero => github.com/refraction-networking/wazero v1.7.1-w
 
@@ -17,10 +19,10 @@ require (
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
 	github.com/getlantern/lantern-water v0.0.0-20250331153903-07abebe611e8
 	github.com/gobwas/ws v1.4.0
-	github.com/refraction-networking/water v0.7.0-alpha
-	github.com/sagernet/sing v0.6.9
+	github.com/refraction-networking/water v0.7.1-alpha
+	github.com/sagernet/sing v0.6.10
 	github.com/sagernet/sing-box v1.11.5
-	github.com/sagernet/sing-dns v0.4.3
+	github.com/sagernet/sing-dns v0.4.5
 	github.com/sagernet/wireguard-go v0.0.1-beta.7
 	github.com/stretchr/testify v1.10.0
 	go.opentelemetry.io/otel v1.35.0
@@ -136,18 +138,18 @@ require (
 	github.com/sagernet/quic-go v0.49.0-beta.1 // indirect
 	github.com/sagernet/reality v0.0.0-20230406110435-ee17307e7691 // indirect
 	github.com/sagernet/sing-mux v0.3.2 // indirect
-	github.com/sagernet/sing-quic v0.4.1 // indirect
-	github.com/sagernet/sing-shadowsocks v0.2.7 // indirect
-	github.com/sagernet/sing-shadowsocks2 v0.2.0 // indirect
+	github.com/sagernet/sing-quic v0.4.3 // indirect
+	github.com/sagernet/sing-shadowsocks v0.2.8 // indirect
+	github.com/sagernet/sing-shadowsocks2 v0.2.1 // indirect
 	github.com/sagernet/sing-shadowtls v0.2.0 // indirect
 	github.com/sagernet/sing-tun v0.6.5 // indirect
-	github.com/sagernet/sing-vmess v0.2.1 // indirect
+	github.com/sagernet/sing-vmess v0.2.3 // indirect
 	github.com/sagernet/smux v1.5.34-mod.2 // indirect
 	github.com/sagernet/utls v1.6.7 // indirect
 	github.com/sagernet/ws v0.0.0-20231204124109-acfe8907c854 // indirect
 	github.com/shadowsocks/go-shadowsocks2 v0.1.5 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
-	github.com/tetratelabs/wazero v1.7.1 // indirect
+	github.com/tetratelabs/wazero v1.7.3 // indirect
 	github.com/tidwall/btree v1.6.0 // indirect
 	github.com/u-root/uio v0.0.0-20240118234441-a3c409a6018e // indirect
 	github.com/vishvananda/netns v0.0.4 // indirect
