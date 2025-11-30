@@ -4,18 +4,34 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/spf13/cobra"
 
+	"github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/protocol"
 )
 
+type ProxyInfo struct {
+	Name             string `ini:"proxyname"`
+	Pro              bool   `ini:"pro"`
+	Track            string `ini:"track"`
+	Provider         string `ini:"provider"`
+	FrontendProvider string `ini:"frontend_provider"`
+	Protocol         string `ini:"proxyprotocol"`
+}
+
 var globalCtx context.Context
+var (
+	version   string
+	commit    string
+	buildDate string
+)
 
 var rootCmd = &cobra.Command{
 	Use:               "lantern-box",
-	Version:           "v1.11.7",
+	Version:           version,
 	PersistentPreRun:  preRun,
 	CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 	SilenceErrors:     true,
@@ -30,6 +46,28 @@ func preRun(cmd *cobra.Command, args []string) {
 		outboundRegistry,
 		endpointRegistry,
 	)
+
+	path, err := cmd.Flags().GetString("config")
+	if err != nil {
+		return
+	}
+
+	proxyInfoPath := strings.Replace(path, ".json", ".ini", 1)
+
+	proxyInfo, err := readProxyInfoFile(proxyInfoPath)
+	if err != nil {
+		return
+	}
+
+	otel.InitGlobalMeterProvider(&otel.Opts{
+		Endpoint:         otel.GetTelemetryEndpoint(),
+		ProxyName:        proxyInfo.Name,
+		IsPro:            proxyInfo.Pro,
+		Track:            proxyInfo.Track,
+		Provider:         proxyInfo.Provider,
+		FrontendProvider: proxyInfo.FrontendProvider,
+		ProxyProtocol:    proxyInfo.Protocol,
+	})
 }
 
 func main() {

@@ -24,7 +24,7 @@ type metricsManager struct {
 var metrics = newMetricsManager()
 
 func newMetricsManager() *metricsManager {
-	meter := otel.GetMeterProvider().Meter("radiance")
+	meter := otel.GetMeterProvider().Meter("lantern-box")
 	bytesSent, err := meter.Int64Counter("sing.bytes_sent", metric.WithDescription("Bytes sent"))
 	if err != nil {
 		bytesSent = &noop.Int64Counter{}
