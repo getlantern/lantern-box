@@ -19,7 +19,6 @@ type metricsManager struct {
 	bytesReceived metric.Int64Counter
 	duration      metric.Int64Histogram
 	conns         metric.Int64UpDownCounter
-	packetConns   metric.Int64UpDownCounter
 }
 
 var metrics = newMetricsManager()

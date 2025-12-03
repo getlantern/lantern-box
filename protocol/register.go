@@ -6,12 +6,12 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/include"
 
-	"github.com/getlantern/sing-box-extensions/protocol/amnezia"
-	"github.com/getlantern/sing-box-extensions/protocol/group"
-	"github.com/getlantern/sing-box-extensions/protocol/water"
+	"github.com/getlantern/lantern-box/protocol/amnezia"
+	"github.com/getlantern/lantern-box/protocol/group"
+	"github.com/getlantern/lantern-box/protocol/water"
 
-	"github.com/getlantern/sing-box-extensions/protocol/algeneva"
-	"github.com/getlantern/sing-box-extensions/protocol/outline"
+	"github.com/getlantern/lantern-box/protocol/algeneva"
+	"github.com/getlantern/lantern-box/protocol/outline"
 )
 
 var supportedProtocols = []string{
@@ -64,6 +64,8 @@ func registerOutbounds(registry *outbound.Registry) {
 
 	// utility outbounds
 	group.RegisterFallback(registry)
+	group.RegisterMutableSelector(registry)
+	group.RegisterMutableURLTest(registry)
 }
 
 func registerEndpoints(registry *endpoint.Registry) {

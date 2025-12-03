@@ -1,32 +1,36 @@
-module github.com/getlantern/sing-box-extensions
+module github.com/getlantern/lantern-box
 
 go 1.23.6
 
 toolchain go1.24.1
 
-replace github.com/sagernet/sing => github.com/getlantern/sing v0.6.13-0.20250613222345-ef046611f2e9
+replace github.com/sagernet/sing => github.com/getlantern/sing v0.6.13-0.20250812195008-c4468d0c7c42
 
-replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.11.12-0.20250616155750-74188abad925
+replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.11.15-lantern.0.20250820161012-d4dd96e95ed6
 
 replace github.com/tetratelabs/wazero => github.com/refraction-networking/wazero v1.7.1-w
+
+replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v0.0.1-beta.5.0.20250310145906-45220d8aec77
 
 // replace github.com/sagernet/sing-box => ../sing-box-minimal
 
 require (
 	github.com/Jigsaw-Code/outline-sdk v0.0.19
 	github.com/Jigsaw-Code/outline-sdk/x v0.0.2
-	github.com/alexflint/go-arg v1.4.3
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
 	github.com/getlantern/lantern-water v0.0.0-20250331153903-07abebe611e8
 	github.com/gobwas/ws v1.4.0
 	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/sing v0.6.10
 	github.com/sagernet/sing-box v1.11.5
-	github.com/sagernet/sing-dns v0.4.5
+	github.com/sagernet/sing-dns v0.4.6
 	github.com/sagernet/wireguard-go v0.0.1-beta.7
+	github.com/spf13/cobra v1.10.1
 	github.com/stretchr/testify v1.10.0
+	github.com/tetratelabs/wazero v1.7.3
 	go.opentelemetry.io/otel v1.35.0
 	go.opentelemetry.io/otel/metric v1.35.0
+	go.opentelemetry.io/otel/trace v1.35.0
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -36,17 +40,16 @@ require (
 	github.com/ajg/form v1.5.1 // indirect
 	github.com/ajwerner/btree v0.0.0-20211221152037-f427b3e689c0 // indirect
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
-	github.com/alexflint/go-scalar v1.1.0 // indirect
 	github.com/anacrolix/chansync v0.3.0 // indirect
 	github.com/anacrolix/dht/v2 v2.19.2-0.20221121215055-066ad8494444 // indirect
 	github.com/anacrolix/envpprof v1.3.0 // indirect
 	github.com/anacrolix/generics v0.0.0-20230816105729-c755655aee45 // indirect
-	github.com/anacrolix/go-libutp v1.3.1 // indirect
+	github.com/anacrolix/go-libutp v1.3.2 // indirect
 	github.com/anacrolix/log v0.14.6-0.20231202035202-ed7a02cad0b4 // indirect
 	github.com/anacrolix/missinggo v1.3.0 // indirect
 	github.com/anacrolix/missinggo/perf v1.0.0 // indirect
 	github.com/anacrolix/missinggo/v2 v2.7.2-0.20230527121029-a582b4f397b9 // indirect
-	github.com/anacrolix/mmsg v1.0.0 // indirect
+	github.com/anacrolix/mmsg v1.0.1 // indirect
 	github.com/anacrolix/multiless v0.3.0 // indirect
 	github.com/anacrolix/stm v0.4.0 // indirect
 	github.com/anacrolix/sync v0.5.1 // indirect
@@ -59,8 +62,7 @@ require (
 	github.com/bits-and-blooms/bitset v1.2.2 // indirect
 	github.com/blang/vfs v1.0.0 // indirect
 	github.com/bradfitz/iter v0.0.0-20191230175014-e8f45d346db8 // indirect
-	github.com/caddyserver/certmagic v0.21.7 // indirect
-	github.com/caddyserver/zerossl v0.1.3 // indirect
+	github.com/caddyserver/certmagic v0.20.0 // indirect
 	github.com/cloudflare/circl v1.6.0 // indirect
 	github.com/cretz/bine v0.2.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
@@ -87,6 +89,7 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/huandu/xstrings v1.3.2 // indirect
+	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/insomniacslk/dhcp v0.0.0-20250109001534-8abf58130905 // indirect
 	github.com/josharian/native v1.1.1-0.20230202152459-5c7d0dd6ab86 // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
@@ -100,7 +103,6 @@ require (
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/metacubex/tfo-go v0.0.0-20241231083714-66613d49c422 // indirect
 	github.com/mholt/acmez v1.2.0 // indirect
-	github.com/mholt/acmez/v3 v3.0.1 // indirect
 	github.com/miekg/dns v1.1.63 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
 	github.com/oschwald/maxminddb-golang v1.12.0 // indirect
@@ -138,18 +140,19 @@ require (
 	github.com/sagernet/quic-go v0.49.0-beta.1 // indirect
 	github.com/sagernet/reality v0.0.0-20230406110435-ee17307e7691 // indirect
 	github.com/sagernet/sing-mux v0.3.2 // indirect
-	github.com/sagernet/sing-quic v0.4.3 // indirect
+	github.com/sagernet/sing-quic v0.4.4 // indirect
 	github.com/sagernet/sing-shadowsocks v0.2.8 // indirect
 	github.com/sagernet/sing-shadowsocks2 v0.2.1 // indirect
 	github.com/sagernet/sing-shadowtls v0.2.0 // indirect
-	github.com/sagernet/sing-tun v0.6.5 // indirect
+	github.com/sagernet/sing-tun v0.6.9 // indirect
 	github.com/sagernet/sing-vmess v0.2.3 // indirect
 	github.com/sagernet/smux v1.5.34-mod.2 // indirect
 	github.com/sagernet/utls v1.6.7 // indirect
 	github.com/sagernet/ws v0.0.0-20231204124109-acfe8907c854 // indirect
 	github.com/shadowsocks/go-shadowsocks2 v0.1.5 // indirect
+	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
-	github.com/tetratelabs/wazero v1.7.3 // indirect
+	github.com/tevino/abool/v2 v2.1.0 // indirect
 	github.com/tidwall/btree v1.6.0 // indirect
 	github.com/u-root/uio v0.0.0-20240118234441-a3c409a6018e // indirect
 	github.com/vishvananda/netns v0.0.4 // indirect
@@ -157,11 +160,9 @@ require (
 	go.etcd.io/bbolt v1.3.6 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.35.0 // indirect
-	go.opentelemetry.io/otel/trace v1.35.0 // indirect
 	go.uber.org/mock v0.5.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
-	go.uber.org/zap/exp v0.3.0 // indirect
 	golang.org/x/crypto v0.33.0 // indirect
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
 	golang.org/x/mod v0.23.0 // indirect

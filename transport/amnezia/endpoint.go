@@ -150,7 +150,6 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 		tunDevice:      tunDevice,
 	}, nil
 }
-
 func (e *Endpoint) Start(resolve bool) error {
 	if common.Any(e.peers, func(peer peerConfig) bool {
 		return !peer.endpoint.IsValid() && peer.destination.IsFqdn()
@@ -171,6 +170,7 @@ func (e *Endpoint) Start(resolve bool) error {
 	} else if resolve {
 		return nil
 	}
+
 	var bind conn.Bind
 	wgListener, isWgListener := e.options.Dialer.(conn.Listener)
 	if isWgListener {
@@ -208,6 +208,13 @@ func (e *Endpoint) Start(resolve bool) error {
 		},
 	}
 	wgDevice := device.NewDevice(e.options.Context, e.tunDevice, bind, logger, e.options.Workers)
+
+	if e.options.ListenPort != 0 { // Start UAPI listener only when running as a server
+		if err := startUAPIListener(e.options.Context, e.options.Name, wgDevice, e.options.Logger); err != nil {
+			return E.Cause(err, "start UAPI listener")
+		}
+	}
+
 	e.tunDevice.SetDevice(wgDevice)
 	ipcConf := e.ipcConf
 	for _, peer := range e.peers {

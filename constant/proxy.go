@@ -8,5 +8,7 @@ const (
 )
 
 const (
-	TypeFallback = "fallback"
+	TypeFallback        = "fallback"
+	TypeMutableSelector = "mutableselector"
+	TypeMutableURLTest  = "mutableurltest"
 )

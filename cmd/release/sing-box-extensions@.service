@@ -1,11 +1,11 @@
 [Unit]
-Description=sing-box-extensions service
+Description=lantern-box service
 After=network.target nss-lookup.target network-online.target
 
 [Service]
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
-ExecStart=/usr/bin/sing-box-extensions -d /var/lib/sing-box-extensions -c /etc/sing-box-extensions/config.json run
+ExecStart=/usr/bin/lantern-box -d /var/lib/lantern-box-%i -c /etc/lantern-box/%i.json run
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=10s

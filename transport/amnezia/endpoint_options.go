@@ -1,7 +1,8 @@
+// Package amnezia implements the amnezia transport endpoint
 package amnezia
 
 import (
-	"github.com/getlantern/sing-box-extensions/option"
+	"github.com/getlantern/lantern-box/option"
 
 	"github.com/sagernet/sing-box/transport/wireguard"
 )

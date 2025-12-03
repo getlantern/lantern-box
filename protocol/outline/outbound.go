@@ -12,8 +12,8 @@ import (
 
 	"github.com/Jigsaw-Code/outline-sdk/transport"
 	"github.com/Jigsaw-Code/outline-sdk/x/smart"
-	C "github.com/getlantern/sing-box-extensions/constant"
-	"github.com/getlantern/sing-box-extensions/option"
+	C "github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/option"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"

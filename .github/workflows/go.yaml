@@ -1,0 +1,35 @@
+name: Go
+
+on:
+  workflow_call:
+
+  push:
+    branches-ignore: [main]
+    paths:
+      - 'Dockerfile'
+      - 'go.mod'
+      - 'go.sum'
+      - '**.go'
+      - '!.github/**'
+
+env:
+  TELEPORT_HOST: ${{secrets.TELEPORT_HOST}}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: "go.mod"
+      - name: Granting private modules access
+        run: |
+          git config --global url."https://${{ secrets.CI_PRIVATE_REPOS_GH_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+      - name: Environment list
+        run: env
+    #   - name: Test
+    #     run: make test
+    #   - name: Build
+    #     run: make build

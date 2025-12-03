@@ -22,10 +22,10 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
-	"github.com/getlantern/sing-box-extensions/constant"
-	"github.com/getlantern/sing-box-extensions/metrics"
-	"github.com/getlantern/sing-box-extensions/option"
-	"github.com/getlantern/sing-box-extensions/transport/amnezia"
+	"github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/metrics"
+	"github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/transport/amnezia"
 )
 
 func RegisterEndpoint(registry *endpoint.Registry) {

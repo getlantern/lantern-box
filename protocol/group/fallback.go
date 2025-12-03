@@ -13,8 +13,8 @@ import (
 	"github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/service"
 
-	"github.com/getlantern/sing-box-extensions/constant"
-	"github.com/getlantern/sing-box-extensions/option"
+	"github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/option"
 )
 
 func RegisterFallback(registry *outbound.Registry) {

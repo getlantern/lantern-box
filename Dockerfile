@@ -1,9 +1,39 @@
-FROM alpine:edge
+FROM --platform=$BUILDPLATFORM golang:1.24-bullseye as builder
+ARG TARGETOS TARGETARCH
+ARG GOPROXY=""
 
-# Set the timezone and install CA certificates
-RUN apk --no-cache add ca-certificates tzdata nftables
+RUN set -ex \
+    && apt-get update \
+    && if [ "$TARGETARCH" = "arm64" ]; then \
+           apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-user; \
+       else \
+           apt-get install -y gcc g++; \
+       fi \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY sing-box-extensions /sing-box-extensions
+WORKDIR $GOPATH/src/getlantern/lantern-box/
+COPY . .
 
-# Set the entrypoint command
-ENTRYPOINT ["/sing-box-extensions", "-d", "/data", "-c", "/config.json", "run"]
+ENV CGO_ENABLED=1
+ENV GOOS=$TARGETOS
+ENV GOARCH=$TARGETARCH
+
+RUN set -ex \
+    && if [ "$TARGETARCH" = "arm64" ]; then \
+           export CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++; \
+       else \
+           export CC=gcc CXX=g++; \
+       fi && \
+       echo "Building for $GOOS/$GOARCH using CC=$CC CXX=$CXX" && \
+       go build -v -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_ech,with_utls,with_reality_server,with_acme,with_clash_api" \
+       -o /usr/local/bin/lantern-box ./cmd
+
+FROM debian:bullseye-slim
+RUN set -ex \
+    && apt-get update \
+    && apt-get install -y ca-certificates tzdata nftables wireguard-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/lantern-box /usr/local/bin/lantern-box
+
+ENTRYPOINT ["/usr/local/bin/lantern-box", "run", "--config", "/config.json"]

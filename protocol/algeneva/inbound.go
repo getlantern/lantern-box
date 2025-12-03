@@ -9,9 +9,9 @@ import (
 	alg "github.com/getlantern/algeneva"
 	"github.com/gobwas/ws"
 
-	"github.com/getlantern/sing-box-extensions/constant"
-	"github.com/getlantern/sing-box-extensions/metrics"
-	"github.com/getlantern/sing-box-extensions/option"
+	"github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/metrics"
+	"github.com/getlantern/lantern-box/option"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
