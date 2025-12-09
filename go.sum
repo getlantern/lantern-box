@@ -173,12 +173,12 @@ github.com/getlantern/lantern-water v0.0.0-20250331153903-07abebe611e8/go.mod h1
 github.com/getlantern/ops v0.0.0-20220713155959-1315d978fff7/go.mod h1:D5ao98qkA6pxftxoqzibIBBrLSUli+kYnJqrgBf9cIA=
 github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534 h1:3BwvWj0JZzFEvNNiMhCu4bf60nqcIuQpTYb00Ezm1ag=
 github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534/go.mod h1:ZsLfOY6gKQOTyEcPYNA9ws5/XHZQFroxqCOhHjGcs9Y=
-github.com/getlantern/sing v0.7.14-0.20251205174047-e00a702507ae h1:DNl8Px5UB8rnUW4yFD/KFFa2Vn1c4O8uWCq2JoakdM8=
-github.com/getlantern/sing v0.7.14-0.20251205174047-e00a702507ae/go.mod h1:ARkL0gM13/Iv5VCZmci/NuoOlePoIsW0m7BWfln/Hak=
+github.com/getlantern/sing v0.7.14-0.20251208213946-adbf4abe8692 h1:pK9igrNx0ipBe6xGDgwVnob3JCFwOp2bmEizwanDVk4=
+github.com/getlantern/sing v0.7.14-0.20251208213946-adbf4abe8692/go.mod h1:ARkL0gM13/Iv5VCZmci/NuoOlePoIsW0m7BWfln/Hak=
 github.com/getlantern/sing-box-minimal v1.12.13-0.20251205011046-be268b083378 h1:qUUykWom/NFUfQhEVNJ7SsKXYTDP27nTCEoqY78FtOA=
 github.com/getlantern/sing-box-minimal v1.12.13-0.20251205011046-be268b083378/go.mod h1:ObMeEc1VAcJdXN6B/3SUIJRuK7J38m0W6yLNJ+E5f+0=
-github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251205211434-fa87bd554827 h1:uQHIZhtDmYY9+cFd0B42AFWpbw+8wqiMTkDpshUySDg=
-github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251205211434-fa87bd554827/go.mod h1:akc2Wh+rX9bFFNnHJGsQ8VIV3eJI1LXJYgx2Y+8lcW8=
+github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4 h1:j/A6xSUbz78xQfFXyDbnWkg96D+UprbLgKlGjXbodxA=
+github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4/go.mod h1:akc2Wh+rX9bFFNnHJGsQ8VIV3eJI1LXJYgx2Y+8lcW8=
 github.com/github/fakeca v0.1.0 h1:Km/MVOFvclqxPM9dZBC4+QE564nU4gz4iZ0D9pMw28I=
 github.com/github/fakeca v0.1.0/go.mod h1:+bormgoGMMuamOscx7N91aOuUST7wdaJ2rNjeohylyo=
 github.com/glycerine/go-unsnap-stream v0.0.0-20180323001048-9f0cb55181dd/go.mod h1:/20jfyN9Y5QPEAprSgKAUr+glWDY39ZiUEAYOEv5dsE=
