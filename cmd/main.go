@@ -5,10 +5,9 @@ import (
 	"fmt"
 	"os"
 
-	box "github.com/sagernet/sing-box"
 	"github.com/spf13/cobra"
 
-	"github.com/getlantern/lantern-box/protocol"
+	box "github.com/getlantern/lantern-box"
 )
 
 var globalCtx context.Context
@@ -23,13 +22,7 @@ var rootCmd = &cobra.Command{
 }
 
 func preRun(cmd *cobra.Command, args []string) {
-	inboundRegistry, outboundRegistry, endpointRegistry := protocol.GetRegistries()
-	globalCtx = box.Context(
-		context.Background(),
-		inboundRegistry,
-		outboundRegistry,
-		endpointRegistry,
-	)
+	globalCtx = box.BaseContext()
 }
 
 func main() {

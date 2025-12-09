@@ -43,7 +43,7 @@ type Outbound struct {
 
 // NewOutbound creates a new Application Layer Geneva HTTP outbound adapter.
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ALGenevaOutboundOptions) (adapter.Outbound, error) {
-	outboundDialer, err := dialer.New(ctx, options.DialerOptions)
+	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
 		return nil, err
 	}
