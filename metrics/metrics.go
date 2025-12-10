@@ -16,14 +16,13 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 )
 
-var (
-	geolite2CityURL = "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz"
-	geoip2ISPURL    = "https://lanterngeo.lantern.io/GeoIP2-ISP.mmdb.tar.gz"
-)
+// var (
+// 	geolite2CityURL = "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz"
+// )
 
-const (
-	cityDBFile = "GeoLite2-City.mmdb"
-)
+// const (
+// 	cityDBFile = "GeoLite2-City.mmdb"
+// )
 
 type metricsManager struct {
 	meter         metric.Meter
@@ -34,9 +33,9 @@ type metricsManager struct {
 	countryLookup geo.CountryLookup
 }
 
-var metrics = newMetricsManager()
+var metrics = &metricsManager{}
 
-func newMetricsManager() *metricsManager {
+func SetupMetricsManager(geolite2CityURL, cityDBFile string) {
 	meter := otel.GetMeterProvider().Meter("lantern-box")
 
 	pIO, err := meter.Int64Counter("proxy.io", metric.WithUnit("bytes"))
@@ -61,20 +60,16 @@ func newMetricsManager() *metricsManager {
 		duration = &noop.Int64Histogram{}
 	}
 
-	manager := &metricsManager{
-		meter:       meter,
-		ProxyIO:     pIO,
-		duration:    duration,
-		Connections: connections,
-		conns:       conns,
-	}
+	metrics.meter = meter
+	metrics.ProxyIO = pIO
+	metrics.duration = duration
+	metrics.Connections = connections
+	metrics.conns = conns
 
-	manager.countryLookup = geo.FromWeb(geolite2CityURL, "GeoLite2-City.mmdb", 24*time.Hour, cityDBFile, geo.CountryCode)
-	if manager.countryLookup == nil {
-		manager.countryLookup = geo.NoLookup{}
+	metrics.countryLookup = geo.FromWeb(geolite2CityURL, cityDBFile, 24*time.Hour, cityDBFile, geo.CountryCode)
+	if metrics.countryLookup == nil {
+		metrics.countryLookup = geo.NoLookup{}
 	}
-
-	return manager
 }
 
 func metadataToAttributes(metadata *adapter.InboundContext) []attribute.KeyValue {

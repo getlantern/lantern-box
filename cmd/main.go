@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	box "github.com/getlantern/lantern-box"
+	"github.com/getlantern/lantern-box/metrics"
 	"github.com/getlantern/lantern-box/otel"
 )
 
@@ -45,6 +46,21 @@ func preRun(cmd *cobra.Command, args []string) {
 		return
 	}
 
+	geoCityURL, err := cmd.Flags().GetString("geo-city-url")
+	if err != nil {
+		return
+	}
+
+	cityDatabaseName, err := cmd.Flags().GetString("city-database-name")
+	if err != nil {
+		return
+	}
+
+	telemetryEndpoint, err := cmd.Flags().GetString("telemetry-endpoint")
+	if err != nil {
+		return
+	}
+
 	proxyInfoPath := strings.Replace(path, ".json", ".ini", 1)
 
 	proxyInfo, err := readProxyInfoFile(proxyInfoPath)
@@ -52,8 +68,9 @@ func preRun(cmd *cobra.Command, args []string) {
 		return
 	}
 
+	// TODO: what is the best place to do clean up of otel?
 	otel.InitGlobalMeterProvider(&otel.Opts{
-		Endpoint:         otel.GetTelemetryEndpoint(),
+		Endpoint:         otel.GetTelemetryEndpoint(telemetryEndpoint),
 		ProxyName:        proxyInfo.Name,
 		IsPro:            proxyInfo.Pro,
 		Track:            proxyInfo.Track,
@@ -61,6 +78,8 @@ func preRun(cmd *cobra.Command, args []string) {
 		FrontendProvider: proxyInfo.FrontendProvider,
 		ProxyProtocol:    proxyInfo.Protocol,
 	})
+
+	metrics.SetupMetricsManager(geoCityURL, cityDatabaseName)
 }
 
 func main() {

@@ -22,6 +22,9 @@ import (
 func init() {
 	rootCmd.AddCommand(runCmd)
 	runCmd.Flags().String("config", "config.json", "Configuration file path")
+	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz", "URL for downloading GeoLite2-City database")
+	runCmd.Flags().String("city-database-name", "GeoLite2-City.mmdb", "Filename for storing GeoLite2-City database")
+	runCmd.Flags().String("telemetry-endpoint", "telemetry.iantem.io:443", "Telemetry endpoint for OpenTelemetry exporter")
 }
 
 var runCmd = &cobra.Command{

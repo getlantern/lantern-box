@@ -16,8 +16,6 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
-const defaultTeleportHost = "telemetry.iantem.io:443"
-
 type Opts struct {
 	Endpoint         string
 	Headers          map[string]string
@@ -33,11 +31,11 @@ type Opts struct {
 	Legacy           bool
 }
 
-func GetTelemetryEndpoint() string {
+func GetTelemetryEndpoint(fallback string) string {
 	if endpoint := os.Getenv("CUSTOM_OTLP_ENDPOINT"); endpoint != "" {
 		return endpoint
 	}
-	return defaultTeleportHost
+	return fallback
 }
 
 func InitGlobalMeterProvider(opts *Opts) (func(), error) {
