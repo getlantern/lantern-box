@@ -16,14 +16,6 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 )
 
-// var (
-// 	geolite2CityURL = "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz"
-// )
-
-// const (
-// 	cityDBFile = "GeoLite2-City.mmdb"
-// )
-
 type metricsManager struct {
 	meter         metric.Meter
 	ProxyIO       metric.Int64Counter
