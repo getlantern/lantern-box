@@ -6,9 +6,9 @@ import (
 	"os"
 	"strings"
 
-	box "github.com/sagernet/sing-box"
 	"github.com/spf13/cobra"
 
+	box "github.com/getlantern/lantern-box"
 	"github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/protocol"
 )
@@ -68,6 +68,7 @@ func preRun(cmd *cobra.Command, args []string) {
 		FrontendProvider: proxyInfo.FrontendProvider,
 		ProxyProtocol:    proxyInfo.Protocol,
 	})
+	globalCtx = box.BaseContext()
 }
 
 func main() {

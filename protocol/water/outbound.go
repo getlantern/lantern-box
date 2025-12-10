@@ -11,10 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/getlantern/lantern-box/constant"
-	L "github.com/getlantern/lantern-box/log"
-	"github.com/getlantern/lantern-box/option"
-	waterTransport "github.com/getlantern/lantern-box/transport/water"
 	waterDownloader "github.com/getlantern/lantern-water/downloader"
 	waterVC "github.com/getlantern/lantern-water/version_control"
 	"github.com/refraction-networking/water"
@@ -29,6 +25,11 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/network"
 	"github.com/tetratelabs/wazero"
+
+	"github.com/getlantern/lantern-box/constant"
+	L "github.com/getlantern/lantern-box/log"
+	"github.com/getlantern/lantern-box/option"
+	waterTransport "github.com/getlantern/lantern-box/transport/water"
 )
 
 // RegisterOutbound registers the WATER outbound adapter with the given registry.
@@ -86,7 +87,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 
-	outboundDialer, err := dialer.New(ctx, options.DialerOptions)
+	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
 		return nil, err
 	}
