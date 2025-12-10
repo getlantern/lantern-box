@@ -10,7 +10,6 @@ import (
 
 	box "github.com/getlantern/lantern-box"
 	"github.com/getlantern/lantern-box/otel"
-	"github.com/getlantern/lantern-box/protocol"
 )
 
 type ProxyInfo struct {
@@ -39,13 +38,7 @@ var rootCmd = &cobra.Command{
 }
 
 func preRun(cmd *cobra.Command, args []string) {
-	inboundRegistry, outboundRegistry, endpointRegistry := protocol.GetRegistries()
-	globalCtx = box.Context(
-		context.Background(),
-		inboundRegistry,
-		outboundRegistry,
-		endpointRegistry,
-	)
+	globalCtx = box.BaseContext()
 
 	path, err := cmd.Flags().GetString("config")
 	if err != nil {
@@ -68,7 +61,6 @@ func preRun(cmd *cobra.Command, args []string) {
 		FrontendProvider: proxyInfo.FrontendProvider,
 		ProxyProtocol:    proxyInfo.Protocol,
 	})
-	globalCtx = box.BaseContext()
 }
 
 func main() {
