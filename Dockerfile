@@ -1,7 +1,9 @@
 FROM --platform=$BUILDPLATFORM golang:1.24-bullseye as builder
 ARG TARGETOS TARGETARCH
 ARG GOPROXY=""
-ARG BUILD_ARG
+ARG VERSION=""
+ARG COMMIT=""
+ARG BUILD_DATE=""
 
 RUN set -ex \
     && apt-get update \
@@ -27,7 +29,8 @@ RUN set -ex \
        fi && \
        echo "Building for $GOOS/$GOARCH using CC=$CC CXX=$CXX" && \
        go build -v -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api" \
-       -o /usr/local/bin/lantern-box ${BUILD_ARG:+"$BUILD_ARG"} ./cmd
+       -ldflags="-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
+       -o /usr/local/bin/lantern-box ./cmd
 
 FROM debian:bullseye-slim
 RUN set -ex \

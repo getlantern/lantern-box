@@ -53,6 +53,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            BUILD_ARG=-ldflags "-X main.version=${{ github.ref_name }} -X main.commit=${{ github.sha }} -X main.buildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
           tags: |
             us-docker.pkg.dev/lantern-cloud/containers/sing-box:latest
