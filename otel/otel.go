@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/log"
+	E "github.com/sagernet/sing/common/exceptions"
 	sdkotel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -81,7 +82,7 @@ func InitGlobalMeterProvider(opts *Opts) (func(), error) {
 		defer cancel()
 		err := mp.Shutdown(ctx)
 		if err != nil {
-			log.Error("error shutting down meter provider: %v", err)
+			log.Error(E.Cause(err, "error shutting down meter provider"))
 		}
 	}, nil
 }
@@ -97,19 +98,19 @@ func (opts *Opts) buildResource() *resource.Resource {
 		attributes = append(attributes, attribute.String("track", opts.Track))
 	}
 	if opts.ProxyName != "" {
-		log.Debug("Will report with proxy.name %v", opts.ProxyName)
+		log.Debug("Will report with proxy.name ", opts.ProxyName)
 		attributes = append(attributes, attribute.String("proxy.name", opts.ProxyName))
 	}
 	if opts.Provider != "" {
-		log.Debug("Will report with provider %v", opts.Provider)
+		log.Debug("Will report with provider ", opts.Provider)
 		attributes = append(attributes, attribute.String("provider", opts.Provider))
 	}
 	if opts.DC != "" {
-		log.Debug("Will report with dc %v", opts.DC)
+		log.Debug("Will report with dc ", opts.DC)
 		attributes = append(attributes, attribute.String("dc", opts.DC))
 	}
 	if opts.FrontendProvider != "" {
-		log.Debug("Will report frontend provider %v in dc %v", opts.FrontendProvider, opts.FrontendDC)
+		log.Debug("Will report frontend provider  in dc ", opts.FrontendProvider, opts.FrontendDC)
 		attributes = append(attributes, attribute.String("frontend.provider", opts.FrontendProvider))
 		attributes = append(attributes, attribute.String("frontend.dc", opts.FrontendDC))
 	}
