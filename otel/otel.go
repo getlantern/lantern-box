@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/getlantern/golog"
+	"github.com/sagernet/sing-box/log"
 	sdkotel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -14,10 +14,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
-)
-
-var (
-	log = golog.LoggerFor("otel")
 )
 
 type Opts struct {
@@ -62,7 +58,7 @@ func InitGlobalMeterProvider(opts *Opts) (func(), error) {
 
 	// If endpoint doesn't use port 443, assume insecure (HTTP not HTTPS)
 	if !strings.Contains(opts.Endpoint, ":443") {
-		log.Debugf("Using insecure connection for OTEL metrics endpoint %v", opts.Endpoint)
+		log.Debug("Using insecure connection for OTEL metrics endpoint %v", opts.Endpoint)
 		metricOpts = append(metricOpts, otlpmetrichttp.WithInsecure())
 	}
 
@@ -85,7 +81,7 @@ func InitGlobalMeterProvider(opts *Opts) (func(), error) {
 		defer cancel()
 		err := mp.Shutdown(ctx)
 		if err != nil {
-			log.Errorf("error shutting down meter provider: %v", err)
+			log.Error("error shutting down meter provider: %v", err)
 		}
 	}, nil
 }
@@ -101,19 +97,19 @@ func (opts *Opts) buildResource() *resource.Resource {
 		attributes = append(attributes, attribute.String("track", opts.Track))
 	}
 	if opts.ProxyName != "" {
-		log.Debugf("Will report with proxy.name %v", opts.ProxyName)
+		log.Debug("Will report with proxy.name %v", opts.ProxyName)
 		attributes = append(attributes, attribute.String("proxy.name", opts.ProxyName))
 	}
 	if opts.Provider != "" {
-		log.Debugf("Will report with provider %v", opts.Provider)
+		log.Debug("Will report with provider %v", opts.Provider)
 		attributes = append(attributes, attribute.String("provider", opts.Provider))
 	}
 	if opts.DC != "" {
-		log.Debugf("Will report with dc %v", opts.DC)
+		log.Debug("Will report with dc %v", opts.DC)
 		attributes = append(attributes, attribute.String("dc", opts.DC))
 	}
 	if opts.FrontendProvider != "" {
-		log.Debugf("Will report frontend provider %v in dc %v", opts.FrontendProvider, opts.FrontendDC)
+		log.Debug("Will report frontend provider %v in dc %v", opts.FrontendProvider, opts.FrontendDC)
 		attributes = append(attributes, attribute.String("frontend.provider", opts.FrontendProvider))
 		attributes = append(attributes, attribute.String("frontend.dc", opts.FrontendDC))
 	}

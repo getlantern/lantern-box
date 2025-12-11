@@ -3,7 +3,6 @@ ARG TARGETOS TARGETARCH
 ARG GOPROXY=""
 ARG VERSION=""
 ARG COMMIT=""
-ARG BUILD_DATE=""
 
 RUN set -ex \
     && apt-get update \
@@ -29,7 +28,7 @@ RUN set -ex \
        fi && \
        echo "Building for $GOOS/$GOARCH using CC=$CC CXX=$CXX" && \
        go build -v -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api" \
-       -ldflags="-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
+       -ldflags="-X main.version=${VERSION} -X main.commit=${COMMIT}" \
        -o /usr/local/bin/lantern-box ./cmd
 
 FROM debian:bullseye-slim

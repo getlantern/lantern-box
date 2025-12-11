@@ -24,9 +24,8 @@ type ProxyInfo struct {
 
 var globalCtx context.Context
 var (
-	version   string
-	commit    string
-	buildDate string
+	version string
+	commit  string
 )
 
 var rootCmd = &cobra.Command{
