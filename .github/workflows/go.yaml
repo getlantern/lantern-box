@@ -4,7 +4,7 @@ on:
   workflow_call:
 
   push:
-    branches-ignore: main
+    branches-ignore: [main]
     paths:
       - 'Dockerfile'
       - 'go.mod'

@@ -8,6 +8,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
@@ -15,7 +16,7 @@ import (
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing/common/atomic"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/batch"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -25,11 +26,11 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/getlantern/sing-box-extensions/adapter"
-	"github.com/getlantern/sing-box-extensions/constant"
-	isync "github.com/getlantern/sing-box-extensions/internal/sync"
-	sbxL "github.com/getlantern/sing-box-extensions/log"
-	"github.com/getlantern/sing-box-extensions/option"
+	"github.com/getlantern/lantern-box/adapter"
+	"github.com/getlantern/lantern-box/constant"
+	isync "github.com/getlantern/lantern-box/internal/sync"
+	lLog "github.com/getlantern/lantern-box/log"
+	"github.com/getlantern/lantern-box/option"
 )
 
 func RegisterMutableURLTest(registry *outbound.Registry) {
@@ -69,8 +70,8 @@ func NewMutableURLTest(ctx context.Context, _ A.Router, logger log.ContextLogger
 	}
 
 	log := logger
-	if slogger, ok := logger.(sbxL.SLogger); ok {
-		nfact := sbxL.NewFactory(slogger.SlogHandler().WithAttrs([]slog.Attr{slog.String("urltest_group", tag)}))
+	if slogger, ok := logger.(lLog.SLogger); ok {
+		nfact := lLog.NewFactory(slogger.SlogHandler().WithAttrs([]slog.Attr{slog.String("urltest_group", tag)}))
 		log = nfact.Logger()
 	}
 	outboundMgr := service.FromContext[A.OutboundManager](ctx)
@@ -222,15 +223,15 @@ type urlTestGroup struct {
 	interval            time.Duration
 	tolerance           uint16
 	idleTimeout         time.Duration
-	history             *urltest.HistoryStorage
-	selectedOutboundTCP atomic.TypedValue[A.Outbound]
-	selectedOutboundUDP atomic.TypedValue[A.Outbound]
+	history             A.URLTestHistoryStorage
+	selectedOutboundTCP common.TypedValue[A.Outbound]
+	selectedOutboundUDP common.TypedValue[A.Outbound]
 	access              sync.Mutex
 	checking            atomic.Bool
 	started             bool
 	isAlive             bool
 	idleTimer           *time.Timer
-	lastActive          atomic.TypedValue[time.Time]
+	lastActive          common.TypedValue[time.Time]
 	pauseC              chan struct{}
 	cancel              context.CancelFunc
 }
@@ -245,12 +246,21 @@ func newURLTestGroup(
 	tolerance uint16,
 ) *urlTestGroup {
 	ctx, cancel := context.WithCancel(ctx)
+	var history A.URLTestHistoryStorage
+	if historyFromCtx := service.PtrFromContext[urltest.HistoryStorage](ctx); historyFromCtx != nil {
+		history = historyFromCtx
+	} else if clashServer := service.FromContext[A.ClashServer](ctx); clashServer != nil {
+		history = clashServer.HistoryStorage()
+	} else {
+		history = urltest.NewHistoryStorage()
+	}
 	return &urlTestGroup{
 		ctx:         ctx,
 		outboundMgr: outboundMgr,
 		logger:      logger,
 		tags:        tags,
 		url:         link,
+		history:     history,
 		interval:    interval,
 		idleTimeout: idleTimeout,
 		tolerance:   tolerance,
@@ -275,13 +285,6 @@ func (g *urlTestGroup) Start() error {
 		g.outbounds.Store(tag, outbound)
 	}
 
-	if history := service.PtrFromContext[urltest.HistoryStorage](g.ctx); history != nil {
-		g.history = history
-	} else if clashServer := service.FromContext[A.ClashServer](g.ctx); clashServer != nil {
-		g.history = clashServer.HistoryStorage()
-	} else {
-		g.history = urltest.NewHistoryStorage()
-	}
 	g.pauseMgr = service.FromContext[pause.Manager](g.ctx)
 	g.updateSelected()
 	return nil
@@ -483,7 +486,7 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 				return nil, nil
 			}
 			g.logger.Debug("outbound available", "tag", realTag, "delay_ms", t)
-			g.history.StoreURLTestHistory(realTag, &urltest.History{
+			g.history.StoreURLTestHistory(realTag, &A.URLTestHistory{
 				Time:  time.Now(),
 				Delay: t,
 			})

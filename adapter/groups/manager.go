@@ -15,7 +15,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/logger"
 
-	"github.com/getlantern/sing-box-extensions/adapter"
+	"github.com/getlantern/lantern-box/adapter"
 )
 
 const (

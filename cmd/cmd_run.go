@@ -16,11 +16,15 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/spf13/cobra"
+	"gopkg.in/ini.v1"
 )
 
 func init() {
 	rootCmd.AddCommand(runCmd)
 	runCmd.Flags().String("config", "config.json", "Configuration file path")
+	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz", "URL for downloading GeoLite2-City database")
+	runCmd.Flags().String("city-database-name", "GeoLite2-City.mmdb", "Filename for storing GeoLite2-City database")
+	runCmd.Flags().String("telemetry-endpoint", "telemetry.iantem.io:443", "Telemetry endpoint for OpenTelemetry exporter")
 }
 
 var runCmd = &cobra.Command{
@@ -33,6 +37,19 @@ var runCmd = &cobra.Command{
 		}
 		return run(path)
 	},
+}
+
+func readProxyInfoFile(path string) (*ProxyInfo, error) {
+	cfg, err := ini.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("loading proxy info file: %w", err)
+	}
+	var info ProxyInfo
+	err = cfg.MapTo(&info)
+	if err != nil {
+		return nil, fmt.Errorf("mapping proxy info file: %w", err)
+	}
+	return &info, nil
 }
 
 func readConfig(path string) (option.Options, error) {
@@ -96,6 +113,7 @@ func closeMonitor(ctx context.Context) {
 }
 
 func run(configPath string) error {
+	log.Info("build info: version , commit ", version, commit)
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(osSignals)

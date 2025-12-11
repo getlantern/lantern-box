@@ -12,8 +12,6 @@ import (
 
 	"github.com/Jigsaw-Code/outline-sdk/transport"
 	"github.com/Jigsaw-Code/outline-sdk/x/smart"
-	C "github.com/getlantern/sing-box-extensions/constant"
-	"github.com/getlantern/sing-box-extensions/option"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -22,6 +20,9 @@ import (
 	"github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/network"
 	"gopkg.in/yaml.v3"
+
+	C "github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/option"
 )
 
 // Outbound implements the smart dialer outbound from outline sdk
@@ -41,7 +42,7 @@ func RegisterOutbound(registry *outbound.Registry) {
 // NewOutbound creates a proxyless outbond that uses the proxyless transport
 // for dialing
 func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogger, tag string, options option.OutboundOutlineOptions) (adapter.Outbound, error) {
-	sDialer, err := dialer.New(ctx, options.DialerOptions)
+	sDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
 		return nil, err
 	}

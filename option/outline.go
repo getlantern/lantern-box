@@ -8,6 +8,7 @@ import O "github.com/sagernet/sing-box/option"
 // Or check the documentation README: https://github.com/Jigsaw-Code/outline-sdk/tree/v0.0.18/x/smart
 type OutboundOutlineOptions struct {
 	O.DialerOptions
+	O.ServerOptions
 	DNSResolvers []DNSEntryConfig `json:"dns,omitempty" yaml:"dns,omitempty"`
 	TLS          []string         `json:"tls,omitempty" yaml:"tls,omitempty"`
 	TestTimeout  string           `json:"test_timeout" yaml:"-"`

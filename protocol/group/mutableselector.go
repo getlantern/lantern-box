@@ -22,12 +22,12 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/getlantern/sing-box-extensions/adapter"
-	"github.com/getlantern/sing-box-extensions/constant"
-	"github.com/getlantern/sing-box-extensions/option"
+	"github.com/getlantern/lantern-box/adapter"
+	"github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/option"
 )
 
-const tracerName = "github.com/getlantern/sing-box-extensions/protocol/group"
+const tracerName = "github.com/getlantern/lantern-box/protocol/group"
 
 func RegisterMutableSelector(registry *outbound.Registry) {
 	outbound.Register[option.MutableSelectorOutboundOptions](registry, constant.TypeMutableSelector, NewMutableSelector)
