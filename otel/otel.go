@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/refraction-networking/water/internal/log"
+	"github.com/getlantern/golog"
 	sdkotel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -14,6 +14,10 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+)
+
+var (
+	log = golog.LoggerFor("otel")
 )
 
 type Opts struct {
