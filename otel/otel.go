@@ -59,7 +59,7 @@ func InitGlobalMeterProvider(opts *Opts) (func(), error) {
 
 	// If endpoint doesn't use port 443, assume insecure (HTTP not HTTPS)
 	if !strings.Contains(opts.Endpoint, ":443") {
-		log.Debug("Using insecure connection for OTEL metrics endpoint %v", opts.Endpoint)
+		log.Debug("Using insecure connection for OTEL metrics endpoint ", opts.Endpoint)
 		metricOpts = append(metricOpts, otlpmetrichttp.WithInsecure())
 	}
 
