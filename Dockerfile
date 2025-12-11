@@ -1,6 +1,7 @@
 FROM --platform=$BUILDPLATFORM golang:1.24-bullseye as builder
 ARG TARGETOS TARGETARCH
 ARG GOPROXY=""
+ARG BUILD_ARG
 
 RUN set -ex \
     && apt-get update \
