@@ -52,5 +52,7 @@ jobs:
           platforms: linux/arm64,linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_ARG=-ldflags "-X main.version=${{ github.ref_name }} -X main.commit=${{ github.sha }} -X main.buildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           tags: |
             us-docker.pkg.dev/lantern-cloud/containers/sing-box:latest

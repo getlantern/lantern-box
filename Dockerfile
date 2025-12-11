@@ -26,7 +26,7 @@ RUN set -ex \
        fi && \
        echo "Building for $GOOS/$GOARCH using CC=$CC CXX=$CXX" && \
        go build -v -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api" \
-       -o /usr/local/bin/lantern-box ./cmd
+       -o /usr/local/bin/lantern-box ${BUILD_ARG:+"$BUILD_ARG"} ./cmd
 
 FROM debian:bullseye-slim
 RUN set -ex \
