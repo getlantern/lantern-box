@@ -17,6 +17,8 @@ import (
 	"github.com/sagernet/sing/common/json"
 	"github.com/spf13/cobra"
 	"gopkg.in/ini.v1"
+
+	"github.com/getlantern/lantern-box/tracker/clientcontext"
 )
 
 func init() {
@@ -78,6 +80,13 @@ func create(configPath string) (*box.Box, context.CancelFunc, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("create service: %w", err)
 	}
+
+	// Add tracker
+	tracker := clientcontext.NewClientContextReader(clientcontext.MatchBounds{
+		Inbound:  []string{""},
+		Outbound: []string{""},
+	}, log.NewNOPFactory().NewLogger("tracker"))
+	instance.Router().AppendTracker(tracker)
 
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
