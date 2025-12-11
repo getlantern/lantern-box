@@ -25,8 +25,8 @@ RUN set -ex \
            export CC=gcc CXX=g++; \
        fi && \
        echo "Building for $GOOS/$GOARCH using CC=$CC CXX=$CXX" && \
-       go build -v -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_ech,with_utls,with_reality_server,with_acme,with_clash_api" \
-       -o /usr/local/bin/lantern-box ${BUILD_ARG:+"$BUILD_ARG"} ./cmd
+       go build -v -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api" \
+       -o /usr/local/bin/lantern-box ./cmd
 
 FROM debian:bullseye-slim
 RUN set -ex \
