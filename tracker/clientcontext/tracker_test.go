@@ -34,7 +34,7 @@ func TestIntegration(t *testing.T) {
 		CountryCode: "US",
 		Version:     "9.0",
 	}
-	ctx := box.BoxContext()
+	ctx := box.BaseContext()
 	logger := log.NewNOPFactory().NewLogger("")
 	clientTracker := NewClientContextTracker(cInfo, MatchBounds{[]string{"any"}, []string{"any"}}, logger)
 	clientOpts, clientBox := newTestBox(ctx, t, testOptionsPath+"/http_client.json", clientTracker)
