@@ -6,7 +6,6 @@
 package metrics
 
 import (
-	"context"
 	"time"
 
 	"github.com/getlantern/geo"
@@ -36,11 +35,6 @@ func SetupMetricsManager(geolite2CityURL, cityDBFile string) {
 	if err != nil {
 		pIO = &noop.Int64Counter{}
 	}
-
-	pIO.Add(context.Background(), 200)
-	pIO.Add(context.Background(), 400)
-	pIO.Add(context.Background(), 600)
-	pIO.Add(context.Background(), 800)
 
 	connections, err := meter.Int64Counter("proxy.connections")
 	if err != nil {
