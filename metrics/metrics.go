@@ -10,6 +10,7 @@ import (
 
 	"github.com/getlantern/geo"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/log"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -62,6 +63,8 @@ func SetupMetricsManager(geolite2CityURL, cityDBFile string) {
 	if metrics.countryLookup == nil {
 		metrics.countryLookup = geo.NoLookup{}
 	}
+
+	log.Info("metrics manager set up completed")
 }
 
 func metadataToAttributes(metadata *adapter.InboundContext) []attribute.KeyValue {
