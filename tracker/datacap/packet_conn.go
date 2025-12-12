@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
@@ -20,7 +21,7 @@ type PacketConn struct {
 	client *Client
 	logger log.ContextLogger
 
-	clientInfo *ClientInfo
+	clientInfo *clientcontext.ClientInfo
 
 	// Atomic counters for thread-safe tracking
 	bytesSent     atomic.Int64
@@ -42,7 +43,7 @@ type PacketConnConfig struct {
 	Conn             N.PacketConn
 	Client           *Client
 	Logger           log.ContextLogger
-	ClientInfo       *ClientInfo
+	ClientInfo       *clientcontext.ClientInfo
 	ReportInterval   time.Duration
 	EnableThrottling bool
 	ThrottleSpeed    int64

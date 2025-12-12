@@ -19,6 +19,7 @@ import (
 	"gopkg.in/ini.v1"
 
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
+	"github.com/getlantern/lantern-box/tracker/datacap"
 )
 
 func init() {
@@ -27,6 +28,7 @@ func init() {
 	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz", "URL for downloading GeoLite2-City database")
 	runCmd.Flags().String("city-database-name", "GeoLite2-City.mmdb", "Filename for storing GeoLite2-City database")
 	runCmd.Flags().String("telemetry-endpoint", "telemetry.iantem.io:443", "Telemetry endpoint for OpenTelemetry exporter")
+	runCmd.Flags().String("datacap-url", "", "Datacap server URL")
 }
 
 var runCmd = &cobra.Command{
@@ -37,7 +39,11 @@ var runCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("get config flag: %w", err)
 		}
-		return run(path)
+		datacapURL, err := cmd.Flags().GetString("datacap-url")
+		if err != nil {
+			return fmt.Errorf("get datacap-url flag: %w", err)
+		}
+		return run(path, datacapURL)
 	},
 }
 
@@ -66,7 +72,7 @@ func readConfig(path string) (option.Options, error) {
 	return options, nil
 }
 
-func create(configPath string) (*box.Box, context.CancelFunc, error) {
+func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc, error) {
 	options, err := readConfig(configPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read config: %w", err)
@@ -87,6 +93,18 @@ func create(configPath string) (*box.Box, context.CancelFunc, error) {
 		Outbound: []string{""},
 	}, log.NewNOPFactory().NewLogger("tracker"))
 	instance.Router().AppendTracker(tracker)
+
+	if datacapURL != "" {
+		datacapTracker, err := datacap.NewDatacapTracker(datacap.Options{
+			URL: datacapURL,
+		}, log.NewNOPFactory().NewLogger("datacap-tracker"))
+		if err != nil {
+			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
+		}
+		instance.Router().AppendTracker(datacapTracker)
+	} else {
+		log.Warn("Datacap URL not provided, datacap tracking disabled")
+	}
 
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
@@ -121,13 +139,13 @@ func closeMonitor(ctx context.Context) {
 	log.Fatal("sing-box did not close!")
 }
 
-func run(configPath string) error {
+func run(configPath string, datacapURL string) error {
 	log.Info("build info: version , commit ", version, commit)
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(osSignals)
 	for {
-		instance, cancel, err := create(configPath)
+		instance, cancel, err := create(configPath, datacapURL)
 		if err != nil {
 			return err
 		}
