@@ -6,10 +6,12 @@
 package metrics
 
 import (
+	"context"
 	"time"
 
 	"github.com/getlantern/geo"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/log"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -34,6 +36,11 @@ func SetupMetricsManager(geolite2CityURL, cityDBFile string) {
 	if err != nil {
 		pIO = &noop.Int64Counter{}
 	}
+
+	pIO.Add(context.Background(), 200)
+	pIO.Add(context.Background(), 400)
+	pIO.Add(context.Background(), 600)
+	pIO.Add(context.Background(), 800)
 
 	connections, err := meter.Int64Counter("proxy.connections")
 	if err != nil {
@@ -62,6 +69,8 @@ func SetupMetricsManager(geolite2CityURL, cityDBFile string) {
 	if metrics.countryLookup == nil {
 		metrics.countryLookup = geo.NoLookup{}
 	}
+
+	log.Info("metrics manager set up completed")
 }
 
 func metadataToAttributes(metadata *adapter.InboundContext) []attribute.KeyValue {
