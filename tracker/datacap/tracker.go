@@ -57,6 +57,7 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 		client:           NewClient(options.URL, httpTimeout),
 		reportInterval:   reportInterval,
 		enableThrottling: options.EnableThrottling,
+		throttleSpeed:    options.ThrottleSpeed,
 		logger:           logger,
 	}, nil
 }

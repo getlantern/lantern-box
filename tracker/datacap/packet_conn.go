@@ -207,17 +207,16 @@ func (c *PacketConn) updateThrottleState(status *DataCapStatus) {
 		// Calculate remaining percentage
 		remainingPct := float64(status.RemainingBytes) / float64(status.CapLimit)
 
-		// Adjust throttle speed based on remaining percentage tiers
 		var throttleSpeed int64
 		if remainingPct > highRemainingThresholdPct {
-			throttleSpeed = highTierSpeedMbps
+			throttleSpeed = highTierSpeedBytesPerSec
 		} else if remainingPct > mediumRemainingThresholdPct {
-			throttleSpeed = mediumTierSpeedMbps
+			throttleSpeed = mediumTierSpeedBytesPerSec
 		} else {
-			throttleSpeed = lowTierSpeedKBps
+			throttleSpeed = lowTierSpeedBytesPerSec
 		}
 
-		c.throttler.EnableWithRates(throttleSpeed, defaultUploadSpeedMbps)
+		c.throttler.EnableWithRates(throttleSpeed, defaultUploadSpeedBytesPerSec)
 		c.logger.Debug("updated throttle speed to ", throttleSpeed, " bytes/s (remaining: ", remainingPct*100, "%)")
 	} else {
 		c.throttler.Disable()

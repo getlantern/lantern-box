@@ -13,24 +13,16 @@ import (
 
 // Throttle speed constants for datacap enforcement
 const (
-	// Default throttle speed when user is capped (conservative browsing speed)
-	defaultThrottleSpeedKBps = 128 * 1024 // 128 KB/s
-
-	// Maximum download speed when throttled (at high remaining percentage)
-	maxThrottledSpeedMBps = 5 * 1024 * 1024 // 5 MB/s
-
-	// Minimum download speed when throttled (at very low remaining percentage)
-	minThrottledSpeedKBps = 64 * 1024 // 64 KB/s
 
 	// Default upload speed (not throttled to allow user uploads even when capped)
-	defaultUploadSpeedMbps = 5 * 1024 * 1024 // 5 Mbps
+	defaultUploadSpeedBytesPerSec = 5 * 1024 * 1024 // 5 MB/s
 
 	// Throttle speed tiers based on remaining percentage
 	highRemainingThresholdPct   = 0.2             // 20% remaining
 	mediumRemainingThresholdPct = 0.1             // 10% remaining
-	highTierSpeedMbps           = 5 * 1024 * 1024 // 5 Mbps
-	mediumTierSpeedMbps         = 2 * 1024 * 1024 // 2 Mbps
-	lowTierSpeedKBps            = 128 * 1024      // 128 KB/s
+	highTierSpeedBytesPerSec    = 5 * 1024 * 1024 // 5 MB/s
+	mediumTierSpeedBytesPerSec  = 2 * 1024 * 1024 // 2 MB/s
+	lowTierSpeedBytesPerSec     = 128 * 1024      // 128 KB/s
 )
 
 // Conn wraps a net.Conn and tracks data consumption for datacap reporting.
@@ -226,14 +218,14 @@ func (c *Conn) updateThrottleState(status *DataCapStatus) {
 		// Adjust throttle speed based on remaining percentage tiers
 		var throttleSpeed int64
 		if remainingPct > highRemainingThresholdPct {
-			throttleSpeed = highTierSpeedMbps
+			throttleSpeed = highTierSpeedBytesPerSec
 		} else if remainingPct > mediumRemainingThresholdPct {
-			throttleSpeed = mediumTierSpeedMbps
+			throttleSpeed = mediumTierSpeedBytesPerSec
 		} else {
-			throttleSpeed = lowTierSpeedKBps
+			throttleSpeed = lowTierSpeedBytesPerSec
 		}
 
-		c.throttler.EnableWithRates(throttleSpeed, defaultUploadSpeedMbps)
+		c.throttler.EnableWithRates(throttleSpeed, defaultUploadSpeedBytesPerSec)
 		c.logger.Debug("updated throttle speed to ", throttleSpeed, " bytes/s (remaining: ", remainingPct*100, "%)")
 	} else {
 		c.throttler.Disable()

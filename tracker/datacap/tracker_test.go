@@ -16,14 +16,14 @@ import (
 )
 
 // Scenario 1: NewDatacapTracker returns error if URL is empty
-func TestScenario1_MissingURL(t *testing.T) {
+func TestNewDatacapTracker_MissingURL_ReturnsError(t *testing.T) {
 	_, err := NewDatacapTracker(Options{URL: ""}, log.NewNOPFactory().Logger())
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "url not defined")
 }
 
 // Scenario 2: Datacap URL is present & Client is Pro
-func TestScenario2_ProClient(t *testing.T) {
+func TestRoutedConnection_ProClient_SkipsTracking(t *testing.T) {
 	tracker, err := NewDatacapTracker(Options{URL: "http://example.com"}, log.NewNOPFactory().Logger())
 	require.NoError(t, err)
 
@@ -38,7 +38,7 @@ func TestScenario2_ProClient(t *testing.T) {
 }
 
 // Scenario 3: Datacap URL present & Free Client & No Cap (Throttle: false)
-func TestScenario3_FreeClient_NoCap(t *testing.T) {
+func TestRoutedConnection_FreeUserNoCap_DisablesThrottling(t *testing.T) {
 	// Mock server returning Throttle: false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -62,6 +62,9 @@ func TestScenario3_FreeClient_NoCap(t *testing.T) {
 	assert.NotEqual(t, mockConn, routedConn)
 
 	conn := routedConn.(*Conn)
+	// Read some data to trigger reporting
+	_, _ = conn.Read(make([]byte, 10))
+
 	// Wait for report to happen to update status
 	time.Sleep(200 * time.Millisecond)
 
@@ -71,11 +74,11 @@ func TestScenario3_FreeClient_NoCap(t *testing.T) {
 }
 
 // Scenario 4: Datacap URL present & Free Client & With Cap (Throttle: true)
-func TestScenario4_FreeClient_WithCap(t *testing.T) {
+func TestRoutedConnection_FreeUserWithCap_EnablesThrottling(t *testing.T) {
 	// Mock server returning Throttle: true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"throttle":true, "remainingBytes": 0, "capLimit": 1000}`))
+		w.Write([]byte(`{"throttle":true, "remainingBytes": 100, "capLimit": 1000}`))
 	}))
 	defer server.Close()
 
@@ -95,6 +98,9 @@ func TestScenario4_FreeClient_WithCap(t *testing.T) {
 	assert.NotEqual(t, mockConn, routedConn)
 
 	conn := routedConn.(*Conn)
+	// Read some data to trigger reporting
+	_, _ = conn.Read(make([]byte, 10))
+
 	// Wait for report to happen to update status
 	time.Sleep(200 * time.Millisecond)
 
