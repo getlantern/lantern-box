@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/getlantern/lantern-box/tracker/clientcontext"
+	"github.com/getlantern/lantern-box/tracker/datacap"
 	box "github.com/sagernet/sing-box"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -17,9 +19,6 @@ import (
 	"github.com/sagernet/sing/common/json"
 	"github.com/spf13/cobra"
 	"gopkg.in/ini.v1"
-
-	"github.com/getlantern/lantern-box/tracker/clientcontext"
-	"github.com/getlantern/lantern-box/tracker/datacap"
 )
 
 func init() {
@@ -88,13 +87,13 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 	}
 
 	// Add tracker
-	tracker := clientcontext.NewClientContextReader(clientcontext.MatchBounds{
-		Inbound:  []string{""},
-		Outbound: []string{""},
-	}, log.NewNOPFactory().NewLogger("tracker"))
-	instance.Router().AppendTracker(tracker)
-
 	if datacapURL != "" {
+		tracker := clientcontext.NewClientContextReader(clientcontext.MatchBounds{
+			Inbound:  []string{""},
+			Outbound: []string{""},
+		}, log.NewNOPFactory().NewLogger("tracker"))
+		instance.Router().AppendTracker(tracker)
+
 		datacapTracker, err := datacap.NewDatacapTracker(datacap.Options{
 			URL: datacapURL,
 		}, log.NewNOPFactory().NewLogger("datacap-tracker"))
