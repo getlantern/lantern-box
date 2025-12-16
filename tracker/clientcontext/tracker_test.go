@@ -28,16 +28,27 @@ const testOptionsPath = "../../testdata/options"
 
 func TestIntegration(t *testing.T) {
 	cInfo := ClientInfo{
-		DeviceID:    "sing-box-extensions",
+		DeviceID:    "lantern-box",
 		Platform:    "linux",
 		IsPro:       false,
 		CountryCode: "US",
 		Version:     "9.0",
 	}
-	ctx := box.BoxContext()
+	ctx := box.BaseContext()
 	logger := log.NewNOPFactory().NewLogger("")
-	clientTracker := NewClientContextTracker(cInfo, MatchBounds{[]string{"any"}, []string{"any"}}, logger)
-	clientOpts, clientBox := newTestBox(ctx, t, testOptionsPath+"/http_client.json", clientTracker)
+	serverTracker := NewClientContextReader(MatchBounds{[]string{"any"}, []string{"any"}}, logger)
+	_, serverBox := newTestBox(ctx, t, testOptionsPath+"/http_server.json", serverTracker)
+
+	mTracker := &mockTracker{}
+	serverBox.Router().AppendTracker(mTracker)
+
+	require.NoError(t, serverBox.Start())
+	defer serverBox.Close()
+
+	httpServer := startHTTPServer()
+	defer httpServer.Close()
+
+	clientOpts, clientBox := newTestBox(ctx, t, testOptionsPath+"/http_client.json", nil)
 
 	httpInbound, exists := clientBox.Inbound().Get("http-client")
 	require.True(t, exists, "http-client inbound should exist")
@@ -46,19 +57,8 @@ func TestIntegration(t *testing.T) {
 	// this cannot actually be empty or we would have failed to create the box instance
 	proxyAddr := getProxyAddress(clientOpts.Inbounds)
 
-	serverTracker := NewClientContextReader(MatchBounds{[]string{"any"}, []string{"any"}}, logger)
-	_, serverBox := newTestBox(ctx, t, testOptionsPath+"/http_server.json", serverTracker)
-
-	mTracker := &mockTracker{}
-	serverBox.Router().AppendTracker(mTracker)
-
 	require.NoError(t, clientBox.Start())
 	defer clientBox.Close()
-	require.NoError(t, serverBox.Start())
-	defer serverBox.Close()
-
-	httpServer := startHTTPServer()
-	defer httpServer.Close()
 
 	proxyURL, _ := url.Parse("http://" + proxyAddr)
 	httpClient := &http.Client{
@@ -66,13 +66,31 @@ func TestIntegration(t *testing.T) {
 			Proxy: http.ProxyURL(proxyURL),
 		},
 	}
-	req, err := http.NewRequest("GET", httpServer.URL, nil)
-	require.NoError(t, err)
+	addr := httpServer.URL
 
-	_, err = httpClient.Do(req)
-	require.NoError(t, err)
+	t.Run("without ClientContext tracker", func(t *testing.T) {
+		req, err := http.NewRequest("GET", addr+"/ip", nil)
+		require.NoError(t, err)
 
-	require.Equal(t, cInfo, *mTracker.info)
+		_, err = httpClient.Do(req)
+		require.NoError(t, err)
+
+		require.Nil(t, mTracker.info)
+		require.NotEqual(t, cInfo, mTracker.info)
+	})
+	t.Run("with ClientContext tracker", func(t *testing.T) {
+		clientTracker := NewClientContextTracker(cInfo, MatchBounds{[]string{"any"}, []string{"any"}}, logger)
+		clientBox.Router().AppendTracker(clientTracker)
+		req, err := http.NewRequest("GET", addr+"/ip", nil)
+		require.NoError(t, err)
+
+		_, err = httpClient.Do(req)
+		require.NoError(t, err)
+
+		info := mTracker.info
+		require.NotNil(t, info)
+		require.Equal(t, cInfo, *info)
+	})
 }
 
 func getProxyAddress(inbounds []option.Inbound) string {
@@ -106,7 +124,9 @@ func newTestBox(ctx context.Context, t *testing.T, configPath string, tracker *C
 	})
 	require.NoError(t, err)
 
-	instance.Router().AppendTracker(tracker)
+	if tracker != nil {
+		instance.Router().AppendTracker(tracker)
+	}
 	return options, instance
 }
 
