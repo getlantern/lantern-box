@@ -76,7 +76,6 @@ func TestIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		require.Nil(t, mTracker.info)
-		require.NotEqual(t, cInfo, mTracker.info)
 	})
 	t.Run("with ClientContext tracker", func(t *testing.T) {
 		clientTracker := NewClientContextTracker(cInfo, MatchBounds{[]string{"any"}, []string{"any"}}, logger)
