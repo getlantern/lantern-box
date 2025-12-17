@@ -17,8 +17,6 @@ import (
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-
-	isync "github.com/getlantern/lantern-box/internal/sync"
 )
 
 var _ (adapter.ConnectionTracker) = (*Manager)(nil)
@@ -38,9 +36,8 @@ func ClientInfoFromContext(ctx context.Context) (ClientInfo, bool) {
 
 // Manager is a ConnectionTracker that manages ClientInfo for connections.
 type Manager struct {
-	connections isync.TypedMap[io.Closer, *ClientInfo]
-	logger      log.ContextLogger
-	trackers    []adapter.ConnectionTracker
+	logger   log.ContextLogger
+	trackers []adapter.ConnectionTracker
 
 	inboundRule  *boundsRule
 	outboundRule *boundsRule
@@ -49,7 +46,6 @@ type Manager struct {
 // NewManager creates a new ClientContext Manager.
 func NewManager(bounds MatchBounds, logger log.ContextLogger) *Manager {
 	return &Manager{
-		connections:  isync.TypedMap[io.Closer, *ClientInfo]{},
 		trackers:     []adapter.ConnectionTracker{},
 		logger:       logger,
 		inboundRule:  newBoundsRule(bounds.Inbound),
@@ -60,10 +56,6 @@ func NewManager(bounds MatchBounds, logger log.ContextLogger) *Manager {
 // AppendTracker appends a ConnectionTracker to the Manager.
 func (m *Manager) AppendTracker(tracker adapter.ConnectionTracker) {
 	m.trackers = append(m.trackers, tracker)
-}
-
-func (m *Manager) deleteConnection(conn io.Closer) {
-	m.connections.Delete(conn)
 }
 
 func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
@@ -79,7 +71,6 @@ func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata 
 	if err != c.readErr {
 		m.logger.Error("failed to read client info ", "tag", "clientcontext-tracker", "error", err)
 	}
-	m.connections.Store(c, info)
 	if err != nil {
 		return c
 	}
@@ -106,7 +97,6 @@ func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn,
 	if err != c.readErr {
 		m.logger.Error("failed to read client info ", "tag", "clientcontext-tracker", "error", err)
 	}
-	m.connections.Store(c, info)
 	if err != nil {
 		return c
 	}
@@ -141,13 +131,6 @@ func (c *readConn) Read(b []byte) (n int, err error) {
 		return c.n, c.readErr
 	}
 	return c.reader.Read(b)
-}
-
-func (c *readConn) Close() error {
-	if !c.closed.Swap(true) {
-		c.mgr.deleteConnection(c)
-	}
-	return c.Conn.Close()
 }
 
 // readInfo reads and decodes client info, then sends an HTTP 200 OK response.
@@ -196,11 +179,6 @@ func (c *readPacketConn) ReadPacket(b *buf.Buffer) (destination metadata.Socksad
 		return c.destination, c.readErr
 	}
 	return c.PacketConn.ReadPacket(b)
-}
-
-func (c *readPacketConn) Close() error {
-	c.mgr.deleteConnection(c)
-	return c.PacketConn.Close()
 }
 
 // readInfo reads and decodes client info if the first packet is a CLIENTINFO packet, then sends an
