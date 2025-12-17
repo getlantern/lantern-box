@@ -35,6 +35,8 @@ package clientcontext
 
 const packetPrefix = "CLIENTINFO "
 
+type GetClientInfoFn func() ClientInfo
+
 // ClientInfo holds information about the client user/device.
 type ClientInfo struct {
 	DeviceID    string

@@ -25,16 +25,16 @@ type ClientContextInjector struct {
 	inboundRule  *boundsRule
 	outboundRule *boundsRule
 	logger       log.ContextLogger
-	info         ClientInfo
+	getInfo      GetClientInfoFn
 }
 
 // NewClientContextInjector creates a tracker for injecting client info.
-func NewClientContextInjector(info ClientInfo, bounds MatchBounds, logger log.ContextLogger) *ClientContextInjector {
+func NewClientContextInjector(fn GetClientInfoFn, bounds MatchBounds, logger log.ContextLogger) *ClientContextInjector {
 	return &ClientContextInjector{
 		inboundRule:  newBoundsRule(bounds.Inbound),
 		outboundRule: newBoundsRule(bounds.Outbound),
 		logger:       logger,
-		info:         info,
+		getInfo:      fn,
 	}
 }
 
@@ -49,7 +49,8 @@ func (t *ClientContextInjector) RoutedConnection(
 	if !t.inboundRule.match(metadata.Inbound) || !t.outboundRule.match(matchOutbound.Tag()) {
 		return conn
 	}
-	return newWriteConn(conn, &t.info)
+	info := t.getInfo()
+	return newWriteConn(conn, &info)
 }
 
 // RoutedPacketConnection wraps the packet connection for writing client info.
@@ -63,7 +64,8 @@ func (t *ClientContextInjector) RoutedPacketConnection(
 	if !t.inboundRule.match(metadata.Inbound) || !t.outboundRule.match(matchOutbound.Tag()) {
 		return conn
 	}
-	return newWritePacketConn(conn, metadata, &t.info)
+	info := t.getInfo()
+	return newWritePacketConn(conn, metadata, &info)
 }
 
 func (t *ClientContextInjector) UpdateBounds(bounds MatchBounds) {
