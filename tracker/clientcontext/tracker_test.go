@@ -67,7 +67,7 @@ func TestIntegration(t *testing.T) {
 	infoFn := func() ClientInfo { return cInfo }
 	t.Run("with ClientContext tracker", func(t *testing.T) {
 		mTracker.info = nil
-		tracker := NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"any"}}, logger)
+		tracker := NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"any"}})
 		runTrackerTest(ctx, t, clientOpts, tracker, httpClient, addr)
 		require.Equal(t, &cInfo, mTracker.info)
 	})

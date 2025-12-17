@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
@@ -40,6 +41,7 @@ type Manager struct {
 
 	inboundRule  *boundsRule
 	outboundRule *boundsRule
+	ruleMu       sync.RWMutex
 }
 
 // NewManager creates a new ClientContext Manager.
@@ -58,7 +60,7 @@ func (m *Manager) AppendTracker(tracker adapter.ConnectionTracker) {
 }
 
 func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
-	if !m.inboundRule.match(metadata.Inbound) || !m.outboundRule.match(matchOutbound.Tag()) {
+	if !m.match(metadata.Inbound, matchOutbound.Tag()) {
 		return conn
 	}
 	c := &readConn{
@@ -85,7 +87,7 @@ func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata 
 }
 
 func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
-	if !m.inboundRule.match(metadata.Inbound) || !m.outboundRule.match(matchOutbound.Tag()) {
+	if !m.match(metadata.Inbound, matchOutbound.Tag()) {
 		return conn
 	}
 	c := &readPacketConn{
@@ -110,9 +112,17 @@ func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn,
 	return conn
 }
 
+func (m *Manager) match(inbound, outbound string) bool {
+	m.ruleMu.RLock()
+	defer m.ruleMu.RUnlock()
+	return m.inboundRule.match(inbound) && m.outboundRule.match(outbound)
+}
+
 func (m *Manager) UpdateBounds(bounds MatchBounds) {
+	m.ruleMu.Lock()
 	m.inboundRule = newBoundsRule(bounds.Inbound)
 	m.outboundRule = newBoundsRule(bounds.Outbound)
+	m.ruleMu.Unlock()
 }
 
 // readConn reads client info from the connection on creation.

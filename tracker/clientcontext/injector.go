@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/log"
 	N "github.com/sagernet/sing/common/network"
 )
 
@@ -20,20 +20,19 @@ var (
 	_ (N.PacketConnHandshakeSuccess) = (*writePacketConn)(nil)
 )
 
-// ClientContextInjector is a connection tracker that sends client info to a ClientContextManager.
+// ClientContextInjector is a connection tracker that sends client info to a ClientContext Manager.
 type ClientContextInjector struct {
+	getInfo      GetClientInfoFn
 	inboundRule  *boundsRule
 	outboundRule *boundsRule
-	logger       log.ContextLogger
-	getInfo      GetClientInfoFn
+	ruleMu       sync.RWMutex
 }
 
 // NewClientContextInjector creates a tracker for injecting client info.
-func NewClientContextInjector(fn GetClientInfoFn, bounds MatchBounds, logger log.ContextLogger) *ClientContextInjector {
+func NewClientContextInjector(fn GetClientInfoFn, bounds MatchBounds) *ClientContextInjector {
 	return &ClientContextInjector{
 		inboundRule:  newBoundsRule(bounds.Inbound),
 		outboundRule: newBoundsRule(bounds.Outbound),
-		logger:       logger,
 		getInfo:      fn,
 	}
 }
@@ -46,7 +45,7 @@ func (t *ClientContextInjector) RoutedConnection(
 	matchedRule adapter.Rule,
 	matchOutbound adapter.Outbound,
 ) net.Conn {
-	if !t.inboundRule.match(metadata.Inbound) || !t.outboundRule.match(matchOutbound.Tag()) {
+	if !t.match(metadata.Inbound, matchOutbound.Tag()) {
 		return conn
 	}
 	info := t.getInfo()
@@ -61,16 +60,24 @@ func (t *ClientContextInjector) RoutedPacketConnection(
 	matchedRule adapter.Rule,
 	matchOutbound adapter.Outbound,
 ) N.PacketConn {
-	if !t.inboundRule.match(metadata.Inbound) || !t.outboundRule.match(matchOutbound.Tag()) {
+	if !t.match(metadata.Inbound, matchOutbound.Tag()) {
 		return conn
 	}
 	info := t.getInfo()
 	return newWritePacketConn(conn, metadata, &info)
 }
 
+func (t *ClientContextInjector) match(inbound, outbound string) bool {
+	t.ruleMu.RLock()
+	defer t.ruleMu.RUnlock()
+	return t.inboundRule.match(inbound) && t.outboundRule.match(outbound)
+}
+
 func (t *ClientContextInjector) UpdateBounds(bounds MatchBounds) {
+	t.ruleMu.Lock()
 	t.inboundRule = newBoundsRule(bounds.Inbound)
 	t.outboundRule = newBoundsRule(bounds.Outbound)
+	t.ruleMu.Unlock()
 }
 
 // writeConn sends client info after handshake.
