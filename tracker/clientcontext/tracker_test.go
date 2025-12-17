@@ -55,6 +55,8 @@ func TestIntegration(t *testing.T) {
 	}
 	addr := httpServer.URL
 
+	mTracker := &mockTracker{}
+	mgr.AppendTracker(mTracker)
 	cInfo := ClientInfo{
 		DeviceID:    "lantern-box",
 		Platform:    "linux",
@@ -63,17 +65,13 @@ func TestIntegration(t *testing.T) {
 		Version:     "9.0",
 	}
 	t.Run("with ClientContext tracker", func(t *testing.T) {
-		mTracker := &mockTracker{}
-		mgr.AppendTracker(mTracker)
-
+		mTracker.info = nil
 		tracker := NewClientContextInjector(cInfo, MatchBounds{[]string{"any"}, []string{"any"}}, logger)
 		runTrackerTest(ctx, t, clientOpts, tracker, httpClient, addr)
 		require.Equal(t, &cInfo, mTracker.info)
 	})
 	t.Run("without ClientContext tracker", func(t *testing.T) {
-		mTracker := &mockTracker{}
-		mgr.AppendTracker(mTracker)
-
+		mTracker.info = nil
 		runTrackerTest(ctx, t, clientOpts, nil, httpClient, addr)
 		require.Nil(t, mTracker.info)
 	})
