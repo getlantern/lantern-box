@@ -11,6 +11,7 @@ import (
 
 	"github.com/getlantern/lantern-box/protocol/amnezia"
 	"github.com/getlantern/lantern-box/protocol/group"
+	"github.com/getlantern/lantern-box/protocol/unbounded"
 	"github.com/getlantern/lantern-box/protocol/water"
 
 	"github.com/getlantern/lantern-box/protocol/algeneva"
@@ -72,6 +73,7 @@ func registerOutbounds(registry *outbound.Registry) {
 	algeneva.RegisterOutbound(registry)
 	outline.RegisterOutbound(registry)
 	water.RegisterOutbound(registry)
+	unbounded.RegisterOutbound(registry)
 
 	// utility outbounds
 	group.RegisterFallback(registry)
