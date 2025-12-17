@@ -49,7 +49,7 @@ func (t *ClientContextInjector) RoutedConnection(
 	if !t.inboundRule.match(metadata.Inbound) || !t.outboundRule.match(matchOutbound.Tag()) {
 		return conn
 	}
-	return newWriteConn(ctx, conn, &t.info, t.logger)
+	return newWriteConn(conn, &t.info)
 }
 
 // RoutedPacketConnection wraps the packet connection for writing client info.
@@ -63,7 +63,7 @@ func (t *ClientContextInjector) RoutedPacketConnection(
 	if !t.inboundRule.match(metadata.Inbound) || !t.outboundRule.match(matchOutbound.Tag()) {
 		return conn
 	}
-	return newWritePacketConn(ctx, conn, metadata, &t.info, t.logger)
+	return newWritePacketConn(conn, metadata, &t.info)
 }
 
 func (t *ClientContextInjector) UpdateBounds(bounds MatchBounds) {
@@ -74,13 +74,11 @@ func (t *ClientContextInjector) UpdateBounds(bounds MatchBounds) {
 // writeConn sends client info after handshake.
 type writeConn struct {
 	net.Conn
-	ctx    context.Context
-	info   *ClientInfo
-	logger log.ContextLogger
+	info *ClientInfo
 }
 
-func newWriteConn(ctx context.Context, conn net.Conn, info *ClientInfo, logger log.ContextLogger) net.Conn {
-	return &writeConn{Conn: conn, ctx: ctx, info: info, logger: logger}
+func newWriteConn(conn net.Conn, info *ClientInfo) net.Conn {
+	return &writeConn{Conn: conn, info: info}
 }
 
 // ConnHandshakeSuccess sends client info upon successful handshake with the server.
@@ -124,25 +122,19 @@ func (c *writeConn) sendInfo(conn net.Conn) error {
 
 type writePacketConn struct {
 	N.PacketConn
-	ctx      context.Context
 	metadata adapter.InboundContext
 	info     *ClientInfo
-	logger   log.ContextLogger
 }
 
 func newWritePacketConn(
-	ctx context.Context,
 	conn N.PacketConn,
 	metadata adapter.InboundContext,
 	info *ClientInfo,
-	logger log.ContextLogger,
 ) N.PacketConn {
 	return &writePacketConn{
 		PacketConn: conn,
-		ctx:        ctx,
 		metadata:   metadata,
 		info:       info,
-		logger:     logger,
 	}
 }
 

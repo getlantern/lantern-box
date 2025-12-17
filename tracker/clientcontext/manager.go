@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
@@ -123,7 +122,6 @@ type readConn struct {
 	reader  io.Reader
 	n       int
 	readErr error
-	closed  atomic.Bool
 }
 
 func (c *readConn) Read(b []byte) (n int, err error) {
@@ -169,7 +167,6 @@ func (c *readConn) readInfo() (*ClientInfo, error) {
 type readPacketConn struct {
 	N.PacketConn
 	mgr         *Manager
-	reader      io.Reader
 	destination metadata.Socksaddr
 	readErr     error
 }
