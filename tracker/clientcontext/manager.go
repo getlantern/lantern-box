@@ -1,14 +1,12 @@
 package clientcontext
 
 import (
-	stdbufio "bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -150,26 +148,19 @@ func (c *readConn) readInfo() (*ClientInfo, error) {
 		c.n = n
 		return nil, err
 	}
-	reader := io.MultiReader(bytes.NewReader(buf[:n]), c.Conn)
-	if !bytes.HasPrefix(buf[:n], []byte("POST /clientinfo")) {
-		c.reader = reader
+	if !bytes.HasPrefix(buf[:n], []byte(packetPrefix)) {
+		c.reader = io.MultiReader(bytes.NewReader(buf[:n]), c.Conn)
 		return nil, nil
 	}
 
-	req, err := http.ReadRequest(stdbufio.NewReader(reader))
-	if err != nil {
-		return nil, fmt.Errorf("reading HTTP request: %w", err)
-	}
-	defer req.Body.Close()
-
 	var info ClientInfo
-	if err := json.NewDecoder(req.Body).Decode(&info); err != nil {
+	reader := io.MultiReader(bytes.NewReader(buf[len(packetPrefix):n]), c.Conn)
+	if err := json.NewDecoder(reader).Decode(&info); err != nil {
 		return nil, fmt.Errorf("decoding client info: %w", err)
 	}
 
-	resp := "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
-	if _, err := c.Write([]byte(resp)); err != nil {
-		return nil, fmt.Errorf("writing HTTP response: %w", err)
+	if _, err := c.Write([]byte("OK")); err != nil {
+		return nil, fmt.Errorf("writing OK response: %w", err)
 	}
 	return &info, nil
 }

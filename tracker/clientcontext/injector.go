@@ -1,13 +1,10 @@
 package clientcontext
 
 import (
-	stdbufio "bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -104,27 +101,18 @@ func (c *writeConn) sendInfo(conn net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("marshaling client info: %w", err)
 	}
-	// Write HTTP POST request
-	req := bytes.NewBuffer(nil)
-	fmt.Fprintf(req, "POST /clientinfo HTTP/1.1\r\n")
-	fmt.Fprintf(req, "Host: localhost\r\n")
-	fmt.Fprintf(req, "Content-Type: application/json\r\n")
-	fmt.Fprintf(req, "Content-Length: %d\r\n", len(buf))
-	fmt.Fprintf(req, "\r\n")
-	req.Write(buf)
-	if _, err = conn.Write(req.Bytes()); err != nil {
+	packet := append([]byte(packetPrefix), buf...)
+	if _, err = conn.Write(packet); err != nil {
 		return fmt.Errorf("writing client info: %w", err)
 	}
 
-	// wait for HTTP 200 OK response
-	reader := stdbufio.NewReader(conn)
-	resp, err := http.ReadResponse(reader, nil)
-	if err != nil {
-		return fmt.Errorf("reading HTTP response: %w", err)
+	// wait for `OK` response
+	var resp [2]byte
+	if _, err := conn.Read(resp[:]); err != nil {
+		return fmt.Errorf("reading response: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("invalid server response: %s", resp.Status)
+	if string(resp[:]) != "OK" {
+		return fmt.Errorf("invalid response: %s", resp)
 	}
 	return nil
 }
@@ -162,17 +150,16 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 		return fmt.Errorf("marshaling client info: %w", err)
 	}
 	packet := append([]byte(packetPrefix), buf...)
-	_, err = conn.WriteTo(packet, c.metadata.Destination)
-	if err != nil {
+	if _, err = conn.WriteTo(packet, c.metadata.Destination); err != nil {
 		return fmt.Errorf("writing packet: %w", err)
 	}
 
 	// wait for `OK` response
-	resp := make([]byte, 2)
-	if _, _, err := conn.ReadFrom(resp); err != nil {
+	var resp [2]byte
+	if _, _, err := conn.ReadFrom(resp[:]); err != nil {
 		return fmt.Errorf("reading response: %w", err)
 	}
-	if string(resp) != "OK" {
+	if string(resp[:]) != "OK" {
 		return fmt.Errorf("invalid response: %s", resp)
 	}
 	return nil
