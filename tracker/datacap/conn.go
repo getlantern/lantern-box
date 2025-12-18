@@ -7,8 +7,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/sagernet/sing-box/log"
+
+	"github.com/getlantern/lantern-box/tracker/clientcontext"
 )
 
 // Throttle speed constants for datacap enforcement
@@ -33,7 +34,7 @@ type Conn struct {
 	client *Client
 	logger log.ContextLogger
 
-	clientInfo *clientcontext.ClientInfo
+	clientInfo clientcontext.ClientInfo
 
 	// Atomic counters for thread-safe tracking
 	bytesSent     atomic.Int64
@@ -54,7 +55,7 @@ type ConnConfig struct {
 	Conn             net.Conn
 	Client           *Client
 	Logger           log.ContextLogger
-	ClientInfo       *clientcontext.ClientInfo
+	ClientInfo       clientcontext.ClientInfo
 	ReportInterval   time.Duration
 	EnableThrottling bool
 	ThrottleSpeed    int64

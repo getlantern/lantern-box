@@ -11,8 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/sagernet/sing-box/log"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/getlantern/lantern-box/tracker/clientcontext"
 )
 
 // mockConn implements net.Conn for testing
@@ -123,7 +126,7 @@ func TestDataCapEndToEndNoThrottling(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID:    "test-device",
 			CountryCode: "US",
 			Platform:    "android",
@@ -143,55 +146,38 @@ func TestDataCapEndToEndNoThrottling(t *testing.T) {
 		if err == io.EOF {
 			break
 		}
-		if err != nil {
-			t.Fatalf("unexpected error reading: %v", err)
-		}
+		require.NoError(t, err)
 	}
 
 	// Verify we read all data
-	if totalRead != len(testData) {
-		t.Errorf("expected to read %d bytes, got %d", len(testData), totalRead)
-	}
+	assert.Equal(t, len(testData), totalRead, "should read all test data")
 
 	// Write data to connection
 	writeData := make([]byte, 1024*50) // 50 KB
 	n, err := conn.Write(writeData)
-	if err != nil {
-		t.Fatalf("unexpected error writing: %v", err)
-	}
-	if n != len(writeData) {
-		t.Errorf("expected to write %d bytes, wrote %d", len(writeData), n)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, len(writeData), n, "should write all data")
 
 	// Wait for at least one periodic report
 	time.Sleep(200 * time.Millisecond)
 
 	// Close connection (triggers final report)
-	if err := conn.Close(); err != nil {
-		t.Fatalf("error closing connection: %v", err)
-	}
+	require.NoError(t, conn.Close())
 
 	// Wait a bit for final report to complete
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify reports were sent
-	reports := reportCount.Load()
-	if reports < 1 {
-		t.Errorf("expected at least 1 report, got %d", reports)
-	}
+	assert.GreaterOrEqual(t, reportCount.Load(), int32(1), "should have sent at least one report")
 
 	// Verify last report included all bytes
 	expectedBytes := int64(totalRead + len(writeData))
 	reportedBytes := lastBytesUsed.Load()
-	if reportedBytes != expectedBytes {
-		t.Errorf("expected %d bytes reported, got %d", expectedBytes, reportedBytes)
-	}
+	assert.Equal(t, expectedBytes, reportedBytes, "last report should include all bytes used")
 
 	// Verify bytes consumed tracking
 	consumed := conn.GetBytesConsumed()
-	if consumed != expectedBytes {
-		t.Errorf("expected %d bytes consumed, got %d", expectedBytes, consumed)
-	}
+	assert.Equal(t, expectedBytes, consumed, "GetBytesConsumed should match total bytes used")
 }
 
 // TestDataCapEndToEndWithThrottling tests datacap workflow with throttling enabled
@@ -221,7 +207,7 @@ func TestDataCapEndToEndWithThrottling(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID:    "test-device",
 			CountryCode: "US",
 			Platform:    "android",
@@ -243,9 +229,7 @@ func TestDataCapEndToEndWithThrottling(t *testing.T) {
 		if err == io.EOF {
 			break
 		}
-		if err != nil {
-			t.Fatalf("unexpected error reading: %v", err)
-		}
+		require.NoError(t, err)
 	}
 	duration := time.Since(startTime)
 
@@ -259,17 +243,13 @@ func TestDataCapEndToEndWithThrottling(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Verify at least one report was sent (which includes throttle status in response)
-	if reportCount.Load() < 1 {
-		t.Error("expected at least one report to be sent")
-	}
+	assert.GreaterOrEqual(t, reportCount.Load(), int32(1), "should have sent at least one report")
 
 	// Close connection
 	conn.Close()
 
 	// Verify reports were sent
-	if reportCount.Load() < 1 {
-		t.Error("expected at least 1 report")
-	}
+	assert.GreaterOrEqual(t, reportCount.Load(), int32(1), "should have sent at least one report")
 }
 
 // TestDataCapThrottleSpeedAdjustment tests dynamic throttle speed adjustment
@@ -313,7 +293,7 @@ func TestDataCapThrottleSpeedAdjustment(t *testing.T) {
 			config := ConnConfig{
 				Conn:   mockConn,
 				Client: nil, // No client needed for this test
-				ClientInfo: &clientcontext.ClientInfo{
+				ClientInfo: clientcontext.ClientInfo{
 					DeviceID: "test-device",
 				},
 				Logger:           noopLogger,
@@ -332,9 +312,7 @@ func TestDataCapThrottleSpeedAdjustment(t *testing.T) {
 			conn.updateThrottleState(status)
 
 			// Verify throttler is enabled
-			if !conn.throttler.IsEnabled() {
-				t.Error("expected throttler to be enabled")
-			}
+			assert.True(t, conn.throttler.IsEnabled(), "throttling should be enabled")
 
 			// Verify appropriate speed was set (we can't easily check exact speed,
 			// but we can verify the throttler is active)
@@ -373,7 +351,7 @@ func TestDataCapPeriodicReporting(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID:    "test-device",
 			CountryCode: "US",
 			Platform:    "android",
@@ -399,9 +377,7 @@ func TestDataCapPeriodicReporting(t *testing.T) {
 	count := len(reportTimes)
 	mu.Unlock()
 
-	if count < 2 {
-		t.Errorf("expected at least 2 reports, got %d", count)
-	}
+	assert.GreaterOrEqual(t, count, 2, "should have sent at least 2 reports")
 
 	// Verify reports were spaced approximately by the interval
 	if count >= 2 {
@@ -447,7 +423,7 @@ func TestDataCapFinalReportOnClose(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID:    "test-device-final",
 			CountryCode: "US",
 			Platform:    "ios",
@@ -476,21 +452,11 @@ func TestDataCapFinalReportOnClose(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if finalReport == nil {
-		t.Fatal("expected final report to be sent")
-	}
+	require.NotNil(t, finalReport, "final report should not be nil")
 
-	if finalReport.DeviceID != "test-device-final" {
-		t.Errorf("expected deviceId 'test-device-final', got '%s'", finalReport.DeviceID)
-	}
-
-	if finalReport.Platform != "ios" {
-		t.Errorf("expected platform 'ios', got '%s'", finalReport.Platform)
-	}
-
-	if finalReport.BytesUsed != int64(totalRead) {
-		t.Errorf("expected %d bytes in final report, got %d", totalRead, finalReport.BytesUsed)
-	}
+	assert.Equal(t, "test-device-final", finalReport.DeviceID, "device ID should match")
+	assert.Equal(t, "ios", finalReport.Platform, "platform should match")
+	assert.Equal(t, int64(totalRead), finalReport.BytesUsed, "bytes used should match total read")
 }
 
 // TestDataCapSidecarUnreachable tests behavior when sidecar is unreachable
@@ -504,7 +470,7 @@ func TestDataCapSidecarUnreachable(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
 		Logger:         noopLogger,
@@ -515,25 +481,18 @@ func TestDataCapSidecarUnreachable(t *testing.T) {
 	// Should still work even if sidecar is down
 	buffer := make([]byte, 512)
 	n, err := conn.Read(buffer)
-	if err != nil && err != io.EOF {
-		t.Fatalf("read should work even if sidecar is down: %v", err)
+	if err == io.EOF {
+		err = nil
 	}
-	if n == 0 {
-		t.Error("expected to read data")
-	}
+	require.NoError(t, err, "read should work even if sidecar is down")
+	require.NotEqual(t, 0, n, "expected to read some data")
 
 	// Wait for report attempt (will fail silently)
 	time.Sleep(100 * time.Millisecond)
 
 	// Connection should still close properly
-	if err := conn.Close(); err != nil {
-		t.Errorf("close should succeed even if sidecar is down: %v", err)
-	}
-
-	// Verify bytes were still tracked locally
-	if conn.GetBytesConsumed() != int64(n) {
-		t.Error("bytes should be tracked even if sidecar is down")
-	}
+	assert.NoError(t, conn.Close(), "close should succeed even if sidecar is down")
+	assert.Equal(t, int64(n), conn.GetBytesConsumed(), "bytes should be tracked even if sidecar is down")
 }
 
 // TestDataCapSidecarReturnsError tests behavior when sidecar returns HTTP errors
@@ -556,7 +515,7 @@ func TestDataCapSidecarReturnsError(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
 		Logger:         noopLogger,
@@ -574,9 +533,7 @@ func TestDataCapSidecarReturnsError(t *testing.T) {
 	conn.Close()
 
 	// Errors should be logged but not crash
-	if errorCount < 1 {
-		t.Error("expected at least one error response from sidecar")
-	}
+	assert.GreaterOrEqual(t, errorCount, 1, "should have received at least one error from sidecar")
 }
 
 // TestDataCapNilClient tests behavior when client is nil (datacap disabled)
@@ -587,7 +544,7 @@ func TestDataCapNilClient(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: nil, // Datacap disabled
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
 		Logger:         noopLogger,
@@ -598,19 +555,14 @@ func TestDataCapNilClient(t *testing.T) {
 	// Should still work normally
 	buffer := make([]byte, 512)
 	n, err := conn.Read(buffer)
-	if err != nil && err != io.EOF {
-		t.Fatalf("read should work with nil client: %v", err)
+	if err == io.EOF {
+		err = nil
 	}
+	require.NoError(t, err, "read should succeed with nil client")
 
 	// Bytes should still be tracked
-	if conn.GetBytesConsumed() != int64(n) {
-		t.Error("bytes should be tracked even with nil client")
-	}
-
-	// Should close without errors
-	if err := conn.Close(); err != nil {
-		t.Errorf("close should succeed with nil client: %v", err)
-	}
+	assert.Equal(t, int64(n), conn.GetBytesConsumed(), "bytes should be tracked even with nil client")
+	assert.NoError(t, conn.Close(), "close should succeed with nil client")
 }
 
 // TestDataCapZeroBytes tests that zero-byte reports are not sent
@@ -635,7 +587,7 @@ func TestDataCapZeroBytes(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
 		Logger:         noopLogger,
@@ -650,9 +602,7 @@ func TestDataCapZeroBytes(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Should not send reports for zero bytes
-	if reportCount > 0 {
-		t.Errorf("expected 0 reports for zero bytes, got %d", reportCount)
-	}
+	assert.Equal(t, 0, reportCount, "should not send reports for zero bytes")
 }
 
 // TestDataCapConcurrentReadWrite tests concurrent reads and writes
@@ -672,7 +622,7 @@ func TestDataCapConcurrentReadWrite(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
 		Logger:         noopLogger,
@@ -726,9 +676,7 @@ func TestDataCapConcurrentReadWrite(t *testing.T) {
 	// Verify atomic counters handled concurrent access correctly
 	expected := totalRead.Load() + totalWritten.Load()
 	actual := conn.GetBytesConsumed()
-	if actual != expected {
-		t.Errorf("expected %d total bytes, got %d", expected, actual)
-	}
+	assert.Equal(t, expected, actual, "GetBytesConsumed should match total read + written bytes")
 }
 
 // TestDataCapMultipleClose tests that closing multiple times is safe
@@ -748,7 +696,7 @@ func TestDataCapMultipleClose(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
 		Logger:         noopLogger,
@@ -761,22 +709,11 @@ func TestDataCapMultipleClose(t *testing.T) {
 	conn.Read(buffer)
 
 	// Close multiple times
-	err1 := conn.Close()
-	err2 := conn.Close()
-	err3 := conn.Close()
-
 	// First close should succeed
-	if err1 != nil {
-		t.Errorf("first close failed: %v", err1)
-	}
-
+	assert.NoError(t, conn.Close(), "first close should succeed")
 	// Subsequent closes should be no-op (return nil)
-	if err2 != nil {
-		t.Errorf("second close should be no-op: %v", err2)
-	}
-	if err3 != nil {
-		t.Errorf("third close should be no-op: %v", err3)
-	}
+	assert.NoError(t, conn.Close(), "second close should be no-op")
+	assert.NoError(t, conn.Close(), "third close should be no-op")
 }
 
 // TestDataCapThrottleDisableAfterEnable tests disabling throttle after it was enabled
@@ -787,7 +724,7 @@ func TestDataCapThrottleDisableAfterEnable(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: nil,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
 		Logger:           noopLogger,
@@ -804,9 +741,7 @@ func TestDataCapThrottleDisableAfterEnable(t *testing.T) {
 	}
 	conn.updateThrottleState(status1)
 
-	if !conn.throttler.IsEnabled() {
-		t.Error("throttler should be enabled")
-	}
+	assert.True(t, conn.throttler.IsEnabled(), "throttling should be enabled")
 
 	// Disable throttling
 	status2 := &DataCapStatus{
@@ -816,9 +751,7 @@ func TestDataCapThrottleDisableAfterEnable(t *testing.T) {
 	}
 	conn.updateThrottleState(status2)
 
-	if conn.throttler.IsEnabled() {
-		t.Error("throttler should be disabled")
-	}
+	assert.False(t, conn.throttler.IsEnabled(), "throttling should be disabled")
 }
 
 // TestDataCapEmptyDeviceID tests behavior with empty device ID
@@ -829,9 +762,7 @@ func TestDataCapEmptyDeviceID(t *testing.T) {
 			json.NewDecoder(r.Body).Decode(&report)
 
 			// Verify empty device ID is sent
-			if report.DeviceID != "" {
-				t.Errorf("expected empty deviceId, got '%s'", report.DeviceID)
-			}
+			assert.Empty(t, report.DeviceID, "deviceId should be empty")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -847,7 +778,7 @@ func TestDataCapEmptyDeviceID(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "", // Empty device ID
 		},
 		Logger:         noopLogger,
@@ -892,7 +823,7 @@ func TestDataCapLargeDataTransfer(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
 		Logger:         noopLogger,
@@ -919,13 +850,8 @@ func TestDataCapLargeDataTransfer(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if lastReport == nil {
-		t.Fatal("expected report to be sent")
-	}
-
-	if lastReport.BytesUsed != int64(totalRead) {
-		t.Errorf("expected %d bytes reported, got %d", totalRead, lastReport.BytesUsed)
-	}
+	require.NotNil(t, lastReport, "last report not sent")
+	assert.Equal(t, int64(totalRead), lastReport.BytesUsed, "bytes used should match total read")
 }
 
 // TestDataCapRapidOpenClose tests rapid connection open/close cycles
@@ -947,7 +873,7 @@ func TestDataCapRapidOpenClose(t *testing.T) {
 		config := ConnConfig{
 			Conn:   mockConn,
 			Client: client,
-			ClientInfo: &clientcontext.ClientInfo{
+			ClientInfo: clientcontext.ClientInfo{
 				DeviceID: "test-device",
 			},
 			Logger:         noopLogger,
@@ -1000,7 +926,7 @@ func TestDataCapStatusCheckAfterReport(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
 		Logger:           noopLogger,
@@ -1017,9 +943,7 @@ func TestDataCapStatusCheckAfterReport(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Throttle should now be enabled based on report response
-	if !conn.throttler.IsEnabled() {
-		t.Error("expected throttler to be enabled after report response")
-	}
+	assert.True(t, conn.throttler.IsEnabled(), "throttling should be enabled after report response")
 
 	conn.Close()
 }
@@ -1056,7 +980,7 @@ func TestDataCapDifferentPlatforms(t *testing.T) {
 			config := ConnConfig{
 				Conn:   mockConn,
 				Client: client,
-				ClientInfo: &clientcontext.ClientInfo{
+				ClientInfo: clientcontext.ClientInfo{
 					DeviceID: "test-device",
 					Platform: platform,
 				},
@@ -1071,9 +995,7 @@ func TestDataCapDifferentPlatforms(t *testing.T) {
 			conn.Close()
 
 			mu.Lock()
-			if receivedPlatform != platform {
-				t.Errorf("expected platform '%s', got '%s'", platform, receivedPlatform)
-			}
+			assert.Equal(t, platform, receivedPlatform, "platform should match")
 			mu.Unlock()
 		})
 	}
@@ -1111,7 +1033,7 @@ func TestDataCapCountryCodeVariations(t *testing.T) {
 			config := ConnConfig{
 				Conn:   mockConn,
 				Client: client,
-				ClientInfo: &clientcontext.ClientInfo{
+				ClientInfo: clientcontext.ClientInfo{
 					DeviceID:    "test-device",
 					CountryCode: code,
 				},
@@ -1126,9 +1048,7 @@ func TestDataCapCountryCodeVariations(t *testing.T) {
 			conn.Close()
 
 			mu.Lock()
-			if receivedCode != code {
-				t.Errorf("expected country code '%s', got '%s'", code, receivedCode)
-			}
+			assert.Equal(t, code, receivedCode, "country code should match")
 			mu.Unlock()
 		})
 	}
@@ -1151,7 +1071,7 @@ func TestDataCapReadWriteErrors(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
 		Logger:         noopLogger,
@@ -1166,19 +1086,13 @@ func TestDataCapReadWriteErrors(t *testing.T) {
 		if err == io.EOF {
 			break
 		}
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		require.NoError(t, err)
 	}
 
 	// Try to read after EOF
 	n, err := conn.Read(buffer)
-	if err != io.EOF {
-		t.Errorf("expected EOF, got %v", err)
-	}
-	if n != 0 {
-		t.Errorf("expected 0 bytes after EOF, got %d", n)
-	}
+	assert.ErrorIs(t, err, io.EOF, "expected EOF error on read after EOF")
+	assert.Equal(t, 0, n, "expected 0 bytes after EOF")
 
 	conn.Close()
 }
@@ -1202,7 +1116,7 @@ func TestDataCapContextCancellation(t *testing.T) {
 	config := ConnConfig{
 		Conn:   mockConn,
 		Client: client,
-		ClientInfo: &clientcontext.ClientInfo{
+		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
 		Logger:         noopLogger,

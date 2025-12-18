@@ -6,11 +6,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
+	"github.com/getlantern/lantern-box/tracker/clientcontext"
 )
 
 // PacketConn wraps a sing-box network.PacketConn and tracks data consumption for datacap reporting.
@@ -21,7 +22,7 @@ type PacketConn struct {
 	client *Client
 	logger log.ContextLogger
 
-	clientInfo *clientcontext.ClientInfo
+	clientInfo clientcontext.ClientInfo
 
 	// Atomic counters for thread-safe tracking
 	bytesSent     atomic.Int64
@@ -43,7 +44,7 @@ type PacketConnConfig struct {
 	Conn             N.PacketConn
 	Client           *Client
 	Logger           log.ContextLogger
-	ClientInfo       *clientcontext.ClientInfo
+	ClientInfo       clientcontext.ClientInfo
 	ReportInterval   time.Duration
 	EnableThrottling bool
 	ThrottleSpeed    int64

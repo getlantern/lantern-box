@@ -5,12 +5,12 @@ import (
 	"net"
 	"time"
 
-	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/service"
+
+	"github.com/getlantern/lantern-box/tracker/clientcontext"
 )
 
 var _ (adapter.ConnectionTracker) = (*DatacapTracker)(nil)
@@ -63,9 +63,9 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 }
 
 func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
-	info := service.PtrFromContext[clientcontext.ClientInfo](ctx)
-	if info == nil {
-		t.logger.Warn("ClientInfo not found in context")
+	info, ok := clientcontext.ClientInfoFromContext(ctx)
+	if !ok {
+		// conn is not from a clientcontext-aware client (e.g., not radiance)
 		return conn
 	}
 	if info.IsPro {
@@ -82,9 +82,9 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 	})
 }
 func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
-	info := service.PtrFromContext[clientcontext.ClientInfo](ctx)
-	if info == nil {
-		t.logger.Warn("ClientInfo not found in context")
+	info, ok := clientcontext.ClientInfoFromContext(ctx)
+	if !ok {
+		// conn is not from a clientcontext-aware client (e.g., not radiance)
 		return conn
 	}
 	if info.IsPro {

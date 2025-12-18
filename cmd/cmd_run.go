@@ -9,16 +9,19 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/getlantern/lantern-box/tracker/clientcontext"
-	"github.com/getlantern/lantern-box/tracker/datacap"
 	box "github.com/sagernet/sing-box"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/service"
 	"github.com/spf13/cobra"
 	"gopkg.in/ini.v1"
+
+	"github.com/getlantern/lantern-box/adapter"
+	"github.com/getlantern/lantern-box/tracker/clientcontext"
+	"github.com/getlantern/lantern-box/tracker/datacap"
 )
 
 func init() {
@@ -86,21 +89,25 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		return nil, nil, fmt.Errorf("create service: %w", err)
 	}
 
-	// Add tracker
 	if datacapURL != "" {
-		tracker := clientcontext.NewClientContextReader(clientcontext.MatchBounds{
+		// Add datacap tracker
+		clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
 			Inbound:  []string{""},
 			Outbound: []string{""},
 		}, log.NewNOPFactory().NewLogger("tracker"))
-		instance.Router().AppendTracker(tracker)
+		instance.Router().AppendTracker(clientCtxMgr)
+		service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
 
-		datacapTracker, err := datacap.NewDatacapTracker(datacap.Options{
-			URL: datacapURL,
-		}, log.NewNOPFactory().NewLogger("datacap-tracker"))
+		datacapTracker, err := datacap.NewDatacapTracker(
+			datacap.Options{
+				URL: datacapURL,
+			},
+			log.NewNOPFactory().NewLogger("datacap-tracker"),
+		)
 		if err != nil {
 			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
 		}
-		instance.Router().AppendTracker(datacapTracker)
+		clientCtxMgr.AppendTracker(datacapTracker)
 	} else {
 		log.Warn("Datacap URL not provided, datacap tracking disabled")
 	}
