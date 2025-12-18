@@ -187,6 +187,7 @@ func (c *readPacketConn) readInfo() (*ClientInfo, error) {
 
 	destination, err := c.ReadPacket(buffer)
 	if err != nil {
+		c.destination = destination
 		c.readErr = err
 		return nil, err
 	}
