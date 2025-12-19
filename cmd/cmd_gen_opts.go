@@ -30,6 +30,7 @@ type config struct {
 	Tag        string
 	ListenPort uint16
 	TLS        *tlsConfig
+	User       map[string]any
 }
 
 func genOpts(cfg config) (option.Options, error) {
@@ -37,12 +38,12 @@ func genOpts(cfg config) (option.Options, error) {
 	inRegistery := service.FromContext[adapter.InboundRegistry](ctx)
 	inbound, err := genInboundOpts(inRegistery, cfg)
 	if err != nil {
-		return option.Options{}, fmt.Errorf("generate inbound options: %w", err)
+		return option.Options{}, fmt.Errorf("inbound options: %w", err)
 	}
 	outRegistry := service.FromContext[adapter.OutboundRegistry](ctx)
 	outbound, err := genOutboundOpts(outRegistry, cfg)
 	if err != nil {
-		return option.Options{}, fmt.Errorf("generate outbound options: %w", err)
+		return option.Options{}, fmt.Errorf("outbound options: %w", err)
 	}
 
 	options := option.Options{
@@ -62,7 +63,7 @@ func genInboundOpts(registry adapter.InboundRegistry, cfg config) (option.Inboun
 	}
 	opts, ok := registry.CreateOptions(cfg.Type)
 	if !ok {
-		return inbound, fmt.Errorf("unknown inbound type: %s", cfg.Type)
+		return inbound, fmt.Errorf("unknown type: %s", cfg.Type)
 	}
 	options := reflect.ValueOf(opts).Elem()
 	addr := badoption.Addr(netip.IPv4Unspecified())
@@ -71,12 +72,20 @@ func genInboundOpts(registry adapter.InboundRegistry, cfg config) (option.Inboun
 		ListenPort: cfg.ListenPort,
 	}
 	if err := setField(options, "ListenOptions", listenOpts); err != nil {
-		return inbound, fmt.Errorf("set listen options: %w", err)
+		return inbound, fmt.Errorf("listen options: %w", err)
 	}
 	if cfg.TLS != nil {
 		tls := tlsInOpts(cfg.TLS.ServerName, cfg.TLS.CertPath, cfg.TLS.KeyPath, cfg.TLS.Insecure)
 		if err := setField(options, "TLS", tls); err != nil {
-			return inbound, fmt.Errorf("set tls options: %w", err)
+			if errors.Is(err, ErrNoSuchField) {
+				return inbound, fmt.Errorf("%w: %s", ErrTLSNotSupported, cfg.Type)
+			}
+			return inbound, fmt.Errorf("tls options: %w", err)
+		}
+	}
+	if len(cfg.User) > 0 {
+		if err := setInboundUserValues(options, cfg.User); err != nil {
+			return inbound, fmt.Errorf("user value: %w", err)
 		}
 	}
 	inbound.Options = opts
@@ -90,7 +99,7 @@ func genOutboundOpts(registry adapter.OutboundRegistry, cfg config) (option.Outb
 	}
 	opts, ok := registry.CreateOptions(cfg.Type)
 	if !ok {
-		return outbound, fmt.Errorf("unknown outbound type: %s", cfg.Type)
+		return outbound, fmt.Errorf("unknown type: %s", cfg.Type)
 	}
 	options := reflect.ValueOf(opts).Elem()
 	serverOpts := option.ServerOptions{
@@ -98,38 +107,26 @@ func genOutboundOpts(registry adapter.OutboundRegistry, cfg config) (option.Outb
 		ServerPort: 10000,
 	}
 	if err := setField(options, "ServerOptions", serverOpts); err != nil {
-		return outbound, fmt.Errorf("set server options: %w", err)
+		return outbound, fmt.Errorf("server options: %w", err)
 	}
 	if cfg.TLS != nil {
 		tls := tlsOutOpts(cfg.TLS.ServerName, cfg.TLS.CertPath, cfg.TLS.DisableSNI, cfg.TLS.Insecure)
 		if err := setField(options, "TLS", tls); err != nil {
-			return outbound, fmt.Errorf("set tls options: %w", err)
+			if errors.Is(err, ErrNoSuchField) {
+				return outbound, fmt.Errorf("%w: %s", ErrTLSNotSupported, cfg.Type)
+			}
+			return outbound, fmt.Errorf("tls options: %w", err)
+		}
+	}
+	if len(cfg.User) > 0 {
+		for fname, fvalue := range cfg.User {
+			if err := setField(options, fname, fvalue); err != nil && !errors.Is(err, ErrNoSuchField) {
+				return outbound, fmt.Errorf("user value %s: %w", fname, err)
+			}
 		}
 	}
 	outbound.Options = opts
 	return outbound, nil
-}
-
-var (
-	ErrNoSuchField  = errors.New("no such field")
-	ErrTypeMismatch = errors.New("type mismatch")
-)
-
-func setField(opts reflect.Value, field string, value any) error {
-	f := opts.FieldByName(field)
-	if !f.IsValid() {
-		return fmt.Errorf("%w: %s", ErrNoSuchField, field)
-	}
-	v := reflect.ValueOf(value)
-	if f.Type() != v.Type() {
-		return fmt.Errorf("%w: expected %s but got %s", ErrTypeMismatch, f.Type().String(), v.Type().String())
-	}
-	f.Set(v)
-	return nil
-}
-
-func hasField(opts reflect.Value, field string) bool {
-	return opts.FieldByName(field).IsValid()
 }
 
 func checkValid(ctx context.Context, options option.Options) error {
@@ -143,6 +140,44 @@ func checkValid(ctx context.Context, options option.Options) error {
 	}
 	cancel()
 	return err
+}
+
+var (
+	ErrTLSNotSupported = errors.New("tls not supported")
+	ErrNoSuchField     = errors.New("no such field")
+	ErrTypeMismatch    = errors.New("type mismatch")
+)
+
+func setField(opts reflect.Value, field string, value any) error {
+	f := opts.FieldByName(field)
+	if !f.IsValid() {
+		return fmt.Errorf("%w: %q", ErrNoSuchField, field)
+	}
+	v := reflect.ValueOf(value)
+	if f.Type() != v.Type() {
+		return fmt.Errorf("%w: expected %q but got %q", ErrTypeMismatch, f.Type().String(), v.Type().String())
+	}
+	f.Set(v)
+	return nil
+}
+
+func hasField(opts reflect.Value, field string) bool {
+	return opts.FieldByName(field).IsValid()
+}
+
+func setInboundUserValues(opts reflect.Value, values map[string]any) error {
+	userField := opts.FieldByName("Users")
+	if !userField.IsValid() {
+		return fmt.Errorf("%w: \"Users\"", ErrNoSuchField)
+	}
+	user := reflect.New(userField.Type().Elem()).Elem()
+	for fname, fvalue := range values {
+		if err := setField(user, fname, fvalue); err != nil {
+			return err
+		}
+	}
+	userField.Set(reflect.Append(userField, user))
+	return nil
 }
 
 func tlsInOpts(serverName, certPath, keyPath string, insecure bool) *option.InboundTLSOptions {
