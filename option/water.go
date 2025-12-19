@@ -28,11 +28,9 @@ type WATEROutboundOptions struct {
 	// DownloadTimeout specifies how much time the downloader should wait
 	// until it cancel and try to fetch from another URL
 	DownloadTimeout string `json:"download_timeout"`
-	// WASMStorageDir specifies which directory should store the WASM files
-	WASMStorageDir string `json:"water_dir"`
-	// WazeroCompilationCacheDir specifies which directory should be used for storing
-	// Wazero cache
-	WazeroCompilationCacheDir string `json:"wazero_compilation_cache_dir"`
+	// Dir specifies which directory we should use for storing WATER related
+	// files
+	Dir string `json:"water_dir"`
 	// Config is a optional config that will be sent to the WASM file.
 	Config map[string]any `json:"config,omitempty"`
 	// SkipHandshake is used when the WATER module deals with the handshake
