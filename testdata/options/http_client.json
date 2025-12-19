@@ -1,0 +1,32 @@
+{
+	"log": {
+		"disabled": true,
+		"level": "trace",
+		"output": "stdout",
+		"timestamp": true
+	},
+	"inbounds": [
+		{
+			"type": "http",
+			"tag": "http-client",
+			"listen": "127.0.0.1",
+			"listen_port": 9080
+		}
+	],
+	"outbounds": [
+		{
+			"type": "http",
+			"tag": "http-out",
+			"server": "localhost",
+			"server_port": 8080
+		}
+	],
+	"route": {
+		"rules": [
+			{
+				"inbound": "http-client",
+				"outbound": "http-out"
+			}
+		]
+	}
+}

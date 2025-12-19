@@ -8,15 +8,16 @@ import (
 	"path/filepath"
 	"testing"
 
-	box "github.com/sagernet/sing-box"
+	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	box "github.com/getlantern/lantern-box"
 )
 
 func TestMutableRuleSet(t *testing.T) {
@@ -106,16 +107,16 @@ func TestMutableRuleSet(t *testing.T) {
 	}
 }
 
-func setup(t *testing.T, rsTag, domain string) (context.Context, *box.Box, string) {
+func setup(t *testing.T, rsTag, domain string) (context.Context, *sbox.Box, string) {
 	path, err := os.MkdirTemp("", "test")
 	require.NoError(t, err)
 	rsFile := filepath.Join(path, rsTag+".json")
 	err = os.WriteFile(rsFile, []byte(`{"version":3,"rules":[{"domain":"`+domain+`"}]}`), 0644)
 	require.NoError(t, err, "failed to create rule file")
 
-	ctx := box.Context(context.Background(), include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry())
+	ctx := box.BaseContext()
 
-	instance, err := box.New(box.Options{
+	instance, err := sbox.New(sbox.Options{
 		Context: ctx,
 		Options: testOptions(rsTag, rsFile),
 	})
@@ -134,7 +135,7 @@ func testStart(t *testing.T, ctx context.Context, mRuleSet *MutableRuleSet, rsTa
 
 func testMatch(
 	t *testing.T,
-	instance *box.Box,
+	instance *sbox.Box,
 	mrs *MutableRuleSet,
 	alter func(*MutableRuleSet, chan struct{}) *adapter.InboundContext,
 	reloaded chan struct{},

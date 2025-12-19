@@ -2,30 +2,19 @@ package amnezia
 
 import (
 	"context"
-	"net"
-	"net/netip"
-	"time"
+	"fmt"
+	"reflect"
+	"unsafe"
 
-	O "github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/transport/wireguard"
+	"github.com/sagernet/sing-box/protocol/wireguard"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
-	"github.com/sagernet/sing-box/common/dialer"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
-	dns "github.com/sagernet/sing-dns"
-	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/bufio"
-	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/logger"
-	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
+	F "github.com/sagernet/sing/common/format"
 
 	"github.com/getlantern/lantern-box/constant"
-	"github.com/getlantern/lantern-box/metrics"
 	"github.com/getlantern/lantern-box/option"
-	"github.com/getlantern/lantern-box/transport/amnezia"
 )
 
 func RegisterEndpoint(registry *endpoint.Registry) {
@@ -33,191 +22,67 @@ func RegisterEndpoint(registry *endpoint.Registry) {
 }
 
 var (
-	_ adapter.Endpoint                = (*Endpoint)(nil)
-	_ adapter.InterfaceUpdateListener = (*Endpoint)(nil)
+	_ adapter.Endpoint = (*Endpoint)(nil)
 )
 
 type Endpoint struct {
-	endpoint.Adapter
-	ctx            context.Context
-	router         adapter.Router
-	logger         logger.ContextLogger
-	localAddresses []netip.Prefix
-	endpoint       *amnezia.Endpoint
+	*wireguard.Endpoint
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AmneziaEndpointOptions) (adapter.Endpoint, error) {
-	ep := &Endpoint{
-		Adapter:        endpoint.NewAdapterWithDialerOptions(constant.TypeAmnezia, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
-		ctx:            ctx,
-		router:         router,
-		logger:         logger,
-		localAddresses: options.Address,
-	}
-	if options.Detour == "" {
-		options.IsWireGuardListener = true
-	}
-	outboundDialer, err := dialer.New(ctx, options.DialerOptions)
+	ep, err := wireguard.NewEndpoint(ctx, router, logger, tag, options.WireGuardEndpointOptions)
 	if err != nil {
 		return nil, err
 	}
-	var udpTimeout time.Duration
-	if options.UDPTimeout != 0 {
-		udpTimeout = time.Duration(options.UDPTimeout)
-	} else {
-		udpTimeout = C.UDPTimeout
-	}
-	wgEndpoint, err := amnezia.NewEndpoint(amnezia.EndpointOptions{
-		EndpointOptions: wireguard.EndpointOptions{
-			Context:    ctx,
-			Logger:     logger,
-			System:     options.System,
-			Handler:    ep,
-			UDPTimeout: udpTimeout,
-			Dialer:     outboundDialer,
-			CreateDialer: func(interfaceName string) N.Dialer {
-				return common.Must1(dialer.NewDefault(ctx, O.DialerOptions{
-					BindInterface: interfaceName,
-				}))
-			},
-			Name:       options.Name,
-			MTU:        options.MTU,
-			Address:    options.Address,
-			PrivateKey: options.PrivateKey,
-			ListenPort: options.ListenPort,
-			ResolvePeer: func(domain string) (netip.Addr, error) {
-				endpointAddresses, lookupErr := router.Lookup(ctx, domain, dns.DomainStrategy(options.DomainStrategy))
-				if lookupErr != nil {
-					return netip.Addr{}, lookupErr
-				}
-				return endpointAddresses[0], nil
-			},
-			Peers: common.Map(options.Peers, func(it O.WireGuardPeer) wireguard.PeerOptions {
-				return wireguard.PeerOptions{
-					Endpoint:                    M.ParseSocksaddrHostPort(it.Address, it.Port),
-					PublicKey:                   it.PublicKey,
-					PreSharedKey:                it.PreSharedKey,
-					AllowedIPs:                  it.AllowedIPs,
-					PersistentKeepaliveInterval: it.PersistentKeepaliveInterval,
-					Reserved:                    it.Reserved,
-				}
-			}),
-			Workers: options.Workers,
-		},
-		AmneziaOptions: options.AmneziaOptions,
-	})
-	if err != nil {
-		return nil, err
-	}
-	ep.endpoint = wgEndpoint
-	return ep, nil
-}
+	wg := ep.(*wireguard.Endpoint)
 
-func (w *Endpoint) Start(stage adapter.StartStage) error {
-	switch stage {
-	case adapter.StartStateStart:
-		return w.endpoint.Start(false)
-	case adapter.StartStatePostStart:
-		return w.endpoint.Start(true)
+	// add amnezia specific options to ipcConf
+	v := reflect.ValueOf(wg).Elem()
+	endpointField := v.FieldByName("endpoint")
+	if !endpointField.IsValid() {
+		return nil, fmt.Errorf("field 'endpoint' not found")
 	}
-	return nil
-}
-
-func (w *Endpoint) Close() error {
-	return w.endpoint.Close()
-}
-
-func (w *Endpoint) InterfaceUpdated() {
-	w.endpoint.BindUpdate()
-}
-
-func (w *Endpoint) PrepareConnection(network string, source, destination M.Socksaddr) error {
-	return w.router.PreMatch(adapter.InboundContext{
-		Inbound:     w.Tag(),
-		InboundType: w.Type(),
-		Network:     network,
-		Source:      source,
-		Destination: destination,
-	})
-}
-
-func (w *Endpoint) NewConnectionEx(ctx context.Context, conn net.Conn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	var metadata adapter.InboundContext
-	metadata.Inbound = w.Tag()
-	metadata.InboundType = w.Type()
-	metadata.Source = source
-	for _, localPrefix := range w.localAddresses {
-		if localPrefix.Contains(destination.Addr) {
-			metadata.OriginDestination = destination
-			if destination.Addr.Is4() {
-				destination.Addr = netip.AddrFrom4([4]uint8{127, 0, 0, 1})
-			} else {
-				destination.Addr = netip.IPv6Loopback()
-			}
-			break
-		}
+	endpointPtr := endpointField.Pointer()
+	if endpointPtr == 0 {
+		return nil, fmt.Errorf("endpoint is nil")
 	}
-	metadata.Destination = destination
-	conn = metrics.NewConn(conn, &metadata)
-	w.logger.InfoContext(ctx, "inbound connection from ", source)
-	w.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
-	w.router.RouteConnectionEx(ctx, conn, metadata, onClose)
-}
+	wgTransportType := endpointField.Type().Elem()
+	wgTransportValue := reflect.NewAt(wgTransportType, unsafe.Pointer(endpointPtr)).Elem()
+	ipcConfField := wgTransportValue.FieldByName("ipcConf")
+	if !ipcConfField.IsValid() {
+		return nil, fmt.Errorf("field 'ipcConf' not found")
+	}
+	ipcConfPtr := unsafe.Pointer(ipcConfField.UnsafeAddr())
 
-func (w *Endpoint) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	var metadata adapter.InboundContext
-	metadata.Inbound = w.Tag()
-	metadata.InboundType = w.Type()
-	metadata.Source = source
-	metadata.Destination = destination
-	for _, localPrefix := range w.localAddresses {
-		if localPrefix.Contains(destination.Addr) {
-			metadata.OriginDestination = destination
-			if destination.Addr.Is4() {
-				metadata.Destination.Addr = netip.AddrFrom4([4]uint8{127, 0, 0, 1})
-			} else {
-				metadata.Destination.Addr = netip.IPv6Loopback()
-			}
-			conn = bufio.NewNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
-		}
+	ipcConf := *(*string)(ipcConfPtr)
+	if options.JunkPacketCount > 0 {
+		ipcConf += "\njc=" + F.ToString(options.JunkPacketCount)
 	}
-	conn = metrics.NewPacketConn(conn, &metadata)
-	w.logger.InfoContext(ctx, "inbound packet connection from ", source)
-	w.logger.InfoContext(ctx, "inbound packet connection to ", destination)
-	w.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
-}
+	if options.JunkPacketMinSize > 0 {
+		ipcConf += "\njmin=" + F.ToString(options.JunkPacketMinSize)
+	}
+	if options.JunkPacketMaxSize > 0 {
+		ipcConf += "\njmax=" + F.ToString(options.JunkPacketMaxSize)
+	}
+	if options.InitPacketJunkSize > 0 {
+		ipcConf += "\ns1=" + F.ToString(options.InitPacketJunkSize)
+	}
+	if options.ResponsePacketJunkSize > 0 {
+		ipcConf += "\ns2=" + F.ToString(options.ResponsePacketJunkSize)
+	}
+	if options.InitPacketMagicHeader > 0 {
+		ipcConf += "\nh1=" + F.ToString(options.InitPacketMagicHeader)
+	}
+	if options.ResponsePacketMagicHeader > 0 {
+		ipcConf += "\nh2=" + F.ToString(options.ResponsePacketMagicHeader)
+	}
+	if options.UnderloadPacketMagicHeader > 0 {
+		ipcConf += "\nh3=" + F.ToString(options.UnderloadPacketMagicHeader)
+	}
+	if options.TransportPacketMagicHeader > 0 {
+		ipcConf += "\nh4=" + F.ToString(options.TransportPacketMagicHeader)
+	}
+	*(*string)(ipcConfPtr) = ipcConf
 
-func (w *Endpoint) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	switch network {
-	case N.NetworkTCP:
-		w.logger.InfoContext(ctx, "outbound connection to ", destination)
-	case N.NetworkUDP:
-		w.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-	}
-	if destination.IsFqdn() {
-		destinationAddresses, err := w.router.LookupDefault(ctx, destination.Fqdn)
-		if err != nil {
-			return nil, err
-		}
-		return N.DialSerial(ctx, w.endpoint, network, destination, destinationAddresses)
-	} else if !destination.Addr.IsValid() {
-		return nil, E.New("invalid destination: ", destination)
-	}
-	return w.endpoint.DialContext(ctx, network, destination)
-}
-
-func (w *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	w.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-	if destination.IsFqdn() {
-		destinationAddresses, err := w.router.LookupDefault(ctx, destination.Fqdn)
-		if err != nil {
-			return nil, err
-		}
-		packetConn, _, err := N.ListenSerial(ctx, w.endpoint, destination, destinationAddresses)
-		if err != nil {
-			return nil, err
-		}
-		return packetConn, err
-	}
-	return w.endpoint.ListenPacket(ctx, destination)
+	return &Endpoint{Endpoint: wg}, nil
 }

@@ -1,0 +1,25 @@
+{
+	"log": {
+		"disabled": true,
+		"level": "trace",
+		"output": "stdout",
+		"timestamp": true
+	},
+	"inbounds": [
+		{
+			"type": "hysteria2",
+			"tag": "hy2-server",
+			"listen": "127.0.0.1",
+			"listen_port": 10002,
+			"users": [
+				{
+					"password": "password"
+				}
+			],
+			"tls": {
+				"enabled": true,
+				"insecure": true
+			}
+		}
+	]
+}

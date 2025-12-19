@@ -23,6 +23,8 @@ const (
 	LevelError = slog.LevelError
 	LevelFatal = slog.LevelError + 4 // no fatal level in slog, use error+4.
 	LevelPanic = slog.LevelError + 8 // no panic level in slog, use error+8.
+
+	Disable = slog.LevelInfo + 255 // A level that disables logging, used for testing or no-op logger.
 )
 
 type Factory interface {
@@ -41,6 +43,10 @@ type factory struct {
 func NewFactory(
 	handler slog.Handler,
 ) Factory {
+	if !handler.Enabled(context.Background(), LevelPanic) {
+		return NewNopFactory(handler)
+	}
+
 	factory := &factory{
 		handler:    handler,
 		subscriber: observable.NewSubscriber[log.Entry](128),
@@ -64,12 +70,14 @@ func (f *factory) Close() error {
 
 // Level returns the current logging level of the factory.
 func (f *factory) Level() log.Level {
-	for i := log.LevelTrace; i >= log.LevelPanic; i-- {
-		if f.handler.Enabled(context.Background(), toSLevel(i)) {
-			return i
+	level := log.Level(Disable)
+	for i := log.LevelPanic; i <= log.LevelTrace; i++ {
+		if !f.handler.Enabled(context.Background(), toSLevel(i)) {
+			break
 		}
+		level = i
 	}
-	return log.LevelTrace
+	return level
 }
 
 // SetLevel implements the [Factory] interface. [slog.Handler] does not support dynamic level changes,
@@ -246,18 +254,37 @@ func toSLevel(lvl log.Level) slog.Level {
 	case log.LevelTrace:
 		return LevelTrace
 	case log.LevelDebug:
-		return slog.LevelDebug
+		return LevelDebug
 	case log.LevelInfo:
-		return slog.LevelInfo
+		return LevelInfo
 	case log.LevelWarn:
-		return slog.LevelWarn
+		return LevelWarn
 	case log.LevelError:
-		return slog.LevelError
+		return LevelError
 	case log.LevelFatal:
 		return LevelFatal
 	case log.LevelPanic:
 		return LevelPanic
 	default:
-		return slog.LevelDebug // Default to debug if the level is unknown.
+		return LevelInfo // Default to info if the level is unknown.
 	}
+}
+
+type nopFactory struct {
+	log.ObservableFactory
+	handler slog.Handler
+}
+
+func NewNopFactory(handler slog.Handler) Factory {
+	return &nopFactory{
+		ObservableFactory: log.NewNOPFactory(),
+	}
+}
+
+func (f *nopFactory) Level() log.Level {
+	return log.LevelTrace + 1
+}
+
+func (f *nopFactory) SlogHandler() slog.Handler {
+	return f.handler
 }

@@ -40,5 +40,8 @@ jobs:
           platforms: linux/arm64,linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
           tags: |
             us-docker.pkg.dev/lantern-cloud/containers/sing-box:${{ github.ref_name }}
