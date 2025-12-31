@@ -306,11 +306,21 @@ func (rq *removalQueue) checkPending() {
 	}
 
 	if len(toRemove) > 0 {
+		defer func() {
+			if err := recover(); err != nil {
+				rq.logger.Error("panic during outbound/endpoint removal", "error", err)
+			}
+		}()
 		rq.mu.Lock()
 		defer rq.mu.Unlock()
 		for _, tag := range toRemove {
 			item, exists := rq.pending[tag]
 			if !exists {
+				continue
+			}
+			// double check if outbound/endpoint still exists
+			if _, exists = rq.outMgr.Outbound(tag); !exists {
+				rq.logger.Trace("outbound already removed", "tag", tag)
 				continue
 			}
 			rq.logger.Debug("removing outbound", "tag", tag)
