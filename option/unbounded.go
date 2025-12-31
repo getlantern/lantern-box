@@ -23,6 +23,7 @@ type UnboundedOutboundOptions struct {
 	GenesisAddr       string `json:"genesis_addr,omitempty"`
 	NATFailTimeout    int    `json:"nat_fail_timeout,omitempty"`
 	STUNBatchSize     int    `json:"stun_batch_size,omitempty"`
+	STUNBatch         func(size uint32) (batch []string, err error)
 	Tag               string `json:"tag,omitempty"`
 	Patience          int    `json:"patience,omitempty"`
 	ErrorBackoff      int    `json:"error_backoff,omitempty"`

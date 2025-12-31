@@ -92,6 +92,10 @@ func NewOutbound(
 		rtcOpt.STUNBatchSize = uint32(options.STUNBatchSize)
 	}
 
+	if options.STUNBatch != nil {
+		rtcOpt.STUNBatch = options.STUNBatch
+	}
+
 	if options.Tag != "" {
 		rtcOpt.Tag = options.Tag
 	}
