@@ -321,6 +321,7 @@ func (rq *removalQueue) checkPending() {
 			// double check if outbound/endpoint still exists
 			if _, exists = rq.outMgr.Outbound(tag); !exists {
 				rq.logger.Trace("outbound already removed", "tag", tag)
+				delete(rq.pending, tag)
 				continue
 			}
 			rq.logger.Debug("removing outbound", "tag", tag)
