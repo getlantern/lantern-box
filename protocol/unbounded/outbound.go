@@ -45,6 +45,8 @@ type Outbound struct {
 	logger       logger.ContextLogger
 	broflakeConn *UBClientcore.BroflakeConn
 	dial         UBClientcore.SOCKS5Dialer
+	ui           UBClientcore.UI
+	ql           *UBClientcore.QUICLayer
 }
 
 func NewOutbound(
@@ -138,7 +140,7 @@ func NewOutbound(
 
 	UBCommon.SetDebugLogger(log.New(la, "", 0))
 
-	BFConn, _, err := UBClientcore.NewBroflake(bfOpt, rtcOpt, egOpt)
+	BFConn, ui, err := UBClientcore.NewBroflake(bfOpt, rtcOpt, egOpt)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +163,8 @@ func NewOutbound(
 		logger:       logger,
 		broflakeConn: BFConn,
 		dial:         dialer,
+		ui:           ui,
+		ql:           QUICLayer,
 	}
 
 	go QUICLayer.ListenAndMaintainQUICConnection()
@@ -181,6 +185,12 @@ func (h *Outbound) DialContext(
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	return nil, os.ErrInvalid
+}
+
+func (h *Outbound) Close() error {
+	h.ql.Close()
+	h.ui.Stop()
+	return nil
 }
 
 // TODO: delete me
