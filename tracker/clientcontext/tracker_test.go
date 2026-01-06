@@ -13,10 +13,12 @@ import (
 
 	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	box "github.com/getlantern/lantern-box"
@@ -24,7 +26,50 @@ import (
 
 const testOptionsPath = "../../testdata/options"
 
-func TestIntegration(t *testing.T) {
+func TestClientContext(t *testing.T) {
+	cInfo := ClientInfo{
+		DeviceID:    "lantern-box",
+		Platform:    "linux",
+		IsPro:       false,
+		CountryCode: "US",
+		Version:     "9.0",
+	}
+	infoFn := func() ClientInfo { return cInfo }
+	tests := []struct {
+		name               string
+		tracker            *ClientContextInjector
+		useSelectorWithtag string
+		shouldHaveInfo     bool
+	}{
+		{
+			name:           "Manager without injector",
+			tracker:        nil,
+			shouldHaveInfo: false,
+		},
+		{
+			name:           "Injector match",
+			tracker:        NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"any"}}),
+			shouldHaveInfo: true,
+		},
+		{
+			name:           "Injector does not match",
+			tracker:        NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"not-exist"}}),
+			shouldHaveInfo: false,
+		},
+		{
+			name:               "Match group real tag",
+			tracker:            NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"socks-out"}}),
+			useSelectorWithtag: "socks-out",
+			shouldHaveInfo:     true,
+		},
+		{
+			name:               "Does not match group real tag",
+			tracker:            NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"socks-out"}}),
+			useSelectorWithtag: "http-out",
+			shouldHaveInfo:     false,
+		},
+	}
+
 	ctx := box.BaseContext()
 	logger := log.NewNOPFactory().NewLogger("")
 	mgr := NewManager(MatchBounds{[]string{"any"}, []string{"any"}}, logger)
@@ -57,25 +102,20 @@ func TestIntegration(t *testing.T) {
 
 	mTracker := &mockTracker{}
 	mgr.AppendTracker(mTracker)
-	cInfo := ClientInfo{
-		DeviceID:    "lantern-box",
-		Platform:    "linux",
-		IsPro:       false,
-		CountryCode: "US",
-		Version:     "9.0",
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mTracker.info = nil
+			if tt.useSelectorWithtag != "" {
+				setSelectorDefaultTag(&clientOpts, tt.useSelectorWithtag)
+			}
+			runTrackerTest(ctx, t, clientOpts, tt.tracker, httpClient, addr)
+			if tt.shouldHaveInfo {
+				assert.Equal(t, &cInfo, mTracker.info)
+			} else {
+				assert.Nil(t, mTracker.info)
+			}
+		})
 	}
-	infoFn := func() ClientInfo { return cInfo }
-	t.Run("with ClientContext tracker", func(t *testing.T) {
-		mTracker.info = nil
-		tracker := NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"any"}})
-		runTrackerTest(ctx, t, clientOpts, tracker, httpClient, addr)
-		require.Equal(t, &cInfo, mTracker.info)
-	})
-	t.Run("without ClientContext tracker", func(t *testing.T) {
-		mTracker.info = nil
-		runTrackerTest(ctx, t, clientOpts, nil, httpClient, addr)
-		require.Nil(t, mTracker.info)
-	})
 }
 
 func runTrackerTest(
@@ -101,8 +141,9 @@ func runTrackerTest(
 	req, err := http.NewRequest("GET", addr, nil)
 	require.NoError(t, err)
 
-	_, err = client.Do(req)
+	resp, err := client.Do(req)
 	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
 func getOptions(ctx context.Context, t *testing.T, configPath string) option.Options {
@@ -123,6 +164,17 @@ func getProxyAddress(inbounds []option.Inbound) string {
 		}
 	}
 	return ""
+}
+
+func setSelectorDefaultTag(options *option.Options, tag string) {
+	for _, outbound := range options.Outbounds {
+		if outbound.Type == constant.TypeSelector {
+			opts := outbound.Options.(*option.SelectorOutboundOptions)
+			opts.Default = tag
+			break
+		}
+	}
+	options.Route.Rules[0].DefaultOptions.RouteOptions.Outbound = "selector"
 }
 
 func startHTTPServer() *httptest.Server {

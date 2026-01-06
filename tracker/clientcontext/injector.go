@@ -7,7 +7,10 @@ import (
 	"net"
 	"sync"
 
+	lAdapter "github.com/getlantern/lantern-box/adapter"
+
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/protocol/group"
 	N "github.com/sagernet/sing/common/network"
 )
 
@@ -42,11 +45,12 @@ func (t *ClientContextInjector) RoutedConnection(
 	matchedRule adapter.Rule,
 	matchOutbound adapter.Outbound,
 ) net.Conn {
-	if !t.match(metadata.Inbound, matchOutbound.Tag()) {
+	_, isGroup := matchOutbound.(adapter.OutboundGroup)
+	if !isGroup && !t.preMatch(metadata.Inbound, matchOutbound.Tag()) {
 		return conn
 	}
 	info := t.getInfo()
-	return newWriteConn(conn, &info)
+	return newWriteConn(conn, &info, t.outboundRule, matchOutbound)
 }
 
 // RoutedPacketConnection wraps the packet connection for writing client info.
@@ -57,14 +61,15 @@ func (t *ClientContextInjector) RoutedPacketConnection(
 	matchedRule adapter.Rule,
 	matchOutbound adapter.Outbound,
 ) N.PacketConn {
-	if !t.match(metadata.Inbound, matchOutbound.Tag()) {
+	_, isGroup := matchOutbound.(adapter.OutboundGroup)
+	if !isGroup && !t.preMatch(metadata.Inbound, matchOutbound.Tag()) {
 		return conn
 	}
 	info := t.getInfo()
-	return newWritePacketConn(conn, metadata, &info)
+	return newWritePacketConn(conn, metadata, &info, *t.outboundRule, matchOutbound)
 }
 
-func (t *ClientContextInjector) match(inbound, outbound string) bool {
+func (t *ClientContextInjector) preMatch(inbound, outbound string) bool {
 	t.ruleMu.RLock()
 	defer t.ruleMu.RUnlock()
 	return t.inboundRule.match(inbound) && t.outboundRule.match(outbound)
@@ -80,19 +85,48 @@ func (t *ClientContextInjector) UpdateBounds(bounds MatchBounds) {
 // writeConn sends client info after handshake.
 type writeConn struct {
 	net.Conn
-	info *ClientInfo
+	info          *ClientInfo
+	outboundRule  *boundsRule
+	matchOutbound adapter.Outbound
 }
 
-func newWriteConn(conn net.Conn, info *ClientInfo) net.Conn {
-	return &writeConn{Conn: conn, info: info}
+func newWriteConn(
+	conn net.Conn,
+	info *ClientInfo,
+	outboundRule *boundsRule,
+	matchOutbound adapter.Outbound,
+) net.Conn {
+	return &writeConn{
+		Conn:          conn,
+		info:          info,
+		outboundRule:  outboundRule,
+		matchOutbound: matchOutbound,
+	}
 }
 
 // ConnHandshakeSuccess sends client info upon successful handshake with the server.
 func (c *writeConn) ConnHandshakeSuccess(conn net.Conn) error {
+	if !c.match(conn) {
+		return nil
+	}
 	if err := c.sendInfo(conn); err != nil {
 		return fmt.Errorf("sending client info: %w", err)
 	}
 	return nil
+}
+
+func (c *writeConn) match(conn net.Conn) bool {
+	outbound, isGroup := c.matchOutbound.(adapter.OutboundGroup)
+	if !isGroup {
+		return true // caught by pre-match
+	}
+	// we need to check if the outbound used by the group matches as it may contain outbounds
+	// that don't
+
+	if tconn, ok := conn.(*lAdapter.TaggedConn); ok {
+		return c.outboundRule.match(tconn.Tag())
+	}
+	return c.outboundRule.match(outbound.Now())
 }
 
 // sendInfo marshals and sends client info as an HTTP POST, then waits for HTTP 200 OK.
@@ -119,28 +153,61 @@ func (c *writeConn) sendInfo(conn net.Conn) error {
 
 type writePacketConn struct {
 	N.PacketConn
-	metadata adapter.InboundContext
-	info     *ClientInfo
+	metadata      adapter.InboundContext
+	info          *ClientInfo
+	outboundRule  boundsRule
+	matchOutbound adapter.Outbound
 }
 
 func newWritePacketConn(
 	conn N.PacketConn,
 	metadata adapter.InboundContext,
 	info *ClientInfo,
+	outboundRule boundsRule,
+	matchOutbound adapter.Outbound,
 ) N.PacketConn {
 	return &writePacketConn{
-		PacketConn: conn,
-		metadata:   metadata,
-		info:       info,
+		PacketConn:    conn,
+		metadata:      metadata,
+		info:          info,
+		outboundRule:  outboundRule,
+		matchOutbound: matchOutbound,
 	}
 }
 
 // PacketConnHandshakeSuccess sends client info upon successful handshake.
 func (c *writePacketConn) PacketConnHandshakeSuccess(conn net.PacketConn) error {
+	if !c.match(conn) {
+		return nil
+	}
 	if err := c.sendInfo(conn); err != nil {
 		return fmt.Errorf("sending client info: %w", err)
 	}
 	return nil
+}
+
+func (c *writePacketConn) match(conn net.PacketConn) bool {
+	outbound, isGroup := c.matchOutbound.(adapter.OutboundGroup)
+	if !isGroup {
+		return true // caught by pre-match
+	}
+	// we need to check if the outbound used by the group matches as it may contain outbounds
+	// that don't
+
+	// fast path: conn is already tagged
+	if tconn, ok := conn.(*lAdapter.TaggedPacketConn); ok {
+		return c.outboundRule.match(tconn.Tag())
+	}
+
+	switch outbound.(type) {
+	case *group.Selector:
+		return c.outboundRule.match(outbound.Now())
+	case *group.URLTest:
+		// edge case: we cannot determine which outbound was actually used. urltest.Now will return
+		// the tag for the selected TCP outbound if it's not nil and the selected UDP outbound can
+		// be different.
+	}
+	return false
 }
 
 // sendInfo marshals and sends client info as a CLIENTINFO packet, then waits for OK.
