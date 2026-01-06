@@ -50,7 +50,10 @@ func (t *ClientContextInjector) RoutedConnection(
 		return conn
 	}
 	info := t.getInfo()
-	return newWriteConn(conn, &info, *t.outboundRule, matchOutbound)
+	t.ruleMu.RLock()
+	rule := *t.outboundRule
+	t.ruleMu.RUnlock()
+	return newWriteConn(conn, &info, rule, matchOutbound)
 }
 
 // RoutedPacketConnection wraps the packet connection for writing client info.
@@ -66,7 +69,10 @@ func (t *ClientContextInjector) RoutedPacketConnection(
 		return conn
 	}
 	info := t.getInfo()
-	return newWritePacketConn(conn, metadata, &info, *t.outboundRule, matchOutbound)
+	t.ruleMu.RLock()
+	rule := *t.outboundRule
+	t.ruleMu.RUnlock()
+	return newWritePacketConn(conn, metadata, &info, rule, matchOutbound)
 }
 
 func (t *ClientContextInjector) preMatch(inbound, outbound string) bool {
