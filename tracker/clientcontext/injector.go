@@ -50,7 +50,7 @@ func (t *ClientContextInjector) RoutedConnection(
 		return conn
 	}
 	info := t.getInfo()
-	return newWriteConn(conn, &info, t.outboundRule, matchOutbound)
+	return newWriteConn(conn, &info, *t.outboundRule, matchOutbound)
 }
 
 // RoutedPacketConnection wraps the packet connection for writing client info.
@@ -86,14 +86,14 @@ func (t *ClientContextInjector) UpdateBounds(bounds MatchBounds) {
 type writeConn struct {
 	net.Conn
 	info          *ClientInfo
-	outboundRule  *boundsRule
+	outboundRule  boundsRule
 	matchOutbound adapter.Outbound
 }
 
 func newWriteConn(
 	conn net.Conn,
 	info *ClientInfo,
-	outboundRule *boundsRule,
+	outboundRule boundsRule,
 	matchOutbound adapter.Outbound,
 ) net.Conn {
 	return &writeConn{
