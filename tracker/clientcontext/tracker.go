@@ -9,6 +9,8 @@
 // access the client info from the connection context using [ClientInfoFromContext].
 package clientcontext
 
+import "slices"
+
 // since sing-box only wraps inbound connections with trackers, conn on the client is from the user
 // (e.g. tun connection), while conn on the server is from an outbound on the client. The connection
 // to the server isn't established until after conn is wrapped on the client side and we don't have
@@ -51,6 +53,13 @@ type ClientInfo struct {
 type MatchBounds struct {
 	Inbound  []string
 	Outbound []string
+}
+
+func (mb MatchBounds) clone() MatchBounds {
+	return MatchBounds{
+		Inbound:  slices.Clone(mb.Inbound),
+		Outbound: slices.Clone(mb.Outbound),
+	}
 }
 
 type boundsRule struct {
