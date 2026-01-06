@@ -85,16 +85,16 @@ func (t *ClientContextInjector) preMatch(inbound, outbound string) bool {
 
 func (t *ClientContextInjector) SetBounds(bounds MatchBounds) {
 	t.ruleMu.Lock()
+	t.matchBounds = bounds
 	t.inboundRule = newBoundsRule(bounds.Inbound)
 	t.outboundRule = newBoundsRule(bounds.Outbound)
-	t.matchBounds = bounds
 	t.ruleMu.Unlock()
 }
 
 func (t *ClientContextInjector) MatchBounds() MatchBounds {
 	t.ruleMu.RLock()
 	defer t.ruleMu.RUnlock()
-	return t.matchBounds
+	return t.matchBounds.clone()
 }
 
 // writeConn sends client info after handshake.

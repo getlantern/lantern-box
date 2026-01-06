@@ -120,16 +120,16 @@ func (m *Manager) match(inbound, outbound string) bool {
 
 func (m *Manager) SetBounds(bounds MatchBounds) {
 	m.ruleMu.Lock()
+	m.matchBounds = bounds
 	m.inboundRule = newBoundsRule(bounds.Inbound)
 	m.outboundRule = newBoundsRule(bounds.Outbound)
-	m.matchBounds = bounds
 	m.ruleMu.Unlock()
 }
 
 func (m *Manager) MatchBounds() MatchBounds {
 	m.ruleMu.RLock()
 	defer m.ruleMu.RUnlock()
-	return m.matchBounds
+	return m.matchBounds.clone()
 }
 
 // readConn reads client info from the connection on creation.
