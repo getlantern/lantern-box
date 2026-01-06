@@ -38,7 +38,7 @@ func TestClientContext(t *testing.T) {
 	tests := []struct {
 		name               string
 		tracker            *ClientContextInjector
-		useSelectorWithtag string
+		useSelectorWithTag string
 		shouldHaveInfo     bool
 	}{
 		{
@@ -59,13 +59,13 @@ func TestClientContext(t *testing.T) {
 		{
 			name:               "Match group real tag",
 			tracker:            NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"socks-out"}}),
-			useSelectorWithtag: "socks-out",
+			useSelectorWithTag: "socks-out",
 			shouldHaveInfo:     true,
 		},
 		{
 			name:               "Does not match group real tag",
 			tracker:            NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"socks-out"}}),
-			useSelectorWithtag: "http-out",
+			useSelectorWithTag: "http-out",
 			shouldHaveInfo:     false,
 		},
 	}
@@ -105,8 +105,9 @@ func TestClientContext(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mTracker.info = nil
-			if tt.useSelectorWithtag != "" {
-				setSelectorDefaultTag(&clientOpts, tt.useSelectorWithtag)
+			clientOpts = getOptions(ctx, t, testOptionsPath+"/http_client.json")
+			if tt.useSelectorWithTag != "" {
+				setSelectorDefaultTag(&clientOpts, tt.useSelectorWithTag)
 			}
 			runTrackerTest(ctx, t, clientOpts, tt.tracker, httpClient, addr)
 			if tt.shouldHaveInfo {
