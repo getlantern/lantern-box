@@ -23,6 +23,7 @@ var (
 // ClientContextInjector is a connection tracker that sends client info to a ClientContext Manager.
 type ClientContextInjector struct {
 	getInfo      GetClientInfoFn
+	matchBounds  MatchBounds
 	inboundRule  *boundsRule
 	outboundRule *boundsRule
 	ruleMu       sync.RWMutex
@@ -31,6 +32,7 @@ type ClientContextInjector struct {
 // NewClientContextInjector creates a tracker for injecting client info.
 func NewClientContextInjector(fn GetClientInfoFn, bounds MatchBounds) *ClientContextInjector {
 	return &ClientContextInjector{
+		matchBounds:  bounds,
 		inboundRule:  newBoundsRule(bounds.Inbound),
 		outboundRule: newBoundsRule(bounds.Outbound),
 		getInfo:      fn,
@@ -81,11 +83,18 @@ func (t *ClientContextInjector) preMatch(inbound, outbound string) bool {
 	return t.inboundRule.match(inbound) && t.outboundRule.match(outbound)
 }
 
-func (t *ClientContextInjector) UpdateBounds(bounds MatchBounds) {
+func (t *ClientContextInjector) SetBounds(bounds MatchBounds) {
 	t.ruleMu.Lock()
 	t.inboundRule = newBoundsRule(bounds.Inbound)
 	t.outboundRule = newBoundsRule(bounds.Outbound)
+	t.matchBounds = bounds
 	t.ruleMu.Unlock()
+}
+
+func (t *ClientContextInjector) MatchBounds() MatchBounds {
+	t.ruleMu.RLock()
+	defer t.ruleMu.RUnlock()
+	return t.matchBounds
 }
 
 // writeConn sends client info after handshake.

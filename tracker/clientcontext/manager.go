@@ -37,6 +37,7 @@ type Manager struct {
 	logger   log.ContextLogger
 	trackers []adapter.ConnectionTracker
 
+	matchBounds  MatchBounds
 	inboundRule  *boundsRule
 	outboundRule *boundsRule
 	ruleMu       sync.RWMutex
@@ -47,6 +48,7 @@ func NewManager(bounds MatchBounds, logger log.ContextLogger) *Manager {
 	return &Manager{
 		trackers:     []adapter.ConnectionTracker{},
 		logger:       logger,
+		matchBounds:  bounds,
 		inboundRule:  newBoundsRule(bounds.Inbound),
 		outboundRule: newBoundsRule(bounds.Outbound),
 	}
@@ -116,11 +118,18 @@ func (m *Manager) match(inbound, outbound string) bool {
 	return m.inboundRule.match(inbound) && m.outboundRule.match(outbound)
 }
 
-func (m *Manager) UpdateBounds(bounds MatchBounds) {
+func (m *Manager) SetBounds(bounds MatchBounds) {
 	m.ruleMu.Lock()
 	m.inboundRule = newBoundsRule(bounds.Inbound)
 	m.outboundRule = newBoundsRule(bounds.Outbound)
+	m.matchBounds = bounds
 	m.ruleMu.Unlock()
+}
+
+func (m *Manager) MatchBounds() MatchBounds {
+	m.ruleMu.RLock()
+	defer m.ruleMu.RUnlock()
+	return m.matchBounds
 }
 
 // readConn reads client info from the connection on creation.
