@@ -91,6 +91,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 
 	if datacapURL != "" {
 		// Add datacap tracker
+		log.Info("Datacap enabled. Creating trackers...")
 		clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
 			Inbound:  []string{""},
 			Outbound: []string{""},
