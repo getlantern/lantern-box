@@ -232,7 +232,7 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 		return fmt.Errorf("marshaling client info: %w", err)
 	}
 	packet := append([]byte(packetPrefix), buf...)
-	if _, err = conn.WriteTo(packet, c.metadata.Destination); err != nil {
+	if _, err = conn.WriteTo(packet, c.metadata.Destination.UDPAddr()); err != nil {
 		return fmt.Errorf("writing packet: %w", err)
 	}
 
