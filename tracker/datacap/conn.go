@@ -212,12 +212,19 @@ func (c *Conn) updateThrottleState(status *DataCapStatus) {
 		return
 	}
 
-	if status.Throttle && status.RemainingBytes > 0 && status.CapLimit > 0 {
-		// Calculate remaining percentage
+	// if sidecar says don't throttle, disable throttling
+	if !status.Throttle {
+		c.throttler.Disable()
+		c.logger.Info("throttling disabled by sidecar")
+		return
+	}
+
+	// calculate appropriate speed tier
+	var throttleSpeed int64
+	if status.CapLimit > 0 && status.RemainingBytes > 0 {
+		// calculate remaining percentage and apply tiered throttling
 		remainingPct := float64(status.RemainingBytes) / float64(status.CapLimit)
 
-		// Adjust throttle speed based on remaining percentage tiers
-		var throttleSpeed int64
 		if remainingPct > highRemainingThresholdPct {
 			throttleSpeed = highTierSpeedBytesPerSec
 		} else if remainingPct > mediumRemainingThresholdPct {
@@ -225,13 +232,14 @@ func (c *Conn) updateThrottleState(status *DataCapStatus) {
 		} else {
 			throttleSpeed = lowTierSpeedBytesPerSec
 		}
-
-		c.throttler.EnableWithRates(throttleSpeed, defaultUploadSpeedBytesPerSec)
-		c.logger.Debug("updated throttle speed to ", throttleSpeed, " bytes/s (remaining: ", remainingPct*100, "%)")
+		c.logger.Info("updated throttle speed to ", throttleSpeed, " bytes/s (remaining: ", remainingPct*100, "%)")
 	} else {
-		c.throttler.Disable()
-		c.logger.Debug("throttling disabled by sidecar")
+		// no remaining bytes, apply lowest tier
+		throttleSpeed = lowTierSpeedBytesPerSec
+		c.logger.Info("applying lowest throttle tier (", throttleSpeed, " bytes/s) - data cap exhausted")
 	}
+
+	c.throttler.EnableWithRates(throttleSpeed, defaultUploadSpeedBytesPerSec)
 }
 
 // GetStatus queries the sidecar for current data cap status.
