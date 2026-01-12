@@ -733,25 +733,25 @@ func TestDataCapThrottleDisableAfterEnable(t *testing.T) {
 	conn := NewConn(config)
 	defer conn.Close()
 
-	// Enable throttling
+	// Enable throttling (data exhausted scenario - Throttle=true, RemainingBytes=0)
 	status1 := &DataCapStatus{
 		Throttle:       true,
-		RemainingBytes: 1000000000,
+		RemainingBytes: 0,
 		CapLimit:       10000000000,
 	}
 	conn.updateThrottleState(status1)
 
-	assert.True(t, conn.throttler.IsEnabled(), "throttling should be enabled")
+	assert.True(t, conn.throttler.IsEnabled(), "throttling should be enabled when data exhausted")
 
-	// Disable throttling
+	// Disable throttling (no datacap scenario - CapLimit=0)
 	status2 := &DataCapStatus{
 		Throttle:       false,
-		RemainingBytes: 5000000000,
-		CapLimit:       10000000000,
+		RemainingBytes: 0,
+		CapLimit:       0,
 	}
 	conn.updateThrottleState(status2)
 
-	assert.False(t, conn.throttler.IsEnabled(), "throttling should be disabled")
+	assert.False(t, conn.throttler.IsEnabled(), "throttling should be disabled when no datacap")
 }
 
 // TestDataCapEmptyDeviceID tests behavior with empty device ID
