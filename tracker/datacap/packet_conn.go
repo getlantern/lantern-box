@@ -200,7 +200,7 @@ func (c *PacketConn) updateThrottleState(status *DataCapStatus) {
 		return
 	}
 
-	if status.Throttle && status.CapLimit > 0 {
+	if status.Throttle {
 		c.throttler.EnableWithRates(lowTierSpeedBytesPerSec, defaultUploadSpeedBytesPerSec)
 		c.logger.Debug("data cap exhausted, throttling at ", lowTierSpeedBytesPerSec, " bytes/s")
 	} else {
