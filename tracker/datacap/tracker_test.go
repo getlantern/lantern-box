@@ -37,22 +37,22 @@ func TestRoutedConnection_ProClient_SkipsTracking(t *testing.T) {
 	assert.Equal(t, mockConn, routedConn)
 }
 
-// Scenario 3: Datacap URL present & Free Client & With Progressive Throttling
-func TestRoutedConnection_FreeUserWithProgressiveThrottling(t *testing.T) {
-	// Mock server returning Throttle: false but with data remaining (progressive throttling applies)
+// Scenario 3: Datacap URL present & Free Client & Data Remaining (Throttling Disabled)
+func TestRoutedConnection_FreeUserWithRemainingBytes_DisablesThrottling(t *testing.T) {
+	// Mock server returning Throttle: false with data remaining (throttling disabled)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"throttle":false, "remainingBytes": 1000, "capLimit": 1000}`))
 	}))
 	defer server.Close()
 
-	tracker, err := NewDatacapTracker(Options{URL: server.URL, ReportInterval: "100ms", EnableThrottling: true}, log.NewNOPFactory().Logger())
+	tracker, err := NewDatacapTracker(Options{URL: server.URL, ReportInterval: "100ms"}, log.NewNOPFactory().Logger())
 	require.NoError(t, err)
 
 	mockConn := newMockConn(make([]byte, 1024))
 	ctx := clientcontext.ContextWithClientInfo(context.Background(), clientcontext.ClientInfo{
 		IsPro:       false,
-		DeviceID:    "device-free-progressive",
+		DeviceID:    "device-free-no-throttle",
 		Platform:    "test",
 		CountryCode: "US",
 	})
@@ -66,8 +66,8 @@ func TestRoutedConnection_FreeUserWithProgressiveThrottling(t *testing.T) {
 	_, _ = conn.Read(make([]byte, 10))
 	time.Sleep(200 * time.Millisecond)
 
-	// Progressive throttling is enabled when RemainingBytes > 0 && CapLimit > 0
-	assert.True(t, conn.throttler.IsEnabled(), "Throttler should be enabled for progressive throttling")
+	// Throttling should be DISABLED when RemainingBytes > 0
+	assert.False(t, conn.throttler.IsEnabled(), "Throttler should be disabled when data remains")
 	conn.Close()
 }
 
@@ -80,7 +80,7 @@ func TestRoutedConnection_FreeUserWithCap_EnablesThrottling(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tracker, err := NewDatacapTracker(Options{URL: server.URL, ReportInterval: "100ms", EnableThrottling: true}, log.NewNOPFactory().Logger())
+	tracker, err := NewDatacapTracker(Options{URL: server.URL, ReportInterval: "100ms"}, log.NewNOPFactory().Logger())
 	require.NoError(t, err)
 
 	mockConn := newMockConn(make([]byte, 1024))

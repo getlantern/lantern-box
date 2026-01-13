@@ -16,19 +16,17 @@ import (
 var _ (adapter.ConnectionTracker) = (*DatacapTracker)(nil)
 
 type DatacapTracker struct {
-	client           *Client
-	logger           log.ContextLogger
-	reportInterval   time.Duration
-	enableThrottling bool
-	throttleSpeed    int64
+	client         *Client
+	logger         log.ContextLogger
+	reportInterval time.Duration
+	throttleSpeed  int64
 }
 
 type Options struct {
-	URL              string `json:"url,omitempty"`
-	ReportInterval   string `json:"report_interval,omitempty"`
-	HTTPTimeout      string `json:"http_timeout,omitempty"`
-	EnableThrottling bool   `json:"enable_throttling,omitempty"`
-	ThrottleSpeed    int64  `json:"throttle_speed,omitempty"`
+	URL            string `json:"url,omitempty"`
+	ReportInterval string `json:"report_interval,omitempty"`
+	HTTPTimeout    string `json:"http_timeout,omitempty"`
+	ThrottleSpeed  int64  `json:"throttle_speed,omitempty"`
 }
 
 func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTracker, error) {
@@ -54,11 +52,10 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 		httpTimeout = timeout
 	}
 	return &DatacapTracker{
-		client:           NewClient(options.URL, httpTimeout),
-		reportInterval:   reportInterval,
-		enableThrottling: options.EnableThrottling,
-		throttleSpeed:    options.ThrottleSpeed,
-		logger:           logger,
+		client:         NewClient(options.URL, httpTimeout),
+		reportInterval: reportInterval,
+		throttleSpeed:  options.ThrottleSpeed,
+		logger:         logger,
 	}, nil
 }
 
@@ -72,13 +69,12 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 		return conn
 	}
 	return NewConn(ConnConfig{
-		Conn:             conn,
-		Client:           t.client,
-		Logger:           t.logger,
-		ClientInfo:       info,
-		ReportInterval:   t.reportInterval,
-		EnableThrottling: t.enableThrottling,
-		ThrottleSpeed:    t.throttleSpeed,
+		Conn:           conn,
+		Client:         t.client,
+		Logger:         t.logger,
+		ClientInfo:     info,
+		ReportInterval: t.reportInterval,
+		ThrottleSpeed:  t.throttleSpeed,
 	})
 }
 func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
@@ -91,12 +87,11 @@ func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 		return conn
 	}
 	return NewPacketConn(PacketConnConfig{
-		Conn:             conn,
-		Client:           t.client,
-		Logger:           t.logger,
-		ClientInfo:       info,
-		ReportInterval:   t.reportInterval,
-		EnableThrottling: t.enableThrottling,
-		ThrottleSpeed:    t.throttleSpeed,
+		Conn:           conn,
+		Client:         t.client,
+		Logger:         t.logger,
+		ClientInfo:     info,
+		ReportInterval: t.reportInterval,
+		ThrottleSpeed:  t.throttleSpeed,
 	})
 }
