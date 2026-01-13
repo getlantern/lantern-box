@@ -34,7 +34,7 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 		return nil, E.New("datacap url not defined")
 	}
 	// Parse intervals with defaults
-	reportInterval := 30 * time.Second
+	reportInterval := 10 * time.Second
 	if options.ReportInterval != "" {
 		interval, err := time.ParseDuration(options.ReportInterval)
 		if err != nil {

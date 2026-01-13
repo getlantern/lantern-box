@@ -59,9 +59,9 @@ type ConnConfig struct {
 func NewConn(config ConnConfig) *Conn {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Default report interval to 30 seconds if not specified
+	// Default report interval to 10 seconds if not specified
 	if config.ReportInterval == 0 {
-		config.ReportInterval = 30 * time.Second
+		config.ReportInterval = 10 * time.Second
 	}
 
 	conn := &Conn{
