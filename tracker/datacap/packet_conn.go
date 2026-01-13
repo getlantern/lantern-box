@@ -153,17 +153,14 @@ func (c *PacketConn) sendReport() {
 	c.reportMutex.Lock()
 	defer c.reportMutex.Unlock()
 
-	// Skip if client is nil (datacap disabled)
 	if c.client == nil {
 		return
 	}
 
-	// Atomically get and reset counters to calculate delta
 	sent := c.bytesSent.Swap(0)
 	received := c.bytesReceived.Swap(0)
 	delta := sent + received
 
-	// Only report if there's data to report
 	if delta == 0 {
 		return
 	}
@@ -175,10 +172,9 @@ func (c *PacketConn) sendReport() {
 		BytesUsed:   delta,
 	}
 
-	// Use the client's configured timeout for consistency
 	timeout := c.client.httpClient.Timeout
 	if timeout == 0 {
-		timeout = 10 * time.Second // Fallback if client has no timeout set
+		timeout = 10 * time.Second
 	}
 	reportCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -191,7 +187,6 @@ func (c *PacketConn) sendReport() {
 		c.logger.Debug("failed to report datacap consumption (will retry): ", err)
 	} else {
 		c.logger.Debug("reported datacap delta: ", delta, " bytes (sent: ", sent, ", received: ", received, ") for device ", c.clientInfo.DeviceID)
-		// Update internal state with response from sidecar
 		if status != nil {
 			c.updateThrottleState(status)
 		}
@@ -199,18 +194,16 @@ func (c *PacketConn) sendReport() {
 }
 
 // updateThrottleState updates the throttling configuration based on the current status.
-// Simple logic: full speed until cap hit, then throttle at lowest tier.
 func (c *PacketConn) updateThrottleState(status *DataCapStatus) {
 	if c.throttler == nil {
+		c.logger.Debug("throttler not initialized, skipping update")
 		return
 	}
 
 	if status.Throttle && status.CapLimit > 0 {
-		// Data cap exhausted - apply throttle
 		c.throttler.EnableWithRates(lowTierSpeedBytesPerSec, defaultUploadSpeedBytesPerSec)
 		c.logger.Debug("data cap exhausted, throttling at ", lowTierSpeedBytesPerSec, " bytes/s")
 	} else {
-		// Full speed
 		c.throttler.Disable()
 		c.logger.Debug("throttling disabled - full speed")
 	}
