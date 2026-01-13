@@ -1198,6 +1198,6 @@ func TestReportFailure_RetriesAndReportsDelta(t *testing.T) {
 	// Should have at least 2 attempts (1 fail, 1 success)
 	assert.GreaterOrEqual(t, reportCount.Load(), int32(2), "Should attempt reporting at least twice")
 
-	// Total bytes reported should be 1000 (succesfully recovered from first failure)
+	// Total bytes reported should be 1000 (successfully recovered from first failure)
 	assert.Equal(t, int64(1000), totalBytesReported.Load(), "Should report total bytes despite initial failure")
 }
