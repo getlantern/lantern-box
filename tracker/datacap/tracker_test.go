@@ -37,12 +37,12 @@ func TestRoutedConnection_ProClient_SkipsTracking(t *testing.T) {
 	assert.Equal(t, mockConn, routedConn)
 }
 
-// Scenario 3: Datacap URL present & Free Client & Data Remaining (Throttling Disabled)
-func TestRoutedConnection_FreeUserWithRemainingBytes_DisablesThrottling(t *testing.T) {
-	// Mock server returning Throttle: false with data remaining (throttling disabled)
+// Scenario 3: Datacap URL present & Free Client & Throttling Disabled
+func TestRoutedConnection_FreeUser_ThrottlingDisabled(t *testing.T) {
+	// Mock server returning Throttle: false (throttling disabled)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"throttle":false, "remainingBytes": 1000, "capLimit": 1000}`))
+		w.Write([]byte(`{"throttle":false, "capLimit": 1000}`))
 	}))
 	defer server.Close()
 
@@ -66,8 +66,8 @@ func TestRoutedConnection_FreeUserWithRemainingBytes_DisablesThrottling(t *testi
 	_, _ = conn.Read(make([]byte, 10))
 	time.Sleep(200 * time.Millisecond)
 
-	// Throttling should be DISABLED when RemainingBytes > 0
-	assert.False(t, conn.throttler.IsEnabled(), "Throttler should be disabled when data remains")
+	// Throttling should be DISABLED
+	assert.False(t, conn.throttler.IsEnabled(), "Throttler should be disabled")
 	conn.Close()
 }
 

@@ -307,7 +307,6 @@ func TestDataCapThrottleSpeedAdjustment(t *testing.T) {
 			// Simulate status update
 			status := &DataCapStatus{
 				Throttle:       tc.throttle,
-				RemainingBytes: tc.remainingBytes,
 				CapLimit:       tc.capLimit,
 			}
 
@@ -740,7 +739,6 @@ func TestDataCapThrottleDisableAfterEnable(t *testing.T) {
 	// Enable throttling (data exhausted scenario - Throttle=true, RemainingBytes=0)
 	status1 := &DataCapStatus{
 		Throttle:       true,
-		RemainingBytes: 0,
 		CapLimit:       10000000000,
 	}
 	conn.updateThrottleState(status1)
@@ -750,7 +748,6 @@ func TestDataCapThrottleDisableAfterEnable(t *testing.T) {
 	// Disable throttling (no datacap scenario - CapLimit=0)
 	status2 := &DataCapStatus{
 		Throttle:       false,
-		RemainingBytes: 0,
 		CapLimit:       0,
 	}
 	conn.updateThrottleState(status2)
