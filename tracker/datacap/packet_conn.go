@@ -35,40 +35,37 @@ type PacketConn struct {
 	wg           sync.WaitGroup
 
 	// Throttling
-	throttler         *Throttler
-	throttlingEnabled bool
+	throttler *Throttler
 }
 
 // PacketConnConfig holds configuration for creating a datacap-tracked packet connection.
 type PacketConnConfig struct {
-	Conn             N.PacketConn
-	Client           *Client
-	Logger           log.ContextLogger
-	ClientInfo       clientcontext.ClientInfo
-	ReportInterval   time.Duration
-	EnableThrottling bool
-	ThrottleSpeed    int64
+	Conn           N.PacketConn
+	Client         *Client
+	Logger         log.ContextLogger
+	ClientInfo     clientcontext.ClientInfo
+	ReportInterval time.Duration
+	ThrottleSpeed  int64
 }
 
 // NewPacketConn creates a new datacap-tracked packet connection wrapper.
 func NewPacketConn(config PacketConnConfig) *PacketConn {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Default report interval to 30 seconds if not specified
+	// Default report interval to 10 seconds if not specified
 	if config.ReportInterval == 0 {
-		config.ReportInterval = 30 * time.Second
+		config.ReportInterval = 10 * time.Second
 	}
 
 	conn := &PacketConn{
-		PacketConn:        config.Conn,
-		ctx:               ctx,
-		cancel:            cancel,
-		client:            config.Client,
-		logger:            config.Logger,
-		clientInfo:        config.ClientInfo,
-		reportTicker:      time.NewTicker(config.ReportInterval),
-		throttler:         NewThrottler(config.ThrottleSpeed),
-		throttlingEnabled: config.EnableThrottling,
+		PacketConn:   config.Conn,
+		ctx:          ctx,
+		cancel:       cancel,
+		client:       config.Client,
+		logger:       config.Logger,
+		clientInfo:   config.ClientInfo,
+		reportTicker: time.NewTicker(config.ReportInterval),
+		throttler:    NewThrottler(config.ThrottleSpeed),
 	}
 
 	// Start periodic reporting goroutine
@@ -151,22 +148,20 @@ func (c *PacketConn) periodicReport() {
 	}
 }
 
-// sendReport sends the current consumption data to the sidecar.
+// sendReport sends the delta consumption data to the sidecar.
 func (c *PacketConn) sendReport() {
 	c.reportMutex.Lock()
 	defer c.reportMutex.Unlock()
 
-	// Skip if client is nil (datacap disabled)
 	if c.client == nil {
 		return
 	}
 
-	sent := c.bytesSent.Load()
-	received := c.bytesReceived.Load()
-	totalConsumed := sent + received
+	sent := c.bytesSent.Swap(0)
+	received := c.bytesReceived.Swap(0)
+	delta := sent + received
 
-	// Only report if there's data to report
-	if totalConsumed == 0 {
+	if delta == 0 {
 		return
 	}
 
@@ -174,24 +169,24 @@ func (c *PacketConn) sendReport() {
 		DeviceID:    c.clientInfo.DeviceID,
 		CountryCode: c.clientInfo.CountryCode,
 		Platform:    c.clientInfo.Platform,
-		BytesUsed:   totalConsumed,
+		BytesUsed:   delta,
 	}
 
-	// Use the client's configured timeout for consistency
 	timeout := c.client.httpClient.Timeout
 	if timeout == 0 {
-		timeout = 10 * time.Second // Fallback if client has no timeout set
+		timeout = 10 * time.Second
 	}
 	reportCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	status, err := c.client.ReportDataCapConsumption(reportCtx, report)
 	if err != nil {
-		// Just log the error, don't fail the connection
-		c.logger.Debug("failed to report datacap consumption (non-fatal): ", err)
+		// On failure, add bytes back for next report attempt
+		c.bytesSent.Add(sent)
+		c.bytesReceived.Add(received)
+		c.logger.Debug("failed to report datacap consumption (will retry): ", err)
 	} else {
-		c.logger.Debug("reported datacap consumption: ", totalConsumed, " bytes (sent: ", sent, ", received: ", received, ") for device ", c.clientInfo.DeviceID)
-		// Update internal state with response from sidecar
+		c.logger.Debug("reported datacap delta: ", delta, " bytes (sent: ", sent, ", received: ", received, ") for device ", c.clientInfo.DeviceID)
 		if status != nil {
 			c.updateThrottleState(status)
 		}
@@ -200,28 +195,17 @@ func (c *PacketConn) sendReport() {
 
 // updateThrottleState updates the throttling configuration based on the current status.
 func (c *PacketConn) updateThrottleState(status *DataCapStatus) {
-	if !c.throttlingEnabled || c.throttler == nil {
+	if c.throttler == nil {
+		c.logger.Debug("throttler not initialized, skipping update")
 		return
 	}
 
-	if status.Throttle && status.RemainingBytes > 0 && status.CapLimit > 0 {
-		// Calculate remaining percentage
-		remainingPct := float64(status.RemainingBytes) / float64(status.CapLimit)
-
-		var throttleSpeed int64
-		if remainingPct > highRemainingThresholdPct {
-			throttleSpeed = highTierSpeedBytesPerSec
-		} else if remainingPct > mediumRemainingThresholdPct {
-			throttleSpeed = mediumTierSpeedBytesPerSec
-		} else {
-			throttleSpeed = lowTierSpeedBytesPerSec
-		}
-
-		c.throttler.EnableWithRates(throttleSpeed, defaultUploadSpeedBytesPerSec)
-		c.logger.Debug("updated throttle speed to ", throttleSpeed, " bytes/s (remaining: ", remainingPct*100, "%)")
+	if status.Throttle {
+		c.throttler.EnableWithRates(lowTierSpeedBytesPerSec, defaultUploadSpeedBytesPerSec)
+		c.logger.Debug("data cap exhausted, throttling at ", lowTierSpeedBytesPerSec, " bytes/s")
 	} else {
 		c.throttler.Disable()
-		c.logger.Debug("throttling disabled by sidecar")
+		c.logger.Debug("throttling disabled - full speed")
 	}
 }
 

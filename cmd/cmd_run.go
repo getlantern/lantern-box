@@ -102,6 +102,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		datacapTracker, err := datacap.NewDatacapTracker(
 			datacap.Options{
 				URL: datacapURL,
+				ReportInterval: "10s",
 			},
 			log.NewNOPFactory().NewLogger("datacap-tracker"),
 		)
