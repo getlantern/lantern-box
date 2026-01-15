@@ -211,9 +211,13 @@ func (c *readPacketConn) readInfo() (*ClientInfo, error) {
 		return nil, fmt.Errorf("unmarshaling client info: %w", err)
 	}
 
-	buffer.Reset()
-	buffer.WriteString("OK")
-	if err := c.WritePacket(buffer, destination); err != nil {
+	// CRITICAL: Use a new buffer for the response to ensure we have enough headroom
+	// for the packet headers (e.g. VMess). Reusing the old buffer with Reset()
+	// discards the headroom and causes 'buffer overflow' panics.
+	respBuffer := buf.NewPacket()
+	defer respBuffer.Release()
+	respBuffer.WriteString("OK")
+	if err := c.WritePacket(respBuffer, destination); err != nil {
 		return nil, fmt.Errorf("writing OK response: %w", err)
 	}
 	return &info, nil

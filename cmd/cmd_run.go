@@ -95,16 +95,16 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
 			Inbound:  []string{""},
 			Outbound: []string{""},
-		}, log.NewNOPFactory().NewLogger("tracker"))
+		}, log.StdLogger())
 		instance.Router().AppendTracker(clientCtxMgr)
 		service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
 
 		datacapTracker, err := datacap.NewDatacapTracker(
 			datacap.Options{
-				URL: datacapURL,
+				URL:            datacapURL,
 				ReportInterval: "10s",
 			},
-			log.NewNOPFactory().NewLogger("datacap-tracker"),
+			log.StdLogger(),
 		)
 		if err != nil {
 			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
