@@ -137,9 +137,6 @@ func (t *Throttler) WaitWrite(ctx context.Context, n int) error {
 }
 
 // wait implements the token bucket algorithm for rate limiting.
-// IMPORTANT: This holds the lock during the entire wait to ensure proper serialization.
-// Without this, parallel goroutines could all calculate waits and wait simultaneously,
-// defeating the rate limiting.
 func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 	if n <= 0 {
 		return nil
