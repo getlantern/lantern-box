@@ -1,6 +1,7 @@
 package datacap
 
 import (
+	"strconv"
 	"sync"
 	"testing"
 
@@ -26,7 +27,6 @@ func TestThrottleRegistry_DifferentDevices(t *testing.T) {
 
 	assert.NotSame(t, t1, t2, "different device IDs should get different throttlers")
 	assert.Equal(t, 2, registry.Count(), "registry should have 2 devices")
-	assert.NotEqual(t, t1, t2, "different device IDs should get different throttlers")
 }
 
 func TestThrottleRegistry_ConcurrentAccess(t *testing.T) {
@@ -42,7 +42,7 @@ func TestThrottleRegistry_ConcurrentAccess(t *testing.T) {
 		go func(workerID int) {
 			defer wg.Done()
 			for d := 0; d < devices; d++ {
-				deviceID := "device-" + string(rune('A'+d))
+				deviceID := "device-" + strconv.Itoa(d)
 				throttler := registry.GetOrCreate(deviceID)
 				assert.NotNil(t, throttler)
 			}
@@ -51,8 +51,8 @@ func TestThrottleRegistry_ConcurrentAccess(t *testing.T) {
 
 	wg.Wait()
 
-	// Should have created throttlers (some device IDs may collide due to rune conversion)
-	assert.Greater(t, registry.Count(), 0, "should have created throttlers")
+	// All goroutines accessed the same 100 device IDs
+	assert.Equal(t, devices, registry.Count(), "should have exactly 100 devices")
 }
 
 func TestThrottleRegistry_ThrottlerStartsDisabled(t *testing.T) {

@@ -1215,8 +1215,8 @@ func TestSharedThrottler_MultipleConnections(t *testing.T) {
 	// Drain the initial token bucket (1 KB capacity)
 	_ = sharedThrottler.WaitRead(context.Background(), 1024)
 
-	// Now the bucket is empty. 10 goroutines will each try to consume 512 bytes.
-	// Total: 5 KB at 1 KB/s = 5 seconds if shared correctly.
+	// Now the bucket is empty. 5 goroutines will each try to consume 512 bytes.
+	// Total: 2.5 KB at 1 KB/s = 2.5 seconds if shared correctly.
 	// If per-connection, each would take 0.5s (512 B / 1 KB/s).
 
 	numConsumers := 5

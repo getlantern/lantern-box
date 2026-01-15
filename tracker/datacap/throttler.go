@@ -202,8 +202,9 @@ func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(waitTime):
-		// After wait, tokens have refilled by deficit amount
-		// Update lastRefill to now so next caller gets accurate refill
+		// Update lastRefill to prevent next caller from getting "free" tokens
+		// for the time we just waited. Without this, elapsed time would include
+		// our wait, giving the next caller unearned tokens.
 		*lastRefill = time.Now()
 		return nil
 	}
