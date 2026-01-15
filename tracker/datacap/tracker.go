@@ -16,17 +16,16 @@ import (
 var _ (adapter.ConnectionTracker) = (*DatacapTracker)(nil)
 
 type DatacapTracker struct {
-	client         *Client
-	logger         log.ContextLogger
-	reportInterval time.Duration
-	throttleSpeed  int64
+	client           *Client
+	logger           log.ContextLogger
+	reportInterval   time.Duration
+	throttleRegistry *ThrottleRegistry
 }
 
 type Options struct {
 	URL            string `json:"url,omitempty"`
 	ReportInterval string `json:"report_interval,omitempty"`
 	HTTPTimeout    string `json:"http_timeout,omitempty"`
-	ThrottleSpeed  int64  `json:"throttle_speed,omitempty"`
 }
 
 func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTracker, error) {
@@ -52,10 +51,10 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 		httpTimeout = timeout
 	}
 	return &DatacapTracker{
-		client:         NewClient(options.URL, httpTimeout),
-		reportInterval: reportInterval,
-		throttleSpeed:  options.ThrottleSpeed,
-		logger:         logger,
+		client:           NewClient(options.URL, httpTimeout),
+		reportInterval:   reportInterval,
+		throttleRegistry: NewThrottleRegistry(),
+		logger:           logger,
 	}, nil
 }
 
@@ -74,7 +73,7 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 		Logger:         t.logger,
 		ClientInfo:     info,
 		ReportInterval: t.reportInterval,
-		ThrottleSpeed:  t.throttleSpeed,
+		Throttler:      t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
 }
 func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
@@ -92,6 +91,6 @@ func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 		Logger:         t.logger,
 		ClientInfo:     info,
 		ReportInterval: t.reportInterval,
-		ThrottleSpeed:  t.throttleSpeed,
+		Throttler:      t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
 }

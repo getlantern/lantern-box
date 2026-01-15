@@ -137,15 +137,18 @@ func (t *Throttler) WaitWrite(ctx context.Context, n int) error {
 }
 
 // wait implements the token bucket algorithm for rate limiting.
+// IMPORTANT: This holds the lock during the entire wait to ensure proper serialization.
+// Without this, parallel goroutines could all calculate waits and wait simultaneously,
+// defeating the rate limiting.
 func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 	if n <= 0 {
 		return nil
 	}
 
 	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	if !t.enabled {
-		t.mu.Unlock()
 		return nil
 	}
 
@@ -169,7 +172,6 @@ func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 
 	// If rate is 0 or negative, no throttling
 	if rate <= 0 {
-		t.mu.Unlock()
 		return nil
 	}
 
@@ -188,23 +190,24 @@ func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 	if *tokens >= required {
 		// Consume tokens and proceed immediately
 		*tokens -= required
-		t.mu.Unlock()
 		return nil
 	}
 
-	// Not enough tokens - calculate wait time
+	// Not enough tokens - calculate wait time for the deficit
 	deficit := required - *tokens
 	waitTime := time.Duration(deficit / float64(rate) * float64(time.Second))
 
 	// Consume all available tokens
 	*tokens = 0
-	t.mu.Unlock()
 
-	// Wait for the required time
+	// Wait while holding the lock (this serializes all consumers)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(waitTime):
+		// After wait, tokens have refilled by deficit amount
+		// Update lastRefill to now so next caller gets accurate refill
+		*lastRefill = time.Now()
 		return nil
 	}
 }
