@@ -72,6 +72,43 @@ func (t *Throttler) EnableWithRates(readBytesPerSec, writeBytesPerSec int64) {
 	t.writeLastRefill = now
 }
 
+// UpdateRates updates throttle rates without resetting the token bucket.
+// Use this when the throttle state is being refreshed (e.g., every report interval)
+// to avoid giving users a burst of full-speed traffic.
+func (t *Throttler) UpdateRates(readBytesPerSec, writeBytesPerSec int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !t.enabled {
+		// Not currently throttling, do a full enable with fresh bucket
+		t.enabled = true
+		now := time.Now()
+		t.readRate = readBytesPerSec
+		t.writeRate = writeBytesPerSec
+		t.readTokens = float64(readBytesPerSec)
+		t.readCapacity = float64(readBytesPerSec)
+		t.readLastRefill = now
+		t.writeTokens = float64(writeBytesPerSec)
+		t.writeCapacity = float64(writeBytesPerSec)
+		t.writeLastRefill = now
+		return
+	}
+
+	// Already throttling - update rates but preserve current tokens
+	t.readRate = readBytesPerSec
+	t.readCapacity = float64(readBytesPerSec)
+	// Clamp tokens to new capacity if it decreased
+	if t.readTokens > t.readCapacity {
+		t.readTokens = t.readCapacity
+	}
+
+	t.writeRate = writeBytesPerSec
+	t.writeCapacity = float64(writeBytesPerSec)
+	if t.writeTokens > t.writeCapacity {
+		t.writeTokens = t.writeCapacity
+	}
+}
+
 // Disable disables throttling.
 func (t *Throttler) Disable() {
 	t.mu.Lock()
