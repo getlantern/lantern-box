@@ -203,6 +203,9 @@ func TestDataCapEndToEndWithThrottling(t *testing.T) {
 	testData := make([]byte, 1024*10) // 10 KB
 	mockConn := newMockConn(testData)
 
+	// Create throttler for test (enabled at 10 KB/s)
+	testThrottler := NewThrottler(1024 * 10) // 10 KB/s (slow for testing)
+
 	// Create datacap-wrapped connection with throttling
 	config := ConnConfig{
 		Conn:   mockConn,
@@ -214,7 +217,7 @@ func TestDataCapEndToEndWithThrottling(t *testing.T) {
 		},
 		Logger:         noopLogger,
 		ReportInterval: 100 * time.Millisecond,
-		ThrottleSpeed:  1024 * 10, // 10 KB/s (slow for testing)
+		Throttler:      testThrottler,
 	}
 	conn := NewConn(config)
 
@@ -306,8 +309,8 @@ func TestDataCapThrottleSpeedAdjustment(t *testing.T) {
 
 			// Simulate status update
 			status := &DataCapStatus{
-				Throttle:       tc.throttle,
-				CapLimit:       tc.capLimit,
+				Throttle: tc.throttle,
+				CapLimit: tc.capLimit,
 			}
 
 			conn.updateThrottleState(status)
@@ -738,8 +741,8 @@ func TestDataCapThrottleDisableAfterEnable(t *testing.T) {
 
 	// Enable throttling (data exhausted scenario - Throttle=true, RemainingBytes=0)
 	status1 := &DataCapStatus{
-		Throttle:       true,
-		CapLimit:       10000000000,
+		Throttle: true,
+		CapLimit: 10000000000,
 	}
 	conn.updateThrottleState(status1)
 
@@ -747,8 +750,8 @@ func TestDataCapThrottleDisableAfterEnable(t *testing.T) {
 
 	// Disable throttling (no datacap scenario - CapLimit=0)
 	status2 := &DataCapStatus{
-		Throttle:       false,
-		CapLimit:       0,
+		Throttle: false,
+		CapLimit: 0,
 	}
 	conn.updateThrottleState(status2)
 
@@ -1197,4 +1200,56 @@ func TestReportFailure_RetriesAndReportsDelta(t *testing.T) {
 
 	// Total bytes reported should be 1000 (successfully recovered from first failure)
 	assert.Equal(t, int64(1000), totalBytesReported.Load(), "Should report total bytes despite initial failure")
+}
+
+// TestSharedThrottler_MultipleConnections proves that multiple parallel connections
+// share the same throttler and are limited to the total throttle rate, not per-connection.
+//
+// The design uses POST-READ throttling for TCP backpressure, so we test the throttler
+// directly to verify that parallel consumers share the same token bucket.
+func TestSharedThrottler_MultipleConnections(t *testing.T) {
+	// Create a shared throttler at 1 KB/s (slow for clear measurement)
+	throttleRate := int64(1024) // 1 KB/s
+	sharedThrottler := NewThrottler(throttleRate)
+
+	// Drain the initial token bucket (1 KB capacity)
+	_ = sharedThrottler.WaitRead(context.Background(), 1024)
+
+	// Now the bucket is empty. 5 goroutines will each try to consume 512 bytes.
+	// Total: 2.5 KB at 1 KB/s = 2.5 seconds if shared correctly.
+	// If per-connection, each would take 0.5s (512 B / 1 KB/s).
+
+	numConsumers := 5
+	bytesPerConsumer := 512                       // 512 bytes each
+	totalBytes := numConsumers * bytesPerConsumer // 2.5 KB total
+
+	var wg sync.WaitGroup
+	startTime := time.Now()
+
+	for i := 0; i < numConsumers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			// Directly wait on shared throttler (simulating reads)
+			sharedThrottler.WaitRead(context.Background(), bytesPerConsumer)
+		}(i)
+	}
+
+	wg.Wait()
+	duration := time.Since(startTime)
+
+	// Expected: 2.5 KB at 1 KB/s = 2.5 seconds
+	expectedDuration := float64(totalBytes) / float64(throttleRate)
+
+	t.Logf("Consumers: %d, Total bytes: %d, Duration: %v, Expected: %.2fs",
+		numConsumers, totalBytes, duration, expectedDuration)
+
+	// Should take at least 2 seconds (with some margin for timing)
+	assert.GreaterOrEqual(t, duration.Seconds(), expectedDuration*0.8,
+		"Should take at least %.1fs (shared throttle)", expectedDuration*0.8)
+
+	// CRITICAL: If throttling was per-throttler (each consumer had its own),
+	// they would all complete in ~0.5s. Shared throttling means total = 2.5s.
+	assert.Greater(t, duration.Seconds(), 1.5,
+		"If duration < 1.5s, throttlers are NOT shared (BUG!)")
 }

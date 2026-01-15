@@ -143,9 +143,9 @@ func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 	}
 
 	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	if !t.enabled {
-		t.mu.Unlock()
 		return nil
 	}
 
@@ -169,7 +169,6 @@ func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 
 	// If rate is 0 or negative, no throttling
 	if rate <= 0 {
-		t.mu.Unlock()
 		return nil
 	}
 
@@ -188,23 +187,25 @@ func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 	if *tokens >= required {
 		// Consume tokens and proceed immediately
 		*tokens -= required
-		t.mu.Unlock()
 		return nil
 	}
 
-	// Not enough tokens - calculate wait time
+	// Not enough tokens - calculate wait time for the deficit
 	deficit := required - *tokens
 	waitTime := time.Duration(deficit / float64(rate) * float64(time.Second))
 
 	// Consume all available tokens
 	*tokens = 0
-	t.mu.Unlock()
 
-	// Wait for the required time
+	// Wait while holding the lock (this serializes all consumers)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(waitTime):
+		// Update lastRefill to prevent next caller from getting "free" tokens
+		// for the time we just waited. Without this, elapsed time would include
+		// our wait, giving the next caller unearned tokens.
+		*lastRefill = time.Now()
 		return nil
 	}
 }

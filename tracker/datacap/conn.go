@@ -52,7 +52,7 @@ type ConnConfig struct {
 	Logger         log.ContextLogger
 	ClientInfo     clientcontext.ClientInfo
 	ReportInterval time.Duration
-	ThrottleSpeed  int64
+	Throttler      *Throttler // Shared throttler from registry
 }
 
 // NewConn creates a new datacap-tracked connection wrapper.
@@ -64,6 +64,12 @@ func NewConn(config ConnConfig) *Conn {
 		config.ReportInterval = 10 * time.Second
 	}
 
+	// Default to disabled throttler if not provided
+	throttler := config.Throttler
+	if throttler == nil {
+		throttler = NewThrottler(0) // Disabled by default
+	}
+
 	conn := &Conn{
 		Conn:         config.Conn,
 		ctx:          ctx,
@@ -72,7 +78,7 @@ func NewConn(config ConnConfig) *Conn {
 		logger:       config.Logger,
 		clientInfo:   config.ClientInfo,
 		reportTicker: time.NewTicker(config.ReportInterval),
-		throttler:    NewThrottler(config.ThrottleSpeed),
+		throttler:    throttler,
 	}
 
 	// Start periodic reporting goroutine
