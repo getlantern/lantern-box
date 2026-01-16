@@ -207,7 +207,8 @@ func (c *PacketConn) updateThrottleState(status *DataCapStatus) {
 	}
 
 	if status.Throttle {
-		c.throttler.UpdateRates(lowTierSpeedBytesPerSec, defaultUploadSpeedBytesPerSec)
+		// We want to throttle Download (Write) but keep Upload (Read) fast enough for requests.
+		c.throttler.UpdateRates(defaultUploadSpeedBytesPerSec, lowTierSpeedBytesPerSec)
 		c.logger.Debug("data cap exhausted, throttling at ", lowTierSpeedBytesPerSec, " bytes/s")
 	} else {
 		c.throttler.Disable()

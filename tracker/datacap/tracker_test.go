@@ -102,5 +102,10 @@ func TestRoutedConnection_FreeUserWithCap_EnablesThrottling(t *testing.T) {
 
 	// Throttler should be enabled when Throttle=true (data exhausted)
 	assert.True(t, conn.throttler.IsEnabled(), "Throttler should be enabled for capped user")
+
+	// Verify rates: Write (Download) should be throttled, Read (Upload) should allow more
+	assert.Equal(t, int64(lowTierSpeedBytesPerSec), conn.throttler.GetWriteRate(), "Write rate (Download) should be throttled to low tier")
+	assert.Equal(t, int64(defaultUploadSpeedBytesPerSec), conn.throttler.GetReadRate(), "Read rate (Upload) should be default upload speed")
+
 	conn.Close()
 }
