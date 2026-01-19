@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"maps"
 	"slices"
 	"sync"
@@ -319,28 +318,17 @@ func (rq *removalQueue) checkPending() {
 			if !exists {
 				continue
 			}
-
+			// double check if outbound/endpoint still exists
+			if _, exists = rq.outMgr.Outbound(tag); !exists {
+				rq.logger.Trace("outbound already removed", "tag", tag)
+				delete(rq.pending, tag)
+				continue
+			}
+			rq.logger.Debug("removing outbound", "tag", tag)
 			if item.isEndpoint {
-				rq.logger.Debug("removing endpoint", "tag", tag)
-				if _, exists = rq.epMgr.Get(tag); !exists {
-					rq.logger.Trace("endpoint already removed", "tag", tag)
-					delete(rq.pending, tag)
-					continue
-				}
-				if err := rq.epMgr.Remove(tag); err != nil {
-					rq.logger.Warn("failed to remove endpoint", slog.Any("error", err), slog.String("tag", tag))
-				}
+				rq.epMgr.Remove(tag)
 			} else {
-				rq.logger.Debug("removing outbound", "tag", tag)
-				// double check if outbound/endpoint still exists
-				if _, exists = rq.outMgr.Outbound(tag); !exists {
-					rq.logger.Trace("outbound already removed", "tag", tag)
-					delete(rq.pending, tag)
-					continue
-				}
-				if err := rq.outMgr.Remove(tag); err != nil {
-					rq.logger.Warn("failed to remove outbound", slog.Any("error", err), slog.String("tag", tag))
-				}
+				rq.outMgr.Remove(tag)
 			}
 			delete(rq.pending, tag)
 		}
