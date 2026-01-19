@@ -30,18 +30,20 @@ func TestURLTestGroup_CloseStopsCheckLoop(t *testing.T) {
 
 	// Trigger checkLoop
 	g.keepAlive()
-	time.Sleep(500 * time.Millisecond)
-	g.access.Lock()
-	assert.True(t, g.isAlive)
-	g.access.Unlock()
+	assert.Eventually(t, func() bool {
+		g.access.Lock()
+		defer g.access.Unlock()
+		return g.isAlive
+	}, time.Second, 200*time.Millisecond)
 
 	// Now stop it
 	cancel()
 	assert.NoError(t, g.Close())
 
 	// Assert it stops
-	time.Sleep(500 * time.Millisecond)
-	g.access.Lock()
-	assert.False(t, g.isAlive)
-	g.access.Unlock()
+	assert.Eventually(t, func() bool {
+		g.access.Lock()
+		defer g.access.Unlock()
+		return !g.isAlive
+	}, time.Second, 200*time.Millisecond)
 }
