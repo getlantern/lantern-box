@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/sing/common/x/list"
+
 	A "github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/urltest"
@@ -411,7 +413,11 @@ func (g *urlTestGroup) checkLoop() {
 	g.access.Lock()
 	ctx, cancel := context.WithCancel(g.ctx)
 	ticker := time.NewTicker(g.interval)
-	pauseCallback := pause.RegisterTicker(g.pauseMgr, ticker, g.interval, nil)
+
+	var pauseCallback *list.Element[pause.Callback]
+	if g.pauseMgr != nil {
+		pauseCallback = pause.RegisterTicker(g.pauseMgr, ticker, g.interval, nil)
+	}
 	g.idleTimer = time.NewTimer(g.idleTimeout)
 	g.isAlive = true
 	g.access.Unlock()
@@ -419,7 +425,9 @@ func (g *urlTestGroup) checkLoop() {
 	defer func() {
 		cancel()
 		g.access.Lock()
-		g.pauseMgr.UnregisterCallback(pauseCallback)
+		if g.pauseMgr != nil {
+			g.pauseMgr.UnregisterCallback(pauseCallback)
+		}
 		g.idleTimer.Stop()
 		g.isAlive = false
 		g.access.Unlock()
