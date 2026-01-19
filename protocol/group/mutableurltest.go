@@ -430,6 +430,9 @@ func (g *urlTestGroup) checkLoop() {
 			return
 		case <-g.idleTimer.C:
 			return
+		case <-ctx.Done():
+			g.logger.Warn("context canceled")
+			return
 		case <-ticker.C:
 			go g.urlTest(ctx, false)
 		}
