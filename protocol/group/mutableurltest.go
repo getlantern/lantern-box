@@ -411,7 +411,6 @@ func (g *urlTestGroup) checkLoop() {
 	g.access.Lock()
 	ctx, cancel := context.WithCancel(g.ctx)
 	ticker := time.NewTicker(g.interval)
-
 	pauseCallback := pause.RegisterTicker(g.pauseMgr, ticker, g.interval, nil)
 	g.idleTimer = time.NewTimer(g.idleTimeout)
 	g.isAlive = true
