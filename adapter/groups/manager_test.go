@@ -111,6 +111,10 @@ type mockOutboundManager struct {
 	mu   sync.Mutex
 }
 
+func (m *mockOutboundManager) Outbound(tag string) (adapter.Outbound, bool) {
+	return nil, slices.Contains(m.tags, tag)
+}
+
 func (m *mockOutboundManager) Remove(tag string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -124,6 +128,10 @@ type mockEndpointManager struct {
 	adapter.EndpointManager
 	tags []string
 	mu   sync.Mutex
+}
+
+func (m *mockEndpointManager) Get(tag string) (adapter.Endpoint, bool) {
+	return nil, slices.Contains(m.tags, tag)
 }
 
 func (m *mockEndpointManager) Remove(tag string) error {
