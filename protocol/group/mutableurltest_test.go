@@ -7,6 +7,8 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	sboxLog "github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/x/list"
+	"github.com/sagernet/sing/service/pause"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -26,6 +28,7 @@ func TestURLTestGroup_CloseStopsCheckLoop(t *testing.T) {
 
 	// Pretend Start/PostStart succeeded
 	g.started = true
+	g.pauseMgr = &mockPauseManager{}
 	g.lastActive.Store(time.Now())
 
 	// Trigger checkLoop
@@ -46,4 +49,45 @@ func TestURLTestGroup_CloseStopsCheckLoop(t *testing.T) {
 		defer g.access.Unlock()
 		return !g.isAlive
 	}, time.Second, 200*time.Millisecond)
+}
+
+type mockPauseManager struct{}
+
+func (m *mockPauseManager) DevicePause() {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockPauseManager) DeviceWake() {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockPauseManager) NetworkPause() {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockPauseManager) NetworkWake() {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockPauseManager) IsDevicePaused() bool {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockPauseManager) IsNetworkPaused() bool {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockPauseManager) IsPaused() bool {
+	return false
+}
+
+func (m *mockPauseManager) WaitActive() {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockPauseManager) RegisterCallback(callback pause.Callback) *list.Element[pause.Callback] {
+	return nil
+}
+
+func (m *mockPauseManager) UnregisterCallback(element *list.Element[pause.Callback]) {
 }
