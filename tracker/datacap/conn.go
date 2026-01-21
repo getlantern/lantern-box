@@ -16,9 +16,9 @@ import (
 const (
 
 	// Default upload speed (not throttled to allow user uploads even when capped)
-	defaultUploadSpeedBytesPerSec = 5 * 1024 * 1024 // 5 MB/s
+	defaultUploadSpeedBytesPerSec = 640 * 1024 // 5 Mb/s (640 KB/s)
 
-	lowTierSpeedBytesPerSec = 128 * 1024 // 128 KB/s
+	lowTierSpeedBytesPerSec = 16 * 1024 // 128 Kb/s (16 KB/s)
 )
 
 // Conn wraps a net.Conn and tracks data consumption for datacap reporting.

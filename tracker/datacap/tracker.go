@@ -62,9 +62,11 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 	info, ok := clientcontext.ClientInfoFromContext(ctx)
 	if !ok {
 		// conn is not from a clientcontext-aware client (e.g., not radiance)
+		t.logger.Debug("skipping datacap: no client info in context")
 		return conn
 	}
 	if info.IsPro {
+		t.logger.Debug("skipping datacap: client is pro ", info.DeviceID)
 		return conn
 	}
 	return NewConn(ConnConfig{
@@ -80,9 +82,11 @@ func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 	info, ok := clientcontext.ClientInfoFromContext(ctx)
 	if !ok {
 		// conn is not from a clientcontext-aware client (e.g., not radiance)
+		t.logger.Debug("skipping datacap: no client info in context")
 		return conn
 	}
 	if info.IsPro {
+		t.logger.Debug("skipping datacap: client is pro ", info.DeviceID)
 		return conn
 	}
 	return NewPacketConn(PacketConnConfig{
