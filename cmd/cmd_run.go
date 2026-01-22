@@ -17,9 +17,13 @@ import (
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric/noop"
+
 	"gopkg.in/ini.v1"
 
 	"github.com/getlantern/lantern-box/adapter"
+	"github.com/getlantern/lantern-box/metrics"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
 )
@@ -112,6 +116,18 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		clientCtxMgr.AppendTracker(datacapTracker)
 	} else {
 		log.Warn("Datacap URL not provided, datacap tracking disabled")
+	}
+
+	mp := otel.GetMeterProvider()
+	if _, ok := mp.(noop.MeterProvider); ok {
+		log.Info("Metrics not enabled, no meter provider configured")
+	} else {
+		metricsTracker, err := metrics.NewTracker()
+		if err != nil {
+			return nil, nil, fmt.Errorf("create metrics tracker: %w", err)
+		}
+		instance.Router().AppendTracker(metricsTracker)
+		log.Info("Metric Tracking Enabled")
 	}
 
 	osSignals := make(chan os.Signal, 1)
