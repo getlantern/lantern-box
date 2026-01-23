@@ -6,15 +6,12 @@ import (
 	"os"
 	"strings"
 
-	sdkotel "go.opentelemetry.io/otel"
-
-	"go.opentelemetry.io/otel/metric/noop"
-
-	"github.com/spf13/cobra"
-
 	box "github.com/getlantern/lantern-box"
-	"github.com/getlantern/lantern-box/metrics"
 	"github.com/getlantern/lantern-box/otel"
+	"github.com/getlantern/lantern-box/tracker/metrics"
+	"github.com/spf13/cobra"
+	sdkotel "go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 type ProxyInfo struct {

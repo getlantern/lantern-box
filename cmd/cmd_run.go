@@ -23,9 +23,9 @@ import (
 	"gopkg.in/ini.v1"
 
 	"github.com/getlantern/lantern-box/adapter"
-	"github.com/getlantern/lantern-box/metrics"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
+	"github.com/getlantern/lantern-box/tracker/metrics"
 )
 
 func init() {
