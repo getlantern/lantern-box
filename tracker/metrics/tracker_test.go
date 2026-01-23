@@ -37,11 +37,11 @@ func TestTracker(t *testing.T) {
 
 	clientSentMessage := []byte("A client sent a short request...")
 	wg.Add(1)
-	serverRecieve := 0
+	serverReceive := 0
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, len(clientSentMessage))
-		serverRecieve, err = serverTracked.Read(buf)
+		serverReceive, err = serverTracked.Read(buf)
 		assert.NoError(t, err)
 	}()
 
@@ -77,10 +77,10 @@ func TestTracker(t *testing.T) {
 		t.Logf("%s: %d\n", k, v)
 	}
 	if results["transmit"] != int64(serverTransmit) {
-		t.Errorf("transmit bytes not match, got %d, want %d", results["transmit"], serverTransmit)
+		t.Errorf("transmit bytes did not match, got %d, want %d", results["transmit"], serverTransmit)
 	}
-	if results["receive"] != int64(serverRecieve) {
-		t.Errorf("receive bytes not match, got %d, want %d", results["receive"], serverRecieve)
+	if results["receive"] != int64(serverReceive) {
+		t.Errorf("receive bytes did not match, got %d, want %d", results["receive"], serverReceive)
 	}
 
 }
