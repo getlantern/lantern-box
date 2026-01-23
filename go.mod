@@ -30,15 +30,16 @@ require (
 	github.com/spf13/cobra v1.10.1
 	github.com/stretchr/testify v1.11.1
 	github.com/tetratelabs/wazero v1.7.3
-	go.opentelemetry.io/otel v1.38.0
-	go.opentelemetry.io/otel/metric v1.38.0
-	go.opentelemetry.io/otel/trace v1.38.0
+	go.opentelemetry.io/otel v1.39.0
+	go.opentelemetry.io/otel/metric v1.39.0
+	go.opentelemetry.io/otel/trace v1.39.0
 	gopkg.in/ini.v1 v1.67.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dsnet/compress v0.0.2-0.20210315054119-f66993602bf5 // indirect
 	github.com/getlantern/context v0.0.0-20220418194847-3d5e7a086201 // indirect
 	github.com/getlantern/golog v0.0.0-20230503153817-8e72de7e0a65 // indirect
@@ -50,11 +51,15 @@ require (
 	github.com/klauspost/pgzip v1.2.5 // indirect
 	github.com/mholt/archiver/v3 v3.5.1 // indirect
 	github.com/nwaples/rardecode v1.1.2 // indirect
+	github.com/ormanli/otel-metric-mocks v0.0.0-20231210142449-f7870276828c // indirect
 	github.com/oschwald/geoip2-golang v1.9.0 // indirect
 	github.com/oschwald/maxminddb-golang v1.13.1 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
 	github.com/ulikunitz/xz v0.5.10 // indirect
 	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 // indirect
+	go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.39.0 // indirect
+	go.opentelemetry.io/otel/log v0.14.0 // indirect
+	go.opentelemetry.io/otel/sdk/log v0.14.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.7.1 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20251124214823-79d6a2a48846 // indirect
@@ -215,10 +220,10 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.etcd.io/bbolt v1.3.6 // indirect
-	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
+	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.38.0
-	go.opentelemetry.io/otel/sdk v1.38.0
-	go.opentelemetry.io/otel/sdk/metric v1.38.0
+	go.opentelemetry.io/otel/sdk v1.39.0
+	go.opentelemetry.io/otel/sdk/metric v1.39.0
 	go.uber.org/mock v0.5.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
@@ -229,7 +234,7 @@ require (
 	golang.org/x/mod v0.27.0 // indirect
 	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/sync v0.16.0 // indirect
-	golang.org/x/sys v0.35.0 // indirect
+	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/term v0.34.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
