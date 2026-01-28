@@ -82,7 +82,6 @@ func TestTracker(t *testing.T) {
 	if results["receive"] != int64(serverReceive) {
 		t.Errorf("receive bytes did not match, got %d, want %d", results["receive"], serverReceive)
 	}
-
 }
 
 func extractCountersByAttribute(rm metricdata.ResourceMetrics, name string) map[string]int64 {
