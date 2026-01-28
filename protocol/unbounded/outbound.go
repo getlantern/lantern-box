@@ -15,14 +15,16 @@ import (
 
 	UBClientcore "github.com/getlantern/broflake/clientcore"
 	UBCommon "github.com/getlantern/broflake/common"
-	C "github.com/getlantern/lantern-box/constant"
-	"github.com/getlantern/lantern-box/option"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/dialer"
 	singlog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
+	C "github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/option"
 )
 
 // WIP usage: edit sing-box/include/registry.go to import and register this protocol
@@ -139,6 +141,17 @@ func NewOutbound(
 	}
 
 	UBCommon.SetDebugLogger(log.New(la, "", 0))
+
+	// wrap sing-box dialer in transport.Net for pion/webrtc usage
+	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
+	if err != nil {
+		return nil, err
+	}
+	rtcNet, err := newRTCNet(ctx, outboundDialer)
+	if err != nil {
+		return nil, err
+	}
+	rtcOpt.Net = rtcNet
 
 	BFConn, ui, err := UBClientcore.NewBroflake(bfOpt, rtcOpt, egOpt)
 	if err != nil {

@@ -22,8 +22,10 @@ require (
 	github.com/Jigsaw-Code/outline-sdk v0.0.19
 	github.com/Jigsaw-Code/outline-sdk/x v0.0.2
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
+	github.com/getlantern/broflake v0.0.0-20260128002846-de79df6a2853
 	github.com/getlantern/lantern-water v0.0.0-20250331153903-07abebe611e8
 	github.com/gobwas/ws v1.4.0
+	github.com/pion/transport/v3 v3.0.7
 	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/sing v0.7.13
 	github.com/sagernet/sing-box v1.11.5
@@ -41,7 +43,6 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/dsnet/compress v0.0.2-0.20210315054119-f66993602bf5 // indirect
 	github.com/enobufs/go-nats v0.0.1 // indirect
-	github.com/getlantern/broflake v0.0.0-20251207191201-44af47ca931f // indirect
 	github.com/getlantern/context v0.0.0-20220418194847-3d5e7a086201 // indirect
 	github.com/getlantern/golog v0.0.0-20230503153817-8e72de7e0a65 // indirect
 	github.com/getlantern/hex v0.0.0-20220104173244-ad7e4b9194dc // indirect
@@ -63,7 +64,6 @@ require (
 	github.com/pion/mdns/v2 v2.0.7 // indirect
 	github.com/pion/srtp/v3 v3.0.6 // indirect
 	github.com/pion/stun/v3 v3.0.0 // indirect
-	github.com/pion/transport/v3 v3.0.7 // indirect
 	github.com/pion/turn v1.3.7 // indirect
 	github.com/pion/turn/v4 v4.0.2 // indirect
 	github.com/pion/webrtc/v4 v4.1.2 // indirect
