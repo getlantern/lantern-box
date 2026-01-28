@@ -7,9 +7,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"log"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"time"
 
@@ -18,10 +20,12 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/constant"
 	singlog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 
 	C "github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
@@ -152,6 +156,23 @@ func NewOutbound(
 		return nil, err
 	}
 	rtcOpt.Net = rtcNet
+
+	outboundManager := service.FromContext[adapter.OutboundManager](ctx)
+	direct, exists := outboundManager.Outbound(constant.TypeDirect)
+	if !exists {
+		return nil, errors.New("Could not find direct outbound")
+	}
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return direct.DialContext(ctx, network, M.ParseSocksaddr(addr))
+	}
+	rtcOpt.HTTPClient = &http.Client{
+		Transport: &http.Transport{
+			Dial: func(network, addr string) (net.Conn, error) {
+				return dialContext(ctx, network, addr)
+			},
+			DialContext: dialContext,
+		},
+	}
 
 	BFConn, ui, err := UBClientcore.NewBroflake(bfOpt, rtcOpt, egOpt)
 	if err != nil {
