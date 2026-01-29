@@ -211,11 +211,13 @@ func (c *readPacketConn) readInfo() (*ClientInfo, error) {
 		return nil, fmt.Errorf("unmarshaling client info: %w", err)
 	}
 
-	// CRITICAL: Use a new buffer for the response to ensure we have enough headroom
-	// for the packet headers (e.g. VMess). Reusing the old buffer with Reset()
-	// discards the headroom and causes 'buffer overflow' panics.
+	// CRITICAL: advance buffer start to leave room for headers on various protocols
 	respBuffer := buf.NewPacket()
 	defer respBuffer.Release()
+
+	headroom := N.CalculateFrontHeadroom(c.PacketConn)
+	respBuffer.Advance(headroom)
+
 	respBuffer.WriteString("OK")
 	if err := c.WritePacket(respBuffer, destination); err != nil {
 		return nil, fmt.Errorf("writing OK response: %w", err)
