@@ -53,7 +53,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, E.New("no WASM URLs available")
 	}
 
-	d, err := waterDownloader.NewWASMDownloader(options.WASMAvailableAt, &http.Client{Timeout: 1 * time.Minute})
+	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, &http.Client{Timeout: 1 * time.Minute})
 	if err != nil {
 		return nil, E.New("failed to create WASM downloader", err)
 	}
