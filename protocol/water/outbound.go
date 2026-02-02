@@ -70,7 +70,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	slogLogger := slog.New(L.NewLogHandler(logger))
 	vc := waterVC.NewWaterVersionControl(wasmDir, slogLogger)
-	d, err := waterDownloader.NewWASMDownloader(options.WASMAvailableAt, &http.Client{Timeout: timeout})
+	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, &http.Client{Timeout: timeout})
 	if err != nil {
 		return nil, E.New("failed to create WASM downloader", err)
 	}

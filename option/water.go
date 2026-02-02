@@ -8,6 +8,9 @@ type WATERInboundOptions struct {
 	option.ListenOptions
 	// Transport works as a identifier for the WASM logs
 	Transport string `json:"transport"`
+	// Hashsum is used for validating if the downloaded WASM
+	// hasn't been tampered. Expects a sha256 sum.
+	Hashsum string `json:"hashsum"`
 	// WASMAvailableAt must provide a list of URLs where the WASM file
 	// can be downloaded
 	WASMAvailableAt []string `json:"wasm_available_at"`
@@ -22,6 +25,9 @@ type WATEROutboundOptions struct {
 	option.DialerOptions
 	// Transport works as a identifier for the WASM logs
 	Transport string `json:"transport"`
+	// Hashsum is used for validating if the downloaded WASM
+	// hasn't been tampered. Expects a sha256 sum.
+	Hashsum string `json:"hashsum"`
 	// WASMAvailableAt must provide a list of URLs where the WASM file
 	// can be downloaded
 	WASMAvailableAt []string `json:"wasm_available_at"`
