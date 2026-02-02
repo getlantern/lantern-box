@@ -10,7 +10,7 @@ type WATERInboundOptions struct {
 	Transport string `json:"transport"`
 	// Hashsum is used for validating if the downloaded WASM
 	// hasn't been tempered. Expects a sha256 sum.
-	Hashsum string `json:hashsum`
+	Hashsum string `json:"hashsum"`
 	// WASMAvailableAt must provide a list of URLs where the WASM file
 	// can be downloaded
 	WASMAvailableAt []string `json:"wasm_available_at"`
@@ -27,7 +27,7 @@ type WATEROutboundOptions struct {
 	Transport string `json:"transport"`
 	// Hashsum is used for validating if the downloaded WASM
 	// hasn't been tempered. Expects a sha256 sum.
-	Hashsum string `json:hashsum`
+	Hashsum string `json:"hashsum"`
 	// WASMAvailableAt must provide a list of URLs where the WASM file
 	// can be downloaded
 	WASMAvailableAt []string `json:"wasm_available_at"`
