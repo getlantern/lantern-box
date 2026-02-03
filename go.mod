@@ -22,7 +22,7 @@ require (
 	github.com/Jigsaw-Code/outline-sdk v0.0.19
 	github.com/Jigsaw-Code/outline-sdk/x v0.0.2
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
-	github.com/getlantern/lantern-water v0.0.0-20250331153903-07abebe611e8
+	github.com/getlantern/lantern-water v0.0.0-20260130212632-d5ea08838250
 	github.com/gobwas/ws v1.4.0
 	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/sing v0.7.18
