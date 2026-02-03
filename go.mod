@@ -4,9 +4,9 @@ go 1.24.0
 
 toolchain go1.24.1
 
-replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.16-lantern
+replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.18-lantern
 
-replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.12.18-lantern
+replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.12.19-lantern
 
 replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4
 
@@ -25,7 +25,7 @@ require (
 	github.com/getlantern/lantern-water v0.0.0-20250331153903-07abebe611e8
 	github.com/gobwas/ws v1.4.0
 	github.com/refraction-networking/water v0.7.1-alpha
-	github.com/sagernet/sing v0.7.16
+	github.com/sagernet/sing v0.7.18
 	github.com/sagernet/sing-box v1.11.5
 	github.com/spf13/cobra v1.10.1
 	github.com/stretchr/testify v1.11.1
@@ -192,7 +192,7 @@ require (
 	github.com/sagernet/sing-shadowsocks v0.2.8 // indirect
 	github.com/sagernet/sing-shadowsocks2 v0.2.1 // indirect
 	github.com/sagernet/sing-shadowtls v0.2.1-0.20250503051639-fcd445d33c11 // indirect
-	github.com/sagernet/sing-tun v0.7.9 // indirect
+	github.com/sagernet/sing-tun v0.7.10 // indirect
 	github.com/sagernet/sing-vmess v0.2.7 // indirect
 	github.com/sagernet/smux v1.5.50-sing-box-mod.1 // indirect
 	github.com/sagernet/tailscale v1.80.3-sing-box-1.12-mod.2 // indirect
