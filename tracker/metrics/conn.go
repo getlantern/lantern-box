@@ -20,7 +20,7 @@ type Conn struct {
 // NewConn creates a new Conn instance.
 func NewConn(conn net.Conn, metadata *adapter.InboundContext) net.Conn {
 	attributes := metadataToAttributes(metadata)
-	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attributes...))
+	metrics.Connections.Add(context.Background(), 1, metric.WithAttributes(attributes...))
 	return &Conn{
 		Conn:       conn,
 		attributes: attributes,
