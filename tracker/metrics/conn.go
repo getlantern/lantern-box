@@ -55,3 +55,7 @@ func (c *Conn) Close() error {
 	metrics.conns.Add(context.Background(), -1, metric.WithAttributes(c.attributes...))
 	return c.Conn.Close()
 }
+
+func (c *Conn) Upstream() any {
+	return c.Conn
+}

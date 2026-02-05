@@ -60,3 +60,7 @@ func (c *PacketConn) Close() error {
 	metrics.conns.Add(context.Background(), -1, metric.WithAttributes(c.attributes...))
 	return c.PacketConn.Close()
 }
+
+func (c *PacketConn) Upstream() any {
+	return c.PacketConn
+}

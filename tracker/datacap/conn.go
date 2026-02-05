@@ -241,3 +241,7 @@ func (c *Conn) GetStatus() (*DataCapStatus, error) {
 func (c *Conn) GetBytesConsumed() int64 {
 	return c.bytesSent.Load() + c.bytesReceived.Load()
 }
+
+func (c *Conn) Upstream() any {
+	return c.Conn
+}
