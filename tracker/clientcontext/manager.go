@@ -174,6 +174,10 @@ func (c *readConn) readInfo() (*ClientInfo, error) {
 	return &info, nil
 }
 
+func (c *readConn) Upstream() any {
+	return c.Conn
+}
+
 type readPacketConn struct {
 	N.PacketConn
 	mgr         *Manager
@@ -214,11 +218,22 @@ func (c *readPacketConn) readInfo() (*ClientInfo, error) {
 	// CRITICAL: Use a new buffer for the response to ensure we have enough headroom
 	// for the packet headers (e.g. VMess). Reusing the old buffer with Reset()
 	// discards the headroom and causes 'buffer overflow' panics.
+	// advance buffer start, and reserve end, to leave room for headers/trailers on various protocols
 	respBuffer := buf.NewPacket()
 	defer respBuffer.Release()
+
+	headroom := N.CalculateFrontHeadroom(c)
+	rearHeadroom := N.CalculateRearHeadroom(c)
+	respBuffer.Advance(headroom)
+	respBuffer.Reserve(rearHeadroom)
+
 	respBuffer.WriteString("OK")
 	if err := c.WritePacket(respBuffer, destination); err != nil {
 		return nil, fmt.Errorf("writing OK response: %w", err)
 	}
 	return &info, nil
+}
+
+func (c *readPacketConn) Upstream() any {
+	return c.PacketConn
 }

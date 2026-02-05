@@ -166,6 +166,10 @@ func (c *writeConn) sendInfo(conn net.Conn) error {
 	return nil
 }
 
+func (c *writeConn) Upstream() any {
+	return c.Conn
+}
+
 type writePacketConn struct {
 	N.PacketConn
 	metadata      adapter.InboundContext
@@ -245,4 +249,8 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 		return fmt.Errorf("invalid response: %s", resp)
 	}
 	return nil
+}
+
+func (c *writePacketConn) Upstream() any {
+	return c.PacketConn
 }
