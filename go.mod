@@ -109,7 +109,6 @@ require (
 	github.com/getlantern/errors v1.0.4 // indirect
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/hidden v0.0.0-20220104173330-f221c5a24770 // indirect
-	github.com/getlantern/http-proxy-lantern/v2 v2.10.1
 	github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534 // indirect
 	github.com/go-chi/chi/v5 v5.2.2 // indirect
 	github.com/go-chi/render v1.0.3 // indirect
@@ -170,7 +169,6 @@ require (
 	github.com/pion/sdp/v3 v3.0.6 // indirect
 	github.com/pion/srtp/v2 v2.0.15 // indirect
 	github.com/pion/stun v0.6.1 // indirect
-	github.com/pion/transport v0.14.1 // indirect
 	github.com/pion/transport/v2 v2.2.3 // indirect
 	github.com/pion/turn/v2 v2.1.0 // indirect
 	github.com/pion/webrtc/v3 v3.2.6 // indirect
