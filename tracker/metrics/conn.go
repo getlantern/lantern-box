@@ -33,7 +33,7 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 	n, err = c.Conn.Read(b)
 	if n > 0 {
 		attrs := append(c.attributes, attribute.KeyValue{Key: "direction", Value: attribute.StringValue("receive")})
-		metrics.proxyIO.Add(context.Background(), int64(n), metric.WithAttributes(attrs...))
+		metrics.ProxyIO.Add(context.Background(), int64(n), metric.WithAttributes(attrs...))
 	}
 	return
 }
@@ -43,7 +43,7 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 	n, err = c.Conn.Write(b)
 	if n > 0 {
 		attrs := append(c.attributes, attribute.KeyValue{Key: "direction", Value: attribute.StringValue("transmit")})
-		metrics.proxyIO.Add(context.Background(), int64(n), metric.WithAttributes(attrs...))
+		metrics.ProxyIO.Add(context.Background(), int64(n), metric.WithAttributes(attrs...))
 	}
 	return
 }
