@@ -7,6 +7,7 @@ import (
 	"github.com/pion/transport/v3"
 	"github.com/pion/transport/v3/stdnet"
 
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -20,9 +21,25 @@ type rtcNet struct {
 	*stdnet.Net
 	ctx    context.Context
 	dialer N.Dialer
+	logger log.ContextLogger
 }
 
-func newRTCNet(ctx context.Context, dialer N.Dialer) (*rtcNet, error) {
+type logDialer struct {
+	d      N.Dialer
+	logger log.ContextLogger
+}
+
+func (d *logDialer) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
+	d.logger.Debug("dialing with sing-box dialer", "network", network, "destination", destination)
+	return d.d.DialContext(ctx, network, destination)
+}
+
+func (d *logDialer) ListenPacket(ctx context.Context, destination metadata.Socksaddr) (net.PacketConn, error) {
+	d.logger.Debug("listening with sing-box dialer", "destination", destination)
+	return d.d.ListenPacket(ctx, destination)
+}
+
+func newRTCNet(ctx context.Context, dialer N.Dialer, logger log.ContextLogger) (*rtcNet, error) {
 	snet, err := stdnet.NewNet()
 	if err != nil {
 		return nil, err
@@ -30,7 +47,8 @@ func newRTCNet(ctx context.Context, dialer N.Dialer) (*rtcNet, error) {
 	return &rtcNet{
 		Net:    snet,
 		ctx:    ctx,
-		dialer: dialer,
+		dialer: &logDialer{dialer, logger},
+		logger: logger,
 	}, nil
 }
 
@@ -46,7 +64,7 @@ func (n *rtcNet) ListenPacket(network string, address string) (net.PacketConn, e
 
 func (n *rtcNet) DialUDP(network string, laddr *net.UDPAddr, raddr *net.UDPAddr) (transport.UDPConn, error) {
 	destination := metadata.SocksaddrFromNet(raddr)
-	conn, err := n.dialer.DialContext(n.ctx, "udp", destination)
+	conn, err := n.dialer.DialContext(n.ctx, network, destination)
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +83,7 @@ func (n *rtcNet) DialUDP(network string, laddr *net.UDPAddr, raddr *net.UDPAddr)
 
 func (n *rtcNet) DialTCP(network string, laddr *net.TCPAddr, raddr *net.TCPAddr) (transport.TCPConn, error) {
 	destination := metadata.SocksaddrFromNet(raddr)
-	conn, err := n.dialer.DialContext(n.ctx, "tcp", destination)
+	conn, err := n.dialer.DialContext(n.ctx, network, destination)
 	if err != nil {
 		return nil, err
 	}
@@ -83,19 +101,30 @@ func (n *rtcNet) DialTCP(network string, laddr *net.TCPAddr, raddr *net.TCPAddr)
 }
 
 // maybe well implement these later. might be useful
-// func (n *rtcNet) ResolveIPAddr(network string, address string) (*net.IPAddr, error)   {}
-// func (n *rtcNet) ResolveUDPAddr(network string, address string) (*net.UDPAddr, error) {}
-// func (n *rtcNet) ResolveTCPAddr(network string, address string) (*net.TCPAddr, error) {}
+func (n *rtcNet) ResolveIPAddr(network string, address string) (*net.IPAddr, error) {
+	n.logger.Debug("resolving IP address", "network", network, "address", address)
+	return n.Net.ResolveIPAddr(network, address)
+}
+
+func (n *rtcNet) ResolveUDPAddr(network string, address string) (*net.UDPAddr, error) {
+	n.logger.Debug("resolving UDP address", "network", network, "address", address)
+	return n.Net.ResolveUDPAddr(network, address)
+}
+
+func (n *rtcNet) ResolveTCPAddr(network string, address string) (*net.TCPAddr, error) {
+	n.logger.Debug("resolving TCP address", "network", network, "address", address)
+	return n.Net.ResolveTCPAddr(network, address)
+}
 
 func (n *rtcNet) CreateDialer(dialer *net.Dialer) transport.Dialer {
-	return &rtcDialer{n.ctx, n.dialer}
+	return &rtcDialer{dialer, n}
 }
 
 type rtcDialer struct {
-	ctx    context.Context
-	dialer N.Dialer
+	dialer *net.Dialer
+	net    *rtcNet
 }
 
 func (d *rtcDialer) Dial(network, address string) (net.Conn, error) {
-	return d.dialer.DialContext(d.ctx, network, metadata.ParseSocksaddr(address))
+	return d.dialer.Dial(network, address)
 }

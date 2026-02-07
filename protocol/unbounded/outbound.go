@@ -151,7 +151,7 @@ func NewOutbound(
 	if err != nil {
 		return nil, err
 	}
-	rtcNet, err := newRTCNet(ctx, outboundDialer)
+	rtcNet, err := newRTCNet(ctx, outboundDialer, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +201,6 @@ func NewOutbound(
 		ql:           QUICLayer,
 	}
 
-	go QUICLayer.ListenAndMaintainQUICConnection()
 	return o, nil
 }
 
@@ -219,6 +218,13 @@ func (h *Outbound) DialContext(
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	return nil, os.ErrInvalid
+}
+
+func (h *Outbound) Start(stage adapter.StartStage) error {
+	if stage == adapter.StartStatePostStart {
+		go h.ql.ListenAndMaintainQUICConnection()
+	}
+	return nil
 }
 
 func (h *Outbound) Close() error {
