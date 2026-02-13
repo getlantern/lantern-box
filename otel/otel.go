@@ -11,9 +11,11 @@ import (
 	sdkotel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
@@ -83,6 +85,42 @@ func InitGlobalMeterProvider(opts *Opts) (func(), error) {
 		err := mp.Shutdown(ctx)
 		if err != nil {
 			log.Error(E.Cause(err, "error shutting down meter provider"))
+		}
+	}, nil
+}
+
+func InitGlobalTracerProvider(opts *Opts) (func(), error) {
+	traceOpts := []otlptracehttp.Option{
+		otlptracehttp.WithEndpoint(opts.Endpoint),
+		otlptracehttp.WithHeaders(opts.Headers),
+	}
+
+	// If endpoint doesn't use port 443, assume insecure (HTTP not HTTPS)
+	if !strings.Contains(opts.Endpoint, ":443") {
+		log.Debug("Using insecure connection for OTEL traces endpoint ", opts.Endpoint)
+		traceOpts = append(traceOpts, otlptracehttp.WithInsecure())
+	}
+
+	exp, err := otlptracehttp.New(context.Background(), traceOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a new tracer provider
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(opts.buildResource()),
+	)
+
+	// Set the tracer provider as global
+	sdkotel.SetTracerProvider(tp)
+
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err := tp.Shutdown(ctx)
+		if err != nil {
+			log.Error(E.Cause(err, "error shutting down tracer provider"))
 		}
 	}, nil
 }

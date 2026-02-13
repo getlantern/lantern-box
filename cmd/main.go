@@ -71,7 +71,7 @@ func preRun(cmd *cobra.Command, args []string) {
 	}
 
 	// TODO: what is the best place to do clean up of otel?
-	otel.InitGlobalMeterProvider(&otel.Opts{
+	otelOpts := &otel.Opts{
 		Endpoint:         otel.GetTelemetryEndpoint(telemetryEndpoint),
 		ProxyName:        proxyInfo.Name,
 		IsPro:            proxyInfo.Pro,
@@ -79,7 +79,10 @@ func preRun(cmd *cobra.Command, args []string) {
 		Provider:         proxyInfo.Provider,
 		FrontendProvider: proxyInfo.FrontendProvider,
 		ProxyProtocol:    proxyInfo.Protocol,
-	})
+	}
+
+	otel.InitGlobalMeterProvider(otelOpts)
+	otel.InitGlobalTracerProvider(otelOpts)
 
 	metrics.SetupMetricsManager(geoCityURL, cityDatabaseName)
 }
