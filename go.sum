@@ -169,6 +169,8 @@ github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52 h1:w2/RqYPw7Pb
 github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52/go.mod h1:PrNR8tMXO26YNs8K9653XCUH7u2Kv4OdfFC3Ke1GsX0=
 github.com/getlantern/broflake v0.0.0-20260128184723-c0316859616b h1:doEOWdRX7o8cKqNR42MYOxS5sQQoPsUihK+5CujrZvs=
 github.com/getlantern/broflake v0.0.0-20260128184723-c0316859616b/go.mod h1:hacSrhmDkUK8laEnfOp51e7PAfhFI/Lbie0MH8/uup4=
+github.com/getlantern/broflake v0.0.0-20260215213912-5f68e35de272 h1:oKungK1zgRUTACFmIulNf7U/KahaIKNK0vubLINhnss=
+github.com/getlantern/broflake v0.0.0-20260215213912-5f68e35de272/go.mod h1:hacSrhmDkUK8laEnfOp51e7PAfhFI/Lbie0MH8/uup4=
 github.com/getlantern/context v0.0.0-20190109183933-c447772a6520/go.mod h1:L+mq6/vvYHKjCX2oez0CgEAJmbq1fbb/oNJIWQkBybY=
 github.com/getlantern/context v0.0.0-20220418194847-3d5e7a086201 h1:oEZYEpZo28Wdx+5FZo4aU7JFXu0WG/4wJWese5reQSA=
 github.com/getlantern/context v0.0.0-20220418194847-3d5e7a086201/go.mod h1:Y9WZUHEb+mpra02CbQ/QczLUe6f0Dezxaw5DCJlJQGo=
