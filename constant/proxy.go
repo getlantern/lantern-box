@@ -1,12 +1,11 @@
 package constant
 
 const (
-	TypeAmnezia   = "amnezia"
-	TypeALGeneva  = "algeneva"
-	TypeOutline   = "outline"
-	TypeSamizdat  = "samizdat"
-	TypeWATER     = "water"
-	TypeUnbounded = "unbounded"
+	TypeAmnezia  = "amnezia"
+	TypeALGeneva = "algeneva"
+	TypeOutline  = "outline"
+	TypeSamizdat = "samizdat"
+	TypeWATER    = "water"
 )
 
 const (
