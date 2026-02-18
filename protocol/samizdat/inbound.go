@@ -49,16 +49,26 @@ func NewInbound(
 		return nil, fmt.Errorf("private_key must be 64 hex characters (32 bytes)")
 	}
 
+	if len(options.ShortIDs) < 1 {
+		return nil, fmt.Errorf("short_ids must contain at least one element")
+	}
+
 	// Decode hex short IDs
 	shortIDs := make([][8]byte, len(options.ShortIDs))
 	for i, sid := range options.ShortIDs {
-		b, err := hex.DecodeString(sid)
-		if err != nil || len(b) != 8 {
+		b, decodeErr := hex.DecodeString(sid)
+		if decodeErr != nil || len(b) != 8 {
 			return nil, fmt.Errorf("short_ids[%d] must be 16 hex characters (8 bytes)", i)
 		}
 		copy(shortIDs[i][:], b)
 	}
 
+	if options.CertPEM == "" && options.CertPath == "" {
+		return nil, fmt.Errorf("either cert_pem or cert_path must be provided")
+	}
+	if options.KeyPEM == "" && options.KeyPath == "" {
+		return nil, fmt.Errorf("either key_pem or key_path must be provided")
+	}
 	// Load TLS certificate
 	var certPEM, keyPEM []byte
 	if options.CertPEM != "" {
@@ -113,7 +123,7 @@ func NewInbound(
 		MasqueradeAddr:        options.MasqueradeAddr,
 		MasqueradeIdleTimeout: masqIdleTimeout,
 		MasqueradeMaxDuration: masqMaxDuration,
-		MaxConcurrentStreams:   options.MaxConcurrentStreams,
+		MaxConcurrentStreams:  options.MaxConcurrentStreams,
 		Handler: func(ctx context.Context, conn net.Conn, destination string) {
 			ib.handleConnection(ctx, conn, destination)
 		},

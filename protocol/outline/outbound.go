@@ -10,8 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Jigsaw-Code/outline-sdk/transport"
-	"github.com/Jigsaw-Code/outline-sdk/x/smart"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -19,6 +17,8 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/network"
+	"golang.getoutline.org/sdk/transport"
+	"golang.getoutline.org/sdk/x/smart"
 	"gopkg.in/yaml.v3"
 
 	C "github.com/getlantern/lantern-box/constant"
