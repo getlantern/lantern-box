@@ -27,3 +27,55 @@ cd -
 - **Traffic shaping** with Chrome-profile padding and timing jitter
 
 Samizdat is implemented as a standalone library ([`samizdat`](https://github.com/getlantern/samizdat)) with zero sing-box dependencies. Lantern Box provides thin adapter code to register it as a sing-box inbound and outbound. See the [samizdat README](https://github.com/getlantern/samizdat/blob/main/README.md) for full protocol details, threat model, and usage.
+
+### Example Configuration
+
+**Client (outbound):**
+
+```json
+{
+  "outbounds": [
+    {
+      "type": "samizdat",
+      "tag": "samizdat-out",
+      "server": "proxy.example.com",
+      "server_port": 443,
+      "public_key": "ab12cd34ef56...",
+      "short_id": "0123456789abcdef",
+      "server_name": "ok.ru",
+      "fingerprint": "chrome",
+      "padding": true,
+      "jitter": true,
+      "tcp_fragmentation": true,
+      "record_fragmentation": true
+    }
+  ]
+}
+```
+
+**Server (inbound):**
+
+```json
+{
+  "inbounds": [
+    {
+      "type": "samizdat",
+      "tag": "samizdat-in",
+      "listen": "::",
+      "listen_port": 443,
+      "private_key": "fedcba9876543210...",
+      "short_ids": ["0123456789abcdef"],
+      "cert_path": "/etc/ssl/certs/cert.pem",
+      "key_path": "/etc/ssl/private/key.pem",
+      "masquerade_domain": "ok.ru",
+      "max_concurrent_streams": 250
+    }
+  ]
+}
+```
+
+Generate keys with the standalone tool:
+
+```bash
+go run github.com/getlantern/samizdat/cmd/samizdat-server --genkeys
+```
