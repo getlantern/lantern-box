@@ -9,12 +9,12 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing/service"
 
+	"github.com/getlantern/lantern-box/protocol/algeneva"
 	"github.com/getlantern/lantern-box/protocol/amnezia"
 	"github.com/getlantern/lantern-box/protocol/group"
-	"github.com/getlantern/lantern-box/protocol/water"
-
-	"github.com/getlantern/lantern-box/protocol/algeneva"
 	"github.com/getlantern/lantern-box/protocol/outline"
+	"github.com/getlantern/lantern-box/protocol/samizdat"
+	"github.com/getlantern/lantern-box/protocol/water"
 )
 
 var supportedProtocols = []string{
@@ -22,6 +22,7 @@ var supportedProtocols = []string{
 	"algeneva",
 	"amnezia",
 	"outline",
+	"samizdat",
 
 	// sing-box built-in protocols
 	"http",
@@ -64,6 +65,7 @@ func RegisterProtocols(ctx context.Context) context.Context {
 
 func registerInbounds(registry *inbound.Registry) {
 	algeneva.RegisterInbound(registry)
+	samizdat.RegisterInbound(registry)
 	water.RegisterInbound(registry)
 }
 
@@ -71,6 +73,7 @@ func registerOutbounds(registry *outbound.Registry) {
 	// custom protocol outbounds
 	algeneva.RegisterOutbound(registry)
 	outline.RegisterOutbound(registry)
+	samizdat.RegisterOutbound(registry)
 	water.RegisterOutbound(registry)
 
 	// utility outbounds
