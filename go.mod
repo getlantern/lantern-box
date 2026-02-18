@@ -1,6 +1,14 @@
 module github.com/getlantern/lantern-box
 
-go 1.25.1
+go 1.24.1
+
+replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.18-lantern
+
+replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.12.19-lantern
+
+replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4
+
+replace github.com/tetratelabs/wazero => github.com/refraction-networking/wazero v1.7.1-w
 
 require (
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
@@ -190,6 +198,7 @@ require (
 	github.com/tailscale/netlink v1.1.1-0.20240822203006-4d49adab4de7 // indirect
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
+	github.com/tevino/abool/v2 v2.1.0 // indirect
 	github.com/tidwall/btree v1.6.0 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
 	github.com/ulikunitz/xz v0.5.10 // indirect
