@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"log"
 	"math/big"
 	"net"
@@ -50,6 +51,9 @@ type Outbound struct {
 	dial         UBClientcore.SOCKS5Dialer
 	ui           UBClientcore.UI
 	ql           *UBClientcore.QUICLayer
+	rtcOpt       *UBClientcore.WebRTCOptions
+	bfOpt        *UBClientcore.BroflakeOptions
+	egOpt        *UBClientcore.EgressOptions
 }
 
 func NewOutbound(
@@ -165,19 +169,6 @@ func NewOutbound(
 		},
 	}
 
-	BFConn, ui, err := UBClientcore.NewBroflake(bfOpt, rtcOpt, egOpt)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO: plumb through a real TLS cert and get rid of the self-signed generator?
-	QUICLayer, err := UBClientcore.NewQUICLayer(BFConn, generateSelfSignedTLSConfig())
-	if err != nil {
-		return nil, err
-	}
-
-	dialer := UBClientcore.CreateSOCKS5Dialer(QUICLayer)
-
 	o := &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(
 			C.TypeUnbounded,
@@ -185,11 +176,10 @@ func NewOutbound(
 			[]string{N.NetworkTCP}, // XXX: Unbounded only supports TCP (not UDP) for now
 			options.DialerOptions,
 		),
-		logger:       logger,
-		broflakeConn: BFConn,
-		dial:         dialer,
-		ui:           ui,
-		ql:           QUICLayer,
+		logger: logger,
+		rtcOpt: rtcOpt,
+		bfOpt:  bfOpt,
+		egOpt:  egOpt,
 	}
 
 	return o, nil
@@ -203,6 +193,10 @@ func (h *Outbound) DialContext(
 	// XXX: this is the log pattern for N.NetworkTCP
 	h.logger.InfoContext(ctx, "outbound connection to ", destination)
 
+	if h.dial == nil {
+		return nil, fmt.Errorf("unbounded not ready")
+	}
+
 	// XXX: network is ignored by Unbounded's SOCKS5 dialer
 	return h.dial(ctx, network, destination.String())
 }
@@ -213,14 +207,38 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 
 func (h *Outbound) Start(stage adapter.StartStage) error {
 	if stage == adapter.StartStatePostStart {
+		BFConn, ui, err := UBClientcore.NewBroflake(h.bfOpt, h.rtcOpt, h.egOpt)
+		if err != nil {
+			return err
+		}
+
+		// TODO: plumb through a real TLS cert and get rid of the self-signed generator?
+		QUICLayer, err := UBClientcore.NewQUICLayer(BFConn, generateSelfSignedTLSConfig())
+		if err != nil {
+			return err
+		}
+
+		dialer := UBClientcore.CreateSOCKS5Dialer(QUICLayer)
+
+		h.broflakeConn = BFConn
+		h.dial = dialer
+		h.ui = ui
+		h.ql = QUICLayer
+
 		go h.ql.ListenAndMaintainQUICConnection()
 	}
 	return nil
 }
 
 func (h *Outbound) Close() error {
-	h.ql.Close()
-	h.ui.Stop()
+	if h.ql != nil {
+		h.ql.Close()
+	}
+
+	if h.ui != nil {
+		h.ui.Stop()
+	}
+
 	return nil
 }
 
