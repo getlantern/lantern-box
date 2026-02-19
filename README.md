@@ -44,10 +44,10 @@ Samizdat is implemented as a standalone library ([`samizdat`](https://github.com
       "short_id": "0123456789abcdef",
       "server_name": "ok.ru",
       "fingerprint": "chrome",
-      "padding": true,
-      "jitter": true,
-      "tcp_fragmentation": true,
-      "record_fragmentation": true
+      "disable_padding": false,
+      "disable_jitter": false,
+      "disable_tcp_fragmentation": false,
+      "disable_record_fragmentation": false
     }
   ]
 }

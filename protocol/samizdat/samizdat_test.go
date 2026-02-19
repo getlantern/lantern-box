@@ -85,18 +85,6 @@ func validInboundOptions(t *testing.T) option.SamizdatInboundOptions {
 	}
 }
 
-// --- boolDefault tests ---
-
-func TestBoolDefault(t *testing.T) {
-	trueVal := true
-	falseVal := false
-
-	assert.True(t, boolDefault(&trueVal, false), "pointer to true should return true")
-	assert.False(t, boolDefault(&falseVal, true), "pointer to false should return false")
-	assert.True(t, boolDefault(nil, true), "nil should return default true")
-	assert.False(t, boolDefault(nil, false), "nil should return default false")
-}
-
 // --- NewInbound validation tests ---
 
 func TestNewInbound_InvalidPrivateKey(t *testing.T) {

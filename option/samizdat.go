@@ -15,15 +15,15 @@ type SamizdatOutboundOptions struct {
 	ServerName  string `json:"server_name,omitempty"`  // cover site SNI (e.g. "ok.ru")
 	Fingerprint string `json:"fingerprint,omitempty"`  // "chrome" (default), "firefox", "safari"
 
-	// Traffic shaping (pointer types so unset is distinguishable from explicitly false)
-	Padding        *bool  `json:"padding,omitempty"`         // enable H2 DATA frame padding (default: true)
-	Jitter         *bool  `json:"jitter,omitempty"`          // enable timing jitter (default: true)
+	// Traffic shaping (enabled by default; set to true to disable)
+	DisablePadding bool   `json:"disable_padding,omitempty"` // disable H2 DATA frame padding
+	DisableJitter  bool   `json:"disable_jitter,omitempty"`  // disable timing jitter
 	MaxJitterMs    int    `json:"max_jitter_ms,omitempty"`   // max jitter in ms (default: 30)
 	PaddingProfile string `json:"padding_profile,omitempty"` // "chrome", "firefox" (default: "chrome")
 
-	// TCP fragmentation (Geneva-inspired)
-	TCPFragmentation    *bool `json:"tcp_fragmentation,omitempty"`    // fragment ClientHello (default: true)
-	RecordFragmentation *bool `json:"record_fragmentation,omitempty"` // fragment TLS records (default: true)
+	// TCP fragmentation (Geneva-inspired; enabled by default; set to true to disable)
+	DisableTCPFragmentation    bool `json:"disable_tcp_fragmentation,omitempty"`    // disable ClientHello fragmentation
+	DisableRecordFragmentation bool `json:"disable_record_fragmentation,omitempty"` // disable TLS record fragmentation
 
 	// Connection management
 	MaxStreamsPerConn int    `json:"max_streams_per_conn,omitempty"` // max H2 streams per TCP conn (default: 100)
