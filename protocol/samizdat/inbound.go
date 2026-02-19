@@ -13,7 +13,6 @@ import (
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/common/network"
 
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
@@ -159,10 +158,6 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 			i.logger.ErrorContext(ctx, err)
 		}
 	})
-}
-
-func (i *Inbound) newPacketConnection(ctx context.Context, conn network.PacketConn, metadata adapter.InboundContext, onClose network.CloseHandlerFunc) {
-	i.logger.ErrorContext(ctx, "packet connection not supported by samizdat")
 }
 
 // Start starts the Samizdat inbound server.
