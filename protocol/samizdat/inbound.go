@@ -101,10 +101,11 @@ func NewInbound(
 	}
 
 	// Build listen address from ListenOptions
-	listenAddr := fmt.Sprintf(":%d", options.ListenPort)
+	addr := netip.IPv6Unspecified()
 	if options.Listen != nil {
-		listenAddr = fmt.Sprintf("%s:%d", netip.Addr(*options.Listen).String(), options.ListenPort)
+		addr = netip.Addr(*options.Listen)
 	}
+	listenAddr := netip.AddrPortFrom(addr, options.ListenPort).String()
 
 	ib := &Inbound{
 		Adapter: inbound.NewAdapter(constant.TypeSamizdat, tag),
