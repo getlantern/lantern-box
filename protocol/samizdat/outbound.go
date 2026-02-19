@@ -87,12 +87,12 @@ func NewOutbound(
 		PublicKey:           pubKey,
 		ShortID:             shortID,
 		Fingerprint:         options.Fingerprint,
-		Padding:             options.Padding,
-		Jitter:              options.Jitter,
+		Padding:             boolDefault(options.Padding, true),
+		Jitter:              boolDefault(options.Jitter, true),
 		MaxJitterMs:         options.MaxJitterMs,
 		PaddingProfile:      options.PaddingProfile,
-		TCPFragmentation:    options.TCPFragmentation,
-		RecordFragmentation: options.RecordFragmentation,
+		TCPFragmentation:    boolDefault(options.TCPFragmentation, true),
+		RecordFragmentation: boolDefault(options.RecordFragmentation, true),
 		MaxStreamsPerConn:    options.MaxStreamsPerConn,
 		IdleTimeout:         idleTimeout,
 		ConnectTimeout:      connectTimeout,
@@ -150,4 +150,12 @@ func (o *Outbound) Close() error {
 		return o.client.Close()
 	}
 	return nil
+}
+
+// boolDefault returns the value pointed to by p, or defaultVal if p is nil.
+func boolDefault(p *bool, defaultVal bool) bool {
+	if p != nil {
+		return *p
+	}
+	return defaultVal
 }
