@@ -63,18 +63,21 @@ func NewInbound(
 		copy(shortIDs[i][:], b)
 	}
 
-	if options.CertPEM == "" && options.CertPath == "" {
-		return nil, fmt.Errorf("either cert_pem or cert_path must be provided")
-	}
-	if options.KeyPEM == "" && options.KeyPath == "" {
-		return nil, fmt.Errorf("either key_pem or key_path must be provided")
-	}
-	// Load TLS certificate
+	// Validate and load TLS certificate/key pair
 	var certPEM, keyPEM []byte
-	if options.CertPEM != "" {
+	if options.CertPEM != "" || options.KeyPEM != "" {
+		if options.CertPEM == "" || options.KeyPEM == "" {
+			return nil, fmt.Errorf("both cert_pem and key_pem must be provided when using inline PEM")
+		}
+		if options.CertPath != "" || options.KeyPath != "" {
+			return nil, fmt.Errorf("cannot mix inline PEM (cert_pem/key_pem) with file paths (cert_path/key_path)")
+		}
 		certPEM = []byte(options.CertPEM)
 		keyPEM = []byte(options.KeyPEM)
-	} else if options.CertPath != "" {
+	} else if options.CertPath != "" || options.KeyPath != "" {
+		if options.CertPath == "" || options.KeyPath == "" {
+			return nil, fmt.Errorf("both cert_path and key_path must be provided when using file paths")
+		}
 		certPEM, err = os.ReadFile(options.CertPath)
 		if err != nil {
 			return nil, fmt.Errorf("reading cert file: %w", err)
@@ -83,6 +86,8 @@ func NewInbound(
 		if err != nil {
 			return nil, fmt.Errorf("reading key file: %w", err)
 		}
+	} else {
+		return nil, fmt.Errorf("TLS certificate and key must be provided via cert_pem/key_pem or cert_path/key_path")
 	}
 
 	// Parse timeouts
