@@ -11,6 +11,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/common/uot"
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 
@@ -30,7 +31,7 @@ type Inbound struct {
 	inbound.Adapter
 	ctx    context.Context
 	logger log.ContextLogger
-	router adapter.Router
+	router adapter.ConnectionRouterEx
 	server *samizdat.Server
 }
 
@@ -115,7 +116,7 @@ func NewInbound(
 		Adapter: inbound.NewAdapter(constant.TypeSamizdat, tag),
 		ctx:     ctx,
 		logger:  logger,
-		router:  router,
+		router:  uot.NewRouter(router, logger),
 	}
 
 	serverConfig := samizdat.ServerConfig{

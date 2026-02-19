@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -14,6 +15,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
@@ -29,8 +31,22 @@ func RegisterOutbound(registry *outbound.Registry) {
 // Outbound represents a Samizdat outbound adapter.
 type Outbound struct {
 	outbound.Adapter
-	logger logger.ContextLogger
+	logger    logger.ContextLogger
+	client    *samizdat.Client
+	uotClient *uot.Client
+}
+
+// samizdatDialer adapts a samizdat.Client to the N.Dialer interface for uot.Client.
+type samizdatDialer struct {
 	client *samizdat.Client
+}
+
+func (d *samizdatDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return d.client.DialContext(ctx, network, destination.String())
+}
+
+func (d *samizdatDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return nil, os.ErrInvalid
 }
 
 // NewOutbound creates a new Samizdat outbound adapter.
@@ -107,16 +123,23 @@ func NewOutbound(
 		return nil, fmt.Errorf("creating samizdat client: %w", err)
 	}
 
-	return &Outbound{
+	o := &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(
 			constant.TypeSamizdat,
 			tag,
-			[]string{N.NetworkTCP},
+			[]string{N.NetworkTCP, N.NetworkUDP},
 			options.DialerOptions,
 		),
 		logger: logger,
 		client: client,
-	}, nil
+	}
+
+	o.uotClient = &uot.Client{
+		Dialer:  &samizdatDialer{client: client},
+		Version: uot.Version,
+	}
+
+	return o, nil
 }
 
 // DialContext dials a connection to the destination through the Samizdat proxy.
@@ -125,23 +148,29 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
 
-	o.logger.InfoContext(ctx, "connecting to ", destination)
-	conn, err := o.client.DialContext(ctx, network, destination.String())
-	if err != nil {
-		return nil, fmt.Errorf("samizdat dial to %s: %w", destination, err)
+	switch N.NetworkName(network) {
+	case N.NetworkTCP:
+		o.logger.InfoContext(ctx, "outbound connection to ", destination)
+		return o.client.DialContext(ctx, network, destination.String())
+	case N.NetworkUDP:
+		o.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
+		return o.uotClient.DialContext(ctx, network, destination)
 	}
-
-	return conn, nil
+	return nil, fmt.Errorf("unsupported network: %s", network)
 }
 
-// ListenPacket is not supported by Samizdat (TCP-only protocol).
+// ListenPacket creates a UoT packet connection through the Samizdat proxy.
 func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	return nil, fmt.Errorf("samizdat does not support UDP")
+	ctx, metadata := adapter.ExtendContext(ctx)
+	metadata.Outbound = o.Tag()
+	metadata.Destination = destination
+	o.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
+	return o.uotClient.ListenPacket(ctx, destination)
 }
 
 // Network returns the supported network types.
 func (o *Outbound) Network() []string {
-	return []string{N.NetworkTCP}
+	return []string{N.NetworkTCP, N.NetworkUDP}
 }
 
 // Close shuts down the Samizdat client.

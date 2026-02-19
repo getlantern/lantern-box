@@ -296,6 +296,14 @@ func TestNewOutbound_InvalidPublicKey(t *testing.T) {
 	}
 }
 
+func TestOutbound_NetworkIncludesUDP(t *testing.T) {
+	o := &Outbound{}
+	networks := o.Network()
+	assert.Contains(t, networks, "tcp", "Network() should include TCP")
+	assert.Contains(t, networks, "udp", "Network() should include UDP")
+	assert.Len(t, networks, 2, "Network() should return exactly 2 networks")
+}
+
 func TestNewOutbound_InvalidShortID(t *testing.T) {
 	pubKey := testPubKeyHex(t)
 
