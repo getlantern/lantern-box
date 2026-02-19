@@ -9,6 +9,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -57,6 +58,12 @@ func NewOutbound(
 	// Build server address
 	serverAddr := options.ServerOptions.Build().String()
 
+	// Build sing-box dialer to honor DialerOptions (bind_interface, routing, detour, etc.)
+	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
+	if err != nil {
+		return nil, fmt.Errorf("creating dialer: %w", err)
+	}
+
 	// Parse timeouts
 	var idleTimeout time.Duration
 	if options.IdleTimeout != "" {
@@ -90,6 +97,9 @@ func NewOutbound(
 		IdleTimeout:         idleTimeout,
 		ConnectTimeout:      connectTimeout,
 		DataThreshold:       options.DataThreshold,
+		Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return outboundDialer.DialContext(ctx, network, M.ParseSocksaddr(address))
+		},
 	}
 
 	client, err := samizdat.NewClient(config)
