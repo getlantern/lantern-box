@@ -14,7 +14,7 @@ require (
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260130212632-d5ea08838250
-	github.com/getlantern/samizdat v0.0.1
+	github.com/getlantern/samizdat v0.0.2
 	github.com/gobwas/ws v1.4.0
 	github.com/refraction-networking/water v0.7.0-alpha
 	github.com/sagernet/sing v0.7.18

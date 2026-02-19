@@ -3,14 +3,15 @@ package samizdat
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
-	"net/netip"
 	"os"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/uot"
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
@@ -29,10 +30,12 @@ func RegisterInbound(registry *inbound.Registry) {
 // Inbound represents a Samizdat inbound adapter.
 type Inbound struct {
 	inbound.Adapter
-	ctx    context.Context
-	logger log.ContextLogger
-	router adapter.ConnectionRouterEx
-	server *samizdat.Server
+	ctx         context.Context
+	logger      log.ContextLogger
+	router      adapter.ConnectionRouterEx
+	listener    *listener.Listener
+	tcpListener net.Listener
+	server      *samizdat.Server
 }
 
 // NewInbound creates a new Samizdat inbound adapter.
@@ -105,22 +108,26 @@ func NewInbound(
 		}
 	}
 
-	// Build listen address from ListenOptions
-	addr := netip.IPv6Unspecified()
-	if options.Listen != nil {
-		addr = netip.Addr(*options.Listen)
-	}
-	listenAddr := netip.AddrPortFrom(addr, options.ListenPort).String()
-
 	ib := &Inbound{
 		Adapter: inbound.NewAdapter(constant.TypeSamizdat, tag),
 		ctx:     ctx,
 		logger:  logger,
 		router:  uot.NewRouter(router, logger),
+		listener: listener.New(listener.Options{
+			Context: ctx,
+			Logger:  logger,
+			Listen:  options.ListenOptions,
+		}),
 	}
 
+	// Use sing-box's listener to create the TCP listener, honoring ListenOptions
+	tcpListener, err := ib.listener.ListenTCP()
+	if err != nil {
+		return nil, fmt.Errorf("creating TCP listener: %w", err)
+	}
+	ib.tcpListener = tcpListener
+
 	serverConfig := samizdat.ServerConfig{
-		ListenAddr:            listenAddr,
 		PrivateKey:            privKey,
 		ShortIDs:              shortIDs,
 		CertPEM:               certPEM,
@@ -168,7 +175,7 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 	}
 
 	go func() {
-		if err := i.server.ListenAndServe(); err != nil {
+		if err := i.server.Serve(i.tcpListener); err != nil {
 			i.logger.Error("samizdat server error: ", err)
 		}
 	}()
@@ -176,10 +183,14 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 	return nil
 }
 
-// Close stops the Samizdat inbound server.
+// Close stops the Samizdat inbound server and sing-box listener.
 func (i *Inbound) Close() error {
+	var serverErr, listenerErr error
 	if i.server != nil {
-		return i.server.Close()
+		serverErr = i.server.Close()
 	}
-	return nil
+	if i.listener != nil {
+		listenerErr = i.listener.Close()
+	}
+	return errors.Join(serverErr, listenerErr)
 }

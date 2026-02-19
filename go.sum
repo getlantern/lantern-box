@@ -183,6 +183,8 @@ github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f h1:wrYrQttPS8FHIRSl
 github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f/go.mod h1:D5ao98qkA6pxftxoqzibIBBrLSUli+kYnJqrgBf9cIA=
 github.com/getlantern/samizdat v0.0.1 h1:nFo3djcHpVzgQ2T2igna5HVMYFzDbhqIc+fre8iz2Yw=
 github.com/getlantern/samizdat v0.0.1/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
+github.com/getlantern/samizdat v0.0.2 h1:PkMu6jsfUz7DLZUH2xh548XfzgPASmq5CajZyUKj/9Y=
+github.com/getlantern/samizdat v0.0.2/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
 github.com/getlantern/sing v0.7.18-lantern h1:QKGgIUA3LwmKYP/7JlQTRkxj9jnP4cX2Q/B+nd8XEjo=
 github.com/getlantern/sing v0.7.18-lantern/go.mod h1:ARkL0gM13/Iv5VCZmci/NuoOlePoIsW0m7BWfln/Hak=
 github.com/getlantern/sing-box-minimal v1.12.19-lantern h1:Tntq+Udsvyv6A/mjxfSoZ8NhvhXRSX6i/CICKGPFhAY=
