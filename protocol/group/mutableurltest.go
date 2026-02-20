@@ -494,7 +494,7 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		}
 		testURL := g.testURLForTag(tag)
 		b.Go(realTag, func() (any, error) {
-			testCtx, cancel := context.WithTimeout(g.ctx, C.TCPTimeout)
+			testCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
 			defer cancel()
 			g.logger.Trace("checking outbound", "tag", realTag)
 			t, err := urlTestGET(testCtx, testURL, p)
