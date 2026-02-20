@@ -152,7 +152,9 @@ func NewInbound(
 }
 
 // handleConnection routes authenticated proxied connections through the
-// sing-box router.
+// sing-box router. It blocks until the proxied connection is complete,
+// which is required because the samizdat H2 handler closes the stream
+// when the Handler function returns.
 func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destination string) {
 	var metadata adapter.InboundContext
 	metadata.Inbound = i.Tag()
@@ -161,11 +163,18 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	metadata.Destination = M.ParseSocksaddr(destination)
 
 	i.logger.InfoContext(ctx, "inbound connection to ", destination)
+	done := make(chan struct{})
 	i.router.RouteConnectionEx(ctx, conn, metadata, func(err error) {
 		if err != nil {
 			i.logger.ErrorContext(ctx, err)
 		}
+		close(done)
 	})
+	select {
+	case <-done:
+	case <-ctx.Done():
+		i.logger.ErrorContext(ctx, "inbound connection to ", destination, " canceled: ", ctx.Err())
+	}
 }
 
 // Start starts the Samizdat inbound server.
