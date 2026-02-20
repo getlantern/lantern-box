@@ -170,7 +170,11 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 		}
 		close(done)
 	})
-	<-done
+	select {
+	case <-done:
+	case <-ctx.Done():
+		i.logger.ErrorContext(ctx, "inbound connection to ", destination, " canceled: ", ctx.Err())
+	}
 }
 
 // Start starts the Samizdat inbound server.
