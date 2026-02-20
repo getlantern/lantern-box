@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -55,23 +56,21 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 
-	if options.WASMStorageDir == "" {
-		return nil, E.New("provided an empty storage directory for WASM files")
+	if options.Dir == "" {
+		return nil, E.New("provided an empty storage directory for WATER files")
 	}
 
-	if options.WazeroCompilationCacheDir == "" {
-		return nil, E.New("provided an empty storage directory for wazero compilation cache")
-	}
-
-	for _, dir := range []string{options.WASMStorageDir, options.WazeroCompilationCacheDir} {
+	wasmDir := filepath.Join(options.Dir, "wasm_files")
+	wazeroCompilationDir := filepath.Join(options.Dir, "wazero_compilation_cache")
+	for _, dir := range []string{wasmDir, wazeroCompilationDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, err
 		}
 	}
 
 	slogLogger := slog.New(L.NewLogHandler(logger))
-	vc := waterVC.NewWaterVersionControl(options.WASMStorageDir, slogLogger)
-	d, err := waterDownloader.NewWASMDownloader(options.WASMAvailableAt, &http.Client{Timeout: timeout})
+	vc := waterVC.NewWaterVersionControl(wasmDir, slogLogger)
+	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, &http.Client{Timeout: timeout})
 	if err != nil {
 		return nil, E.New("failed to create WASM downloader", err)
 	}
@@ -95,7 +94,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	// We're creating the compilation cache dir and setting the global value so during runtime
 	// it won't need to create one at a temp directory
-	compilationCache, err := wazero.NewCompilationCacheWithDir(options.WazeroCompilationCacheDir)
+	compilationCache, err := wazero.NewCompilationCacheWithDir(wazeroCompilationDir)
 	if err != nil {
 		return nil, err
 	}

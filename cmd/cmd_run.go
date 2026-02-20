@@ -17,11 +17,15 @@ import (
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric/noop"
+
 	"gopkg.in/ini.v1"
 
 	"github.com/getlantern/lantern-box/adapter"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
+	"github.com/getlantern/lantern-box/tracker/metrics"
 )
 
 func init() {
@@ -91,18 +95,20 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 
 	if datacapURL != "" {
 		// Add datacap tracker
+		log.Info("Datacap enabled. Creating trackers...")
 		clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
 			Inbound:  []string{""},
 			Outbound: []string{""},
-		}, log.NewNOPFactory().NewLogger("tracker"))
+		}, log.StdLogger())
 		instance.Router().AppendTracker(clientCtxMgr)
 		service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
 
 		datacapTracker, err := datacap.NewDatacapTracker(
 			datacap.Options{
-				URL: datacapURL,
+				URL:            datacapURL,
+				ReportInterval: "10s",
 			},
-			log.NewNOPFactory().NewLogger("datacap-tracker"),
+			log.StdLogger(),
 		)
 		if err != nil {
 			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
@@ -110,6 +116,18 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		clientCtxMgr.AppendTracker(datacapTracker)
 	} else {
 		log.Warn("Datacap URL not provided, datacap tracking disabled")
+	}
+
+	mp := otel.GetMeterProvider()
+	if _, ok := mp.(noop.MeterProvider); ok {
+		log.Info("Metrics not enabled, no meter provider configured")
+	} else {
+		metricsTracker, err := metrics.NewTracker()
+		if err != nil {
+			return nil, nil, fmt.Errorf("create metrics tracker: %w", err)
+		}
+		instance.Router().AppendTracker(metricsTracker)
+		log.Info("Metric Tracking Enabled")
 	}
 
 	osSignals := make(chan os.Signal, 1)

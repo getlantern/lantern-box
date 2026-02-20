@@ -151,13 +151,16 @@ func (s *MutableURLTest) DialContext(ctx context.Context, network string, destin
 		return nil, err
 	}
 	conn, err := outbound.DialContext(ctx, network, destination)
-	if err == nil {
-		return conn, nil
+	if err != nil {
+		s.logger.ErrorContext(ctx, err)
+		s.group.history.DeleteURLTestHistory(outbound.Tag())
+		span.RecordError(err)
+		return nil, err
 	}
-	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	span.RecordError(err)
-	return nil, err
+	if taggedConn, ok := conn.(*adapter.TaggedConn); ok {
+		return taggedConn, nil
+	}
+	return adapter.NewTaggedConn(conn, realTag(outbound)), nil
 }
 
 func (s *MutableURLTest) ListenPacket(ctx context.Context, destination metadata.Socksaddr) (net.PacketConn, error) {
@@ -176,13 +179,16 @@ func (s *MutableURLTest) ListenPacket(ctx context.Context, destination metadata.
 		return nil, err
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
-	if err == nil {
-		return conn, nil
+	if err != nil {
+		s.logger.ErrorContext(ctx, err)
+		s.group.history.DeleteURLTestHistory(outbound.Tag())
+		span.RecordError(err)
+		return nil, err
 	}
-	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	span.RecordError(err)
-	return nil, err
+	if taggedConn, ok := conn.(*adapter.TaggedPacketConn); ok {
+		return taggedConn, nil
+	}
+	return adapter.NewTaggedPacketConn(conn, realTag(outbound)), nil
 }
 
 func (s *MutableURLTest) selectOutbound(network string) (A.Outbound, error) {
@@ -423,6 +429,9 @@ func (g *urlTestGroup) checkLoop() {
 		case <-g.pauseC:
 			return
 		case <-g.idleTimer.C:
+			return
+		case <-ctx.Done():
+			g.logger.Warn("context canceled")
 			return
 		case <-ticker.C:
 			go g.urlTest(ctx, false)

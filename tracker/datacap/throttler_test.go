@@ -241,3 +241,68 @@ func TestThrottler_RefillCap(t *testing.T) {
 	// Should wait ~0.5s. If it waited 0, then refill cap logic is broken.
 	assert.Greater(t, elapsed.Milliseconds(), int64(400), "Should have capped token refill")
 }
+
+func TestThrottler_UpdateRates_EnablesWhenDisabled(t *testing.T) {
+	throttler := NewThrottler(0)
+	assert.False(t, throttler.IsEnabled())
+
+	throttler.UpdateRates(100, 100)
+	assert.True(t, throttler.IsEnabled())
+
+	ctx := context.Background()
+	_ = throttler.WaitRead(ctx, 100) // drain bucket
+
+	start := time.Now()
+	err := throttler.WaitRead(ctx, 50)
+	assert.NoError(t, err)
+	assert.GreaterOrEqual(t, time.Since(start).Milliseconds(), int64(450))
+}
+
+func TestThrottler_UpdateRates_PreservesTokens(t *testing.T) {
+	throttler := NewThrottler(100)
+	ctx := context.Background()
+
+	_ = throttler.WaitRead(ctx, 100)   // drain bucket
+	time.Sleep(500 * time.Millisecond) // accumulate 50 tokens
+
+	throttler.UpdateRates(100, 100) // should NOT reset
+
+	start := time.Now()
+	err := throttler.WaitRead(ctx, 80)
+	assert.NoError(t, err)
+
+	elapsed := time.Since(start)
+	assert.GreaterOrEqual(t, elapsed.Milliseconds(), int64(200))
+	assert.Less(t, elapsed.Milliseconds(), int64(500))
+}
+
+func TestThrottler_UpdateRates_ClampsTokens(t *testing.T) {
+	throttler := NewThrottler(1000) // large bucket
+	ctx := context.Background()
+
+	throttler.UpdateRates(100, 100) // reduce capacity
+
+	start := time.Now()
+	_ = throttler.WaitRead(ctx, 100) // consume new capacity
+	assert.Less(t, time.Since(start), 50*time.Millisecond)
+
+	start = time.Now()
+	err := throttler.WaitRead(ctx, 50)
+	assert.NoError(t, err)
+	assert.GreaterOrEqual(t, time.Since(start).Milliseconds(), int64(400))
+}
+
+func TestThrottler_UpdateRates_NoResetOnRepeatedCalls(t *testing.T) {
+	throttler := NewThrottler(100)
+	ctx := context.Background()
+
+	_ = throttler.WaitRead(ctx, 100)   // drain
+	time.Sleep(200 * time.Millisecond) // accumulate 20 tokens
+
+	throttler.UpdateRates(100, 100)
+
+	start := time.Now()
+	err := throttler.WaitRead(ctx, 80)
+	assert.NoError(t, err)
+	assert.GreaterOrEqual(t, time.Since(start).Milliseconds(), int64(400))
+}

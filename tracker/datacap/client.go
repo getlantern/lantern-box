@@ -70,10 +70,9 @@ func NewClientWithConfig(config ClientConfig) *Client {
 
 // DataCapStatus represents the response from the GET /data-cap/{deviceId} endpoint.
 type DataCapStatus struct {
-	Throttle       bool  `json:"throttle"`
-	RemainingBytes int64 `json:"remainingBytes"`
-	CapLimit       int64 `json:"capLimit"`
-	ExpiryTime     int64 `json:"expiryTime"`
+	Throttle   bool  `json:"throttle"`
+	CapLimit   int64 `json:"capLimit"`
+	ExpiryTime int64 `json:"expiryTime"`
 }
 
 // DataCapReport represents the request body for POST /data-cap/ endpoint.

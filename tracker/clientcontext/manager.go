@@ -37,6 +37,7 @@ type Manager struct {
 	logger   log.ContextLogger
 	trackers []adapter.ConnectionTracker
 
+	matchBounds  MatchBounds
 	inboundRule  *boundsRule
 	outboundRule *boundsRule
 	ruleMu       sync.RWMutex
@@ -47,6 +48,7 @@ func NewManager(bounds MatchBounds, logger log.ContextLogger) *Manager {
 	return &Manager{
 		trackers:     []adapter.ConnectionTracker{},
 		logger:       logger,
+		matchBounds:  bounds,
 		inboundRule:  newBoundsRule(bounds.Inbound),
 		outboundRule: newBoundsRule(bounds.Outbound),
 	}
@@ -116,11 +118,18 @@ func (m *Manager) match(inbound, outbound string) bool {
 	return m.inboundRule.match(inbound) && m.outboundRule.match(outbound)
 }
 
-func (m *Manager) UpdateBounds(bounds MatchBounds) {
+func (m *Manager) SetBounds(bounds MatchBounds) {
 	m.ruleMu.Lock()
+	m.matchBounds = bounds
 	m.inboundRule = newBoundsRule(bounds.Inbound)
 	m.outboundRule = newBoundsRule(bounds.Outbound)
 	m.ruleMu.Unlock()
+}
+
+func (m *Manager) MatchBounds() MatchBounds {
+	m.ruleMu.RLock()
+	defer m.ruleMu.RUnlock()
+	return m.matchBounds.clone()
 }
 
 // readConn reads client info from the connection on creation.
@@ -165,6 +174,10 @@ func (c *readConn) readInfo() (*ClientInfo, error) {
 	return &info, nil
 }
 
+func (c *readConn) Upstream() any {
+	return c.Conn
+}
+
 type readPacketConn struct {
 	N.PacketConn
 	mgr         *Manager
@@ -202,10 +215,25 @@ func (c *readPacketConn) readInfo() (*ClientInfo, error) {
 		return nil, fmt.Errorf("unmarshaling client info: %w", err)
 	}
 
-	buffer.Reset()
-	buffer.WriteString("OK")
-	if err := c.WritePacket(buffer, destination); err != nil {
+	// CRITICAL: Use a new buffer for the response to ensure we have enough headroom
+	// for the packet headers (e.g. VMess). Reusing the old buffer with Reset()
+	// discards the headroom and causes 'buffer overflow' panics.
+	// advance buffer start, and reserve end, to leave room for headers/trailers on various protocols
+	respBuffer := buf.NewPacket()
+	defer respBuffer.Release()
+
+	headroom := N.CalculateFrontHeadroom(c)
+	rearHeadroom := N.CalculateRearHeadroom(c)
+	respBuffer.Advance(headroom)
+	respBuffer.Reserve(rearHeadroom)
+
+	respBuffer.WriteString("OK")
+	if err := c.WritePacket(respBuffer, destination); err != nil {
 		return nil, fmt.Errorf("writing OK response: %w", err)
 	}
 	return &info, nil
+}
+
+func (c *readPacketConn) Upstream() any {
+	return c.PacketConn
 }

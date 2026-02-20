@@ -216,7 +216,11 @@ func (s *MutableSelector) DialContext(ctx context.Context, network string, desti
 		span.RecordError(err)
 		return nil, err
 	}
-	return s.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+	conn = s.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx))
+	if taggedConn, ok := conn.(*adapter.TaggedConn); ok {
+		return taggedConn, nil
+	}
+	return adapter.NewTaggedConn(conn, realTag(outbound)), nil
 }
 
 func (s *MutableSelector) ListenPacket(ctx context.Context, destination metadata.Socksaddr) (net.PacketConn, error) {
@@ -240,7 +244,11 @@ func (s *MutableSelector) ListenPacket(ctx context.Context, destination metadata
 		span.RecordError(err)
 		return nil, err
 	}
-	return s.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+	conn = s.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx))
+	if taggedConn, ok := conn.(*adapter.TaggedPacketConn); ok {
+		return taggedConn, nil
+	}
+	return adapter.NewTaggedPacketConn(conn, realTag(outbound)), nil
 }
 
 func (s *MutableSelector) NewConnectionEx(ctx context.Context, conn net.Conn, metadata A.InboundContext, onClose network.CloseHandlerFunc) {

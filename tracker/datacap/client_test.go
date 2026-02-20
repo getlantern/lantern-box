@@ -52,10 +52,6 @@ func TestDataCapClient(t *testing.T) {
 		t.Error("expected throttle=false, got true")
 	}
 
-	if status.RemainingBytes != 9663676416 {
-		t.Errorf("expected remainingBytes=9663676416, got %d", status.RemainingBytes)
-	}
-
 	if status.CapLimit != 10737418240 {
 		t.Errorf("expected capLimit=10737418240, got %d", status.CapLimit)
 	}
@@ -135,9 +131,6 @@ func TestDataCapClientThrottleTrue(t *testing.T) {
 		t.Error("expected throttle=true, got false")
 	}
 
-	if status.RemainingBytes != 0 {
-		t.Errorf("expected remainingBytes=0, got %d", status.RemainingBytes)
-	}
 }
 
 func TestDataCapClientAcceptHeader(t *testing.T) {

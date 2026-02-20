@@ -10,7 +10,6 @@ import (
 	"github.com/gobwas/ws"
 
 	"github.com/getlantern/lantern-box/constant"
-	"github.com/getlantern/lantern-box/metrics"
 	"github.com/getlantern/lantern-box/option"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -48,7 +47,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 func (a *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose network.CloseHandlerFunc) {
 	metadata.Inbound = a.Tag()
 	metadata.InboundType = a.Type()
-	conn = metrics.NewConn(conn, &metadata)
 	conn, err := a.newConnectionEx(ctx, conn)
 	if err != nil {
 		network.CloseOnHandshakeFailure(conn, onClose, err)

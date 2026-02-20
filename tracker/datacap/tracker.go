@@ -19,16 +19,13 @@ type DatacapTracker struct {
 	client           *Client
 	logger           log.ContextLogger
 	reportInterval   time.Duration
-	enableThrottling bool
-	throttleSpeed    int64
+	throttleRegistry *ThrottleRegistry
 }
 
 type Options struct {
-	URL              string `json:"url,omitempty"`
-	ReportInterval   string `json:"report_interval,omitempty"`
-	HTTPTimeout      string `json:"http_timeout,omitempty"`
-	EnableThrottling bool   `json:"enable_throttling,omitempty"`
-	ThrottleSpeed    int64  `json:"throttle_speed,omitempty"`
+	URL            string `json:"url,omitempty"`
+	ReportInterval string `json:"report_interval,omitempty"`
+	HTTPTimeout    string `json:"http_timeout,omitempty"`
 }
 
 func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTracker, error) {
@@ -36,7 +33,7 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 		return nil, E.New("datacap url not defined")
 	}
 	// Parse intervals with defaults
-	reportInterval := 30 * time.Second
+	reportInterval := 10 * time.Second
 	if options.ReportInterval != "" {
 		interval, err := time.ParseDuration(options.ReportInterval)
 		if err != nil {
@@ -56,8 +53,7 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 	return &DatacapTracker{
 		client:           NewClient(options.URL, httpTimeout),
 		reportInterval:   reportInterval,
-		enableThrottling: options.EnableThrottling,
-		throttleSpeed:    options.ThrottleSpeed,
+		throttleRegistry: NewThrottleRegistry(),
 		logger:           logger,
 	}, nil
 }
@@ -66,37 +62,39 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 	info, ok := clientcontext.ClientInfoFromContext(ctx)
 	if !ok {
 		// conn is not from a clientcontext-aware client (e.g., not radiance)
+		t.logger.Debug("skipping datacap: no client info in context")
 		return conn
 	}
 	if info.IsPro {
+		t.logger.Debug("skipping datacap: client is pro ", info.DeviceID)
 		return conn
 	}
 	return NewConn(ConnConfig{
-		Conn:             conn,
-		Client:           t.client,
-		Logger:           t.logger,
-		ClientInfo:       info,
-		ReportInterval:   t.reportInterval,
-		EnableThrottling: t.enableThrottling,
-		ThrottleSpeed:    t.throttleSpeed,
+		Conn:           conn,
+		Client:         t.client,
+		Logger:         t.logger,
+		ClientInfo:     info,
+		ReportInterval: t.reportInterval,
+		Throttler:      t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
 }
 func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
 	info, ok := clientcontext.ClientInfoFromContext(ctx)
 	if !ok {
 		// conn is not from a clientcontext-aware client (e.g., not radiance)
+		t.logger.Debug("skipping datacap: no client info in context")
 		return conn
 	}
 	if info.IsPro {
+		t.logger.Debug("skipping datacap: client is pro ", info.DeviceID)
 		return conn
 	}
 	return NewPacketConn(PacketConnConfig{
-		Conn:             conn,
-		Client:           t.client,
-		Logger:           t.logger,
-		ClientInfo:       info,
-		ReportInterval:   t.reportInterval,
-		EnableThrottling: t.enableThrottling,
-		ThrottleSpeed:    t.throttleSpeed,
+		Conn:           conn,
+		Client:         t.client,
+		Logger:         t.logger,
+		ClientInfo:     info,
+		ReportInterval: t.reportInterval,
+		Throttler:      t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
 }
