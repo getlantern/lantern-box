@@ -21,6 +21,7 @@ func TestURLTestGroup_CloseStopsCheckLoop(t *testing.T) {
 		sboxLog.NewNOPFactory().Logger(),
 		[]string{"test"},
 		"https://example.com",
+		nil, // no URL overrides
 		10*time.Millisecond, // fast interval
 		time.Minute,
 		50,

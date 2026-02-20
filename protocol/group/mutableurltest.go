@@ -82,7 +82,7 @@ func NewMutableURLTest(ctx context.Context, _ A.Router, logger log.ContextLogger
 		connMgr:     service.FromContext[A.ConnectionManager](ctx),
 		logger:      logger,
 		group: newURLTestGroup(
-			ctx, outboundMgr, log, options.Outbounds, options.URL, interval, idleTimeout, options.Tolerance,
+			ctx, outboundMgr, log, options.Outbounds, options.URL, options.URLOverrides, interval, idleTimeout, options.Tolerance,
 		),
 	}
 	return outbound, nil
@@ -226,6 +226,7 @@ type urlTestGroup struct {
 	tags                []string
 	outbounds           isync.TypedMap[string, A.Outbound]
 	url                 string
+	urlOverrides        map[string]string
 	interval            time.Duration
 	tolerance           uint16
 	idleTimeout         time.Duration
@@ -248,6 +249,7 @@ func newURLTestGroup(
 	logger log.ContextLogger,
 	tags []string,
 	link string,
+	urlOverrides map[string]string,
 	interval, idleTimeout time.Duration,
 	tolerance uint16,
 ) *urlTestGroup {
@@ -261,16 +263,17 @@ func newURLTestGroup(
 		history = urltest.NewHistoryStorage()
 	}
 	return &urlTestGroup{
-		ctx:         ctx,
-		outboundMgr: outboundMgr,
-		logger:      logger,
-		tags:        tags,
-		url:         link,
-		history:     history,
-		interval:    interval,
-		idleTimeout: idleTimeout,
-		tolerance:   tolerance,
-		cancel:      cancel,
+		ctx:          ctx,
+		outboundMgr:  outboundMgr,
+		logger:       logger,
+		tags:         tags,
+		url:          link,
+		urlOverrides: urlOverrides,
+		history:      history,
+		interval:     interval,
+		idleTimeout:  idleTimeout,
+		tolerance:    tolerance,
+		cancel:       cancel,
 	}
 }
 
@@ -484,11 +487,12 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			g.logger.Trace("skipping outbound", "tag", realTag, "reason", "not found")
 			continue
 		}
+		testURL := g.testURLForTag(tag)
 		b.Go(realTag, func() (any, error) {
 			testCtx, cancel := context.WithTimeout(g.ctx, C.TCPTimeout)
 			defer cancel()
 			g.logger.Trace("checking outbound", "tag", realTag)
-			t, err := urltest.URLTest(testCtx, g.url, p)
+			t, err := urltest.URLTest(testCtx, testURL, p)
 			if err != nil {
 				g.logger.Debug("outbound unavailable", "tag", realTag, "error", err)
 				g.history.DeleteURLTestHistory(realTag)
@@ -564,6 +568,18 @@ func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound) A.Ou
 		}
 	}
 	return nil
+}
+
+// testURLForTag returns the URL to use when testing the given outbound tag.
+// If the tag has a per-outbound override, that URL is returned; otherwise the
+// group's default URL is used.
+func (g *urlTestGroup) testURLForTag(tag string) string {
+	if g.urlOverrides != nil {
+		if override, ok := g.urlOverrides[tag]; ok {
+			return override
+		}
+	}
+	return g.url
 }
 
 func realTag(outbound A.Outbound) string {
