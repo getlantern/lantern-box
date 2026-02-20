@@ -16,7 +16,7 @@ require (
 	github.com/getlantern/lantern-water v0.0.0-20260130212632-d5ea08838250
 	github.com/getlantern/samizdat v0.0.2
 	github.com/gobwas/ws v1.4.0
-	github.com/refraction-networking/water v0.7.0-alpha
+	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/sing v0.7.18
 	github.com/sagernet/sing-box v1.12.22
 	github.com/spf13/cobra v1.10.2
