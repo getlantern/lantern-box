@@ -29,8 +29,6 @@ import (
 	"github.com/getlantern/lantern-box/option"
 )
 
-// WIP usage: edit sing-box/include/registry.go to import and register this protocol
-
 type logAdapter struct {
 	singBoxLogger singlog.ContextLogger
 }
@@ -54,6 +52,7 @@ type Outbound struct {
 	rtcOpt       *UBClientcore.WebRTCOptions
 	bfOpt        *UBClientcore.BroflakeOptions
 	egOpt        *UBClientcore.EgressOptions
+	tlsConfig    *tls.Config
 }
 
 func NewOutbound(
@@ -176,10 +175,11 @@ func NewOutbound(
 			[]string{N.NetworkTCP}, // XXX: Unbounded only supports TCP (not UDP) for now
 			options.DialerOptions,
 		),
-		logger: logger,
-		rtcOpt: rtcOpt,
-		bfOpt:  bfOpt,
-		egOpt:  egOpt,
+		logger:    logger,
+		rtcOpt:    rtcOpt,
+		bfOpt:     bfOpt,
+		egOpt:     egOpt,
+		tlsConfig: generateSelfSignedTLSConfig(options.InsecureDoNotVerifyClientCert),
 	}
 
 	return o, nil
@@ -212,8 +212,7 @@ func (h *Outbound) Start(stage adapter.StartStage) error {
 			return err
 		}
 
-		// TODO: plumb through a real TLS cert and get rid of the self-signed generator?
-		QUICLayer, err := UBClientcore.NewQUICLayer(BFConn, generateSelfSignedTLSConfig())
+		QUICLayer, err := UBClientcore.NewQUICLayer(BFConn, h.tlsConfig)
 		if err != nil {
 			return err
 		}
@@ -242,8 +241,8 @@ func (h *Outbound) Close() error {
 	return nil
 }
 
-// TODO: delete me
-func generateSelfSignedTLSConfig() *tls.Config {
+// Reverse TLS, since the Unbounded client is the QUIC server
+func generateSelfSignedTLSConfig(insecureDoNotVerifyClientCert bool) *tls.Config {
 	key, err := rsa.GenerateKey(rand.Reader, 1024)
 	if err != nil {
 		panic(err)
@@ -261,8 +260,16 @@ func generateSelfSignedTLSConfig() *tls.Config {
 	if err != nil {
 		panic(err)
 	}
+
+	clientAuth := tls.RequireAndVerifyClientCert
+
+	if insecureDoNotVerifyClientCert {
+		clientAuth = tls.NoClientCert
+	}
+
 	return &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
 		NextProtos:   []string{"broflake"},
+		ClientAuth:   clientAuth,
 	}
 }
