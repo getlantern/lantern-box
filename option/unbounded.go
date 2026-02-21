@@ -12,7 +12,8 @@ import (
 type UnboundedOutboundOptions struct {
 	option.DialerOptions
 	option.ServerOptions
-	InsecureDoNotVerifyClientCert bool `json:"insecure_do_not_verify_client_cert,omitempty"`
+	InsecureDoNotVerifyClientCert bool   `json:"insecure_do_not_verify_client_cert,omitempty"`
+	EgressCA                      string `json:"egress_ca,omitempty"`
 	// BroflakeOptions
 	CTableSize  int    `json:"c_table_size,omitempty"`
 	PTableSize  int    `json:"p_table_size,omitempty"`

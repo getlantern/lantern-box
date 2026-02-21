@@ -179,7 +179,7 @@ func NewOutbound(
 		rtcOpt:    rtcOpt,
 		bfOpt:     bfOpt,
 		egOpt:     egOpt,
-		tlsConfig: generateSelfSignedTLSConfig(options.InsecureDoNotVerifyClientCert),
+		tlsConfig: generateSelfSignedTLSConfig(options.InsecureDoNotVerifyClientCert, options.EgressCA),
 	}
 
 	return o, nil
@@ -242,7 +242,7 @@ func (h *Outbound) Close() error {
 }
 
 // Reverse TLS, since the Unbounded client is the QUIC server
-func generateSelfSignedTLSConfig(insecureDoNotVerifyClientCert bool) *tls.Config {
+func generateSelfSignedTLSConfig(insecureDoNotVerifyClientCert bool, egressCA string) *tls.Config {
 	key, err := rsa.GenerateKey(rand.Reader, 1024)
 	if err != nil {
 		panic(err)
@@ -261,6 +261,15 @@ func generateSelfSignedTLSConfig(insecureDoNotVerifyClientCert bool) *tls.Config
 		panic(err)
 	}
 
+	caCertPool := x509.NewCertPool()
+
+	if egressCA != "" {
+		ok := caCertPool.AppendCertsFromPEM([]byte(egressCA))
+		if !ok {
+			panic("an egress CA cert was configured, but it could not be appended")
+		}
+	}
+
 	clientAuth := tls.RequireAndVerifyClientCert
 
 	if insecureDoNotVerifyClientCert {
@@ -271,5 +280,6 @@ func generateSelfSignedTLSConfig(insecureDoNotVerifyClientCert bool) *tls.Config
 		Certificates: []tls.Certificate{tlsCert},
 		NextProtos:   []string{"broflake"},
 		ClientAuth:   clientAuth,
+		ClientCAs:    caCertPool,
 	}
 }
