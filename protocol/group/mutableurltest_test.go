@@ -21,6 +21,7 @@ func TestURLTestGroup_CloseStopsCheckLoop(t *testing.T) {
 		sboxLog.NewNOPFactory().Logger(),
 		[]string{"test"},
 		"https://example.com",
+		nil, // no URL overrides
 		10*time.Millisecond, // fast interval
 		time.Minute,
 		50,
@@ -49,6 +50,51 @@ func TestURLTestGroup_CloseStopsCheckLoop(t *testing.T) {
 		defer g.access.Unlock()
 		return !g.isAlive
 	}, time.Second, 200*time.Millisecond)
+}
+
+func TestTestURLForTag_DefaultURL(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{"out1": nil}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"out1"},
+		"https://default.example.com",
+		nil, // no overrides
+		time.Minute, time.Minute, 50,
+	)
+
+	assert.Equal(t, "https://default.example.com", g.testURLForTag("out1"))
+	assert.Equal(t, "https://default.example.com", g.testURLForTag("unknown"))
+}
+
+func TestTestURLForTag_WithOverrides(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	overrides := map[string]string{
+		"out1": "https://override1.example.com",
+		"out2": "https://override2.example.com",
+	}
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{
+			"out1": nil, "out2": nil, "out3": nil,
+		}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"out1", "out2", "out3"},
+		"https://default.example.com",
+		overrides,
+		time.Minute, time.Minute, 50,
+	)
+
+	// Tags with overrides use their override URL
+	assert.Equal(t, "https://override1.example.com", g.testURLForTag("out1"))
+	assert.Equal(t, "https://override2.example.com", g.testURLForTag("out2"))
+	// Tags without overrides fall back to the default URL
+	assert.Equal(t, "https://default.example.com", g.testURLForTag("out3"))
+	// Unknown tags also fall back to the default
+	assert.Equal(t, "https://default.example.com", g.testURLForTag("unknown"))
 }
 
 type mockPauseManager struct{}
