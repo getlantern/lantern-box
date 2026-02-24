@@ -238,3 +238,7 @@ func (c *PacketConn) GetStatus() (*DataCapStatus, error) {
 func (c *PacketConn) GetBytesConsumed() int64 {
 	return c.bytesSent.Load() + c.bytesReceived.Load()
 }
+
+func (c *PacketConn) Upstream() any {
+	return c.PacketConn
+}

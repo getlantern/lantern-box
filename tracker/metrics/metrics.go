@@ -18,11 +18,12 @@ import (
 )
 
 type metricsManager struct {
-	meter         metric.Meter
-	ProxyIO       metric.Int64Counter
-	Connections   metric.Int64Counter
-	conns         metric.Int64UpDownCounter
-	duration      metric.Int64Histogram
+	meter       metric.Meter
+	ProxyIO     metric.Int64Counter
+	Connections metric.Int64Counter
+	conns       metric.Int64UpDownCounter
+	duration    metric.Int64Histogram
+
 	countryLookup geo.CountryLookup
 }
 
