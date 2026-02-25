@@ -164,6 +164,9 @@ func (m *MutableGroupManager) addToGroup(outGroup adapter.MutableOutboundGroup, 
 func (m *MutableGroupManager) SetURLOverrides(group string, overrides map[string]string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed.Load() {
+		return ErrIsClosed
+	}
 	outGroup, ok := m.groups[group]
 	if !ok {
 		return fmt.Errorf("group %q not found", group)
