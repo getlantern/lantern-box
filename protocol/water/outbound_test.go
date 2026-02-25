@@ -23,7 +23,7 @@ import (
 	"github.com/sagernet/sing/common/metadata"
 	"github.com/stretchr/testify/require"
 
-	"github.com/getlantern/sing-box-extensions/option"
+	"github.com/getlantern/lantern-box/option"
 )
 
 func TestOutboundWASM(t *testing.T) {
@@ -60,15 +60,15 @@ func TestOutboundWASM(t *testing.T) {
 	}
 	tmp := t.TempDir()
 	options := option.WATEROutboundOptions{
-		DownloadTimeout:           "10s",
-		WASMStorageDir:            tmp,
-		WazeroCompilationCacheDir: tmp,
-		WASMAvailableAt:           []string{server.URL + "/shadowsocks_client.wasm"},
-		Transport:                 "shadowsocks",
-		ServerOptions:             O.ServerOptions{Server: "127.0.0.1", ServerPort: 8480},
-		DialerOptions:             O.DialerOptions{},
-		Config:                    transportConfig,
-		SkipHandshake:             true,
+		DownloadTimeout: "10s",
+		Dir:             tmp,
+		WASMAvailableAt: []string{server.URL + "/shadowsocks_client.wasm"},
+		Transport:       "shadowsocks",
+		ServerOptions:   O.ServerOptions{Server: "127.0.0.1", ServerPort: 8480},
+		DialerOptions:   O.DialerOptions{},
+		Config:          transportConfig,
+		SkipHandshake:   true,
+		Hashsum:         "05b820148199ea64a7f3e716adefb4c247c8ea0f69175a3af61c36260773e273",
 	}
 
 	out, err := NewOutbound(ctx, nil, log.NewNOPFactory().Logger(), "test", options)
@@ -171,10 +171,7 @@ func startTestHTTPServer(t *testing.T) *httptest.Server {
 
 func startBoxServer(t *testing.T, opts string) (*box.Box, context.Context) {
 	t.Helper()
-	outboundRegistry := include.OutboundRegistry()
-	inboundRegistry := include.InboundRegistry()
-	endpointRegistry := include.EndpointRegistry()
-	ctx := box.Context(context.Background(), inboundRegistry, outboundRegistry, endpointRegistry)
+	ctx := box.Context(context.Background(), include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry(), include.DNSTransportRegistry(), include.ServiceRegistry())
 
 	options, err := json.UnmarshalExtendedContext[O.Options](ctx, []byte(opts))
 	require.NoError(t, err, "failed to unmarshal options")
