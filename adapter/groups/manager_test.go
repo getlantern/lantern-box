@@ -11,6 +11,8 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	lbAdapter "github.com/getlantern/lantern-box/adapter"
 )
 
 func TestRemovalQueue(t *testing.T) {
@@ -103,6 +105,81 @@ func TestRemovalQueue(t *testing.T) {
 			tt.assertFn(t, rq)
 		})
 	}
+}
+
+func TestSetURLOverrides(t *testing.T) {
+	logger := log.NewNOPFactory().Logger()
+
+	t.Run("delegates to URLOverrideSetter group", func(t *testing.T) {
+		mock := &mockURLOverrideGroup{urlOverrides: nil}
+		mgr := &MutableGroupManager{
+			groups: map[string]lbAdapter.MutableOutboundGroup{"auto-test": mock},
+			removalQueue: newRemovalQueue(
+				logger, &mockOutboundManager{}, &mockEndpointManager{}, &mockConnectionManager{},
+				pollInterval, forceAfter,
+			),
+		}
+		overrides := map[string]string{"out1": "https://example.com/cb"}
+		err := mgr.SetURLOverrides("auto-test", overrides)
+		require.NoError(t, err)
+		assert.Equal(t, overrides, mock.urlOverrides)
+	})
+
+	t.Run("error when group not found", func(t *testing.T) {
+		mgr := &MutableGroupManager{
+			groups: map[string]lbAdapter.MutableOutboundGroup{},
+			removalQueue: newRemovalQueue(
+				logger, &mockOutboundManager{}, &mockEndpointManager{}, &mockConnectionManager{},
+				pollInterval, forceAfter,
+			),
+		}
+		err := mgr.SetURLOverrides("nonexistent", nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "not found")
+	})
+
+	t.Run("error when group does not implement URLOverrideSetter", func(t *testing.T) {
+		mock := &mockPlainGroup{}
+		mgr := &MutableGroupManager{
+			groups: map[string]lbAdapter.MutableOutboundGroup{"plain": mock},
+			removalQueue: newRemovalQueue(
+				logger, &mockOutboundManager{}, &mockEndpointManager{}, &mockConnectionManager{},
+				pollInterval, forceAfter,
+			),
+		}
+		err := mgr.SetURLOverrides("plain", nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "does not support URL overrides")
+	})
+
+	t.Run("error when manager is closed", func(t *testing.T) {
+		mock := &mockURLOverrideGroup{}
+		mgr := &MutableGroupManager{
+			groups: map[string]lbAdapter.MutableOutboundGroup{"auto-test": mock},
+			removalQueue: newRemovalQueue(
+				logger, &mockOutboundManager{}, &mockEndpointManager{}, &mockConnectionManager{},
+				pollInterval, forceAfter,
+			),
+		}
+		mgr.closed.Store(true)
+		err := mgr.SetURLOverrides("auto-test", nil)
+		assert.ErrorIs(t, err, ErrIsClosed)
+	})
+}
+
+// mockURLOverrideGroup implements both MutableOutboundGroup and URLOverrideSetter.
+type mockURLOverrideGroup struct {
+	lbAdapter.MutableOutboundGroup
+	urlOverrides map[string]string
+}
+
+func (m *mockURLOverrideGroup) SetURLOverrides(overrides map[string]string) {
+	m.urlOverrides = overrides
+}
+
+// mockPlainGroup implements MutableOutboundGroup but NOT URLOverrideSetter.
+type mockPlainGroup struct {
+	lbAdapter.MutableOutboundGroup
 }
 
 type mockOutboundManager struct {
