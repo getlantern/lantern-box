@@ -1,17 +1,20 @@
 package protocol
 
 import (
+	"context"
+
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
-	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing/service"
 
-	"github.com/getlantern/sing-box-extensions/protocol/amnezia"
-	"github.com/getlantern/sing-box-extensions/protocol/group"
-	"github.com/getlantern/sing-box-extensions/protocol/water"
-
-	"github.com/getlantern/sing-box-extensions/protocol/algeneva"
-	"github.com/getlantern/sing-box-extensions/protocol/outline"
+	"github.com/getlantern/lantern-box/protocol/algeneva"
+	"github.com/getlantern/lantern-box/protocol/amnezia"
+	"github.com/getlantern/lantern-box/protocol/group"
+	"github.com/getlantern/lantern-box/protocol/outline"
+	"github.com/getlantern/lantern-box/protocol/samizdat"
+	"github.com/getlantern/lantern-box/protocol/water"
 )
 
 var supportedProtocols = []string{
@@ -19,6 +22,7 @@ var supportedProtocols = []string{
 	"algeneva",
 	"amnezia",
 	"outline",
+	"samizdat",
 
 	// sing-box built-in protocols
 	"http",
@@ -36,22 +40,32 @@ var supportedProtocols = []string{
 	"wireguard",
 }
 
-func GetRegistries() (*inbound.Registry, *outbound.Registry, *endpoint.Registry) {
-	outboundRegistry := include.OutboundRegistry()
-	inboundRegistry := include.InboundRegistry()
-	endpointRegistry := include.EndpointRegistry()
-
-	registerInbounds(inboundRegistry)
-	registerOutbounds(outboundRegistry)
-	registerEndpoints(endpointRegistry)
-
-	return inboundRegistry, outboundRegistry, endpointRegistry
+// RegisterProtocols registers all lantern-box protocols to the given context's registries.
+// Note: this does not register sing-box built-in protocols.
+func RegisterProtocols(ctx context.Context) context.Context {
+	if registry := service.FromContext[adapter.InboundRegistry](ctx); registry != nil {
+		if reg, ok := registry.(*inbound.Registry); ok {
+			registerInbounds(reg)
+		}
+	}
+	if registry := service.FromContext[adapter.OutboundRegistry](ctx); registry != nil {
+		if reg, ok := registry.(*outbound.Registry); ok {
+			registerOutbounds(reg)
+		}
+	}
+	if registry := service.FromContext[adapter.EndpointRegistry](ctx); registry != nil {
+		if reg, ok := registry.(*endpoint.Registry); ok {
+			registerEndpoints(reg)
+		}
+	}
+	return ctx
 }
 
 // ***** REGISTER NEW PROTOCOLS HERE ***** //
 
 func registerInbounds(registry *inbound.Registry) {
 	algeneva.RegisterInbound(registry)
+	samizdat.RegisterInbound(registry)
 	water.RegisterInbound(registry)
 }
 
@@ -59,11 +73,13 @@ func registerOutbounds(registry *outbound.Registry) {
 	// custom protocol outbounds
 	algeneva.RegisterOutbound(registry)
 	outline.RegisterOutbound(registry)
-	amnezia.RegisterOutbound(registry)
+	samizdat.RegisterOutbound(registry)
 	water.RegisterOutbound(registry)
 
 	// utility outbounds
 	group.RegisterFallback(registry)
+	group.RegisterMutableSelector(registry)
+	group.RegisterMutableURLTest(registry)
 }
 
 func registerEndpoints(registry *endpoint.Registry) {

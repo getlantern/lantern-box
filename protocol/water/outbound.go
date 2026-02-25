@@ -7,16 +7,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
 	waterDownloader "github.com/getlantern/lantern-water/downloader"
 	waterVC "github.com/getlantern/lantern-water/version_control"
-	"github.com/getlantern/sing-box-extensions/constant"
-	L "github.com/getlantern/sing-box-extensions/log"
-	"github.com/getlantern/sing-box-extensions/option"
-	waterTransport "github.com/getlantern/sing-box-extensions/transport/water"
 	"github.com/refraction-networking/water"
 	_ "github.com/refraction-networking/water/transport/v1"
 	"github.com/sagernet/sing-box/adapter"
@@ -29,6 +26,11 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/network"
 	"github.com/tetratelabs/wazero"
+
+	"github.com/getlantern/lantern-box/constant"
+	L "github.com/getlantern/lantern-box/log"
+	"github.com/getlantern/lantern-box/option"
+	waterTransport "github.com/getlantern/lantern-box/transport/water"
 )
 
 // RegisterOutbound registers the WATER outbound adapter with the given registry.
@@ -54,23 +56,21 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 
-	if options.WASMStorageDir == "" {
-		return nil, E.New("provided an empty storage directory for WASM files")
+	if options.Dir == "" {
+		return nil, E.New("provided an empty storage directory for WATER files")
 	}
 
-	if options.WazeroCompilationCacheDir == "" {
-		return nil, E.New("provided an empty storage directory for wazero compilation cache")
-	}
-
-	for _, dir := range []string{options.WASMStorageDir, options.WazeroCompilationCacheDir} {
+	wasmDir := filepath.Join(options.Dir, "wasm_files")
+	wazeroCompilationDir := filepath.Join(options.Dir, "wazero_compilation_cache")
+	for _, dir := range []string{wasmDir, wazeroCompilationDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, err
 		}
 	}
 
 	slogLogger := slog.New(L.NewLogHandler(logger))
-	vc := waterVC.NewWaterVersionControl(options.WASMStorageDir, slogLogger)
-	d, err := waterDownloader.NewWASMDownloader(options.WASMAvailableAt, &http.Client{Timeout: timeout})
+	vc := waterVC.NewWaterVersionControl(wasmDir, slogLogger)
+	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, &http.Client{Timeout: timeout})
 	if err != nil {
 		return nil, E.New("failed to create WASM downloader", err)
 	}
@@ -86,7 +86,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 
-	outboundDialer, err := dialer.New(ctx, options.DialerOptions)
+	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +94,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	// We're creating the compilation cache dir and setting the global value so during runtime
 	// it won't need to create one at a temp directory
-	compilationCache, err := wazero.NewCompilationCacheWithDir(options.WazeroCompilationCacheDir)
+	compilationCache, err := wazero.NewCompilationCacheWithDir(wazeroCompilationDir)
 	if err != nil {
 		return nil, err
 	}

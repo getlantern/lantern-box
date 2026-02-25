@@ -15,6 +15,18 @@ import (
 	"github.com/sagernet/sing/common/observable"
 )
 
+const (
+	LevelTrace = slog.LevelDebug - 4 // no trace level in slog, use debug-4.
+	LevelDebug = slog.LevelDebug
+	LevelInfo  = slog.LevelInfo
+	LevelWarn  = slog.LevelWarn
+	LevelError = slog.LevelError
+	LevelFatal = slog.LevelError + 4 // no fatal level in slog, use error+4.
+	LevelPanic = slog.LevelError + 8 // no panic level in slog, use error+8.
+
+	Disable = slog.LevelInfo + 255 // A level that disables logging, used for testing or no-op logger.
+)
+
 type Factory interface {
 	log.ObservableFactory
 	SlogHandler() slog.Handler
@@ -31,6 +43,10 @@ type factory struct {
 func NewFactory(
 	handler slog.Handler,
 ) Factory {
+	if !handler.Enabled(context.Background(), LevelPanic) {
+		return NewNopFactory(handler)
+	}
+
 	factory := &factory{
 		handler:    handler,
 		subscriber: observable.NewSubscriber[log.Entry](128),
@@ -54,12 +70,14 @@ func (f *factory) Close() error {
 
 // Level returns the current logging level of the factory.
 func (f *factory) Level() log.Level {
-	for i := log.LevelTrace; i >= log.LevelPanic; i-- {
-		if f.handler.Enabled(context.Background(), toSLevel(i)) {
-			return i
+	level := log.Level(Disable)
+	for i := log.LevelPanic; i <= log.LevelTrace; i++ {
+		if !f.handler.Enabled(context.Background(), toSLevel(i)) {
+			break
 		}
+		level = i
 	}
-	return log.LevelTrace
+	return level
 }
 
 // SetLevel implements the [Factory] interface. [slog.Handler] does not support dynamic level changes,
@@ -111,6 +129,8 @@ type slogLogger struct {
 	tag string
 }
 
+// Log accepts a [sing-box/log.Level] to satisfy the [log.ContextLogger] interface. It is converted
+// to [slog.Level] internally.
 func (l *slogLogger) Log(ctx context.Context, level log.Level, args ...any) string {
 	if len(args) == 0 {
 		return ""
@@ -118,12 +138,11 @@ func (l *slogLogger) Log(ctx context.Context, level log.Level, args ...any) stri
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return l.log(ctx, level, args)
+	return l.log(ctx, toSLevel(level), args)
 }
 
-func (l *slogLogger) log(ctx context.Context, level log.Level, args []any) string {
-	slevel := toSLevel(level)
-	if !l.handler.Enabled(ctx, slevel) {
+func (l *slogLogger) log(ctx context.Context, level slog.Level, args []any) string {
+	if !l.handler.Enabled(ctx, level) {
 		return ""
 	}
 
@@ -150,77 +169,82 @@ func (l *slogLogger) log(ctx context.Context, level log.Level, args []any) strin
 	runtime.Callers(3, pcs[:])
 	pc := pcs[0]
 
-	r := slog.NewRecord(time.Now(), slevel, message, pc)
+	r := slog.NewRecord(time.Now(), level, message, pc)
 	r.Add(args...)
 	_ = l.SlogHandler().Handle(ctx, r)
 
 	if l.subscriber != nil {
-		l.subscriber.Emit(log.Entry{level, message})
+		l.subscriber.Emit(log.Entry{
+			Level:   log.Level(level),
+			Message: message,
+		})
 	}
 	return message
 }
 
 func (l *slogLogger) Trace(args ...any) {
-	l.TraceContext(context.Background(), args...)
+	l.log(context.Background(), LevelTrace, args)
 }
 
 func (l *slogLogger) Debug(args ...any) {
-	l.DebugContext(context.Background(), args...)
+	l.log(context.Background(), LevelDebug, args)
 }
 
 func (l *slogLogger) Info(args ...any) {
-	l.InfoContext(context.Background(), args...)
+	l.log(context.Background(), LevelInfo, args)
 }
 
 func (l *slogLogger) Warn(args ...any) {
-	l.WarnContext(context.Background(), args...)
+	l.log(context.Background(), LevelWarn, args)
 }
 
 func (l *slogLogger) Error(args ...any) {
-	l.ErrorContext(context.Background(), args...)
+	l.log(context.Background(), LevelError, args)
 }
 
 func (l *slogLogger) Fatal(args ...any) {
-	l.FatalContext(context.Background(), args...)
+	l.log(context.Background(), LevelFatal, args)
+	os.Exit(1)
 }
 
 func (l *slogLogger) Panic(args ...any) {
-	l.PanicContext(context.Background(), args...)
+	message := l.log(context.Background(), LevelPanic, args)
+	panic(message)
 }
 
 func (l *slogLogger) TraceContext(ctx context.Context, args ...any) {
-	l.log(ctx, log.LevelTrace, args)
+	l.log(ctx, LevelTrace, args)
 }
 
 func (l *slogLogger) DebugContext(ctx context.Context, args ...any) {
-	l.log(ctx, log.LevelDebug, args)
+	l.log(ctx, LevelDebug, args)
 }
 
 func (l *slogLogger) InfoContext(ctx context.Context, args ...any) {
-	l.log(ctx, log.LevelInfo, args)
+	l.log(ctx, LevelInfo, args)
 }
 
 func (l *slogLogger) WarnContext(ctx context.Context, args ...any) {
-	l.log(ctx, log.LevelWarn, args)
+	l.log(ctx, LevelWarn, args)
 }
 
 func (l *slogLogger) ErrorContext(ctx context.Context, args ...any) {
-	l.log(ctx, log.LevelError, args)
+	l.log(ctx, LevelError, args)
 }
 
 func (l *slogLogger) FatalContext(ctx context.Context, args ...any) {
-	l.log(ctx, log.LevelFatal, args)
+	l.log(ctx, LevelFatal, args)
 	os.Exit(1)
 }
 
 func (l *slogLogger) PanicContext(ctx context.Context, args ...any) {
-	message := l.log(ctx, log.LevelPanic, args)
+	message := l.log(ctx, LevelPanic, args)
 	panic(message)
 }
 
 // SBLevelToString converts a [log.Level] to its string representation.
 func SBLevelToString(l log.Level) string {
-	return strings.ToUpper(log.FormatLevel(log.Level(l)))
+	return strings.ToUpper(log.FormatLevel(l))
 }
 
 // toSLevel converts a [log.Level] to a [slog.Level]. This is necessary because slog and sing-box
@@ -228,20 +252,39 @@ func SBLevelToString(l log.Level) string {
 func toSLevel(lvl log.Level) slog.Level {
 	switch lvl {
 	case log.LevelTrace:
-		return slog.LevelDebug - 4 // slog does not have a separate trace level, so we use debug-4.
+		return LevelTrace
 	case log.LevelDebug:
-		return slog.LevelDebug
+		return LevelDebug
 	case log.LevelInfo:
-		return slog.LevelInfo
+		return LevelInfo
 	case log.LevelWarn:
-		return slog.LevelWarn
+		return LevelWarn
 	case log.LevelError:
-		return slog.LevelError
+		return LevelError
 	case log.LevelFatal:
-		return slog.LevelError + 4 // slog does not have a separate fatal level, so we use error+4.
+		return LevelFatal
 	case log.LevelPanic:
-		return slog.LevelError + 8 // slog does not have a separate panic level, so we use error+8.
+		return LevelPanic
 	default:
-		return slog.LevelDebug // Default to debug if the level is unknown.
+		return LevelInfo // Default to info if the level is unknown.
 	}
+}
+
+type nopFactory struct {
+	log.ObservableFactory
+	handler slog.Handler
+}
+
+func NewNopFactory(handler slog.Handler) Factory {
+	return &nopFactory{
+		ObservableFactory: log.NewNOPFactory(),
+	}
+}
+
+func (f *nopFactory) Level() log.Level {
+	return log.LevelTrace + 1
+}
+
+func (f *nopFactory) SlogHandler() slog.Handler {
+	return f.handler
 }

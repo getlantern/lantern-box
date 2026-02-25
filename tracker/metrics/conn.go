@@ -20,7 +20,7 @@ type Conn struct {
 // NewConn creates a new Conn instance.
 func NewConn(conn net.Conn, metadata *adapter.InboundContext) net.Conn {
 	attributes := metadataToAttributes(metadata)
-	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attributes...))
+	metrics.Connections.Add(context.Background(), 1, metric.WithAttributes(attributes...))
 	return &Conn{
 		Conn:       conn,
 		attributes: attributes,
@@ -32,7 +32,8 @@ func NewConn(conn net.Conn, metadata *adapter.InboundContext) net.Conn {
 func (c *Conn) Read(b []byte) (n int, err error) {
 	n, err = c.Conn.Read(b)
 	if n > 0 {
-		metrics.bytesReceived.Add(context.Background(), int64(n), metric.WithAttributes(c.attributes...))
+		attrs := append(c.attributes, attribute.KeyValue{Key: "direction", Value: attribute.StringValue("receive")})
+		metrics.ProxyIO.Add(context.Background(), int64(n), metric.WithAttributes(attrs...))
 	}
 	return
 }
@@ -41,7 +42,8 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 func (c *Conn) Write(b []byte) (n int, err error) {
 	n, err = c.Conn.Write(b)
 	if n > 0 {
-		metrics.bytesSent.Add(context.Background(), int64(n), metric.WithAttributes(c.attributes...))
+		attrs := append(c.attributes, attribute.KeyValue{Key: "direction", Value: attribute.StringValue("transmit")})
+		metrics.ProxyIO.Add(context.Background(), int64(n), metric.WithAttributes(attrs...))
 	}
 	return
 }
@@ -52,4 +54,8 @@ func (c *Conn) Close() error {
 	metrics.duration.Record(context.Background(), duration, metric.WithAttributes(c.attributes...))
 	metrics.conns.Add(context.Background(), -1, metric.WithAttributes(c.attributes...))
 	return c.Conn.Close()
+}
+
+func (c *Conn) Upstream() any {
+	return c.Conn
 }

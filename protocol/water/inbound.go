@@ -9,11 +9,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/getlantern/lantern-box/constant"
+	L "github.com/getlantern/lantern-box/log"
+	"github.com/getlantern/lantern-box/option"
+	waterTransport "github.com/getlantern/lantern-box/transport/water"
 	waterDownloader "github.com/getlantern/lantern-water/downloader"
-	"github.com/getlantern/sing-box-extensions/constant"
-	L "github.com/getlantern/sing-box-extensions/log"
-	"github.com/getlantern/sing-box-extensions/option"
-	waterTransport "github.com/getlantern/sing-box-extensions/transport/water"
 	"github.com/refraction-networking/water"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -53,7 +53,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, E.New("no WASM URLs available")
 	}
 
-	d, err := waterDownloader.NewWASMDownloader(options.WASMAvailableAt, &http.Client{Timeout: 1 * time.Minute})
+	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, &http.Client{Timeout: 1 * time.Minute})
 	if err != nil {
 		return nil, E.New("failed to create WASM downloader", err)
 	}
