@@ -131,6 +131,11 @@ func (s *MutableURLTest) Remove(tags ...string) (n int, err error) {
 	return s.group.Remove(tags)
 }
 
+// SetURLOverrides replaces the per-outbound URL override map used during URL testing.
+func (s *MutableURLTest) SetURLOverrides(overrides map[string]string) {
+	s.group.SetURLOverrides(overrides)
+}
+
 func (s *MutableURLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return s.group.URLTest(ctx)
 }
@@ -361,6 +366,12 @@ func (g *urlTestGroup) Add(tags []string) (n int, err error) {
 		return n, fmt.Errorf("%d outbounds not found: %v", len(missing), missing)
 	}
 	return n, nil
+}
+
+func (g *urlTestGroup) SetURLOverrides(overrides map[string]string) {
+	g.access.Lock()
+	defer g.access.Unlock()
+	g.urlOverrides = overrides
 }
 
 func (g *urlTestGroup) Remove(tags []string) (n int, err error) {

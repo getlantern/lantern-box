@@ -12,6 +12,11 @@ type MutableOutboundGroup interface {
 	Remove(tags ...string) (n int, err error)
 }
 
+// URLOverrideSetter is implemented by outbound groups that support per-outbound URL test overrides.
+type URLOverrideSetter interface {
+	SetURLOverrides(overrides map[string]string)
+}
+
 // TaggedConn is a net.Conn tagged with the outbound tag used to create it.
 type TaggedConn struct {
 	net.Conn
