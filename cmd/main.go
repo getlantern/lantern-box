@@ -9,6 +9,7 @@ import (
 	box "github.com/getlantern/lantern-box"
 	"github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/metrics"
+	"github.com/sagernet/sing-box/log"
 	"github.com/spf13/cobra"
 	sdkotel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -67,6 +68,7 @@ func preRun(cmd *cobra.Command, args []string) {
 	proxyInfoPath := strings.Replace(path, ".json", ".ini", 1)
 	proxyInfo, err := readProxyInfoFile(proxyInfoPath)
 	if err != nil {
+		log.Warn("telemetry disabled: could not read proxy info file: ", err)
 		return
 	}
 
@@ -83,6 +85,7 @@ func preRun(cmd *cobra.Command, args []string) {
 
 	otel.InitGlobalMeterProvider(otelOpts)
 	otel.InitGlobalTracerProvider(otelOpts)
+	log.Info("telemetry enabled, exporting to ", otelOpts.Endpoint)
 
 	metrics.SetupMetricsManager(geoCityURL, cityDatabaseName)
 }

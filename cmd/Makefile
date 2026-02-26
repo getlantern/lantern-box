@@ -3,4 +3,4 @@ TAGS = with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_c
 build:
 	go build -v -tags "$(TAGS)" -o lantern-box .
 run:
-	go run -tags=$(TAGS) . run --config $(config)
+	go run -tags=$(TAGS) . run --config $(config) --telemetry-endpoint $(telemetry_endpoint)
