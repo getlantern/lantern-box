@@ -28,8 +28,8 @@ type UnboundedOutboundOptions struct {
 	NATFailTimeout    int      `json:"nat_fail_timeout,omitempty"`
 	STUNBatchSize     int      `json:"stun_batch_size,omitempty"`
 	STUNServers       []string `json:"stun_servers,omitempty"`
-	STUNBatch         func(size uint32) (batch []string, err error)
-	HTTPClient        *http.Client
+	STUNBatch  func(size uint32) (batch []string, err error) `json:"-"`
+	HTTPClient *http.Client                                   `json:"-"`
 	Tag               string `json:"tag,omitempty"`
 	Patience          int    `json:"patience,omitempty"`
 	ErrorBackoff      int    `json:"error_backoff,omitempty"`
