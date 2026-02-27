@@ -15,8 +15,17 @@ import (
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/service"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric/noop"
+
 	"gopkg.in/ini.v1"
+
+	"github.com/getlantern/lantern-box/adapter"
+	"github.com/getlantern/lantern-box/tracker/clientcontext"
+	"github.com/getlantern/lantern-box/tracker/datacap"
+	"github.com/getlantern/lantern-box/tracker/metrics"
 )
 
 func init() {
@@ -25,6 +34,7 @@ func init() {
 	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz", "URL for downloading GeoLite2-City database")
 	runCmd.Flags().String("city-database-name", "GeoLite2-City.mmdb", "Filename for storing GeoLite2-City database")
 	runCmd.Flags().String("telemetry-endpoint", "telemetry.iantem.io:443", "Telemetry endpoint for OpenTelemetry exporter")
+	runCmd.Flags().String("datacap-url", "", "Datacap server URL")
 }
 
 var runCmd = &cobra.Command{
@@ -35,7 +45,11 @@ var runCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("get config flag: %w", err)
 		}
-		return run(path)
+		datacapURL, err := cmd.Flags().GetString("datacap-url")
+		if err != nil {
+			return fmt.Errorf("get datacap-url flag: %w", err)
+		}
+		return run(path, datacapURL)
 	},
 }
 
@@ -64,7 +78,7 @@ func readConfig(path string) (option.Options, error) {
 	return options, nil
 }
 
-func create(configPath string) (*box.Box, context.CancelFunc, error) {
+func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc, error) {
 	options, err := readConfig(configPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read config: %w", err)
@@ -77,6 +91,43 @@ func create(configPath string) (*box.Box, context.CancelFunc, error) {
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("create service: %w", err)
+	}
+
+	if datacapURL != "" {
+		// Add datacap tracker
+		log.Info("Datacap enabled. Creating trackers...")
+		clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
+			Inbound:  []string{""},
+			Outbound: []string{""},
+		}, log.StdLogger())
+		instance.Router().AppendTracker(clientCtxMgr)
+		service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
+
+		datacapTracker, err := datacap.NewDatacapTracker(
+			datacap.Options{
+				URL:            datacapURL,
+				ReportInterval: "10s",
+			},
+			log.StdLogger(),
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
+		}
+		clientCtxMgr.AppendTracker(datacapTracker)
+	} else {
+		log.Warn("Datacap URL not provided, datacap tracking disabled")
+	}
+
+	mp := otel.GetMeterProvider()
+	if _, ok := mp.(noop.MeterProvider); ok {
+		log.Info("Metrics not enabled, no meter provider configured")
+	} else {
+		metricsTracker, err := metrics.NewTracker()
+		if err != nil {
+			return nil, nil, fmt.Errorf("create metrics tracker: %w", err)
+		}
+		instance.Router().AppendTracker(metricsTracker)
+		log.Info("Metric Tracking Enabled")
 	}
 
 	osSignals := make(chan os.Signal, 1)
@@ -112,13 +163,13 @@ func closeMonitor(ctx context.Context) {
 	log.Fatal("sing-box did not close!")
 }
 
-func run(configPath string) error {
+func run(configPath string, datacapURL string) error {
 	log.Info("build info: version ", version, ", commit ", commit)
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(osSignals)
 	for {
-		instance, cancel, err := create(configPath)
+		instance, cancel, err := create(configPath, datacapURL)
 		if err != nil {
 			return err
 		}

@@ -19,6 +19,20 @@
 			"tag": "http-out",
 			"server": "localhost",
 			"server_port": 8080
+		},
+		{
+			"type": "socks",
+			"tag": "socks-out",
+			"server": "localhost",
+			"server_port": 8080
+		},
+		{
+			"type": "selector",
+			"tag": "selector",
+			"outbounds": [
+				"http-out",
+				"socks-out"
+			]
 		}
 	],
 	"route": {

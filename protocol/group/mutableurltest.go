@@ -2,10 +2,14 @@ package group
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/url"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -18,8 +22,9 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/batch"
-	"github.com/sagernet/sing/common/metadata"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 	"go.opentelemetry.io/otel"
@@ -82,7 +87,7 @@ func NewMutableURLTest(ctx context.Context, _ A.Router, logger log.ContextLogger
 		connMgr:     service.FromContext[A.ConnectionManager](ctx),
 		logger:      logger,
 		group: newURLTestGroup(
-			ctx, outboundMgr, log, options.Outbounds, options.URL, interval, idleTimeout, options.Tolerance,
+			ctx, outboundMgr, log, options.Outbounds, options.URL, options.URLOverrides, interval, idleTimeout, options.Tolerance,
 		),
 	}
 	return outbound, nil
@@ -134,7 +139,7 @@ func (s *MutableURLTest) CheckOutbounds() {
 	s.group.CheckOutbounds(true)
 }
 
-func (s *MutableURLTest) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
+func (s *MutableURLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableURLTest.DialContext", trace.WithAttributes(
 		attribute.String("network", network),
 		attribute.StringSlice("supported_network_options", s.Network()),
@@ -151,16 +156,19 @@ func (s *MutableURLTest) DialContext(ctx context.Context, network string, destin
 		return nil, err
 	}
 	conn, err := outbound.DialContext(ctx, network, destination)
-	if err == nil {
-		return conn, nil
+	if err != nil {
+		s.logger.ErrorContext(ctx, err)
+		s.group.history.DeleteURLTestHistory(outbound.Tag())
+		span.RecordError(err)
+		return nil, err
 	}
-	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	span.RecordError(err)
-	return nil, err
+	if taggedConn, ok := conn.(*adapter.TaggedConn); ok {
+		return taggedConn, nil
+	}
+	return adapter.NewTaggedConn(conn, realTag(outbound)), nil
 }
 
-func (s *MutableURLTest) ListenPacket(ctx context.Context, destination metadata.Socksaddr) (net.PacketConn, error) {
+func (s *MutableURLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableURLTest.ListenPacket", trace.WithAttributes(
 		attribute.StringSlice("supported_network_options", s.Network()),
 		attribute.String("outbound", s.Now()),
@@ -176,13 +184,16 @@ func (s *MutableURLTest) ListenPacket(ctx context.Context, destination metadata.
 		return nil, err
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
-	if err == nil {
-		return conn, nil
+	if err != nil {
+		s.logger.ErrorContext(ctx, err)
+		s.group.history.DeleteURLTestHistory(outbound.Tag())
+		span.RecordError(err)
+		return nil, err
 	}
-	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	span.RecordError(err)
-	return nil, err
+	if taggedConn, ok := conn.(*adapter.TaggedPacketConn); ok {
+		return taggedConn, nil
+	}
+	return adapter.NewTaggedPacketConn(conn, realTag(outbound)), nil
 }
 
 func (s *MutableURLTest) selectOutbound(network string) (A.Outbound, error) {
@@ -220,6 +231,7 @@ type urlTestGroup struct {
 	tags                []string
 	outbounds           isync.TypedMap[string, A.Outbound]
 	url                 string
+	urlOverrides        map[string]string
 	interval            time.Duration
 	tolerance           uint16
 	idleTimeout         time.Duration
@@ -242,6 +254,7 @@ func newURLTestGroup(
 	logger log.ContextLogger,
 	tags []string,
 	link string,
+	urlOverrides map[string]string,
 	interval, idleTimeout time.Duration,
 	tolerance uint16,
 ) *urlTestGroup {
@@ -255,16 +268,17 @@ func newURLTestGroup(
 		history = urltest.NewHistoryStorage()
 	}
 	return &urlTestGroup{
-		ctx:         ctx,
-		outboundMgr: outboundMgr,
-		logger:      logger,
-		tags:        tags,
-		url:         link,
-		history:     history,
-		interval:    interval,
-		idleTimeout: idleTimeout,
-		tolerance:   tolerance,
-		cancel:      cancel,
+		ctx:          ctx,
+		outboundMgr:  outboundMgr,
+		logger:       logger,
+		tags:         tags,
+		url:          link,
+		urlOverrides: urlOverrides,
+		history:      history,
+		interval:     interval,
+		idleTimeout:  idleTimeout,
+		tolerance:    tolerance,
+		cancel:       cancel,
 	}
 }
 
@@ -424,6 +438,9 @@ func (g *urlTestGroup) checkLoop() {
 			return
 		case <-g.idleTimer.C:
 			return
+		case <-ctx.Done():
+			g.logger.Warn("context canceled")
+			return
 		case <-ticker.C:
 			go g.urlTest(ctx, false)
 		}
@@ -475,11 +492,12 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			g.logger.Trace("skipping outbound", "tag", realTag, "reason", "not found")
 			continue
 		}
+		testURL := g.testURLForTag(tag)
 		b.Go(realTag, func() (any, error) {
-			testCtx, cancel := context.WithTimeout(g.ctx, C.TCPTimeout)
+			testCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
 			defer cancel()
 			g.logger.Trace("checking outbound", "tag", realTag)
-			t, err := urltest.URLTest(testCtx, g.url, p)
+			t, err := urlTestGET(testCtx, testURL, p)
 			if err != nil {
 				g.logger.Debug("outbound unavailable", "tag", realTag, "error", err)
 				g.history.DeleteURLTestHistory(realTag)
@@ -557,9 +575,81 @@ func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound) A.Ou
 	return nil
 }
 
+// testURLForTag returns the URL to use when testing the given outbound tag.
+// If the tag has a per-outbound override, that URL is returned; otherwise the
+// group's default URL is used.
+func (g *urlTestGroup) testURLForTag(tag string) string {
+	if g.urlOverrides != nil {
+		if override, ok := g.urlOverrides[tag]; ok {
+			return override
+		}
+	}
+	return g.url
+}
+
 func realTag(outbound A.Outbound) string {
 	if group, isGroup := outbound.(A.OutboundGroup); isGroup {
 		return group.Now()
 	}
 	return outbound.Tag()
+}
+
+// urlTestGET is a replacement for urltest.URLTest that sends a GET request
+// instead of HEAD. This allows future use of the response body (e.g., to
+// validate proxy behavior or carry data back from the test endpoint).
+func urlTestGET(ctx context.Context, link string, detour N.Dialer) (uint16, error) {
+	if link == "" {
+		link = "https://www.gstatic.com/generate_204"
+	}
+	linkURL, err := url.Parse(link)
+	if err != nil {
+		return 0, err
+	}
+	hostname := linkURL.Hostname()
+	port := linkURL.Port()
+	if port == "" {
+		switch linkURL.Scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+
+	start := time.Now()
+	instance, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
+	if err != nil {
+		return 0, err
+	}
+	defer instance.Close()
+	if earlyConn, isEarlyConn := common.Cast[N.EarlyConn](instance); isEarlyConn && earlyConn.NeedHandshake() {
+		start = time.Now()
+	}
+	req, err := http.NewRequest(http.MethodGet, link, nil)
+	if err != nil {
+		return 0, err
+	}
+	client := http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return instance, nil
+			},
+			TLSClientConfig: &tls.Config{
+				Time:    ntp.TimeFuncFromContext(ctx),
+				RootCAs: A.RootPoolFromContext(ctx),
+			},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: C.TCPTimeout,
+	}
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		return 0, err
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return uint16(time.Since(start) / time.Millisecond), nil
 }

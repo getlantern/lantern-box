@@ -4,6 +4,7 @@ const (
 	TypeAmnezia   = "amnezia"
 	TypeALGeneva  = "algeneva"
 	TypeOutline   = "outline"
+  TypeSamizdat = "samizdat"
 	TypeWATER     = "water"
 	TypeUnbounded = "unbounded"
 )

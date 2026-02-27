@@ -18,7 +18,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/service"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	box "github.com/getlantern/lantern-box"
@@ -26,39 +26,71 @@ import (
 
 const testOptionsPath = "../../testdata/options"
 
-func TestIntegration(t *testing.T) {
+func TestClientContext(t *testing.T) {
 	cInfo := ClientInfo{
-		DeviceID:    "sing-box-extensions",
+		DeviceID:    "lantern-box",
 		Platform:    "linux",
 		IsPro:       false,
 		CountryCode: "US",
 		Version:     "9.0",
 	}
-	ctx := box.BoxContext()
+	infoFn := func() ClientInfo { return cInfo }
+	tests := []struct {
+		name               string
+		tracker            *ClientContextInjector
+		useSelectorWithTag string
+		shouldHaveInfo     bool
+	}{
+		{
+			name:           "Manager without injector",
+			tracker:        nil,
+			shouldHaveInfo: false,
+		},
+		{
+			name:           "Injector match",
+			tracker:        NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"any"}}),
+			shouldHaveInfo: true,
+		},
+		{
+			name:           "Injector does not match",
+			tracker:        NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"not-exist"}}),
+			shouldHaveInfo: false,
+		},
+		{
+			name:               "Match group real tag",
+			tracker:            NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"socks-out"}}),
+			useSelectorWithTag: "socks-out",
+			shouldHaveInfo:     true,
+		},
+		{
+			name:               "Does not match group real tag",
+			tracker:            NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"socks-out"}}),
+			useSelectorWithTag: "http-out",
+			shouldHaveInfo:     false,
+		},
+	}
+
+	ctx := box.BaseContext()
 	logger := log.NewNOPFactory().NewLogger("")
-	clientTracker := NewClientContextTracker(cInfo, MatchBounds{[]string{"any"}, []string{"any"}}, logger)
-	clientOpts, clientBox := newTestBox(ctx, t, testOptionsPath+"/http_client.json", clientTracker)
+	mgr := NewManager(MatchBounds{[]string{"any"}, []string{"any"}}, logger)
+	serverOpts := getOptions(ctx, t, testOptionsPath+"/http_server.json")
+	serverBox, err := sbox.New(sbox.Options{
+		Context: ctx,
+		Options: serverOpts,
+	})
+	require.NoError(t, err)
 
-	httpInbound, exists := clientBox.Inbound().Get("http-client")
-	require.True(t, exists, "http-client inbound should exist")
-	require.Equal(t, constant.TypeHTTP, httpInbound.Type(), "http-client should be a HTTP inbound")
+	serverBox.Router().AppendTracker(mgr)
 
-	// this cannot actually be empty or we would have failed to create the box instance
-	proxyAddr := getProxyAddress(clientOpts.Inbounds)
-
-	serverTracker := NewClientContextReader(MatchBounds{[]string{"any"}, []string{"any"}}, logger)
-	_, serverBox := newTestBox(ctx, t, testOptionsPath+"/http_server.json", serverTracker)
-
-	mTracker := &mockTracker{}
-	serverBox.Router().AppendTracker(mTracker)
-
-	require.NoError(t, clientBox.Start())
-	defer clientBox.Close()
 	require.NoError(t, serverBox.Start())
 	defer serverBox.Close()
 
 	httpServer := startHTTPServer()
 	defer httpServer.Close()
+
+	clientOpts := getOptions(ctx, t, testOptionsPath+"/http_client.json")
+	proxyAddr := getProxyAddress(clientOpts.Inbounds)
+	require.NotEmpty(t, proxyAddr, "http-client inbound not found in client options")
 
 	proxyURL, _ := url.Parse("http://" + proxyAddr)
 	httpClient := &http.Client{
@@ -66,13 +98,62 @@ func TestIntegration(t *testing.T) {
 			Proxy: http.ProxyURL(proxyURL),
 		},
 	}
-	req, err := http.NewRequest("GET", httpServer.URL, nil)
+	addr := httpServer.URL
+
+	mTracker := &mockTracker{}
+	mgr.AppendTracker(mTracker)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mTracker.info = nil
+			clientOpts = getOptions(ctx, t, testOptionsPath+"/http_client.json")
+			if tt.useSelectorWithTag != "" {
+				setSelectorDefaultTag(&clientOpts, tt.useSelectorWithTag)
+			}
+			runTrackerTest(ctx, t, clientOpts, tt.tracker, httpClient, addr)
+			if tt.shouldHaveInfo {
+				assert.Equal(t, &cInfo, mTracker.info)
+			} else {
+				assert.Nil(t, mTracker.info)
+			}
+		})
+	}
+}
+
+func runTrackerTest(
+	ctx context.Context,
+	t *testing.T,
+	opts option.Options,
+	tracker *ClientContextInjector,
+	client *http.Client,
+	addr string,
+) {
+	instance, err := sbox.New(sbox.Options{
+		Context: ctx,
+		Options: opts,
+	})
+	require.NoError(t, err)
+	if tracker != nil {
+		instance.Router().AppendTracker(tracker)
+	}
+
+	require.NoError(t, instance.Start())
+	defer instance.Close()
+
+	req, err := http.NewRequest("GET", addr, nil)
 	require.NoError(t, err)
 
-	_, err = httpClient.Do(req)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func getOptions(ctx context.Context, t *testing.T, configPath string) option.Options {
+	buf, err := os.ReadFile(configPath)
 	require.NoError(t, err)
 
-	require.Equal(t, cInfo, *mTracker.info)
+	options, err := json.UnmarshalExtendedContext[option.Options](ctx, buf)
+	require.NoError(t, err)
+	return options
 }
 
 func getProxyAddress(inbounds []option.Inbound) string {
@@ -86,28 +167,22 @@ func getProxyAddress(inbounds []option.Inbound) string {
 	return ""
 }
 
+func setSelectorDefaultTag(options *option.Options, tag string) {
+	for _, outbound := range options.Outbounds {
+		if outbound.Type == constant.TypeSelector {
+			opts := outbound.Options.(*option.SelectorOutboundOptions)
+			opts.Default = tag
+			break
+		}
+	}
+	options.Route.Rules[0].DefaultOptions.RouteOptions.Outbound = "selector"
+}
+
 func startHTTPServer() *httptest.Server {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	return httptest.NewServer(handler)
-}
-
-func newTestBox(ctx context.Context, t *testing.T, configPath string, tracker *ClientContextTracker) (option.Options, *sbox.Box) {
-	buf, err := os.ReadFile(configPath)
-	require.NoError(t, err)
-
-	options, err := json.UnmarshalExtendedContext[option.Options](ctx, buf)
-	require.NoError(t, err)
-
-	instance, err := sbox.New(sbox.Options{
-		Context: ctx,
-		Options: options,
-	})
-	require.NoError(t, err)
-
-	instance.Router().AppendTracker(tracker)
-	return options, instance
 }
 
 var _ (adapter.ConnectionTracker) = (*mockTracker)(nil)
@@ -117,7 +192,10 @@ type mockTracker struct {
 }
 
 func (t *mockTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
-	t.info = service.PtrFromContext[ClientInfo](ctx)
+	info, ok := ClientInfoFromContext(ctx)
+	if ok {
+		t.info = &info
+	}
 	return conn
 }
 func (t *mockTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {

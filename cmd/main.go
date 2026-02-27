@@ -6,11 +6,12 @@ import (
 	"os"
 	"strings"
 
-	"github.com/spf13/cobra"
-
 	box "github.com/getlantern/lantern-box"
-	"github.com/getlantern/lantern-box/metrics"
 	"github.com/getlantern/lantern-box/otel"
+	"github.com/getlantern/lantern-box/tracker/metrics"
+	"github.com/spf13/cobra"
+	sdkotel "go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 type ProxyInfo struct {
@@ -40,6 +41,9 @@ var rootCmd = &cobra.Command{
 func preRun(cmd *cobra.Command, args []string) {
 	globalCtx = box.BaseContext()
 
+	// Default to not report metrics
+	sdkotel.SetMeterProvider(noop.NewMeterProvider())
+
 	path, err := cmd.Flags().GetString("config")
 	if err != nil {
 		return
@@ -61,7 +65,6 @@ func preRun(cmd *cobra.Command, args []string) {
 	}
 
 	proxyInfoPath := strings.Replace(path, ".json", ".ini", 1)
-
 	proxyInfo, err := readProxyInfoFile(proxyInfoPath)
 	if err != nil {
 		return
