@@ -24,6 +24,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 
 	C "github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
@@ -47,12 +48,29 @@ type Outbound struct {
 	logger       logger.ContextLogger
 	broflakeConn *UBClientcore.BroflakeConn
 	dial         UBClientcore.SOCKS5Dialer
+	uotClient    *uot.Client
 	ui           UBClientcore.UI
 	ql           *UBClientcore.QUICLayer
 	rtcOpt       *UBClientcore.WebRTCOptions
 	bfOpt        *UBClientcore.BroflakeOptions
 	egOpt        *UBClientcore.EgressOptions
 	tlsConfig    *tls.Config
+}
+
+// unboundedDialer adapts the Unbounded SOCKS5 dialer to the N.Dialer interface for uot.Client.
+type unboundedDialer struct {
+	outbound *Outbound
+}
+
+func (d *unboundedDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if d.outbound.dial == nil {
+		return nil, fmt.Errorf("unbounded not ready")
+	}
+	return d.outbound.dial(ctx, network, destination.String())
+}
+
+func (d *unboundedDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return nil, os.ErrInvalid
 }
 
 func NewOutbound(
@@ -185,7 +203,7 @@ func NewOutbound(
 		Adapter: outbound.NewAdapterWithDialerOptions(
 			C.TypeUnbounded,
 			tag,
-			[]string{N.NetworkTCP}, // XXX: Unbounded only supports TCP (not UDP) for now
+			[]string{N.NetworkTCP, N.NetworkUDP},
 			options.DialerOptions,
 		),
 		logger:    logger,
@@ -193,6 +211,11 @@ func NewOutbound(
 		bfOpt:     bfOpt,
 		egOpt:     egOpt,
 		tlsConfig: generateSelfSignedTLSConfig(options.InsecureDoNotVerifyClientCert, options.EgressCA),
+	}
+
+	o.uotClient = &uot.Client{
+		Dialer:  &unboundedDialer{outbound: o},
+		Version: uot.Version,
 	}
 
 	return o, nil
@@ -203,19 +226,28 @@ func (h *Outbound) DialContext(
 	network string,
 	destination M.Socksaddr,
 ) (net.Conn, error) {
-	// XXX: this is the log pattern for N.NetworkTCP
-	h.logger.InfoContext(ctx, "outbound connection to ", destination)
-
 	if h.dial == nil {
 		return nil, fmt.Errorf("unbounded not ready")
 	}
 
-	// XXX: network is ignored by Unbounded's SOCKS5 dialer
-	return h.dial(ctx, network, destination.String())
+	switch N.NetworkName(network) {
+	case N.NetworkTCP:
+		h.logger.InfoContext(ctx, "outbound connection to ", destination)
+		return h.dial(ctx, network, destination.String())
+	case N.NetworkUDP:
+		h.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
+		return h.uotClient.DialContext(ctx, network, destination)
+	}
+	return nil, fmt.Errorf("unsupported network: %s", network)
 }
 
+// ListenPacket creates a UoT packet connection through the Unbounded proxy.
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	return nil, os.ErrInvalid
+	ctx, metadata := adapter.ExtendContext(ctx)
+	metadata.Outbound = h.Tag()
+	metadata.Destination = destination
+	h.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
+	return h.uotClient.ListenPacket(ctx, destination)
 }
 
 func (h *Outbound) Start(stage adapter.StartStage) error {
