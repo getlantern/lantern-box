@@ -1,6 +1,8 @@
 package option
 
 import (
+	"net/http"
+
 	"github.com/sagernet/sing-box/option"
 )
 
@@ -20,12 +22,14 @@ type UnboundedOutboundOptions struct {
 	BusBufferSz int    `json:"bus_buffer_sz,omitempty"`
 	Netstated   string `json:"netstated,omitempty"`
 	// WebRTCOptions
-	DiscoverySrv      string `json:"discovery_srv,omitempty"`
-	DiscoveryEndpoint string `json:"discovery_endpoint,omitempty"`
-	GenesisAddr       string `json:"genesis_addr,omitempty"`
-	NATFailTimeout    int    `json:"nat_fail_timeout,omitempty"`
-	STUNBatchSize     int    `json:"stun_batch_size,omitempty"`
+	DiscoverySrv      string   `json:"discovery_srv,omitempty"`
+	DiscoveryEndpoint string   `json:"discovery_endpoint,omitempty"`
+	GenesisAddr       string   `json:"genesis_addr,omitempty"`
+	NATFailTimeout    int      `json:"nat_fail_timeout,omitempty"`
+	STUNBatchSize     int      `json:"stun_batch_size,omitempty"`
+	STUNServers       []string `json:"stun_servers,omitempty"`
 	STUNBatch         func(size uint32) (batch []string, err error)
+	HTTPClient        *http.Client
 	Tag               string `json:"tag,omitempty"`
 	Patience          int    `json:"patience,omitempty"`
 	ErrorBackoff      int    `json:"error_backoff,omitempty"`

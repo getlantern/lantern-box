@@ -102,6 +102,15 @@ func NewOutbound(
 
 	if options.STUNBatch != nil {
 		rtcOpt.STUNBatch = options.STUNBatch
+	} else if len(options.STUNServers) > 0 {
+		servers := make([]string, len(options.STUNServers))
+		copy(servers, options.STUNServers)
+		rtcOpt.STUNBatch = func(size uint32) ([]string, error) {
+			if int(size) >= len(servers) {
+				return servers, nil
+			}
+			return servers[:size], nil
+		}
 	}
 
 	if options.Tag != "" {
@@ -156,16 +165,20 @@ func NewOutbound(
 		return nil, err
 	}
 	rtcOpt.Net = rtcNet
-	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return outboundDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
-	}
-	rtcOpt.HTTPClient = &http.Client{
-		Transport: &http.Transport{
-			Dial: func(network, addr string) (net.Conn, error) {
-				return dialContext(ctx, network, addr)
+	if options.HTTPClient != nil {
+		rtcOpt.HTTPClient = options.HTTPClient
+	} else {
+		dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return outboundDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+		}
+		rtcOpt.HTTPClient = &http.Client{
+			Transport: &http.Transport{
+				Dial: func(network, addr string) (net.Conn, error) {
+					return dialContext(ctx, network, addr)
+				},
+				DialContext: dialContext,
 			},
-			DialContext: dialContext,
-		},
+		}
 	}
 
 	o := &Outbound{
