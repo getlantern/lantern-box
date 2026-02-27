@@ -2,8 +2,9 @@ package unbounded
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -199,6 +200,11 @@ func NewOutbound(
 		}
 	}
 
+	tlsConfig, err := generateSelfSignedTLSConfig(options.InsecureDoNotVerifyClientCert, options.EgressCA)
+	if err != nil {
+		return nil, fmt.Errorf("generate TLS config: %w", err)
+	}
+
 	o := &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(
 			C.TypeUnbounded,
@@ -210,7 +216,7 @@ func NewOutbound(
 		rtcOpt:    rtcOpt,
 		bfOpt:     bfOpt,
 		egOpt:     egOpt,
-		tlsConfig: generateSelfSignedTLSConfig(options.InsecureDoNotVerifyClientCert, options.EgressCA),
+		tlsConfig: tlsConfig,
 	}
 
 	o.uotClient = &uot.Client{
@@ -287,23 +293,28 @@ func (h *Outbound) Close() error {
 }
 
 // Reverse TLS, since the Unbounded client is the QUIC server
-func generateSelfSignedTLSConfig(insecureDoNotVerifyClientCert bool, egressCA string) *tls.Config {
-	key, err := rsa.GenerateKey(rand.Reader, 1024)
+func generateSelfSignedTLSConfig(insecureDoNotVerifyClientCert bool, egressCA string) (*tls.Config, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("generate ECDSA key: %w", err)
 	}
 
 	template := x509.Certificate{SerialNumber: big.NewInt(1)}
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("create certificate: %w", err)
 	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("marshal ECDSA key: %w", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("load key pair: %w", err)
 	}
 
 	caCertPool := x509.NewCertPool()
@@ -311,7 +322,7 @@ func generateSelfSignedTLSConfig(insecureDoNotVerifyClientCert bool, egressCA st
 	if egressCA != "" {
 		ok := caCertPool.AppendCertsFromPEM([]byte(egressCA))
 		if !ok {
-			panic("an egress CA cert was configured, but it could not be appended")
+			return nil, fmt.Errorf("failed to append egress CA cert")
 		}
 	}
 
@@ -326,5 +337,5 @@ func generateSelfSignedTLSConfig(insecureDoNotVerifyClientCert bool, egressCA st
 		NextProtos:   []string{"broflake"},
 		ClientAuth:   clientAuth,
 		ClientCAs:    caCertPool,
-	}
+	}, nil
 }
