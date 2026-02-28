@@ -30,6 +30,8 @@ var (
 	commit  string
 )
 
+var otelShutdownFuncs []func()
+
 var rootCmd = &cobra.Command{
 	Use:               "lantern-box",
 	Version:           version,
@@ -72,7 +74,6 @@ func preRun(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// TODO: what is the best place to do clean up of otel?
 	otelOpts := &otel.Opts{
 		Endpoint:         otel.GetTelemetryEndpoint(telemetryEndpoint),
 		ProxyName:        proxyInfo.Name,
@@ -83,14 +84,33 @@ func preRun(cmd *cobra.Command, args []string) {
 		ProxyProtocol:    proxyInfo.Protocol,
 	}
 
-	otel.InitGlobalMeterProvider(otelOpts)
-	otel.InitGlobalTracerProvider(otelOpts)
+	meterShutdown, err := otel.InitGlobalMeterProvider(otelOpts)
+	if err != nil {
+		log.Warn("telemetry disabled: failed to init meter provider: ", err)
+		return
+	}
+	otelShutdownFuncs = append(otelShutdownFuncs, meterShutdown)
+
+	tracerShutdown, err := otel.InitGlobalTracerProvider(otelOpts)
+	if err != nil {
+		log.Warn("telemetry disabled: failed to init tracer provider: ", err)
+		return
+	}
+	otelShutdownFuncs = append(otelShutdownFuncs, tracerShutdown)
+
 	log.Info("telemetry enabled, exporting to ", otelOpts.Endpoint)
 
 	metrics.SetupMetricsManager(geoCityURL, cityDatabaseName)
 }
 
+func shutdownOtel() {
+	for _, shutdown := range otelShutdownFuncs {
+		shutdown()
+	}
+}
+
 func main() {
+	defer shutdownOtel()
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
