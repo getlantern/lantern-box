@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# ping.sh - Test the CLIENTINFO protocol by sending a mock packet to the proxy
 #
-# Usage: ./ping.sh [host] [port]
-#   host: Proxy host (default: 127.0.0.1)
-#   port: Proxy port (default: 8888)
+# Mock CLIENTINFO to provide a mimimal mock of a lantern-client connection.
+#
+# Usage: ./ping.sh [host:-127.0.0.1] [port:-8888]
 #
 # This script sends an HTTP CONNECT request followed by a CLIENTINFO packet,
 # which triggers the device_id.connected span in telemetry.
