@@ -20,6 +20,9 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdkotel "go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	box "github.com/getlantern/lantern-box"
 )
@@ -200,4 +203,75 @@ func (t *mockTracker) RoutedConnection(ctx context.Context, conn net.Conn, metad
 }
 func (t *mockTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
 	return conn
+}
+
+func TestDeviceConnectedSpan(t *testing.T) {
+	// Set up in-memory tracer provider
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	sdkotel.SetTracerProvider(tp)
+	defer tp.Shutdown(context.Background())
+
+	cInfo := ClientInfo{
+		DeviceID:    "test-device-123",
+		Platform:    "android",
+		IsPro:       true,
+		CountryCode: "CA",
+		Version:     "10.0",
+	}
+	infoFn := func() ClientInfo { return cInfo }
+
+	ctx := box.BaseContext()
+	logger := log.NewNOPFactory().NewLogger("")
+	mgr := NewManager(MatchBounds{[]string{"any"}, []string{"any"}}, logger)
+	serverOpts := getOptions(ctx, t, testOptionsPath+"/http_server.json")
+	serverBox, err := sbox.New(sbox.Options{
+		Context: ctx,
+		Options: serverOpts,
+	})
+	require.NoError(t, err)
+
+	serverBox.Router().AppendTracker(mgr)
+	require.NoError(t, serverBox.Start())
+	defer serverBox.Close()
+
+	httpServer := startHTTPServer()
+	defer httpServer.Close()
+
+	clientOpts := getOptions(ctx, t, testOptionsPath+"/http_client.json")
+	proxyAddr := getProxyAddress(clientOpts.Inbounds)
+	require.NotEmpty(t, proxyAddr, "http-client inbound not found in client options")
+
+	proxyURL, _ := url.Parse("http://" + proxyAddr)
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
+
+	tracker := NewClientContextInjector(infoFn, MatchBounds{[]string{"any"}, []string{"any"}})
+	runTrackerTest(ctx, t, clientOpts, tracker, httpClient, httpServer.URL)
+
+	// Verify the span was emitted
+	spans := exporter.GetSpans()
+	var deviceSpan *tracetest.SpanStub
+	for i := range spans {
+		if spans[i].Name == "device_id.connected" {
+			deviceSpan = &spans[i]
+			break
+		}
+	}
+	require.NotNil(t, deviceSpan, "device_id.connected span should be emitted")
+
+	// Verify attributes
+	attrs := make(map[string]any)
+	for _, attr := range deviceSpan.Attributes {
+		attrs[string(attr.Key)] = attr.Value.AsInterface()
+	}
+
+	assert.Equal(t, "test-device-123", attrs["client.device_id"])
+	assert.Equal(t, "android", attrs["client.platform"])
+	assert.Equal(t, true, attrs["client.is_pro"])
+	assert.Equal(t, "CA", attrs["geo.country.iso_code"])
+	assert.Equal(t, "10.0", attrs["client.version"])
 }

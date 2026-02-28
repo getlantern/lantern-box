@@ -9,6 +9,7 @@ import (
 	box "github.com/getlantern/lantern-box"
 	"github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/metrics"
+	"github.com/sagernet/sing-box/log"
 	"github.com/spf13/cobra"
 	sdkotel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -28,6 +29,8 @@ var (
 	version string
 	commit  string
 )
+
+var otelShutdownFuncs []func()
 
 var rootCmd = &cobra.Command{
 	Use:               "lantern-box",
@@ -67,11 +70,11 @@ func preRun(cmd *cobra.Command, args []string) {
 	proxyInfoPath := strings.Replace(path, ".json", ".ini", 1)
 	proxyInfo, err := readProxyInfoFile(proxyInfoPath)
 	if err != nil {
+		log.Warn("telemetry disabled: could not read proxy info file: ", err)
 		return
 	}
 
-	// TODO: what is the best place to do clean up of otel?
-	otel.InitGlobalMeterProvider(&otel.Opts{
+	otelOpts := &otel.Opts{
 		Endpoint:         otel.GetTelemetryEndpoint(telemetryEndpoint),
 		ProxyName:        proxyInfo.Name,
 		IsPro:            proxyInfo.Pro,
@@ -79,12 +82,35 @@ func preRun(cmd *cobra.Command, args []string) {
 		Provider:         proxyInfo.Provider,
 		FrontendProvider: proxyInfo.FrontendProvider,
 		ProxyProtocol:    proxyInfo.Protocol,
-	})
+	}
+
+	meterShutdown, err := otel.InitGlobalMeterProvider(otelOpts)
+	if err != nil {
+		log.Warn("telemetry disabled: failed to init meter provider: ", err)
+		return
+	}
+	otelShutdownFuncs = append(otelShutdownFuncs, meterShutdown)
+
+	tracerShutdown, err := otel.InitGlobalTracerProvider(otelOpts)
+	if err != nil {
+		log.Warn("telemetry disabled: failed to init tracer provider: ", err)
+		return
+	}
+	otelShutdownFuncs = append(otelShutdownFuncs, tracerShutdown)
+
+	log.Info("telemetry enabled, exporting to ", otelOpts.Endpoint)
 
 	metrics.SetupMetricsManager(geoCityURL, cityDatabaseName)
 }
 
+func shutdownOtel() {
+	for _, shutdown := range otelShutdownFuncs {
+		shutdown()
+	}
+}
+
 func main() {
+	defer shutdownOtel()
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)

@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric/noop"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"gopkg.in/ini.v1"
 
@@ -93,9 +94,10 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		return nil, nil, fmt.Errorf("create service: %w", err)
 	}
 
-	if datacapURL != "" {
-		// Add datacap tracker
-		log.Info("Datacap enabled. Creating trackers...")
+	// Add client context manager if telemetry or datacap is enabled
+	tp := otel.GetTracerProvider()
+	_, tracerIsNoop := tp.(tracenoop.TracerProvider)
+	if !tracerIsNoop || datacapURL != "" {
 		clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
 			Inbound:  []string{""},
 			Outbound: []string{""},
@@ -103,19 +105,20 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		instance.Router().AppendTracker(clientCtxMgr)
 		service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
 
-		datacapTracker, err := datacap.NewDatacapTracker(
-			datacap.Options{
-				URL:            datacapURL,
-				ReportInterval: "10s",
-			},
-			log.StdLogger(),
-		)
-		if err != nil {
-			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
+		if datacapURL != "" {
+			log.Info("Datacap enabled. Creating datacap tracker...")
+			datacapTracker, err := datacap.NewDatacapTracker(
+				datacap.Options{
+					URL:            datacapURL,
+					ReportInterval: "10s",
+				},
+				log.StdLogger(),
+			)
+			if err != nil {
+				return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
+			}
+			clientCtxMgr.AppendTracker(datacapTracker)
 		}
-		clientCtxMgr.AppendTracker(datacapTracker)
-	} else {
-		log.Warn("Datacap URL not provided, datacap tracking disabled")
 	}
 
 	mp := otel.GetMeterProvider()
