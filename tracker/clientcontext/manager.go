@@ -61,6 +61,22 @@ func (m *Manager) AppendTracker(tracker adapter.ConnectionTracker) {
 	m.trackers = append(m.trackers, tracker)
 }
 
+// emitDeviceConnectedSpan emits a correlation span for device_id's initial connection to proxy,
+// to be correlated with the client's api proxy assignment to assess
+// connectivity success rate and time-to-connect differences.
+func emitDeviceConnectedSpan(ctx context.Context, info *ClientInfo) {
+	tracer := otel.Tracer("lantern-box")
+	_, span := tracer.Start(ctx, "device_id.connected")
+	span.SetAttributes(
+		attribute.String("client.device_id", info.DeviceID),
+		attribute.String("client.platform", info.Platform),
+		attribute.Bool("client.is_pro", info.IsPro),
+		attribute.String("geo.country.iso_code", info.CountryCode),
+		attribute.String("client.version", info.Version),
+	)
+	span.End()
+}
+
 func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	if !m.match(metadata.Inbound, matchOutbound.Tag()) {
 		return conn
@@ -81,20 +97,7 @@ func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata 
 		return c
 	}
 	ctx = ContextWithClientInfo(ctx, *info)
-
-	// Emit correlation span for device_id's initial connection to proxy,
-	// to be correlated with the client's api proxy assignment to assess
-	// connectivity success rate and time-to-connect differences.
-	tracer := otel.Tracer("lantern-box")
-	_, span := tracer.Start(ctx, "device_id.connected")
-	span.SetAttributes(
-		attribute.String("client.device_id", info.DeviceID),
-		attribute.String("client.platform", info.Platform),
-		attribute.Bool("client.is_pro", info.IsPro),
-		attribute.String("geo.country.iso_code", info.CountryCode),
-		attribute.String("client.version", info.Version),
-	)
-	span.End()
+	emitDeviceConnectedSpan(ctx, info)
 
 	conn = c
 	for _, tracker := range m.trackers {
@@ -122,20 +125,7 @@ func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn,
 		return c
 	}
 	ctx = ContextWithClientInfo(ctx, *info)
-
-	// Emit correlation span for device_id's initial connection to proxy,
-	// to be correlated with the client's api proxy assignment to assess
-	// connectivity success rate and time-to-connect differences.
-	tracer := otel.Tracer("lantern-box")
-	_, span := tracer.Start(ctx, "device_id.connected")
-	span.SetAttributes(
-		attribute.String("client.device_id", info.DeviceID),
-		attribute.String("client.platform", info.Platform),
-		attribute.Bool("client.is_pro", info.IsPro),
-		attribute.String("geo.country.iso_code", info.CountryCode),
-		attribute.String("client.version", info.Version),
-	)
-	span.End()
+	emitDeviceConnectedSpan(ctx, info)
 
 	conn = c
 	for _, tracker := range m.trackers {
