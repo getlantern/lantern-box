@@ -159,6 +159,26 @@ func (m *MutableGroupManager) addToGroup(outGroup adapter.MutableOutboundGroup, 
 	return nil
 }
 
+// SetURLOverrides updates the per-outbound URL test overrides for the specified group.
+// The group must implement [adapter.URLOverrideSetter].
+func (m *MutableGroupManager) SetURLOverrides(group string, overrides map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed.Load() {
+		return ErrIsClosed
+	}
+	outGroup, ok := m.groups[group]
+	if !ok {
+		return fmt.Errorf("group %q not found", group)
+	}
+	setter, ok := outGroup.(adapter.URLOverrideSetter)
+	if !ok {
+		return fmt.Errorf("group %q does not support URL overrides", group)
+	}
+	setter.SetURLOverrides(overrides)
+	return nil
+}
+
 // RemoveFromGroup removes an outbound/endpoint from the specified group.
 func (m *MutableGroupManager) RemoveFromGroup(group, tag string) error {
 	m.mu.Lock()

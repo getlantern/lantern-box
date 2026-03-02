@@ -69,6 +69,67 @@ func TestTestURLForTag_DefaultURL(t *testing.T) {
 	assert.Equal(t, "https://default.example.com", g.testURLForTag("unknown"))
 }
 
+func TestSetURLOverrides(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{
+			"out1": nil, "out2": nil, "out3": nil,
+		}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"out1", "out2", "out3"},
+		"https://default.example.com",
+		nil, // start with no overrides
+		time.Minute, time.Minute, 50,
+	)
+
+	// Initially all tags use the default URL
+	assert.Equal(t, "https://default.example.com", g.testURLForTag("out1"))
+
+	// Set overrides
+	g.SetURLOverrides(map[string]string{
+		"out1": "https://new-override.example.com",
+		"out3": "https://out3-override.example.com",
+	})
+	assert.Equal(t, "https://new-override.example.com", g.testURLForTag("out1"))
+	assert.Equal(t, "https://default.example.com", g.testURLForTag("out2"))
+	assert.Equal(t, "https://out3-override.example.com", g.testURLForTag("out3"))
+
+	// Replace with different overrides
+	g.SetURLOverrides(map[string]string{
+		"out2": "https://out2-override.example.com",
+	})
+	assert.Equal(t, "https://default.example.com", g.testURLForTag("out1"))
+	assert.Equal(t, "https://out2-override.example.com", g.testURLForTag("out2"))
+
+	// Clear overrides
+	g.SetURLOverrides(nil)
+	assert.Equal(t, "https://default.example.com", g.testURLForTag("out1"))
+	assert.Equal(t, "https://default.example.com", g.testURLForTag("out2"))
+}
+
+func TestSetURLOverrides_DoesNotMutateCallerMap(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{"out1": nil}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"out1"},
+		"https://default.example.com",
+		nil,
+		time.Minute, time.Minute, 50,
+	)
+
+	callerMap := map[string]string{"out1": "https://original.example.com"}
+	g.SetURLOverrides(callerMap)
+
+	// Mutating the caller's map after SetURLOverrides should not affect the group
+	callerMap["out1"] = "https://mutated.example.com"
+	assert.Equal(t, "https://original.example.com", g.testURLForTag("out1"))
+}
+
 func TestTestURLForTag_WithOverrides(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
