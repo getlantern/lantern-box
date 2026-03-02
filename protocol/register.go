@@ -14,6 +14,7 @@ import (
 	"github.com/getlantern/lantern-box/protocol/group"
 	"github.com/getlantern/lantern-box/protocol/outline"
 	"github.com/getlantern/lantern-box/protocol/samizdat"
+	"github.com/getlantern/lantern-box/protocol/unbounded"
 	"github.com/getlantern/lantern-box/protocol/water"
 )
 
@@ -23,6 +24,8 @@ var supportedProtocols = []string{
 	"amnezia",
 	"outline",
 	"samizdat",
+	"unbounded",
+	"water",
 
 	// sing-box built-in protocols
 	"http",
@@ -75,6 +78,7 @@ func registerOutbounds(registry *outbound.Registry) {
 	outline.RegisterOutbound(registry)
 	samizdat.RegisterOutbound(registry)
 	water.RegisterOutbound(registry)
+	unbounded.RegisterOutbound(registry)
 
 	// utility outbounds
 	group.RegisterFallback(registry)
