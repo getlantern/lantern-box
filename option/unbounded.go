@@ -1,8 +1,6 @@
 package option
 
 import (
-	"net/http"
-
 	"github.com/sagernet/sing-box/option"
 )
 
@@ -28,12 +26,10 @@ type UnboundedOutboundOptions struct {
 	NATFailTimeout    int      `json:"nat_fail_timeout,omitempty"`
 	STUNBatchSize     int      `json:"stun_batch_size,omitempty"`
 	STUNServers       []string `json:"stun_servers,omitempty"`
-	STUNBatch  func(size uint32) (batch []string, err error) `json:"-"`
-	HTTPClient *http.Client                                   `json:"-"`
-	Tag               string `json:"tag,omitempty"`
-	Patience          int    `json:"patience,omitempty"`
-	ErrorBackoff      int    `json:"error_backoff,omitempty"`
-	ConsumerSessionID string `json:"consumer_session_id,omitempty"`
+	Tag               string   `json:"tag,omitempty"`
+	Patience          int      `json:"patience,omitempty"`
+	ErrorBackoff      int      `json:"error_backoff,omitempty"`
+	ConsumerSessionID string   `json:"consumer_session_id,omitempty"`
 	// EgressOptions
 	EgressAddr           string `json:"egress_addr,omitempty"`
 	EgressEndpoint       string `json:"egress_endpoint,omitempty"`

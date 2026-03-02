@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	mathrand "math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -119,17 +120,19 @@ func NewOutbound(
 		rtcOpt.STUNBatchSize = uint32(options.STUNBatchSize)
 	}
 
-	if options.STUNBatch != nil {
-		rtcOpt.STUNBatch = options.STUNBatch
-	} else if len(options.STUNServers) > 0 {
-		servers := make([]string, len(options.STUNServers))
-		copy(servers, options.STUNServers)
-		rtcOpt.STUNBatch = func(size uint32) ([]string, error) {
-			if int(size) >= len(servers) {
-				return servers, nil
-			}
-			return servers[:size], nil
+	servers := make([]string, len(options.STUNServers))
+	copy(servers, options.STUNServers)
+
+	rtcOpt.STUNBatch = func(size uint32) (batch []string, err error) {
+		// At batch time, select N random servers from the list provided in the options
+		for i := 0; i < int(size) && len(servers) > 0; i++ {
+			idx := mathrand.Intn(len(servers))
+			batch = append(batch, servers[idx])
+			servers[idx] = servers[len(servers)-1]
+			servers = servers[:len(servers)-1]
 		}
+
+		return batch, nil
 	}
 
 	if options.Tag != "" {
@@ -184,20 +187,17 @@ func NewOutbound(
 		return nil, err
 	}
 	rtcOpt.Net = rtcNet
-	if options.HTTPClient != nil {
-		rtcOpt.HTTPClient = options.HTTPClient
-	} else {
-		dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return outboundDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
-		}
-		rtcOpt.HTTPClient = &http.Client{
-			Transport: &http.Transport{
-				Dial: func(network, addr string) (net.Conn, error) {
-					return dialContext(ctx, network, addr)
-				},
-				DialContext: dialContext,
+
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return outboundDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+	}
+	rtcOpt.HTTPClient = &http.Client{
+		Transport: &http.Transport{
+			Dial: func(network, addr string) (net.Conn, error) {
+				return dialContext(ctx, network, addr)
 			},
-		}
+			DialContext: dialContext,
+		},
 	}
 
 	tlsConfig, err := generateSelfSignedTLSConfig(options.InsecureDoNotVerifyClientCert, options.EgressCA)
