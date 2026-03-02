@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -371,15 +372,7 @@ func (g *urlTestGroup) Add(tags []string) (n int, err error) {
 func (g *urlTestGroup) SetURLOverrides(overrides map[string]string) {
 	g.access.Lock()
 	defer g.access.Unlock()
-	if overrides == nil {
-		g.urlOverrides = nil
-		return
-	}
-	copied := make(map[string]string, len(overrides))
-	for k, v := range overrides {
-		copied[k] = v
-	}
-	g.urlOverrides = copied
+	g.urlOverrides = maps.Clone(overrides)
 }
 
 func (g *urlTestGroup) Remove(tags []string) (n int, err error) {
