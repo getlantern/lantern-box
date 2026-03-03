@@ -185,8 +185,8 @@ github.com/getlantern/samizdat v0.0.2 h1:PkMu6jsfUz7DLZUH2xh548XfzgPASmq5CajZyUK
 github.com/getlantern/samizdat v0.0.2/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
 github.com/getlantern/sing v0.7.18-lantern h1:QKGgIUA3LwmKYP/7JlQTRkxj9jnP4cX2Q/B+nd8XEjo=
 github.com/getlantern/sing v0.7.18-lantern/go.mod h1:ARkL0gM13/Iv5VCZmci/NuoOlePoIsW0m7BWfln/Hak=
-github.com/getlantern/sing-box-minimal v1.12.19-lantern h1:Tntq+Udsvyv6A/mjxfSoZ8NhvhXRSX6i/CICKGPFhAY=
-github.com/getlantern/sing-box-minimal v1.12.19-lantern/go.mod h1:LzlFRel9E92gX0HXWCdsxgeg+kuAEPzLR+Znixk9EI4=
+github.com/getlantern/sing-box-minimal v1.12.20-lantern h1:dWdR/z0A1Ukn+kcOIgH7+aOc9+yh8kvQ3Odw53+uocQ=
+github.com/getlantern/sing-box-minimal v1.12.20-lantern/go.mod h1:LzlFRel9E92gX0HXWCdsxgeg+kuAEPzLR+Znixk9EI4=
 github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4 h1:j/A6xSUbz78xQfFXyDbnWkg96D+UprbLgKlGjXbodxA=
 github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4/go.mod h1:akc2Wh+rX9bFFNnHJGsQ8VIV3eJI1LXJYgx2Y+8lcW8=
 github.com/github/fakeca v0.1.0 h1:Km/MVOFvclqxPM9dZBC4+QE564nU4gz4iZ0D9pMw28I=
