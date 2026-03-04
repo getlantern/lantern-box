@@ -28,169 +28,15 @@ That's it. The rest of this document is about what goes inside `config.json`.
 
 ## Protocol Guide
 
-Pick the protocol that fits your threat model. They're listed from simplest to most complex.
+Pick the protocol that fits your threat model.
 
 | Protocol | Threat Model | Keys/Certs? | Server Needed? |
 |---|---|---|---|
-| **ALGeneva** | HTTP-level DPI (header inspection) | No | Yes |
-| **WATER** | Pluggable transport (swap WASM modules) | WASM hash | Yes |
 | **Samizdat** | Full DPI resistance (Russia-grade TSPU) | X25519 + TLS cert | Yes |
+| **WATER** | Pluggable transport (swap WASM modules) | WASM hash | Yes |
 | **Outline SDK** | DNS/SNI blocking (smart dialer) | No | No |
 | **AmneziaWG** | WireGuard protocol fingerprinting | WireGuard keys | Yes |
-
----
-
-### ALGeneva
-
-Application-layer [Geneva](https://www.usenix.org/system/files/sec22-harrity.pdf) -- mutates HTTP headers on the fly to evade DPI that inspects header fields. No keys, no certs, no TLS. Just a strategy string that describes how to mangle traffic.
-
-**When to use it:** The censor is doing simple HTTP header inspection. You want the fastest possible setup with zero credential management.
-
-**Strategy syntax:** `[trigger]-action-|` where the trigger matches a header field and the action transforms it. Example: `[HTTP:host:*]-changecase{lower}-|` lowercases the Host header.
-
-#### Server config
-
-```json
-{
-  "log": { "level": "info" },
-  "inbounds": [
-    {
-      "type": "algeneva",
-      "tag": "algeneva-in",
-      "listen": "::",
-      "listen_port": 9001
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-```
-
-The server doesn't need a strategy -- it just accepts connections and forwards them.
-
-#### Client config
-
-```json
-{
-  "inbounds": [
-    {
-      "type": "mixed",
-      "tag": "mixed-in",
-      "listen": "127.0.0.1",
-      "listen_port": 1080
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "algeneva",
-      "tag": "algeneva-out",
-      "server": "YOUR_SERVER_IP",
-      "server_port": 9001,
-      "strategy": "[HTTP:host:*]-changecase{lower}-|"
-    }
-  ]
-}
-```
-
-Point your browser's SOCKS5 proxy at `127.0.0.1:1080` and you're done.
-
----
-
-### WATER
-
-[WATER](https://arxiv.org/html/2312.00163v2) (WebAssembly Transport Executables Runtime) lets you swap transport logic at runtime by loading WASM modules. Both sides download the same WASM binary; the module handles how bytes move over the wire.
-
-**When to use it:** You want pluggable transports without recompiling. New evasion logic ships as a `.wasm` file.
-
-#### Credentials
-
-You need a WASM module and its SHA-256 hash. The `plain.wasm` test module is bundled in the WATER Go module:
-
-```bash
-# Download the WATER module
-go mod download github.com/refraction-networking/water@v0.7.1-alpha
-
-# Find plain.wasm in the module cache
-WASM_PATH="$(go env GOPATH)/pkg/mod/github.com/refraction-networking/water@v0.7.1-alpha/transport/v1/testdata/plain.wasm"
-
-# Compute the SHA-256 hash
-shasum -a 256 "$WASM_PATH"
-```
-
-Host the `.wasm` file on an HTTP server both sides can reach (a simple `python3 -m http.server 8888` works).
-
-#### Server config
-
-```json
-{
-  "log": { "level": "info" },
-  "inbounds": [
-    {
-      "type": "water",
-      "tag": "water-in",
-      "listen": "::",
-      "listen_port": 9003,
-      "transport": "plain",
-      "hashsum": "WASM_SHA256_HASH",
-      "wasm_available_at": ["http://127.0.0.1:8888/plain.wasm"],
-      "config": {}
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-```
-
-#### Client config
-
-```json
-{
-  "inbounds": [
-    {
-      "type": "mixed",
-      "tag": "mixed-in",
-      "listen": "127.0.0.1",
-      "listen_port": 1080
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "water",
-      "tag": "water-out",
-      "server": "YOUR_SERVER_IP",
-      "server_port": 9003,
-      "transport": "plain",
-      "hashsum": "WASM_SHA256_HASH",
-      "wasm_available_at": ["http://YOUR_SERVER_IP:8888/plain.wasm"],
-      "download_timeout": "60s",
-      "water_dir": "/tmp/water",
-      "config": {}
-    }
-  ]
-}
-```
-
-> **Gotcha:** The `"config"` field is optional. If omitted, WATER will still start, but it will not inject `remote_addr`/`remote_port` into the module config. Include `"config": {}` when your WASM module expects those values.
-
-#### All client options
-
-| Field | Type | Description |
-|---|---|---|
-| `transport` | string | Identifier for WASM logs |
-| `hashsum` | string | SHA-256 of the WASM file (integrity check) |
-| `wasm_available_at` | string[] | URLs to download the WASM module |
-| `download_timeout` | string | Required. Per-URL download timeout (e.g. `"60s"`). No default is applied; must be a valid Go duration string. |
-| `water_dir` | string | Required. Local directory for WATER files; must not be empty. |
-| `config` | object | Config passed to the WASM module (can be `{}`) |
-| `skip_handshake` | bool | Set `true` if the WASM module handles its own handshake |
+| **ALGeneva** | HTTP-level DPI (header inspection) | No | Yes |
 
 ---
 
@@ -326,6 +172,100 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 
 ---
 
+### WATER
+
+[WATER](https://arxiv.org/html/2312.00163v2) (WebAssembly Transport Executables Runtime) lets you swap transport logic at runtime by loading WASM modules. Both sides download the same WASM binary; the module handles how bytes move over the wire.
+
+**When to use it:** You want pluggable transports without recompiling. New evasion logic ships as a `.wasm` file.
+
+#### Credentials
+
+You need a WASM module and its SHA-256 hash. The `plain.wasm` test module is bundled in the WATER Go module:
+
+```bash
+# Download the WATER module
+go mod download github.com/refraction-networking/water@v0.7.1-alpha
+
+# Find plain.wasm in the module cache
+WASM_PATH="$(go env GOPATH)/pkg/mod/github.com/refraction-networking/water@v0.7.1-alpha/transport/v1/testdata/plain.wasm"
+
+# Compute the SHA-256 hash
+shasum -a 256 "$WASM_PATH"
+```
+
+Host the `.wasm` file on an HTTP server both sides can reach (a simple `python3 -m http.server 8888` works).
+
+#### Server config
+
+```json
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "water",
+      "tag": "water-in",
+      "listen": "::",
+      "listen_port": 9003,
+      "transport": "plain",
+      "hashsum": "WASM_SHA256_HASH",
+      "wasm_available_at": ["http://127.0.0.1:8888/plain.wasm"],
+      "config": {}
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+```
+
+#### Client config
+
+```json
+{
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "water",
+      "tag": "water-out",
+      "server": "YOUR_SERVER_IP",
+      "server_port": 9003,
+      "transport": "plain",
+      "hashsum": "WASM_SHA256_HASH",
+      "wasm_available_at": ["http://YOUR_SERVER_IP:8888/plain.wasm"],
+      "download_timeout": "60s",
+      "water_dir": "/tmp/water",
+      "config": {}
+    }
+  ]
+}
+```
+
+> **Gotcha:** The `"config"` field is optional. If omitted, WATER will still start, but it will not inject `remote_addr`/`remote_port` into the module config. Include `"config": {}` when your WASM module expects those values.
+
+#### All client options
+
+| Field | Type | Description |
+|---|---|---|
+| `transport` | string | Identifier for WASM logs |
+| `hashsum` | string | SHA-256 of the WASM file (integrity check) |
+| `wasm_available_at` | string[] | URLs to download the WASM module |
+| `download_timeout` | string | Required. Per-URL download timeout (e.g. `"60s"`). No default is applied; must be a valid Go duration string. |
+| `water_dir` | string | Required. Local directory for WATER files; must not be empty. |
+| `config` | object | Config passed to the WASM module (can be `{}`) |
+| `skip_handshake` | bool | Set `true` if the WASM module handles its own handshake |
+
+---
+
 ### Outline SDK (Smart Dialer)
 
 The [Outline SDK smart dialer](https://github.com/Jigsaw-Code/outline-sdk/tree/main/x/smart) is an outbound-only protocol that automatically tries DNS and TLS evasion strategies to reach blocked sites. It cycles through DNS resolvers (system, DoH, DoT, UDP, TCP) and TLS tricks (record fragmentation, packet reordering) until something works.
@@ -433,6 +373,66 @@ Add the Amnezia parameters alongside your WireGuard endpoint config:
 | H4 | `transport_packet_magic_header` | Magic header for transport packets |
 
 Both client and server must use identical Amnezia parameters. See the [AmneziaWG docs](https://docs.amnezia.org/documentation/amnezia-wg/) for parameter tuning guidance.
+
+---
+
+### ALGeneva
+
+Application-layer [Geneva](https://www.usenix.org/system/files/sec22-harrity.pdf) -- mutates HTTP headers on the fly to evade DPI that inspects header fields. No keys, no certs, no TLS. Just a strategy string that describes how to mangle traffic.
+
+**When to use it:** The censor is doing simple HTTP header inspection. You want the fastest possible setup with zero credential management.
+
+**Strategy syntax:** `[trigger]-action-|` where the trigger matches a header field and the action transforms it. Example: `[HTTP:host:*]-changecase{lower}-|` lowercases the Host header.
+
+#### Server config
+
+```json
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "algeneva",
+      "tag": "algeneva-in",
+      "listen": "::",
+      "listen_port": 9001
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+```
+
+The server doesn't need a strategy -- it just accepts connections and forwards them.
+
+#### Client config
+
+```json
+{
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "algeneva",
+      "tag": "algeneva-out",
+      "server": "YOUR_SERVER_IP",
+      "server_port": 9001,
+      "strategy": "[HTTP:host:*]-changecase{lower}-|"
+    }
+  ]
+}
+```
+
+Point your browser's SOCKS5 proxy at `127.0.0.1:1080` and you're done.
 
 ---
 
