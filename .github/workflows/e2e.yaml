@@ -58,6 +58,7 @@ jobs:
           WASM_HASH=$(sha256sum "$WASM_PATH" | awk '{print $1}')
           cp "$WASM_PATH" plain.wasm
 
+          echo "::add-mask::$SAMIZDAT_PRIV"
           echo "samizdat_priv=$SAMIZDAT_PRIV" >> "$GITHUB_OUTPUT"
           echo "samizdat_pub=$SAMIZDAT_PUB" >> "$GITHUB_OUTPUT"
           echo "samizdat_short_id=$SAMIZDAT_SHORT_ID" >> "$GITHUB_OUTPUT"
