@@ -97,15 +97,21 @@ jobs:
           echo "Droplet $DROPLET_ID created at $DROPLET_IP"
 
           # Wait for SSH readiness
+          SSH_READY=0
           for i in $(seq 1 30); do
             if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
               -i e2e_key root@"$DROPLET_IP" echo ready 2>/dev/null; then
               echo "SSH is ready"
+              SSH_READY=1
               break
             fi
             echo "Waiting for SSH... attempt $i/30"
             sleep 10
           done
+          if [ "$SSH_READY" -ne 1 ]; then
+            echo "ERROR: SSH never became ready after 30 attempts"
+            exit 1
+          fi
 
       - name: Deploy to droplet
         env:
