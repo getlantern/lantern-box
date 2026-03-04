@@ -187,8 +187,8 @@ Host the `.wasm` file on an HTTP server both sides can reach (a simple `python3 
 | `transport` | string | Identifier for WASM logs |
 | `hashsum` | string | SHA-256 of the WASM file (integrity check) |
 | `wasm_available_at` | string[] | URLs to download the WASM module |
-| `download_timeout` | string | Per-URL download timeout (e.g. `"60s"`) |
-| `water_dir` | string | Local directory for WATER files |
+| `download_timeout` | string | Required. Per-URL download timeout (e.g. `"60s"`). No default is applied; must be a valid Go duration string. |
+| `water_dir` | string | Required. Local directory for WATER files; must not be empty. |
 | `config` | object | Config passed to the WASM module (can be `{}`) |
 | `skip_handshake` | bool | Set `true` if the WASM module handles its own handshake |
 
