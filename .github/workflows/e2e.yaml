@@ -150,7 +150,7 @@ jobs:
           # --- ALGeneva server config ---
           cat > /tmp/algeneva-server.json << 'JSONEOF'
           {
-            "log": {"level": "debug"},
+            "log": {"level": "trace"},
             "inbounds": [{
               "type": "algeneva",
               "tag": "algeneva-in",
