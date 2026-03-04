@@ -25,7 +25,7 @@ jobs:
 
       - name: Build lantern-box (linux/amd64)
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \
             -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api" \
             -o lantern-box \
             ./cmd
