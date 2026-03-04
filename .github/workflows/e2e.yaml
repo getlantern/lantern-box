@@ -2,12 +2,6 @@ name: E2E Protocol Tests
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches: [main]
-    paths-ignore:
-      - '.github/workflows/**'
-      - '*.md'
-      - 'LICENSE'
 
 env:
   DROPLET_NAME: "e2e-lantern-box-${{ github.run_id }}"
