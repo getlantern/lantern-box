@@ -115,9 +115,14 @@ func metadataToAttributes(metadata adapter.InboundContext) *attributes {
 		},
 	}
 	attrs.country.Store(ccNa)
-	go func() {
-		fromCountry := metrics.countryLookup.CountryCode(metadata.Source.IPAddr().IP)
-		attrs.country.Store(fromCountry)
-	}()
+	if metrics.countryLookupC != nil {
+		select {
+		case metrics.countryLookupC <- countryLookupRequest{
+			ip:      metadata.Source.IPAddr().IP,
+			country: &attrs.country,
+		}:
+		default:
+		}
+	}
 	return attrs
 }

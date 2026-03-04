@@ -6,11 +6,21 @@
 package metrics
 
 import (
+	"net"
+	"sync/atomic"
+
 	"github.com/getlantern/geo"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 )
+
+const countryLookupWorkers = 4
+
+type countryLookupRequest struct {
+	ip      net.IP
+	country *atomic.Value
+}
 
 type metricsManager struct {
 	meter    metric.Meter
@@ -18,7 +28,8 @@ type metricsManager struct {
 	conns    metric.Int64UpDownCounter
 	duration metric.Int64Histogram
 
-	countryLookup geo.CountryLookup
+	countryLookup  geo.CountryLookup
+	countryLookupC chan countryLookupRequest
 }
 
 var metrics = &metricsManager{
@@ -47,5 +58,18 @@ func SetupMetricsManager(countryLookup geo.CountryLookup) {
 	if countryLookup != nil {
 		metrics.countryLookup = countryLookup
 	}
+	if _, ok := countryLookup.(geo.NoLookup); !ok {
+		metrics.countryLookupC = make(chan countryLookupRequest, 256)
+		for range countryLookupWorkers {
+			go countryLookupWorker(metrics.countryLookupC, metrics.countryLookup)
+		}
+	}
+
 	metrics.meter = meter
+}
+
+func countryLookupWorker(ch <-chan countryLookupRequest, lookup geo.CountryLookup) {
+	for req := range ch {
+		req.country.Store(lookup.CountryCode(req.ip))
+	}
 }
