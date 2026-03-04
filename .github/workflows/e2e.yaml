@@ -141,7 +141,7 @@ jobs:
 
           # Start Python HTTP server to serve plain.wasm (for WATER)
           ssh $SSH_OPTS root@"$DROPLET_IP" \
-            "cd /root && nohup python3 -m http.server 8888 > /root/wasm-server.log 2>&1 &"
+            "cd /root && nohup python3 -m http.server 8888 > /root/wasm-server.log 2>&1 < /dev/null &"
 
           # --- ALGeneva server config ---
           cat > /tmp/algeneva-server.json << 'JSONEOF'
@@ -206,10 +206,11 @@ jobs:
           scp $SSH_OPTS /tmp/water-server.json root@"$DROPLET_IP":/root/water-server.json
 
           # Start all 3 server processes
+          # Close stdin (< /dev/null) so SSH doesn't wait for background processes
           ssh $SSH_OPTS root@"$DROPLET_IP" \
-            "nohup /root/lantern-box run --config /root/algeneva-server.json > /root/algeneva-server.log 2>&1 &
-             nohup /root/lantern-box run --config /root/samizdat-server.json > /root/samizdat-server.log 2>&1 &
-             nohup /root/lantern-box run --config /root/water-server.json > /root/water-server.log 2>&1 &"
+            "nohup /root/lantern-box run --config /root/algeneva-server.json > /root/algeneva-server.log 2>&1 < /dev/null &
+             nohup /root/lantern-box run --config /root/samizdat-server.json > /root/samizdat-server.log 2>&1 < /dev/null &
+             nohup /root/lantern-box run --config /root/water-server.json > /root/water-server.log 2>&1 < /dev/null &"
 
           # Wait for servers to be ready (WATER needs time to download/compile WASM)
           # Note: must use bash explicitly since Ubuntu default shell is dash (no /dev/tcp support)
