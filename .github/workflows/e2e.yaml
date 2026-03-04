@@ -194,12 +194,24 @@ jobs:
              nohup /root/lantern-box run --config /root/samizdat-server.json > /root/samizdat-server.log 2>&1 &
              nohup /root/lantern-box run --config /root/water-server.json > /root/water-server.log 2>&1 &"
 
-          # Wait for servers to start
-          sleep 5
-
-          # Verify server processes are running
-          ssh $SSH_OPTS root@"$DROPLET_IP" \
-            "pgrep -f 'lantern-box run' || (echo 'No lantern-box processes found!' && cat /root/*.log && exit 1)"
+          # Wait for servers to be ready (WATER needs time to download/compile WASM)
+          ssh $SSH_OPTS root@"$DROPLET_IP" '
+            for port in 9001 9002 9003; do
+              echo "Waiting for port $port to be ready..."
+              for i in $(seq 1 60); do
+                if echo > /dev/tcp/127.0.0.1/$port 2>/dev/null; then
+                  echo "Port $port is ready"
+                  break
+                fi
+                if [ "$i" -eq 60 ]; then
+                  echo "Port $port not ready after 60 seconds" >&2
+                  cat /root/*.log
+                  exit 1
+                fi
+                sleep 1
+              done
+            done
+          '
 
       - name: Test ALGeneva
         env:
