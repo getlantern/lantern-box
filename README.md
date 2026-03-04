@@ -424,7 +424,7 @@ Application-layer [Geneva](https://www.usenix.org/system/files/sec22-harrity.pdf
 
 **When to use it:** The censor is doing simple HTTP header inspection. You want the fastest possible setup with zero credential management.
 
-**Strategy syntax:** `[trigger]-action-|` where the trigger matches a header field and the action transforms it. Example: `[HTTP:host:*]-changecase{lower}-|` lowercases the Host header.
+**Strategy syntax:** `[trigger]-action-|` where the trigger matches a header field and the action transforms it. Example: `[HTTP:host:*]-changecase{lower}-|` lowercases the Host header. The [algeneva strategies file](https://github.com/getlantern/algeneva/blob/main/strategies.go) has pre-built strategies tested against censors in China, India, and Kazakhstan.
 
 #### Server config
 
