@@ -10,6 +10,7 @@ env:
 jobs:
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -34,10 +35,10 @@ jobs:
         run: |
           # Samizdat X25519 keypair
           openssl genpkey -algorithm X25519 -out samizdat_priv.pem
-          SAMIZDAT_PRIV=$(openssl pkey -in samizdat_priv.pem -text 2>/dev/null \
-            | grep -A2 'priv:' | tail -n+2 | tr -d ' :\n')
-          SAMIZDAT_PUB=$(openssl pkey -in samizdat_priv.pem -pubout -text 2>/dev/null \
-            | grep -A2 'pub:' | tail -n+2 | tr -d ' :\n')
+          SAMIZDAT_PRIV=$(openssl pkey -in samizdat_priv.pem -outform DER \
+            | tail -c 32 | xxd -p | tr -d '\n')
+          SAMIZDAT_PUB=$(openssl pkey -in samizdat_priv.pem -pubout -outform DER \
+            | tail -c 32 | xxd -p | tr -d '\n')
           SAMIZDAT_SHORT_ID=$(openssl rand -hex 8)
 
           # Self-signed TLS cert for Samizdat
@@ -47,12 +48,12 @@ jobs:
 
           # Locate plain.wasm from Go module cache
           WATER_MOD_DIR="$(go env GOPATH)/pkg/mod/github.com/refraction-networking/water@v0.7.1-alpha"
-          WASM_PATH="${WATER_MOD_DIR}/transport/v0/testdata/plain.wasm"
+          WASM_PATH="${WATER_MOD_DIR}/transport/v1/testdata/plain.wasm"
           if [ ! -f "$WASM_PATH" ]; then
             echo "plain.wasm not found at $WASM_PATH, downloading module..."
             go mod download github.com/refraction-networking/water@v0.7.1-alpha
             WATER_MOD_DIR="$(go env GOPATH)/pkg/mod/github.com/refraction-networking/water@v0.7.1-alpha"
-            WASM_PATH="${WATER_MOD_DIR}/transport/v0/testdata/plain.wasm"
+            WASM_PATH="${WATER_MOD_DIR}/transport/v1/testdata/plain.wasm"
           fi
           WASM_HASH=$(sha256sum "$WASM_PATH" | awk '{print $1}')
           cp "$WASM_PATH" plain.wasm
