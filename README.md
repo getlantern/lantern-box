@@ -178,7 +178,7 @@ Host the `.wasm` file on an HTTP server both sides can reach (a simple `python3 
 }
 ```
 
-> **Gotcha:** The `"config": {}` field must be present even if empty. Omitting it will cause startup failures.
+> **Gotcha:** The `"config"` field is optional. If omitted, WATER will still start, but it will not inject `remote_addr`/`remote_port` into the module config. Include `"config": {}` when your WASM module expects those values.
 
 #### All client options
 
