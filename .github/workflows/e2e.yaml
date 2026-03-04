@@ -122,13 +122,17 @@ jobs:
           SAMIZDAT_SHORT_ID: ${{ steps.creds.outputs.samizdat_short_id }}
           WASM_HASH: ${{ steps.creds.outputs.wasm_hash }}
         run: |
-          SSH_OPTS="-o StrictHostKeyChecking=no -i e2e_key"
+          SSH_OPTS="-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -i e2e_key"
+
+          # Compress binary before upload to avoid SCP timeout on small droplets
+          gzip -1 -c lantern-box > lantern-box.gz
 
           # Upload files
-          scp $SSH_OPTS lantern-box cert.pem key.pem plain.wasm root@"$DROPLET_IP":/root/
+          scp $SSH_OPTS lantern-box.gz cert.pem key.pem plain.wasm root@"$DROPLET_IP":/root/
 
-          # Make binary executable
-          ssh $SSH_OPTS root@"$DROPLET_IP" chmod +x /root/lantern-box
+          # Decompress and make binary executable
+          ssh $SSH_OPTS root@"$DROPLET_IP" \
+            "gzip -d /root/lantern-box.gz && chmod +x /root/lantern-box"
 
           # Start Python HTTP server to serve plain.wasm (for WATER)
           ssh $SSH_OPTS root@"$DROPLET_IP" \
