@@ -27,8 +27,10 @@ jobs:
         run: |
           CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \
             -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api" \
+            -ldflags="-s -w" \
             -o lantern-box \
             ./cmd
+          ls -lh lantern-box
 
       - name: Generate test credentials
         id: creds
@@ -84,7 +86,7 @@ jobs:
           # Create droplet
           DROPLET_ID=$(doctl compute droplet create "$DROPLET_NAME" \
             --image ubuntu-24-04-x64 \
-            --size s-1vcpu-1gb \
+            --size s-2vcpu-2gb \
             --region nyc3 \
             --ssh-keys "$SSH_KEY_ID" \
             --wait \
@@ -124,11 +126,14 @@ jobs:
         run: |
           SSH_OPTS="-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -i e2e_key"
 
-          # Compress binary before upload to avoid SCP timeout on small droplets
+          # Compress binary before upload
           gzip -1 -c lantern-box > lantern-box.gz
+          ls -lh lantern-box.gz
 
           # Upload files
-          scp $SSH_OPTS lantern-box.gz cert.pem key.pem plain.wasm root@"$DROPLET_IP":/root/
+          echo "Starting SCP upload..."
+          scp -v $SSH_OPTS lantern-box.gz cert.pem key.pem plain.wasm root@"$DROPLET_IP":/root/
+          echo "SCP upload complete"
 
           # Decompress and make binary executable
           ssh $SSH_OPTS root@"$DROPLET_IP" \
