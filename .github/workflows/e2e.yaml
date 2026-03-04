@@ -132,16 +132,20 @@ jobs:
 
           # Upload files
           echo "Starting SCP upload..."
-          scp -v $SSH_OPTS lantern-box.gz cert.pem key.pem plain.wasm root@"$DROPLET_IP":/root/
+          scp $SSH_OPTS lantern-box.gz cert.pem key.pem plain.wasm root@"$DROPLET_IP":/root/
           echo "SCP upload complete"
 
           # Decompress and make binary executable
+          echo "Decompressing binary..."
           ssh $SSH_OPTS root@"$DROPLET_IP" \
             "gzip -d /root/lantern-box.gz && chmod +x /root/lantern-box"
+          echo "Binary ready"
 
           # Start Python HTTP server to serve plain.wasm (for WATER)
-          ssh $SSH_OPTS root@"$DROPLET_IP" \
-            "cd /root && nohup python3 -m http.server 8888 > /root/wasm-server.log 2>&1 < /dev/null &"
+          echo "Starting WASM HTTP server..."
+          ssh -f $SSH_OPTS root@"$DROPLET_IP" \
+            "cd /root && python3 -m http.server 8888 > /root/wasm-server.log 2>&1"
+          echo "WASM HTTP server started"
 
           # --- ALGeneva server config ---
           cat > /tmp/algeneva-server.json << 'JSONEOF'
@@ -206,13 +210,15 @@ jobs:
           scp $SSH_OPTS /tmp/water-server.json root@"$DROPLET_IP":/root/water-server.json
 
           # Start all 3 server processes
-          # Close stdin (< /dev/null) so SSH doesn't wait for background processes
-          ssh $SSH_OPTS root@"$DROPLET_IP" \
-            "nohup /root/lantern-box run --config /root/algeneva-server.json > /root/algeneva-server.log 2>&1 < /dev/null &
-             nohup /root/lantern-box run --config /root/samizdat-server.json > /root/samizdat-server.log 2>&1 < /dev/null &
-             nohup /root/lantern-box run --config /root/water-server.json > /root/water-server.log 2>&1 < /dev/null &"
+          echo "Starting servers..."
+          ssh $SSH_OPTS root@"$DROPLET_IP" "nohup /root/lantern-box run --config /root/algeneva-server.json > /root/algeneva-server.log 2>&1 < /dev/null &
+          nohup /root/lantern-box run --config /root/samizdat-server.json > /root/samizdat-server.log 2>&1 < /dev/null &
+          nohup /root/lantern-box run --config /root/water-server.json > /root/water-server.log 2>&1 < /dev/null &
+          sleep 1"
+          echo "Servers launched"
 
           # Wait for servers to be ready (WATER needs time to download/compile WASM)
+          echo "Checking port readiness..."
           # Note: must use bash explicitly since Ubuntu default shell is dash (no /dev/tcp support)
           ssh $SSH_OPTS root@"$DROPLET_IP" bash << 'READYEOF'
             for port in 9001 9002 9003; do
