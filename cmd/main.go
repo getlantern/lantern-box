@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
+
+	"github.com/getlantern/geo"
+	"github.com/spf13/cobra"
+	sdkotel "go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric/noop"
 
 	box "github.com/getlantern/lantern-box"
 	"github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/metrics"
-	"github.com/spf13/cobra"
-	sdkotel "go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/metric/noop"
 )
 
 type ProxyInfo struct {
@@ -81,7 +84,8 @@ func preRun(cmd *cobra.Command, args []string) {
 		ProxyProtocol:    proxyInfo.Protocol,
 	})
 
-	metrics.SetupMetricsManager(geoCityURL, cityDatabaseName)
+	geolookup := geo.FromWeb(geoCityURL, cityDatabaseName, 24*time.Hour, cityDatabaseName, geo.CountryCode)
+	metrics.SetupMetricsManager(geolookup)
 }
 
 func main() {
