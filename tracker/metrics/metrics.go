@@ -45,12 +45,12 @@ func SetupMetricsManager(countryLookup geo.CountryLookup) {
 		metrics.ProxyIO = pIO
 	}
 	// Track the number of connections.
-	conns, err := meter.Int64UpDownCounter("proxy.connections", metric.WithDescription("Number of connections"))
+	conns, err := meter.Int64UpDownCounter("sing.connections", metric.WithDescription("Number of connections"))
 	if err == nil {
 		metrics.conns = conns
 	}
 	// Track connection duration.
-	duration, err := meter.Int64Histogram("proxy.connection_duration", metric.WithDescription("Connection duration"))
+	duration, err := meter.Int64Histogram("sing.connection_duration", metric.WithDescription("Connection duration"))
 	if err == nil {
 		metrics.duration = duration
 	}
