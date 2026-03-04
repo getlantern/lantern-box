@@ -507,10 +507,10 @@ PRs welcome. The upstream goal means we prefer changes that are general enough t
 
 - Protocol adapters live in `protocol/`
 - Option structs live in `option/`
-- Build tags: `with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api`
+- Build tags: `with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale`
 
 Run tests with:
 
 ```bash
-go test -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api" ./...
+go test -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale" ./...
 ```
