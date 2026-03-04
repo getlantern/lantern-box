@@ -393,16 +393,32 @@ jobs:
 
       - name: Cleanup DO resources
         if: always()
+        env:
+          DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
         run: |
           DROPLET_ID="${{ steps.droplet.outputs.droplet_id }}"
           SSH_KEY_ID="${{ steps.droplet.outputs.ssh_key_id }}"
 
-          if [ -n "$DROPLET_ID" ]; then
-            echo "Destroying droplet $DROPLET_ID..."
-            doctl compute droplet delete "$DROPLET_ID" --force || true
-          fi
-
-          if [ -n "$SSH_KEY_ID" ]; then
-            echo "Deleting SSH key $SSH_KEY_ID..."
-            doctl compute ssh-key delete "$SSH_KEY_ID" --force || true
+          # Fall back to DO API directly if doctl is not available
+          if command -v doctl &>/dev/null; then
+            if [ -n "$DROPLET_ID" ]; then
+              echo "Destroying droplet $DROPLET_ID..."
+              doctl compute droplet delete "$DROPLET_ID" --force || true
+            fi
+            if [ -n "$SSH_KEY_ID" ]; then
+              echo "Deleting SSH key $SSH_KEY_ID..."
+              doctl compute ssh-key delete "$SSH_KEY_ID" --force || true
+            fi
+          else
+            echo "doctl not available, using DO API directly"
+            if [ -n "$DROPLET_ID" ]; then
+              echo "Destroying droplet $DROPLET_ID..."
+              curl -sf -X DELETE "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
+                -H "Authorization: Bearer $DO_API_TOKEN" || true
+            fi
+            if [ -n "$SSH_KEY_ID" ]; then
+              echo "Deleting SSH key $SSH_KEY_ID..."
+              curl -sf -X DELETE "https://api.digitalocean.com/v2/account/keys/$SSH_KEY_ID" \
+                -H "Authorization: Bearer $DO_API_TOKEN" || true
+            fi
           fi
