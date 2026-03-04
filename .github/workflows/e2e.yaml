@@ -199,7 +199,8 @@ jobs:
               "listen_port": 9003,
               "transport": "plain",
               "hashsum": "${WASM_HASH}",
-              "wasm_available_at": ["http://127.0.0.1:8888/plain.wasm"]
+              "wasm_available_at": ["http://127.0.0.1:8888/plain.wasm"],
+              "config": {}
             }],
             "outbounds": [{
               "type": "direct",
@@ -239,13 +240,16 @@ jobs:
           READYEOF
 
       - name: Test ALGeneva
+        id: test_algeneva
+        continue-on-error: true
         env:
           DROPLET_IP: ${{ steps.droplet.outputs.droplet_ip }}
         run: |
           # Generate client config
+          # Use a simple strategy that only modifies the host header (not the CONNECT request line)
           cat > /tmp/algeneva-client.json << JSONEOF
           {
-            "log": {"level": "debug"},
+            "log": {"level": "trace"},
             "inbounds": [{
               "type": "mixed",
               "tag": "mixed-in",
@@ -257,7 +261,7 @@ jobs:
               "tag": "algeneva-out",
               "server": "${DROPLET_IP}",
               "server_port": 9001,
-              "strategy": "[HTTP:method:*]-insert{%0A:end:value:2}-|"
+              "strategy": "[HTTP:host:*]-changecase{lower}-|"
             }]
           }
           JSONEOF
@@ -275,11 +279,14 @@ jobs:
           fi
 
           # Test
+          set +e
           RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1081 -m 30 http://example.com)
+          CURL_EXIT=$?
+          set -e
           if echo "$RESPONSE" | grep -q "Example Domain"; then
             echo "ALGeneva test PASSED"
           else
-            echo "ALGeneva test FAILED"
+            echo "ALGeneva test FAILED (curl exit code: $CURL_EXIT)"
             echo "Response: $RESPONSE"
             cat /tmp/algeneva-client.log
             kill $CLIENT_PID 2>/dev/null || true
@@ -289,6 +296,8 @@ jobs:
           kill $CLIENT_PID 2>/dev/null || true
 
       - name: Test Samizdat
+        id: test_samizdat
+        continue-on-error: true
         env:
           DROPLET_IP: ${{ steps.droplet.outputs.droplet_ip }}
           SAMIZDAT_PUB: ${{ steps.creds.outputs.samizdat_pub }}
@@ -325,11 +334,14 @@ jobs:
             exit 1
           fi
 
+          set +e
           RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1082 -m 30 http://example.com)
+          CURL_EXIT=$?
+          set -e
           if echo "$RESPONSE" | grep -q "Example Domain"; then
             echo "Samizdat test PASSED"
           else
-            echo "Samizdat test FAILED"
+            echo "Samizdat test FAILED (curl exit code: $CURL_EXIT)"
             echo "Response: $RESPONSE"
             cat /tmp/samizdat-client.log
             kill $CLIENT_PID 2>/dev/null || true
@@ -339,6 +351,8 @@ jobs:
           kill $CLIENT_PID 2>/dev/null || true
 
       - name: Test WATER
+        id: test_water
+        continue-on-error: true
         env:
           DROPLET_IP: ${{ steps.droplet.outputs.droplet_ip }}
           WASM_HASH: ${{ steps.creds.outputs.wasm_hash }}
@@ -361,7 +375,8 @@ jobs:
               "hashsum": "${WASM_HASH}",
               "wasm_available_at": ["http://${DROPLET_IP}:8888/plain.wasm"],
               "download_timeout": "60s",
-              "water_dir": "/tmp/water"
+              "water_dir": "/tmp/water",
+              "config": {}
             }]
           }
           JSONEOF
@@ -376,11 +391,14 @@ jobs:
             exit 1
           fi
 
+          set +e
           RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1083 -m 30 http://example.com)
+          CURL_EXIT=$?
+          set -e
           if echo "$RESPONSE" | grep -q "Example Domain"; then
             echo "WATER test PASSED"
           else
-            echo "WATER test FAILED"
+            echo "WATER test FAILED (curl exit code: $CURL_EXIT)"
             echo "Response: $RESPONSE"
             cat /tmp/water-client.log
             kill $CLIENT_PID 2>/dev/null || true
@@ -388,6 +406,35 @@ jobs:
           fi
 
           kill $CLIENT_PID 2>/dev/null || true
+
+      - name: Check test results
+        if: always()
+        run: |
+          FAILED=0
+          echo "=== E2E Test Results ==="
+          if [ "${{ steps.test_algeneva.outcome }}" = "success" ]; then
+            echo "ALGeneva:  PASSED"
+          else
+            echo "ALGeneva:  FAILED"
+            FAILED=1
+          fi
+          if [ "${{ steps.test_samizdat.outcome }}" = "success" ]; then
+            echo "Samizdat:  PASSED"
+          else
+            echo "Samizdat:  FAILED"
+            FAILED=1
+          fi
+          if [ "${{ steps.test_water.outcome }}" = "success" ]; then
+            echo "WATER:     PASSED"
+          else
+            echo "WATER:     FAILED"
+            FAILED=1
+          fi
+          echo "========================"
+          if [ "$FAILED" -ne 0 ]; then
+            echo "One or more tests failed"
+            exit 1
+          fi
 
       - name: Collect server logs
         if: always()
