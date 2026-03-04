@@ -1,28 +1,70 @@
 # lantern-box
 
-Lantern Box is the Lantern fork of [sing-box](https://github.com/SagerNet/sing-box) -- the universal proxy platform -- with extra protocols built for places where the internet comes with walls. It adds [ALGeneva](https://www.usenix.org/system/files/sec22-harrity.pdf), [WATER](https://arxiv.org/html/2312.00163v2), [Samizdat](https://github.com/getlantern/samizdat), [Outline SDK smart dialer](https://github.com/Jigsaw-Code/outline-sdk/tree/main/x/smart), and [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) to the sing-box ecosystem.
+Lantern Box is the Lantern fork of [sing-box](https://github.com/SagerNet/sing-box) -- the universal proxy platform -- with extra protocols built for places where the internet comes with walls. It adds [Samizdat](https://github.com/getlantern/samizdat), [WATER](https://arxiv.org/html/2312.00163v2), [Outline SDK smart dialer](https://github.com/Jigsaw-Code/outline-sdk/tree/main/x/smart), [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/), and [ALGeneva](https://www.usenix.org/system/files/sec22-harrity.pdf) to the sing-box ecosystem.
 
 The goal is to be as useful as possible to the censorship circumvention community. Operators are encouraged to run servers and hand configs to users. We contribute changes upstream whenever we can.
 
+There are two ways to use lantern-box:
+
+1. **Run the server binary** -- deploy it on a VPS and hand JSON configs to users. You get every sing-box protocol plus the Lantern additions.
+2. **Import it as a Go library** -- integrate the protocols into your own tooling. One function call registers everything.
+
 ---
 
-## Quick Start
+## Quick Start: Run the Server
 
-Build:
+Build and run the lantern-box binary:
 
 ```bash
 cd cmd
 make
 cd -
-```
-
-Run:
-
-```bash
 ./cmd/lantern-box run --config config.json
 ```
 
-That's it. The rest of this document is about what goes inside `config.json`.
+This gives you a full sing-box server with all built-in protocols (Shadowsocks, VMess, Trojan, Hysteria, WireGuard, etc.) plus the Lantern protocols documented below. The rest of this README is about what goes inside `config.json`.
+
+## Quick Start: Go Library Integration
+
+If you're building your own Go tool and want to use the Lantern protocols (client-side or server-side), import lantern-box as a module:
+
+```bash
+go get github.com/getlantern/lantern-box@latest
+```
+
+Then call `BaseContext()` to get a context with all sing-box and lantern-box protocols registered:
+
+```go
+package main
+
+import (
+	"os"
+
+	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json"
+
+	lanternbox "github.com/getlantern/lantern-box"
+)
+
+func main() {
+	// Register all sing-box + lantern-box protocols
+	ctx := lanternbox.BaseContext()
+
+	// Load your config (same JSON format as the CLI)
+	content, _ := os.ReadFile("config.json")
+	options, _ := json.UnmarshalExtendedContext[option.Options](ctx, content)
+
+	// Create and start the instance
+	instance, _ := box.New(box.Options{
+		Context: ctx,
+		Options: options,
+	})
+	instance.Start()
+}
+```
+
+`BaseContext()` registers every protocol -- Samizdat, WATER, ALGeneva, Outline SDK, AmneziaWG, plus all the sing-box built-ins. The JSON config format is the same whether you use the CLI binary or the library.
 
 ---
 
