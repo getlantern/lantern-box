@@ -74,13 +74,13 @@ func trackIOLoop(ctx context.Context, reportC <-chan report) {
 
 func (t *MetricsTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	attrs := metadataToAttributes(metadata)
-	metrics.Connections.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
+	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return NewConn(conn, attrs, t)
 }
 
 func (t *MetricsTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
 	attrs := metadataToAttributes(metadata)
-	metrics.Connections.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
+	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return NewPacketConn(conn, attrs, t)
 }
 

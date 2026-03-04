@@ -13,18 +13,16 @@ import (
 )
 
 type metricsManager struct {
-	meter       metric.Meter
-	ProxyIO     metric.Int64Counter
-	Connections metric.Int64Counter
-	conns       metric.Int64UpDownCounter
-	duration    metric.Int64Histogram
+	meter    metric.Meter
+	ProxyIO  metric.Int64Counter
+	conns    metric.Int64UpDownCounter
+	duration metric.Int64Histogram
 
 	countryLookup geo.CountryLookup
 }
 
 var metrics = &metricsManager{
 	ProxyIO:       &noop.Int64Counter{},
-	Connections:   &noop.Int64Counter{},
 	conns:         &noop.Int64UpDownCounter{},
 	duration:      &noop.Int64Histogram{},
 	countryLookup: geo.NoLookup{},
@@ -32,23 +30,16 @@ var metrics = &metricsManager{
 
 func SetupMetricsManager(countryLookup geo.CountryLookup) {
 	meter := otel.GetMeterProvider().Meter("lantern-box")
-
 	if pIO, err := meter.Int64Counter("proxy.io", metric.WithUnit("bytes")); err == nil {
 		metrics.ProxyIO = pIO
 	}
-
-	if connections, err := meter.Int64Counter("proxy.connections"); err == nil {
-		metrics.Connections = connections
-	}
-
 	// Track the number of connections.
-	conns, err := meter.Int64UpDownCounter("sing.connections", metric.WithDescription("Number of connections"))
+	conns, err := meter.Int64UpDownCounter("proxy.connections", metric.WithDescription("Number of connections"))
 	if err == nil {
 		metrics.conns = conns
 	}
-
 	// Track connection duration.
-	duration, err := meter.Int64Histogram("sing.connection_duration", metric.WithDescription("Connection duration"))
+	duration, err := meter.Int64Histogram("proxy.connection_duration", metric.WithDescription("Connection duration"))
 	if err == nil {
 		metrics.duration = duration
 	}
