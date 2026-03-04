@@ -51,7 +51,10 @@ type report struct {
 }
 
 func (t *MetricsTracker) TrackIO(d ioAttr, n int, attrs *attributes) {
-	t.reportC <- report{n, d, attrs}
+	select {
+	case <-t.ctx.Done():
+	case t.reportC <- report{n, d, attrs}:
+	}
 }
 
 func trackIOLoop(ctx context.Context, reportC <-chan report) {
