@@ -1,32 +1,27 @@
 package metrics
 
 import (
-	"context"
 	"time"
 
-	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
 )
 
 // PacketConn wraps a sing-box network.PacketConn and tracks metrics such as bytes sent and received.
 type PacketConn struct {
 	N.PacketConn
-	attributes []attribute.KeyValue
-	startTime  time.Time
+	attrs     *attributes
+	tracker   *MetricsTracker
+	startTime time.Time
 }
 
 // NewPacketConn creates a new PacketConn instance.
-func NewPacketConn(conn N.PacketConn, metadata *adapter.InboundContext) N.PacketConn {
-	attributes := metadataToAttributes(metadata)
-	metrics.Connections.Add(context.Background(), 1, metric.WithAttributes(attributes...))
-
+func NewPacketConn(conn N.PacketConn, attrs *attributes, tracker *MetricsTracker) N.PacketConn {
 	return &PacketConn{
 		PacketConn: conn,
-		attributes: attributes,
+		attrs:      attrs,
+		tracker:    tracker,
 		startTime:  time.Now(),
 	}
 }
@@ -38,8 +33,7 @@ func (c *PacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, er
 		return dest, err
 	}
 	if buffer.Len() > 0 {
-		attrs := append(c.attributes, attribute.KeyValue{Key: "direction", Value: attribute.StringValue("receive")})
-		metrics.ProxyIO.Add(context.Background(), int64(buffer.Len()), metric.WithAttributes(attrs...))
+		c.tracker.TrackIO(rx, buffer.Len(), c.attrs)
 	}
 	return dest, nil
 }
@@ -47,8 +41,7 @@ func (c *PacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, er
 // WritePacket overrides network.PacketConn's WritePacket method to track sent bytes.
 func (c *PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	if buffer.Len() > 0 {
-		attrs := append(c.attributes, attribute.KeyValue{Key: "direction", Value: attribute.StringValue("transmit")})
-		metrics.ProxyIO.Add(context.Background(), int64(buffer.Len()), metric.WithAttributes(attrs...))
+		c.tracker.TrackIO(tx, buffer.Len(), c.attrs)
 	}
 	return c.PacketConn.WritePacket(buffer, destination)
 }
@@ -56,8 +49,7 @@ func (c *PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) er
 // Close overrides net.PacketConn's Close method to track connection duration.
 func (c *PacketConn) Close() error {
 	duration := time.Since(c.startTime).Milliseconds()
-	metrics.duration.Record(context.Background(), duration, metric.WithAttributes(c.attributes...))
-	metrics.conns.Add(context.Background(), -1, metric.WithAttributes(c.attributes...))
+	c.tracker.Leave(duration, c.attrs)
 	return c.PacketConn.Close()
 }
 

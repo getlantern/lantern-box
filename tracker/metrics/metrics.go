@@ -6,13 +6,8 @@
 package metrics
 
 import (
-	"time"
-
 	"github.com/getlantern/geo"
-	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/log"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 )
@@ -27,55 +22,39 @@ type metricsManager struct {
 	countryLookup geo.CountryLookup
 }
 
-var metrics = &metricsManager{}
+var metrics = &metricsManager{
+	ProxyIO:       &noop.Int64Counter{},
+	Connections:   &noop.Int64Counter{},
+	conns:         &noop.Int64UpDownCounter{},
+	duration:      &noop.Int64Histogram{},
+	countryLookup: geo.NoLookup{},
+}
 
-func SetupMetricsManager(geolite2CityURL, cityDBFile string) {
+func SetupMetricsManager(countryLookup geo.CountryLookup) {
 	meter := otel.GetMeterProvider().Meter("lantern-box")
 
-	pIO, err := meter.Int64Counter("proxy.io", metric.WithUnit("bytes"))
-	if err != nil {
-		pIO = &noop.Int64Counter{}
+	if pIO, err := meter.Int64Counter("proxy.io", metric.WithUnit("bytes")); err == nil {
+		metrics.ProxyIO = pIO
 	}
 
-	connections, err := meter.Int64Counter("proxy.connections")
-	if err != nil {
-		connections = &noop.Int64Counter{}
+	if connections, err := meter.Int64Counter("proxy.connections"); err == nil {
+		metrics.Connections = connections
 	}
 
 	// Track the number of connections.
 	conns, err := meter.Int64UpDownCounter("sing.connections", metric.WithDescription("Number of connections"))
-	if err != nil {
-		conns = &noop.Int64UpDownCounter{}
+	if err == nil {
+		metrics.conns = conns
 	}
 
 	// Track connection duration.
 	duration, err := meter.Int64Histogram("sing.connection_duration", metric.WithDescription("Connection duration"))
-	if err != nil {
-		duration = &noop.Int64Histogram{}
+	if err == nil {
+		metrics.duration = duration
 	}
 
+	if countryLookup != nil {
+		metrics.countryLookup = countryLookup
+	}
 	metrics.meter = meter
-	metrics.ProxyIO = pIO
-	metrics.duration = duration
-	metrics.Connections = connections
-	metrics.conns = conns
-
-	metrics.countryLookup = geo.FromWeb(geolite2CityURL, cityDBFile, 24*time.Hour, cityDBFile, geo.CountryCode)
-	if metrics.countryLookup == nil {
-		metrics.countryLookup = geo.NoLookup{}
-	}
-
-	log.Info("metrics manager set up completed")
-}
-
-func metadataToAttributes(metadata *adapter.InboundContext) []attribute.KeyValue {
-	// Convert metadata to attributes
-	fromCountry := metrics.countryLookup.CountryCode(metadata.Source.IPAddr().IP)
-	return []attribute.KeyValue{
-		attribute.String("country", fromCountry),
-		attribute.String("protocol", metadata.Protocol),
-		attribute.String("inbound", metadata.Inbound),
-		attribute.String("inbound_type", metadata.InboundType),
-		attribute.String("outbound", metadata.Outbound),
-	}
 }
