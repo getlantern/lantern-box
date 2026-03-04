@@ -493,7 +493,7 @@ The E2E test suite spins up a DigitalOcean droplet, deploys lantern-box, and run
 gh workflow run e2e.yaml
 ```
 
-It also runs automatically on pull requests to `main`.
+It also runs automatically on pull requests to `main` that modify non-documentation files (docs-only changes are ignored).
 
 **What it tests:** Each protocol gets a server instance on the droplet and a client instance on the CI runner. The test curls `http://example.com` through each proxy and checks for a valid response.
 
