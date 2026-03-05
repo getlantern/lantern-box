@@ -128,7 +128,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			logger.WarnContext(ctx, "failed to seed WASM", slog.Any("error", err), slog.String("transport", transportFilepath))
 		}
 		if seeder != nil {
-			log.DebugContext(ctx, "seeding WASM file", slog.String("magnet_uri", seeder.MagnetURI()), slog.String("transport", transportFilepath))
+			logger.DebugContext(ctx, "seeding WASM file", slog.String("magnet_uri", seeder.MagnetURI()), slog.String("transport", transportFilepath))
 		}
 		outbound.seeder = seeder
 	}
