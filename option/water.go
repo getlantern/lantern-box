@@ -49,6 +49,6 @@ type WATEROutboundOptions struct {
 type WATEROutboundSeedOptions struct {
 	// SeedEnabled enables seeding the used transport
 	SeedEnabled bool `json:"seed_enabled"`
-	// AnnounceList specifies where to annouce the file
+	// AnnounceList specifies which trackers should be used to announce the file
 	AnnounceList [][]string `json:"announce_list"`
 }
