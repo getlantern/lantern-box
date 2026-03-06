@@ -2,6 +2,7 @@ package water
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	waterDownloader "github.com/getlantern/lantern-water/downloader"
+	"github.com/getlantern/lantern-water/seed"
 	waterVC "github.com/getlantern/lantern-water/version_control"
 	"github.com/refraction-networking/water"
 	_ "github.com/refraction-networking/water/transport/v1"
@@ -47,6 +49,7 @@ type Outbound struct {
 	dialerConfig          *water.Config
 	transportModuleConfig map[string]any
 	dialMutex             sync.Mutex
+	seeder                *seed.Seeder
 }
 
 // NewOutbound creates a new WATER outbound adapter.
@@ -118,8 +121,26 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		dialMutex:             sync.Mutex{},
 		skipHandshake:         options.SkipHandshake,
 	}
+	if options.SeedEnabled {
+		transportFilepath := filepath.Join(wasmDir, fmt.Sprintf("%s.%s", options.Transport, "wasm"))
+		seeder, err := seed.New(transportFilepath, options.AnnounceList)
+		if err != nil {
+			logger.WarnContext(ctx, "failed to seed WASM", slog.Any("error", err), slog.String("transport", transportFilepath))
+		}
+		if seeder != nil {
+			logger.DebugContext(ctx, "seeding WASM file", slog.String("magnet_uri", seeder.MagnetURI()), slog.String("transport", transportFilepath))
+		}
+		outbound.seeder = seeder
+	}
 
 	return outbound, nil
+}
+
+func (o *Outbound) Close() error {
+	if o.seeder != nil {
+		return o.seeder.Close()
+	}
+	return nil
 }
 
 func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (water.Dialer, error) {
