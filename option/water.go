@@ -48,7 +48,7 @@ type WATEROutboundOptions struct {
 // WATEROutboundSeedOptions specifies the seed configuration options
 type WATEROutboundSeedOptions struct {
 	// SeedEnabled enables seeding the used transport
-	SeedEnabled bool `json:"seed_enabled"`
+	SeedEnabled bool `json:"seed_enabled,omitempty"`
 	// AnnounceList specifies which trackers should be used to announce the file
-	AnnounceList [][]string `json:"announce_list"`
+	AnnounceList [][]string `json:"announce_list,omitempty"`
 }
