@@ -200,7 +200,12 @@ func NewOutbound(
 		},
 	}
 
-	tlsConfig, err := generateSelfSignedTLSConfig(options.InsecureDoNotVerifyClientCert, options.EgressCA)
+	tlsConfig, err := generateSelfSignedTLSConfig(
+		options.InsecureDoNotVerifyClientCert,
+		options.EgressCA,
+		options.EgressServerName,
+	)
+
 	if err != nil {
 		return nil, fmt.Errorf("generate TLS config: %w", err)
 	}
@@ -293,7 +298,11 @@ func (h *Outbound) Close() error {
 }
 
 // Reverse TLS, since the Unbounded client is the QUIC server
-func generateSelfSignedTLSConfig(insecureDoNotVerifyClientCert bool, egressCA string) (*tls.Config, error) {
+func generateSelfSignedTLSConfig(
+	insecureDoNotVerifyClientCert bool,
+	egressCA string,
+	egressServerName string,
+) (*tls.Config, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate ECDSA key: %w", err)
@@ -337,5 +346,29 @@ func generateSelfSignedTLSConfig(insecureDoNotVerifyClientCert bool, egressCA st
 		NextProtos:   []string{"broflake"},
 		ClientAuth:   clientAuth,
 		ClientCAs:    caCertPool,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return fmt.Errorf("no egress server client certificate")
+			}
+
+			cert := cs.PeerCertificates[0]
+
+			// We assume the egress server will present a DNS or IP SAN, so we don't check
+			// against URI or Email SANs...
+
+			for _, dns := range cert.DNSNames {
+				if dns == egressServerName {
+					return nil
+				}
+			}
+
+			for _, ip := range cert.IPAddresses {
+				if ip.String() == egressServerName {
+					return nil
+				}
+			}
+
+			return fmt.Errorf("egress server client SAN not authorized")
+		},
 	}, nil
 }
