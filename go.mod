@@ -8,7 +8,9 @@ replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v
 
 replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4
 
-replace github.com/tetratelabs/wazero => github.com/refraction-networking/wazero v1.7.1-w
+replace github.com/tetratelabs/wazero => github.com/getlantern/wazero v1.11.0-water
+
+replace github.com/refraction-networking/water => github.com/getlantern/water v0.7.1-alpha.0.20260307121918-d0e2989e3aed
 
 require (
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
