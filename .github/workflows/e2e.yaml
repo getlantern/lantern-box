@@ -56,9 +56,8 @@ jobs:
 
           # Locate plain.wasm from Go module cache
           # The replace directive in go.mod redirects refraction-networking/water
-          # to getlantern/water, so download via the module graph and find it.
-          go mod download github.com/refraction-networking/water
-          WATER_MOD_DIR=$(go mod download -json github.com/refraction-networking/water | grep '"Dir"' | cut -d'"' -f4)
+          # to getlantern/water, so resolve via the module graph and find it.
+          WATER_MOD_DIR=$(go list -m -f '{{.Dir}}' github.com/refraction-networking/water)
           WASM_PATH="${WATER_MOD_DIR}/transport/v1/testdata/plain.wasm"
           if [ ! -f "$WASM_PATH" ]; then
             echo "plain.wasm not found at $WASM_PATH"
