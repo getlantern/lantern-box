@@ -10,7 +10,7 @@ replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v
 
 replace github.com/tetratelabs/wazero => github.com/getlantern/wazero v1.11.0-water
 
-replace github.com/refraction-networking/water => github.com/getlantern/water v0.7.1-alpha.0.20260307121918-d0e2989e3aed
+replace github.com/refraction-networking/water => github.com/getlantern/water v0.7.1-alpha.0.20260309190745-bd547c14b4aa
 
 require (
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
