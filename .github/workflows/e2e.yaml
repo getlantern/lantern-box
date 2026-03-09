@@ -55,13 +55,15 @@ jobs:
             -subj "/CN=example.com"
 
           # Locate plain.wasm from Go module cache
-          WATER_MOD_DIR="$(go env GOPATH)/pkg/mod/github.com/refraction-networking/water@v0.7.1-alpha"
+          # The replace directive in go.mod redirects refraction-networking/water
+          # to getlantern/water, so download via the module graph and find it.
+          go mod download github.com/refraction-networking/water
+          WATER_MOD_DIR=$(go mod download -json github.com/refraction-networking/water | grep '"Dir"' | cut -d'"' -f4)
           WASM_PATH="${WATER_MOD_DIR}/transport/v1/testdata/plain.wasm"
           if [ ! -f "$WASM_PATH" ]; then
-            echo "plain.wasm not found at $WASM_PATH, downloading module..."
-            go mod download github.com/refraction-networking/water@v0.7.1-alpha
-            WATER_MOD_DIR="$(go env GOPATH)/pkg/mod/github.com/refraction-networking/water@v0.7.1-alpha"
-            WASM_PATH="${WATER_MOD_DIR}/transport/v1/testdata/plain.wasm"
+            echo "plain.wasm not found at $WASM_PATH"
+            echo "Module dir contents:" && ls -la "$WATER_MOD_DIR/transport/v1/testdata/" || true
+            exit 1
           fi
           WASM_HASH=$(sha256sum "$WASM_PATH" | awk '{print $1}')
           cp "$WASM_PATH" plain.wasm
@@ -93,7 +95,7 @@ jobs:
           DROPLET_ID=$(doctl compute droplet create "$DROPLET_NAME" \
             --image ubuntu-24-04-x64 \
             --size s-2vcpu-2gb \
-            --region nyc3 \
+            --region sfo3 \
             --ssh-keys "$SSH_KEY_ID" \
             --wait \
             --format ID --no-header)
