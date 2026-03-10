@@ -1,30 +1,25 @@
 package metrics
 
 import (
-	"context"
 	"net"
 	"time"
-
-	"github.com/sagernet/sing-box/adapter"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
 )
 
 // Conn wraps a net.Conn and tracks metrics such as bytes sent and received.
 type Conn struct {
 	net.Conn
-	attributes []attribute.KeyValue
-	startTime  time.Time
+	attrs     *attributes
+	tracker   *MetricsTracker
+	startTime time.Time
 }
 
 // NewConn creates a new Conn instance.
-func NewConn(conn net.Conn, metadata *adapter.InboundContext) net.Conn {
-	attributes := metadataToAttributes(metadata)
-	metrics.Connections.Add(context.Background(), 1, metric.WithAttributes(attributes...))
+func NewConn(conn net.Conn, attrs *attributes, tracker *MetricsTracker) net.Conn {
 	return &Conn{
-		Conn:       conn,
-		attributes: attributes,
-		startTime:  time.Now(),
+		Conn:      conn,
+		attrs:     attrs,
+		tracker:   tracker,
+		startTime: time.Now(),
 	}
 }
 
@@ -32,8 +27,7 @@ func NewConn(conn net.Conn, metadata *adapter.InboundContext) net.Conn {
 func (c *Conn) Read(b []byte) (n int, err error) {
 	n, err = c.Conn.Read(b)
 	if n > 0 {
-		attrs := append(c.attributes, attribute.KeyValue{Key: "direction", Value: attribute.StringValue("receive")})
-		metrics.ProxyIO.Add(context.Background(), int64(n), metric.WithAttributes(attrs...))
+		c.tracker.TrackIO(rx, n, c.attrs)
 	}
 	return
 }
@@ -42,8 +36,7 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 func (c *Conn) Write(b []byte) (n int, err error) {
 	n, err = c.Conn.Write(b)
 	if n > 0 {
-		attrs := append(c.attributes, attribute.KeyValue{Key: "direction", Value: attribute.StringValue("transmit")})
-		metrics.ProxyIO.Add(context.Background(), int64(n), metric.WithAttributes(attrs...))
+		c.tracker.TrackIO(tx, n, c.attrs)
 	}
 	return
 }
@@ -51,9 +44,19 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 // Close overrides net.Conn's Close method to track connection duration.
 func (c *Conn) Close() error {
 	duration := time.Since(c.startTime).Milliseconds()
-	metrics.duration.Record(context.Background(), duration, metric.WithAttributes(c.attributes...))
-	metrics.conns.Add(context.Background(), -1, metric.WithAttributes(c.attributes...))
+	c.tracker.Leave(duration, c.attrs)
 	return c.Conn.Close()
+}
+
+// CloseWrite implements N.WriteCloser to support half-close semantics.
+// This is critical for protocols tunneled over H2 (like Samizdat) where
+// sing-box's bidirectional copy needs to half-close one direction without
+// killing the entire stream.
+func (c *Conn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 func (c *Conn) Upstream() any {

@@ -14,10 +14,11 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/protocol/http"
 	"github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/network"
+	N "github.com/sagernet/sing/common/network"
 )
 
 func RegisterInbound(registry *inbound.Registry) {
@@ -27,8 +28,10 @@ func RegisterInbound(registry *inbound.Registry) {
 // Inbound is a wrapper around [http.Inbound] that listens for connections using the Application
 // Layer Geneva HTTP protocol.
 type Inbound struct {
-	http.Inbound
-	logger log.ContextLogger
+	inbound.Adapter
+	httpInbound *http.Inbound
+	listener    *listener.Listener
+	logger      log.ContextLogger
 }
 
 // NewInbound creates a new algeneva inbound adapter.
@@ -37,23 +40,42 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
-	inbound := httpInbound.(*http.Inbound)
-	return &Inbound{
-		Inbound: *inbound,
-		logger:  logger,
-	}, nil
+	a := &Inbound{
+		Adapter:     inbound.NewAdapter(constant.TypeALGeneva, tag),
+		httpInbound: httpInbound.(*http.Inbound),
+		logger:      logger,
+	}
+	a.listener = listener.New(listener.Options{
+		Context:           ctx,
+		Logger:            logger,
+		Network:           []string{N.NetworkTCP},
+		Listen:            options.ListenOptions,
+		ConnectionHandler: a,
+	})
+	return a, nil
 }
 
-func (a *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose network.CloseHandlerFunc) {
+func (a *Inbound) Start(stage adapter.StartStage) error {
+	if stage != adapter.StartStateStart {
+		return nil
+	}
+	return a.listener.Start()
+}
+
+func (a *Inbound) Close() error {
+	return a.listener.Close()
+}
+
+func (a *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = a.Tag()
 	metadata.InboundType = a.Type()
-	conn, err := a.newConnectionEx(ctx, conn)
+	wsConn, err := a.newConnectionEx(ctx, conn)
 	if err != nil {
-		network.CloseOnHandshakeFailure(conn, onClose, err)
+		N.CloseOnHandshakeFailure(conn, onClose, err)
 		a.logger.ErrorContext(ctx, exceptions.Cause(err, "process connection from ", metadata.Source))
 		return
 	}
-	a.Inbound.NewConnectionEx(ctx, conn, metadata, onClose)
+	a.httpInbound.NewConnectionEx(ctx, wsConn, metadata, onClose)
 }
 
 // newConnectionEx processes the connection and upgrades it to a WebSocket connection.
