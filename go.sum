@@ -181,8 +181,14 @@ github.com/getlantern/lantern-water v0.0.0-20260130212632-d5ea08838250 h1:xculJy
 github.com/getlantern/lantern-water v0.0.0-20260130212632-d5ea08838250/go.mod h1:ZpSOrcdJkmb8MvaQn6mxaidxshlyi+RJLUerhW4L5Lo=
 github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f h1:wrYrQttPS8FHIRSlsrcuKazukx/xqO/PpLZzZXsF+EA=
 github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f/go.mod h1:D5ao98qkA6pxftxoqzibIBBrLSUli+kYnJqrgBf9cIA=
-github.com/getlantern/samizdat v0.0.2 h1:PkMu6jsfUz7DLZUH2xh548XfzgPASmq5CajZyUKj/9Y=
-github.com/getlantern/samizdat v0.0.2/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
+github.com/getlantern/samizdat v0.0.3-0.20260310042917-8ad2f23c21f1 h1:+d6CQD1edA6eaIUfi4nX2ZJm6SEq0dR1PjvzPDLp5WQ=
+github.com/getlantern/samizdat v0.0.3-0.20260310042917-8ad2f23c21f1/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
+github.com/getlantern/samizdat v0.0.3-0.20260310043659-422ab3dc0899 h1:g4ReZ0+5zstaoDatl4YyY0yjlxXpZ5QQ9jsUw1FrOqc=
+github.com/getlantern/samizdat v0.0.3-0.20260310043659-422ab3dc0899/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
+github.com/getlantern/samizdat v0.0.3-0.20260310124504-1c9d3eea7dce h1:yWvVYmg4Sk9dO6iBNL7/trJ+gS24PYHDllYo7DQbxi4=
+github.com/getlantern/samizdat v0.0.3-0.20260310124504-1c9d3eea7dce/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
+github.com/getlantern/samizdat v0.0.3-0.20260310125445-325cf1bd1b60 h1:m9eXjDK9vllbVH467+QXbrxUFFM9Yp7YJ90wZLw4dwU=
+github.com/getlantern/samizdat v0.0.3-0.20260310125445-325cf1bd1b60/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
 github.com/getlantern/sing v0.7.18-lantern h1:QKGgIUA3LwmKYP/7JlQTRkxj9jnP4cX2Q/B+nd8XEjo=
 github.com/getlantern/sing v0.7.18-lantern/go.mod h1:ARkL0gM13/Iv5VCZmci/NuoOlePoIsW0m7BWfln/Hak=
 github.com/getlantern/sing-box-minimal v1.12.20-lantern h1:dWdR/z0A1Ukn+kcOIgH7+aOc9+yh8kvQ3Odw53+uocQ=

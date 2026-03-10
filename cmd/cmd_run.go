@@ -173,6 +173,7 @@ func run(configPath string, datacapURL string) error {
 		runtimeDebug.FreeOSMemory()
 		for {
 			osSignal := <-osSignals
+			log.Info("received signal: ", osSignal)
 			if osSignal == syscall.SIGHUP {
 				err = check(configPath)
 				if err != nil {
