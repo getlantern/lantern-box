@@ -185,6 +185,8 @@ github.com/getlantern/samizdat v0.0.3-0.20260310042917-8ad2f23c21f1 h1:+d6CQD1ed
 github.com/getlantern/samizdat v0.0.3-0.20260310042917-8ad2f23c21f1/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
 github.com/getlantern/samizdat v0.0.3-0.20260310043659-422ab3dc0899 h1:g4ReZ0+5zstaoDatl4YyY0yjlxXpZ5QQ9jsUw1FrOqc=
 github.com/getlantern/samizdat v0.0.3-0.20260310043659-422ab3dc0899/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
+github.com/getlantern/samizdat v0.0.3-0.20260310124504-1c9d3eea7dce h1:yWvVYmg4Sk9dO6iBNL7/trJ+gS24PYHDllYo7DQbxi4=
+github.com/getlantern/samizdat v0.0.3-0.20260310124504-1c9d3eea7dce/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
 github.com/getlantern/sing v0.7.18-lantern h1:QKGgIUA3LwmKYP/7JlQTRkxj9jnP4cX2Q/B+nd8XEjo=
 github.com/getlantern/sing v0.7.18-lantern/go.mod h1:ARkL0gM13/Iv5VCZmci/NuoOlePoIsW0m7BWfln/Hak=
 github.com/getlantern/sing-box-minimal v1.12.20-lantern h1:dWdR/z0A1Ukn+kcOIgH7+aOc9+yh8kvQ3Odw53+uocQ=
