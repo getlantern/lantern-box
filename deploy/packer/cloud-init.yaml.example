@@ -1,0 +1,35 @@
+#cloud-config
+# Pass this as user-data when creating a VPS from the pre-baked image.
+# The config.json content should be customized per server.
+
+write_files:
+  - path: /etc/lantern-box/config.json
+    permissions: "0600"
+    content: |
+      {
+        "log": { "level": "info" },
+        "inbounds": [
+          {
+            "type": "algeneva",
+            "listen": "::",
+            "listen_port": 9001,
+            "strategy": "[HTTP:host:*]-changecase{lower}-|"
+          }
+        ],
+        "outbounds": [
+          { "type": "direct" }
+        ]
+      }
+
+  # Optional: proxy info for telemetry
+  - path: /etc/lantern-box/config.ini
+    permissions: "0600"
+    content: |
+      proxyname = my-proxy-01
+      pro = false
+      track = stable
+      provider = digitalocean
+      proxyprotocol = algeneva
+
+runcmd:
+  - systemctl start lantern-box
