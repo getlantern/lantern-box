@@ -90,6 +90,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		Options: options,
 	})
 	if err != nil {
+		cancel()
 		return nil, nil, fmt.Errorf("create service: %w", err)
 	}
 
@@ -111,6 +112,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 			log.StdLogger(),
 		)
 		if err != nil {
+			cancel()
 			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
 		}
 		clientCtxMgr.AppendTracker(datacapTracker)
