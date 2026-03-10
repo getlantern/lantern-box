@@ -8,9 +8,8 @@ import (
 	"time"
 
 	"github.com/getlantern/geo"
-	"github.com/spf13/cobra"
-	sdkotel "go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/metric/noop"
+	"go.opentelemetry.io/otel/attribute"
+	"gopkg.in/ini.v1"
 
 	box "github.com/getlantern/lantern-box"
 	"github.com/getlantern/lantern-box/otel"
@@ -21,7 +20,7 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 )
 
-type ProxyInfo struct {
+type proxyInfo struct {
 	Name             string `ini:"proxyname"`
 	Pro              bool   `ini:"pro"`
 	Track            string `ini:"track"`
@@ -50,64 +49,76 @@ var rootCmd = &cobra.Command{
 func preRun(cmd *cobra.Command, args []string) {
 	globalCtx = box.BaseContext()
 
-	// Default to not report metrics
+	// Default to not report metrics.
 	sdkotel.SetMeterProvider(noop.NewMeterProvider())
 
-	path, err := cmd.Flags().GetString("config")
-	if err != nil {
+	if !otel.Enabled() {
+		log.Info("telemetry disabled (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)")
 		return
 	}
 
-	geoCityURL, err := cmd.Flags().GetString("geo-city-url")
-	if err != nil {
-		return
+	// Read proxy info as resource attributes.
+	var attrs []attribute.KeyValue
+	path, _ := cmd.Flags().GetString("config")
+	if path != "" {
+		iniPath := strings.Replace(path, ".json", ".ini", 1)
+		if info, err := readProxyInfo(iniPath); err != nil {
+			log.Warn("could not read proxy info: ", err)
+		} else {
+			attrs = info.resourceAttrs()
+		}
 	}
 
-	cityDatabaseName, err := cmd.Flags().GetString("city-database-name")
+	meterShutdown, err := otel.InitGlobalMeterProvider(attrs...)
 	if err != nil {
-		return
-	}
-
-	telemetryEndpoint, err := cmd.Flags().GetString("telemetry-endpoint")
-	if err != nil {
-		return
-	}
-
-	proxyInfoPath := strings.Replace(path, ".json", ".ini", 1)
-	proxyInfo, err := readProxyInfoFile(proxyInfoPath)
-	if err != nil {
-		log.Warn("telemetry disabled: could not read proxy info file: ", err)
-		return
-	}
-
-	otelOpts := &otel.Opts{
-		Endpoint:         otel.GetTelemetryEndpoint(telemetryEndpoint),
-		ProxyName:        proxyInfo.Name,
-		IsPro:            proxyInfo.Pro,
-		Track:            proxyInfo.Track,
-		Provider:         proxyInfo.Provider,
-		FrontendProvider: proxyInfo.FrontendProvider,
-		ProxyProtocol:    proxyInfo.Protocol,
-	}
-
-	meterShutdown, err := otel.InitGlobalMeterProvider(otelOpts)
-	if err != nil {
-		log.Warn("telemetry disabled: failed to init meter provider: ", err)
+		log.Warn("failed to init meter provider: ", err)
 		return
 	}
 	otelShutdownFuncs = append(otelShutdownFuncs, meterShutdown)
 
-	tracerShutdown, err := otel.InitGlobalTracerProvider(otelOpts)
+	tracerShutdown, err := otel.InitGlobalTracerProvider(attrs...)
 	if err != nil {
-		log.Warn("telemetry disabled: failed to init tracer provider: ", err)
+		log.Warn("failed to init tracer provider: ", err)
 		return
 	}
 	otelShutdownFuncs = append(otelShutdownFuncs, tracerShutdown)
 
-	log.Info("telemetry enabled, exporting to ", otelOpts.Endpoint)
+	log.Info("telemetry enabled")
 
-	geolookup := geo.FromWeb(geoCityURL, cityDatabaseName, 24*time.Hour, cityDatabaseName, geo.CountryCode)
-	metrics.SetupMetricsManager(geolookup)
+	geoCityURL, _ := cmd.Flags().GetString("geo-city-url")
+	cityDatabaseName, _ := cmd.Flags().GetString("city-database-name")
+	if geoCityURL != "" && cityDatabaseName != "" {
+		geolookup := geo.FromWeb(
+			geoCityURL, cityDatabaseName,
+			24*time.Hour, cityDatabaseName,
+			geo.CountryCode,
+		)
+		metrics.SetupMetricsManager(geolookup)
+	}
+}
+
+func readProxyInfo(path string) (*proxyInfo, error) {
+	cfg, err := ini.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("loading proxy info: %w", err)
+	}
+	var info proxyInfo
+	if err := cfg.MapTo(&info); err != nil {
+		return nil, fmt.Errorf("mapping proxy info: %w", err)
+	}
+	return &info, nil
+}
+
+func (info *proxyInfo) resourceAttrs() []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		attribute.Bool("pro", info.Pro),
+		attribute.String("proxy.name", info.Name),
+		attribute.String("protocol", info.Protocol),
+		attribute.String("track", info.Track),
+		attribute.String("provider", info.Provider),
+		attribute.String("frontend.provider", info.FrontendProvider),
+	}
+	return attrs
 }
 
 func shutdownOtel() {

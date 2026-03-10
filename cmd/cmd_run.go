@@ -21,8 +21,6 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
-	"gopkg.in/ini.v1"
-
 	"github.com/getlantern/lantern-box/adapter"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
@@ -34,7 +32,6 @@ func init() {
 	runCmd.Flags().String("config", "config.json", "Configuration file path")
 	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz", "URL for downloading GeoLite2-City database")
 	runCmd.Flags().String("city-database-name", "GeoLite2-City.mmdb", "Filename for storing GeoLite2-City database")
-	runCmd.Flags().String("telemetry-endpoint", "telemetry.iantem.io:443", "Telemetry endpoint for OpenTelemetry exporter")
 	runCmd.Flags().String("datacap-url", "", "Datacap server URL")
 }
 
@@ -52,19 +49,6 @@ var runCmd = &cobra.Command{
 		}
 		return run(path, datacapURL)
 	},
-}
-
-func readProxyInfoFile(path string) (*ProxyInfo, error) {
-	cfg, err := ini.Load(path)
-	if err != nil {
-		return nil, fmt.Errorf("loading proxy info file: %w", err)
-	}
-	var info ProxyInfo
-	err = cfg.MapTo(&info)
-	if err != nil {
-		return nil, fmt.Errorf("mapping proxy info file: %w", err)
-	}
-	return &info, nil
 }
 
 func readConfig(path string) (option.Options, error) {
