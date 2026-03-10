@@ -103,16 +103,13 @@ func NewOutbound(
 		PublicKey:           pubKey,
 		ShortID:             shortID,
 		Fingerprint:         options.Fingerprint,
-		Padding:             !options.DisablePadding,
 		Jitter:              !options.DisableJitter,
 		MaxJitterMs:         options.MaxJitterMs,
-		PaddingProfile:      options.PaddingProfile,
 		TCPFragmentation:    !options.DisableTCPFragmentation,
 		RecordFragmentation: !options.DisableRecordFragmentation,
 		MaxStreamsPerConn:    options.MaxStreamsPerConn,
 		IdleTimeout:         idleTimeout,
 		ConnectTimeout:      connectTimeout,
-		DataThreshold:       options.DataThreshold,
 		Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
 			return outboundDialer.DialContext(ctx, network, M.ParseSocksaddr(address))
 		},

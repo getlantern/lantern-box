@@ -342,8 +342,7 @@ jobs:
               "server_port": 9002,
               "public_key": "${SAMIZDAT_PUB}",
               "short_id": "${SAMIZDAT_SHORT_ID}",
-              "server_name": "example.com",
-              "disable_padding": true
+              "server_name": "example.com"
             }]
           }
           JSONEOF
