@@ -1,0 +1,164 @@
+{
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "dns_remote",
+        "detour": "auto",
+        "server": "9.9.9.9",
+        "server_port": 443,
+        "path": "/dns-query"
+      },
+      {
+        "type": "https",
+        "tag": "dns_local",
+        "server": "9.9.9.9",
+        "server_port": 443,
+        "path": "/dns-query"
+      },
+      {
+        "type": "fakeip",
+        "tag": "dns_fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "server": "dns_fakeip"
+      }
+    ],
+    "final": "dns_local"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "10.10.1.1/30"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "sniff": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria-out",
+      "server": "79.76.42.214",
+      "server_port": 45028,
+      "password": "eb5be46702b83b5177a7c057a68509d6",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "mutableurltest",
+      "tag": "auto-lantern",
+      "outbounds": [
+        "hysteria-out"
+      ],
+      "url": "https://google.com/generate_204",
+      "interval": "3m0s",
+      "idle_timeout": "15m0s"
+    },
+    {
+      "type": "mutableselector",
+      "tag": "lantern",
+      "outbounds": [
+        "auto-lantern",
+        "hysteria-out"
+      ]
+    },
+    {
+      "type": "mutableurltest",
+      "tag": "auto-user",
+      "outbounds": null,
+      "url": "https://google.com/generate_204",
+      "interval": "3m0s",
+      "idle_timeout": "15m0s"
+    },
+    {
+      "type": "mutableselector",
+      "tag": "user",
+      "outbounds": [
+        "auto-user"
+      ]
+    },
+    {
+      "type": "mutableurltest",
+      "tag": "auto",
+      "outbounds": [
+        "auto-lantern",
+        "auto-user"
+      ],
+      "url": "https://google.com/generate_204",
+      "interval": "3m0s",
+      "idle_timeout": "15m0s"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "split-tunnel",
+          "direct-domains"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "process_path_regex": "(?i)^/Lantern.app/Contents/MacOS/lantern$",
+        "outbound": "direct"
+      },
+      {
+        "clash_mode": "auto",
+        "outbound": "auto"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "local",
+        "tag": "split-tunnel",
+        "path": "/Users/Shared/Lantern/split-tunnel.json"
+      },
+      {
+        "type": "local",
+        "tag": "direct-domains",
+        "path": "/Users/Shared/Lantern/direct-domains.json"
+      }
+    ],
+    "auto_detect_interface": true
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "/Users/Shared/Lantern/lantern.cache",
+      "cache_id": "lantern"
+    },
+    "clash_api": {
+      "default_mode": "auto"
+    }
+  }
+}

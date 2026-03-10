@@ -1,0 +1,582 @@
+{
+  "log": {
+    "level": "debug",
+    "output": "lantern-box.log",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "dns_remote",
+        "detour": "auto",
+        "server": "9.9.9.9",
+        "server_port": 443,
+        "path": "/dns-query"
+      },
+      {
+        "type": "https",
+        "tag": "dns_local",
+        "server": "9.9.9.9",
+        "server_port": 443,
+        "path": "/dns-query"
+      },
+      {
+        "type": "fakeip",
+        "tag": "dns_fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "server": "dns_fakeip"
+      }
+    ],
+    "final": "dns_local"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "utun225",
+      "mtu": 1500,
+      "address": "10.10.1.1/30",
+      "auto_route": true,
+      "strict_route": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-monterrey-oci-pro-52a57381-e1af-46a4-afbf-496a2ee0dd04",
+      "server": "40.233.25.154",
+      "server_port": 51401,
+      "password": "adc9e4c58ac16db5d5f11e77b8a0c382",
+      "tls": {
+        "enabled": true,
+        "server_name": "api.push.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-mumbai-oci-pro-2fdcc5dc-6497-46e1-a70a-d7e03749aaab",
+      "server": "80.225.216.219",
+      "server_port": 46159,
+      "password": "d029a0ed09c2e845236149fea58c5b47",
+      "tls": {
+        "enabled": true,
+        "server_name": "api.push.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-cardiff-oci-pro-dc5a4afe-4382-4cd4-8431-38d5a8f73f41",
+      "server": "134.65.57.10",
+      "server_port": 53666,
+      "password": "fce30694b0ac0664fa3f0d9d9e38e5ba",
+      "tls": {
+        "enabled": true,
+        "server_name": "api.push.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-zurich-oci-pro-783d06bd-43b8-44ae-b3cf-a420ad5fd822",
+      "server": "144.24.235.82",
+      "server_port": 65095,
+      "password": "2c9f3160d1a10285da1cd021252b9ca2",
+      "tls": {
+        "enabled": true,
+        "server_name": "cdn-node-oss-03.anycdn.de",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria-frankfurt-oci-pro-757f69a3-174a-42d1-898b-0cdadc65df08",
+      "server": "89.168.81.129",
+      "server_port": 56139,
+      "password": "4cbfd4d1173aced546076a89550ac3d5",
+      "tls": {
+        "enabled": true,
+        "server_name": "tv.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-stockholm-oci-pro-ed01f0b4-36cf-43a1-9cad-216d5dc1208d",
+      "server": "79.76.58.55",
+      "server_port": 64549,
+      "password": "814680fa5e07dc266a5e659c66f9b465",
+      "tls": {
+        "enabled": true,
+        "server_name": "tv.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-paris-oci-pro-c1b15bd4-fca7-406c-8b0f-2e5d1eaf83c9",
+      "server": "141.253.127.179",
+      "server_port": 45912,
+      "password": "9054fed241d9998c420ae08aa7947fac",
+      "tls": {
+        "enabled": true,
+        "server_name": "cdn-node-oss-03.anycdn.de",
+        "insecure": true
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-out-shadowsocks-chuncheon-oci-pro-29c19141-ea2a-48ca-ba72-6668915392cb",
+      "server": "134.185.107.40",
+      "server_port": 51075,
+      "method": "chacha20-ietf-poly1305",
+      "password": "YmM5NTcwODE1NGZmZmUyMjgzN2UyMWYxOGMxN2RkODg="
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-sydney-oci-pro-f21284a1-dbcf-4e60-97da-4896cf612438",
+      "server": "149.118.77.92",
+      "server_port": 48176,
+      "password": "44dedf0fb4c3d2ea78e636ec77cd9f18",
+      "tls": {
+        "enabled": true,
+        "server_name": "tv.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-bogota-oci-pro-508de1cc-100f-4f46-b066-794fa82dc2ba",
+      "server": "149.130.174.217",
+      "server_port": 49507,
+      "password": "99f8c4575df0d8254a5db06f0bd64bc9",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-chicago-oci-pro-39e60f63-7b39-4dfe-a295-a5364d990b93",
+      "server": "147.224.157.173",
+      "server_port": 52802,
+      "password": "a50b1c285424f70782d5ef55ff8aabb7",
+      "tls": {
+        "enabled": true,
+        "server_name": "cdn-node-oss-03.anycdn.de",
+        "insecure": true
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-out-shadowsocks-osaka-oci-pro-07b81a62-92b3-4a9e-96b5-eb6d3d5071d8",
+      "server": "150.230.6.22",
+      "server_port": 61182,
+      "method": "chacha20-ietf-poly1305",
+      "password": "ZGZhYWIwMjAxMzY3M2RmYzUwYjE4YzM1ZGMwYTlmNDY="
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-out-shadowsocks-frankfurt-oci-pro-cf84cb50-13f1-4cd0-b4da-a869ce3bfc0a",
+      "server": "141.144.225.59",
+      "server_port": 60892,
+      "method": "chacha20-ietf-poly1305",
+      "password": "ODIwNjk1Yjc4MmRmMDM3OTJmMDIxMTM2MWU5MWExMmQ="
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-madrid-oci-pro-5e79b6c4-491c-45f6-99d0-e8558e1f63b2",
+      "server": "158.179.215.149",
+      "server_port": 64930,
+      "password": "90f400f470f2774d1e78a6df9d8dedbf",
+      "tls": {
+        "enabled": true,
+        "server_name": "api.push.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-out-shadowsocks-phx-oci-pro-0bbe1211-b77a-42d0-a79d-c40026232f99",
+      "server": "161.153.45.215",
+      "server_port": 49749,
+      "method": "chacha20-ietf-poly1305",
+      "password": "OTgzYThmM2U2OGJiZDNmYjg1Zjc2MTFkYmVlZGMxN2E="
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-out-shadowsocks-brazil-oci-pro-cc9718fb-39ac-48af-a177-754a1711d71f",
+      "server": "64.181.171.150",
+      "server_port": 59982,
+      "method": "chacha20-ietf-poly1305",
+      "password": "MTZjYTEzM2MwYjdmOWQxMjliMzY5ZDZiNGQxNzczZmU="
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-out-shadowsocks-santiago-oci-pro-7c27b892-9dd8-4c32-af30-14cda176f041",
+      "server": "129.151.109.85",
+      "server_port": 45804,
+      "method": "chacha20-ietf-poly1305",
+      "password": "NDczYmJhNzUwYmJhNWYyOGM2NjJkZTg4NTBhZjYwZTY="
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-marseille-oci-pro-6772ac7c-4cd2-4a9e-8d7d-68c5d88a98ee",
+      "server": "129.151.233.209",
+      "server_port": 60618,
+      "password": "a00da48edc6b18b1cbebb078d5e6f1cd",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-jerusalem-oci-pro-f97a2c15-3ade-427b-b874-6c5f17654a27",
+      "server": "151.145.82.212",
+      "server_port": 50874,
+      "password": "cfb1cbb9581e9d947c41309ce480b5b4",
+      "tls": {
+        "enabled": true,
+        "server_name": "cdn-node-oss-03.anycdn.de",
+        "insecure": true
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-out-shadowsocks-ashburn-oci-pro-a47b3af5-8390-4152-ae15-b649052a63e6",
+      "server": "129.80.15.40",
+      "server_port": 47852,
+      "method": "chacha20-ietf-poly1305",
+      "password": "YmY2ZGIxZDdiODgxNGFmZDRiYWYyY2JhMTU1NTcwYjQ="
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-chuncheon-oci-pro-c5f60b19-eb06-488d-a8ba-70356d692bd6",
+      "server": "168.107.37.119",
+      "server_port": 50184,
+      "password": "c0ba1f2d25f8d74ef465da5271e05089",
+      "tls": {
+        "enabled": true,
+        "server_name": "api.push.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-osaka-oci-pro-fda564e7-06d9-4548-9786-19b00af81e2b",
+      "server": "161.33.36.42",
+      "server_port": 50108,
+      "password": "5845c9933cfc16934899d3af44c080d9",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-milan-oci-pro-0477c1db-d64b-4f66-9501-c4bb76ab0227",
+      "server": "130.110.71.98",
+      "server_port": 57540,
+      "password": "d25e7a9986df12d4ded57534e1205166",
+      "tls": {
+        "enabled": true,
+        "server_name": "cdn-node-oss-03.anycdn.de",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-tokyo-oci-pro-9952539e-f129-452a-bfc4-c0c267a3bea8",
+      "server": "161.33.134.22",
+      "server_port": 45670,
+      "password": "52ed6cfd14aa4dfc03ee3d298dde488b",
+      "tls": {
+        "enabled": true,
+        "server_name": "api.push.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-toronto-oci-pro-03aa58a8-bf2d-413e-b9a7-3637838c6aa6",
+      "server": "40.233.103.58",
+      "server_port": 45409,
+      "password": "123866dd81154027f560b06862579c3a",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-out-shadowsocks-amsterdam-oci-pro-66be5ea0-17b9-468c-83ca-5e769987fb3b",
+      "server": "158.101.211.69",
+      "server_port": 48270,
+      "method": "chacha20-ietf-poly1305",
+      "password": "MWQ3ODJjZGQ3MTViODc1ODVkOGQ2NmQzOWQwMmZmMTU="
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-johannesburg-oci-pro-a838a443-4a3f-4343-a6ca-5a5f89d668a8",
+      "server": "129.151.162.10",
+      "server_port": 63915,
+      "password": "6a3b6d6044a6aaea77625c19cd678f8e",
+      "tls": {
+        "enabled": true,
+        "server_name": "api.push.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-queretaro-oci-pro-368a8dd5-70f1-4f5c-a66c-74b1e3683e51",
+      "server": "163.192.144.149",
+      "server_port": 61893,
+      "password": "1c723b22b62d1ed89fe20605a84b78df",
+      "tls": {
+        "enabled": true,
+        "server_name": "api.push.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-melbourne-oci-pro-62559374-609e-4549-8346-777ad4927782",
+      "server": "130.162.192.208",
+      "server_port": 53146,
+      "password": "3ad2ca7d11c6357cd9303ca65e2d9069",
+      "tls": {
+        "enabled": true,
+        "server_name": "tv.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-singapore-oci-pro-91249a74-abb1-489d-94be-c587e4e94888",
+      "server": "217.142.187.74",
+      "server_port": 59891,
+      "password": "8bcce9f9c4fc0e79255332fba638e395",
+      "tls": {
+        "enabled": true,
+        "server_name": "tv.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-out-hysteria2-valparaiso-oci-pro-ab93e52a-24d7-444b-b74e-b8a2e56aea18",
+      "server": "148.116.110.4",
+      "server_port": 45719,
+      "password": "8c2798dff59f38b5f692742bafcca784",
+      "tls": {
+        "enabled": true,
+        "server_name": "api.push.apple.com",
+        "insecure": true
+      }
+    },
+    {
+      "type": "mutableurltest",
+      "tag": "auto-lantern",
+      "outbounds": [
+        "hysteria2-out-hysteria2-monterrey-oci-pro-52a57381-e1af-46a4-afbf-496a2ee0dd04",
+        "hysteria2-out-hysteria2-mumbai-oci-pro-2fdcc5dc-6497-46e1-a70a-d7e03749aaab",
+        "hysteria2-out-hysteria2-cardiff-oci-pro-dc5a4afe-4382-4cd4-8431-38d5a8f73f41",
+        "hysteria2-out-hysteria2-zurich-oci-pro-783d06bd-43b8-44ae-b3cf-a420ad5fd822",
+        "hysteria2-out-hysteria-frankfurt-oci-pro-757f69a3-174a-42d1-898b-0cdadc65df08",
+        "hysteria2-out-hysteria2-stockholm-oci-pro-ed01f0b4-36cf-43a1-9cad-216d5dc1208d",
+        "hysteria2-out-hysteria2-paris-oci-pro-c1b15bd4-fca7-406c-8b0f-2e5d1eaf83c9",
+        "shadowsocks-out-shadowsocks-chuncheon-oci-pro-29c19141-ea2a-48ca-ba72-6668915392cb",
+        "hysteria2-out-hysteria2-sydney-oci-pro-f21284a1-dbcf-4e60-97da-4896cf612438",
+        "hysteria2-out-hysteria2-bogota-oci-pro-508de1cc-100f-4f46-b066-794fa82dc2ba",
+        "hysteria2-out-hysteria2-chicago-oci-pro-39e60f63-7b39-4dfe-a295-a5364d990b93",
+        "shadowsocks-out-shadowsocks-osaka-oci-pro-07b81a62-92b3-4a9e-96b5-eb6d3d5071d8",
+        "shadowsocks-out-shadowsocks-frankfurt-oci-pro-cf84cb50-13f1-4cd0-b4da-a869ce3bfc0a",
+        "hysteria2-out-hysteria2-madrid-oci-pro-5e79b6c4-491c-45f6-99d0-e8558e1f63b2",
+        "shadowsocks-out-shadowsocks-phx-oci-pro-0bbe1211-b77a-42d0-a79d-c40026232f99",
+        "shadowsocks-out-shadowsocks-brazil-oci-pro-cc9718fb-39ac-48af-a177-754a1711d71f",
+        "shadowsocks-out-shadowsocks-santiago-oci-pro-7c27b892-9dd8-4c32-af30-14cda176f041",
+        "hysteria2-out-hysteria2-marseille-oci-pro-6772ac7c-4cd2-4a9e-8d7d-68c5d88a98ee",
+        "hysteria2-out-hysteria2-jerusalem-oci-pro-f97a2c15-3ade-427b-b874-6c5f17654a27",
+        "shadowsocks-out-shadowsocks-ashburn-oci-pro-a47b3af5-8390-4152-ae15-b649052a63e6",
+        "hysteria2-out-hysteria2-chuncheon-oci-pro-c5f60b19-eb06-488d-a8ba-70356d692bd6",
+        "hysteria2-out-hysteria2-osaka-oci-pro-fda564e7-06d9-4548-9786-19b00af81e2b",
+        "hysteria2-out-hysteria2-milan-oci-pro-0477c1db-d64b-4f66-9501-c4bb76ab0227",
+        "hysteria2-out-hysteria2-tokyo-oci-pro-9952539e-f129-452a-bfc4-c0c267a3bea8",
+        "hysteria2-out-hysteria2-toronto-oci-pro-03aa58a8-bf2d-413e-b9a7-3637838c6aa6",
+        "shadowsocks-out-shadowsocks-amsterdam-oci-pro-66be5ea0-17b9-468c-83ca-5e769987fb3b",
+        "hysteria2-out-hysteria2-johannesburg-oci-pro-a838a443-4a3f-4343-a6ca-5a5f89d668a8",
+        "hysteria2-out-hysteria2-queretaro-oci-pro-368a8dd5-70f1-4f5c-a66c-74b1e3683e51",
+        "hysteria2-out-hysteria2-melbourne-oci-pro-62559374-609e-4549-8346-777ad4927782",
+        "hysteria2-out-hysteria2-singapore-oci-pro-91249a74-abb1-489d-94be-c587e4e94888",
+        "hysteria2-out-hysteria2-valparaiso-oci-pro-ab93e52a-24d7-444b-b74e-b8a2e56aea18"
+      ],
+      "url": "https://google.com/generate_204",
+      "interval": "3m0s",
+      "idle_timeout": "15m0s"
+    },
+    {
+      "type": "mutableselector",
+      "tag": "lantern",
+      "outbounds": [
+        "auto-lantern",
+        "hysteria2-out-hysteria2-monterrey-oci-pro-52a57381-e1af-46a4-afbf-496a2ee0dd04",
+        "hysteria2-out-hysteria2-mumbai-oci-pro-2fdcc5dc-6497-46e1-a70a-d7e03749aaab",
+        "hysteria2-out-hysteria2-cardiff-oci-pro-dc5a4afe-4382-4cd4-8431-38d5a8f73f41",
+        "hysteria2-out-hysteria2-zurich-oci-pro-783d06bd-43b8-44ae-b3cf-a420ad5fd822",
+        "hysteria2-out-hysteria-frankfurt-oci-pro-757f69a3-174a-42d1-898b-0cdadc65df08",
+        "hysteria2-out-hysteria2-stockholm-oci-pro-ed01f0b4-36cf-43a1-9cad-216d5dc1208d",
+        "hysteria2-out-hysteria2-paris-oci-pro-c1b15bd4-fca7-406c-8b0f-2e5d1eaf83c9",
+        "shadowsocks-out-shadowsocks-chuncheon-oci-pro-29c19141-ea2a-48ca-ba72-6668915392cb",
+        "hysteria2-out-hysteria2-sydney-oci-pro-f21284a1-dbcf-4e60-97da-4896cf612438",
+        "hysteria2-out-hysteria2-bogota-oci-pro-508de1cc-100f-4f46-b066-794fa82dc2ba",
+        "hysteria2-out-hysteria2-chicago-oci-pro-39e60f63-7b39-4dfe-a295-a5364d990b93",
+        "shadowsocks-out-shadowsocks-osaka-oci-pro-07b81a62-92b3-4a9e-96b5-eb6d3d5071d8",
+        "shadowsocks-out-shadowsocks-frankfurt-oci-pro-cf84cb50-13f1-4cd0-b4da-a869ce3bfc0a",
+        "hysteria2-out-hysteria2-madrid-oci-pro-5e79b6c4-491c-45f6-99d0-e8558e1f63b2",
+        "shadowsocks-out-shadowsocks-phx-oci-pro-0bbe1211-b77a-42d0-a79d-c40026232f99",
+        "shadowsocks-out-shadowsocks-brazil-oci-pro-cc9718fb-39ac-48af-a177-754a1711d71f",
+        "shadowsocks-out-shadowsocks-santiago-oci-pro-7c27b892-9dd8-4c32-af30-14cda176f041",
+        "hysteria2-out-hysteria2-marseille-oci-pro-6772ac7c-4cd2-4a9e-8d7d-68c5d88a98ee",
+        "hysteria2-out-hysteria2-jerusalem-oci-pro-f97a2c15-3ade-427b-b874-6c5f17654a27",
+        "shadowsocks-out-shadowsocks-ashburn-oci-pro-a47b3af5-8390-4152-ae15-b649052a63e6",
+        "hysteria2-out-hysteria2-chuncheon-oci-pro-c5f60b19-eb06-488d-a8ba-70356d692bd6",
+        "hysteria2-out-hysteria2-osaka-oci-pro-fda564e7-06d9-4548-9786-19b00af81e2b",
+        "hysteria2-out-hysteria2-milan-oci-pro-0477c1db-d64b-4f66-9501-c4bb76ab0227",
+        "hysteria2-out-hysteria2-tokyo-oci-pro-9952539e-f129-452a-bfc4-c0c267a3bea8",
+        "hysteria2-out-hysteria2-toronto-oci-pro-03aa58a8-bf2d-413e-b9a7-3637838c6aa6",
+        "shadowsocks-out-shadowsocks-amsterdam-oci-pro-66be5ea0-17b9-468c-83ca-5e769987fb3b",
+        "hysteria2-out-hysteria2-johannesburg-oci-pro-a838a443-4a3f-4343-a6ca-5a5f89d668a8",
+        "hysteria2-out-hysteria2-queretaro-oci-pro-368a8dd5-70f1-4f5c-a66c-74b1e3683e51",
+        "hysteria2-out-hysteria2-melbourne-oci-pro-62559374-609e-4549-8346-777ad4927782",
+        "hysteria2-out-hysteria2-singapore-oci-pro-91249a74-abb1-489d-94be-c587e4e94888",
+        "hysteria2-out-hysteria2-valparaiso-oci-pro-ab93e52a-24d7-444b-b74e-b8a2e56aea18"
+      ]
+    },
+    {
+      "type": "mutableurltest",
+      "tag": "auto-user",
+      "outbounds": null,
+      "url": "https://google.com/generate_204",
+      "interval": "3m0s",
+      "idle_timeout": "15m0s"
+    },
+    {
+      "type": "mutableselector",
+      "tag": "user",
+      "outbounds": [
+        "auto-user"
+      ]
+    },
+    {
+      "type": "mutableurltest",
+      "tag": "auto",
+      "outbounds": [
+        "auto-lantern",
+        "auto-user"
+      ],
+      "url": "https://google.com/generate_204",
+      "interval": "3m0s",
+      "idle_timeout": "15m0s"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "split-tunnel",
+          "direct-domains"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "process_path_regex": "(?i)^/Lantern.app/Contents/MacOS/lantern$",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "smart-routing-us-common-direct",
+        "outbound": "direct"
+      },
+      {
+        "clash_mode": "auto",
+        "outbound": "auto"
+      },
+      {
+        "clash_mode": "lantern",
+        "outbound": "lantern"
+      },
+      {
+        "clash_mode": "user",
+        "outbound": "user"
+      },
+      {
+        "action": "reject"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "local",
+        "tag": "split-tunnel",
+        "path": "/Users/Shared/Lantern/split-tunnel.json"
+      },
+      {
+        "type": "local",
+        "tag": "direct-domains",
+        "path": "/Users/Shared/Lantern/direct-domains.json"
+      },
+      {
+        "type": "remote",
+        "tag": "smart-routing-us-common-direct",
+        "url": "https://raw.githubusercontent.com/getlantern/rulesets/refs/heads/main/srs/common.srs",
+        "download_detour": "direct",
+        "update_interval": "24h0m0s"
+      }
+    ],
+    "auto_detect_interface": true
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "/Users/Shared/Lantern/lantern.cache",
+      "cache_id": "lantern"
+    },
+    "clash_api": {
+      "default_mode": "auto"
+    }
+  }
+}
