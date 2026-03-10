@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.25-bullseye as builder
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS builder
 ARG TARGETOS TARGETARCH
 ARG GOPROXY=""
 ARG VERSION=""
@@ -31,7 +31,7 @@ RUN set -ex \
        -ldflags="-X main.version=${VERSION} -X main.commit=${COMMIT}" \
        -o /usr/local/bin/lantern-box ./cmd
 
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 RUN set -ex \
     && apt-get update \
     && apt-get install -y ca-certificates tzdata nftables wireguard-tools \
