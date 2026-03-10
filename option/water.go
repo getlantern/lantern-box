@@ -23,6 +23,7 @@ type WATERInboundOptions struct {
 type WATEROutboundOptions struct {
 	option.ServerOptions
 	option.DialerOptions
+	WATEROutboundSeedOptions
 	// Transport works as a identifier for the WASM logs
 	Transport string `json:"transport"`
 	// Hashsum is used for validating if the downloaded WASM
@@ -42,4 +43,12 @@ type WATEROutboundOptions struct {
 	// SkipHandshake is used when the WATER module deals with the handshake
 	// instead of the sing-box WATER transport
 	SkipHandshake bool `json:"skip_handshake,omitempty"`
+}
+
+// WATEROutboundSeedOptions specifies the seed configuration options
+type WATEROutboundSeedOptions struct {
+	// SeedEnabled enables seeding the used transport
+	SeedEnabled bool `json:"seed_enabled,omitempty"`
+	// AnnounceList specifies which trackers should be used to announce the file
+	AnnounceList [][]string `json:"announce_list,omitempty"`
 }
