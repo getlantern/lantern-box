@@ -84,14 +84,18 @@ func preRun(cmd *cobra.Command, args []string) {
 		FrontendProvider: proxyInfo.FrontendProvider,
 		ProxyProtocol:    proxyInfo.Protocol,
 	}
-	otel.InitGlobalMeterProvider(otelOpts)
+	if _, err := otel.InitGlobalMeterProvider(otelOpts); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize OTEL meter provider: %v\n", err)
+	}
 
 	// Report any crash from a previous run, then set up crash output for
 	// this run. Order matters: report first (reads crash.log), then setup
 	// (truncates crash.log for the next crash).
 	crashDir := filepath.Dir(path)
 	otel.ReportPreviousCrash(crashDir, otelOpts)
-	otel.SetupCrashOutput(crashDir)
+	if err := otel.SetupCrashOutput(crashDir); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to set up crash output: %v\n", err)
+	}
 
 	geolookup := geo.FromWeb(geoCityURL, cityDatabaseName, 24*time.Hour, cityDatabaseName, geo.CountryCode)
 	metrics.SetupMetricsManager(geolookup)
