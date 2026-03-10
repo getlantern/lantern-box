@@ -12,6 +12,14 @@ on:
       - '**.go'
       - '!.github/**'
 
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - 'go.mod'
+      - 'go.sum'
+      - '**.go'
+      - '!.github/**'
+
 env:
   TELEPORT_HOST: ${{secrets.TELEPORT_HOST}}
 

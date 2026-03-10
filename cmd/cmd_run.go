@@ -125,10 +125,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 	if _, ok := mp.(noop.MeterProvider); ok {
 		log.Info("Metrics not enabled, no meter provider configured")
 	} else {
-		metricsTracker, err := metrics.NewTracker()
-		if err != nil {
-			return nil, nil, fmt.Errorf("create metrics tracker: %w", err)
-		}
+		metricsTracker := metrics.NewTracker(ctx)
 		instance.Router().AppendTracker(metricsTracker)
 		log.Info("Metric Tracking Enabled")
 	}
@@ -179,6 +176,7 @@ func run(configPath string, datacapURL string) error {
 		runtimeDebug.FreeOSMemory()
 		for {
 			osSignal := <-osSignals
+			log.Info("received signal: ", osSignal)
 			if osSignal == syscall.SIGHUP {
 				err = check(configPath)
 				if err != nil {

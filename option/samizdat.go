@@ -16,10 +16,8 @@ type SamizdatOutboundOptions struct {
 	Fingerprint string `json:"fingerprint,omitempty"`  // "chrome" (default), "firefox", "safari"
 
 	// Traffic shaping (enabled by default; set to true to disable)
-	DisablePadding bool   `json:"disable_padding,omitempty"` // disable H2 DATA frame padding
-	DisableJitter  bool   `json:"disable_jitter,omitempty"`  // disable timing jitter
-	MaxJitterMs    int    `json:"max_jitter_ms,omitempty"`   // max jitter in ms (default: 30)
-	PaddingProfile string `json:"padding_profile,omitempty"` // "chrome", "firefox" (default: "chrome")
+	DisableJitter bool `json:"disable_jitter,omitempty"` // disable timing jitter
+	MaxJitterMs   int  `json:"max_jitter_ms,omitempty"`  // max jitter in ms (default: 30)
 
 	// TCP fragmentation (Geneva-inspired; enabled by default; set to true to disable)
 	DisableTCPFragmentation    bool `json:"disable_tcp_fragmentation,omitempty"`    // disable ClientHello fragmentation
@@ -30,8 +28,6 @@ type SamizdatOutboundOptions struct {
 	IdleTimeout      string `json:"idle_timeout,omitempty"`         // close idle connections after (default: "5m")
 	ConnectTimeout   string `json:"connect_timeout,omitempty"`      // TCP+TLS connect timeout (default: "15s")
 
-	// Russia-specific evasion
-	DataThreshold int `json:"data_threshold,omitempty"` // bytes before aggressive padding (default: 14000)
 }
 
 // SamizdatInboundOptions configures a Samizdat inbound proxy.

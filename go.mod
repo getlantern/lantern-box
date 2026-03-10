@@ -1,20 +1,22 @@
 module github.com/getlantern/lantern-box
 
-go 1.24.1
+go 1.25.1
 
 replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.18-lantern
 
-replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.12.19-lantern
+replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.12.20-lantern
 
 replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4
 
-replace github.com/tetratelabs/wazero => github.com/refraction-networking/wazero v1.7.1-w
+replace github.com/tetratelabs/wazero => github.com/getlantern/wazero v1.11.0-water.1
+
+replace github.com/refraction-networking/water => github.com/getlantern/water v0.7.1-alpha.0.20260309190745-bd547c14b4aa
 
 require (
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260130212632-d5ea08838250
-	github.com/getlantern/samizdat v0.0.2
+	github.com/getlantern/samizdat v0.0.3-0.20260310125445-325cf1bd1b60
 	github.com/gobwas/ws v1.4.0
 	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/sing v0.7.18

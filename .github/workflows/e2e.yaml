@@ -1,0 +1,545 @@
+name: E2E Protocol Tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '.github/workflows/**'
+      - '*.md'
+      - 'LICENSE'
+
+env:
+  DROPLET_NAME: "e2e-lantern-box-${{ github.run_id }}"
+  SSH_KEY_NAME: "e2e-lantern-box-${{ github.run_id }}"
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: "go.mod"
+
+      - name: Grant private modules access
+        run: |
+          git config --global url."https://${{ secrets.CI_PRIVATE_REPOS_GH_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+
+      - name: Build lantern-box (linux/amd64)
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \
+            -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api" \
+            -ldflags="-s -w" \
+            -o lantern-box \
+            ./cmd
+          ls -lh lantern-box
+
+      - name: Generate test credentials
+        id: creds
+        run: |
+          # Samizdat X25519 keypair
+          openssl genpkey -algorithm X25519 -out samizdat_priv.pem
+          SAMIZDAT_PRIV=$(openssl pkey -in samizdat_priv.pem -outform DER \
+            | tail -c 32 | xxd -p | tr -d '\n')
+          SAMIZDAT_PUB=$(openssl pkey -in samizdat_priv.pem -pubout -outform DER \
+            | tail -c 32 | xxd -p | tr -d '\n')
+          SAMIZDAT_SHORT_ID=$(openssl rand -hex 8)
+
+          # Self-signed TLS cert for Samizdat
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout key.pem -out cert.pem -days 1 -nodes \
+            -subj "/CN=example.com"
+
+          # Locate plain.wasm from Go module cache
+          # The replace directive in go.mod redirects refraction-networking/water
+          # to getlantern/water, so resolve via the module graph and find it.
+          WATER_MOD_DIR=$(go list -m -f '{{.Dir}}' github.com/refraction-networking/water)
+          WASM_PATH="${WATER_MOD_DIR}/transport/v1/testdata/plain.wasm"
+          if [ ! -f "$WASM_PATH" ]; then
+            echo "plain.wasm not found at $WASM_PATH"
+            echo "Module dir contents:" && ls -la "$WATER_MOD_DIR/transport/v1/testdata/" || true
+            exit 1
+          fi
+          WASM_HASH=$(sha256sum "$WASM_PATH" | awk '{print $1}')
+          cp "$WASM_PATH" plain.wasm
+
+          echo "::add-mask::$SAMIZDAT_PRIV"
+          echo "samizdat_priv=$SAMIZDAT_PRIV" >> "$GITHUB_OUTPUT"
+          echo "samizdat_pub=$SAMIZDAT_PUB" >> "$GITHUB_OUTPUT"
+          echo "samizdat_short_id=$SAMIZDAT_SHORT_ID" >> "$GITHUB_OUTPUT"
+          echo "wasm_hash=$WASM_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Create DO droplet
+        id: droplet
+        run: |
+          # Generate ephemeral SSH key
+          ssh-keygen -t ed25519 -f e2e_key -N "" -q
+          SSH_PUB=$(cat e2e_key.pub)
+
+          # Upload SSH key to DO
+          SSH_KEY_ID=$(doctl compute ssh-key create "$SSH_KEY_NAME" \
+            --public-key "$SSH_PUB" --format ID --no-header)
+          echo "ssh_key_id=$SSH_KEY_ID" >> "$GITHUB_OUTPUT"
+
+          # Create droplet
+          DROPLET_ID=$(doctl compute droplet create "$DROPLET_NAME" \
+            --image ubuntu-24-04-x64 \
+            --size s-2vcpu-2gb \
+            --region sfo3 \
+            --ssh-keys "$SSH_KEY_ID" \
+            --wait \
+            --format ID --no-header)
+          echo "droplet_id=$DROPLET_ID" >> "$GITHUB_OUTPUT"
+
+          # Get droplet IP
+          DROPLET_IP=$(doctl compute droplet get "$DROPLET_ID" \
+            --format PublicIPv4 --no-header)
+          echo "droplet_ip=$DROPLET_IP" >> "$GITHUB_OUTPUT"
+
+          echo "Droplet $DROPLET_ID created at $DROPLET_IP"
+
+          # Wait for SSH readiness
+          SSH_READY=0
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+              -i e2e_key root@"$DROPLET_IP" echo ready 2>/dev/null; then
+              echo "SSH is ready"
+              SSH_READY=1
+              break
+            fi
+            echo "Waiting for SSH... attempt $i/30"
+            sleep 10
+          done
+          if [ "$SSH_READY" -ne 1 ]; then
+            echo "ERROR: SSH never became ready after 30 attempts"
+            exit 1
+          fi
+
+      - name: Deploy to droplet
+        env:
+          DROPLET_IP: ${{ steps.droplet.outputs.droplet_ip }}
+          SAMIZDAT_PRIV: ${{ steps.creds.outputs.samizdat_priv }}
+          SAMIZDAT_SHORT_ID: ${{ steps.creds.outputs.samizdat_short_id }}
+          WASM_HASH: ${{ steps.creds.outputs.wasm_hash }}
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -i e2e_key"
+
+          # Compress binary before upload
+          gzip -1 -c lantern-box > lantern-box.gz
+          ls -lh lantern-box.gz
+
+          # Upload files
+          echo "Starting SCP upload..."
+          scp $SSH_OPTS lantern-box.gz cert.pem key.pem plain.wasm root@"$DROPLET_IP":/root/
+          echo "SCP upload complete"
+
+          # Decompress and make binary executable
+          echo "Decompressing binary..."
+          ssh $SSH_OPTS root@"$DROPLET_IP" \
+            "gzip -d /root/lantern-box.gz && chmod +x /root/lantern-box"
+          echo "Binary ready"
+
+          # Start Python HTTP server to serve plain.wasm (for WATER)
+          echo "Starting WASM HTTP server..."
+          ssh -f $SSH_OPTS root@"$DROPLET_IP" \
+            "cd /root && python3 -m http.server 8888 > /root/wasm-server.log 2>&1"
+          echo "WASM HTTP server started"
+
+          # --- ALGeneva server config ---
+          cat > /tmp/algeneva-server.json << 'JSONEOF'
+          {
+            "log": {"level": "trace"},
+            "inbounds": [{
+              "type": "algeneva",
+              "tag": "algeneva-in",
+              "listen": "::",
+              "listen_port": 9001
+            }],
+            "outbounds": [{
+              "type": "direct",
+              "tag": "direct"
+            }]
+          }
+          JSONEOF
+          scp $SSH_OPTS /tmp/algeneva-server.json root@"$DROPLET_IP":/root/algeneva-server.json
+
+          # --- Samizdat server config ---
+          cat > /tmp/samizdat-server.json << JSONEOF
+          {
+            "log": {"level": "debug"},
+            "inbounds": [{
+              "type": "samizdat",
+              "tag": "samizdat-in",
+              "listen": "::",
+              "listen_port": 9002,
+              "private_key": "${SAMIZDAT_PRIV}",
+              "short_ids": ["${SAMIZDAT_SHORT_ID}"],
+              "cert_path": "/root/cert.pem",
+              "key_path": "/root/key.pem",
+              "masquerade_domain": "example.com"
+            }],
+            "outbounds": [{
+              "type": "direct",
+              "tag": "direct"
+            }]
+          }
+          JSONEOF
+          scp $SSH_OPTS /tmp/samizdat-server.json root@"$DROPLET_IP":/root/samizdat-server.json
+
+          # --- WATER server config ---
+          cat > /tmp/water-server.json << JSONEOF
+          {
+            "log": {"level": "debug"},
+            "inbounds": [{
+              "type": "water",
+              "tag": "water-in",
+              "listen": "::",
+              "listen_port": 9003,
+              "transport": "plain",
+              "hashsum": "${WASM_HASH}",
+              "wasm_available_at": ["http://127.0.0.1:8888/plain.wasm"],
+              "config": {}
+            }],
+            "outbounds": [{
+              "type": "direct",
+              "tag": "direct"
+            }]
+          }
+          JSONEOF
+          scp $SSH_OPTS /tmp/water-server.json root@"$DROPLET_IP":/root/water-server.json
+
+          # Start all 3 server processes
+          echo "Starting servers..."
+          ssh $SSH_OPTS root@"$DROPLET_IP" "nohup /root/lantern-box run --config /root/algeneva-server.json > /root/algeneva-server.log 2>&1 < /dev/null &
+          nohup /root/lantern-box run --config /root/samizdat-server.json > /root/samizdat-server.log 2>&1 < /dev/null &
+          nohup /root/lantern-box run --config /root/water-server.json > /root/water-server.log 2>&1 < /dev/null &
+          sleep 1"
+          echo "Servers launched"
+
+          # Wait for servers to be ready (WATER needs time to download/compile WASM)
+          echo "Checking port readiness..."
+          # Note: must use bash explicitly since Ubuntu default shell is dash (no /dev/tcp support)
+          ssh $SSH_OPTS root@"$DROPLET_IP" bash << 'READYEOF'
+            for port in 9001 9002 9003; do
+              echo "Waiting for port $port to be ready..."
+              for i in $(seq 1 60); do
+                if echo > /dev/tcp/127.0.0.1/$port 2>/dev/null; then
+                  echo "Port $port is ready"
+                  break
+                fi
+                if [ "$i" -eq 60 ]; then
+                  echo "Port $port not ready after 60 seconds" >&2
+                  cat /root/*.log
+                  exit 1
+                fi
+                sleep 1
+              done
+            done
+          READYEOF
+
+      - name: Test ALGeneva
+        id: test_algeneva
+        continue-on-error: true
+        env:
+          DROPLET_IP: ${{ steps.droplet.outputs.droplet_ip }}
+        run: |
+          # Generate client config
+          # Use a simple strategy that only modifies the host header (not the CONNECT request line)
+          cat > /tmp/algeneva-client.json << JSONEOF
+          {
+            "log": {"level": "trace"},
+            "inbounds": [{
+              "type": "mixed",
+              "tag": "mixed-in",
+              "listen": "127.0.0.1",
+              "listen_port": 1081
+            }],
+            "outbounds": [{
+              "type": "algeneva",
+              "tag": "algeneva-out",
+              "server": "${DROPLET_IP}",
+              "server_port": 9001,
+              "strategy": "[HTTP:host:*]-changecase{lower}-|"
+            }]
+          }
+          JSONEOF
+
+          # Start client (setsid prevents stray SIGTERM from parent shell process group)
+          setsid ./lantern-box run --config /tmp/algeneva-client.json > /tmp/algeneva-client.log 2>&1 &
+          CLIENT_PID=$!
+          sleep 3
+
+          # Verify client is running
+          if ! kill -0 $CLIENT_PID 2>/dev/null; then
+            echo "ALGeneva client failed to start"
+            cat /tmp/algeneva-client.log
+            exit 1
+          fi
+
+          # Test
+          # Test HTTP
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1081 -m 30 http://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "ALGeneva HTTP test PASSED"
+          else
+            echo "ALGeneva HTTP test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/algeneva-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Test HTTPS
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1081 -m 30 https://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "ALGeneva HTTPS test PASSED"
+          else
+            echo "ALGeneva HTTPS test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/algeneva-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          kill $CLIENT_PID 2>/dev/null || true
+
+      - name: Test Samizdat
+        id: test_samizdat
+        continue-on-error: true
+        env:
+          DROPLET_IP: ${{ steps.droplet.outputs.droplet_ip }}
+          SAMIZDAT_PUB: ${{ steps.creds.outputs.samizdat_pub }}
+          SAMIZDAT_SHORT_ID: ${{ steps.creds.outputs.samizdat_short_id }}
+        run: |
+          cat > /tmp/samizdat-client.json << JSONEOF
+          {
+            "log": {"level": "debug"},
+            "inbounds": [{
+              "type": "mixed",
+              "tag": "mixed-in",
+              "listen": "127.0.0.1",
+              "listen_port": 1082
+            }],
+            "outbounds": [{
+              "type": "samizdat",
+              "tag": "samizdat-out",
+              "server": "${DROPLET_IP}",
+              "server_port": 9002,
+              "public_key": "${SAMIZDAT_PUB}",
+              "short_id": "${SAMIZDAT_SHORT_ID}",
+              "server_name": "example.com"
+            }]
+          }
+          JSONEOF
+
+          setsid ./lantern-box run --config /tmp/samizdat-client.json > /tmp/samizdat-client.log 2>&1 &
+          CLIENT_PID=$!
+          sleep 3
+
+          if ! kill -0 $CLIENT_PID 2>/dev/null; then
+            echo "Samizdat client failed to start"
+            cat /tmp/samizdat-client.log
+            exit 1
+          fi
+
+          # Test HTTP
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1082 -m 30 http://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "Samizdat HTTP test PASSED"
+          else
+            echo "Samizdat HTTP test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/samizdat-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Test HTTPS
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1082 -m 30 https://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "Samizdat HTTPS test PASSED"
+          else
+            echo "Samizdat HTTPS test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/samizdat-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          kill $CLIENT_PID 2>/dev/null || true
+
+      - name: Test WATER
+        id: test_water
+        continue-on-error: true
+        env:
+          DROPLET_IP: ${{ steps.droplet.outputs.droplet_ip }}
+          WASM_HASH: ${{ steps.creds.outputs.wasm_hash }}
+        run: |
+          cat > /tmp/water-client.json << JSONEOF
+          {
+            "log": {"level": "debug"},
+            "inbounds": [{
+              "type": "mixed",
+              "tag": "mixed-in",
+              "listen": "127.0.0.1",
+              "listen_port": 1083
+            }],
+            "outbounds": [{
+              "type": "water",
+              "tag": "water-out",
+              "server": "${DROPLET_IP}",
+              "server_port": 9003,
+              "transport": "plain",
+              "hashsum": "${WASM_HASH}",
+              "wasm_available_at": ["http://${DROPLET_IP}:8888/plain.wasm"],
+              "download_timeout": "60s",
+              "water_dir": "/tmp/water",
+              "config": {}
+            }]
+          }
+          JSONEOF
+
+          setsid ./lantern-box run --config /tmp/water-client.json > /tmp/water-client.log 2>&1 &
+          CLIENT_PID=$!
+          sleep 5
+
+          if ! kill -0 $CLIENT_PID 2>/dev/null; then
+            echo "WATER client failed to start"
+            cat /tmp/water-client.log
+            exit 1
+          fi
+
+          # Test HTTP
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1083 -m 30 http://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "WATER HTTP test PASSED"
+          else
+            echo "WATER HTTP test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/water-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Test HTTPS
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1083 -m 30 https://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "WATER HTTPS test PASSED"
+          else
+            echo "WATER HTTPS test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/water-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          kill $CLIENT_PID 2>/dev/null || true
+
+      - name: Check test results
+        if: always()
+        run: |
+          FAILED=0
+          echo "=== E2E Test Results ==="
+          if [ "${{ steps.test_algeneva.outcome }}" = "success" ]; then
+            echo "ALGeneva:  PASSED"
+          else
+            echo "ALGeneva:  FAILED"
+            FAILED=1
+          fi
+          if [ "${{ steps.test_samizdat.outcome }}" = "success" ]; then
+            echo "Samizdat:  PASSED"
+          else
+            echo "Samizdat:  FAILED"
+            FAILED=1
+          fi
+          if [ "${{ steps.test_water.outcome }}" = "success" ]; then
+            echo "WATER:     PASSED"
+          else
+            echo "WATER:     FAILED"
+            FAILED=1
+          fi
+          echo "========================"
+          if [ "$FAILED" -ne 0 ]; then
+            echo "One or more tests failed"
+            exit 1
+          fi
+
+      - name: Collect server logs
+        if: always()
+        env:
+          DROPLET_IP: ${{ steps.droplet.outputs.droplet_ip }}
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -i e2e_key"
+          mkdir -p /tmp/server-logs
+
+          scp $SSH_OPTS root@"$DROPLET_IP":/root/*.log /tmp/server-logs/ 2>/dev/null || true
+
+          # Also grab client logs
+          cp /tmp/*-client.log /tmp/server-logs/ 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: /tmp/server-logs/
+          retention-days: 7
+
+      - name: Cleanup DO resources
+        if: always()
+        env:
+          DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+        run: |
+          DROPLET_ID="${{ steps.droplet.outputs.droplet_id }}"
+          SSH_KEY_ID="${{ steps.droplet.outputs.ssh_key_id }}"
+
+          # Fall back to DO API directly if doctl is not available
+          if command -v doctl &>/dev/null; then
+            if [ -n "$DROPLET_ID" ]; then
+              echo "Destroying droplet $DROPLET_ID..."
+              doctl compute droplet delete "$DROPLET_ID" --force || true
+            fi
+            if [ -n "$SSH_KEY_ID" ]; then
+              echo "Deleting SSH key $SSH_KEY_ID..."
+              doctl compute ssh-key delete "$SSH_KEY_ID" --force || true
+            fi
+          else
+            echo "doctl not available, using DO API directly"
+            if [ -n "$DROPLET_ID" ]; then
+              echo "Destroying droplet $DROPLET_ID..."
+              curl -sf -X DELETE "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
+                -H "Authorization: Bearer $DO_API_TOKEN" || true
+            fi
+            if [ -n "$SSH_KEY_ID" ]; then
+              echo "Deleting SSH key $SSH_KEY_ID..."
+              curl -sf -X DELETE "https://api.digitalocean.com/v2/account/keys/$SSH_KEY_ID" \
+                -H "Authorization: Bearer $DO_API_TOKEN" || true
+            fi
+          fi

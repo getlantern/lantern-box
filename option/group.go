@@ -13,9 +13,10 @@ type MutableSelectorOutboundOptions struct {
 }
 
 type MutableURLTestOutboundOptions struct {
-	Outbounds   []string           `json:"outbounds"`
-	URL         string             `json:"url,omitempty"`
-	Interval    badoption.Duration `json:"interval,omitempty"`
-	Tolerance   uint16             `json:"tolerance,omitempty"`
-	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`
+	Outbounds    []string           `json:"outbounds"`
+	URL          string             `json:"url,omitempty"`
+	URLOverrides map[string]string  `json:"url_overrides,omitempty"`
+	Interval     badoption.Duration `json:"interval,omitempty"`
+	Tolerance    uint16             `json:"tolerance,omitempty"`
+	IdleTimeout  badoption.Duration `json:"idle_timeout,omitempty"`
 }
