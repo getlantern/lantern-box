@@ -48,6 +48,17 @@ func (c *Conn) Close() error {
 	return c.Conn.Close()
 }
 
+// CloseWrite implements N.WriteCloser to support half-close semantics.
+// This is critical for protocols tunneled over H2 (like Samizdat) where
+// sing-box's bidirectional copy needs to half-close one direction without
+// killing the entire stream.
+func (c *Conn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
 func (c *Conn) Upstream() any {
 	return c.Conn
 }

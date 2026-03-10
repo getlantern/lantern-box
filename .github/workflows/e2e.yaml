@@ -273,8 +273,8 @@ jobs:
           }
           JSONEOF
 
-          # Start client
-          ./lantern-box run --config /tmp/algeneva-client.json > /tmp/algeneva-client.log 2>&1 &
+          # Start client (setsid prevents stray SIGTERM from parent shell process group)
+          setsid ./lantern-box run --config /tmp/algeneva-client.json > /tmp/algeneva-client.log 2>&1 &
           CLIENT_PID=$!
           sleep 3
 
@@ -286,14 +286,30 @@ jobs:
           fi
 
           # Test
+          # Test HTTP
           set +e
           RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1081 -m 30 http://example.com)
           CURL_EXIT=$?
           set -e
           if echo "$RESPONSE" | grep -q "Example Domain"; then
-            echo "ALGeneva test PASSED"
+            echo "ALGeneva HTTP test PASSED"
           else
-            echo "ALGeneva test FAILED (curl exit code: $CURL_EXIT)"
+            echo "ALGeneva HTTP test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/algeneva-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Test HTTPS
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1081 -m 30 https://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "ALGeneva HTTPS test PASSED"
+          else
+            echo "ALGeneva HTTPS test FAILED (curl exit code: $CURL_EXIT)"
             echo "Response: $RESPONSE"
             cat /tmp/algeneva-client.log
             kill $CLIENT_PID 2>/dev/null || true
@@ -326,12 +342,13 @@ jobs:
               "server_port": 9002,
               "public_key": "${SAMIZDAT_PUB}",
               "short_id": "${SAMIZDAT_SHORT_ID}",
-              "server_name": "example.com"
+              "server_name": "example.com",
+              "disable_padding": true
             }]
           }
           JSONEOF
 
-          ./lantern-box run --config /tmp/samizdat-client.json > /tmp/samizdat-client.log 2>&1 &
+          setsid ./lantern-box run --config /tmp/samizdat-client.json > /tmp/samizdat-client.log 2>&1 &
           CLIENT_PID=$!
           sleep 3
 
@@ -341,14 +358,30 @@ jobs:
             exit 1
           fi
 
+          # Test HTTP
           set +e
           RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1082 -m 30 http://example.com)
           CURL_EXIT=$?
           set -e
           if echo "$RESPONSE" | grep -q "Example Domain"; then
-            echo "Samizdat test PASSED"
+            echo "Samizdat HTTP test PASSED"
           else
-            echo "Samizdat test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Samizdat HTTP test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/samizdat-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Test HTTPS
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1082 -m 30 https://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "Samizdat HTTPS test PASSED"
+          else
+            echo "Samizdat HTTPS test FAILED (curl exit code: $CURL_EXIT)"
             echo "Response: $RESPONSE"
             cat /tmp/samizdat-client.log
             kill $CLIENT_PID 2>/dev/null || true
@@ -388,7 +421,7 @@ jobs:
           }
           JSONEOF
 
-          ./lantern-box run --config /tmp/water-client.json > /tmp/water-client.log 2>&1 &
+          setsid ./lantern-box run --config /tmp/water-client.json > /tmp/water-client.log 2>&1 &
           CLIENT_PID=$!
           sleep 5
 
@@ -398,14 +431,30 @@ jobs:
             exit 1
           fi
 
+          # Test HTTP
           set +e
           RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1083 -m 30 http://example.com)
           CURL_EXIT=$?
           set -e
           if echo "$RESPONSE" | grep -q "Example Domain"; then
-            echo "WATER test PASSED"
+            echo "WATER HTTP test PASSED"
           else
-            echo "WATER test FAILED (curl exit code: $CURL_EXIT)"
+            echo "WATER HTTP test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/water-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Test HTTPS
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1083 -m 30 https://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "WATER HTTPS test PASSED"
+          else
+            echo "WATER HTTPS test FAILED (curl exit code: $CURL_EXIT)"
             echo "Response: $RESPONSE"
             cat /tmp/water-client.log
             kill $CLIENT_PID 2>/dev/null || true
