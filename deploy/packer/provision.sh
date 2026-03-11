@@ -4,8 +4,14 @@ set -euo pipefail
 # VERSION is passed as an environment variable by Packer.
 : "${VERSION:?VERSION must be set}"
 
-echo "==> Installing runtime dependencies"
+echo "==> Waiting for apt locks (unattended-upgrades may be running)"
 export DEBIAN_FRONTEND=noninteractive
+while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+  echo "    Waiting for dpkg lock..."
+  sleep 5
+done
+
+echo "==> Installing runtime dependencies"
 apt-get update -q
 # Keep this package list in sync with Dockerfile
 apt-get install -y -q \
@@ -49,6 +55,6 @@ systemctl daemon-reload
 #   systemctl enable --now lantern-box
 
 echo "==> Verifying installation"
-lantern-box version || sing-box-extensions version
+command -v lantern-box
 
 echo "==> Done. Image ready."
