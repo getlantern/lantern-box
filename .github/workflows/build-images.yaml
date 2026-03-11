@@ -1,0 +1,92 @@
+name: Build Packer Images
+
+on:
+  # Run after a release is published (GoReleaser pushes .deb to Gemfury first)
+  release:
+    types: [published]
+
+  # Allow manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "lantern-box version to bake into the image (e.g. 1.2.3)"
+        required: true
+        type: string
+      builders:
+        description: "Comma-separated builders (digitalocean,linode,oracle-oci)"
+        required: false
+        default: "digitalocean,linode,oracle-oci"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-images:
+    name: Build images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # Strip the leading 'v' from the tag
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "builders=digitalocean.lantern-box,linode.lantern-box,oracle-oci.lantern-box" >> "$GITHUB_OUTPUT"
+          else
+            version="${{ inputs.version }}"
+            if [[ "$version" == v* ]]; then
+              echo "::error::Version should not start with 'v' (got '$version'). Use e.g. 1.2.3"
+              exit 1
+            fi
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            # Convert comma-separated builder names to packer format
+            builders=""
+            IFS=',' read -ra PARTS <<< "${{ inputs.builders }}"
+            for part in "${PARTS[@]}"; do
+              part=$(echo "$part" | xargs)  # trim whitespace
+              builders="${builders:+$builders,}${part}.lantern-box"
+            done
+            echo "builders=$builders" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@v3
+        with:
+          version: 1.11.2
+
+      - name: Init Packer plugins
+        working-directory: deploy/packer
+        run: packer init lantern-box.pkr.hcl
+
+      - name: Build images
+        working-directory: deploy/packer
+        env:
+          DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          FURY_TOKEN: ${{ secrets.FURY_TOKEN }}
+          # OCI auth via API key — set these secrets from your ~/.oci/config
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_KEY_CONTENT: ${{ secrets.OCI_KEY_CONTENT }}
+          OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+        run: |
+          packer build \
+            -var "lantern_box_version=${{ steps.version.outputs.version }}" \
+            -only="${{ steps.version.outputs.builders }}" \
+            lantern-box.pkr.hcl
+
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: packer-manifest
+          path: deploy/packer/manifest.json
