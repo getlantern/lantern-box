@@ -40,6 +40,9 @@ packer build \
 | `DIGITALOCEAN_API_TOKEN` | DigitalOcean API token |
 | `LINODE_TOKEN` | Linode/Akamai API token |
 | `FURY_TOKEN` | Gemfury token for .deb repo |
+| `OCI_COMPARTMENT_OCID` | OCI compartment for the image |
+| `OCI_SUBNET_OCID` | OCI subnet for the build instance |
+| `OCI_AVAILABILITY_DOMAIN` | OCI availability domain |
 
 ## Deploy a VPS from the image
 

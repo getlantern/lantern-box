@@ -8,6 +8,10 @@ packer {
       version = ">= 1.1.0"
       source  = "github.com/linode/linode"
     }
+    oracle = {
+      version = ">= 1.0.5"
+      source  = "github.com/hashicorp/oracle"
+    }
   }
 }
 
@@ -47,6 +51,30 @@ variable "linode_region" {
   default = "us-west"
 }
 
+# OCI variables
+variable "oci_compartment_ocid" {
+  type        = string
+  default     = env("OCI_COMPARTMENT_OCID")
+  description = "OCI compartment OCID where the image will be created."
+}
+
+variable "oci_subnet_ocid" {
+  type        = string
+  default     = env("OCI_SUBNET_OCID")
+  description = "OCI subnet OCID for the build instance."
+}
+
+variable "oci_availability_domain" {
+  type        = string
+  default     = env("OCI_AVAILABILITY_DOMAIN")
+  description = "OCI availability domain (e.g. Iocq:PHX-AD-1)."
+}
+
+variable "oci_region" {
+  type    = string
+  default = "us-phoenix-1"
+}
+
 # ---------- Sources ----------
 
 source "digitalocean" "lantern-box" {
@@ -60,6 +88,30 @@ source "digitalocean" "lantern-box" {
     "sfo3", "nyc3", "ams3", "sgp1", "lon1", "fra1", "blr1", "syd1",
   ]
   tags = ["lantern-box", "packer"]
+}
+
+# OCI uses API key auth via ~/.oci/config or instance principal.
+# See: https://developer.hashicorp.com/packer/integrations/hashicorp/oracle/latest/components/builder/oci
+source "oracle-oci" "lantern-box" {
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain
+  region              = var.oci_region
+
+  # Ubuntu 24.04 amd64 — GoReleaser .deb is amd64-only for now.
+  # Switch to aarch64 + VM.Standard.A1.Flex when arm64 .deb is available.
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-amd64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.E4.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 4
+  }
+  subnet_ocid  = var.oci_subnet_ocid
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}"
 }
 
 source "linode" "lantern-box" {
@@ -78,6 +130,7 @@ build {
   sources = [
     "source.digitalocean.lantern-box",
     "source.linode.lantern-box",
+    "source.oracle-oci.lantern-box",
   ]
 
   # Install runtime dependencies + lantern-box from Gemfury .deb repo

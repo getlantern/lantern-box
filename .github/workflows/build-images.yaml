@@ -15,7 +15,7 @@ on:
       builders:
         description: "Comma-separated builders to run (digitalocean,linode or just one)"
         required: false
-        default: "digitalocean,linode"
+        default: "digitalocean,linode,oracle-oci"
         type: string
 
 permissions:
@@ -37,7 +37,7 @@ jobs:
           if [ "${{ github.event_name }}" = "release" ]; then
             # Strip the leading 'v' from the tag
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-            echo "builders=digitalocean.lantern-box,linode.lantern-box" >> "$GITHUB_OUTPUT"
+            echo "builders=digitalocean.lantern-box,linode.lantern-box,oracle-oci.lantern-box" >> "$GITHUB_OUTPUT"
           else
             echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
             # Convert comma-separated builder names to packer format
@@ -65,6 +65,14 @@ jobs:
           DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
           LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
           FURY_TOKEN: ${{ secrets.FURY_TOKEN }}
+          # OCI auth via API key — set these secrets from your ~/.oci/config
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_KEY_CONTENT: ${{ secrets.OCI_KEY_CONTENT }}
+          OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
         run: |
           packer build \
             -var "lantern_box_version=${{ steps.version.outputs.version }}" \
