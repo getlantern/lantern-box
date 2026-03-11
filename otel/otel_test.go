@@ -120,7 +120,7 @@ func TestInitTelemetry(t *testing.T) {
 	ctr, err := testcontainers.GenericContainer(ctx,
 		testcontainers.GenericContainerRequest{
 			ContainerRequest: testcontainers.ContainerRequest{
-				Image:        "otel/opentelemetry-collector-contrib:latest",
+				Image:        "otel/opentelemetry-collector-contrib:0.144.0",
 				ExposedPorts: []string{"4318/tcp"},
 				WaitingFor: wait.ForLog("Everything is ready").
 					WithStartupTimeout(30 * time.Second),
@@ -165,23 +165,25 @@ func TestInitTelemetry(t *testing.T) {
 	shutdownTracer()
 	shutdownMeter()
 
-	// Give the collector a moment to process and log.
-	time.Sleep(2 * time.Second)
-
-	logs, err := ctr.Logs(ctx)
-	require.NoError(t, err)
-	defer logs.Close()
-
-	buf, err := io.ReadAll(logs)
-	require.NoError(t, err)
-	output := string(buf)
-
-	assert.Contains(t, output, "test-span",
-		"collector logs should contain the test span name")
-	assert.Contains(t, output, "lantern-box",
-		"collector logs should contain the service name")
-	assert.Contains(t, output, "proxy.name",
-		"collector logs should contain proxy.name attribute")
-	assert.Contains(t, output, "test.counter",
-		"collector logs should contain the metric name")
+	// Poll collector logs until expected output appears.
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		logs, err := ctr.Logs(ctx)
+		if !assert.NoError(c, err) {
+			return
+		}
+		defer logs.Close()
+		buf, err := io.ReadAll(logs)
+		if !assert.NoError(c, err) {
+			return
+		}
+		output := string(buf)
+		assert.Contains(c, output, "test-span",
+			"collector logs should contain the test span name")
+		assert.Contains(c, output, "lantern-box",
+			"collector logs should contain the service name")
+		assert.Contains(c, output, "proxy.name",
+			"collector logs should contain proxy.name attribute")
+		assert.Contains(c, output, "test.counter",
+			"collector logs should contain the metric name")
+	}, 10*time.Second, 500*time.Millisecond)
 }

@@ -19,9 +19,9 @@ import (
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric/noop"
-	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/getlantern/lantern-box/adapter"
+	lbotel "github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
 	"github.com/getlantern/lantern-box/tracker/metrics"
@@ -79,9 +79,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 	}
 
 	// Add client context manager if telemetry or datacap is enabled
-	tp := otel.GetTracerProvider()
-	_, tracerIsNoop := tp.(tracenoop.TracerProvider)
-	if !tracerIsNoop || datacapURL != "" {
+	if lbotel.Enabled() || datacapURL != "" {
 		clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
 			Inbound:  []string{""},
 			Outbound: []string{""},

@@ -62,9 +62,9 @@ func (m *Manager) AppendTracker(tracker adapter.ConnectionTracker) {
 	m.trackers = append(m.trackers, tracker)
 }
 
-// emitDeviceConnectedSpan emits a correlation span for device_id's initial connection to proxy,
-// to be correlated with the client's api proxy assignment to assess
-// connectivity success rate and time-to-connect differences.
+// emitDeviceConnectedSpan emits a correlation span for a device_id's connection to the proxy,
+// to be correlated with the client's API proxy assignment to assess
+// connectivity success rate and time-to-connect differences across connections.
 func emitDeviceConnectedSpan(ctx context.Context, info *ClientInfo) {
 	tracer := otel.Tracer("lantern-box")
 	_, span := tracer.Start(ctx, "device_id.connected")

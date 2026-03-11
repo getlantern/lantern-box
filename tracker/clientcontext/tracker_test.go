@@ -239,8 +239,12 @@ func TestDeviceConnectedSpan(t *testing.T) {
 	// Set up in-memory tracer provider
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	prevTP := sdkotel.GetTracerProvider()
 	sdkotel.SetTracerProvider(tp)
-	defer tp.Shutdown(context.Background())
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+		sdkotel.SetTracerProvider(prevTP)
+	})
 
 	cInfo := ClientInfo{
 		DeviceID:    "test-device-123",

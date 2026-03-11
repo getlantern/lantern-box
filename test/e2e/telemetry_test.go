@@ -47,7 +47,7 @@ func TestTelemetryE2E(t *testing.T) {
 	ctr, err := testcontainers.GenericContainer(ctx,
 		testcontainers.GenericContainerRequest{
 			ContainerRequest: testcontainers.ContainerRequest{
-				Image:        "otel/opentelemetry-collector-contrib:latest",
+				Image:        "otel/opentelemetry-collector-contrib:0.144.0",
 				ExposedPorts: []string{"4318/tcp"},
 				WaitingFor: wait.ForLog("Everything is ready").
 					WithStartupTimeout(30 * time.Second),
@@ -148,27 +148,29 @@ func TestTelemetryE2E(t *testing.T) {
 	shutdownTracer()
 	shutdownMeter()
 
-	time.Sleep(2 * time.Second)
-
-	// check logs
-	logs, err := ctr.Logs(ctx)
-	require.NoError(t, err)
-	defer logs.Close()
-
-	buf, err := io.ReadAll(logs)
-	require.NoError(t, err)
-	output := string(buf)
-
-	assert.Contains(t, output, "device_id.connected",
-		"should contain device connected span")
-	assert.Contains(t, output, "e2e-device",
-		"should contain the device ID")
-	assert.Contains(t, output, "lantern-box",
-		"should contain service name")
-	assert.Contains(t, output, "proxy.io",
-		"should contain proxy IO metric")
-	assert.Contains(t, output, "sing.connections",
-		"should contain connections metric")
+	// Poll collector logs until expected output appears.
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		logs, err := ctr.Logs(ctx)
+		if !assert.NoError(c, err) {
+			return
+		}
+		defer logs.Close()
+		buf, err := io.ReadAll(logs)
+		if !assert.NoError(c, err) {
+			return
+		}
+		output := string(buf)
+		assert.Contains(c, output, "device_id.connected",
+			"should contain device connected span")
+		assert.Contains(c, output, "e2e-device",
+			"should contain the device ID")
+		assert.Contains(c, output, "lantern-box",
+			"should contain service name")
+		assert.Contains(c, output, "proxy.io",
+			"should contain proxy IO metric")
+		assert.Contains(c, output, "sing.connections",
+			"should contain connections metric")
+	}, 10*time.Second, 500*time.Millisecond)
 }
 
 func getOptions(ctx context.Context, t *testing.T, path string) option.Options {
