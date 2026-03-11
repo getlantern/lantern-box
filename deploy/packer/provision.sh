@@ -74,9 +74,9 @@ rm -f "/tmp/${otelcol_deb}"
 # The file is uploaded by the packer file provisioner to /tmp/otelcol.yaml.
 cp /tmp/otelcol.yaml /etc/otelcol-contrib/config.yaml
 
-# Create empty env file — cloud-init populates it with SIGNOZ_INGEST_KEY
-# and OTEL_RESOURCE_ATTRIBUTES before starting the service.
-touch /etc/otelcol-contrib/otelcol.env
+# Create empty env file with restrictive permissions — cloud-init populates it
+# with SIGNOZ_INGEST_KEY and OTEL_RESOURCE_ATTRIBUTES before starting the service.
+install -m 600 -o root -g root /dev/null /etc/otelcol-contrib/otelcol.env
 
 # Systemd drop-in to load the env file
 mkdir -p /etc/systemd/system/otelcol-contrib.service.d
