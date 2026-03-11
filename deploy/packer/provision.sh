@@ -4,16 +4,25 @@ set -euo pipefail
 # VERSION is passed as an environment variable by Packer.
 : "${VERSION:?VERSION must be set}"
 
-# Use apt-get's built-in lock timeout (seconds) to wait for
-# unattended-upgrades to finish on fresh VPS instances.
-APT_LOCK_OPTS='-o DPkg::Lock::Timeout=300 -o APT::Get::Lock::Timeout=300'
-
 export DEBIAN_FRONTEND=noninteractive
 
+# Kill unattended-upgrades and wait for any running apt/dpkg to finish.
+# Fresh VPS instances often have unattended-upgrades holding apt locks.
+echo "==> Stopping unattended-upgrades"
+systemctl stop unattended-upgrades.service 2>/dev/null || true
+systemctl kill --signal=TERM apt-daily.service 2>/dev/null || true
+systemctl kill --signal=TERM apt-daily-upgrade.service 2>/dev/null || true
+
+# Wait for any lingering dpkg/apt processes to exit
+while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do
+  echo "    Waiting for apt/dpkg locks..."
+  sleep 3
+done
+
 echo "==> Installing runtime dependencies"
-apt-get $APT_LOCK_OPTS update -q
+apt-get update -q
 # Keep this package list in sync with Dockerfile
-apt-get $APT_LOCK_OPTS install -y -q \
+apt-get install -y -q \
   ca-certificates \
   tzdata \
   nftables
