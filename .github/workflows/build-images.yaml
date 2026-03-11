@@ -69,7 +69,6 @@ jobs:
         env:
           DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
           LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
-          FURY_TOKEN: ${{ secrets.FURY_TOKEN }}
           # OCI auth via API key — set these secrets from your ~/.oci/config
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}

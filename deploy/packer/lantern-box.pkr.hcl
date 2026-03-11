@@ -19,7 +19,7 @@ packer {
 
 variable "lantern_box_version" {
   type        = string
-  description = "Version tag to install (e.g. 1.2.3). Pulled from Gemfury .deb repo."
+  description = "Version tag to install (e.g. 1.2.3). Downloaded from GitHub release."
 }
 
 variable "do_api_token" {
@@ -34,12 +34,6 @@ variable "linode_token" {
   default   = env("LINODE_TOKEN")
 }
 
-variable "fury_token" {
-  type      = string
-  sensitive = true
-  default   = env("FURY_TOKEN")
-  description = "Gemfury token for accessing the private .deb repo."
-}
 
 variable "do_region" {
   type    = string
@@ -132,10 +126,10 @@ build {
     "source.oracle-oci.lantern-box",
   ]
 
-  # Install runtime dependencies + lantern-box from Gemfury .deb repo
+  # Install runtime dependencies + lantern-box .deb from GitHub release
   provisioner "shell" {
     environment_vars = [
-      "FURY_TOKEN=${var.fury_token}",
+      "VERSION=${var.lantern_box_version}",
     ]
     script = "${path.root}/provision.sh"
   }
