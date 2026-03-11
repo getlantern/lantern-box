@@ -5,10 +5,12 @@ import (
 	"net"
 	"sync/atomic"
 
+	semconv "github.com/getlantern/semconv"
 	"github.com/sagernet/sing-box/adapter"
 	N "github.com/sagernet/sing/common/network"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	otelsc "go.opentelemetry.io/otel/semconv/v1.37.0"
 )
 
 const (
@@ -63,10 +65,9 @@ func trackIOLoop(ctx context.Context, reportC <-chan report) {
 		case <-ctx.Done():
 			return
 		case r := <-reportC:
-			attrs := append(r.attrs.AsSlice(), attribute.KeyValue{
-				Key:   "direction",
-				Value: attribute.StringValue(string(r.direction)),
-			})
+			attrs := append(r.attrs.AsSlice(),
+				otelsc.NetworkIODirectionKey.String(string(r.direction)),
+			)
 			metrics.ProxyIO.Add(context.Background(), int64(r.n), metric.WithAttributes(attrs...))
 		}
 	}
@@ -85,10 +86,9 @@ func (t *MetricsTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 }
 
 func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
-	a := append(attrs.attrs, attribute.KeyValue{
-		Key:   "country",
-		Value: attribute.StringValue(attrs.country.Load().(string)),
-	})
+	a := append(attrs.attrs,
+		otelsc.GeoCountryISOCodeKey.String(attrs.country.Load().(string)),
+	)
 	metrics.duration.Record(context.Background(), duration, metric.WithAttributes(a...))
 	metrics.conns.Add(context.Background(), -1, metric.WithAttributes(a...))
 }
@@ -99,19 +99,18 @@ type attributes struct {
 }
 
 func (a *attributes) AsSlice() []attribute.KeyValue {
-	return append(a.attrs, attribute.KeyValue{
-		Key:   "country",
-		Value: attribute.StringValue(a.country.Load().(string)),
-	})
+	return append(a.attrs,
+		otelsc.GeoCountryISOCodeKey.String(a.country.Load().(string)),
+	)
 }
 
 func metadataToAttributes(metadata adapter.InboundContext) *attributes {
 	attrs := &attributes{
 		attrs: []attribute.KeyValue{
-			attribute.String("protocol", metadata.Protocol),
-			attribute.String("inbound", metadata.Inbound),
-			attribute.String("inbound_type", metadata.InboundType),
-			attribute.String("outbound", metadata.Outbound),
+			otelsc.NetworkProtocolNameKey.String(metadata.Protocol),
+			semconv.ProxyInboundKey.String(metadata.Inbound),
+			semconv.ProxyInboundTypeKey.String(metadata.InboundType),
+			semconv.ProxyOutboundKey.String(metadata.Outbound),
 		},
 	}
 	attrs.country.Store(ccNa)

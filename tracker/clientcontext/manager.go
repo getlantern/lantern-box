@@ -15,8 +15,9 @@ import (
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	semconv "github.com/getlantern/semconv"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
+	otelsc "go.opentelemetry.io/otel/semconv/v1.37.0"
 )
 
 var _ (adapter.ConnectionTracker) = (*Manager)(nil)
@@ -68,11 +69,11 @@ func emitDeviceConnectedSpan(ctx context.Context, info *ClientInfo) {
 	tracer := otel.Tracer("lantern-box")
 	_, span := tracer.Start(ctx, "device_id.connected")
 	span.SetAttributes(
-		attribute.String("client.device_id", info.DeviceID),
-		attribute.String("client.platform", info.Platform),
-		attribute.Bool("client.is_pro", info.IsPro),
-		attribute.String("geo.country.iso_code", info.CountryCode),
-		attribute.String("client.version", info.Version),
+		semconv.ClientDeviceIDKey.String(info.DeviceID),
+		semconv.ClientPlatformKey.String(info.Platform),
+		semconv.ClientIsProKey.Bool(info.IsPro),
+		otelsc.GeoCountryISOCodeKey.String(info.CountryCode),
+		semconv.ClientVersionKey.String(info.Version),
 	)
 	span.End()
 }

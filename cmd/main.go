@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/getlantern/geo"
+	semconv "github.com/getlantern/semconv"
 	"go.opentelemetry.io/otel/attribute"
 	"gopkg.in/ini.v1"
 
@@ -110,15 +111,14 @@ func readProxyInfo(path string) (*proxyInfo, error) {
 }
 
 func (info *proxyInfo) resourceAttrs() []attribute.KeyValue {
-	attrs := []attribute.KeyValue{
-		attribute.Bool("pro", info.Pro),
-		attribute.String("proxy.name", info.Name),
-		attribute.String("protocol", info.Protocol),
-		attribute.String("track", info.Track),
-		attribute.String("provider", info.Provider),
-		attribute.String("frontend.provider", info.FrontendProvider),
+	return []attribute.KeyValue{
+		semconv.ProxyNameKey.String(info.Name),
+		semconv.ProxyProtocolKey.String(info.Protocol),
+		semconv.ProxyTrackKey.String(info.Track),
+		semconv.ProxyProviderKey.String(info.Provider),
+		semconv.ProxyFrontendProviderKey.String(info.FrontendProvider),
+		semconv.ClientIsProKey.Bool(info.Pro),
 	}
-	return attrs
 }
 
 func shutdownOtel() {
