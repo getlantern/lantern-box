@@ -13,7 +13,7 @@ on:
         required: true
         type: string
       builders:
-        description: "Comma-separated builders to run (digitalocean,linode or just one)"
+        description: "Comma-separated builders (digitalocean,linode,oracle-oci)"
         required: false
         default: "digitalocean,linode,oracle-oci"
         type: string
@@ -51,9 +51,9 @@ jobs:
           fi
 
       - name: Setup Packer
-        uses: hashicorp/setup-packer@main
+        uses: hashicorp/setup-packer@v3
         with:
-          version: latest
+          version: 1.11.2
 
       - name: Init Packer plugins
         working-directory: deploy/packer

@@ -32,4 +32,4 @@ write_files:
       proxyprotocol = algeneva
 
 runcmd:
-  - systemctl start lantern-box
+  - systemctl enable --now lantern-box

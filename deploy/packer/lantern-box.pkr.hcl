@@ -67,7 +67,7 @@ variable "oci_subnet_ocid" {
 variable "oci_availability_domain" {
   type        = string
   default     = env("OCI_AVAILABILITY_DOMAIN")
-  description = "OCI availability domain (e.g. Iocq:PHX-AD-1)."
+  description = "OCI availability domain (e.g. TYgz:US-ASHBURN-AD-1)."
 }
 
 variable "oci_region" {
@@ -90,7 +90,7 @@ source "digitalocean" "lantern-box" {
   tags = ["lantern-box", "packer"]
 }
 
-# OCI uses API key auth via ~/.oci/config or instance principal.
+# OCI uses API key auth via ~/.oci/config or environment variables.
 # See: https://developer.hashicorp.com/packer/integrations/hashicorp/oracle/latest/components/builder/oci
 source "oracle-oci" "lantern-box" {
   compartment_ocid    = var.oci_compartment_ocid
@@ -142,13 +142,13 @@ build {
     script = "${path.root}/provision.sh"
   }
 
-  # Clean up for smaller image
+  # Clean up for smaller image and to remove any credential traces
   provisioner "shell" {
     inline = [
       "apt-get clean",
       "rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*",
-      "truncate -s 0 /var/log/*.log",
-      "history -c",
+      "find /var/log -type f -exec truncate -s 0 {} +",
+      "rm -f /root/.bash_history /home/*/.bash_history",
     ]
   }
 

@@ -7,7 +7,7 @@ Pre-baked VM images with lantern-box installed. Boot-to-proxy-ready in ~35-60 se
 - Ubuntu 24.04 LTS
 - Runtime deps: ca-certificates, tzdata, nftables, wireguard-tools
 - lantern-box binary (from Gemfury .deb)
-- systemd service (enabled, not started — needs config)
+- systemd service (installed but not enabled — cloud-init starts it)
 
 ## Prerequisites
 
@@ -40,6 +40,10 @@ packer build \
 | `DIGITALOCEAN_API_TOKEN` | DigitalOcean API token |
 | `LINODE_TOKEN` | Linode/Akamai API token |
 | `FURY_TOKEN` | Gemfury token for .deb repo |
+| `OCI_TENANCY_OCID` | OCI tenancy OCID |
+| `OCI_USER_OCID` | OCI user OCID |
+| `OCI_FINGERPRINT` | OCI API key fingerprint |
+| `OCI_KEY_CONTENT` | OCI API private key (PEM) |
 | `OCI_COMPARTMENT_OCID` | OCI compartment for the image |
 | `OCI_SUBNET_OCID` | OCI subnet for the build instance |
 | `OCI_AVAILABILITY_DOMAIN` | OCI availability domain |
