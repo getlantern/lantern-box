@@ -10,7 +10,7 @@ metadata:
 
 builds:
   - id: amd64
-    main: ./cmd/sing-box-extensions
+    main: ./cmd
     flags:
       - -v
       - -trimpath
@@ -36,7 +36,7 @@ builds:
     binary: sing-box-extensions
 
   - id: arm64
-    main: ./cmd/sing-box-extensions
+    main: ./cmd
     flags:
       - -v
       - -trimpath
@@ -88,9 +88,9 @@ nfpms:
     homepage: "https://github.com/getlantern/sing-box-extensions"
     license: "GPL"
     contents:
-      - src: cmd/sing-box-extensions/release/sing-box-extensions.service
+      - src: cmd/release/sing-box-extensions.service
         dst: /usr/lib/systemd/system/sing-box-extensions.service
-      - src: cmd/sing-box-extensions/release/sing-box-extensions@.service
+      - src: cmd/release/sing-box-extensions@.service
         dst: /usr/lib/systemd/system/sing-box-extensions@.service
 
 furies:
