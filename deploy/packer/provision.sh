@@ -6,7 +6,7 @@ set -euo pipefail
 
 # Use apt-get's built-in lock timeout (seconds) to wait for
 # unattended-upgrades to finish on fresh VPS instances.
-APT_LOCK_OPTS='-o DPkg::Lock::Timeout=300'
+APT_LOCK_OPTS='-o DPkg::Lock::Timeout=300 -o APT::Get::Lock::Timeout=300'
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -16,8 +16,7 @@ apt-get $APT_LOCK_OPTS update -q
 apt-get $APT_LOCK_OPTS install -y -q \
   ca-certificates \
   tzdata \
-  nftables \
-  wireguard-tools
+  nftables
 
 echo "==> Downloading sing-box-extensions .deb from GitHub release"
 arch=$(dpkg --print-architecture)  # amd64 or arm64
