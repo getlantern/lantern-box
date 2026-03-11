@@ -4,8 +4,45 @@ set -euo pipefail
 # VERSION is passed as an environment variable by Packer.
 : "${VERSION:?VERSION must be set}"
 
-echo "==> Installing runtime dependencies"
+# Wait for dpkg/apt locks with a bounded timeout.
+# Unattended-upgrades often holds the lock on fresh VPS instances.
+wait_for_dpkg_lock() {
+  local lock_files=(
+    /var/lib/dpkg/lock-frontend
+    /var/lib/dpkg/lock
+  )
+  local timeout=300
+  local start
+  start=$(date +%s)
+
+  while :; do
+    local locked=0
+    for lf in "${lock_files[@]}"; do
+      if fuser "$lf" >/dev/null 2>&1; then
+        locked=1
+        break
+      fi
+    done
+
+    if [ "$locked" -eq 0 ]; then
+      return 0
+    fi
+
+    if [ $(( $(date +%s) - start )) -ge "$timeout" ]; then
+      echo "Timed out waiting for dpkg/apt lock(s)" >&2
+      return 1
+    fi
+
+    echo "    Waiting for dpkg lock..."
+    sleep 5
+  done
+}
+
+echo "==> Waiting for apt locks (unattended-upgrades may be running)"
 export DEBIAN_FRONTEND=noninteractive
+wait_for_dpkg_lock
+
+echo "==> Installing runtime dependencies"
 apt-get update -q
 # Keep this package list in sync with Dockerfile
 apt-get install -y -q \
@@ -49,6 +86,10 @@ systemctl daemon-reload
 #   systemctl enable --now lantern-box
 
 echo "==> Verifying installation"
-lantern-box version || sing-box-extensions version
-
+if ! command -v lantern-box >/dev/null 2>&1; then
+  echo "lantern-box not found on PATH" >&2
+  exit 1
+fi
+# Cobra sets rootCmd.Version via ldflags; --version outputs "lantern-box version X.Y.Z"
+lantern-box --version
 echo "==> Done. Image ready."
