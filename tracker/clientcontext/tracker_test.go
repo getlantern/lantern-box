@@ -76,7 +76,11 @@ func TestClientContext(t *testing.T) {
 	ctx := box.BaseContext()
 	logger := log.NewNOPFactory().NewLogger("")
 	mgr := NewManager(MatchBounds{[]string{"any"}, []string{"any"}}, logger)
+	serverPort := freePort(t)
+	clientPort := freePort(t)
 	serverOpts := getOptions(ctx, t, testOptionsPath+"/http_server.json")
+	clientOpts := getOptions(ctx, t, testOptionsPath+"/http_client.json")
+	patchPorts(&serverOpts, &clientOpts, serverPort, clientPort)
 	serverBox, err := sbox.New(sbox.Options{
 		Context: ctx,
 		Options: serverOpts,
@@ -91,7 +95,6 @@ func TestClientContext(t *testing.T) {
 	httpServer := startHTTPServer()
 	defer httpServer.Close()
 
-	clientOpts := getOptions(ctx, t, testOptionsPath+"/http_client.json")
 	proxyAddr := getProxyAddress(clientOpts.Inbounds)
 	require.NotEmpty(t, proxyAddr, "http-client inbound not found in client options")
 
@@ -109,6 +112,7 @@ func TestClientContext(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mTracker.info = nil
 			clientOpts = getOptions(ctx, t, testOptionsPath+"/http_client.json")
+			patchPorts(&serverOpts, &clientOpts, serverPort, clientPort)
 			if tt.useSelectorWithTag != "" {
 				setSelectorDefaultTag(&clientOpts, tt.useSelectorWithTag)
 			}
@@ -188,6 +192,32 @@ func startHTTPServer() *httptest.Server {
 	return httptest.NewServer(handler)
 }
 
+func freePort(t *testing.T) uint16 {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return uint16(port)
+}
+
+func patchPorts(
+	serverOpts *option.Options,
+	clientOpts *option.Options,
+	serverPort, clientPort uint16,
+) {
+	serverOpts.Inbounds[0].Options.(*option.HTTPMixedInboundOptions).ListenPort = serverPort
+	clientOpts.Inbounds[0].Options.(*option.HTTPMixedInboundOptions).ListenPort = clientPort
+	for _, ob := range clientOpts.Outbounds {
+		switch opts := ob.Options.(type) {
+		case *option.HTTPOutboundOptions:
+			opts.ServerPort = serverPort
+		case *option.SOCKSOutboundOptions:
+			opts.ServerPort = serverPort
+		}
+	}
+}
+
 var _ (adapter.ConnectionTracker) = (*mockTracker)(nil)
 
 type mockTracker struct {
@@ -224,7 +254,11 @@ func TestDeviceConnectedSpan(t *testing.T) {
 	ctx := box.BaseContext()
 	logger := log.NewNOPFactory().NewLogger("")
 	mgr := NewManager(MatchBounds{[]string{"any"}, []string{"any"}}, logger)
+	serverPort := freePort(t)
+	clientPort := freePort(t)
 	serverOpts := getOptions(ctx, t, testOptionsPath+"/http_server.json")
+	clientOpts := getOptions(ctx, t, testOptionsPath+"/http_client.json")
+	patchPorts(&serverOpts, &clientOpts, serverPort, clientPort)
 	serverBox, err := sbox.New(sbox.Options{
 		Context: ctx,
 		Options: serverOpts,
@@ -238,7 +272,6 @@ func TestDeviceConnectedSpan(t *testing.T) {
 	httpServer := startHTTPServer()
 	defer httpServer.Close()
 
-	clientOpts := getOptions(ctx, t, testOptionsPath+"/http_client.json")
 	proxyAddr := getProxyAddress(clientOpts.Inbounds)
 	require.NotEmpty(t, proxyAddr, "http-client inbound not found in client options")
 

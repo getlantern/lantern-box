@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -88,7 +89,12 @@ func TestTelemetryE2E(t *testing.T) {
 	boxCtx := box.BaseContext()
 	logger := log.NewNOPFactory().NewLogger("")
 
+	serverPort := freePort(t)
+	clientPort := freePort(t)
 	serverOpts := getOptions(boxCtx, t, "testdata/http_server.json")
+	clientOpts := getOptions(boxCtx, t, "testdata/http_client.json")
+	patchPorts(&serverOpts, &clientOpts, serverPort, clientPort)
+
 	serverBox, err := sbox.New(sbox.Options{Context: boxCtx, Options: serverOpts})
 	require.NoError(t, err)
 
@@ -118,7 +124,6 @@ func TestTelemetryE2E(t *testing.T) {
 		clientcontext.MatchBounds{Inbound: []string{"any"}, Outbound: []string{"any"}},
 	)
 
-	clientOpts := getOptions(boxCtx, t, "testdata/http_client.json")
 	clientBox, err := sbox.New(sbox.Options{Context: boxCtx, Options: clientOpts})
 	require.NoError(t, err)
 	clientBox.Router().AppendTracker(injector)
@@ -172,6 +177,32 @@ func getOptions(ctx context.Context, t *testing.T, path string) option.Options {
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, buf)
 	require.NoError(t, err)
 	return opts
+}
+
+func freePort(t *testing.T) uint16 {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return uint16(port)
+}
+
+func patchPorts(
+	serverOpts *option.Options,
+	clientOpts *option.Options,
+	serverPort, clientPort uint16,
+) {
+	serverOpts.Inbounds[0].Options.(*option.HTTPMixedInboundOptions).ListenPort = serverPort
+	clientOpts.Inbounds[0].Options.(*option.HTTPMixedInboundOptions).ListenPort = clientPort
+	for _, ob := range clientOpts.Outbounds {
+		switch opts := ob.Options.(type) {
+		case *option.HTTPOutboundOptions:
+			opts.ServerPort = serverPort
+		case *option.SOCKSOutboundOptions:
+			opts.ServerPort = serverPort
+		}
+	}
 }
 
 func getProxyAddress(inbounds []option.Inbound) string {
