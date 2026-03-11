@@ -93,7 +93,7 @@ jobs:
         env:
           VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
           VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
-          VAULT_SKIP_VERIFY: "1"
+          VAULT_CACERT: ${{ secrets.VAULT_CACERT }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           if [ -z "$VAULT_ADDR" ] || [ -z "$VAULT_TOKEN" ]; then
@@ -105,8 +105,19 @@ jobs:
             exit 0
           fi
 
-          # Install vault CLI
+          # Write CA cert if provided, otherwise skip TLS verification
+          if [ -n "$VAULT_CACERT" ]; then
+            echo "$VAULT_CACERT" > /tmp/vault-ca.pem
+            export VAULT_CACERT=/tmp/vault-ca.pem
+          else
+            echo "::warning::VAULT_CACERT not set, disabling TLS verification"
+            export VAULT_SKIP_VERIFY=1
+          fi
+
+          # Install vault CLI with checksum verification
           curl -fsSL https://releases.hashicorp.com/vault/1.17.2/vault_1.17.2_linux_amd64.zip -o /tmp/vault.zip
+          curl -fsSL https://releases.hashicorp.com/vault/1.17.2/vault_1.17.2_SHA256SUMS -o /tmp/vault_SHA256SUMS
+          (cd /tmp && grep 'vault_1.17.2_linux_amd64.zip' vault_SHA256SUMS | sha256sum -c -)
           unzip -o /tmp/vault.zip -d /tmp
           chmod +x /tmp/vault
 
@@ -135,12 +146,17 @@ jobs:
           # Also update the OCI region config (image_id) used by the provision worker today
           if [ -n "$oci_image" ]; then
             current=$(/tmp/vault kv get -format=json secret/lantern_cloud/vps/oci_regions 2>/dev/null | jq '.data.data' || echo '{}')
-            updated=$(echo "$current" | jq --arg img "$oci_image" '
-              .regions |= with_entries(.value.image_id = $img)
-            ')
-            echo "Updating Vault secret/lantern_cloud/vps/oci_regions..."
-            echo "$updated" | /tmp/vault kv put secret/lantern_cloud/vps/oci_regions -
-            echo "Done."
+            regions_type=$(echo "$current" | jq -r 'if has("regions") then (.regions | type) else "null" end' 2>/dev/null || echo "null")
+            if [ "$regions_type" != "object" ]; then
+              echo "::warning::Vault secret/lantern_cloud/vps/oci_regions has no valid .regions object; skipping OCI regions image_id update"
+            else
+              updated=$(echo "$current" | jq --arg img "$oci_image" '
+                .regions |= with_entries(.value.image_id = $img)
+              ')
+              echo "Updating Vault secret/lantern_cloud/vps/oci_regions..."
+              echo "$updated" | /tmp/vault kv put secret/lantern_cloud/vps/oci_regions -
+              echo "Done."
+            fi
           fi
 
       - name: Clean up OCI key
