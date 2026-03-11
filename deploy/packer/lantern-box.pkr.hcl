@@ -105,7 +105,7 @@ source "oracle-oci" "lantern-box" {
   shape = "VM.Standard.A1.Flex"
   shape_config {
     ocpus         = 1
-    memory_in_gbs = 6
+    memory_in_gbs = 1
   }
   subnet_ocid  = var.oci_subnet_ocid
   ssh_username = "ubuntu"
