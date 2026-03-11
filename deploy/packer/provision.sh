@@ -4,48 +4,16 @@ set -euo pipefail
 # VERSION is passed as an environment variable by Packer.
 : "${VERSION:?VERSION must be set}"
 
-# Wait for dpkg/apt locks with a bounded timeout.
-# Unattended-upgrades often holds the lock on fresh VPS instances.
-wait_for_dpkg_lock() {
-  local lock_files=(
-    /var/lib/dpkg/lock-frontend
-    /var/lib/dpkg/lock
-  )
-  local timeout=300
-  local start
-  start=$(date +%s)
+# Use apt-get's built-in lock timeout (seconds) to wait for
+# unattended-upgrades to finish on fresh VPS instances.
+APT_LOCK_OPTS='-o DPkg::Lock::Timeout=300'
 
-  while :; do
-    local locked=0
-    for lf in "${lock_files[@]}"; do
-      if fuser "$lf" >/dev/null 2>&1; then
-        locked=1
-        break
-      fi
-    done
-
-    if [ "$locked" -eq 0 ]; then
-      return 0
-    fi
-
-    if [ $(( $(date +%s) - start )) -ge "$timeout" ]; then
-      echo "Timed out waiting for dpkg/apt lock(s)" >&2
-      return 1
-    fi
-
-    echo "    Waiting for dpkg lock..."
-    sleep 5
-  done
-}
-
-echo "==> Waiting for apt locks (unattended-upgrades may be running)"
 export DEBIAN_FRONTEND=noninteractive
-wait_for_dpkg_lock
 
 echo "==> Installing runtime dependencies"
-apt-get update -q
+apt-get $APT_LOCK_OPTS update -q
 # Keep this package list in sync with Dockerfile
-apt-get install -y -q \
+apt-get $APT_LOCK_OPTS install -y -q \
   ca-certificates \
   tzdata \
   nftables \
