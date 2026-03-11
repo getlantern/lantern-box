@@ -102,6 +102,8 @@ dockers:
   - image_templates:
       - "getlantern/sing-box-extensions:latest"
       - "getlantern/sing-box-extensions:{{ .Tag }}"
+    dockerfile: Dockerfile.goreleaser
+    ids: [amd64]
 
 dockerhub:
   - images:
