@@ -46,22 +46,43 @@ variable "linode_region" {
 }
 
 # OCI variables
-variable "oci_compartment_ocid" {
+variable "oci_tenancy_ocid" {
+  type      = string
+  sensitive = true
+  default   = env("OCI_TENANCY_OCID")
+}
+
+variable "oci_user_ocid" {
+  type      = string
+  sensitive = true
+  default   = env("OCI_USER_OCID")
+}
+
+variable "oci_fingerprint" {
+  type      = string
+  sensitive = true
+  default   = env("OCI_FINGERPRINT")
+}
+
+variable "oci_key_file" {
   type        = string
-  default     = env("OCI_COMPARTMENT_OCID")
-  description = "OCI compartment OCID where the image will be created."
+  default     = env("OCI_KEY_FILE")
+  description = "Path to OCI API private key PEM file."
+}
+
+variable "oci_compartment_ocid" {
+  type    = string
+  default = env("OCI_COMPARTMENT_OCID")
 }
 
 variable "oci_subnet_ocid" {
-  type        = string
-  default     = env("OCI_SUBNET_OCID")
-  description = "OCI subnet OCID for the build instance."
+  type    = string
+  default = env("OCI_SUBNET_OCID")
 }
 
 variable "oci_availability_domain" {
-  type        = string
-  default     = env("OCI_AVAILABILITY_DOMAIN")
-  description = "OCI availability domain (e.g. TYgz:US-ASHBURN-AD-1)."
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN")
 }
 
 variable "oci_region" {
@@ -84,9 +105,13 @@ source "digitalocean" "lantern-box" {
   tags = ["lantern-box", "packer"]
 }
 
-# OCI uses API key auth via ~/.oci/config or environment variables.
+# OCI API key auth — all fields must be explicit (plugin doesn't read env vars directly).
 # See: https://developer.hashicorp.com/packer/integrations/hashicorp/oracle/latest/components/builder/oci
 source "oracle-oci" "lantern-box" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
   compartment_ocid    = var.oci_compartment_ocid
   availability_domain = var.oci_availability_domain
   region              = var.oci_region

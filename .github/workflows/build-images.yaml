@@ -64,16 +64,20 @@ jobs:
         working-directory: deploy/packer
         run: packer init lantern-box.pkr.hcl
 
+      - name: Write OCI private key
+        run: |
+          echo "${{ secrets.OCI_KEY_CONTENT }}" > /tmp/oci_api_key.pem
+          chmod 600 /tmp/oci_api_key.pem
+
       - name: Build images
         working-directory: deploy/packer
         env:
           DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
           LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
-          # OCI auth via API key — set these secrets from your ~/.oci/config
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
-          OCI_KEY_CONTENT: ${{ secrets.OCI_KEY_CONTENT }}
+          OCI_KEY_FILE: /tmp/oci_api_key.pem
           OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
           OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
           OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
@@ -82,6 +86,10 @@ jobs:
             -var "lantern_box_version=${{ steps.version.outputs.version }}" \
             -only="${{ steps.version.outputs.builders }}" \
             lantern-box.pkr.hcl
+
+      - name: Clean up OCI key
+        if: always()
+        run: rm -f /tmp/oci_api_key.pem
 
       - name: Upload manifest
         uses: actions/upload-artifact@v4
