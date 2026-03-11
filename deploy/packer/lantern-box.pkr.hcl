@@ -152,6 +152,12 @@ build {
     "source.oracle-oci.lantern-box",
   ]
 
+  # Upload OTel Collector config before the shell provisioner copies it into place.
+  provisioner "file" {
+    source      = "${path.root}/otelcol.yaml"
+    destination = "/tmp/otelcol.yaml"
+  }
+
   # Install runtime dependencies + lantern-box .deb from GitHub release
   # execute_command uses sudo for non-root SSH users (OCI uses "ubuntu")
   provisioner "shell" {
