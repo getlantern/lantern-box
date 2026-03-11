@@ -72,7 +72,7 @@ variable "oci_availability_domain" {
 
 variable "oci_region" {
   type    = string
-  default = "us-phoenix-1"
+  default = "us-ashburn-1"
 }
 
 # ---------- Sources ----------
