@@ -1,0 +1,58 @@
+{
+  "log": { "level": "debug" },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "dns_remote",
+        "detour": "samizdat-1",
+        "server": "9.9.9.9",
+        "server_port": 443,
+        "path": "/dns-query"
+      },
+      {
+        "type": "https",
+        "tag": "dns_local",
+        "server": "9.9.9.9",
+        "server_port": 443,
+        "path": "/dns-query"
+      }
+    ],
+    "final": "dns_local"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "samizdat",
+      "tag": "samizdat-1",
+      "server": "45.79.214.235",
+      "server_port": 28046,
+      "public_key": "1f3f7048549fe6cfdf9eb33deb692f9029ca815b1b35762e4de7d7e45c3d3a71",
+      "short_id": "212bded0f713b9de",
+      "server_name": "gist.githubusercontent.com"
+    },
+    {
+      "type": "samizdat",
+      "tag": "samizdat-2",
+      "server": "45.79.214.177",
+      "server_port": 37985,
+      "public_key": "c240e37349edc2bdf8fa078a8d3ce71bd65e799398688990833c3b5b1875a25c",
+      "short_id": "3e4e1b9d080c33bc",
+      "server_name": "appen.com"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "samizdat-1"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "log": {
+    "level": "trace",
+    "output": "stdout",
+	  "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "utun225",
+      "mtu": 1500,
+      "address": [
+        "10.10.1.1/30",
+        "fdf0:f3e1:fdd::1/126"
+      ],
+      "auto_route": true,
+      "strict_route": true
+    }
+  ],
+  "outbounds": [{
+    "type":"direct",
+    "tag":"direct",
+    "password":"9cf3af4984997f84fdae9bb4c71bce63",
+    "server":"159.13.39.39",
+    "server_port":48277,
+    "tls":{
+      "enabled":true,
+      "insecure":true
+    }}],
+  "route": {
+    "rules": [
+        {
+            "inbound": "tun-in",
+            "outbound": "hy2-out"
+        }
+    ],
+    "auto_detect_interface": true
+  }
+}
