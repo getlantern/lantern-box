@@ -61,6 +61,33 @@ systemctl daemon-reload
 # writes the config, causing a startup failure loop. Cloud-init should run:
 #   systemctl enable --now lantern-box
 
+echo "==> Installing OTel Collector for host metrics"
+otelcol_version="0.120.0"
+otelcol_deb="otelcol-contrib_${otelcol_version}_linux_${arch}.deb"
+otelcol_url="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${otelcol_version}/${otelcol_deb}"
+echo "    URL: ${otelcol_url}"
+curl -fsSL -o "/tmp/${otelcol_deb}" "${otelcol_url}"
+dpkg -i "/tmp/${otelcol_deb}"
+rm -f "/tmp/${otelcol_deb}"
+
+# Copy our config into the otelcol-contrib config directory.
+# The file is uploaded by the packer file provisioner to /tmp/otelcol.yaml.
+cp /tmp/otelcol.yaml /etc/otelcol-contrib/config.yaml
+
+# Create empty env file with restrictive permissions — cloud-init populates it
+# with SIGNOZ_INGEST_KEY and OTEL_RESOURCE_ATTRIBUTES before starting the service.
+install -m 600 -o root -g root /dev/null /etc/otelcol-contrib/otelcol.env
+
+# Systemd drop-in to load the env file
+mkdir -p /etc/systemd/system/otelcol-contrib.service.d
+cat > /etc/systemd/system/otelcol-contrib.service.d/env.conf <<'DROPIN'
+[Service]
+EnvironmentFile=/etc/otelcol-contrib/otelcol.env
+DROPIN
+
+systemctl daemon-reload
+# Do NOT enable — cloud-init writes env vars first, then enables the service.
+
 echo "==> Verifying installation"
 if ! command -v lantern-box >/dev/null 2>&1; then
   echo "lantern-box not found on PATH" >&2
