@@ -8,28 +8,35 @@ export DEBIAN_FRONTEND=noninteractive
 
 # Wait for cloud-init to finish — it triggers apt operations on fresh VPS instances.
 if command -v cloud-init >/dev/null 2>&1; then
-  echo "==> Waiting for cloud-init to finish"
-  cloud-init status --wait || true
+  echo "==> Waiting for cloud-init to finish (max 5 minutes)"
+  if timeout 300s cloud-init status --wait; then
+    echo "    cloud-init finished successfully"
+  else
+    echo "    WARNING: cloud-init wait exited with code $?" >&2
+  fi
 fi
 
-# Kill unattended-upgrades so it doesn't race with our apt-get calls.
+# Stop unattended-upgrades so it doesn't race with our apt-get calls.
+# We mask it during provisioning but re-enable at the end of the script
+# so the final image still receives automatic security updates.
 echo "==> Stopping unattended-upgrades"
 systemctl stop unattended-upgrades.service 2>/dev/null || true
-systemctl disable unattended-upgrades.service 2>/dev/null || true
-systemctl kill --signal=KILL apt-daily.service 2>/dev/null || true
-systemctl kill --signal=KILL apt-daily-upgrade.service 2>/dev/null || true
-# Kill any lingering apt/dpkg processes
-killall -9 apt-get dpkg unattended-upgrade 2>/dev/null || true
+systemctl mask unattended-upgrades.service 2>/dev/null || true
+systemctl kill --signal=TERM apt-daily.service 2>/dev/null || true
+systemctl kill --signal=TERM apt-daily-upgrade.service 2>/dev/null || true
+# Kill any lingering apt/unattended-upgrade processes (but not dpkg — killing
+# dpkg mid-transaction can corrupt the package database).
+killall -9 apt-get unattended-upgrade 2>/dev/null || true
 sleep 2
 
 # Use apt-get's built-in lock timeout (wait up to 5 minutes for locks to clear)
 # instead of a fragile fuser loop that can race between update and install.
-APT_OPTS='-o DPkg::Lock::Timeout=300'
+APT_OPTS=(-o DPkg::Lock::Timeout=300)
 
 echo "==> Installing runtime dependencies"
-apt-get $APT_OPTS update -q
+apt-get "${APT_OPTS[@]}" update -q
 # Keep this package list in sync with Dockerfile
-apt-get $APT_OPTS install -y -q \
+apt-get "${APT_OPTS[@]}" install -y -q \
   ca-certificates \
   tzdata \
   nftables
@@ -42,7 +49,7 @@ echo "    URL: ${deb_url}"
 curl -fsSL -o "/tmp/${deb_name}" "${deb_url}"
 
 echo "==> Installing ${deb_name}"
-dpkg --force-confdef --force-confold -i "/tmp/${deb_name}"
+apt-get "${APT_OPTS[@]}" install -y -q "/tmp/${deb_name}"
 rm -f "/tmp/${deb_name}"
 
 # The .deb installs the binary as /usr/bin/sing-box-extensions.
@@ -74,7 +81,7 @@ otelcol_deb="otelcol-contrib_${otelcol_version}_linux_${arch}.deb"
 otelcol_url="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${otelcol_version}/${otelcol_deb}"
 echo "    URL: ${otelcol_url}"
 curl -fsSL -o "/tmp/${otelcol_deb}" "${otelcol_url}"
-dpkg --force-confdef --force-confold -i "/tmp/${otelcol_deb}"
+apt-get "${APT_OPTS[@]}" install -y -q "/tmp/${otelcol_deb}"
 rm -f "/tmp/${otelcol_deb}"
 
 # Copy our config into the otelcol-contrib config directory.
@@ -94,6 +101,10 @@ DROPIN
 
 systemctl daemon-reload
 # Do NOT enable — cloud-init writes env vars first, then enables the service.
+
+# Re-enable unattended-upgrades so the final image receives security updates.
+systemctl unmask unattended-upgrades.service 2>/dev/null || true
+systemctl enable unattended-upgrades.service 2>/dev/null || true
 
 echo "==> Verifying installation"
 if ! command -v lantern-box >/dev/null 2>&1; then
