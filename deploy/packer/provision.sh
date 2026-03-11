@@ -90,6 +90,5 @@ if ! command -v lantern-box >/dev/null 2>&1; then
   echo "lantern-box not found on PATH" >&2
   exit 1
 fi
-# Cobra sets rootCmd.Version via ldflags; --version outputs "lantern-box version X.Y.Z"
-lantern-box --version
+echo "    lantern-box installed at $(command -v lantern-box)"
 echo "==> Done. Image ready."
