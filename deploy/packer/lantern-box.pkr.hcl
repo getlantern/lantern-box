@@ -152,7 +152,9 @@ build {
   ]
 
   # Install runtime dependencies + lantern-box .deb from GitHub release
+  # execute_command uses sudo for non-root SSH users (OCI uses "ubuntu")
   provisioner "shell" {
+    execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
     environment_vars = [
       "VERSION=${var.lantern_box_version}",
     ]
@@ -161,6 +163,7 @@ build {
 
   # Clean up for smaller image and to remove any credential traces
   provisioner "shell" {
+    execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
     inline = [
       "apt-get clean",
       "rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*",
