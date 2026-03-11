@@ -97,21 +97,20 @@ source "oracle-oci" "lantern-box" {
   availability_domain = var.oci_availability_domain
   region              = var.oci_region
 
-  # Ubuntu 24.04 amd64 — GoReleaser .deb is amd64-only for now.
-  # Switch to aarch64 + VM.Standard.A1.Flex when arm64 .deb is available.
+  # Ampere A1 (ARM) — cost-effective and included in OCI Always Free tier
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-amd64-"
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
     operating_system    = "Canonical Ubuntu"
   }
-  shape = "VM.Standard.E4.Flex"
+  shape = "VM.Standard.A1.Flex"
   shape_config {
     ocpus         = 1
-    memory_in_gbs = 4
+    memory_in_gbs = 6
   }
   subnet_ocid  = var.oci_subnet_ocid
   ssh_username = "ubuntu"
 
-  image_name = "lantern-box-${var.lantern_box_version}"
+  image_name = "lantern-box-${var.lantern_box_version}-arm64"
 }
 
 source "linode" "lantern-box" {
