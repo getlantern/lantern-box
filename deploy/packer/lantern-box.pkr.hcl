@@ -103,6 +103,7 @@ source "digitalocean" "lantern-box" {
     "sfo3", "nyc3", "ams3", "sgp1", "lon1", "fra1", "blr1", "syd1",
   ]
   tags = ["lantern-box", "packer"]
+  state_timeout = "10m"
 }
 
 # OCI API key auth — all fields must be explicit (plugin doesn't read env vars directly).
