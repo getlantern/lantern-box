@@ -137,7 +137,6 @@ build {
   provisioner "shell" {
     environment_vars = [
       "FURY_TOKEN=${var.fury_token}",
-      "LANTERN_BOX_VERSION=${var.lantern_box_version}",
     ]
     script = "${path.root}/provision.sh"
   }

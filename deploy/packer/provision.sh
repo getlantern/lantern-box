@@ -4,13 +4,12 @@ set -euo pipefail
 echo "==> Installing runtime dependencies"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
+# Keep this package list in sync with Dockerfile
 apt-get install -y -q \
   ca-certificates \
   tzdata \
   nftables \
-  wireguard-tools \
-  curl \
-  jq
+  wireguard-tools
 
 echo "==> Adding Gemfury apt repo"
 # Gemfury hosts the .deb packages produced by GoReleaser.
@@ -31,9 +30,7 @@ rm -f /etc/apt/sources.list.d/getlantern.list
 
 # The .deb installs the binary as /usr/bin/sing-box-extensions.
 # The systemd service files reference /usr/bin/lantern-box, so create a symlink.
-if [ -f /usr/bin/sing-box-extensions ] && [ ! -f /usr/bin/lantern-box ]; then
-  ln -s /usr/bin/sing-box-extensions /usr/bin/lantern-box
-fi
+ln -sf /usr/bin/sing-box-extensions /usr/bin/lantern-box
 
 echo "==> Setting up directories"
 mkdir -p /etc/lantern-box /var/lib/lantern-box
@@ -43,8 +40,8 @@ mkdir -p /etc/lantern-box /var/lib/lantern-box
 for svc in sing-box-extensions.service sing-box-extensions@.service; do
   installed="/usr/lib/systemd/system/${svc}"
   target="/usr/lib/systemd/system/$(echo "$svc" | sed 's/sing-box-extensions/lantern-box/')"
-  if [ -f "$installed" ] && [ ! -f "$target" ]; then
-    ln -s "$installed" "$target"
+  if [ -f "$installed" ]; then
+    ln -sf "$installed" "$target"
   fi
 done
 
@@ -55,6 +52,6 @@ systemctl daemon-reload
 #   systemctl enable --now lantern-box
 
 echo "==> Verifying installation"
-lantern-box version || sing-box-extensions version || echo "version check skipped"
+lantern-box version || sing-box-extensions version
 
 echo "==> Done. Image ready."

@@ -32,6 +32,7 @@ RUN set -ex \
        -o /usr/local/bin/lantern-box ./cmd
 
 FROM debian:bookworm-slim
+# Keep runtime deps in sync with deploy/packer/provision.sh
 RUN set -ex \
     && apt-get update \
     && apt-get install -y ca-certificates tzdata nftables wireguard-tools \
