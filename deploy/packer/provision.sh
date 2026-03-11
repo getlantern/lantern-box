@@ -31,7 +31,7 @@ sleep 2
 
 # Use apt-get's built-in lock timeout (wait up to 5 minutes for locks to clear)
 # instead of a fragile fuser loop that can race between update and install.
-APT_OPTS=(-o DPkg::Lock::Timeout=300)
+APT_OPTS=(-o DPkg::Lock::Timeout=300 -o APT::Get::Lock::Timeout=300)
 
 echo "==> Installing runtime dependencies"
 apt-get "${APT_OPTS[@]}" update -q
