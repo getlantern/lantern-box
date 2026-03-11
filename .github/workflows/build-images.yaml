@@ -87,6 +87,62 @@ jobs:
             -only="${{ steps.version.outputs.builders }}" \
             lantern-box.pkr.hcl
 
+      - name: Update Vault with new image IDs
+        if: success()
+        working-directory: deploy/packer
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+          VAULT_SKIP_VERIFY: "1"
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -z "$VAULT_ADDR" ] || [ -z "$VAULT_TOKEN" ]; then
+            echo "::warning::VAULT_ADDR or VAULT_TOKEN not set, skipping Vault update"
+            exit 0
+          fi
+          if [ ! -f manifest.json ]; then
+            echo "::warning::manifest.json not found, skipping Vault update"
+            exit 0
+          fi
+
+          # Install vault CLI
+          curl -fsSL https://releases.hashicorp.com/vault/1.17.2/vault_1.17.2_linux_amd64.zip -o /tmp/vault.zip
+          unzip -o /tmp/vault.zip -d /tmp
+          chmod +x /tmp/vault
+
+          # Parse image IDs from packer manifest
+          oci_image=$(jq -r '.builds[] | select(.builder_type == "oracle-oci") | .artifact_id // empty' manifest.json)
+          linode_image=$(jq -r '.builds[] | select(.builder_type == "linode") | .artifact_id // empty' manifest.json)
+          do_image=$(jq -r '.builds[] | select(.builder_type == "digitalocean") | .artifact_id // empty' manifest.json)
+
+          echo "Packer images:"
+          echo "  OCI:          ${oci_image:-<not built>}"
+          echo "  Linode:       ${linode_image:-<not built>}"
+          echo "  DigitalOcean: ${do_image:-<not built>}"
+
+          # Build the packer_images Vault secret with all provider image IDs
+          images_json=$(jq -n \
+            --arg ver "$VERSION" \
+            --arg oci "$oci_image" \
+            --arg linode "$linode_image" \
+            --arg do "$do_image" \
+            '{version: $ver, oci: $oci, linode: $linode, digitalocean: $do}')
+
+          echo "Updating Vault secret/lantern_cloud/vps/packer_images..."
+          echo "$images_json" | /tmp/vault kv put secret/lantern_cloud/vps/packer_images -
+          echo "Done."
+
+          # Also update the OCI region config (image_id) used by the provision worker today
+          if [ -n "$oci_image" ]; then
+            current=$(/tmp/vault kv get -format=json secret/lantern_cloud/vps/oci_regions 2>/dev/null | jq '.data.data' || echo '{}')
+            updated=$(echo "$current" | jq --arg img "$oci_image" '
+              .regions |= with_entries(.value.image_id = $img)
+            ')
+            echo "Updating Vault secret/lantern_cloud/vps/oci_regions..."
+            echo "$updated" | /tmp/vault kv put secret/lantern_cloud/vps/oci_regions -
+            echo "Done."
+          fi
+
       - name: Clean up OCI key
         if: always()
         run: rm -f /tmp/oci_api_key.pem
