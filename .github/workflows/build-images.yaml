@@ -97,8 +97,8 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           if [ -z "$VAULT_ADDR" ] || [ -z "$VAULT_TOKEN" ]; then
-            echo "::warning::VAULT_ADDR or VAULT_TOKEN not set, skipping Vault update"
-            exit 0
+            echo "::error::VAULT_ADDR or VAULT_TOKEN not set — cannot update image IDs in Vault"
+            exit 1
           fi
           if [ ! -f manifest.json ]; then
             echo "::warning::manifest.json not found, skipping Vault update"
