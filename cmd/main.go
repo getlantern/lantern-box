@@ -54,16 +54,16 @@ func preRun(cmd *cobra.Command, args []string) {
 
 	if !otel.Enabled() {
 		log.Info("telemetry disabled (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)")
-		return
 	}
 
-	// Read proxy info as resource attributes.
 	var attrs []attribute.KeyValue
+	// Attempt to read proxy info, but this is merely informational,
+	// and may not be needed for every subcommand.
 	path, _ := cmd.Flags().GetString("config")
 	if path != "" {
 		iniPath := strings.Replace(path, ".json", ".ini", 1)
 		if info, err := readProxyInfo(iniPath); err != nil {
-			log.Warn("could not read proxy info: ", err)
+			log.Warn("could not read proxy info, skipping attribute addition: ", err)
 		} else {
 			attrs = info.resourceAttrs()
 		}
@@ -71,14 +71,14 @@ func preRun(cmd *cobra.Command, args []string) {
 
 	meterShutdown, err := otel.InitGlobalMeterProvider(attrs...)
 	if err != nil {
-		log.Warn("failed to init meter provider: ", err)
+		log.Error("init meter provider: ", err)
 		return
 	}
 	otelShutdownFuncs = append(otelShutdownFuncs, meterShutdown)
 
 	tracerShutdown, err := otel.InitGlobalTracerProvider(attrs...)
 	if err != nil {
-		log.Warn("failed to init tracer provider: ", err)
+		log.Error("init tracer provider: ", err)
 		return
 	}
 	otelShutdownFuncs = append(otelShutdownFuncs, tracerShutdown)
