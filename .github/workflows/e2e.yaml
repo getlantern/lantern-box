@@ -4,10 +4,11 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '.github/workflows/**'
-      - '*.md'
-      - 'LICENSE'
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
 
 env:
   DROPLET_NAME: "e2e-lantern-box-${{ github.run_id }}"
