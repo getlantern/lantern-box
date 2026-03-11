@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# VERSION is passed as an environment variable by Packer.
+: "${VERSION:?VERSION must be set}"
+
 echo "==> Installing runtime dependencies"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
@@ -11,22 +14,16 @@ apt-get install -y -q \
   nftables \
   wireguard-tools
 
-echo "==> Adding Gemfury apt repo"
-# Gemfury hosts the .deb packages produced by GoReleaser.
-# trusted=yes is required because Gemfury does not provide GPG-signed
-# repos. The token is removed from the image after install (see below).
-echo "deb [trusted=yes] https://${FURY_TOKEN}@apt.fury.io/getlantern/ /" \
-  > /etc/apt/sources.list.d/getlantern.list
-apt-get update -q
+echo "==> Downloading sing-box-extensions .deb from GitHub release"
+arch=$(dpkg --print-architecture)  # amd64 or arm64
+deb_name="sing-box-extensions_${VERSION}_linux_${arch}.deb"
+deb_url="https://github.com/getlantern/lantern-box/releases/download/v${VERSION}/${deb_name}"
+echo "    URL: ${deb_url}"
+curl -fsSL -o "/tmp/${deb_name}" "${deb_url}"
 
-echo "==> Installing sing-box-extensions (lantern-box)"
-# GoReleaser publishes the package as "sing-box-extensions".
-# Don't pin an exact version — nfpm appends a release suffix (e.g. -1)
-# that makes exact matching fragile. The Gemfury repo only has one version.
-apt-get install -y -q sing-box-extensions
-
-# Remove the Fury repo and credentials from the image immediately.
-rm -f /etc/apt/sources.list.d/getlantern.list
+echo "==> Installing ${deb_name}"
+dpkg -i "/tmp/${deb_name}"
+rm -f "/tmp/${deb_name}"
 
 # The .deb installs the binary as /usr/bin/sing-box-extensions.
 # The systemd service files reference /usr/bin/lantern-box, so create a symlink.
