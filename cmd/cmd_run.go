@@ -94,16 +94,15 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		return nil, nil, fmt.Errorf("create service: %w", err)
 	}
 
-	if datacapURL != "" {
-		// Add datacap tracker
-		log.Info("Datacap enabled. Creating trackers...")
-		clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
-			Inbound:  []string{""},
-			Outbound: []string{""},
-		}, log.StdLogger())
-		instance.Router().AppendTracker(clientCtxMgr)
-		service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
+	clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
+		Inbound:  []string{""},
+		Outbound: []string{""},
+	}, log.StdLogger())
+	instance.Router().AppendTracker(clientCtxMgr)
+	service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
 
+	if datacapURL != "" {
+		log.Info("Datacap enabled. Creating tracker...")
 		datacapTracker, err := datacap.NewDatacapTracker(
 			datacap.Options{
 				URL:            datacapURL,
