@@ -26,12 +26,24 @@ systemctl kill --signal=TERM apt-daily.service 2>/dev/null || true
 systemctl kill --signal=TERM apt-daily-upgrade.service 2>/dev/null || true
 # Kill any lingering apt/unattended-upgrade processes (but not dpkg — killing
 # dpkg mid-transaction can corrupt the package database).
-killall -9 apt-get unattended-upgrade 2>/dev/null || true
-sleep 2
+killall apt apt-get unattended-upgrade 2>/dev/null || true
+# Wait for all apt-family processes to actually exit (up to 2 minutes).
+# This is more reliable than a fixed sleep and avoids lock races.
+echo "==> Waiting for apt/dpkg processes to finish"
+deadline=$((SECONDS + 120))
+while [ $SECONDS -lt $deadline ]; do
+  if ! pgrep -x "apt|apt-get|dpkg|unattended-upgrade" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+if pgrep -x "apt|apt-get|dpkg|unattended-upgrade" >/dev/null 2>&1; then
+  echo "    WARNING: apt processes still running after 2 minutes, proceeding anyway" >&2
+fi
 
-# Use apt-get's built-in lock timeout (wait up to 5 minutes for locks to clear)
-# instead of a fragile fuser loop that can race between update and install.
-APT_OPTS=(-o DPkg::Lock::Timeout=300 -o APT::Get::Lock::Timeout=300)
+# DPkg::Lock::Timeout makes apt-get wait for the dpkg lock instead of failing
+# immediately. This is a safety net in case a dpkg process is still finishing.
+APT_OPTS=(-o DPkg::Lock::Timeout=300)
 
 echo "==> Installing runtime dependencies"
 apt-get "${APT_OPTS[@]}" update -q
