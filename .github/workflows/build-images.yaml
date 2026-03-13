@@ -13,9 +13,9 @@ on:
         required: true
         type: string
       builders:
-        description: "Comma-separated builders (digitalocean,linode,oracle-oci)"
+        description: "Comma-separated builders (digitalocean,linode,oracle-oci-iad,oracle-oci-fra,oracle-oci-nrt,oracle-oci-sin)"
         required: false
-        default: "digitalocean,linode,oracle-oci"
+        default: "digitalocean,linode,oracle-oci-iad,oracle-oci-fra,oracle-oci-nrt,oracle-oci-sin"
         type: string
 
 permissions:
@@ -37,7 +37,7 @@ jobs:
           if [ "${{ github.event_name }}" = "release" ]; then
             # Strip the leading 'v' from the tag
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-            echo "builders=digitalocean.lantern-box,linode.lantern-box,oracle-oci.lantern-box" >> "$GITHUB_OUTPUT"
+            echo "builders=digitalocean.lantern-box,linode.lantern-box,oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin" >> "$GITHUB_OUTPUT"
           else
             version="${{ inputs.version }}"
             if [[ "$version" == v* ]]; then
@@ -45,12 +45,26 @@ jobs:
               exit 1
             fi
             echo "version=$version" >> "$GITHUB_OUTPUT"
-            # Convert comma-separated builder names to packer format
+            # Convert comma-separated builder names to packer -only format.
+            # Input names like "oracle-oci-iad" map to "oracle-oci.lantern-box-iad".
+            # Non-OCI names like "digitalocean" map to "digitalocean.lantern-box".
             builders=""
             IFS=',' read -ra PARTS <<< "${{ inputs.builders }}"
             for part in "${PARTS[@]}"; do
               part=$(echo "$part" | xargs)  # trim whitespace
-              builders="${builders:+$builders,}${part}.lantern-box"
+              case "$part" in
+                oracle-oci-*)
+                  region_code="${part#oracle-oci-}"
+                  builders="${builders:+$builders,}oracle-oci.lantern-box-${region_code}"
+                  ;;
+                oracle-oci)
+                  # Legacy name: expand to all OCI regions
+                  builders="${builders:+$builders,}oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin"
+                  ;;
+                *)
+                  builders="${builders:+$builders,}${part}.lantern-box"
+                  ;;
+              esac
             done
             echo "builders=$builders" >> "$GITHUB_OUTPUT"
           fi
@@ -74,13 +88,24 @@ jobs:
         env:
           DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
           LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          # OCI shared auth
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_KEY_FILE: /tmp/oci_api_key.pem
           OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
-          OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
-          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          # OCI per-region: IAD (us-ashburn-1) — falls back to legacy secret names
+          OCI_SUBNET_OCID_IAD: ${{ secrets.OCI_SUBNET_OCID_IAD || secrets.OCI_SUBNET_OCID }}
+          OCI_AVAILABILITY_DOMAIN_IAD: ${{ secrets.OCI_AVAILABILITY_DOMAIN_IAD || secrets.OCI_AVAILABILITY_DOMAIN }}
+          # OCI per-region: FRA (eu-frankfurt-1)
+          OCI_SUBNET_OCID_FRA: ${{ secrets.OCI_SUBNET_OCID_FRA }}
+          OCI_AVAILABILITY_DOMAIN_FRA: ${{ secrets.OCI_AVAILABILITY_DOMAIN_FRA }}
+          # OCI per-region: NRT (ap-tokyo-1)
+          OCI_SUBNET_OCID_NRT: ${{ secrets.OCI_SUBNET_OCID_NRT }}
+          OCI_AVAILABILITY_DOMAIN_NRT: ${{ secrets.OCI_AVAILABILITY_DOMAIN_NRT }}
+          # OCI per-region: SIN (ap-singapore-1)
+          OCI_SUBNET_OCID_SIN: ${{ secrets.OCI_SUBNET_OCID_SIN }}
+          OCI_AVAILABILITY_DOMAIN_SIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN_SIN }}
         run: |
           packer build \
             -var "lantern_box_version=${{ steps.version.outputs.version }}" \
@@ -121,42 +146,75 @@ jobs:
           unzip -o /tmp/vault.zip -d /tmp
           chmod +x /tmp/vault
 
-          # Parse image IDs from packer manifest
-          oci_image=$(jq -r '.builds[] | select(.builder_type == "oracle-oci") | .artifact_id // empty' manifest.json)
+          # Parse per-region OCI images from packer manifest.
+          # Each OCI source is named "lantern-box-<code>" where code maps to a region.
+          oci_image_iad=$(jq -r '.builds[] | select(.name == "lantern-box-iad") | .artifact_id // empty' manifest.json)
+          oci_image_fra=$(jq -r '.builds[] | select(.name == "lantern-box-fra") | .artifact_id // empty' manifest.json)
+          oci_image_nrt=$(jq -r '.builds[] | select(.name == "lantern-box-nrt") | .artifact_id // empty' manifest.json)
+          oci_image_sin=$(jq -r '.builds[] | select(.name == "lantern-box-sin") | .artifact_id // empty' manifest.json)
           linode_image=$(jq -r '.builds[] | select(.builder_type == "linode") | .artifact_id // empty' manifest.json)
           do_image=$(jq -r '.builds[] | select(.builder_type == "digitalocean") | .artifact_id // empty' manifest.json)
 
           echo "Packer images:"
-          echo "  OCI:          ${oci_image:-<not built>}"
+          echo "  OCI IAD:      ${oci_image_iad:-<not built>}"
+          echo "  OCI FRA:      ${oci_image_fra:-<not built>}"
+          echo "  OCI NRT:      ${oci_image_nrt:-<not built>}"
+          echo "  OCI SIN:      ${oci_image_sin:-<not built>}"
           echo "  Linode:       ${linode_image:-<not built>}"
           echo "  DigitalOcean: ${do_image:-<not built>}"
 
-          # Build the packer_images Vault secret with all provider image IDs
-          images_json=$(jq -n \
+          # Merge new image IDs into the existing packer_images Vault secret.
+          # Only non-empty values are written, preserving previously built images.
+          existing=$(/tmp/vault kv get -format=json secret/lantern_cloud/vps/packer_images 2>/dev/null | jq '.data.data // {}' || echo '{}')
+          images_json=$(echo "$existing" | jq \
             --arg ver "$VERSION" \
-            --arg oci "$oci_image" \
+            --arg oci_iad "$oci_image_iad" \
+            --arg oci_fra "$oci_image_fra" \
+            --arg oci_nrt "$oci_image_nrt" \
+            --arg oci_sin "$oci_image_sin" \
             --arg linode "$linode_image" \
             --arg do "$do_image" \
-            '{version: $ver, oci: $oci, linode: $linode, digitalocean: $do}')
+            '. + {version: $ver}
+             | if $oci_iad != "" then .oci_iad = $oci_iad else . end
+             | if $oci_fra != "" then .oci_fra = $oci_fra else . end
+             | if $oci_nrt != "" then .oci_nrt = $oci_nrt else . end
+             | if $oci_sin != "" then .oci_sin = $oci_sin else . end
+             | if $linode != "" then .linode = $linode else . end
+             | if $do != "" then .digitalocean = $do else . end')
 
           echo "Updating Vault secret/lantern_cloud/vps/packer_images..."
           echo "$images_json" | /tmp/vault kv put secret/lantern_cloud/vps/packer_images -
           echo "Done."
 
-          # Also update the OCI region config (image_id) used by the provision worker today
-          if [ -n "$oci_image" ]; then
-            current=$(/tmp/vault kv get -format=json secret/lantern_cloud/vps/oci_regions 2>/dev/null | jq '.data.data' || echo '{}')
-            regions_type=$(echo "$current" | jq -r 'if has("regions") then (.regions | type) else "null" end' 2>/dev/null || echo "null")
-            if [ "$regions_type" != "object" ]; then
-              echo "::warning::Vault secret/lantern_cloud/vps/oci_regions has no valid .regions object; skipping OCI regions image_id update"
-            else
-              updated=$(echo "$current" | jq --arg img "$oci_image" '
-                .regions |= with_entries(.value.image_id = $img)
-              ')
-              echo "Updating Vault secret/lantern_cloud/vps/oci_regions..."
-              echo "$updated" | /tmp/vault kv put secret/lantern_cloud/vps/oci_regions -
-              echo "Done."
-            fi
+          # Update OCI region configs with per-region image IDs.
+          # Only update regions that were actually built (non-empty image ID).
+          current=$(/tmp/vault kv get -format=json secret/lantern_cloud/vps/oci_regions 2>/dev/null | jq '.data.data' || echo '{}')
+          regions_type=$(echo "$current" | jq -r 'if has("regions") then (.regions | type) else "null" end' 2>/dev/null || echo "null")
+          if [ "$regions_type" != "object" ]; then
+            echo "::warning::Vault secret/lantern_cloud/vps/oci_regions has no valid .regions object; skipping OCI regions image_id update"
+          else
+            updated="$current"
+            for pair in \
+              "us-ashburn-1:$oci_image_iad" \
+              "eu-frankfurt-1:$oci_image_fra" \
+              "ap-tokyo-1:$oci_image_nrt" \
+              "ap-singapore-1:$oci_image_sin"; do
+              region="${pair%%:*}"
+              img="${pair#*:}"
+              if [ -n "$img" ]; then
+                has_region=$(echo "$updated" | jq --arg r "$region" 'if .regions[$r] then "yes" else "no" end' -r)
+                if [ "$has_region" = "no" ]; then
+                  echo "::warning::Region $region was built (image $img) but does not exist in Vault oci_regions; skipping. Add it to Vault first."
+                  continue
+                fi
+                updated=$(echo "$updated" | jq --arg r "$region" --arg img "$img" '
+                  .regions[$r].image_id = $img
+                ')
+              fi
+            done
+            echo "Updating Vault secret/lantern_cloud/vps/oci_regions..."
+            echo "$updated" | /tmp/vault kv put secret/lantern_cloud/vps/oci_regions -
+            echo "Done."
           fi
 
       - name: Clean up OCI key
