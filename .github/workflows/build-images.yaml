@@ -57,6 +57,10 @@ jobs:
                   region_code="${part#oracle-oci-}"
                   builders="${builders:+$builders,}oracle-oci.lantern-box-${region_code}"
                   ;;
+                oracle-oci)
+                  # Legacy name: expand to all OCI regions
+                  builders="${builders:+$builders,}oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin"
+                  ;;
                 *)
                   builders="${builders:+$builders,}${part}.lantern-box"
                   ;;
@@ -159,8 +163,10 @@ jobs:
           echo "  Linode:       ${linode_image:-<not built>}"
           echo "  DigitalOcean: ${do_image:-<not built>}"
 
-          # Build the packer_images Vault secret with all provider image IDs
-          images_json=$(jq -n \
+          # Merge new image IDs into the existing packer_images Vault secret.
+          # Only non-empty values are written, preserving previously built images.
+          existing=$(/tmp/vault kv get -format=json secret/lantern_cloud/vps/packer_images 2>/dev/null | jq '.data.data // {}' || echo '{}')
+          images_json=$(echo "$existing" | jq \
             --arg ver "$VERSION" \
             --arg oci_iad "$oci_image_iad" \
             --arg oci_fra "$oci_image_fra" \
@@ -168,7 +174,13 @@ jobs:
             --arg oci_sin "$oci_image_sin" \
             --arg linode "$linode_image" \
             --arg do "$do_image" \
-            '{version: $ver, oci_iad: $oci_iad, oci_fra: $oci_fra, oci_nrt: $oci_nrt, oci_sin: $oci_sin, linode: $linode, digitalocean: $do}')
+            '. + {version: $ver}
+             | if $oci_iad != "" then .oci_iad = $oci_iad else . end
+             | if $oci_fra != "" then .oci_fra = $oci_fra else . end
+             | if $oci_nrt != "" then .oci_nrt = $oci_nrt else . end
+             | if $oci_sin != "" then .oci_sin = $oci_sin else . end
+             | if $linode != "" then .linode = $linode else . end
+             | if $do != "" then .digitalocean = $do else . end')
 
           echo "Updating Vault secret/lantern_cloud/vps/packer_images..."
           echo "$images_json" | /tmp/vault kv put secret/lantern_cloud/vps/packer_images -
@@ -190,8 +202,13 @@ jobs:
               region="${pair%%:*}"
               img="${pair#*:}"
               if [ -n "$img" ]; then
+                has_region=$(echo "$updated" | jq --arg r "$region" 'if .regions[$r] then "yes" else "no" end' -r)
+                if [ "$has_region" = "no" ]; then
+                  echo "::warning::Region $region was built (image $img) but does not exist in Vault oci_regions; skipping. Add it to Vault first."
+                  continue
+                fi
                 updated=$(echo "$updated" | jq --arg r "$region" --arg img "$img" '
-                  if .regions[$r] then .regions[$r].image_id = $img else . end
+                  .regions[$r].image_id = $img
                 ')
               fi
             done

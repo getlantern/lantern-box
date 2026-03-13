@@ -76,14 +76,15 @@ variable "oci_compartment_ocid" {
 }
 
 # OCI per-region variables: us-ashburn-1 (IAD)
+# Falls back to legacy OCI_SUBNET_OCID / OCI_AVAILABILITY_DOMAIN for backward compatibility.
 variable "oci_subnet_ocid_iad" {
   type    = string
-  default = env("OCI_SUBNET_OCID_IAD")
+  default = env("OCI_SUBNET_OCID_IAD") != "" ? env("OCI_SUBNET_OCID_IAD") : env("OCI_SUBNET_OCID")
 }
 
 variable "oci_availability_domain_iad" {
   type    = string
-  default = env("OCI_AVAILABILITY_DOMAIN_IAD")
+  default = env("OCI_AVAILABILITY_DOMAIN_IAD") != "" ? env("OCI_AVAILABILITY_DOMAIN_IAD") : env("OCI_AVAILABILITY_DOMAIN")
 }
 
 # OCI per-region variables: eu-frankfurt-1 (FRA)
