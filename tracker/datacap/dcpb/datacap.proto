@@ -1,0 +1,43 @@
+syntax = "proto3";
+package lantern_cloud.api;
+option go_package = "github.com/getlantern/lantern-box/tracker/datacap/dcpb";
+
+message DataCapUsageBatch {
+    repeated DataCapUsage records = 1;
+}
+
+message DataCapUsage {
+    string deviceId = 1;
+    int64 bytesUsed = 2;
+    int64 capLimit = 3;
+    string countryCode = 5;
+    string platform = 6;
+}
+
+message ReportUsageResponse {
+    repeated UsageResult results = 1;
+}
+
+message UsageResult {
+    string deviceId = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+message DataCapSyncRequest {
+    string deviceId = 1;
+}
+
+message DataCapSyncResponse {
+    string deviceId = 1;
+    int64 bytesUsed = 2;
+    int64 capLimit = 3;
+    int64 expiryTime = 5;
+    string countryCode = 6;
+    string platform = 7;
+}
+
+service DataCapService {
+    rpc ReportUsage(DataCapUsageBatch) returns (ReportUsageResponse);
+    rpc SyncDeviceState(DataCapSyncRequest) returns (DataCapSyncResponse);
+}
