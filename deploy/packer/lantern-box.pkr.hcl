@@ -45,7 +45,7 @@ variable "linode_region" {
   default = "us-west"
 }
 
-# OCI variables
+# OCI shared variables (same across all regions)
 variable "oci_tenancy_ocid" {
   type      = string
   sensitive = true
@@ -75,19 +75,48 @@ variable "oci_compartment_ocid" {
   default = env("OCI_COMPARTMENT_OCID")
 }
 
-variable "oci_subnet_ocid" {
+# OCI per-region variables: us-ashburn-1 (IAD)
+variable "oci_subnet_ocid_iad" {
   type    = string
-  default = env("OCI_SUBNET_OCID")
+  default = env("OCI_SUBNET_OCID_IAD")
 }
 
-variable "oci_availability_domain" {
+variable "oci_availability_domain_iad" {
   type    = string
-  default = env("OCI_AVAILABILITY_DOMAIN")
+  default = env("OCI_AVAILABILITY_DOMAIN_IAD")
 }
 
-variable "oci_region" {
+# OCI per-region variables: eu-frankfurt-1 (FRA)
+variable "oci_subnet_ocid_fra" {
   type    = string
-  default = "us-ashburn-1"
+  default = env("OCI_SUBNET_OCID_FRA")
+}
+
+variable "oci_availability_domain_fra" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_FRA")
+}
+
+# OCI per-region variables: ap-tokyo-1 (NRT)
+variable "oci_subnet_ocid_nrt" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_NRT")
+}
+
+variable "oci_availability_domain_nrt" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_NRT")
+}
+
+# OCI per-region variables: ap-singapore-1 (SIN)
+variable "oci_subnet_ocid_sin" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_SIN")
+}
+
+variable "oci_availability_domain_sin" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_SIN")
 }
 
 # ---------- Sources ----------
@@ -106,18 +135,19 @@ source "digitalocean" "lantern-box" {
   state_timeout = "10m"
 }
 
-# OCI API key auth — all fields must be explicit (plugin doesn't read env vars directly).
+# OCI sources — one per region. All share auth + compartment but use
+# region-specific subnet, AD, and produce region-local images.
 # See: https://developer.hashicorp.com/packer/integrations/hashicorp/oracle/latest/components/builder/oci
-source "oracle-oci" "lantern-box" {
+
+source "oracle-oci" "lantern-box-iad" {
   tenancy_ocid        = var.oci_tenancy_ocid
   user_ocid           = var.oci_user_ocid
   fingerprint         = var.oci_fingerprint
   key_file            = var.oci_key_file
   compartment_ocid    = var.oci_compartment_ocid
-  availability_domain = var.oci_availability_domain
-  region              = var.oci_region
+  availability_domain = var.oci_availability_domain_iad
+  region              = "us-ashburn-1"
 
-  # Ampere A1 (ARM) — cost-effective and included in OCI Always Free tier
   base_image_filter {
     display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
     operating_system    = "Canonical Ubuntu"
@@ -127,10 +157,82 @@ source "oracle-oci" "lantern-box" {
     ocpus         = 1
     memory_in_gbs = 1
   }
-  subnet_ocid  = var.oci_subnet_ocid
+  subnet_ocid  = var.oci_subnet_ocid_iad
   ssh_username = "ubuntu"
 
-  image_name = "lantern-box-${var.lantern_box_version}-arm64"
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-iad"
+}
+
+source "oracle-oci" "lantern-box-fra" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_fra
+  region              = "eu-frankfurt-1"
+
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.A1.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 1
+  }
+  subnet_ocid  = var.oci_subnet_ocid_fra
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-fra"
+}
+
+source "oracle-oci" "lantern-box-nrt" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_nrt
+  region              = "ap-tokyo-1"
+
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.A1.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 1
+  }
+  subnet_ocid  = var.oci_subnet_ocid_nrt
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-nrt"
+}
+
+source "oracle-oci" "lantern-box-sin" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_sin
+  region              = "ap-singapore-1"
+
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.A1.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 1
+  }
+  subnet_ocid  = var.oci_subnet_ocid_sin
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-sin"
 }
 
 source "linode" "lantern-box" {
@@ -149,7 +251,10 @@ build {
   sources = [
     "source.digitalocean.lantern-box",
     "source.linode.lantern-box",
-    "source.oracle-oci.lantern-box",
+    "source.oracle-oci.lantern-box-iad",
+    "source.oracle-oci.lantern-box-fra",
+    "source.oracle-oci.lantern-box-nrt",
+    "source.oracle-oci.lantern-box-sin",
   ]
 
   # Upload OTel Collector config before the shell provisioner copies it into place.

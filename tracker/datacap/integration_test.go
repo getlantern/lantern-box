@@ -127,7 +127,7 @@ func TestDataCapEndToEndNoThrottling(t *testing.T) {
 	// Create datacap-wrapped connection
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID:    "test-device",
 			CountryCode: "US",
@@ -209,7 +209,7 @@ func TestDataCapEndToEndWithThrottling(t *testing.T) {
 	// Create datacap-wrapped connection with throttling
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID:    "test-device",
 			CountryCode: "US",
@@ -298,7 +298,7 @@ func TestDataCapThrottleSpeedAdjustment(t *testing.T) {
 			// Create datacap-wrapped connection
 			config := ConnConfig{
 				Conn:   mockConn,
-				Client: nil, // No client needed for this test
+				Sink: nil, // No sink needed for this test
 				ClientInfo: clientcontext.ClientInfo{
 					DeviceID: "test-device",
 				},
@@ -355,7 +355,7 @@ func TestDataCapPeriodicReporting(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID:    "test-device",
 			CountryCode: "US",
@@ -425,7 +425,7 @@ func TestDataCapFinalReportOnClose(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID:    "test-device-final",
 			CountryCode: "US",
@@ -472,7 +472,7 @@ func TestDataCapSidecarUnreachable(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
@@ -517,7 +517,7 @@ func TestDataCapSidecarReturnsError(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
@@ -546,7 +546,7 @@ func TestDataCapNilClient(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: nil, // Datacap disabled
+		Sink: nil, // Datacap disabled
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
@@ -589,7 +589,7 @@ func TestDataCapZeroBytes(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
@@ -624,7 +624,7 @@ func TestDataCapConcurrentReadWrite(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
@@ -702,7 +702,7 @@ func TestDataCapMultipleClose(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
@@ -730,7 +730,7 @@ func TestDataCapThrottleDisableAfterEnable(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: nil,
+		Sink: nil,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
@@ -781,7 +781,7 @@ func TestDataCapEmptyDeviceID(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "", // Empty device ID
 		},
@@ -826,7 +826,7 @@ func TestDataCapLargeDataTransfer(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
@@ -876,7 +876,7 @@ func TestDataCapRapidOpenClose(t *testing.T) {
 
 		config := ConnConfig{
 			Conn:   mockConn,
-			Client: client,
+			Sink: client,
 			ClientInfo: clientcontext.ClientInfo{
 				DeviceID: "test-device",
 			},
@@ -929,7 +929,7 @@ func TestDataCapStatusCheckAfterReport(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
@@ -982,7 +982,7 @@ func TestDataCapDifferentPlatforms(t *testing.T) {
 
 			config := ConnConfig{
 				Conn:   mockConn,
-				Client: client,
+				Sink: client,
 				ClientInfo: clientcontext.ClientInfo{
 					DeviceID: "test-device",
 					Platform: platform,
@@ -1035,7 +1035,7 @@ func TestDataCapCountryCodeVariations(t *testing.T) {
 
 			config := ConnConfig{
 				Conn:   mockConn,
-				Client: client,
+				Sink: client,
 				ClientInfo: clientcontext.ClientInfo{
 					DeviceID:    "test-device",
 					CountryCode: code,
@@ -1073,7 +1073,7 @@ func TestDataCapReadWriteErrors(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},
@@ -1118,7 +1118,7 @@ func TestDataCapContextCancellation(t *testing.T) {
 
 	config := ConnConfig{
 		Conn:   mockConn,
-		Client: client,
+		Sink:   client,
 		ClientInfo: clientcontext.ClientInfo{
 			DeviceID: "test-device",
 		},

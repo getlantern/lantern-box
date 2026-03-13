@@ -34,7 +34,23 @@ func init() {
 	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz", "URL for downloading GeoLite2-City database")
 	runCmd.Flags().String("city-database-name", "GeoLite2-City.mmdb", "Filename for storing GeoLite2-City database")
 	runCmd.Flags().String("telemetry-endpoint", "telemetry.iantem.io:443", "Telemetry endpoint for OpenTelemetry exporter")
-	runCmd.Flags().String("datacap-url", "", "Datacap server URL")
+	runCmd.Flags().String("datacap-url", "", "Datacap sidecar URL (legacy mode)")
+	runCmd.Flags().String("datacap-grpc-api", "", "Datacap cloud gRPC API address (direct mode, mutually exclusive with --datacap-url)")
+	runCmd.Flags().Duration("datacap-batch-interval", 30*time.Second, "Datacap batch upload interval (direct mode)")
+	runCmd.Flags().Duration("datacap-cache-ttl", 5*time.Minute, "Datacap device state cache TTL (direct mode)")
+	runCmd.Flags().String("datacap-ca-cert", "", "Path to CA cert for datacap mTLS")
+	runCmd.Flags().String("datacap-client-cert", "", "Path to client cert for datacap mTLS")
+	runCmd.Flags().String("datacap-client-key", "", "Path to client key for datacap mTLS")
+}
+
+type datacapFlags struct {
+	URL            string
+	GRPCAPI        string
+	CACertPath     string
+	ClientCertPath string
+	ClientKeyPath  string
+	BatchInterval  time.Duration
+	CacheTTL       time.Duration
 }
 
 var runCmd = &cobra.Command{
@@ -45,11 +61,23 @@ var runCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("get config flag: %w", err)
 		}
-		datacapURL, err := cmd.Flags().GetString("datacap-url")
-		if err != nil {
-			return fmt.Errorf("get datacap-url flag: %w", err)
+		dcFlags := datacapFlags{}
+		dcFlags.URL, _ = cmd.Flags().GetString("datacap-url")
+		dcFlags.GRPCAPI, _ = cmd.Flags().GetString("datacap-grpc-api")
+		if dcFlags.GRPCAPI == "" {
+			dcFlags.GRPCAPI = os.Getenv("DATACAP_GRPC_API")
 		}
-		return run(path, datacapURL)
+		dcFlags.CACertPath, _ = cmd.Flags().GetString("datacap-ca-cert")
+		dcFlags.ClientCertPath, _ = cmd.Flags().GetString("datacap-client-cert")
+		dcFlags.ClientKeyPath, _ = cmd.Flags().GetString("datacap-client-key")
+		dcFlags.BatchInterval, _ = cmd.Flags().GetDuration("datacap-batch-interval")
+		dcFlags.CacheTTL, _ = cmd.Flags().GetDuration("datacap-cache-ttl")
+
+		if dcFlags.URL != "" && dcFlags.GRPCAPI != "" {
+			return fmt.Errorf("--datacap-url and --datacap-grpc-api are mutually exclusive")
+		}
+
+		return run(path, dcFlags)
 	},
 }
 
@@ -78,7 +106,7 @@ func readConfig(path string) (option.Options, error) {
 	return options, nil
 }
 
-func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc, error) {
+func create(configPath string, dcFlags datacapFlags) (*box.Box, context.CancelFunc, error) {
 	options, err := readConfig(configPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read config: %w", err)
@@ -101,11 +129,42 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 	instance.Router().AppendTracker(clientCtxMgr)
 	service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
 
-	if datacapURL != "" {
-		log.Info("Datacap enabled. Creating tracker...")
+	if dcFlags.GRPCAPI != "" {
+		log.Info("Datacap direct mode enabled (gRPC API: ", dcFlags.GRPCAPI, ")")
+		var mtls *datacapMTLSConfig
+		if dcFlags.ClientCertPath != "" {
+			mtls = &datacapMTLSConfig{
+				CACertPath:     dcFlags.CACertPath,
+				ClientCertPath: dcFlags.ClientCertPath,
+				ClientKeyPath:  dcFlags.ClientKeyPath,
+			}
+		}
+		grpcConn, err := newDataCapGRPCConn(dcFlags.GRPCAPI, mtls)
+		if err != nil {
+			cancel()
+			return nil, nil, fmt.Errorf("create datacap gRPC connection: %w", err)
+		}
+		api := newGRPCDataCapAPI(grpcConn)
+		store := datacap.NewDeviceUsageStore(api, datacap.StoreOptions{
+			BatchInterval: dcFlags.BatchInterval,
+			CacheTTL:      dcFlags.CacheTTL,
+		}, log.StdLogger())
+		tracker := datacap.NewDatacapTrackerWithStore(store, 10*time.Second, log.StdLogger())
+		tracker.Start(ctx)
+		clientCtxMgr.AppendTracker(tracker)
+		// Register shutdown hook for graceful batch upload
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer shutdownCancel()
+			tracker.Stop(shutdownCtx)
+			grpcConn.Close()
+		}()
+	} else if dcFlags.URL != "" {
+		log.Info("Datacap sidecar mode enabled (URL: ", dcFlags.URL, ")")
 		datacapTracker, err := datacap.NewDatacapTracker(
 			datacap.Options{
-				URL:            datacapURL,
+				URL:            dcFlags.URL,
 				ReportInterval: "10s",
 			},
 			log.StdLogger(),
@@ -116,7 +175,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		}
 		clientCtxMgr.AppendTracker(datacapTracker)
 	} else {
-		log.Warn("Datacap URL not provided, datacap tracking disabled")
+		log.Warn("Datacap not configured, datacap tracking disabled")
 	}
 
 	mp := otel.GetMeterProvider()
@@ -161,13 +220,13 @@ func closeMonitor(ctx context.Context) {
 	log.Fatal("sing-box did not close!")
 }
 
-func run(configPath string, datacapURL string) error {
+func run(configPath string, dcFlags datacapFlags) error {
 	log.Info("build info: version ", version, ", commit ", commit)
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(osSignals)
 	for {
-		instance, cancel, err := create(configPath, datacapURL)
+		instance, cancel, err := create(configPath, dcFlags)
 		if err != nil {
 			return err
 		}

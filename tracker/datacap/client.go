@@ -147,3 +147,8 @@ func (c *Client) ReportDataCapConsumption(ctx context.Context, report *DataCapRe
 
 	return &status, nil
 }
+
+// Report implements ReportSink by delegating to ReportDataCapConsumption.
+func (c *Client) Report(ctx context.Context, report *DataCapReport) (*DataCapStatus, error) {
+	return c.ReportDataCapConsumption(ctx, report)
+}
