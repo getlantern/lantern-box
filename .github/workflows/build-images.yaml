@@ -139,9 +139,19 @@ jobs:
             export VAULT_SKIP_VERIFY=1
           fi
 
-          # Install vault CLI with checksum verification
-          curl -fsSL https://releases.hashicorp.com/vault/1.17.2/vault_1.17.2_linux_amd64.zip -o /tmp/vault.zip
-          curl -fsSL https://releases.hashicorp.com/vault/1.17.2/vault_1.17.2_SHA256SUMS -o /tmp/vault_SHA256SUMS
+          # Install vault CLI with retry and checksum verification
+          for attempt in 1 2 3; do
+            echo "Downloading vault CLI (attempt $attempt)..."
+            curl -fsSL --retry 3 --retry-delay 2 \
+              https://releases.hashicorp.com/vault/1.17.2/vault_1.17.2_linux_amd64.zip -o /tmp/vault.zip && break
+            echo "::warning::Download attempt $attempt failed, retrying..."
+            rm -f /tmp/vault.zip
+          done
+          if [ ! -f /tmp/vault.zip ]; then
+            echo "::error::Failed to download vault CLI after 3 attempts"
+            exit 1
+          fi
+          curl -fsSL --retry 3 https://releases.hashicorp.com/vault/1.17.2/vault_1.17.2_SHA256SUMS -o /tmp/vault_SHA256SUMS
           (cd /tmp && grep 'vault_1.17.2_linux_amd64.zip' vault_SHA256SUMS | sha256sum -c -)
           unzip -o /tmp/vault.zip -d /tmp
           chmod +x /tmp/vault
