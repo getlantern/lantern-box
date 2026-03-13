@@ -20,6 +20,7 @@ import (
 	_ "github.com/refraction-networking/water/transport/v1"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/conntrack"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -108,7 +109,16 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		TransportModuleBin: b,
 		OverrideLogger:     slogLogger,
 		NetworkDialerFunc: func(network, address string) (net.Conn, error) {
-			return outboundDialer.DialContext(log.ContextWithNewID(ctx), network, serverAddr)
+			conn, err := outboundDialer.DialContext(log.ContextWithNewID(ctx), network, serverAddr)
+			if err != nil {
+				return nil, err
+			}
+			switch conn := conn.(type) {
+			case *conntrack.Conn:
+				return conn.Conn, nil
+			default:
+				return conn, nil
+			}
 		},
 	}
 
