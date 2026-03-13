@@ -1,6 +1,6 @@
 # lantern-box
 
-Lantern Box is the Lantern fork of [sing-box](https://github.com/SagerNet/sing-box) -- the universal proxy platform -- with extra protocols built for places where the internet comes with walls. It adds [Samizdat](https://github.com/getlantern/samizdat), [WATER](https://arxiv.org/html/2312.00163v2), [Outline SDK smart dialer](https://github.com/Jigsaw-Code/outline-sdk/tree/main/x/smart), [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/), and [ALGeneva](https://www.usenix.org/system/files/sec22-harrity.pdf) to the sing-box ecosystem.
+Lantern Box is a censorship circumvention proxy and client platform that's built on [sing-box](https://github.com/SagerNet/sing-box) -- the universal proxy platform -- with extra protocols built for places where the internet comes with walls. It adds [Samizdat](https://github.com/getlantern/samizdat), [WATER](https://arxiv.org/html/2312.00163v2), [Outline SDK smart dialer](https://github.com/Jigsaw-Code/outline-sdk/tree/main/x/smart), [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/), and [ALGeneva](https://www.usenix.org/system/files/sec22-harrity.pdf) to the sing-box ecosystem.
 
 The goal is to be as useful as possible to the censorship circumvention community. Operators are encouraged to run servers and hand configs to users. We contribute changes upstream whenever we can.
 
