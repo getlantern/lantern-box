@@ -71,6 +71,8 @@ jobs:
 
       - name: Setup Packer
         uses: hashicorp/setup-packer@v3
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           version: 1.11.2
 
@@ -117,7 +119,7 @@ jobs:
         run: rm -f /tmp/oci_api_key.pem
 
       - name: Upload manifest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         if: always()
         with:
           name: packer-manifest
