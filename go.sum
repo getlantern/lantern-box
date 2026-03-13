@@ -182,8 +182,8 @@ github.com/getlantern/hidden v0.0.0-20190325191715-f02dbb02be55 h1:XYzSdCbkzOC0F
 github.com/getlantern/hidden v0.0.0-20190325191715-f02dbb02be55/go.mod h1:6mmzY2kW1TOOrVy+r41Za2MxXM+hhqTtY3oBKd2AgFA=
 github.com/getlantern/keepcurrent v0.0.0-20221014183517-fcee77376b89 h1:gjlTAADW8ZUrIey+u1ZtbVlI91bqI0Bu+GBxvRlBBqo=
 github.com/getlantern/keepcurrent v0.0.0-20221014183517-fcee77376b89/go.mod h1:EtJEobtQH/HiQsZLyRjlrnq/fu7vfgnTMzhbmUqkZ3M=
-github.com/getlantern/lantern-water v0.0.0-20260306114106-aa194f060592 h1:asN1IaWrOGISB8Cp6aDBGT6EyeK8SyADIfieol+iu5Y=
-github.com/getlantern/lantern-water v0.0.0-20260306114106-aa194f060592/go.mod h1:3JpJgwi4KEI6rS9loOAvcBp+F2jP65d0tTg2GQcTPBU=
+github.com/getlantern/lantern-water v0.0.0-20260313142412-dfc64287c8c8 h1:FgWUZXVvhUDjkcx5wBub5FDx82mMuJDhUcMLECx/onQ=
+github.com/getlantern/lantern-water v0.0.0-20260313142412-dfc64287c8c8/go.mod h1:3JpJgwi4KEI6rS9loOAvcBp+F2jP65d0tTg2GQcTPBU=
 github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f h1:wrYrQttPS8FHIRSlsrcuKazukx/xqO/PpLZzZXsF+EA=
 github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f/go.mod h1:D5ao98qkA6pxftxoqzibIBBrLSUli+kYnJqrgBf9cIA=
 github.com/getlantern/samizdat v0.0.3-0.20260310125445-325cf1bd1b60 h1:m9eXjDK9vllbVH467+QXbrxUFFM9Yp7YJ90wZLw4dwU=
