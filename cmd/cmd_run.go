@@ -62,16 +62,30 @@ var runCmd = &cobra.Command{
 			return fmt.Errorf("get config flag: %w", err)
 		}
 		dcFlags := datacapFlags{}
-		dcFlags.URL, _ = cmd.Flags().GetString("datacap-url")
-		dcFlags.GRPCAPI, _ = cmd.Flags().GetString("datacap-grpc-api")
+		if dcFlags.URL, err = cmd.Flags().GetString("datacap-url"); err != nil {
+			return fmt.Errorf("get datacap-url flag: %w", err)
+		}
+		if dcFlags.GRPCAPI, err = cmd.Flags().GetString("datacap-grpc-api"); err != nil {
+			return fmt.Errorf("get datacap-grpc-api flag: %w", err)
+		}
 		if dcFlags.GRPCAPI == "" {
 			dcFlags.GRPCAPI = os.Getenv("DATACAP_GRPC_API")
 		}
-		dcFlags.CACertPath, _ = cmd.Flags().GetString("datacap-ca-cert")
-		dcFlags.ClientCertPath, _ = cmd.Flags().GetString("datacap-client-cert")
-		dcFlags.ClientKeyPath, _ = cmd.Flags().GetString("datacap-client-key")
-		dcFlags.BatchInterval, _ = cmd.Flags().GetDuration("datacap-batch-interval")
-		dcFlags.CacheTTL, _ = cmd.Flags().GetDuration("datacap-cache-ttl")
+		if dcFlags.CACertPath, err = cmd.Flags().GetString("datacap-ca-cert"); err != nil {
+			return fmt.Errorf("get datacap-ca-cert flag: %w", err)
+		}
+		if dcFlags.ClientCertPath, err = cmd.Flags().GetString("datacap-client-cert"); err != nil {
+			return fmt.Errorf("get datacap-client-cert flag: %w", err)
+		}
+		if dcFlags.ClientKeyPath, err = cmd.Flags().GetString("datacap-client-key"); err != nil {
+			return fmt.Errorf("get datacap-client-key flag: %w", err)
+		}
+		if dcFlags.BatchInterval, err = cmd.Flags().GetDuration("datacap-batch-interval"); err != nil {
+			return fmt.Errorf("get datacap-batch-interval flag: %w", err)
+		}
+		if dcFlags.CacheTTL, err = cmd.Flags().GetDuration("datacap-cache-ttl"); err != nil {
+			return fmt.Errorf("get datacap-cache-ttl flag: %w", err)
+		}
 
 		if dcFlags.URL != "" && dcFlags.GRPCAPI != "" {
 			return fmt.Errorf("--datacap-url and --datacap-grpc-api are mutually exclusive")

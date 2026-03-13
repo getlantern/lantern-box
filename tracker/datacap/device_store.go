@@ -55,6 +55,7 @@ type DeviceUsageStore struct {
 	syncGroup singleflight.Group
 
 	shutdown chan struct{}
+	stopOnce sync.Once
 	wg       sync.WaitGroup
 }
 
@@ -79,26 +80,42 @@ func (s *DeviceUsageStore) Start(ctx context.Context) {
 	}()
 }
 
-// Stop uploads a final batch and waits for goroutines to finish.
+// Stop signals the background loop to exit, waits for it to finish, then
+// uploads a final batch. The ctx bounds the overall shutdown time.
+// It is idempotent and safe to call multiple times.
 func (s *DeviceUsageStore) Stop(ctx context.Context) {
-	close(s.shutdown)
+	s.stopOnce.Do(func() {
+		close(s.shutdown)
+	})
 
-	uploadCtx, cancel := context.WithTimeout(context.Background(), finalUploadTimeout)
-	defer cancel()
-	if err := s.uploadBatch(uploadCtx); err != nil {
-		s.logger.Error("failed to upload final datacap batch: ", err)
-	}
-
+	// Wait for the background loop to exit first so we don't race with
+	// its uploadBatch calls.
 	doneCh := make(chan struct{})
 	go func() {
 		s.wg.Wait()
 		close(doneCh)
 	}()
 
+	// Use a deadline derived from ctx if available, otherwise use a fixed timeout.
+	waitCtx := ctx
+	if _, ok := ctx.Deadline(); !ok || ctx.Err() != nil {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(context.Background(), shutdownGracePeriod)
+		defer cancel()
+	}
+
 	select {
 	case <-doneCh:
-	case <-time.After(shutdownGracePeriod):
+	case <-waitCtx.Done():
 		s.logger.Error("timed out waiting for datacap goroutines to finish")
+		return
+	}
+
+	// Background loop is done — safe to do a final upload.
+	uploadCtx, cancel := context.WithTimeout(context.Background(), finalUploadTimeout)
+	defer cancel()
+	if err := s.uploadBatch(uploadCtx); err != nil {
+		s.logger.Error("failed to upload final datacap batch: ", err)
 	}
 }
 

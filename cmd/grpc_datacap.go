@@ -91,6 +91,10 @@ func newDataCapGRPCConn(addr string, mtls *datacapMTLSConfig) (*grpc.ClientConn,
 	var tlsCfg tls.Config
 
 	if mtls != nil {
+		if mtls.CACertPath == "" || mtls.ClientCertPath == "" || mtls.ClientKeyPath == "" {
+			return nil, fmt.Errorf("datacap mTLS requires all three paths: --datacap-ca-cert, --datacap-client-cert, --datacap-client-key")
+		}
+
 		// Load client certificate
 		clientCert, err := tls.LoadX509KeyPair(mtls.ClientCertPath, mtls.ClientKeyPath)
 		if err != nil {
