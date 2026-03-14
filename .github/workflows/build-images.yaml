@@ -1,0 +1,126 @@
+name: Build Packer Images
+
+on:
+  # Run after a release is published (GoReleaser pushes .deb to Gemfury first)
+  release:
+    types: [published]
+
+  # Allow manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "lantern-box version to bake into the image (e.g. 1.2.3)"
+        required: true
+        type: string
+      builders:
+        description: "Comma-separated builders (digitalocean,linode,oracle-oci-iad,oracle-oci-fra,oracle-oci-nrt,oracle-oci-sin)"
+        required: false
+        default: "digitalocean,linode,oracle-oci-iad,oracle-oci-fra,oracle-oci-nrt,oracle-oci-sin"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-images:
+    name: Build images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # Strip the leading 'v' from the tag
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "builders=digitalocean.lantern-box,linode.lantern-box,oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin" >> "$GITHUB_OUTPUT"
+          else
+            version="${{ inputs.version }}"
+            if [[ "$version" == v* ]]; then
+              echo "::error::Version should not start with 'v' (got '$version'). Use e.g. 1.2.3"
+              exit 1
+            fi
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            # Convert comma-separated builder names to packer -only format.
+            # Input names like "oracle-oci-iad" map to "oracle-oci.lantern-box-iad".
+            # Non-OCI names like "digitalocean" map to "digitalocean.lantern-box".
+            builders=""
+            IFS=',' read -ra PARTS <<< "${{ inputs.builders }}"
+            for part in "${PARTS[@]}"; do
+              part=$(echo "$part" | xargs)  # trim whitespace
+              case "$part" in
+                oracle-oci-*)
+                  region_code="${part#oracle-oci-}"
+                  builders="${builders:+$builders,}oracle-oci.lantern-box-${region_code}"
+                  ;;
+                oracle-oci)
+                  # Legacy name: expand to all OCI regions
+                  builders="${builders:+$builders,}oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin"
+                  ;;
+                *)
+                  builders="${builders:+$builders,}${part}.lantern-box"
+                  ;;
+              esac
+            done
+            echo "builders=$builders" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@v3
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          version: 1.11.2
+
+      - name: Init Packer plugins
+        working-directory: deploy/packer
+        run: packer init lantern-box.pkr.hcl
+
+      - name: Write OCI private key
+        run: |
+          echo "${{ secrets.OCI_KEY_CONTENT }}" > /tmp/oci_api_key.pem
+          chmod 600 /tmp/oci_api_key.pem
+
+      - name: Build images
+        working-directory: deploy/packer
+        env:
+          DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
+          # OCI shared auth
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_KEY_FILE: /tmp/oci_api_key.pem
+          OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          # OCI per-region: IAD (us-ashburn-1) — falls back to legacy secret names
+          OCI_SUBNET_OCID_IAD: ${{ secrets.OCI_SUBNET_OCID_IAD || secrets.OCI_SUBNET_OCID }}
+          OCI_AVAILABILITY_DOMAIN_IAD: ${{ secrets.OCI_AVAILABILITY_DOMAIN_IAD || secrets.OCI_AVAILABILITY_DOMAIN }}
+          # OCI per-region: FRA (eu-frankfurt-1)
+          OCI_SUBNET_OCID_FRA: ${{ secrets.OCI_SUBNET_OCID_FRA }}
+          OCI_AVAILABILITY_DOMAIN_FRA: ${{ secrets.OCI_AVAILABILITY_DOMAIN_FRA }}
+          # OCI per-region: NRT (ap-tokyo-1)
+          OCI_SUBNET_OCID_NRT: ${{ secrets.OCI_SUBNET_OCID_NRT }}
+          OCI_AVAILABILITY_DOMAIN_NRT: ${{ secrets.OCI_AVAILABILITY_DOMAIN_NRT }}
+          # OCI per-region: SIN (ap-singapore-1)
+          OCI_SUBNET_OCID_SIN: ${{ secrets.OCI_SUBNET_OCID_SIN }}
+          OCI_AVAILABILITY_DOMAIN_SIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN_SIN }}
+        run: |
+          packer build \
+            -var "lantern_box_version=${{ steps.version.outputs.version }}" \
+            -only="${{ steps.version.outputs.builders }}" \
+            lantern-box.pkr.hcl
+
+      - name: Clean up OCI key
+        if: always()
+        run: rm -f /tmp/oci_api_key.pem
+
+      - name: Upload manifest
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: packer-manifest
+          path: deploy/packer/manifest.json

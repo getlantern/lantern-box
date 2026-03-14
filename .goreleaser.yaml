@@ -9,7 +9,8 @@ metadata:
   license: "GPL"
 
 builds:
-  - main: ./cmd/sing-box-extensions
+  - id: amd64
+    main: ./cmd
     flags:
       - -v
       - -trimpath
@@ -19,6 +20,8 @@ builds:
       - amd64
     env:
       - CGO_ENABLED=1
+      - CC=gcc
+      - CXX=g++
     ldflags:
       - -X github.com/sagernet/sing-box/constant.Version={{ .Version }} -s -w -buildid=
     tags:
@@ -26,11 +29,34 @@ builds:
       - with_quic
       - with_dhcp
       - with_wireguard
-      - with_ech
       - with_utls
-      - with_reality_server
+      - with_acme
       - with_clash_api
+    binary: sing-box-extensions
 
+  - id: arm64
+    main: ./cmd
+    flags:
+      - -v
+      - -trimpath
+    goos:
+      - linux
+    goarch:
+      - arm64
+    env:
+      - CGO_ENABLED=1
+      - CC=aarch64-linux-gnu-gcc
+      - CXX=aarch64-linux-gnu-g++
+    ldflags:
+      - -X github.com/sagernet/sing-box/constant.Version={{ .Version }} -s -w -buildid=
+    tags:
+      - with_gvisor
+      - with_quic
+      - with_dhcp
+      - with_wireguard
+      - with_utls
+      - with_acme
+      - with_clash_api
     binary: sing-box-extensions
 
 archives:
@@ -60,9 +86,9 @@ nfpms:
     homepage: "https://github.com/getlantern/sing-box-extensions"
     license: "GPL"
     contents:
-      - src: cmd/sing-box-extensions/release/sing-box-extensions.service
+      - src: cmd/release/sing-box-extensions.service
         dst: /usr/lib/systemd/system/sing-box-extensions.service
-      - src: cmd/sing-box-extensions/release/sing-box-extensions@.service
+      - src: cmd/release/sing-box-extensions@.service
         dst: /usr/lib/systemd/system/sing-box-extensions@.service
 
 furies:
@@ -76,6 +102,8 @@ dockers:
   - image_templates:
       - "getlantern/sing-box-extensions:latest"
       - "getlantern/sing-box-extensions:{{ .Tag }}"
+    dockerfile: Dockerfile.goreleaser
+    ids: [amd64]
 
 dockerhub:
   - images:

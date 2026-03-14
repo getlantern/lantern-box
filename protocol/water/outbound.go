@@ -20,6 +20,7 @@ import (
 	_ "github.com/refraction-networking/water/transport/v1"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/conntrack"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -108,7 +109,16 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		TransportModuleBin: b,
 		OverrideLogger:     slogLogger,
 		NetworkDialerFunc: func(network, address string) (net.Conn, error) {
-			return outboundDialer.DialContext(log.ContextWithNewID(ctx), network, serverAddr)
+			conn, err := outboundDialer.DialContext(log.ContextWithNewID(ctx), network, serverAddr)
+			if err != nil {
+				return nil, err
+			}
+			switch conn := conn.(type) {
+			case *conntrack.Conn:
+				return conn.Conn, nil
+			default:
+				return conn, nil
+			}
 		},
 	}
 
@@ -146,16 +156,17 @@ func (o *Outbound) Close() error {
 func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (water.Dialer, error) {
 	cfg := o.dialerConfig.Clone()
 
+	o.logger.DebugContext(ctx, "building new dialer", slog.String("destination", destination.String()))
 	if o.transportModuleConfig != nil {
 		// currently this is the only way to share the destination with the WATER module.
-		addr := destination.AddrPort()
-		o.transportModuleConfig["remote_addr"] = addr.Addr().String()
-		o.transportModuleConfig["remote_port"] = strconv.Itoa(int(addr.Port()))
+		o.transportModuleConfig["remote_addr"] = destination.AddrString()
+		o.transportModuleConfig["remote_port"] = strconv.FormatUint(uint64(destination.Port), 10)
 		transportModuleConfig, err := json.MarshalContext(ctx, o.transportModuleConfig)
 		if err != nil {
 			return nil, err
 		}
 
+		o.logger.DebugContext(ctx, "building transport module config", slog.String("config_json", string(transportModuleConfig)))
 		cfg.TransportModuleConfig = water.TransportModuleConfigFromBytes(transportModuleConfig)
 	}
 
@@ -172,11 +183,13 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 
 	dialer, err := o.newDialer(ctx, destination)
 	if err != nil {
+		o.logger.ErrorContext(ctx, "failed to build new WATER dialer", slog.Any("error", err), slog.String("destination", destination.String()))
 		return nil, err
 	}
 
 	conn, err := dialer.DialContext(context.Background(), network, "localhost:0")
 	if err != nil {
+		o.logger.ErrorContext(ctx, "WATER failed to dial", slog.Any("error", err))
 		return nil, err
 	}
 

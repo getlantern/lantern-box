@@ -74,38 +74,37 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		Options: options,
 	})
 	if err != nil {
+		cancel()
 		return nil, nil, fmt.Errorf("create service: %w", err)
 	}
 
-	// Add client context manager if telemetry or datacap is enabled
-	if lbotel.Enabled() || datacapURL != "" {
-		clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
-			Inbound:  []string{""},
-			Outbound: []string{""},
-		}, log.StdLogger())
-		instance.Router().AppendTracker(clientCtxMgr)
-		service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
+	clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
+		Inbound:  []string{""},
+		Outbound: []string{""},
+	}, log.StdLogger())
+	instance.Router().AppendTracker(clientCtxMgr)
+	service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
 
-		if lbotel.Enabled() {
-			metricsTracker := metrics.NewTracker(ctx)
-			clientCtxMgr.AppendTracker(metricsTracker)
-			log.Info("Metric Tracking Enabled")
-		}
+	if lbotel.Enabled() {
+		metricsTracker := metrics.NewTracker(ctx)
+		clientCtxMgr.AppendTracker(metricsTracker)
+		log.Info("Metric Tracking Enabled")
+	}
 
-		if datacapURL != "" {
-			log.Info("Datacap enabled. Creating datacap tracker...")
-			datacapTracker, err := datacap.NewDatacapTracker(
-				datacap.Options{
-					URL:            datacapURL,
-					ReportInterval: "10s",
-				},
-				log.StdLogger(),
-			)
-			if err != nil {
-				return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
-			}
-			clientCtxMgr.AppendTracker(datacapTracker)
+	if datacapURL != "" {
+		log.Info("Datacap enabled. Creating tracker...")
+		datacapTracker, err := datacap.NewDatacapTracker(
+			datacap.Options{
+				URL:            datacapURL,
+				ReportInterval: "10s",
+			},
+			log.StdLogger(),
+		)
+		if err != nil {
+			cancel()
+			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
 		}
+		clientCtxMgr.AppendTracker(datacapTracker)
 	}
 
 	osSignals := make(chan os.Signal, 1)

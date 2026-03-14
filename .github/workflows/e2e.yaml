@@ -4,10 +4,11 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '.github/workflows/**'
-      - '*.md'
-      - 'LICENSE'
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
 
 env:
   DROPLET_NAME: "e2e-lantern-box-${{ github.run_id }}"
@@ -18,10 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v6
         with:
           go-version-file: "go.mod"
 
