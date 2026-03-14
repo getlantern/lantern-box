@@ -4,20 +4,23 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/getlantern/geo"
-	"github.com/spf13/cobra"
-	sdkotel "go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/metric/noop"
+	semconv "github.com/getlantern/semconv"
+	"go.opentelemetry.io/otel/attribute"
+	"gopkg.in/ini.v1"
 
 	box "github.com/getlantern/lantern-box"
 	"github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/metrics"
+	"github.com/sagernet/sing-box/log"
+	"github.com/spf13/cobra"
+	sdkotel "go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
-type ProxyInfo struct {
+type proxyInfo struct {
 	Name             string `ini:"proxyname"`
 	Pro              bool   `ini:"pro"`
 	Track            string `ini:"track"`
@@ -32,6 +35,8 @@ var (
 	commit  string
 )
 
+var otelShutdownFuncs []func()
+
 var rootCmd = &cobra.Command{
 	Use:               "lantern-box",
 	Version:           version,
@@ -44,51 +49,84 @@ var rootCmd = &cobra.Command{
 func preRun(cmd *cobra.Command, args []string) {
 	globalCtx = box.BaseContext()
 
-	// Default to not report metrics
+	// Default to not report metrics.
 	sdkotel.SetMeterProvider(noop.NewMeterProvider())
 
-	path, err := cmd.Flags().GetString("config")
-	if err != nil {
-		return
+	if !otel.Enabled() {
+		log.Info("telemetry disabled (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)")
 	}
 
-	geoCityURL, err := cmd.Flags().GetString("geo-city-url")
-	if err != nil {
-		return
+	var attrs []attribute.KeyValue
+	// Attempt to read proxy info, but this is merely informational,
+	// and may not be needed for every subcommand.
+	proxyInfoPath, _ := cmd.Flags().GetString("proxy-info")
+	if proxyInfoPath != "" {
+		if info, err := readProxyInfo(proxyInfoPath); err != nil {
+			log.Warn("could not read proxy info, skipping attribute addition: ", err)
+		} else {
+			attrs = info.resourceAttrs()
+		}
 	}
 
-	cityDatabaseName, err := cmd.Flags().GetString("city-database-name")
+	meterShutdown, err := otel.InitGlobalMeterProvider(attrs...)
 	if err != nil {
+		log.Error("init meter provider: ", err)
 		return
 	}
+	otelShutdownFuncs = append(otelShutdownFuncs, meterShutdown)
 
-	telemetryEndpoint, err := cmd.Flags().GetString("telemetry-endpoint")
+	tracerShutdown, err := otel.InitGlobalTracerProvider(attrs...)
 	if err != nil {
+		log.Error("init tracer provider: ", err)
 		return
 	}
+	otelShutdownFuncs = append(otelShutdownFuncs, tracerShutdown)
 
-	proxyInfoPath := strings.Replace(path, ".json", ".ini", 1)
-	proxyInfo, err := readProxyInfoFile(proxyInfoPath)
-	if err != nil {
-		return
+	log.Info("telemetry enabled")
+
+	geoCityURL, _ := cmd.Flags().GetString("geo-city-url")
+	cityDatabaseName, _ := cmd.Flags().GetString("city-database-name")
+	if geoCityURL != "" && cityDatabaseName != "" {
+		geolookup := geo.FromWeb(
+			geoCityURL, cityDatabaseName,
+			24*time.Hour, cityDatabaseName,
+			geo.CountryCode,
+		)
+		metrics.SetupMetricsManager(geolookup)
 	}
+}
 
-	// TODO: what is the best place to do clean up of otel?
-	otel.InitGlobalMeterProvider(&otel.Opts{
-		Endpoint:         otel.GetTelemetryEndpoint(telemetryEndpoint),
-		ProxyName:        proxyInfo.Name,
-		IsPro:            proxyInfo.Pro,
-		Track:            proxyInfo.Track,
-		Provider:         proxyInfo.Provider,
-		FrontendProvider: proxyInfo.FrontendProvider,
-		ProxyProtocol:    proxyInfo.Protocol,
-	})
+func readProxyInfo(path string) (*proxyInfo, error) {
+	cfg, err := ini.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("loading proxy info: %w", err)
+	}
+	var info proxyInfo
+	if err := cfg.MapTo(&info); err != nil {
+		return nil, fmt.Errorf("mapping proxy info: %w", err)
+	}
+	return &info, nil
+}
 
-	geolookup := geo.FromWeb(geoCityURL, cityDatabaseName, 24*time.Hour, cityDatabaseName, geo.CountryCode)
-	metrics.SetupMetricsManager(geolookup)
+func (info *proxyInfo) resourceAttrs() []attribute.KeyValue {
+	return []attribute.KeyValue{
+		semconv.ProxyNameKey.String(info.Name),
+		semconv.ProxyProtocolKey.String(info.Protocol),
+		semconv.ProxyTrackKey.String(info.Track),
+		semconv.ProxyProviderKey.String(info.Provider),
+		semconv.ProxyFrontendProviderKey.String(info.FrontendProvider),
+		semconv.ClientIsProKey.Bool(info.Pro),
+	}
+}
+
+func shutdownOtel() {
+	for _, shutdown := range otelShutdownFuncs {
+		shutdown()
+	}
 }
 
 func main() {
+	defer shutdownOtel()
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)

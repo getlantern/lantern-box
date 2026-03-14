@@ -17,12 +17,9 @@ import (
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
 	"github.com/spf13/cobra"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/metric/noop"
-
-	"gopkg.in/ini.v1"
 
 	"github.com/getlantern/lantern-box/adapter"
+	lbotel "github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
 	"github.com/getlantern/lantern-box/tracker/metrics"
@@ -33,8 +30,8 @@ func init() {
 	runCmd.Flags().String("config", "config.json", "Configuration file path")
 	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz", "URL for downloading GeoLite2-City database")
 	runCmd.Flags().String("city-database-name", "GeoLite2-City.mmdb", "Filename for storing GeoLite2-City database")
-	runCmd.Flags().String("telemetry-endpoint", "telemetry.iantem.io:443", "Telemetry endpoint for OpenTelemetry exporter")
 	runCmd.Flags().String("datacap-url", "", "Datacap server URL")
+	runCmd.Flags().String("proxy-info", "", "Path to proxy info INI file")
 }
 
 var runCmd = &cobra.Command{
@@ -51,19 +48,6 @@ var runCmd = &cobra.Command{
 		}
 		return run(path, datacapURL)
 	},
-}
-
-func readProxyInfoFile(path string) (*ProxyInfo, error) {
-	cfg, err := ini.Load(path)
-	if err != nil {
-		return nil, fmt.Errorf("loading proxy info file: %w", err)
-	}
-	var info ProxyInfo
-	err = cfg.MapTo(&info)
-	if err != nil {
-		return nil, fmt.Errorf("mapping proxy info file: %w", err)
-	}
-	return &info, nil
 }
 
 func readConfig(path string) (option.Options, error) {
@@ -101,6 +85,12 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 	instance.Router().AppendTracker(clientCtxMgr)
 	service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
 
+	if lbotel.Enabled() {
+		metricsTracker := metrics.NewTracker(ctx)
+		clientCtxMgr.AppendTracker(metricsTracker)
+		log.Info("Metric Tracking Enabled")
+	}
+
 	if datacapURL != "" {
 		log.Info("Datacap enabled. Creating tracker...")
 		datacapTracker, err := datacap.NewDatacapTracker(
@@ -115,17 +105,6 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
 		}
 		clientCtxMgr.AppendTracker(datacapTracker)
-	} else {
-		log.Warn("Datacap URL not provided, datacap tracking disabled")
-	}
-
-	mp := otel.GetMeterProvider()
-	if _, ok := mp.(noop.MeterProvider); ok {
-		log.Info("Metrics not enabled, no meter provider configured")
-	} else {
-		metricsTracker := metrics.NewTracker(ctx)
-		instance.Router().AppendTracker(metricsTracker)
-		log.Info("Metric Tracking Enabled")
 	}
 
 	osSignals := make(chan os.Signal, 1)
