@@ -106,7 +106,7 @@ func TestTelemetryE2E(t *testing.T) {
 	service.MustRegister[adapter.ClientContextManager](boxCtx, mgr)
 
 	metricsTracker := metrics.NewTracker(boxCtx)
-	serverBox.Router().AppendTracker(metricsTracker)
+	mgr.AppendTracker(metricsTracker)
 
 	require.NoError(t, serverBox.Start())
 	defer serverBox.Close()

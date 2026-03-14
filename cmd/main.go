@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/getlantern/geo"
@@ -60,10 +59,9 @@ func preRun(cmd *cobra.Command, args []string) {
 	var attrs []attribute.KeyValue
 	// Attempt to read proxy info, but this is merely informational,
 	// and may not be needed for every subcommand.
-	path, _ := cmd.Flags().GetString("config")
-	if path != "" {
-		iniPath := strings.Replace(path, ".json", ".ini", 1)
-		if info, err := readProxyInfo(iniPath); err != nil {
+	proxyInfoPath, _ := cmd.Flags().GetString("proxy-info")
+	if proxyInfoPath != "" {
+		if info, err := readProxyInfo(proxyInfoPath); err != nil {
 			log.Warn("could not read proxy info, skipping attribute addition: ", err)
 		} else {
 			attrs = info.resourceAttrs()

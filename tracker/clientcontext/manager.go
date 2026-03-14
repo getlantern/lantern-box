@@ -15,9 +15,6 @@ import (
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	semconv "github.com/getlantern/semconv"
-	"go.opentelemetry.io/otel"
-	otelsc "go.opentelemetry.io/otel/semconv/v1.37.0"
 )
 
 var _ (adapter.ConnectionTracker) = (*Manager)(nil)
@@ -62,22 +59,6 @@ func (m *Manager) AppendTracker(tracker adapter.ConnectionTracker) {
 	m.trackers = append(m.trackers, tracker)
 }
 
-// emitDeviceConnectedSpan emits a correlation span for a device_id's connection to the proxy,
-// to be correlated with the client's API proxy assignment to assess
-// connectivity success rate and time-to-connect differences across connections.
-func emitDeviceConnectedSpan(ctx context.Context, info *ClientInfo) {
-	tracer := otel.Tracer("lantern-box")
-	_, span := tracer.Start(ctx, "device_id.connected")
-	span.SetAttributes(
-		semconv.ClientDeviceIDKey.String(info.DeviceID),
-		semconv.ClientPlatformKey.String(info.Platform),
-		semconv.ClientIsProKey.Bool(info.IsPro),
-		otelsc.GeoCountryISOCodeKey.String(info.CountryCode),
-		semconv.ClientVersionKey.String(info.Version),
-	)
-	span.End()
-}
-
 func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	if !m.match(metadata.Inbound, matchOutbound.Tag()) {
 		return conn
@@ -98,7 +79,6 @@ func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata 
 		return c
 	}
 	ctx = ContextWithClientInfo(ctx, *info)
-	emitDeviceConnectedSpan(ctx, info)
 
 	conn = c
 	for _, tracker := range m.trackers {
@@ -126,7 +106,6 @@ func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn,
 		return c
 	}
 	ctx = ContextWithClientInfo(ctx, *info)
-	emitDeviceConnectedSpan(ctx, info)
 
 	conn = c
 	for _, tracker := range m.trackers {
