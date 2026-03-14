@@ -12,6 +12,10 @@ packer {
       version = ">= 1.0.5"
       source  = "github.com/hashicorp/oracle"
     }
+    alicloud = {
+      version = ">= 1.1.0"
+      source  = "github.com/hashicorp/alicloud"
+    }
   }
 }
 
@@ -43,6 +47,31 @@ variable "do_region" {
 variable "linode_region" {
   type    = string
   default = "us-west"
+}
+
+# Alibaba Cloud (Alicloud) variables
+variable "alicloud_access_key" {
+  type      = string
+  sensitive = true
+  default   = env("ALICLOUD_ACCESS_KEY")
+}
+
+variable "alicloud_secret_key" {
+  type      = string
+  sensitive = true
+  default   = env("ALICLOUD_SECRET_KEY")
+}
+
+variable "alicloud_region" {
+  type        = string
+  default     = "ap-southeast-1"
+  description = "Region to build the image in. Defaults to Singapore."
+}
+
+variable "alicloud_source_image" {
+  type        = string
+  default     = env("ALICLOUD_SOURCE_IMAGE")
+  description = "Base Ubuntu 24.04 image ID. Find via: aliyun ecs DescribeImages --RegionId ap-southeast-1 --OSType linux --ImageOwnerAlias system --ImageName 'ubuntu_24*64*'"
 }
 
 # OCI shared variables (same across all regions)
@@ -246,6 +275,32 @@ source "linode" "lantern-box" {
   image_description = "lantern-box ${var.lantern_box_version} pre-baked image"
 }
 
+# Alibaba Cloud ECS — build in Singapore, copy to all Asia regions.
+source "alicloud-ecs" "lantern-box" {
+  access_key           = var.alicloud_access_key
+  secret_key           = var.alicloud_secret_key
+  region               = var.alicloud_region
+  instance_type        = "ecs.t6-c1m1.large"
+  image_name           = "lantern-box-${var.lantern_box_version}"
+  image_force_delete   = true
+  source_image         = var.alicloud_source_image
+  io_optimized         = true
+  internet_charge_type = "PayByTraffic"
+  ssh_username         = "root"
+
+  image_copy_regions = [
+    "ap-southeast-1",  # Singapore
+    "ap-southeast-3",  # Malaysia (Kuala Lumpur)
+    "ap-southeast-5",  # Indonesia (Jakarta)
+    "ap-southeast-6",  # Philippines (Manila)
+    "ap-southeast-7",  # Thailand (Bangkok)
+    "ap-northeast-1",  # Japan (Tokyo)
+    "ap-northeast-2",  # South Korea (Seoul)
+    "ap-south-1",      # India (Mumbai)
+    "cn-hongkong",     # Hong Kong
+  ]
+}
+
 # ---------- Build ----------
 
 build {
@@ -256,6 +311,7 @@ build {
     "source.oracle-oci.lantern-box-fra",
     "source.oracle-oci.lantern-box-nrt",
     "source.oracle-oci.lantern-box-sin",
+    "source.alicloud-ecs.lantern-box",
   ]
 
   # Upload OTel Collector config before the shell provisioner copies it into place.
