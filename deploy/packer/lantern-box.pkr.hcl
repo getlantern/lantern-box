@@ -290,7 +290,6 @@ source "alicloud-ecs" "lantern-box" {
     "ap-southeast-7",  # Thailand (Bangkok)
     "ap-northeast-1",  # Japan (Tokyo)
     "ap-northeast-2",  # South Korea (Seoul)
-    "ap-south-1",      # India (Mumbai)
     "cn-hongkong",     # Hong Kong
   ]
 }
