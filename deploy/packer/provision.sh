@@ -55,8 +55,16 @@ apt-get "${APT_OPTS[@]}" install -y -q \
 
 echo "==> Adding Gemfury apt repository"
 : "${FURY_READ_TOKEN:?FURY_READ_TOKEN must be set}"
-echo "deb [trusted=yes] https://${FURY_READ_TOKEN}@apt.fury.io/getlantern/ /" \
+echo "deb [trusted=yes] https://apt.fury.io/getlantern/ /" \
   > /etc/apt/sources.list.d/getlantern.list
+# Store credentials separately with restricted permissions (not in world-readable sources.list).
+install -m 600 -o root -g root /dev/null /etc/apt/auth.conf.d/getlantern.conf
+cat > /etc/apt/auth.conf.d/getlantern.conf <<AUTHEOF
+machine apt.fury.io
+  login ${FURY_READ_TOKEN}
+  password ""
+AUTHEOF
+chmod 600 /etc/apt/auth.conf.d/getlantern.conf
 
 echo "==> Downloading sing-box-extensions .deb from GitHub release"
 arch=$(dpkg --print-architecture)  # amd64 or arm64
@@ -119,14 +127,27 @@ DROPIN
 systemctl daemon-reload
 # Do NOT enable — cloud-init writes env vars first, then enables the service.
 
-echo "==> Setting up lantern-box auto-update cron"
-# Random delay (0-59 min) prevents all instances from updating simultaneously.
-# The cron runs every 6 hours with a random offset per machine.
-delay=$((RANDOM % 60))
-cat > /etc/cron.d/lantern-box-update <<CRON
+echo "==> Setting up lantern-box auto-update"
+cat > /usr/local/bin/lantern-box-update <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+# Derive a per-machine sleep (0-3599s) from machine-id so instances stagger naturally.
+sleep $(( $(cksum /etc/machine-id | cut -d' ' -f1) % 3600 ))
+old_ver=$(dpkg-query -W -f='${Version}' sing-box-extensions 2>/dev/null || echo "none")
+apt-get update -qq
+apt-get install -y -qq sing-box-extensions
+new_ver=$(dpkg-query -W -f='${Version}' sing-box-extensions 2>/dev/null || echo "none")
+if [ "$old_ver" != "$new_ver" ]; then
+  echo "lantern-box upgraded: $old_ver -> $new_ver, restarting"
+  systemctl restart lantern-box
+fi
+SCRIPT
+chmod 755 /usr/local/bin/lantern-box-update
+
+cat > /etc/cron.d/lantern-box-update <<'CRON'
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-${delay} */6 * * * root apt-get update -qq -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/getlantern.list -o Dir::Etc::sourceparts="-" && apt-get install -y -qq sing-box-extensions && systemctl restart lantern-box
+0 */6 * * * root /usr/local/bin/lantern-box-update
 CRON
 chmod 644 /etc/cron.d/lantern-box-update
 
