@@ -280,7 +280,8 @@ source "alicloud-ecs" "lantern-box" {
   source_image         = var.alicloud_source_image
   io_optimized         = true
   internet_charge_type = "PayByTraffic"
-  ssh_username         = "root"
+  ssh_username              = "root"
+  temporary_key_pair_name   = "packer-lantern-box-{{timestamp}}"
 
   image_copy_regions = [
     "ap-southeast-1",  # Singapore
