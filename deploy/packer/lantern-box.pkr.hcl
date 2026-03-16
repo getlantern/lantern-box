@@ -299,6 +299,16 @@ source "alicloud-ecs" "lantern-box" {
     "ap-northeast-2",  # South Korea (Seoul)
     "cn-hongkong",     # Hong Kong
   ]
+  image_copy_names = [
+    "lantern-box-${var.lantern_box_version}",  # Singapore
+    "lantern-box-${var.lantern_box_version}",  # Malaysia
+    "lantern-box-${var.lantern_box_version}",  # Indonesia
+    "lantern-box-${var.lantern_box_version}",  # Philippines
+    "lantern-box-${var.lantern_box_version}",  # Thailand
+    "lantern-box-${var.lantern_box_version}",  # Japan
+    "lantern-box-${var.lantern_box_version}",  # South Korea
+    "lantern-box-${var.lantern_box_version}",  # Hong Kong
+  ]
 }
 
 # ---------- Build ----------
