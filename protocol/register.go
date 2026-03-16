@@ -23,6 +23,7 @@ var supportedProtocols = []string{
 	"amnezia",
 	"outline",
 	"samizdat",
+	"water",
 
 	// sing-box built-in protocols
 	"http",
