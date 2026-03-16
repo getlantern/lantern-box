@@ -112,6 +112,7 @@ jobs:
           ALICLOUD_ACCESS_KEY: ${{ secrets.ALICLOUD_ACCESS_KEY }}
           ALICLOUD_SECRET_KEY: ${{ secrets.ALICLOUD_SECRET_KEY }}
           ALICLOUD_SOURCE_IMAGE: ${{ secrets.ALICLOUD_SOURCE_IMAGE }}
+          ALICLOUD_SSH_PASSWORD: ${{ secrets.ALICLOUD_SSH_PASSWORD }}
         run: |
           packer build \
             -var "lantern_box_version=${{ steps.version.outputs.version }}" \

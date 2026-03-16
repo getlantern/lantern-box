@@ -62,6 +62,12 @@ variable "alicloud_secret_key" {
   default   = env("ALICLOUD_SECRET_KEY")
 }
 
+variable "alicloud_ssh_password" {
+  type      = string
+  sensitive = true
+  default   = env("ALICLOUD_SSH_PASSWORD")
+}
+
 variable "alicloud_source_image" {
   type        = string
   default     = env("ALICLOUD_SOURCE_IMAGE")
@@ -281,7 +287,7 @@ source "alicloud-ecs" "lantern-box" {
   io_optimized         = true
   internet_charge_type = "PayByTraffic"
   ssh_username         = "root"
-  ssh_password         = "Packer-Build-2026!"
+  ssh_password         = var.alicloud_ssh_password
 
   image_copy_regions = [
     "ap-southeast-1",  # Singapore
@@ -332,6 +338,8 @@ build {
       "rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*",
       "find /var/log -type f -exec truncate -s 0 {} +",
       "rm -f /root/.bash_history /home/*/.bash_history",
+      "passwd -l root",
+      "sed -i 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config",
     ]
   }
 
