@@ -53,6 +53,11 @@ apt-get "${APT_OPTS[@]}" install -y -q \
   tzdata \
   nftables
 
+echo "==> Adding Gemfury apt repository"
+: "${FURY_READ_TOKEN:?FURY_READ_TOKEN must be set}"
+echo "deb [trusted=yes] https://${FURY_READ_TOKEN}@apt.fury.io/getlantern/ /" \
+  > /etc/apt/sources.list.d/getlantern.list
+
 echo "==> Downloading sing-box-extensions .deb from GitHub release"
 arch=$(dpkg --print-architecture)  # amd64 or arm64
 deb_name="sing-box-extensions_${VERSION}_linux_${arch}.deb"
@@ -113,6 +118,17 @@ DROPIN
 
 systemctl daemon-reload
 # Do NOT enable — cloud-init writes env vars first, then enables the service.
+
+echo "==> Setting up lantern-box auto-update cron"
+# Random delay (0-59 min) prevents all instances from updating simultaneously.
+# The cron runs every 6 hours with a random offset per machine.
+delay=$((RANDOM % 60))
+cat > /etc/cron.d/lantern-box-update <<CRON
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+${delay} */6 * * * root apt-get update -qq -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/getlantern.list -o Dir::Etc::sourceparts="-" && apt-get install -y -qq sing-box-extensions && systemctl restart lantern-box
+CRON
+chmod 644 /etc/cron.d/lantern-box-update
 
 # Re-enable unattended-upgrades so the final image receives security updates.
 systemctl unmask unattended-upgrades.service 2>/dev/null || true

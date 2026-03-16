@@ -3,6 +3,13 @@ name: Auto-tag patch release
 on:
   push:
     branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - 'Dockerfile.goreleaser'
+      - 'cmd/release/*.service'
 
 permissions:
   contents: write

@@ -26,6 +26,12 @@ variable "lantern_box_version" {
   description = "Version tag to install (e.g. 1.2.3). Downloaded from GitHub release."
 }
 
+variable "fury_read_token" {
+  type      = string
+  sensitive = true
+  default   = env("FURY_READ_TOKEN")
+}
+
 variable "do_api_token" {
   type      = string
   sensitive = true
@@ -336,6 +342,7 @@ build {
     execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
     environment_vars = [
       "VERSION=${var.lantern_box_version}",
+      "FURY_READ_TOKEN=${var.fury_read_token}",
     ]
     script = "${path.root}/provision.sh"
   }
