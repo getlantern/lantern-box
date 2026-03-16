@@ -62,12 +62,6 @@ variable "alicloud_secret_key" {
   default   = env("ALICLOUD_SECRET_KEY")
 }
 
-variable "alicloud_region" {
-  type        = string
-  default     = "ap-southeast-1"
-  description = "Region to build the image in. Defaults to Singapore."
-}
-
 variable "alicloud_source_image" {
   type        = string
   default     = env("ALICLOUD_SOURCE_IMAGE")
@@ -279,7 +273,7 @@ source "linode" "lantern-box" {
 source "alicloud-ecs" "lantern-box" {
   access_key           = var.alicloud_access_key
   secret_key           = var.alicloud_secret_key
-  region               = var.alicloud_region
+  region               = "ap-southeast-1"
   instance_type        = "ecs.t6-c1m1.large"
   image_name           = "lantern-box-${var.lantern_box_version}"
   image_force_delete   = true
