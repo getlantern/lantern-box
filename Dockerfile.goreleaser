@@ -4,6 +4,6 @@ RUN set -ex \
     && apt-get install -y ca-certificates tzdata nftables wireguard-tools \
     && rm -rf /var/lib/apt/lists/*
 
-COPY sing-box-extensions /usr/local/bin/lantern-box
+COPY lantern-box /usr/local/bin/lantern-box
 
 ENTRYPOINT ["/usr/local/bin/lantern-box", "run", "--config", "/config.json"]

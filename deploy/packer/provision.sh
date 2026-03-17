@@ -53,22 +53,9 @@ apt-get "${APT_OPTS[@]}" install -y -q \
   tzdata \
   nftables
 
-echo "==> Adding Gemfury apt repository"
-: "${FURY_READ_TOKEN:?FURY_READ_TOKEN must be set}"
-echo "deb [trusted=yes] https://apt.fury.io/getlantern/ /" \
-  > /etc/apt/sources.list.d/getlantern.list
-# Store credentials separately with restricted permissions (not in world-readable sources.list).
-install -m 600 -o root -g root /dev/null /etc/apt/auth.conf.d/getlantern.conf
-cat > /etc/apt/auth.conf.d/getlantern.conf <<AUTHEOF
-machine apt.fury.io
-  login ${FURY_READ_TOKEN}
-  password ""
-AUTHEOF
-chmod 600 /etc/apt/auth.conf.d/getlantern.conf
-
-echo "==> Downloading sing-box-extensions .deb from GitHub release"
+echo "==> Downloading lantern-box .deb from GitHub release"
 arch=$(dpkg --print-architecture)  # amd64 or arm64
-deb_name="sing-box-extensions_${VERSION}_linux_${arch}.deb"
+deb_name="lantern-box_${VERSION}_linux_${arch}.deb"
 deb_url="https://github.com/getlantern/lantern-box/releases/download/v${VERSION}/${deb_name}"
 echo "    URL: ${deb_url}"
 curl -fsSL -o "/tmp/${deb_name}" "${deb_url}"
@@ -77,22 +64,8 @@ echo "==> Installing ${deb_name}"
 apt-get "${APT_OPTS[@]}" install -y -q "/tmp/${deb_name}"
 rm -f "/tmp/${deb_name}"
 
-# The .deb installs the binary as /usr/bin/sing-box-extensions.
-# The systemd service files reference /usr/bin/lantern-box, so create a symlink.
-ln -sf /usr/bin/sing-box-extensions /usr/bin/lantern-box
-
 echo "==> Setting up directories"
 mkdir -p /etc/lantern-box /var/lib/lantern-box
-
-# Symlink installed service files to lantern-box names.
-# Using symlinks (not copies) so updates to the .deb package are reflected.
-for svc in sing-box-extensions.service sing-box-extensions@.service; do
-  installed="/usr/lib/systemd/system/${svc}"
-  target="/usr/lib/systemd/system/$(echo "$svc" | sed 's/sing-box-extensions/lantern-box/')"
-  if [ -f "$installed" ]; then
-    ln -sf "$installed" "$target"
-  fi
-done
 
 systemctl daemon-reload
 
@@ -127,20 +100,44 @@ DROPIN
 systemctl daemon-reload
 # Do NOT enable — cloud-init writes env vars first, then enables the service.
 
-echo "==> Setting up lantern-box auto-update"
+echo "==> Setting up lantern-box auto-update (via GitHub Releases)"
 cat > /usr/local/bin/lantern-box-update <<'SCRIPT'
 #!/bin/bash
 set -euo pipefail
 # Derive a per-machine sleep (0-3599s) from machine-id so instances stagger naturally.
 sleep $(( $(cksum /etc/machine-id | cut -d' ' -f1) % 3600 ))
-old_ver=$(dpkg-query -W -f='${Version}' sing-box-extensions 2>/dev/null || echo "none")
-apt-get update -qq
-apt-get install -y -qq sing-box-extensions
-new_ver=$(dpkg-query -W -f='${Version}' sing-box-extensions 2>/dev/null || echo "none")
-if [ "$old_ver" != "$new_ver" ]; then
-  echo "lantern-box upgraded: $old_ver -> $new_ver, restarting"
-  systemctl restart lantern-box
+
+arch=$(dpkg --print-architecture)
+current_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
+
+# Fetch latest release tag via the redirect from /releases/latest.
+# This avoids the GitHub API rate limit (60 req/hr unauthenticated).
+latest_tag=$(curl -fsSI --retry 3 -o /dev/null -w '%{redirect_url}' \
+  https://github.com/getlantern/lantern-box/releases/latest \
+  | grep -oE '[^/]+$')
+
+if [ -z "$latest_tag" ]; then
+  echo "lantern-box-update: failed to fetch latest release tag" >&2
+  exit 1
 fi
+
+latest_ver="${latest_tag#v}"
+
+if [ "$current_ver" = "$latest_ver" ]; then
+  echo "lantern-box is up to date ($current_ver)"
+  exit 0
+fi
+
+echo "lantern-box update available: $current_ver -> $latest_ver"
+deb_name="lantern-box_${latest_ver}_linux_${arch}.deb"
+deb_url="https://github.com/getlantern/lantern-box/releases/download/${latest_tag}/${deb_name}"
+
+curl -fsSL --retry 3 -o "/tmp/${deb_name}" "${deb_url}"
+dpkg -i "/tmp/${deb_name}" || apt-get install -f -y -qq
+rm -f "/tmp/${deb_name}"
+
+echo "lantern-box upgraded: $current_ver -> $latest_ver, restarting"
+systemctl restart lantern-box
 SCRIPT
 chmod 755 /usr/local/bin/lantern-box-update
 

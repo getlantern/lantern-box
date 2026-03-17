@@ -1,11 +1,11 @@
 # yaml-language-server: $schema=https://goreleaser.com/static/schema-pro.json
 version: 2
-project_name: sing-box-extensions
+project_name: lantern-box
 metadata:
   maintainers:
     - "Lantern Team <dev@getlantern.org>"
-  description: Sing Box Extensions
-  homepage: "https://github.com/getlantern/sing-box-extensions"
+  description: Lantern Box
+  homepage: "https://github.com/getlantern/lantern-box"
   license: "GPL"
 
 builds:
@@ -32,7 +32,7 @@ builds:
       - with_utls
       - with_acme
       - with_clash_api
-    binary: sing-box-extensions
+    binary: lantern-box
 
   - id: arm64
     main: ./cmd
@@ -57,7 +57,7 @@ builds:
       - with_utls
       - with_acme
       - with_clash_api
-    binary: sing-box-extensions
+    binary: lantern-box
 
 archives:
   - formats: ["tar.gz"]
@@ -74,40 +74,61 @@ release:
   replace_existing_artifacts: true
 
 nfpms:
-  - package_name: "sing-box-extensions"
+  - id: lantern-box
+    package_name: "lantern-box"
     formats:
       - deb
       - rpm
     section: "default"
     maintainer: "Lantern Team <dev@getlantern.org>"
     description: |
-      Sing Box Extensions
+      Lantern Box
     vendor: "Brave New Software"
-    homepage: "https://github.com/getlantern/sing-box-extensions"
+    homepage: "https://github.com/getlantern/lantern-box"
     license: "GPL"
     contents:
-      - src: cmd/release/sing-box-extensions.service
+      - src: cmd/release/lantern-box.service
+        dst: /usr/lib/systemd/system/lantern-box.service
+      - src: cmd/release/lantern-box@.service
+        dst: /usr/lib/systemd/system/lantern-box@.service
+
+  # Backward-compatible package for Gemfury consumers (e.g. private server feature).
+  # Same binary and service files, just published under the old name.
+  - id: gemfury-compat
+    package_name: "sing-box-extensions"
+    formats:
+      - deb
+      - rpm
+    section: "default"
+    maintainer: "Lantern Team <dev@getlantern.org>"
+    description: |
+      Lantern Box (legacy sing-box-extensions package name)
+    vendor: "Brave New Software"
+    homepage: "https://github.com/getlantern/lantern-box"
+    license: "GPL"
+    contents:
+      - src: cmd/release/lantern-box.service
         dst: /usr/lib/systemd/system/sing-box-extensions.service
-      - src: cmd/release/sing-box-extensions@.service
+      - src: cmd/release/lantern-box@.service
         dst: /usr/lib/systemd/system/sing-box-extensions@.service
 
 furies:
   - account: getlantern
+    ids: [gemfury-compat]
     formats:
       - deb
       - rpm
 
-
 dockers:
   - image_templates:
-      - "getlantern/sing-box-extensions:latest"
-      - "getlantern/sing-box-extensions:{{ .Tag }}"
+      - "getlantern/lantern-box:latest"
+      - "getlantern/lantern-box:{{ .Tag }}"
     dockerfile: Dockerfile.goreleaser
     ids: [amd64]
 
 dockerhub:
   - images:
-      - getlantern/sing-box-extensions
+      - getlantern/lantern-box
     username: getlantern
     secret_name: DOCKER_PASSWORD
     full_description:
