@@ -53,18 +53,21 @@ apt-get "${APT_OPTS[@]}" install -y -q \
   tzdata \
   nftables
 
-echo "==> Adding Gemfury apt repository"
-: "${FURY_READ_TOKEN:?FURY_READ_TOKEN must be set}"
-echo "deb [trusted=yes] https://apt.fury.io/getlantern/ /" \
-  > /etc/apt/sources.list.d/getlantern.list
-# Store credentials separately with restricted permissions (not in world-readable sources.list).
-install -m 600 -o root -g root /dev/null /etc/apt/auth.conf.d/getlantern.conf
-cat > /etc/apt/auth.conf.d/getlantern.conf <<AUTHEOF
+if [ -n "${FURY_READ_TOKEN:-}" ]; then
+  echo "==> Adding Gemfury apt repository"
+  echo "deb [trusted=yes] https://apt.fury.io/getlantern/ /" \
+    > /etc/apt/sources.list.d/getlantern.list
+  # Store credentials separately with restricted permissions (not in world-readable sources.list).
+  install -m 600 -o root -g root /dev/null /etc/apt/auth.conf.d/getlantern.conf
+  cat > /etc/apt/auth.conf.d/getlantern.conf <<AUTHEOF
 machine apt.fury.io
   login ${FURY_READ_TOKEN}
   password ""
 AUTHEOF
-chmod 600 /etc/apt/auth.conf.d/getlantern.conf
+  chmod 600 /etc/apt/auth.conf.d/getlantern.conf
+else
+  echo "==> FURY_READ_TOKEN not set, skipping Gemfury apt repository setup"
+fi
 
 echo "==> Downloading sing-box-extensions .deb from GitHub release"
 arch=$(dpkg --print-architecture)  # amd64 or arm64
@@ -127,8 +130,9 @@ DROPIN
 systemctl daemon-reload
 # Do NOT enable — cloud-init writes env vars first, then enables the service.
 
-echo "==> Setting up lantern-box auto-update"
-cat > /usr/local/bin/lantern-box-update <<'SCRIPT'
+if [ -n "${FURY_READ_TOKEN:-}" ]; then
+  echo "==> Setting up lantern-box auto-update"
+  cat > /usr/local/bin/lantern-box-update <<'SCRIPT'
 #!/bin/bash
 set -euo pipefail
 # Derive a per-machine sleep (0-3599s) from machine-id so instances stagger naturally.
@@ -142,14 +146,17 @@ if [ "$old_ver" != "$new_ver" ]; then
   systemctl restart lantern-box
 fi
 SCRIPT
-chmod 755 /usr/local/bin/lantern-box-update
+  chmod 755 /usr/local/bin/lantern-box-update
 
-cat > /etc/cron.d/lantern-box-update <<'CRON'
+  cat > /etc/cron.d/lantern-box-update <<'CRON'
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 0 */6 * * * root /usr/local/bin/lantern-box-update
 CRON
-chmod 644 /etc/cron.d/lantern-box-update
+  chmod 644 /etc/cron.d/lantern-box-update
+else
+  echo "==> FURY_READ_TOKEN not set, skipping auto-update setup"
+fi
 
 # Re-enable unattended-upgrades so the final image receives security updates.
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
