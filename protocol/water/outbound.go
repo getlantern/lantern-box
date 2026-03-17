@@ -16,7 +16,6 @@ import (
 	waterDownloader "github.com/getlantern/lantern-water/downloader"
 	"github.com/getlantern/lantern-water/seed"
 	waterVC "github.com/getlantern/lantern-water/version_control"
-	"github.com/getlantern/radiance/kindling"
 	"github.com/refraction-networking/water"
 	_ "github.com/refraction-networking/water/transport/v1"
 	"github.com/sagernet/sing-box/adapter"
@@ -29,6 +28,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 	"github.com/tetratelabs/wazero"
 
 	"github.com/getlantern/lantern-box/constant"
@@ -75,9 +75,19 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	slogLogger := slog.New(L.NewLogHandler(logger))
 	vc := waterVC.NewWaterVersionControl(wasmDir, slogLogger)
+
 	httpClient := &http.Client{Timeout: timeout}
-	if kHTTPClient := kindling.HTTPClient(); kHTTPClient != nil {
-		httpClient.Transport = kHTTPClient.Transport
+	if options.Detour != "" {
+		logger.DebugContext(ctx, "detour option set", slog.Any("detour", options.Detour))
+		outboundManager := service.FromContext[adapter.OutboundManager](ctx)
+		if detourDialer, loaded := outboundManager.Outbound(options.Detour); loaded {
+			httpClient.Transport = &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return detourDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+				},
+			}
+			logger.DebugContext(ctx, "using detour outbound for downloading and seeding WASM files", slog.Any("detour", options.Detour))
+		}
 	}
 	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, httpClient)
 	if err != nil {

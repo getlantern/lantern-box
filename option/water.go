@@ -43,6 +43,8 @@ type WATEROutboundOptions struct {
 	// SkipHandshake is used when the WATER module deals with the handshake
 	// instead of the sing-box WATER transport
 	SkipHandshake bool `json:"skip_handshake,omitempty"`
+	// Detour specifies which outbound to use when downloading and seed the WASM file
+	Detour string `json:"detour,omitempty"`
 }
 
 // WATEROutboundSeedOptions specifies the seed configuration options
