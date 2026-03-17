@@ -287,7 +287,8 @@ source "alicloud-ecs" "lantern-box" {
   image_ignore_data_disks       = true
   source_image         = var.alicloud_source_image
   system_disk_mapping {
-    disk_size = 20
+    disk_size     = 20
+    disk_category = "cloud_essd"
   }
   io_optimized                  = true
   internet_charge_type          = "PayByTraffic"
