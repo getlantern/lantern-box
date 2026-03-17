@@ -76,8 +76,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	slogLogger := slog.New(L.NewLogHandler(logger))
 	vc := waterVC.NewWaterVersionControl(wasmDir, slogLogger)
 	httpClient := &http.Client{Timeout: timeout}
-	kHTTPClient := kindling.HTTPClient()
-	if kHTTPClient != nil {
+	if kHTTPClient := kindling.HTTPClient(); kHTTPClient != nil {
 		httpClient.Transport = kHTTPClient.Transport
 	}
 	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, httpClient)
