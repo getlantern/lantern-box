@@ -1,7 +1,7 @@
 name: Build Packer Images
 
 on:
-  # Run after a release is published (GoReleaser pushes .deb to Gemfury first)
+  # Run after a release is published
   release:
     types: [published]
 
@@ -88,7 +88,6 @@ jobs:
       - name: Build images
         working-directory: deploy/packer
         env:
-          FURY_READ_TOKEN: ${{ secrets.FURY_READ_TOKEN }}
           DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
           LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
           # OCI shared auth
