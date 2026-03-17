@@ -282,15 +282,22 @@ source "alicloud-ecs" "lantern-box" {
   region               = "ap-southeast-1"
   instance_type        = "ecs.t6-c1m1.large"
   image_name           = "lantern-box-${var.lantern_box_version}"
-  image_force_delete   = true
+  image_force_delete            = true
+  image_force_delete_snapshots  = true
+  image_ignore_data_disks       = true
   source_image         = var.alicloud_source_image
   system_disk_mapping {
     disk_size = 20
   }
-  io_optimized         = true
-  internet_charge_type = "PayByTraffic"
+  io_optimized                  = true
+  internet_charge_type          = "PayByTraffic"
+  internet_max_bandwidth_out    = 5
+  security_enhancement_strategy = "Deactive"
+  force_stop_instance           = true
   ssh_username         = "root"
   ssh_password         = var.alicloud_ssh_password
+
+  wait_copying_image_ready_timeout = 7200
 
   image_copy_regions = [
     "ap-southeast-1",  # Singapore
