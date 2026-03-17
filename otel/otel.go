@@ -2,8 +2,8 @@ package otel
 
 import (
 	"context"
+	"net"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/log"
@@ -57,8 +57,7 @@ func InitGlobalMeterProvider(opts *Opts) (func(), error) {
 		}),
 	}
 
-	// If endpoint doesn't use port 443, assume insecure (HTTP not HTTPS)
-	if !strings.Contains(opts.Endpoint, ":443") {
+	if !isSecureEndpoint(opts.Endpoint) {
 		log.Debug("Using insecure connection for OTEL metrics endpoint ", opts.Endpoint)
 		metricOpts = append(metricOpts, otlpmetrichttp.WithInsecure())
 	}
@@ -85,6 +84,16 @@ func InitGlobalMeterProvider(opts *Opts) (func(), error) {
 			log.Error(E.Cause(err, "error shutting down meter provider"))
 		}
 	}, nil
+}
+
+// isSecureEndpoint returns true if the OTLP endpoint uses port 443,
+// indicating TLS should be used. The endpoint format is "host:port".
+func isSecureEndpoint(endpoint string) bool {
+	_, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return false
+	}
+	return port == "443"
 }
 
 func (opts *Opts) buildResource() *resource.Resource {

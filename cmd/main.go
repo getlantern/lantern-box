@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -74,7 +75,7 @@ func preRun(cmd *cobra.Command, args []string) {
 	}
 
 	// TODO: what is the best place to do clean up of otel?
-	otel.InitGlobalMeterProvider(&otel.Opts{
+	otelOpts := &otel.Opts{
 		Endpoint:         otel.GetTelemetryEndpoint(telemetryEndpoint),
 		ProxyName:        proxyInfo.Name,
 		IsPro:            proxyInfo.Pro,
@@ -82,7 +83,19 @@ func preRun(cmd *cobra.Command, args []string) {
 		Provider:         proxyInfo.Provider,
 		FrontendProvider: proxyInfo.FrontendProvider,
 		ProxyProtocol:    proxyInfo.Protocol,
-	})
+	}
+	if _, err := otel.InitGlobalMeterProvider(otelOpts); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize OTEL meter provider: %v\n", err)
+	}
+
+	// Report any crash from a previous run, then set up crash output for
+	// this run. Order matters: report first (reads crash.log), then setup
+	// (truncates crash.log for the next crash).
+	crashDir := filepath.Dir(path)
+	otel.ReportPreviousCrash(crashDir, otelOpts)
+	if err := otel.SetupCrashOutput(crashDir); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to set up crash output: %v\n", err)
+	}
 
 	geolookup := geo.FromWeb(geoCityURL, cityDatabaseName, 24*time.Hour, cityDatabaseName, geo.CountryCode)
 	metrics.SetupMetricsManager(geolookup)
