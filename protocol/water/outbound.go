@@ -16,6 +16,7 @@ import (
 	waterDownloader "github.com/getlantern/lantern-water/downloader"
 	"github.com/getlantern/lantern-water/seed"
 	waterVC "github.com/getlantern/lantern-water/version_control"
+	"github.com/getlantern/radiance/kindling"
 	"github.com/refraction-networking/water"
 	_ "github.com/refraction-networking/water/transport/v1"
 	"github.com/sagernet/sing-box/adapter"
@@ -74,7 +75,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	slogLogger := slog.New(L.NewLogHandler(logger))
 	vc := waterVC.NewWaterVersionControl(wasmDir, slogLogger)
-	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, &http.Client{Timeout: timeout})
+	httpClient := &http.Client{Timeout: timeout}
+	kHTTPClient := kindling.HTTPClient()
+	if kHTTPClient != nil {
+		httpClient.Transport = kHTTPClient.Transport
+	}
+	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, httpClient)
 	if err != nil {
 		return nil, E.New("failed to create WASM downloader", err)
 	}
@@ -133,7 +139,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	if options.SeedEnabled {
 		transportFilepath := filepath.Join(wasmDir, fmt.Sprintf("%s.%s", options.Transport, "wasm"))
-		seeder, err := seed.New(transportFilepath, options.AnnounceList)
+		seeder, err := seed.New(transportFilepath, options.AnnounceList, httpClient)
 		if err != nil {
 			logger.WarnContext(ctx, "failed to seed WASM", slog.Any("error", err), slog.String("transport", transportFilepath))
 		}
