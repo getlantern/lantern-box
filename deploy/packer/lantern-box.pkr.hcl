@@ -284,7 +284,9 @@ source "alicloud-ecs" "lantern-box" {
   image_name           = "lantern-box-${var.lantern_box_version}"
   image_force_delete   = true
   source_image         = var.alicloud_source_image
-  system_disk_size     = 20
+  system_disk_mapping {
+    disk_size = 20
+  }
   io_optimized         = true
   internet_charge_type = "PayByTraffic"
   ssh_username         = "root"
