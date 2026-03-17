@@ -110,11 +110,11 @@ sleep $(( $(cksum /etc/machine-id | cut -d' ' -f1) % 3600 ))
 arch=$(dpkg --print-architecture)
 current_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
 
-# Fetch latest release tag via the redirect from /releases/latest.
-# This avoids the GitHub API rate limit (60 req/hr unauthenticated).
-latest_tag=$(curl -fsSI --retry 3 -o /dev/null -w '%{redirect_url}' \
-  https://github.com/getlantern/lantern-box/releases/latest \
-  | grep -oE '[^/]+$')
+# Fetch latest release tag via the 302 redirect from /releases/latest.
+# This avoids the GitHub API rate limit (60 req/hr unauthenticated) entirely.
+redirect_url=$(curl -fsSI --retry 3 -o /dev/null -w '%{redirect_url}' \
+  https://github.com/getlantern/lantern-box/releases/latest)
+latest_tag="${redirect_url##*/}"
 
 if [ -z "$latest_tag" ]; then
   echo "lantern-box-update: failed to fetch latest release tag" >&2
@@ -132,11 +132,19 @@ echo "lantern-box update available: $current_ver -> $latest_ver"
 deb_name="lantern-box_${latest_ver}_linux_${arch}.deb"
 deb_url="https://github.com/getlantern/lantern-box/releases/download/${latest_tag}/${deb_name}"
 
-curl -fsSL --retry 3 -o "/tmp/${deb_name}" "${deb_url}"
-dpkg -i "/tmp/${deb_name}" || apt-get install -f -y -qq
-rm -f "/tmp/${deb_name}"
+tmpfile=$(mktemp /tmp/lantern-box-update-XXXXXX.deb)
+trap 'rm -f "$tmpfile"' EXIT
 
-echo "lantern-box upgraded: $current_ver -> $latest_ver, restarting"
+curl -fsSL --retry 3 -o "$tmpfile" "${deb_url}"
+dpkg -i "$tmpfile" || { apt-get update -qq && apt-get install -f -y -qq; }
+
+new_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
+if [ "$new_ver" != "$latest_ver" ]; then
+  echo "lantern-box-update: install failed, expected $latest_ver but got $new_ver" >&2
+  exit 1
+fi
+
+echo "lantern-box upgraded: $current_ver -> $new_ver, restarting"
 systemctl restart lantern-box
 SCRIPT
 chmod 755 /usr/local/bin/lantern-box-update
