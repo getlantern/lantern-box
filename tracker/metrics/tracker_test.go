@@ -1,3 +1,5 @@
+//go:build goexperiment.synctest
+
 package metrics
 
 import (
@@ -19,7 +21,7 @@ import (
 )
 
 func TestTracker(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
+	synctest.Run(func() {
 		reader := metric.NewManualReader()
 		provider := metric.NewMeterProvider(metric.WithReader(reader))
 		sdkotel.SetMeterProvider(provider)
