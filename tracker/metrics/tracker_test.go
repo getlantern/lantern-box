@@ -16,8 +16,12 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTracker(t *testing.T) {
@@ -77,6 +81,69 @@ func TestTracker(t *testing.T) {
 		assert.Equal(t, int64(serverTransmit), results["transmit"], "transmit bytes did not match")
 		assert.Equal(t, int64(serverReceive), results["receive"], "receive bytes did not match")
 	})
+}
+
+func TestDeviceConnectedSpan(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSyncer(exporter),
+	)
+	prevTP := sdkotel.GetTracerProvider()
+	sdkotel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+		sdkotel.SetTracerProvider(prevTP)
+	})
+
+	ctx := clientcontext.ContextWithClientInfo(
+		context.Background(),
+		clientcontext.ClientInfo{
+			DeviceID:    "test-device-123",
+			Platform:    "android",
+			IsPro:       true,
+			CountryCode: "CA",
+			Version:     "10.0",
+		},
+	)
+	emitDeviceConnectedSpan(ctx)
+
+	spans := exporter.GetSpans()
+	var deviceSpan *tracetest.SpanStub
+	for i := range spans {
+		if spans[i].Name == "device_id.connected" {
+			deviceSpan = &spans[i]
+			break
+		}
+	}
+	require.NotNil(t, deviceSpan,
+		"device_id.connected span should be emitted")
+
+	attrs := make(map[string]any)
+	for _, attr := range deviceSpan.Attributes {
+		attrs[string(attr.Key)] = attr.Value.AsInterface()
+	}
+	assert.Equal(t, "test-device-123", attrs["client.device_id"])
+	assert.Equal(t, "android", attrs["client.platform"])
+	assert.Equal(t, true, attrs["client.is_pro"])
+	assert.Equal(t, "CA", attrs["geo.country.iso_code"])
+	assert.Equal(t, "10.0", attrs["client.version"])
+}
+
+func TestDeviceConnectedSpanNoClientInfo(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSyncer(exporter),
+	)
+	prevTP := sdkotel.GetTracerProvider()
+	sdkotel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+		sdkotel.SetTracerProvider(prevTP)
+	})
+
+	emitDeviceConnectedSpan(context.Background())
+	assert.Empty(t, exporter.GetSpans(),
+		"no span should be emitted without client info")
 }
 
 func extractCountersByAttribute(rm metricdata.ResourceMetrics, name string) map[string]int64 {

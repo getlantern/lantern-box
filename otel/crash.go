@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/log"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
@@ -40,7 +41,7 @@ func SetupCrashOutput(dir string) error {
 // it sends the crash as an OTLP log record and truncates the file so it is
 // ready for the next crash. This should be called early in startup, after the
 // telemetry endpoint is configured.
-func ReportPreviousCrash(dir string, opts *Opts) {
+func ReportPreviousCrash(dir string, attrs ...attribute.KeyValue) {
 	path := filepath.Join(dir, crashFileName)
 	f, err := os.Open(path)
 	if err != nil {
@@ -61,7 +62,7 @@ func ReportPreviousCrash(dir string, opts *Opts) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := sendCrashLog(ctx, crashLog, opts); err != nil {
+	if err := sendCrashLog(ctx, crashLog, attrs...); err != nil {
 		log.Error("failed to report crash log: ", err)
 		return
 	}
@@ -76,24 +77,19 @@ func ReportPreviousCrash(dir string, opts *Opts) {
 	log.Info("crash log reported and cleared")
 }
 
-func sendCrashLog(ctx context.Context, crashLog string, opts *Opts) error {
-	exporterOpts := []otlploghttp.Option{
-		otlploghttp.WithEndpoint(opts.Endpoint),
-		otlploghttp.WithHeaders(opts.Headers),
-	}
-	if !isSecureEndpoint(opts.Endpoint) {
-		exporterOpts = append(exporterOpts, otlploghttp.WithInsecure())
-	}
-
-	exporter, err := otlploghttp.New(ctx, exporterOpts...)
+func sendCrashLog(
+	ctx context.Context,
+	crashLog string,
+	attrs ...attribute.KeyValue,
+) error {
+	exporter, err := otlploghttp.New(ctx)
 	if err != nil {
 		return err
 	}
 
-	res := opts.buildResource()
 	provider := sdklog.NewLoggerProvider(
 		sdklog.WithProcessor(sdklog.NewSimpleProcessor(exporter)),
-		sdklog.WithResource(res),
+		sdklog.WithResource(buildResource(attrs...)),
 	)
 	defer func() {
 		if err := provider.Shutdown(ctx); err != nil {
