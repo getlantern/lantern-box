@@ -1,0 +1,86 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-direct",
+        "type": "udp",
+        "server": "8.8.8.8"
+      }
+    ],
+    "final": "dns-direct"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "sniff": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "dns",
+      "tag": "dns-out"
+    },
+    {
+      "type": "unbounded",
+      "tag": "unbounded-out",
+      "discovery_srv": "http://127.0.0.1:9000",
+      "discovery_endpoint": "/v1/signal",
+      "insecure_do_not_verify_client_cert": true
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "network": "udp",
+        "port": [53],
+        "outbound": "direct"
+      },
+      {
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          {
+            "process_path_regex": [
+              ".*cmd/socks5/socks5",
+              ".*cmd/dist/bin/widget",
+              ".*cmd/lantern-box"
+            ]
+          },
+          {
+            "protocol": "stun"
+          },
+          {
+            "domain_suffix": "raw.githubusercontent.com"
+          }
+        ],
+        "outbound": "direct"
+      }
+    ],
+    "final": "unbounded-out",
+    "auto_detect_interface": true
+  }
+}

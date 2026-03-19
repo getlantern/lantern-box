@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/getlantern/geo"
@@ -83,6 +84,18 @@ func preRun(cmd *cobra.Command, args []string) {
 	otelShutdownFuncs = append(otelShutdownFuncs, tracerShutdown)
 
 	log.Info("telemetry enabled")
+
+	// Report any crash from a previous run, then set up crash output
+	// for this run. Order matters: report first (reads crash.log),
+	// then setup (truncates crash.log for the next crash).
+	configPath, _ := cmd.Flags().GetString("config")
+	if configPath != "" {
+		crashDir := filepath.Dir(configPath)
+		otel.ReportPreviousCrash(crashDir, attrs...)
+		if err := otel.SetupCrashOutput(crashDir); err != nil {
+			log.Error("set up crash output: ", err)
+		}
+	}
 
 	geoCityURL, _ := cmd.Flags().GetString("geo-city-url")
 	cityDatabaseName, _ := cmd.Flags().GetString("city-database-name")

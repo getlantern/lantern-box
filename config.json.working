@@ -1,0 +1,31 @@
+{
+  "log": {
+    "level": "trace",
+    "output": "stdout",
+	  "timestamp": true
+  },
+  "inbounds": [{
+        "type": "http",
+        "tag": "http-in",
+        "listen": "127.0.0.1",
+        "listen_port": 34789
+    }],
+  "outbounds": [{
+    "type":"hysteria2",
+    "tag":"hy2-out",
+    "password":"9cf3af4984997f84fdae9bb4c71bce63",
+    "server":"159.13.39.39",
+    "server_port":48277,
+    "tls":{
+      "enabled":true,
+      "insecure":true
+    }}],
+  "route": {
+    "rules": [
+        {
+            "inbound": "http-in",
+            "outbound": "hy2-out"
+        }
+    ]
+  }
+}

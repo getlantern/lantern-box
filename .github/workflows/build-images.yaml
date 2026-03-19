@@ -1,7 +1,7 @@
 name: Build Packer Images
 
 on:
-  # Run after a release is published (GoReleaser pushes .deb to Gemfury first)
+  # Run after a release is published
   release:
     types: [published]
 
@@ -13,9 +13,9 @@ on:
         required: true
         type: string
       builders:
-        description: "Comma-separated builders (digitalocean,linode,oracle-oci-iad,oracle-oci-fra,oracle-oci-nrt,oracle-oci-sin)"
+        description: "Comma-separated builders (digitalocean,linode,oracle-oci-iad,oracle-oci-fra,oracle-oci-nrt,oracle-oci-sin,alicloud-ecs)"
         required: false
-        default: "digitalocean,linode,oracle-oci-iad,oracle-oci-fra,oracle-oci-nrt,oracle-oci-sin"
+        default: "digitalocean,linode,oracle-oci-iad,oracle-oci-fra,oracle-oci-nrt,oracle-oci-sin,alicloud-ecs"
         type: string
 
 permissions:
@@ -37,7 +37,7 @@ jobs:
           if [ "${{ github.event_name }}" = "release" ]; then
             # Strip the leading 'v' from the tag
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-            echo "builders=digitalocean.lantern-box,linode.lantern-box,oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin" >> "$GITHUB_OUTPUT"
+            echo "builders=digitalocean.lantern-box,linode.lantern-box,oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin,alicloud-ecs.lantern-box" >> "$GITHUB_OUTPUT"
           else
             version="${{ inputs.version }}"
             if [[ "$version" == v* ]]; then
@@ -108,6 +108,11 @@ jobs:
           # OCI per-region: SIN (ap-singapore-1)
           OCI_SUBNET_OCID_SIN: ${{ secrets.OCI_SUBNET_OCID_SIN }}
           OCI_AVAILABILITY_DOMAIN_SIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN_SIN }}
+          # Alibaba Cloud (Alicloud)
+          ALICLOUD_ACCESS_KEY: ${{ secrets.ALICLOUD_ACCESS_KEY }}
+          ALICLOUD_SECRET_KEY: ${{ secrets.ALICLOUD_SECRET_KEY }}
+          ALICLOUD_SOURCE_IMAGE: ${{ secrets.ALICLOUD_SOURCE_IMAGE }}
+          ALICLOUD_SSH_PASSWORD: ${{ secrets.ALICLOUD_SSH_PASSWORD }}
         run: |
           packer build \
             -var "lantern_box_version=${{ steps.version.outputs.version }}" \
