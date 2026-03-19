@@ -239,12 +239,8 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 	var addr *net.UDPAddr
 	if dest.IsIP() {
 		addr = dest.UDPAddr()
-	} else {
-		var err error
-		addr, err = net.ResolveUDPAddr("udp", dest.String())
-		if err != nil {
-			return fmt.Errorf("resolving destination %s: %w", dest, err)
-		}
+	} else if addr, err = net.ResolveUDPAddr("udp", dest.String()); err != nil {
+		return fmt.Errorf("resolving destination %s: %w", dest, err)
 	}
 	packet := append([]byte(packetPrefix), buf...)
 	if _, err = conn.WriteTo(packet, addr); err != nil {
