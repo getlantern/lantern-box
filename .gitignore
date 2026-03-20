@@ -1,11 +1,6 @@
 /data/
 /dist/
 **/.DS_Store
-<<<<<<< HEAD
 cmd/cmd
 cmd/*.mmdb
-||||||| ddd468b
-**/.DS_Store
-=======
 /cmd/lantern-box
->>>>>>> main
