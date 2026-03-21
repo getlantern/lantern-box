@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"time"
 
 	"github.com/sagernet/sing-box/log"
@@ -95,10 +96,24 @@ func deltaForCounters(kind sdkmetric.InstrumentKind) metricdata.Temporality {
 func buildResource(extras ...attribute.KeyValue) *resource.Resource {
 	attrs := append([]attribute.KeyValue{
 		semconv.ServiceNameKey.String("lantern-box"),
+		semconv.ServiceVersionKey.String(vcsRevision()),
 	}, extras...)
 	r, _ := resource.New(context.Background(),
 		resource.WithAttributes(attrs...),
 		resource.WithFromEnv(),
 	)
 	return r
+}
+
+func vcsRevision() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	for _, s := range bi.Settings {
+		if s.Key == "vcs.revision" {
+			return s.Value
+		}
+	}
+	return "unknown"
 }
