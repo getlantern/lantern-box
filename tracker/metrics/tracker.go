@@ -100,6 +100,9 @@ func emitDeviceConnectedSpan(ctx context.Context) {
 func (t *MetricsTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	emitDeviceConnectedSpan(ctx)
 	attrs := metadataToAttributes(metadata)
+	if info, ok := clientcontext.ClientInfoFromContext(ctx); ok {
+		attrs.client = &info
+	}
 	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return NewConn(conn, attrs, t)
 }
@@ -107,6 +110,9 @@ func (t *MetricsTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 func (t *MetricsTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
 	emitDeviceConnectedSpan(ctx)
 	attrs := metadataToAttributes(metadata)
+	if info, ok := clientcontext.ClientInfoFromContext(ctx); ok {
+		attrs.client = &info
+	}
 	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return NewPacketConn(conn, attrs, t)
 }
@@ -115,6 +121,14 @@ func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
 	a := append(attrs.attrs,
 		otelsc.GeoCountryISOCodeKey.String(attrs.country.Load().(string)),
 	)
+	if attrs.client != nil {
+		a = append(a,
+			semconv.ClientDeviceIDKey.String(attrs.client.DeviceID),
+			semconv.ClientPlatformKey.String(attrs.client.Platform),
+			semconv.ClientIsProKey.Bool(attrs.client.IsPro),
+			semconv.ClientVersionKey.String(attrs.client.Version),
+		)
+	}
 	metrics.duration.Record(context.Background(), duration, metric.WithAttributes(a...))
 	metrics.conns.Add(context.Background(), -1, metric.WithAttributes(a...))
 }
@@ -122,12 +136,22 @@ func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
 type attributes struct {
 	attrs   []attribute.KeyValue
 	country atomic.Value // string
+	client  *clientcontext.ClientInfo
 }
 
 func (a *attributes) AsSlice() []attribute.KeyValue {
-	return append(a.attrs,
+	s := append(a.attrs,
 		otelsc.GeoCountryISOCodeKey.String(a.country.Load().(string)),
 	)
+	if a.client != nil {
+		s = append(s,
+			semconv.ClientDeviceIDKey.String(a.client.DeviceID),
+			semconv.ClientPlatformKey.String(a.client.Platform),
+			semconv.ClientIsProKey.Bool(a.client.IsPro),
+			semconv.ClientVersionKey.String(a.client.Version),
+		)
+	}
+	return s
 }
 
 func metadataToAttributes(metadata adapter.InboundContext) *attributes {
