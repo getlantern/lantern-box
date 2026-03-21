@@ -89,7 +89,7 @@ jobs:
           # timestamped snapshot. Keep the 3 most recent; delete the rest.
           KEEP=3
           echo "Fetching DigitalOcean snapshots..."
-          snapshots=$(curl -s -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
+          snapshots=$(curl -sS -f -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
             "https://api.digitalocean.com/v2/snapshots?resource_type=droplet&per_page=200" \
             | jq -r '.snapshots[] | select(.name | startswith("lantern-box-")) | "\(.created_at)\t\(.id)\t\(.name)"' \
             | sort -r)
@@ -102,8 +102,11 @@ jobs:
           else
             echo "$snapshots" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id name; do
               echo "Deleting $name ($id, created $created)..."
-              curl -s -X DELETE -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
-                "https://api.digitalocean.com/v2/snapshots/$id"
+              if ! curl -sS -f -X DELETE -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
+                "https://api.digitalocean.com/v2/snapshots/$id"; then
+                echo "::error::Failed to delete DO snapshot $name ($id)" >&2
+                exit 1
+              fi
             done
           fi
 
@@ -116,7 +119,7 @@ jobs:
           # Keep the 3 most recent lantern-box images; delete the rest.
           KEEP=3
           echo "Fetching Linode custom images..."
-          images=$(curl -s -H "Authorization: Bearer $LINODE_TOKEN" \
+          images=$(curl -sS -f -H "Authorization: Bearer $LINODE_TOKEN" \
             "https://api.linode.com/v4/images?page_size=500" \
             | jq -r '.data[] | select(.is_public == false and (.label | startswith("lantern-box-"))) | "\(.created)\t\(.id)\t\(.label)"' \
             | sort -r)
@@ -129,8 +132,11 @@ jobs:
           else
             echo "$images" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id label; do
               echo "Deleting $label ($id, created $created)..."
-              curl -s -X DELETE -H "Authorization: Bearer $LINODE_TOKEN" \
-                "https://api.linode.com/v4/images/$id"
+              if ! curl -sS -f -X DELETE -H "Authorization: Bearer $LINODE_TOKEN" \
+                "https://api.linode.com/v4/images/$id"; then
+                echo "::error::Failed to delete Linode image $label ($id)" >&2
+                exit 1
+              fi
             done
           fi
 
