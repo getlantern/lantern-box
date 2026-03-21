@@ -293,12 +293,14 @@ source "alicloud-ecs" "lantern-box" {
   io_optimized                  = true
   internet_charge_type          = "PayByTraffic"
   internet_max_bandwidth_out    = 5
+  # Disable Alibaba's "security enhancement" (China-specific Aegis/CloudMonitor agent).
+  # We run our own monitoring and don't want the extra agent on proxy servers.
   security_enhancement_strategy = "Deactive"
   force_stop_instance           = true
   ssh_username         = "root"
   ssh_password         = var.alicloud_ssh_password
 
-  wait_copying_image_ready_timeout = 7200
+  wait_copying_image_ready_timeout = 7200 # seconds (2h) — copying to 8 regions can be slow
 
   image_copy_regions = [
     "ap-southeast-1",  # Singapore
