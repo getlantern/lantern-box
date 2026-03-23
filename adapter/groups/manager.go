@@ -179,6 +179,29 @@ func (m *MutableGroupManager) SetURLOverrides(group string, overrides map[string
 	return nil
 }
 
+// CheckOutbounds triggers an immediate URL test cycle on the specified group.
+// The group must implement [adapter.OutboundChecker].
+func (m *MutableGroupManager) CheckOutbounds(group string) error {
+	m.mu.Lock()
+	if m.closed.Load() {
+		m.mu.Unlock()
+		return ErrIsClosed
+	}
+	outGroup, ok := m.groups[group]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("group %q not found", group)
+	}
+	checker, ok := outGroup.(adapter.OutboundChecker)
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("group %q does not support outbound checking", group)
+	}
+	m.mu.Unlock()
+	checker.CheckOutbounds()
+	return nil
+}
+
 // RemoveFromGroup removes an outbound/endpoint from the specified group.
 func (m *MutableGroupManager) RemoveFromGroup(group, tag string) error {
 	m.mu.Lock()
