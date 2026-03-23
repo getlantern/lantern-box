@@ -17,6 +17,11 @@ type URLOverrideSetter interface {
 	SetURLOverrides(overrides map[string]string)
 }
 
+// OutboundChecker is implemented by outbound groups that support on-demand URL testing.
+type OutboundChecker interface {
+	CheckOutbounds()
+}
+
 // TaggedConn is a net.Conn tagged with the outbound tag used to create it.
 type TaggedConn struct {
 	net.Conn
