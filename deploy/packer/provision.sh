@@ -104,8 +104,9 @@ echo "==> Setting up lantern-box auto-update (via GitHub Releases)"
 cat > /usr/local/bin/lantern-box-update <<'SCRIPT'
 #!/bin/bash
 set -euo pipefail
-# Derive a per-machine sleep (0-3599s) from machine-id so instances stagger naturally.
-sleep $(( $(cksum /etc/machine-id | cut -d' ' -f1) % 3600 ))
+# Derive a per-machine sleep (0-599s) from machine-id so instances stagger naturally
+# within the 10-minute check interval.
+sleep $(( $(cksum /etc/machine-id | cut -d' ' -f1) % 600 ))
 
 arch=$(dpkg --print-architecture)
 current_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
@@ -152,7 +153,7 @@ chmod 755 /usr/local/bin/lantern-box-update
 cat > /etc/cron.d/lantern-box-update <<'CRON'
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-0 */6 * * * root /usr/local/bin/lantern-box-update
+*/10 * * * * root /usr/local/bin/lantern-box-update
 CRON
 chmod 644 /etc/cron.d/lantern-box-update
 
