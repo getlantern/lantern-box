@@ -68,12 +68,6 @@ variable "alicloud_ssh_password" {
   default   = env("ALICLOUD_SSH_PASSWORD")
 }
 
-variable "alicloud_source_image" {
-  type        = string
-  default     = env("ALICLOUD_SOURCE_IMAGE")
-  description = "Base Ubuntu 24.04 image ID. Find via: aliyun ecs DescribeImages --RegionId ap-southeast-1 --OSType linux --ImageOwnerAlias system --ImageName 'ubuntu_24*64*'"
-}
-
 # OCI shared variables (same across all regions)
 variable "oci_tenancy_ocid" {
   type      = string
@@ -285,7 +279,13 @@ source "alicloud-ecs" "lantern-box" {
   image_force_delete            = true
   image_force_delete_snapshots  = true
   image_ignore_data_disks       = true
-  source_image         = var.alicloud_source_image
+  # Auto-discover the latest Ubuntu 24.04 base image so the build doesn't
+  # break when Alibaba rotates system images.
+  source_image_filter {
+    most_recent = true
+    owners      = "system"
+    name_regex  = "^ubuntu_24_04.*x64$"
+  }
   system_disk_mapping {
     disk_size     = 20
     disk_category = "cloud_essd"
