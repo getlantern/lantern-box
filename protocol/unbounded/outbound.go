@@ -202,9 +202,6 @@ func NewOutbound(
 			return outboundDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
 		}
 		signalingTransport = &http.Transport{
-			Dial: func(network, addr string) (net.Conn, error) {
-				return dialContext(ctx, network, addr)
-			},
 			DialContext: dialContext,
 		}
 	}
