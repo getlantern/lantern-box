@@ -28,6 +28,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
 
+	lbAdapter "github.com/getlantern/lantern-box/adapter"
 	C "github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
 )
@@ -188,17 +189,26 @@ func NewOutbound(
 	}
 	rtcOpt.Net = rtcNet
 
-	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return outboundDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
-	}
-	rtcOpt.HTTPClient = &http.Client{
-		Transport: &http.Transport{
+	// Use the direct transport registered by radiance (backed by kindling) when
+	// available. This ensures signaling traffic bypasses the VPN tunnel on all
+	// platforms via sing-box's direct outbound socket protection.
+	// Fall back to the outbound dialer when no direct transport is registered
+	// (e.g., in tests or standalone usage).
+	var signalingTransport http.RoundTripper
+	if dt := lbAdapter.DirectTransportFromContext(ctx); dt != nil {
+		signalingTransport = dt
+	} else {
+		dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return outboundDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+		}
+		signalingTransport = &http.Transport{
 			Dial: func(network, addr string) (net.Conn, error) {
 				return dialContext(ctx, network, addr)
 			},
 			DialContext: dialContext,
-		},
+		}
 	}
+	rtcOpt.HTTPClient = &http.Client{Transport: signalingTransport}
 
 	tlsConfig, err := generateSelfSignedTLSConfig(
 		options.InsecureDoNotVerifyClientCert,
