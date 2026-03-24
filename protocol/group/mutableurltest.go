@@ -641,6 +641,11 @@ func urlTestGET(ctx context.Context, link string, detour N.Dialer) (uint16, erro
 	if err != nil {
 		return 0, err
 	}
+	// Propagate embedded trace context so the bandit callback
+	// appears in the same distributed trace as the config assignment.
+	if tp := linkURL.Query().Get("tp"); tp != "" {
+		req.Header.Set("traceparent", tp)
+	}
 	client := http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
