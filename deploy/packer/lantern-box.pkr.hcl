@@ -68,12 +68,6 @@ variable "alicloud_ssh_password" {
   default   = env("ALICLOUD_SSH_PASSWORD")
 }
 
-variable "alicloud_source_image" {
-  type        = string
-  default     = env("ALICLOUD_SOURCE_IMAGE")
-  description = "Optional: explicit base image ID. If empty, source_image_filter auto-discovers the latest Ubuntu 24.04."
-}
-
 # OCI shared variables (same across all regions)
 variable "oci_tenancy_ocid" {
   type      = string
@@ -290,7 +284,7 @@ source "alicloud-ecs" "lantern-box" {
   source_image_filter {
     most_recent = true
     owners      = "system"
-    name_regex  = "^ubuntu_24.*64"
+    name_regex  = "^ubuntu_24_04.*x64$"
   }
   system_disk_mapping {
     disk_size     = 20
