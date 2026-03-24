@@ -104,8 +104,17 @@ echo "==> Setting up lantern-box auto-update (via GitHub Releases)"
 cat > /usr/local/bin/lantern-box-update <<'SCRIPT'
 #!/bin/bash
 set -euo pipefail
-# Derive a per-machine sleep (0-3599s) from machine-id so instances stagger naturally.
-sleep $(( $(cksum /etc/machine-id | cut -d' ' -f1) % 3600 ))
+
+# Prevent overlapping runs — cron may start a new instance while the
+# previous one is still sleeping or installing.
+exec 9>/var/lock/lantern-box-update.lock
+if ! flock -n 9; then
+  exit 0
+fi
+
+# Derive a per-machine sleep (0-599s) from machine-id so instances stagger naturally
+# within the 10-minute check interval.
+sleep $(( $(cksum /etc/machine-id | cut -d' ' -f1) % 600 ))
 
 arch=$(dpkg --print-architecture)
 current_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
@@ -124,7 +133,6 @@ fi
 latest_ver="${latest_tag#v}"
 
 if [ "$current_ver" = "$latest_ver" ]; then
-  echo "lantern-box is up to date ($current_ver)"
   exit 0
 fi
 
@@ -136,7 +144,7 @@ tmpfile=$(mktemp /tmp/lantern-box-update-XXXXXX.deb)
 trap 'rm -f "$tmpfile"' EXIT
 
 curl -fsSL --retry 3 -o "$tmpfile" "${deb_url}"
-dpkg -i "$tmpfile" || { apt-get update -qq && apt-get install -f -y -qq; }
+dpkg -o DPkg::Lock::Timeout=120 -i "$tmpfile" || { apt-get -o DPkg::Lock::Timeout=120 update -qq && apt-get -o DPkg::Lock::Timeout=120 install -f -y -qq; }
 
 new_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
 if [ "$new_ver" != "$latest_ver" ]; then
@@ -152,7 +160,8 @@ chmod 755 /usr/local/bin/lantern-box-update
 cat > /etc/cron.d/lantern-box-update <<'CRON'
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-0 */6 * * * root /usr/local/bin/lantern-box-update
+MAILTO=""
+*/10 * * * * root /usr/local/bin/lantern-box-update 2>&1 | logger -t lantern-box-update
 CRON
 chmod 644 /etc/cron.d/lantern-box-update
 
