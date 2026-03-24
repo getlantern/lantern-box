@@ -13,7 +13,7 @@ packer {
       source  = "github.com/hashicorp/oracle"
     }
     alicloud = {
-      version = ">= 1.1.0"
+      version = ">= 1.1.2"
       source  = "github.com/hashicorp/alicloud"
     }
   }
@@ -279,13 +279,10 @@ source "alicloud-ecs" "lantern-box" {
   image_force_delete            = true
   image_force_delete_snapshots  = true
   image_ignore_data_disks       = true
-  # Auto-discover the latest Ubuntu 24.04 base image so the build doesn't
-  # break when Alibaba rotates system images.
-  source_image_filter {
-    most_recent = true
-    owners      = "system"
-    name_regex  = "^ubuntu_24_04.*x64$"
-  }
+  # Auto-discover the latest Ubuntu 24.04 base image via image_family
+  # (requires alicloud plugin >= 1.1.2). This calls DescribeImageFromFamily
+  # and always returns the latest system image in the family.
+  image_family = "acs:ubuntu_24_04_x64"
   system_disk_mapping {
     disk_size     = 20
     disk_category = "cloud_essd"
