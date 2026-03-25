@@ -97,6 +97,18 @@ cat > /etc/systemd/system/otelcol-contrib.service.d/env.conf <<'DROPIN'
 EnvironmentFile=/etc/otelcol-contrib/otelcol.env
 DROPIN
 
+# Create empty env file for lantern-box OTel — cloud-init populates it
+# with OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS, and
+# OTEL_RESOURCE_ATTRIBUTES before starting the service.
+install -m 600 -o root -g root /dev/null /etc/lantern-box/otel.env
+
+# Systemd drop-in to load OTel env vars into lantern-box
+mkdir -p /etc/systemd/system/lantern-box.service.d
+cat > /etc/systemd/system/lantern-box.service.d/otel.conf <<'DROPIN'
+[Service]
+EnvironmentFile=/etc/lantern-box/otel.env
+DROPIN
+
 systemctl daemon-reload
 # Do NOT enable — cloud-init writes env vars first, then enables the service.
 
