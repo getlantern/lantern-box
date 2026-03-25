@@ -53,9 +53,9 @@ apt-get "${APT_OPTS[@]}" install -y -q \
   tzdata \
   nftables
 
-echo "==> Downloading sing-box-extensions .deb from GitHub release"
+echo "==> Downloading lantern-box .deb from GitHub release"
 arch=$(dpkg --print-architecture)  # amd64 or arm64
-deb_name="sing-box-extensions_${VERSION}_linux_${arch}.deb"
+deb_name="lantern-box_${VERSION}_linux_${arch}.deb"
 deb_url="https://github.com/getlantern/lantern-box/releases/download/v${VERSION}/${deb_name}"
 echo "    URL: ${deb_url}"
 curl -fsSL -o "/tmp/${deb_name}" "${deb_url}"
@@ -64,22 +64,8 @@ echo "==> Installing ${deb_name}"
 apt-get "${APT_OPTS[@]}" install -y -q "/tmp/${deb_name}"
 rm -f "/tmp/${deb_name}"
 
-# The .deb installs the binary as /usr/bin/sing-box-extensions.
-# The systemd service files reference /usr/bin/lantern-box, so create a symlink.
-ln -sf /usr/bin/sing-box-extensions /usr/bin/lantern-box
-
 echo "==> Setting up directories"
 mkdir -p /etc/lantern-box /var/lib/lantern-box
-
-# Symlink installed service files to lantern-box names.
-# Using symlinks (not copies) so updates to the .deb package are reflected.
-for svc in sing-box-extensions.service sing-box-extensions@.service; do
-  installed="/usr/lib/systemd/system/${svc}"
-  target="/usr/lib/systemd/system/$(echo "$svc" | sed 's/sing-box-extensions/lantern-box/')"
-  if [ -f "$installed" ]; then
-    ln -sf "$installed" "$target"
-  fi
-done
 
 systemctl daemon-reload
 
@@ -111,8 +97,85 @@ cat > /etc/systemd/system/otelcol-contrib.service.d/env.conf <<'DROPIN'
 EnvironmentFile=/etc/otelcol-contrib/otelcol.env
 DROPIN
 
+# Create empty env file for lantern-box OTel — cloud-init populates it
+# with OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS, and
+# OTEL_RESOURCE_ATTRIBUTES before starting the service.
+install -m 600 -o root -g root /dev/null /etc/lantern-box/otel.env
+
+# Systemd drop-in to load OTel env vars into lantern-box
+mkdir -p /etc/systemd/system/lantern-box.service.d
+cat > /etc/systemd/system/lantern-box.service.d/otel.conf <<'DROPIN'
+[Service]
+EnvironmentFile=/etc/lantern-box/otel.env
+DROPIN
+
 systemctl daemon-reload
 # Do NOT enable — cloud-init writes env vars first, then enables the service.
+
+echo "==> Setting up lantern-box auto-update (via GitHub Releases)"
+cat > /usr/local/bin/lantern-box-update <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+
+# Prevent overlapping runs — cron may start a new instance while the
+# previous one is still sleeping or installing.
+exec 9>/var/lock/lantern-box-update.lock
+if ! flock -n 9; then
+  exit 0
+fi
+
+# Derive a per-machine sleep (0-599s) from machine-id so instances stagger naturally
+# within the 10-minute check interval.
+sleep $(( $(cksum /etc/machine-id | cut -d' ' -f1) % 600 ))
+
+arch=$(dpkg --print-architecture)
+current_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
+
+# Fetch latest release tag via the 302 redirect from /releases/latest.
+# This avoids the GitHub API rate limit (60 req/hr unauthenticated) entirely.
+redirect_url=$(curl -fsSI --retry 3 -o /dev/null -w '%{redirect_url}' \
+  https://github.com/getlantern/lantern-box/releases/latest)
+latest_tag="${redirect_url##*/}"
+
+if [ -z "$latest_tag" ]; then
+  echo "lantern-box-update: failed to fetch latest release tag" >&2
+  exit 1
+fi
+
+latest_ver="${latest_tag#v}"
+
+if [ "$current_ver" = "$latest_ver" ]; then
+  exit 0
+fi
+
+echo "lantern-box update available: $current_ver -> $latest_ver"
+deb_name="lantern-box_${latest_ver}_linux_${arch}.deb"
+deb_url="https://github.com/getlantern/lantern-box/releases/download/${latest_tag}/${deb_name}"
+
+tmpfile=$(mktemp /tmp/lantern-box-update-XXXXXX.deb)
+trap 'rm -f "$tmpfile"' EXIT
+
+curl -fsSL --retry 3 -o "$tmpfile" "${deb_url}"
+dpkg -o DPkg::Lock::Timeout=120 -i "$tmpfile" || { apt-get -o DPkg::Lock::Timeout=120 update -qq && apt-get -o DPkg::Lock::Timeout=120 install -f -y -qq; }
+
+new_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
+if [ "$new_ver" != "$latest_ver" ]; then
+  echo "lantern-box-update: install failed, expected $latest_ver but got $new_ver" >&2
+  exit 1
+fi
+
+echo "lantern-box upgraded: $current_ver -> $new_ver, restarting"
+systemctl restart lantern-box
+SCRIPT
+chmod 755 /usr/local/bin/lantern-box-update
+
+cat > /etc/cron.d/lantern-box-update <<'CRON'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+*/10 * * * * root /usr/local/bin/lantern-box-update 2>&1 | logger -t lantern-box-update
+CRON
+chmod 644 /etc/cron.d/lantern-box-update
 
 # Re-enable unattended-upgrades so the final image receives security updates.
 systemctl unmask unattended-upgrades.service 2>/dev/null || true

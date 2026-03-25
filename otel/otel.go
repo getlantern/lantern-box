@@ -2,8 +2,8 @@ package otel
 
 import (
 	"context"
+	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/log"
@@ -11,108 +11,94 @@ import (
 	sdkotel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 )
 
-type Opts struct {
-	Endpoint         string
-	Headers          map[string]string
-	ProxyName        string
-	Track            string
-	Provider         string
-	DC               string
-	FrontendProvider string
-	FrontendDC       string
-	ProxyProtocol    string
-	Addr             string
-	IsPro            bool
-	Legacy           bool
+// Enabled checks if an OTLP endpoint is configured via standard OTEL_EXPORTER_OTLP_* env vars.
+func Enabled() bool {
+	for _, key := range []string{
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+	} {
+		if os.Getenv(key) != "" {
+			return true
+		}
+	}
+	return false
 }
 
-func GetTelemetryEndpoint(fallback string) string {
-	if endpoint := os.Getenv("CUSTOM_OTLP_ENDPOINT"); endpoint != "" {
-		return endpoint
-	}
-	return fallback
-}
-
-func InitGlobalMeterProvider(opts *Opts) (func(), error) {
-	metricOpts := []otlpmetrichttp.Option{
-		otlpmetrichttp.WithEndpoint(opts.Endpoint),
-		otlpmetrichttp.WithHeaders(opts.Headers),
-		otlpmetrichttp.WithTemporalitySelector(func(kind sdkmetric.InstrumentKind) metricdata.Temporality {
-			switch kind {
-			case
-				sdkmetric.InstrumentKindCounter,
-				sdkmetric.InstrumentKindUpDownCounter,
-				sdkmetric.InstrumentKindObservableCounter,
-				sdkmetric.InstrumentKindObservableUpDownCounter:
-				return metricdata.DeltaTemporality
-			default:
-				return metricdata.CumulativeTemporality
-			}
-		}),
-	}
-
-	// If endpoint doesn't use port 443, assume insecure (HTTP not HTTPS)
-	if !strings.Contains(opts.Endpoint, ":443") {
-		log.Debug("Using insecure connection for OTEL metrics endpoint ", opts.Endpoint)
-		metricOpts = append(metricOpts, otlpmetrichttp.WithInsecure())
-	}
-
-	exp, err := otlpmetrichttp.New(context.Background(), metricOpts...)
+func InitGlobalMeterProvider(attrs ...attribute.KeyValue) (func(), error) {
+	exp, err := otlpmetrichttp.New(context.Background(),
+		otlpmetrichttp.WithTemporalitySelector(deltaForCounters),
+	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("new meter provider: %w", err)
 	}
 
-	// Create a new meter provider
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exp)),
-		sdkmetric.WithResource(opts.buildResource()),
+		sdkmetric.WithResource(buildResource(attrs...)),
 	)
-
-	// Set the meter provider as global
 	sdkotel.SetMeterProvider(mp)
 
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		err := mp.Shutdown(ctx)
-		if err != nil {
-			log.Error(E.Cause(err, "error shutting down meter provider"))
+		if err := mp.Shutdown(ctx); err != nil {
+			log.Error(E.Cause(err, "shutting down meter provider"))
 		}
 	}, nil
 }
 
-func (opts *Opts) buildResource() *resource.Resource {
-	attributes := []attribute.KeyValue{
+func InitGlobalTracerProvider(attrs ...attribute.KeyValue) (func(), error) {
+	exp, err := otlptracehttp.New(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("new tracer provider: %w", err)
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(buildResource(attrs...)),
+	)
+	sdkotel.SetTracerProvider(tp)
+
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := tp.Shutdown(ctx); err != nil {
+			log.Error(E.Cause(err, "shutting down tracer provider"))
+		}
+	}, nil
+}
+
+func deltaForCounters(kind sdkmetric.InstrumentKind) metricdata.Temporality {
+	switch kind {
+	case sdkmetric.InstrumentKindCounter,
+		sdkmetric.InstrumentKindUpDownCounter,
+		sdkmetric.InstrumentKindObservableCounter,
+		sdkmetric.InstrumentKindObservableUpDownCounter:
+		return metricdata.DeltaTemporality
+	default:
+		return metricdata.CumulativeTemporality
+	}
+}
+
+// buildResource creates an OTEL resource with a default service name
+// of "lantern-box". All attributes can be overridden or extended via
+// OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES env vars.
+func buildResource(extras ...attribute.KeyValue) *resource.Resource {
+	attrs := append([]attribute.KeyValue{
 		semconv.ServiceNameKey.String("lantern-box"),
-		attribute.String("protocol", opts.ProxyProtocol),
-		attribute.Bool("pro", opts.IsPro),
-		attribute.Bool("legacy", opts.Legacy),
-	}
-	if opts.Track != "" {
-		attributes = append(attributes, attribute.String("track", opts.Track))
-	}
-	if opts.ProxyName != "" {
-		log.Debug("Will report with proxy.name ", opts.ProxyName)
-		attributes = append(attributes, attribute.String("proxy.name", opts.ProxyName))
-	}
-	if opts.Provider != "" {
-		log.Debug("Will report with provider ", opts.Provider)
-		attributes = append(attributes, attribute.String("provider", opts.Provider))
-	}
-	if opts.DC != "" {
-		log.Debug("Will report with dc ", opts.DC)
-		attributes = append(attributes, attribute.String("dc", opts.DC))
-	}
-	if opts.FrontendProvider != "" {
-		log.Debug("Will report frontend provider  in dc ", opts.FrontendProvider, opts.FrontendDC)
-		attributes = append(attributes, attribute.String("frontend.provider", opts.FrontendProvider))
-		attributes = append(attributes, attribute.String("frontend.dc", opts.FrontendDC))
-	}
-	return resource.NewWithAttributes(semconv.SchemaURL, attributes...)
+	}, extras...)
+	r, _ := resource.New(context.Background(),
+		resource.WithAttributes(attrs...),
+		resource.WithFromEnv(),
+	)
+	return r
 }

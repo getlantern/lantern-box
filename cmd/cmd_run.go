@@ -17,12 +17,9 @@ import (
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
 	"github.com/spf13/cobra"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/metric/noop"
-
-	"gopkg.in/ini.v1"
 
 	"github.com/getlantern/lantern-box/adapter"
+	lbotel "github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
 	"github.com/getlantern/lantern-box/tracker/metrics"
@@ -33,7 +30,6 @@ func init() {
 	runCmd.Flags().String("config", "config.json", "Configuration file path")
 	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz", "URL for downloading GeoLite2-City database")
 	runCmd.Flags().String("city-database-name", "GeoLite2-City.mmdb", "Filename for storing GeoLite2-City database")
-	runCmd.Flags().String("telemetry-endpoint", "telemetry.iantem.io:443", "Telemetry endpoint for OpenTelemetry exporter")
 	runCmd.Flags().String("datacap-url", "", "Datacap sidecar URL (legacy mode)")
 	runCmd.Flags().String("datacap-grpc-api", "", "Datacap cloud gRPC API address (direct mode, mutually exclusive with --datacap-url)")
 	runCmd.Flags().Duration("datacap-batch-interval", 30*time.Second, "Datacap batch upload interval (direct mode)")
@@ -41,6 +37,7 @@ func init() {
 	runCmd.Flags().String("datacap-ca-cert", "", "Path to CA cert for datacap mTLS")
 	runCmd.Flags().String("datacap-client-cert", "", "Path to client cert for datacap mTLS")
 	runCmd.Flags().String("datacap-client-key", "", "Path to client key for datacap mTLS")
+	runCmd.Flags().String("proxy-info", "", "Path to proxy info INI file")
 }
 
 type datacapFlags struct {
@@ -95,19 +92,6 @@ var runCmd = &cobra.Command{
 	},
 }
 
-func readProxyInfoFile(path string) (*ProxyInfo, error) {
-	cfg, err := ini.Load(path)
-	if err != nil {
-		return nil, fmt.Errorf("loading proxy info file: %w", err)
-	}
-	var info ProxyInfo
-	err = cfg.MapTo(&info)
-	if err != nil {
-		return nil, fmt.Errorf("mapping proxy info file: %w", err)
-	}
-	return &info, nil
-}
-
 func readConfig(path string) (option.Options, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -143,6 +127,12 @@ func create(configPath string, dcFlags datacapFlags) (*box.Box, context.CancelFu
 	instance.Router().AppendTracker(clientCtxMgr)
 	service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
 
+	if lbotel.Enabled() {
+		metricsTracker := metrics.NewTracker(ctx)
+		clientCtxMgr.AppendTracker(metricsTracker)
+		log.Info("Metric Tracking Enabled")
+	}
+
 	if dcFlags.GRPCAPI != "" {
 		log.Info("Datacap direct mode enabled (gRPC API: ", dcFlags.GRPCAPI, ")")
 		var mtls *datacapMTLSConfig
@@ -166,7 +156,6 @@ func create(configPath string, dcFlags datacapFlags) (*box.Box, context.CancelFu
 		tracker := datacap.NewDatacapTrackerWithStore(store, 10*time.Second, log.StdLogger())
 		tracker.Start(ctx)
 		clientCtxMgr.AppendTracker(tracker)
-		// Register shutdown hook for graceful batch upload
 		go func() {
 			<-ctx.Done()
 			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -190,15 +179,6 @@ func create(configPath string, dcFlags datacapFlags) (*box.Box, context.CancelFu
 		clientCtxMgr.AppendTracker(datacapTracker)
 	} else {
 		log.Warn("Datacap not configured, datacap tracking disabled")
-	}
-
-	mp := otel.GetMeterProvider()
-	if _, ok := mp.(noop.MeterProvider); ok {
-		log.Info("Metrics not enabled, no meter provider configured")
-	} else {
-		metricsTracker := metrics.NewTracker(ctx)
-		instance.Router().AppendTracker(metricsTracker)
-		log.Info("Metric Tracking Enabled")
 	}
 
 	osSignals := make(chan os.Signal, 1)

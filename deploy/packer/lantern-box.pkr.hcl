@@ -12,6 +12,10 @@ packer {
       version = ">= 1.0.5"
       source  = "github.com/hashicorp/oracle"
     }
+    alicloud = {
+      version = ">= 1.1.2"
+      source  = "github.com/hashicorp/alicloud"
+    }
   }
 }
 
@@ -43,6 +47,25 @@ variable "do_region" {
 variable "linode_region" {
   type    = string
   default = "us-west"
+}
+
+# Alibaba Cloud (Alicloud) variables
+variable "alicloud_access_key" {
+  type      = string
+  sensitive = true
+  default   = env("ALICLOUD_ACCESS_KEY")
+}
+
+variable "alicloud_secret_key" {
+  type      = string
+  sensitive = true
+  default   = env("ALICLOUD_SECRET_KEY")
+}
+
+variable "alicloud_ssh_password" {
+  type      = string
+  sensitive = true
+  default   = env("ALICLOUD_SSH_PASSWORD")
 }
 
 # OCI shared variables (same across all regions)
@@ -246,6 +269,56 @@ source "linode" "lantern-box" {
   image_description = "lantern-box ${var.lantern_box_version} pre-baked image"
 }
 
+# Alibaba Cloud ECS — build in Singapore, copy to all Asia regions.
+source "alicloud-ecs" "lantern-box" {
+  access_key           = var.alicloud_access_key
+  secret_key           = var.alicloud_secret_key
+  region               = "ap-southeast-1"
+  instance_type        = "ecs.t6-c1m1.large"
+  image_name           = "lantern-box-${var.lantern_box_version}-{{timestamp}}"
+  image_ignore_data_disks       = true
+  # Auto-discover the latest Ubuntu 24.04 base image via image_family
+  # (requires alicloud plugin >= 1.1.2). This calls DescribeImageFromFamily
+  # and always returns the latest system image in the family.
+  image_family = "acs:ubuntu_24_04_x64"
+  system_disk_mapping {
+    disk_size     = 20
+    disk_category = "cloud_essd"
+  }
+  io_optimized                  = true
+  internet_charge_type          = "PayByTraffic"
+  internet_max_bandwidth_out    = 5
+  # Disable Alibaba's "security enhancement" (China-specific Aegis/CloudMonitor agent).
+  # We run our own monitoring and don't want the extra agent on proxy servers.
+  security_enhancement_strategy = "Deactive"
+  force_stop_instance           = true
+  ssh_username         = "root"
+  ssh_password         = var.alicloud_ssh_password
+
+  wait_copying_image_ready_timeout = 7200 # seconds (2h) — copying to 8 regions can be slow
+
+  image_copy_regions = [
+    "ap-southeast-1",  # Singapore
+    "ap-southeast-3",  # Malaysia (Kuala Lumpur)
+    "ap-southeast-5",  # Indonesia (Jakarta)
+    "ap-southeast-6",  # Philippines (Manila)
+    "ap-southeast-7",  # Thailand (Bangkok)
+    "ap-northeast-1",  # Japan (Tokyo)
+    "ap-northeast-2",  # South Korea (Seoul)
+    "cn-hongkong",     # Hong Kong
+  ]
+  image_copy_names = [
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Singapore
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Malaysia
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Indonesia
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Philippines
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Thailand
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Japan
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # South Korea
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Hong Kong
+  ]
+}
+
 # ---------- Build ----------
 
 build {
@@ -256,6 +329,7 @@ build {
     "source.oracle-oci.lantern-box-fra",
     "source.oracle-oci.lantern-box-nrt",
     "source.oracle-oci.lantern-box-sin",
+    "source.alicloud-ecs.lantern-box",
   ]
 
   # Upload OTel Collector config before the shell provisioner copies it into place.
@@ -282,6 +356,8 @@ build {
       "rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*",
       "find /var/log -type f -exec truncate -s 0 {} +",
       "rm -f /root/.bash_history /home/*/.bash_history",
+      "passwd -l root",
+      "sed -i 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config",
     ]
   }
 

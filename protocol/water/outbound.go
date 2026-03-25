@@ -28,6 +28,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 	"github.com/tetratelabs/wazero"
 
 	"github.com/getlantern/lantern-box/constant"
@@ -74,7 +75,21 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	slogLogger := slog.New(L.NewLogHandler(logger))
 	vc := waterVC.NewWaterVersionControl(wasmDir, slogLogger)
-	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, &http.Client{Timeout: timeout})
+
+	httpClient := &http.Client{Timeout: timeout}
+	if options.DownloadDetour != "" {
+		logger.DebugContext(ctx, "download detour option set", slog.Any("detour", options.DownloadDetour))
+		outboundManager := service.FromContext[adapter.OutboundManager](ctx)
+		if detourDialer, loaded := outboundManager.Outbound(options.DownloadDetour); loaded {
+			httpClient.Transport = &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return detourDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+				},
+			}
+			logger.DebugContext(ctx, "using detour outbound for downloading WASM files", slog.Any("detour", options.DownloadDetour))
+		}
+	}
+	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, httpClient)
 	if err != nil {
 		return nil, E.New("failed to create WASM downloader", err)
 	}
@@ -131,9 +146,23 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		dialMutex:             sync.Mutex{},
 		skipHandshake:         options.SkipHandshake,
 	}
+
 	if options.SeedEnabled {
 		transportFilepath := filepath.Join(wasmDir, fmt.Sprintf("%s.%s", options.Transport, "wasm"))
-		seeder, err := seed.New(transportFilepath, options.AnnounceList)
+		httpClient := &http.Client{}
+		if options.SeedDetour != "" {
+			logger.DebugContext(ctx, "seeding detour option set", slog.Any("detour", options.SeedDetour))
+			outboundManager := service.FromContext[adapter.OutboundManager](ctx)
+			if detourDialer, loaded := outboundManager.Outbound(options.SeedDetour); loaded {
+				httpClient.Transport = &http.Transport{
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return detourDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+					},
+				}
+				logger.DebugContext(ctx, "using detour outbound for seeding WASM files", slog.Any("detour", options.SeedDetour))
+			}
+		}
+		seeder, err := seed.New(transportFilepath, options.AnnounceList, httpClient)
 		if err != nil {
 			logger.WarnContext(ctx, "failed to seed WASM", slog.Any("error", err), slog.String("transport", transportFilepath))
 		}

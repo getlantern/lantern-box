@@ -167,6 +167,76 @@ func TestSetURLOverrides(t *testing.T) {
 	})
 }
 
+func TestCheckOutbounds(t *testing.T) {
+	logger := log.NewNOPFactory().Logger()
+
+	t.Run("delegates to OutboundChecker group", func(t *testing.T) {
+		mock := &mockCheckerGroup{}
+		mgr := &MutableGroupManager{
+			groups: map[string]lbAdapter.MutableOutboundGroup{"auto-test": mock},
+			removalQueue: newRemovalQueue(
+				logger, &mockOutboundManager{}, &mockEndpointManager{}, &mockConnectionManager{},
+				pollInterval, forceAfter,
+			),
+		}
+		err := mgr.CheckOutbounds("auto-test")
+		require.NoError(t, err)
+		assert.True(t, mock.checked)
+	})
+
+	t.Run("error when group not found", func(t *testing.T) {
+		mgr := &MutableGroupManager{
+			groups: map[string]lbAdapter.MutableOutboundGroup{},
+			removalQueue: newRemovalQueue(
+				logger, &mockOutboundManager{}, &mockEndpointManager{}, &mockConnectionManager{},
+				pollInterval, forceAfter,
+			),
+		}
+		err := mgr.CheckOutbounds("nonexistent")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "not found")
+	})
+
+	t.Run("error when group does not implement OutboundChecker", func(t *testing.T) {
+		mock := &mockPlainGroup{}
+		mgr := &MutableGroupManager{
+			groups: map[string]lbAdapter.MutableOutboundGroup{"plain": mock},
+			removalQueue: newRemovalQueue(
+				logger, &mockOutboundManager{}, &mockEndpointManager{}, &mockConnectionManager{},
+				pollInterval, forceAfter,
+			),
+		}
+		err := mgr.CheckOutbounds("plain")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "does not support outbound checking")
+	})
+
+	t.Run("error when manager is closed", func(t *testing.T) {
+		mock := &mockCheckerGroup{}
+		mgr := &MutableGroupManager{
+			groups: map[string]lbAdapter.MutableOutboundGroup{"auto-test": mock},
+			removalQueue: newRemovalQueue(
+				logger, &mockOutboundManager{}, &mockEndpointManager{}, &mockConnectionManager{},
+				pollInterval, forceAfter,
+			),
+		}
+		mgr.closed.Store(true)
+		err := mgr.CheckOutbounds("auto-test")
+		assert.ErrorIs(t, err, ErrIsClosed)
+		assert.False(t, mock.checked)
+	})
+}
+
+// mockCheckerGroup implements both MutableOutboundGroup and OutboundChecker.
+type mockCheckerGroup struct {
+	lbAdapter.MutableOutboundGroup
+	checked bool
+}
+
+func (m *mockCheckerGroup) CheckOutbounds() {
+	m.checked = true
+}
+
 // mockURLOverrideGroup implements both MutableOutboundGroup and URLOverrideSetter.
 type mockURLOverrideGroup struct {
 	lbAdapter.MutableOutboundGroup
@@ -177,7 +247,7 @@ func (m *mockURLOverrideGroup) SetURLOverrides(overrides map[string]string) {
 	m.urlOverrides = overrides
 }
 
-// mockPlainGroup implements MutableOutboundGroup but NOT URLOverrideSetter.
+// mockPlainGroup implements MutableOutboundGroup but NOT URLOverrideSetter or OutboundChecker.
 type mockPlainGroup struct {
 	lbAdapter.MutableOutboundGroup
 }

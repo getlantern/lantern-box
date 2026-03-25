@@ -79,6 +79,7 @@ func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata 
 		return c
 	}
 	ctx = ContextWithClientInfo(ctx, *info)
+
 	conn = c
 	for _, tracker := range m.trackers {
 		conn = tracker.RoutedConnection(ctx, conn, metadata, matchedRule, matchOutbound)
@@ -105,6 +106,7 @@ func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn,
 		return c
 	}
 	ctx = ContextWithClientInfo(ctx, *info)
+
 	conn = c
 	for _, tracker := range m.trackers {
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, matchedRule, matchOutbound)

@@ -235,8 +235,15 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 	if err != nil {
 		return fmt.Errorf("marshaling client info: %w", err)
 	}
+	dest := c.metadata.Destination
+	var addr *net.UDPAddr
+	if dest.IsIP() {
+		addr = dest.UDPAddr()
+	} else if addr, err = net.ResolveUDPAddr("udp", dest.String()); err != nil {
+		return fmt.Errorf("resolving destination %s: %w", dest, err)
+	}
 	packet := append([]byte(packetPrefix), buf...)
-	if _, err = conn.WriteTo(packet, c.metadata.Destination.UDPAddr()); err != nil {
+	if _, err = conn.WriteTo(packet, addr); err != nil {
 		return fmt.Errorf("writing packet: %w", err)
 	}
 

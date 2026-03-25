@@ -24,17 +24,9 @@ type WATEROutboundOptions struct {
 	option.ServerOptions
 	option.DialerOptions
 	WATEROutboundSeedOptions
+	WATERDownloadOptions
 	// Transport works as a identifier for the WASM logs
 	Transport string `json:"transport"`
-	// Hashsum is used for validating if the downloaded WASM
-	// hasn't been tampered. Expects a sha256 sum.
-	Hashsum string `json:"hashsum"`
-	// WASMAvailableAt must provide a list of URLs where the WASM file
-	// can be downloaded
-	WASMAvailableAt []string `json:"wasm_available_at"`
-	// DownloadTimeout specifies how much time the downloader should wait
-	// until it cancel and try to fetch from another URL
-	DownloadTimeout string `json:"download_timeout"`
 	// Dir specifies which directory we should use for storing WATER related
 	// files
 	Dir string `json:"water_dir"`
@@ -45,10 +37,26 @@ type WATEROutboundOptions struct {
 	SkipHandshake bool `json:"skip_handshake,omitempty"`
 }
 
+type WATERDownloadOptions struct {
+	// Hashsum is used for validating if the downloaded WASM
+	// hasn't been tampered. Expects a sha256 sum.
+	Hashsum string `json:"hashsum"`
+	// WASMAvailableAt must provide a list of URLs where the WASM file
+	// can be downloaded
+	WASMAvailableAt []string `json:"wasm_available_at"`
+	// DownloadTimeout specifies how much time the downloader should wait
+	// until it cancel and try to fetch from another URL
+	DownloadTimeout string `json:"download_timeout"`
+	// DownloadDetour specifies which outbound tag to use when downloading the WASM file
+	DownloadDetour string `json:"download_detour,omitempty"`
+}
+
 // WATEROutboundSeedOptions specifies the seed configuration options
 type WATEROutboundSeedOptions struct {
 	// SeedEnabled enables seeding the used transport
 	SeedEnabled bool `json:"seed_enabled,omitempty"`
+	// SeedDetour specifies which outbound tag to use when seeding the WASM file
+	SeedDetour string `json:"seed_detour,omitempty"`
 	// AnnounceList specifies which trackers should be used to announce the file
 	AnnounceList [][]string `json:"announce_list,omitempty"`
 }
