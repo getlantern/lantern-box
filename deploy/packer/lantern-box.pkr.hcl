@@ -267,6 +267,19 @@ source "linode" "lantern-box" {
   ssh_username  = "root"
   image_label   = "lantern-box-${var.lantern_box_version}"
   image_description = "lantern-box ${var.lantern_box_version} pre-baked image"
+
+  # Replicate to all Linode regions. Linode handles replication in parallel.
+  # The build region (var.linode_region) must be included or it will be removed.
+  image_regions = [
+    "us-west", "us-east", "us-central", "us-southeast", "us-ord", "us-iad",
+    "us-lax", "us-mia", "us-sea",
+    "ca-central",
+    "eu-west", "eu-central", "gb-lon", "de-fra-2", "fr-par", "fr-par-2",
+    "nl-ams", "it-mil", "es-mad", "se-sto",
+    "ap-west", "ap-south", "ap-southeast", "ap-northeast",
+    "in-bom-2", "in-maa", "sg-sin-2", "jp-tyo-3", "jp-osa", "au-mel",
+    "id-cgk", "br-gru",
+  ]
 }
 
 # Alibaba Cloud ECS — build in Singapore, copy to all Asia regions.
