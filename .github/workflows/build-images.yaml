@@ -66,7 +66,8 @@ jobs:
           fi
 
           # Convert to JSON array for matrix strategy using jq to safely escape values
-          json_array=$(printf '%s\n' "$builders" | tr ',' '\n' | jq -R . | jq -s .)
+          # -c produces compact single-line output required by $GITHUB_OUTPUT
+          json_array=$(printf '%s\n' "$builders" | tr ',' '\n' | jq -R . | jq -sc .)
           echo "matrix={\"builder\":$json_array}" >> "$GITHUB_OUTPUT"
           echo "Matrix: $json_array"
 
