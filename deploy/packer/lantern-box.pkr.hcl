@@ -275,9 +275,7 @@ source "alicloud-ecs" "lantern-box" {
   secret_key           = var.alicloud_secret_key
   region               = "ap-southeast-1"
   instance_type        = "ecs.t6-c1m1.large"
-  image_name           = "lantern-box-${var.lantern_box_version}"
-  image_force_delete            = true
-  image_force_delete_snapshots  = true
+  image_name           = "lantern-box-${var.lantern_box_version}-{{timestamp}}"
   image_ignore_data_disks       = true
   # Auto-discover the latest Ubuntu 24.04 base image via image_family
   # (requires alicloud plugin >= 1.1.2). This calls DescribeImageFromFamily
@@ -310,14 +308,14 @@ source "alicloud-ecs" "lantern-box" {
     "cn-hongkong",     # Hong Kong
   ]
   image_copy_names = [
-    "lantern-box-${var.lantern_box_version}",  # Singapore
-    "lantern-box-${var.lantern_box_version}",  # Malaysia
-    "lantern-box-${var.lantern_box_version}",  # Indonesia
-    "lantern-box-${var.lantern_box_version}",  # Philippines
-    "lantern-box-${var.lantern_box_version}",  # Thailand
-    "lantern-box-${var.lantern_box_version}",  # Japan
-    "lantern-box-${var.lantern_box_version}",  # South Korea
-    "lantern-box-${var.lantern_box_version}",  # Hong Kong
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Singapore
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Malaysia
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Indonesia
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Philippines
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Thailand
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Japan
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # South Korea
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Hong Kong
   ]
 }
 
