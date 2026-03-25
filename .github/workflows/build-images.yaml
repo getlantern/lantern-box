@@ -59,10 +59,16 @@ jobs:
           else
             builders="$INPUT_BUILDERS"
           fi
-          # Convert to JSON array for matrix strategy
-          json=$(echo "$builders" | tr ',' '\n' | xargs -I{} echo '"{}"' | paste -sd',' | sed 's/^/[/;s/$/]/')
-          echo "matrix={\"builder\":$json}" >> "$GITHUB_OUTPUT"
-          echo "Matrix: $json"
+          # Validate that we have at least one builder
+          if [ -z "$builders" ]; then
+            echo "::error::No builders specified. Provide at least one builder (comma-separated) via the 'builders' input."
+            exit 1
+          fi
+
+          # Convert to JSON array for matrix strategy using jq to safely escape values
+          json_array=$(printf '%s\n' "$builders" | tr ',' '\n' | jq -R . | jq -s .)
+          echo "matrix={\"builder\":$json_array}" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $json_array"
 
   # Prune old images before building (avoids provider quota limits)
   prune:
@@ -87,11 +93,22 @@ jobs:
           if [ "$total" -le "$KEEP" ]; then
             echo "Nothing to prune."
           else
+            failures=0
             echo "$snapshots" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id name; do
               echo "Deleting $name ($id, created $created)..."
-              curl -sS -f -X DELETE -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
-                "https://api.digitalocean.com/v2/snapshots/$id" || echo "::warning::Failed to delete $name"
+              http_code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
+                "https://api.digitalocean.com/v2/snapshots/$id")
+              if [ "$http_code" = "404" ]; then
+                echo "  Already gone (404), skipping."
+              elif [ "$http_code" -ge 400 ]; then
+                echo "::error::Failed to delete DO snapshot $name ($id): HTTP $http_code"
+                failures=$((failures + 1))
+              fi
             done
+            if [ "$failures" -gt 0 ]; then
+              echo "::error::$failures snapshot(s) failed to delete"
+              exit 1
+            fi
           fi
 
       - name: Prune old Linode images
@@ -110,11 +127,22 @@ jobs:
           if [ "$total" -le "$KEEP" ]; then
             echo "Nothing to prune."
           else
+            failures=0
             echo "$images" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id label; do
               echo "Deleting $label ($id, created $created)..."
-              curl -sS -f -X DELETE -H "Authorization: Bearer $LINODE_TOKEN" \
-                "https://api.linode.com/v4/images/$id" || echo "::warning::Failed to delete $label"
+              http_code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $LINODE_TOKEN" \
+                "https://api.linode.com/v4/images/$id")
+              if [ "$http_code" = "404" ]; then
+                echo "  Already gone (404), skipping."
+              elif [ "$http_code" -ge 400 ]; then
+                echo "::error::Failed to delete Linode image $label ($id): HTTP $http_code"
+                failures=$((failures + 1))
+              fi
             done
+            if [ "$failures" -gt 0 ]; then
+              echo "::error::$failures image(s) failed to delete"
+              exit 1
+            fi
           fi
 
   # Build each provider in parallel
@@ -152,8 +180,12 @@ jobs:
             oracle-oci)
               echo "flag=oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin" >> "$GITHUB_OUTPUT"
               ;;
-            *)
+            digitalocean|linode|alicloud-ecs)
               echo "flag=${BUILDER}.lantern-box" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unsupported builder: $BUILDER"
+              exit 1
               ;;
           esac
 
