@@ -46,7 +46,7 @@ variable "do_region" {
 
 variable "linode_region" {
   type    = string
-  default = "us-west"
+  default = "us-lax"
 }
 
 # Alibaba Cloud (Alicloud) variables
@@ -270,13 +270,13 @@ source "linode" "lantern-box" {
 
   # Replicate to all Linode regions. Linode handles replication in parallel.
   # The build region (var.linode_region) must be included or it will be removed.
+  # Only city-based region IDs are supported; legacy IDs (us-west, ap-southeast, etc.)
+  # lack Object Storage capability and cannot receive replicated images.
   image_regions = [
-    "us-west", "us-east", "us-central", "us-southeast", "us-ord", "us-iad",
-    "us-lax", "us-mia", "us-sea",
-    "ca-central",
-    "eu-west", "eu-central", "gb-lon", "de-fra-2", "fr-par", "fr-par-2",
+    "us-lax", "us-mia", "us-sea", "us-ord", "us-iad",
+    "us-east", "us-southeast",
+    "gb-lon", "de-fra-2", "fr-par", "fr-par-2",
     "nl-ams", "it-mil", "es-mad", "se-sto",
-    "ap-west", "ap-south", "ap-southeast", "ap-northeast",
     "in-bom-2", "in-maa", "sg-sin-2", "jp-tyo-3", "jp-osa", "au-mel",
     "id-cgk", "br-gru",
   ]
