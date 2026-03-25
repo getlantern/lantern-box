@@ -13,61 +13,124 @@ on:
         required: true
         type: string
       builders:
-        description: "Comma-separated builders (digitalocean,linode,oracle-oci-iad,oracle-oci-fra,oracle-oci-nrt,oracle-oci-sin,alicloud-ecs)"
+        description: "Comma-separated builders (digitalocean,linode,oracle-oci,alicloud-ecs)"
         required: false
-        default: "digitalocean,linode,oracle-oci-iad,oracle-oci-fra,oracle-oci-nrt,oracle-oci-sin,alicloud-ecs"
+        default: "digitalocean,linode,oracle-oci,alicloud-ecs"
         type: string
 
 permissions:
   contents: read
 
 jobs:
-  build-images:
-    name: Build images
+  # Determine version and which builders to run
+  prepare:
+    name: Prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Determine version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "release" ]; then
+            echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            if [[ "$INPUT_VERSION" == v* ]]; then
+              echo "::error::Version should not start with 'v' (got '$INPUT_VERSION'). Use e.g. 1.2.3"
+              exit 1
+            fi
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build matrix
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BUILDERS: ${{ inputs.builders }}
+        run: |
+          if [ "$EVENT_NAME" = "release" ]; then
+            builders="digitalocean,linode,oracle-oci,alicloud-ecs"
+          else
+            builders="$INPUT_BUILDERS"
+          fi
+          # Convert to JSON array for matrix strategy
+          json=$(echo "$builders" | tr ',' '\n' | xargs -I{} echo '"{}"' | paste -sd',' | sed 's/^/[/;s/$/]/')
+          echo "matrix={\"builder\":$json}" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $json"
+
+  # Prune old images before building (avoids provider quota limits)
+  prune:
+    name: Prune old images
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: prepare
+    steps:
+      - name: Prune old DigitalOcean snapshots
+        if: contains(needs.prepare.outputs.matrix, 'digitalocean')
+        env:
+          DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+        run: |
+          KEEP=3
+          echo "Fetching DigitalOcean snapshots..."
+          snapshots=$(curl -sS -f -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
+            "https://api.digitalocean.com/v2/snapshots?resource_type=droplet&per_page=200" \
+            | jq -r '.snapshots[] | select(.name | startswith("lantern-box-")) | "\(.created_at)\t\(.id)\t\(.name)"' \
+            | sort -r)
+          total=$(echo "$snapshots" | grep -c . || true)
+          echo "Found $total lantern-box snapshots (keeping $KEEP most recent)"
+          if [ "$total" -le "$KEEP" ]; then
+            echo "Nothing to prune."
+          else
+            echo "$snapshots" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id name; do
+              echo "Deleting $name ($id, created $created)..."
+              curl -sS -f -X DELETE -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
+                "https://api.digitalocean.com/v2/snapshots/$id" || echo "::warning::Failed to delete $name"
+            done
+          fi
+
+      - name: Prune old Linode images
+        if: contains(needs.prepare.outputs.matrix, 'linode')
+        env:
+          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
+        run: |
+          KEEP=3
+          echo "Fetching Linode custom images..."
+          images=$(curl -sS -f -H "Authorization: Bearer $LINODE_TOKEN" \
+            "https://api.linode.com/v4/images?page_size=500" \
+            | jq -r '.data[] | select(.is_public == false and (.label | startswith("lantern-box-"))) | "\(.created)\t\(.id)\t\(.label)"' \
+            | sort -r)
+          total=$(echo "$images" | grep -c . || true)
+          echo "Found $total lantern-box images (keeping $KEEP most recent)"
+          if [ "$total" -le "$KEEP" ]; then
+            echo "Nothing to prune."
+          else
+            echo "$images" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id label; do
+              echo "Deleting $label ($id, created $created)..."
+              curl -sS -f -X DELETE -H "Authorization: Bearer $LINODE_TOKEN" \
+                "https://api.linode.com/v4/images/$id" || echo "::warning::Failed to delete $label"
+            done
+          fi
+
+  # Build each provider in parallel
+  build:
+    name: Build ${{ matrix.builder }}
+    runs-on: ubuntu-latest
+    needs: [prepare, prune]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    # Alicloud copies images to 8 regions (up to 2h). Others are fast.
+    timeout-minutes: ${{ matrix.builder == 'alicloud-ecs' && 150 || 45 }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Determine version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            # Strip the leading 'v' from the tag
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-            echo "builders=digitalocean.lantern-box,linode.lantern-box,oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin,alicloud-ecs.lantern-box" >> "$GITHUB_OUTPUT"
-          else
-            version="${{ inputs.version }}"
-            if [[ "$version" == v* ]]; then
-              echo "::error::Version should not start with 'v' (got '$version'). Use e.g. 1.2.3"
-              exit 1
-            fi
-            echo "version=$version" >> "$GITHUB_OUTPUT"
-            # Convert comma-separated builder names to packer -only format.
-            # Input names like "oracle-oci-iad" map to "oracle-oci.lantern-box-iad".
-            # Non-OCI names like "digitalocean" map to "digitalocean.lantern-box".
-            builders=""
-            IFS=',' read -ra PARTS <<< "${{ inputs.builders }}"
-            for part in "${PARTS[@]}"; do
-              part=$(echo "$part" | xargs)  # trim whitespace
-              case "$part" in
-                oracle-oci-*)
-                  region_code="${part#oracle-oci-}"
-                  builders="${builders:+$builders,}oracle-oci.lantern-box-${region_code}"
-                  ;;
-                oracle-oci)
-                  # Legacy name: expand to all OCI regions
-                  builders="${builders:+$builders,}oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin"
-                  ;;
-                *)
-                  builders="${builders:+$builders,}${part}.lantern-box"
-                  ;;
-              esac
-            done
-            echo "builders=$builders" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Setup Packer
         uses: hashicorp/setup-packer@v3
@@ -80,112 +143,62 @@ jobs:
         working-directory: deploy/packer
         run: packer init lantern-box.pkr.hcl
 
-      - name: Prune old DigitalOcean snapshots
-        if: contains(steps.version.outputs.builders, 'digitalocean')
+      - name: Map builder to packer -only flag
+        id: only
         env:
-          DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+          BUILDER: ${{ matrix.builder }}
         run: |
-          # DO has a default snapshot limit (25). Each build creates a new
-          # timestamped snapshot. Keep the 3 most recent; delete the rest.
-          KEEP=3
-          echo "Fetching DigitalOcean snapshots..."
-          snapshots=$(curl -sS -f -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
-            "https://api.digitalocean.com/v2/snapshots?resource_type=droplet&per_page=200" \
-            | jq -r '.snapshots[] | select(.name | startswith("lantern-box-")) | "\(.created_at)\t\(.id)\t\(.name)"' \
-            | sort -r)
-
-          total=$(echo "$snapshots" | grep -c . || true)
-          echo "Found $total lantern-box snapshots (keeping $KEEP most recent)"
-
-          if [ "$total" -le "$KEEP" ]; then
-            echo "Nothing to prune."
-          else
-            echo "$snapshots" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id name; do
-              echo "Deleting $name ($id, created $created)..."
-              if ! curl -sS -f -X DELETE -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
-                "https://api.digitalocean.com/v2/snapshots/$id"; then
-                echo "::error::Failed to delete DO snapshot $name ($id)" >&2
-                exit 1
-              fi
-            done
-          fi
-
-      - name: Prune old Linode images
-        if: contains(steps.version.outputs.builders, 'linode')
-        env:
-          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
-        run: |
-          # Linode has an account-level image limit (default 25).
-          # Keep the 3 most recent lantern-box images; delete the rest.
-          KEEP=3
-          echo "Fetching Linode custom images..."
-          images=$(curl -sS -f -H "Authorization: Bearer $LINODE_TOKEN" \
-            "https://api.linode.com/v4/images?page_size=500" \
-            | jq -r '.data[] | select(.is_public == false and (.label | startswith("lantern-box-"))) | "\(.created)\t\(.id)\t\(.label)"' \
-            | sort -r)
-
-          total=$(echo "$images" | grep -c . || true)
-          echo "Found $total lantern-box images (keeping $KEEP most recent)"
-
-          if [ "$total" -le "$KEEP" ]; then
-            echo "Nothing to prune."
-          else
-            echo "$images" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id label; do
-              echo "Deleting $label ($id, created $created)..."
-              if ! curl -sS -f -X DELETE -H "Authorization: Bearer $LINODE_TOKEN" \
-                "https://api.linode.com/v4/images/$id"; then
-                echo "::error::Failed to delete Linode image $label ($id)" >&2
-                exit 1
-              fi
-            done
-          fi
+          case "$BUILDER" in
+            oracle-oci)
+              echo "flag=oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "flag=${BUILDER}.lantern-box" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
 
       - name: Write OCI private key
+        if: matrix.builder == 'oracle-oci'
         run: |
           echo "${{ secrets.OCI_KEY_CONTENT }}" > /tmp/oci_api_key.pem
           chmod 600 /tmp/oci_api_key.pem
 
-      - name: Build images
+      - name: Build
         working-directory: deploy/packer
         env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ONLY: ${{ steps.only.outputs.flag }}
           DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
           LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
-          # OCI shared auth
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_KEY_FILE: /tmp/oci_api_key.pem
           OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
-          # OCI per-region: IAD (us-ashburn-1) — falls back to legacy secret names
           OCI_SUBNET_OCID_IAD: ${{ secrets.OCI_SUBNET_OCID_IAD || secrets.OCI_SUBNET_OCID }}
           OCI_AVAILABILITY_DOMAIN_IAD: ${{ secrets.OCI_AVAILABILITY_DOMAIN_IAD || secrets.OCI_AVAILABILITY_DOMAIN }}
-          # OCI per-region: FRA (eu-frankfurt-1)
           OCI_SUBNET_OCID_FRA: ${{ secrets.OCI_SUBNET_OCID_FRA }}
           OCI_AVAILABILITY_DOMAIN_FRA: ${{ secrets.OCI_AVAILABILITY_DOMAIN_FRA }}
-          # OCI per-region: NRT (ap-tokyo-1)
           OCI_SUBNET_OCID_NRT: ${{ secrets.OCI_SUBNET_OCID_NRT }}
           OCI_AVAILABILITY_DOMAIN_NRT: ${{ secrets.OCI_AVAILABILITY_DOMAIN_NRT }}
-          # OCI per-region: SIN (ap-singapore-1)
           OCI_SUBNET_OCID_SIN: ${{ secrets.OCI_SUBNET_OCID_SIN }}
           OCI_AVAILABILITY_DOMAIN_SIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN_SIN }}
-          # Alibaba Cloud (Alicloud)
           ALICLOUD_ACCESS_KEY: ${{ secrets.ALICLOUD_ACCESS_KEY }}
           ALICLOUD_SECRET_KEY: ${{ secrets.ALICLOUD_SECRET_KEY }}
-          ALICLOUD_SOURCE_IMAGE: ${{ secrets.ALICLOUD_SOURCE_IMAGE }}
           ALICLOUD_SSH_PASSWORD: ${{ secrets.ALICLOUD_SSH_PASSWORD }}
         run: |
           packer build \
-            -var "lantern_box_version=${{ steps.version.outputs.version }}" \
-            -only="${{ steps.version.outputs.builders }}" \
+            -var "lantern_box_version=$VERSION" \
+            -only="$ONLY" \
             lantern-box.pkr.hcl
 
       - name: Clean up OCI key
-        if: always()
+        if: always() && matrix.builder == 'oracle-oci'
         run: rm -f /tmp/oci_api_key.pem
 
       - name: Upload manifest
         uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: packer-manifest
+          name: packer-manifest-${{ matrix.builder }}
           path: deploy/packer/manifest.json
