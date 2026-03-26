@@ -46,7 +46,6 @@ func RegisterOutbound(registry *outbound.Registry) {
 type Outbound struct {
 	outbound.Adapter
 	logger                logger.ContextLogger
-	serverAddr            string
 	skipHandshake         bool
 	dialerConfig          *water.Config
 	transportModuleConfig map[string]any
@@ -73,10 +72,37 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		}
 	}
 
+	// We're creating the compilation cache dir and setting the global value so during runtime
+	// it won't need to create one at a temp directory
+	compilationCache, err := wazero.NewCompilationCacheWithDir(wazeroCompilationDir)
+	if err != nil {
+		return nil, err
+	}
+	water.SetGlobalCompilationCache(compilationCache)
+
+	outbound := &Outbound{
+		Adapter:               outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{network.NetworkTCP}, options.DialerOptions),
+		logger:                logger,
+		transportModuleConfig: options.Config,
+		dialMutex:             sync.Mutex{},
+		skipHandshake:         options.SkipHandshake,
+	}
+
+	go outbound.loadConfig(ctx, logger, options, timeout)
+
+	return outbound, nil
+}
+
+func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, options option.WATEROutboundOptions, downloadTimeout time.Duration) {
+	logger.DebugContext(ctx, "loading WATER configuration in background")
+
+	wasmDir := filepath.Join(options.Dir, "wasm_files")
+	serverAddr := options.ServerOptions.Build()
+
 	slogLogger := slog.New(L.NewLogHandler(logger))
 	vc := waterVC.NewWaterVersionControl(wasmDir, slogLogger)
+	httpClient := &http.Client{Timeout: downloadTimeout}
 
-	httpClient := &http.Client{Timeout: timeout}
 	if options.DownloadDetour != "" {
 		logger.DebugContext(ctx, "download detour option set", slog.Any("detour", options.DownloadDetour))
 		outboundManager := service.FromContext[adapter.OutboundManager](ctx)
@@ -91,36 +117,33 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, httpClient)
 	if err != nil {
-		return nil, E.New("failed to create WASM downloader", err)
+		logger.ErrorContext(ctx, "failed to create WASM downloader", slog.Any("error", err))
+		return
 	}
 
 	rc, err := vc.GetWASM(ctx, options.Transport, d)
 	if err != nil {
-		return nil, err
+		logger.ErrorContext(ctx, "failed to load WASM file", slog.Any("error", err))
+		return
 	}
 	defer rc.Close()
 
 	b, err := io.ReadAll(rc)
 	if err != nil {
-		return nil, err
+		logger.ErrorContext(ctx, "failed to read WASM file", slog.Any("error", err))
+		return
 	}
+
+	logger.DebugContext(ctx, "successfully loaded WASM file", slog.String("transport", options.Transport))
 
 	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
-		return nil, err
-	}
-	serverAddr := options.ServerOptions.Build()
-
-	// We're creating the compilation cache dir and setting the global value so during runtime
-	// it won't need to create one at a temp directory
-	compilationCache, err := wazero.NewCompilationCacheWithDir(wazeroCompilationDir)
-	if err != nil {
-		return nil, err
+		logger.ErrorContext(ctx, "failed to create outbound dialer", slog.Any("error", err))
+		return
 	}
 
-	water.SetGlobalCompilationCache(compilationCache)
-
-	cfg := &water.Config{
+	o.dialMutex.Lock()
+	o.dialerConfig = &water.Config{
 		TransportModuleBin: b,
 		OverrideLogger:     slogLogger,
 		NetworkDialerFunc: func(network, address string) (net.Conn, error) {
@@ -136,16 +159,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			}
 		},
 	}
-
-	outbound := &Outbound{
-		Adapter:               outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{network.NetworkTCP}, options.DialerOptions),
-		logger:                logger,
-		serverAddr:            serverAddr.String(),
-		dialerConfig:          cfg,
-		transportModuleConfig: options.Config,
-		dialMutex:             sync.Mutex{},
-		skipHandshake:         options.SkipHandshake,
-	}
+	o.dialMutex.Unlock()
 
 	if options.SeedEnabled {
 		transportFilepath := filepath.Join(wasmDir, fmt.Sprintf("%s.%s", options.Transport, "wasm"))
@@ -169,10 +183,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		if seeder != nil {
 			logger.DebugContext(ctx, "seeding WASM file", slog.String("magnet_uri", seeder.MagnetURI()), slog.String("transport", transportFilepath))
 		}
-		outbound.seeder = seeder
+		o.seeder = seeder
 	}
-
-	return outbound, nil
 }
 
 func (o *Outbound) Close() error {
@@ -183,6 +195,9 @@ func (o *Outbound) Close() error {
 }
 
 func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (water.Dialer, error) {
+	if o.dialerConfig == nil {
+		return nil, fmt.Errorf("dialer config not set. The outbound is not ready to dial")
+	}
 	cfg := o.dialerConfig.Clone()
 
 	o.logger.DebugContext(ctx, "building new dialer", slog.String("destination", destination.String()))
