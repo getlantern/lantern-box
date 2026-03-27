@@ -181,6 +181,12 @@ chmod 644 /etc/cron.d/lantern-box-update
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
 systemctl enable unattended-upgrades.service 2>/dev/null || true
 
+echo "==> Installing Tailscale (for operator SSH access)"
+curl -fsSL https://tailscale.com/install.sh | sh
+# Do NOT start or enable tailscaled here — cloud-init activates it
+# at boot time with a per-machine auth key and --ssh flag.
+systemctl disable tailscaled 2>/dev/null || true
+
 echo "==> Verifying installation"
 if ! command -v lantern-box >/dev/null 2>&1; then
   echo "lantern-box not found on PATH" >&2
