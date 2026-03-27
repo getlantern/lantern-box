@@ -17,7 +17,7 @@ require (
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260317143726-e0ee64a11d90
 	github.com/getlantern/samizdat v0.0.3-0.20260310125445-325cf1bd1b60
-	github.com/getlantern/semconv v0.0.0-20260311010754-121098b82c93
+	github.com/getlantern/semconv v0.0.0-20260327035242-c93140b6acf3
 	github.com/gobwas/ws v1.4.0
 	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/sing v0.7.18

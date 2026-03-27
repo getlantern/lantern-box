@@ -11,7 +11,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	otelsc "go.opentelemetry.io/otel/semconv/v1.37.0"
 
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 )
@@ -69,7 +68,7 @@ func trackIOLoop(ctx context.Context, reportC <-chan report) {
 			return
 		case r := <-reportC:
 			attrs := append(r.attrs.AsSlice(),
-				otelsc.NetworkIODirectionKey.String(string(r.direction)),
+				semconv.NetworkIODirectionKey.String(string(r.direction)),
 			)
 			metrics.ProxyIO.Add(context.Background(), int64(r.n), metric.WithAttributes(attrs...))
 		}
@@ -91,7 +90,7 @@ func emitDeviceConnectedSpan(ctx context.Context) {
 		semconv.ClientDeviceIDKey.String(info.DeviceID),
 		semconv.ClientPlatformKey.String(info.Platform),
 		semconv.ClientIsProKey.Bool(info.IsPro),
-		otelsc.GeoCountryISOCodeKey.String(info.CountryCode),
+		semconv.GeoCountryISOCodeKey.String(info.CountryCode),
 		semconv.ClientVersionKey.String(info.Version),
 	)
 	span.End()
@@ -119,7 +118,7 @@ func (t *MetricsTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 
 func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
 	a := append(attrs.attrs,
-		otelsc.GeoCountryISOCodeKey.String(attrs.country.Load().(string)),
+		semconv.GeoCountryISOCodeKey.String(attrs.country.Load().(string)),
 	)
 	if attrs.client != nil {
 		a = append(a,
@@ -141,7 +140,7 @@ type attributes struct {
 
 func (a *attributes) AsSlice() []attribute.KeyValue {
 	s := append(a.attrs,
-		otelsc.GeoCountryISOCodeKey.String(a.country.Load().(string)),
+		semconv.GeoCountryISOCodeKey.String(a.country.Load().(string)),
 	)
 	if a.client != nil {
 		s = append(s,
@@ -157,7 +156,7 @@ func (a *attributes) AsSlice() []attribute.KeyValue {
 func metadataToAttributes(metadata adapter.InboundContext) *attributes {
 	attrs := &attributes{
 		attrs: []attribute.KeyValue{
-			otelsc.NetworkProtocolNameKey.String(metadata.Protocol),
+			semconv.NetworkProtocolNameKey.String(metadata.Protocol),
 			semconv.ProxyInboundKey.String(metadata.Inbound),
 			semconv.ProxyInboundTypeKey.String(metadata.InboundType),
 			semconv.ProxyOutboundKey.String(metadata.Outbound),
