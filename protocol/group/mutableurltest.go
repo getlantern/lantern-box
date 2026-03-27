@@ -46,6 +46,7 @@ func RegisterMutableURLTest(registry *outbound.Registry) {
 var (
 	_ adapter.MutableOutboundGroup = (*MutableURLTest)(nil)
 	_ A.OutboundGroup              = (*MutableURLTest)(nil)
+	_ A.InterfaceUpdateListener    = (*MutableURLTest)(nil)
 	_ A.ConnectionHandlerEx        = (*MutableURLTest)(nil)
 	_ A.PacketConnectionHandlerEx  = (*MutableURLTest)(nil)
 )
@@ -105,6 +106,11 @@ func (s *MutableURLTest) PostStart() error {
 
 func (s *MutableURLTest) Close() error {
 	return s.group.Close()
+}
+
+func (s *MutableURLTest) InterfaceUpdated() {
+	s.logger.Info("interface updated, restarting URL tests")
+	s.group.onInterfaceUpdated()
 }
 
 func (s *MutableURLTest) Now() string {
@@ -213,6 +219,11 @@ func (s *MutableURLTest) selectOutbound(network string) (A.Outbound, error) {
 		return nil, fmt.Errorf("network %s not supported", network)
 	}
 	if outbound == nil {
+		outbound = s.group.pickBestOutbound(network, nil)
+	}
+	if outbound == nil && len(s.group.tags) > 0 {
+		s.logger.Warn("no outbound available, forcing URL test for recovery")
+		s.group.CheckOutbounds(true)
 		outbound = s.group.pickBestOutbound(network, nil)
 	}
 	if outbound == nil {
@@ -421,6 +432,25 @@ func (g *urlTestGroup) keepAlive() {
 	}
 	g.pauseC = make(chan struct{}, 1)
 	go g.checkLoop()
+}
+
+func (g *urlTestGroup) onInterfaceUpdated() {
+	g.access.Lock()
+	if !g.started || g.isClosed() || len(g.tags) == 0 {
+		g.access.Unlock()
+		return
+	}
+	g.lastActive.Store(time.Now())
+	wasAlive := g.isAlive
+	if wasAlive {
+		g.idleTimer.Reset(g.idleTimeout)
+	}
+	g.access.Unlock()
+
+	if !wasAlive {
+		g.keepAlive()
+	}
+	go g.CheckOutbounds(true)
 }
 
 func (g *urlTestGroup) checkLoop() {
