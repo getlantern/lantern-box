@@ -30,12 +30,13 @@ func RegisterInbound(registry *inbound.Registry) {
 // Inbound represents a Samizdat inbound adapter.
 type Inbound struct {
 	inbound.Adapter
-	ctx         context.Context
-	logger      log.ContextLogger
-	router      adapter.ConnectionRouterEx
-	listener    *listener.Listener
-	tcpListener net.Listener
-	server      *samizdat.Server
+	ctx             context.Context
+	logger          log.ContextLogger
+	router          adapter.ConnectionRouterEx
+	listener        *listener.Listener
+	tcpListener     net.Listener
+	server          *samizdat.Server
+	shutdownTimeout time.Duration // time to wait for goroutines after ctx cancel; 0 = 5s
 }
 
 // NewInbound creates a new Samizdat inbound adapter.
@@ -173,7 +174,23 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	select {
 	case <-done:
 	case <-ctx.Done():
-		i.logger.ErrorContext(ctx, "inbound connection to ", destination, " canceled: ", ctx.Err())
+		// Context cancelled (client disconnect, stream reset). Close the conn
+		// to force in-flight copy goroutines to error out, then wait for them
+		// to finish. We MUST NOT return while goroutines are still writing —
+		// the samizdat HTTP handler returns when this function returns, which
+		// invalidates the HTTP/2 ResponseWriter and causes a panic.
+		conn.Close()
+		timeout := i.shutdownTimeout
+		if timeout == 0 {
+			timeout = 5 * time.Second
+		}
+		timer := time.NewTimer(timeout)
+		select {
+		case <-done:
+			timer.Stop()
+		case <-timer.C:
+			i.logger.ErrorContext(ctx, "timed out waiting for copy goroutines to finish after context cancellation for ", destination)
+		}
 	}
 }
 
