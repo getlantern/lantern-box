@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"math/big"
@@ -261,6 +262,55 @@ func TestNewInbound_InvalidTimeouts(t *testing.T) {
 	})
 }
 
+// --- decodeKey tests ---
+
+func TestDecodeKey_Hex(t *testing.T) {
+	raw := make([]byte, 32)
+	_, err := rand.Read(raw)
+	require.NoError(t, err)
+
+	b, err := decodeKey(hex.EncodeToString(raw), 32)
+	require.NoError(t, err)
+	assert.Equal(t, raw, b)
+}
+
+func TestDecodeKey_Base64Standard(t *testing.T) {
+	raw := make([]byte, 32)
+	_, err := rand.Read(raw)
+	require.NoError(t, err)
+
+	b, err := decodeKey(base64.StdEncoding.EncodeToString(raw), 32)
+	require.NoError(t, err)
+	assert.Equal(t, raw, b)
+}
+
+func TestDecodeKey_Base64RawStandard(t *testing.T) {
+	raw := make([]byte, 32)
+	_, err := rand.Read(raw)
+	require.NoError(t, err)
+
+	b, err := decodeKey(base64.RawStdEncoding.EncodeToString(raw), 32)
+	require.NoError(t, err)
+	assert.Equal(t, raw, b)
+}
+
+func TestDecodeKey_Invalid(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{"empty", ""},
+		{"wrong size hex", hex.EncodeToString(make([]byte, 16))},
+		{"garbage", "not-a-key-at-all!!!"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decodeKey(tt.key, 32)
+			require.Error(t, err)
+		})
+	}
+}
+
 // --- NewOutbound validation tests ---
 
 func TestNewOutbound_InvalidPublicKey(t *testing.T) {
@@ -268,9 +318,8 @@ func TestNewOutbound_InvalidPublicKey(t *testing.T) {
 		name string
 		key  string
 	}{
-		{"not hex", "zz" + strings.Repeat("00", 31)},
-		{"too short", hex.EncodeToString(make([]byte, 16))},
-		{"too long", hex.EncodeToString(make([]byte, 64))},
+		{"too short hex", hex.EncodeToString(make([]byte, 16))},
+		{"too long hex", hex.EncodeToString(make([]byte, 64))},
 		{"empty", ""},
 	}
 	for _, tt := range tests {
@@ -281,6 +330,22 @@ func TestNewOutbound_InvalidPublicKey(t *testing.T) {
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "public_key")
 		})
+	}
+}
+
+func TestNewOutbound_Base64PublicKey(t *testing.T) {
+	raw := make([]byte, 32)
+	_, err := rand.Read(raw)
+	require.NoError(t, err)
+
+	// Should fail later (no server), but NOT on key decoding
+	_, err = NewOutbound(context.Background(), nil, nil, "test", option.SamizdatOutboundOptions{
+		PublicKey: base64.StdEncoding.EncodeToString(raw),
+		ShortID:  testShortIDHex(t),
+	})
+	// Error should be about something other than public_key
+	if err != nil {
+		assert.NotContains(t, err.Error(), "public_key")
 	}
 }
 

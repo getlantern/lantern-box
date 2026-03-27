@@ -2,6 +2,7 @@ package samizdat
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -57,10 +58,10 @@ func NewOutbound(
 	tag string,
 	options option.SamizdatOutboundOptions,
 ) (adapter.Outbound, error) {
-	// Decode hex public key
-	pubKey, err := hex.DecodeString(options.PublicKey)
-	if err != nil || len(pubKey) != 32 {
-		return nil, fmt.Errorf("public_key must be 64 hex characters (32 bytes)")
+	// Decode public key: accept hex (64 chars) or base64 (44 chars)
+	pubKey, err := decodeKey(options.PublicKey, 32)
+	if err != nil {
+		return nil, fmt.Errorf("public_key: %w", err)
 	}
 
 	// Decode hex short ID
@@ -176,5 +177,29 @@ func (o *Outbound) Close() error {
 		return o.client.Close()
 	}
 	return nil
+}
+
+// decodeKey decodes a key from hex or base64 encoding, returning exactly size bytes.
+func decodeKey(s string, size int) ([]byte, error) {
+	// Try hex first (expected format: 2*size hex chars)
+	if b, err := hex.DecodeString(s); err == nil && len(b) == size {
+		return b, nil
+	}
+	// Try standard base64
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil && len(b) == size {
+		return b, nil
+	}
+	// Try URL-safe base64
+	if b, err := base64.URLEncoding.DecodeString(s); err == nil && len(b) == size {
+		return b, nil
+	}
+	// Try raw (no padding) base64 variants
+	if b, err := base64.RawStdEncoding.DecodeString(s); err == nil && len(b) == size {
+		return b, nil
+	}
+	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil && len(b) == size {
+		return b, nil
+	}
+	return nil, fmt.Errorf("must be %d hex characters or base64-encoded %d bytes", size*2, size)
 }
 
