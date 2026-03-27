@@ -158,6 +158,101 @@ func TestTestURLForTag_WithOverrides(t *testing.T) {
 	assert.Equal(t, "https://default.example.com", g.testURLForTag("unknown"))
 }
 
+func TestOnInterfaceUpdated_RestartsDeadCheckLoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{"test": nil}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"test"},
+		"https://example.com",
+		nil,
+		10*time.Millisecond, // fast interval
+		50*time.Millisecond, // short idle timeout
+		50,
+	)
+
+	g.started = true
+	g.pauseMgr = &mockPauseManager{}
+	g.lastActive.Store(time.Now())
+
+	// Start the check loop
+	g.keepAlive()
+	assert.Eventually(t, func() bool {
+		g.access.Lock()
+		defer g.access.Unlock()
+		return g.isAlive
+	}, time.Second, 5*time.Millisecond)
+
+	// Wait for the idle timer to kill the check loop
+	assert.Eventually(t, func() bool {
+		g.access.Lock()
+		defer g.access.Unlock()
+		return !g.isAlive
+	}, time.Second, 10*time.Millisecond, "check loop should have stopped after idle timeout")
+
+	// Simulate a network interface change (e.g. wake from sleep)
+	g.onInterfaceUpdated()
+
+	// The check loop should be alive again
+	assert.Eventually(t, func() bool {
+		g.access.Lock()
+		defer g.access.Unlock()
+		return g.isAlive
+	}, time.Second, 5*time.Millisecond, "onInterfaceUpdated should restart the check loop")
+}
+
+func TestOnInterfaceUpdated_NoopWhenClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{"test": nil}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"test"},
+		"https://example.com",
+		nil,
+		time.Minute, time.Minute, 50,
+	)
+	g.started = true
+	g.pauseMgr = &mockPauseManager{}
+
+	// Close the group
+	cancel()
+	_ = g.Close()
+
+	// Should not panic or start a check loop
+	g.onInterfaceUpdated()
+
+	g.access.Lock()
+	alive := g.isAlive
+	g.access.Unlock()
+	assert.False(t, alive, "onInterfaceUpdated should not start check loop on closed group")
+}
+
+func TestOnInterfaceUpdated_NoopWhenNoTags(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{}, // no tags
+		"https://example.com",
+		nil,
+		time.Minute, time.Minute, 50,
+	)
+	g.started = true
+	g.pauseMgr = &mockPauseManager{}
+
+	g.onInterfaceUpdated()
+
+	g.access.Lock()
+	alive := g.isAlive
+	g.access.Unlock()
+	assert.False(t, alive, "onInterfaceUpdated should not start check loop with no tags")
+}
+
 type mockPauseManager struct{}
 
 func (m *mockPauseManager) DevicePause() {

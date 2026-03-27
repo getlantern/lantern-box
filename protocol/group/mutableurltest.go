@@ -46,6 +46,7 @@ func RegisterMutableURLTest(registry *outbound.Registry) {
 var (
 	_ adapter.MutableOutboundGroup = (*MutableURLTest)(nil)
 	_ A.OutboundGroup              = (*MutableURLTest)(nil)
+	_ A.InterfaceUpdateListener    = (*MutableURLTest)(nil)
 	_ A.ConnectionHandlerEx        = (*MutableURLTest)(nil)
 	_ A.PacketConnectionHandlerEx  = (*MutableURLTest)(nil)
 )
@@ -105,6 +106,11 @@ func (s *MutableURLTest) PostStart() error {
 
 func (s *MutableURLTest) Close() error {
 	return s.group.Close()
+}
+
+func (s *MutableURLTest) InterfaceUpdated() {
+	s.logger.Info("interface updated, restarting URL tests")
+	s.group.onInterfaceUpdated()
 }
 
 func (s *MutableURLTest) Now() string {
@@ -215,7 +221,16 @@ func (s *MutableURLTest) selectOutbound(network string) (A.Outbound, error) {
 	if outbound == nil {
 		outbound = s.group.pickBestOutbound(network, nil)
 	}
+	recoveryStarted := false
+	if outbound == nil && len(s.group.tags) > 0 {
+		recoveryStarted = true
+		s.logger.Warn("no outbound available, starting async URL test for recovery")
+		go s.group.CheckOutbounds(true)
+	}
 	if outbound == nil {
+		if recoveryStarted {
+			return nil, errors.New("no outbound available, recovery in progress")
+		}
 		return nil, errors.New("missing supported outbound")
 	}
 	return outbound, nil
@@ -419,8 +434,28 @@ func (g *urlTestGroup) keepAlive() {
 		g.idleTimer.Reset(g.idleTimeout)
 		return
 	}
+	g.isAlive = true
 	g.pauseC = make(chan struct{}, 1)
 	go g.checkLoop()
+}
+
+func (g *urlTestGroup) onInterfaceUpdated() {
+	g.access.Lock()
+	if !g.started || g.isClosed() || len(g.tags) == 0 {
+		g.access.Unlock()
+		return
+	}
+	g.lastActive.Store(time.Now())
+	wasAlive := g.isAlive
+	if wasAlive {
+		g.idleTimer.Reset(g.idleTimeout)
+	}
+	g.access.Unlock()
+
+	if !wasAlive {
+		g.keepAlive()
+	}
+	go g.CheckOutbounds(true)
 }
 
 func (g *urlTestGroup) checkLoop() {
@@ -433,7 +468,8 @@ func (g *urlTestGroup) checkLoop() {
 	ticker := time.NewTicker(g.interval)
 	pauseCallback := pause.RegisterTicker(g.pauseMgr, ticker, g.interval, nil)
 	g.idleTimer = time.NewTimer(g.idleTimeout)
-	g.isAlive = true
+	// isAlive is already set to true by keepAlive() under the lock before
+	// spawning this goroutine, preventing duplicate checkLoop starts.
 	g.access.Unlock()
 
 	defer func() {
