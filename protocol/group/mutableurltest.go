@@ -221,12 +221,16 @@ func (s *MutableURLTest) selectOutbound(network string) (A.Outbound, error) {
 	if outbound == nil {
 		outbound = s.group.pickBestOutbound(network, nil)
 	}
+	recoveryStarted := false
 	if outbound == nil && len(s.group.tags) > 0 {
-		s.logger.Warn("no outbound available, forcing URL test for recovery")
-		s.group.CheckOutbounds(true)
-		outbound = s.group.pickBestOutbound(network, nil)
+		recoveryStarted = true
+		s.logger.Warn("no outbound available, starting async URL test for recovery")
+		go s.group.CheckOutbounds(true)
 	}
 	if outbound == nil {
+		if recoveryStarted {
+			return nil, errors.New("no outbound available, recovery in progress")
+		}
 		return nil, errors.New("missing supported outbound")
 	}
 	return outbound, nil
@@ -430,6 +434,7 @@ func (g *urlTestGroup) keepAlive() {
 		g.idleTimer.Reset(g.idleTimeout)
 		return
 	}
+	g.isAlive = true
 	g.pauseC = make(chan struct{}, 1)
 	go g.checkLoop()
 }
@@ -463,7 +468,8 @@ func (g *urlTestGroup) checkLoop() {
 	ticker := time.NewTicker(g.interval)
 	pauseCallback := pause.RegisterTicker(g.pauseMgr, ticker, g.interval, nil)
 	g.idleTimer = time.NewTimer(g.idleTimeout)
-	g.isAlive = true
+	// isAlive is already set to true by keepAlive() under the lock before
+	// spawning this goroutine, preventing duplicate checkLoop starts.
 	g.access.Unlock()
 
 	defer func() {
