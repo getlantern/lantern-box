@@ -173,7 +173,17 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	select {
 	case <-done:
 	case <-ctx.Done():
-		i.logger.ErrorContext(ctx, "inbound connection to ", destination, " canceled: ", ctx.Err())
+		// Context cancelled (client disconnect, stream reset). Close the conn
+		// to force in-flight copy goroutines to error out, then wait for them
+		// to finish. We MUST NOT return while goroutines are still writing —
+		// the samizdat HTTP handler returns when this function returns, which
+		// invalidates the HTTP/2 ResponseWriter and causes a panic.
+		conn.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			i.logger.ErrorContext(ctx, "timed out waiting for copy goroutines to finish after context cancellation for ", destination)
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package samizdat
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +34,17 @@ func (m *mockRouter) RouteConnectionEx(ctx context.Context, conn net.Conn, metad
 }
 
 func (m *mockRouter) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+}
+
+// closeTrackingConn wraps a net.Conn and records when Close is called.
+type closeTrackingConn struct {
+	net.Conn
+	closed *atomic.Bool
+}
+
+func (c *closeTrackingConn) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
 }
 
 // dummyConn returns one end of a net.Pipe, closing the other end.
@@ -85,11 +97,72 @@ func TestHandleConnection_BlocksUntilCallbackFires(t *testing.T) {
 	}
 }
 
-func TestHandleConnection_ReturnsOnContextCancel(t *testing.T) {
+func TestHandleConnection_ContextCancelClosesConnAndWaitsForCallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	var connClosed atomic.Bool
+	callbackFired := make(chan struct{})
+
+	// Use a pipe so we can observe when Close is called.
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() { c1.Close(); c2.Close() })
+	wrapped := &closeTrackingConn{Conn: c1, closed: &connClosed}
+
 	router := &mockRouter{
 		onRoute: func(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-			// Never call onClose — simulates a hung route
+			// Simulate sing-box's fire-and-forget: spawn goroutines, return.
+			// The onClose fires after the goroutines detect the conn is closed.
+			go func() {
+				// Wait until the conn is closed (which handleConnection does
+				// after context cancel), then fire the callback.
+				for !connClosed.Load() {
+					time.Sleep(10 * time.Millisecond)
+				}
+				time.Sleep(50 * time.Millisecond) // small delay to simulate real goroutine cleanup
+				onClose(nil)
+				close(callbackFired)
+			}()
+		},
+	}
+
+	ib := &Inbound{
+		logger: log.NewNOPFactory().Logger(),
+		router: router,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		ib.handleConnection(ctx, wrapped, "1.2.3.4:80")
+		close(done)
+	}()
+
+	// Should be blocking
+	select {
+	case <-done:
+		t.Fatal("handleConnection returned before context was cancelled")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+
+	// After cancel, handleConnection should close the conn, wait for
+	// the callback, then return.
+	select {
+	case <-done:
+		// Good — returned after callback fired
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleConnection did not return after context cancellation + callback")
+	}
+
+	// Verify the conn was closed (which is how the goroutines are unblocked)
+	assert.True(t, connClosed.Load(), "conn should have been closed after context cancel")
+}
+
+func TestHandleConnection_ContextCancelTimesOutIfCallbackNeverFires(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	router := &mockRouter{
+		onRoute: func(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+			// Never call onClose — simulates a completely hung route
 		},
 	}
 
@@ -104,20 +177,14 @@ func TestHandleConnection_ReturnsOnContextCancel(t *testing.T) {
 		close(done)
 	}()
 
-	// Should be blocking
-	select {
-	case <-done:
-		t.Fatal("handleConnection returned before context was cancelled")
-	case <-time.After(50 * time.Millisecond):
-	}
-
 	cancel()
 
+	// Should return within the 5s timeout + small buffer
 	select {
 	case <-done:
-		// Good — returned promptly after cancel
-	case <-time.After(time.Second):
-		t.Fatal("handleConnection did not return after context cancellation")
+		// Good — timed out and returned
+	case <-time.After(7 * time.Second):
+		t.Fatal("handleConnection did not return after context cancellation + timeout")
 	}
 }
 
