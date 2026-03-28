@@ -1,5 +1,6 @@
 # OTel Collector config for VPS proxy instances.
-# Collects host metrics (CPU, memory, disk, network) and ships to SigNoz.
+# Collects host metrics (CPU, memory, disk, network) and structured logs
+# (auto-update script, etc.) and ships to SigNoz.
 # The SIGNOZ_INGEST_KEY and OTEL_RESOURCE_ATTRIBUTES env vars are set by cloud-init.
 
 receivers:
@@ -20,6 +21,25 @@ receivers:
         include:
           match_type: regexp
           names: ["lantern-box", "sing-box"]
+
+  # Structured JSON logs from the auto-update script and other lantern-box tooling.
+  filelog/lantern-box:
+    include: ["/var/log/lantern-box/*.log"]
+    start_at: end
+    max_log_size: 65536
+    operators:
+      - type: json_parser
+        parse_from: body
+        timestamp:
+          parse_from: attributes.timestamp
+          layout: "%Y-%m-%dT%H:%M:%SZ"
+        severity:
+          parse_from: attributes.severity
+      # Move the JSON "body" field into the log record body so it's
+      # searchable as the main log message in SigNoz.
+      - type: move
+        from: attributes.body
+        to: body
 
 processors:
   batch:
@@ -53,5 +73,9 @@ service:
   pipelines:
     metrics:
       receivers: [hostmetrics]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlp/signoz]
+    logs:
+      receivers: [filelog/lantern-box]
       processors: [memory_limiter, resourcedetection, batch]
       exporters: [otlp/signoz]
