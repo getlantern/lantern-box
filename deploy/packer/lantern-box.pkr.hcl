@@ -416,7 +416,7 @@ source "linode" "lantern-box" {
   image_regions = [
     "us-lax", "us-mia", "us-sea", "us-ord", "us-iad",
     "us-east", "us-southeast",
-    "eu-west", "fr-par", "nl-ams", "it-mil", "es-mad", "se-sto",
+    "fr-par", "nl-ams", "it-mil", "es-mad", "se-sto",
     "in-maa", "jp-osa", "au-mel",
     "id-cgk", "br-gru",
   ]
