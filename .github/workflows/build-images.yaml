@@ -179,7 +179,7 @@ jobs:
         run: |
           case "$BUILDER" in
             oracle-oci)
-              echo "flag=oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin" >> "$GITHUB_OUTPUT"
+              echo "flag=oracle-oci.lantern-box-iad,oracle-oci.lantern-box-fra,oracle-oci.lantern-box-nrt,oracle-oci.lantern-box-sin,oracle-oci.lantern-box-phx,oracle-oci.lantern-box-ams,oracle-oci.lantern-box-bom,oracle-oci.lantern-box-gru" >> "$GITHUB_OUTPUT"
               ;;
             digitalocean|linode|alicloud-ecs)
               echo "flag=${BUILDER}.lantern-box" >> "$GITHUB_OUTPUT"
@@ -216,6 +216,14 @@ jobs:
           OCI_AVAILABILITY_DOMAIN_NRT: ${{ secrets.OCI_AVAILABILITY_DOMAIN_NRT }}
           OCI_SUBNET_OCID_SIN: ${{ secrets.OCI_SUBNET_OCID_SIN }}
           OCI_AVAILABILITY_DOMAIN_SIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN_SIN }}
+          OCI_SUBNET_OCID_PHX: ${{ secrets.OCI_SUBNET_OCID_PHX }}
+          OCI_AVAILABILITY_DOMAIN_PHX: ${{ secrets.OCI_AVAILABILITY_DOMAIN_PHX }}
+          OCI_SUBNET_OCID_AMS: ${{ secrets.OCI_SUBNET_OCID_AMS }}
+          OCI_AVAILABILITY_DOMAIN_AMS: ${{ secrets.OCI_AVAILABILITY_DOMAIN_AMS }}
+          OCI_SUBNET_OCID_BOM: ${{ secrets.OCI_SUBNET_OCID_BOM }}
+          OCI_AVAILABILITY_DOMAIN_BOM: ${{ secrets.OCI_AVAILABILITY_DOMAIN_BOM }}
+          OCI_SUBNET_OCID_GRU: ${{ secrets.OCI_SUBNET_OCID_GRU }}
+          OCI_AVAILABILITY_DOMAIN_GRU: ${{ secrets.OCI_AVAILABILITY_DOMAIN_GRU }}
           ALICLOUD_ACCESS_KEY: ${{ secrets.ALICLOUD_ACCESS_KEY }}
           ALICLOUD_SECRET_KEY: ${{ secrets.ALICLOUD_SECRET_KEY }}
           ALICLOUD_SSH_PASSWORD: ${{ secrets.ALICLOUD_SSH_PASSWORD }}
