@@ -143,6 +143,50 @@ variable "oci_availability_domain_sin" {
   default = env("OCI_AVAILABILITY_DOMAIN_SIN")
 }
 
+# OCI per-region variables: us-phoenix-1 (PHX)
+variable "oci_subnet_ocid_phx" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_PHX")
+}
+
+variable "oci_availability_domain_phx" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_PHX")
+}
+
+# OCI per-region variables: eu-amsterdam-1 (AMS)
+variable "oci_subnet_ocid_ams" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_AMS")
+}
+
+variable "oci_availability_domain_ams" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_AMS")
+}
+
+# OCI per-region variables: ap-mumbai-1 (BOM)
+variable "oci_subnet_ocid_bom" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_BOM")
+}
+
+variable "oci_availability_domain_bom" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_BOM")
+}
+
+# OCI per-region variables: sa-saopaulo-1 (GRU)
+variable "oci_subnet_ocid_gru" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_GRU")
+}
+
+variable "oci_availability_domain_gru" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_GRU")
+}
+
 # ---------- Sources ----------
 
 source "digitalocean" "lantern-box" {
@@ -259,6 +303,102 @@ source "oracle-oci" "lantern-box-sin" {
   image_name = "lantern-box-${var.lantern_box_version}-arm64-sin"
 }
 
+source "oracle-oci" "lantern-box-phx" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_phx
+  region              = "us-phoenix-1"
+
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.A1.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 1
+  }
+  subnet_ocid  = var.oci_subnet_ocid_phx
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-phx"
+}
+
+source "oracle-oci" "lantern-box-ams" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_ams
+  region              = "eu-amsterdam-1"
+
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.A1.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 1
+  }
+  subnet_ocid  = var.oci_subnet_ocid_ams
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-ams"
+}
+
+source "oracle-oci" "lantern-box-bom" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_bom
+  region              = "ap-mumbai-1"
+
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.A1.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 1
+  }
+  subnet_ocid  = var.oci_subnet_ocid_bom
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-bom"
+}
+
+source "oracle-oci" "lantern-box-gru" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_gru
+  region              = "sa-saopaulo-1"
+
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.A1.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 1
+  }
+  subnet_ocid  = var.oci_subnet_ocid_gru
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-gru"
+}
+
 source "linode" "lantern-box" {
   linode_token  = var.linode_token
   image         = "linode/ubuntu24.04"
@@ -276,7 +416,7 @@ source "linode" "lantern-box" {
   image_regions = [
     "us-lax", "us-mia", "us-sea", "us-ord", "us-iad",
     "us-east", "us-southeast",
-    "fr-par", "nl-ams", "it-mil", "es-mad", "se-sto",
+    "eu-west", "fr-par", "nl-ams", "it-mil", "es-mad", "se-sto",
     "in-maa", "jp-osa", "au-mel",
     "id-cgk", "br-gru",
   ]
@@ -342,6 +482,10 @@ build {
     "source.oracle-oci.lantern-box-fra",
     "source.oracle-oci.lantern-box-nrt",
     "source.oracle-oci.lantern-box-sin",
+    "source.oracle-oci.lantern-box-phx",
+    "source.oracle-oci.lantern-box-ams",
+    "source.oracle-oci.lantern-box-bom",
+    "source.oracle-oci.lantern-box-gru",
     "source.alicloud-ecs.lantern-box",
   ]
 
