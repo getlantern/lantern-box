@@ -45,8 +45,24 @@ packer build \
 | `OCI_FINGERPRINT` | OCI API key fingerprint |
 | `OCI_KEY_CONTENT` | OCI API private key (PEM) |
 | `OCI_COMPARTMENT_OCID` | OCI compartment for the image |
-| `OCI_SUBNET_OCID` | OCI subnet for the build instance |
-| `OCI_AVAILABILITY_DOMAIN` | OCI availability domain |
+| `OCI_SUBNET_OCID` | Legacy fallback subnet (used by IAD if `OCI_SUBNET_OCID_IAD` is empty) |
+| `OCI_AVAILABILITY_DOMAIN` | Legacy fallback AD (used by IAD if `OCI_AVAILABILITY_DOMAIN_IAD` is empty) |
+| `OCI_SUBNET_OCID_IAD` | OCI subnet — us-ashburn-1 |
+| `OCI_AVAILABILITY_DOMAIN_IAD` | OCI AD — us-ashburn-1 |
+| `OCI_SUBNET_OCID_FRA` | OCI subnet — eu-frankfurt-1 |
+| `OCI_AVAILABILITY_DOMAIN_FRA` | OCI AD — eu-frankfurt-1 |
+| `OCI_SUBNET_OCID_NRT` | OCI subnet — ap-tokyo-1 |
+| `OCI_AVAILABILITY_DOMAIN_NRT` | OCI AD — ap-tokyo-1 |
+| `OCI_SUBNET_OCID_SIN` | OCI subnet — ap-singapore-1 |
+| `OCI_AVAILABILITY_DOMAIN_SIN` | OCI AD — ap-singapore-1 |
+| `OCI_SUBNET_OCID_PHX` | OCI subnet — us-phoenix-1 |
+| `OCI_AVAILABILITY_DOMAIN_PHX` | OCI AD — us-phoenix-1 |
+| `OCI_SUBNET_OCID_AMS` | OCI subnet — eu-amsterdam-1 |
+| `OCI_AVAILABILITY_DOMAIN_AMS` | OCI AD — eu-amsterdam-1 |
+| `OCI_SUBNET_OCID_BOM` | OCI subnet — ap-mumbai-1 |
+| `OCI_AVAILABILITY_DOMAIN_BOM` | OCI AD — ap-mumbai-1 |
+| `OCI_SUBNET_OCID_GRU` | OCI subnet — sa-saopaulo-1 |
+| `OCI_AVAILABILITY_DOMAIN_GRU` | OCI AD — sa-saopaulo-1 |
 
 ## Deploy a VPS from the image
 
