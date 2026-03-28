@@ -122,12 +122,30 @@ set -uo pipefail
 LOG_FILE="/var/log/lantern-box/update.log"
 
 # Structured JSON log line for the OTel filelog receiver → SigNoz pipeline.
+# Uses python3 json.dumps for safe escaping of all dynamic fields.
 log_json() {
   local level="$1" msg="$2"
-  local ts
+  local ts json_line
   ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  printf '{"timestamp":"%s","severity":"%s","body":"%s","attributes":{"source":"lantern-box-update","current_ver":"%s","latest_ver":"%s"}}\n' \
-    "$ts" "$level" "$msg" "${current_ver:-unknown}" "${latest_ver:-unknown}" >> "$LOG_FILE"
+  json_line=$(
+    TS="$ts" \
+    LEVEL="$level" \
+    MSG="$msg" \
+    CURRENT_VER="${current_ver:-unknown}" \
+    LATEST_VER="${latest_ver:-unknown}" \
+    python3 -c '
+import json, os
+print(json.dumps({
+    "timestamp": os.environ["TS"],
+    "severity": os.environ["LEVEL"],
+    "body": os.environ["MSG"],
+    "source": "lantern-box-update",
+    "current_ver": os.environ.get("CURRENT_VER", "unknown"),
+    "latest_ver": os.environ.get("LATEST_VER", "unknown"),
+}, ensure_ascii=False))
+'
+  )
+  printf '%s\n' "$json_line" >> "$LOG_FILE"
 }
 
 # Prevent overlapping runs — cron may start a new instance while the
@@ -148,12 +166,15 @@ current_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "non
 # extracting the tag from the final URL. This is more robust than reading
 # %{redirect_url} from a HEAD request, which can fail when curl is behind
 # a transparent proxy or CDN that follows the 302 before curl sees it.
+curl_err=$(mktemp)
 final_url=$(curl -fsSL --retry 3 --max-time 30 -o /dev/null -w '%{url_effective}' \
-  https://github.com/getlantern/lantern-box/releases/latest 2>/dev/null) || true
+  https://github.com/getlantern/lantern-box/releases/latest 2>"$curl_err") || true
+curl_stderr=$(cat "$curl_err" 2>/dev/null)
+rm -f "$curl_err"
 latest_tag="${final_url##*/}"
 
 if [ -z "$latest_tag" ] || [ "$latest_tag" = "latest" ]; then
-  log_json "ERROR" "failed to fetch latest release tag (final_url=${final_url:-empty})"
+  log_json "ERROR" "failed to fetch latest release tag (final_url=${final_url:-empty}, curl_err=${curl_stderr:-none})"
   exit 1
 fi
 
@@ -168,7 +189,11 @@ log_json "INFO" "update available: ${current_ver} -> ${latest_ver}"
 deb_name="lantern-box_${latest_ver}_linux_${arch}.deb"
 deb_url="https://github.com/getlantern/lantern-box/releases/download/${latest_tag}/${deb_name}"
 
-tmpfile=$(mktemp /tmp/lantern-box-update-XXXXXX.deb)
+tmpfile=$(mktemp /tmp/lantern-box-update-XXXXXX.deb) || tmpfile=""
+if [ -z "$tmpfile" ]; then
+  log_json "ERROR" "failed to create temporary file for downloading ${deb_url}"
+  exit 1
+fi
 trap 'rm -f "$tmpfile"' EXIT
 
 if ! curl -fsSL --retry 3 --max-time 120 -o "$tmpfile" "${deb_url}"; then
@@ -187,7 +212,10 @@ if [ "$new_ver" != "$latest_ver" ]; then
 fi
 
 log_json "INFO" "upgraded ${current_ver} -> ${new_ver}, restarting service"
-systemctl restart lantern-box
+if ! systemctl restart lantern-box; then
+  log_json "ERROR" "failed to restart lantern-box service after upgrade to ${new_ver}"
+  exit 1
+fi
 SCRIPT
 chmod 755 /usr/local/bin/lantern-box-update
 

@@ -35,6 +35,11 @@ receivers:
           layout: "%Y-%m-%dT%H:%M:%SZ"
         severity:
           parse_from: attributes.severity
+      # Move the JSON "body" field into the log record body so it's
+      # searchable as the main log message in SigNoz.
+      - type: move
+        from: attributes.body
+        to: body
 
 processors:
   batch:
