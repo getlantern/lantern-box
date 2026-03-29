@@ -435,6 +435,7 @@ func (g *urlTestGroup) keepAlive() {
 		return
 	}
 	g.isAlive = true
+	g.idleTimer = time.NewTimer(g.idleTimeout)
 	g.pauseC = make(chan struct{}, 1)
 	go g.checkLoop()
 }
@@ -467,9 +468,9 @@ func (g *urlTestGroup) checkLoop() {
 	ctx, cancel := context.WithCancel(g.ctx)
 	ticker := time.NewTicker(g.interval)
 	pauseCallback := pause.RegisterTicker(g.pauseMgr, ticker, g.interval, nil)
-	g.idleTimer = time.NewTimer(g.idleTimeout)
-	// isAlive is already set to true by keepAlive() under the lock before
-	// spawning this goroutine, preventing duplicate checkLoop starts.
+	// idleTimer and isAlive are already set by keepAlive() under the lock
+	// before spawning this goroutine, preventing duplicate checkLoop starts
+	// and ensuring idleTimer is non-nil for concurrent keepAlive() callers.
 	g.access.Unlock()
 
 	defer func() {
