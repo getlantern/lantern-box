@@ -158,6 +158,45 @@ func TestTestURLForTag_WithOverrides(t *testing.T) {
 	assert.Equal(t, "https://default.example.com", g.testURLForTag("unknown"))
 }
 
+func TestKeepAlive_ConcurrentCallsNoPanic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{"test": nil}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"test"},
+		"https://example.com",
+		nil,
+		10*time.Millisecond,
+		time.Minute,
+		50,
+	)
+	g.started = true
+	g.pauseMgr = &mockPauseManager{}
+	g.lastActive.Store(time.Now())
+
+	// Call keepAlive rapidly from multiple goroutines. Before the fix, the
+	// second call could see isAlive=true with a nil idleTimer and panic.
+	done := make(chan struct{})
+	for i := 0; i < 20; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			g.keepAlive()
+		}()
+	}
+	for i := 0; i < 20; i++ {
+		<-done
+	}
+
+	// Verify invariant: isAlive implies idleTimer != nil
+	g.access.Lock()
+	if g.isAlive {
+		assert.NotNil(t, g.idleTimer, "idleTimer must be non-nil when isAlive is true")
+	}
+	g.access.Unlock()
+}
+
 func TestOnInterfaceUpdated_RestartsDeadCheckLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

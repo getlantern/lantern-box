@@ -431,10 +431,11 @@ func (g *urlTestGroup) keepAlive() {
 	}
 	if g.isAlive {
 		g.lastActive.Store(time.Now())
-		g.idleTimer.Reset(g.idleTimeout)
+		resetTimer(g.idleTimer, g.idleTimeout)
 		return
 	}
 	g.isAlive = true
+	g.idleTimer = time.NewTimer(g.idleTimeout)
 	g.pauseC = make(chan struct{}, 1)
 	go g.checkLoop()
 }
@@ -448,7 +449,7 @@ func (g *urlTestGroup) onInterfaceUpdated() {
 	g.lastActive.Store(time.Now())
 	wasAlive := g.isAlive
 	if wasAlive {
-		g.idleTimer.Reset(g.idleTimeout)
+		resetTimer(g.idleTimer, g.idleTimeout)
 	}
 	g.access.Unlock()
 
@@ -467,9 +468,9 @@ func (g *urlTestGroup) checkLoop() {
 	ctx, cancel := context.WithCancel(g.ctx)
 	ticker := time.NewTicker(g.interval)
 	pauseCallback := pause.RegisterTicker(g.pauseMgr, ticker, g.interval, nil)
-	g.idleTimer = time.NewTimer(g.idleTimeout)
-	// isAlive is already set to true by keepAlive() under the lock before
-	// spawning this goroutine, preventing duplicate checkLoop starts.
+	// idleTimer and isAlive are already set by keepAlive() under the lock
+	// before spawning this goroutine, preventing duplicate checkLoop starts
+	// and ensuring idleTimer is non-nil for concurrent keepAlive() callers.
 	g.access.Unlock()
 
 	defer func() {
@@ -633,6 +634,19 @@ func (g *urlTestGroup) testURLForTag(tag string) string {
 		}
 	}
 	return g.url
+}
+
+// resetTimer safely resets a timer by stopping it and draining the channel
+// before resetting. This prevents a stale fire from causing checkLoop to exit
+// immediately after the reset.
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
 }
 
 func realTag(outbound A.Outbound) string {
