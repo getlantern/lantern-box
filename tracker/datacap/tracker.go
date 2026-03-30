@@ -16,7 +16,8 @@ import (
 var _ (adapter.ConnectionTracker) = (*DatacapTracker)(nil)
 
 type DatacapTracker struct {
-	client           *Client
+	sink             ReportSink
+	store            *DeviceUsageStore // nil in sidecar mode
 	logger           log.ContextLogger
 	reportInterval   time.Duration
 	throttleRegistry *ThrottleRegistry
@@ -28,11 +29,11 @@ type Options struct {
 	HTTPTimeout    string `json:"http_timeout,omitempty"`
 }
 
+// NewDatacapTracker creates a tracker that reports to the sidecar via HTTP (legacy mode).
 func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTracker, error) {
 	if options.URL == "" {
 		return nil, E.New("datacap url not defined")
 	}
-	// Parse intervals with defaults
 	reportInterval := 10 * time.Second
 	if options.ReportInterval != "" {
 		interval, err := time.ParseDuration(options.ReportInterval)
@@ -51,17 +52,44 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 		httpTimeout = timeout
 	}
 	return &DatacapTracker{
-		client:           NewClient(options.URL, httpTimeout),
+		sink:             NewClient(options.URL, httpTimeout),
 		reportInterval:   reportInterval,
 		throttleRegistry: NewThrottleRegistry(),
 		logger:           logger,
 	}, nil
 }
 
+// NewDatacapTrackerWithStore creates a tracker that uses an in-process DeviceUsageStore (direct mode).
+func NewDatacapTrackerWithStore(store *DeviceUsageStore, reportInterval time.Duration, logger log.ContextLogger) *DatacapTracker {
+	if reportInterval <= 0 {
+		reportInterval = 10 * time.Second
+	}
+	return &DatacapTracker{
+		sink:             store,
+		store:            store,
+		reportInterval:   reportInterval,
+		throttleRegistry: NewThrottleRegistry(),
+		logger:           logger,
+	}
+}
+
+// Start launches background goroutines (only meaningful in direct mode).
+func (t *DatacapTracker) Start(ctx context.Context) {
+	if t.store != nil {
+		t.store.Start(ctx)
+	}
+}
+
+// Stop performs graceful shutdown (only meaningful in direct mode).
+func (t *DatacapTracker) Stop(ctx context.Context) {
+	if t.store != nil {
+		t.store.Stop(ctx)
+	}
+}
+
 func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	info, ok := clientcontext.ClientInfoFromContext(ctx)
 	if !ok {
-		// conn is not from a clientcontext-aware client (e.g., not radiance)
 		t.logger.Debug("skipping datacap: no client info in context")
 		return conn
 	}
@@ -71,17 +99,17 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 	}
 	return NewConn(ConnConfig{
 		Conn:           conn,
-		Client:         t.client,
+		Sink:           t.sink,
 		Logger:         t.logger,
 		ClientInfo:     info,
 		ReportInterval: t.reportInterval,
 		Throttler:      t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
 }
+
 func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
 	info, ok := clientcontext.ClientInfoFromContext(ctx)
 	if !ok {
-		// conn is not from a clientcontext-aware client (e.g., not radiance)
 		t.logger.Debug("skipping datacap: no client info in context")
 		return conn
 	}
@@ -91,7 +119,7 @@ func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 	}
 	return NewPacketConn(PacketConnConfig{
 		Conn:           conn,
-		Client:         t.client,
+		Sink:           t.sink,
 		Logger:         t.logger,
 		ClientInfo:     info,
 		ReportInterval: t.reportInterval,
