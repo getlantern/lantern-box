@@ -60,12 +60,8 @@ func NewOutbound(
 	// Decode hex public key
 	pubKey, err := hex.DecodeString(options.PublicKey)
 	if err != nil || len(pubKey) != 32 {
-		prefix := options.PublicKey
-		if len(prefix) > 32 {
-			prefix = prefix[:32]
-		}
-		return nil, fmt.Errorf("public_key must be 64 hex characters (32 bytes), got len=%d prefix=%q hex_err=%v decoded_len=%d",
-			len(options.PublicKey), prefix, err, len(pubKey))
+		return nil, fmt.Errorf("public_key must be 64 hex characters (32 bytes), got len=%d hex_err=%v decoded_len=%d",
+			len(options.PublicKey), err, len(pubKey))
 	}
 
 	// Decode hex short ID

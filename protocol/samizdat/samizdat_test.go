@@ -280,6 +280,8 @@ func TestNewOutbound_InvalidPublicKey(t *testing.T) {
 			})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "public_key")
+			assert.Contains(t, err.Error(), "len=")
+			assert.Contains(t, err.Error(), "decoded_len=")
 		})
 	}
 }
