@@ -117,17 +117,7 @@ func (t *MetricsTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 }
 
 func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
-	a := append(attrs.attrs,
-		semconv.GeoCountryISOCodeKey.String(attrs.country.Load().(string)),
-	)
-	if attrs.client != nil {
-		a = append(a,
-			semconv.ClientDeviceIDKey.String(attrs.client.DeviceID),
-			semconv.ClientPlatformKey.String(attrs.client.Platform),
-			semconv.ClientIsProKey.Bool(attrs.client.IsPro),
-			semconv.ClientVersionKey.String(attrs.client.Version),
-		)
-	}
+	a := attrs.AsSlice()
 	metrics.duration.Record(context.Background(), duration, metric.WithAttributes(a...))
 	metrics.conns.Add(context.Background(), -1, metric.WithAttributes(a...))
 }
