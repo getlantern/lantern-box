@@ -55,9 +55,6 @@ func preRun(cmd *cobra.Command, args []string) {
 
 	if !otel.Enabled() {
 		log.Info("telemetry disabled (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)")
-	} else {
-		log.Info("telemetry enabled")
-
 	}
 
 	var attrs []attribute.KeyValue
@@ -71,7 +68,7 @@ func preRun(cmd *cobra.Command, args []string) {
 			attrs = info.resourceAttrs()
 		}
 	} else {
-		log.Warn("no proxy-info path provided, skipping attribute addition")
+		log.Info("no proxy-info path provided, skipping attribute addition")
 	}
 
 	meterShutdown, err := otel.InitGlobalMeterProvider(attrs...)
@@ -89,7 +86,7 @@ func preRun(cmd *cobra.Command, args []string) {
 	otelShutdownFuncs = append(otelShutdownFuncs, tracerShutdown)
 
 	for _, attr := range attrs {
-		log.Info("reporting with attribute: ", fmt.Sprintf("%s", attr.Key), "=", attr.Value.AsString())
+		log.Info("reporting with attribute: ", fmt.Sprintf("%s=%v", attr.Key, attr.Value.AsString()))
 	}
 
 	// Report any crash from a previous run, then set up crash output
@@ -113,6 +110,10 @@ func preRun(cmd *cobra.Command, args []string) {
 			geo.CountryCode,
 		)
 		metrics.SetupMetricsManager(geolookup)
+	}
+	if otel.Enabled() {
+		log.Info("telemetry enabled")
+
 	}
 }
 
