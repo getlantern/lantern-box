@@ -13,7 +13,7 @@ packer {
       source  = "github.com/hashicorp/oracle"
     }
     alicloud = {
-      version = ">= 1.1.0"
+      version = ">= 1.1.2"
       source  = "github.com/hashicorp/alicloud"
     }
   }
@@ -46,7 +46,7 @@ variable "do_region" {
 
 variable "linode_region" {
   type    = string
-  default = "us-west"
+  default = "us-lax"
 }
 
 # Alibaba Cloud (Alicloud) variables
@@ -66,12 +66,6 @@ variable "alicloud_ssh_password" {
   type      = string
   sensitive = true
   default   = env("ALICLOUD_SSH_PASSWORD")
-}
-
-variable "alicloud_source_image" {
-  type        = string
-  default     = env("ALICLOUD_SOURCE_IMAGE")
-  description = "Base Ubuntu 24.04 image ID. Find via: aliyun ecs DescribeImages --RegionId ap-southeast-1 --OSType linux --ImageOwnerAlias system --ImageName 'ubuntu_24*64*'"
 }
 
 # OCI shared variables (same across all regions)
@@ -147,6 +141,50 @@ variable "oci_subnet_ocid_sin" {
 variable "oci_availability_domain_sin" {
   type    = string
   default = env("OCI_AVAILABILITY_DOMAIN_SIN")
+}
+
+# OCI per-region variables: us-phoenix-1 (PHX)
+variable "oci_subnet_ocid_phx" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_PHX")
+}
+
+variable "oci_availability_domain_phx" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_PHX")
+}
+
+# OCI per-region variables: eu-amsterdam-1 (AMS)
+variable "oci_subnet_ocid_ams" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_AMS")
+}
+
+variable "oci_availability_domain_ams" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_AMS")
+}
+
+# OCI per-region variables: ap-mumbai-1 (BOM)
+variable "oci_subnet_ocid_bom" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_BOM")
+}
+
+variable "oci_availability_domain_bom" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_BOM")
+}
+
+# OCI per-region variables: sa-saopaulo-1 (GRU)
+variable "oci_subnet_ocid_gru" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_GRU")
+}
+
+variable "oci_availability_domain_gru" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_GRU")
 }
 
 # ---------- Sources ----------
@@ -265,6 +303,102 @@ source "oracle-oci" "lantern-box-sin" {
   image_name = "lantern-box-${var.lantern_box_version}-arm64-sin"
 }
 
+source "oracle-oci" "lantern-box-phx" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_phx
+  region              = "us-phoenix-1"
+
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.A1.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 1
+  }
+  subnet_ocid  = var.oci_subnet_ocid_phx
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-phx"
+}
+
+source "oracle-oci" "lantern-box-ams" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_ams
+  region              = "eu-amsterdam-1"
+
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.A1.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 1
+  }
+  subnet_ocid  = var.oci_subnet_ocid_ams
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-ams"
+}
+
+source "oracle-oci" "lantern-box-bom" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_bom
+  region              = "ap-mumbai-1"
+
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.A1.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 1
+  }
+  subnet_ocid  = var.oci_subnet_ocid_bom
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-bom"
+}
+
+source "oracle-oci" "lantern-box-gru" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_gru
+  region              = "sa-saopaulo-1"
+
+  base_image_filter {
+    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+    operating_system    = "Canonical Ubuntu"
+  }
+  shape = "VM.Standard.A1.Flex"
+  shape_config {
+    ocpus         = 1
+    memory_in_gbs = 1
+  }
+  subnet_ocid  = var.oci_subnet_ocid_gru
+  ssh_username = "ubuntu"
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-gru"
+}
+
 source "linode" "lantern-box" {
   linode_token  = var.linode_token
   image         = "linode/ubuntu24.04"
@@ -273,6 +407,19 @@ source "linode" "lantern-box" {
   ssh_username  = "root"
   image_label   = "lantern-box-${var.lantern_box_version}"
   image_description = "lantern-box ${var.lantern_box_version} pre-baked image"
+
+  # Replicate to Linode regions that support image replication.
+  # The build region (var.linode_region) must be included or it will be removed.
+  # Excluded: legacy IDs (us-west, ap-southeast, etc.) and newer regions that
+  # don't yet support replication (gb-lon, de-fra-2, fr-par-2, in-bom-2,
+  # sg-sin-2, jp-tyo-3).
+  image_regions = [
+    "us-lax", "us-mia", "us-sea", "us-ord", "us-iad",
+    "us-east", "us-southeast",
+    "fr-par", "nl-ams", "it-mil", "es-mad", "se-sto",
+    "in-maa", "jp-osa", "au-mel",
+    "id-cgk", "br-gru",
+  ]
 }
 
 # Alibaba Cloud ECS — build in Singapore, copy to all Asia regions.
@@ -281,16 +428,27 @@ source "alicloud-ecs" "lantern-box" {
   secret_key           = var.alicloud_secret_key
   region               = "ap-southeast-1"
   instance_type        = "ecs.t6-c1m1.large"
-  image_name           = "lantern-box-${var.lantern_box_version}"
-  image_force_delete   = true
-  source_image         = var.alicloud_source_image
+  image_name           = "lantern-box-${var.lantern_box_version}-{{timestamp}}"
+  image_ignore_data_disks       = true
+  # Auto-discover the latest Ubuntu 24.04 base image via image_family
+  # (requires alicloud plugin >= 1.1.2). This calls DescribeImageFromFamily
+  # and always returns the latest system image in the family.
+  image_family = "acs:ubuntu_24_04_x64"
   system_disk_mapping {
-    disk_size = 20
+    disk_size     = 20
+    disk_category = "cloud_essd"
   }
-  io_optimized         = true
-  internet_charge_type = "PayByTraffic"
+  io_optimized                  = true
+  internet_charge_type          = "PayByTraffic"
+  internet_max_bandwidth_out    = 5
+  # Disable Alibaba's "security enhancement" (China-specific Aegis/CloudMonitor agent).
+  # We run our own monitoring and don't want the extra agent on proxy servers.
+  security_enhancement_strategy = "Deactive"
+  force_stop_instance           = true
   ssh_username         = "root"
   ssh_password         = var.alicloud_ssh_password
+
+  wait_copying_image_ready_timeout = 7200 # seconds (2h) — copying to 8 regions can be slow
 
   image_copy_regions = [
     "ap-southeast-1",  # Singapore
@@ -303,14 +461,14 @@ source "alicloud-ecs" "lantern-box" {
     "cn-hongkong",     # Hong Kong
   ]
   image_copy_names = [
-    "lantern-box-${var.lantern_box_version}",  # Singapore
-    "lantern-box-${var.lantern_box_version}",  # Malaysia
-    "lantern-box-${var.lantern_box_version}",  # Indonesia
-    "lantern-box-${var.lantern_box_version}",  # Philippines
-    "lantern-box-${var.lantern_box_version}",  # Thailand
-    "lantern-box-${var.lantern_box_version}",  # Japan
-    "lantern-box-${var.lantern_box_version}",  # South Korea
-    "lantern-box-${var.lantern_box_version}",  # Hong Kong
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Singapore
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Malaysia
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Indonesia
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Philippines
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Thailand
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Japan
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # South Korea
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Hong Kong
   ]
 }
 
@@ -324,6 +482,10 @@ build {
     "source.oracle-oci.lantern-box-fra",
     "source.oracle-oci.lantern-box-nrt",
     "source.oracle-oci.lantern-box-sin",
+    "source.oracle-oci.lantern-box-phx",
+    "source.oracle-oci.lantern-box-ams",
+    "source.oracle-oci.lantern-box-bom",
+    "source.oracle-oci.lantern-box-gru",
     "source.alicloud-ecs.lantern-box",
   ]
 

@@ -4,3 +4,19 @@
 cmd/cmd
 cmd/*.mmdb
 /cmd/lantern-box
+
+# Local debug/test configs and logs
+*.log
+*.out
+*.working
+*.broken
+config.json
+config.json.*
+debug-*.json
+lantern-client.json
+derek-*.json
+direct.json
+gemini*.json
+hysteria*.json
+simplest.json
+unbounded*.json
