@@ -88,7 +88,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		Adapter:               outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{network.NetworkTCP}, options.DialerOptions),
 		logger:                logger,
 		transportModuleConfig: options.Config,
-		mu:             sync.Mutex{},
+		mu:                    sync.Mutex{},
 		skipHandshake:         options.SkipHandshake,
 		cancelLoad:            cancelLoad,
 	}
