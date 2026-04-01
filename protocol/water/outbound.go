@@ -82,7 +82,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	water.SetGlobalCompilationCache(compilationCache)
 
-	loadCtx, cancelLoad := context.WithCancel(context.Background())
+	loadCtx, cancelLoad := context.WithCancel(ctx)
 
 	outbound := &Outbound{
 		Adapter:               outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{network.NetworkTCP}, options.DialerOptions),
