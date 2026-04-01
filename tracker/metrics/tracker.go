@@ -70,6 +70,11 @@ func trackIOLoop(ctx context.Context, reportC <-chan report) {
 			attrs := append(r.attrs.AsSlice(),
 				semconv.NetworkIODirectionKey.String(string(r.direction)),
 			)
+			if r.attrs.client != nil {
+				attrs = append(attrs,
+					semconv.ClientDeviceIDKey.String(r.attrs.client.DeviceID),
+				)
+			}
 			metrics.ProxyIO.Add(context.Background(), int64(r.n), metric.WithAttributes(attrs...))
 		}
 	}
@@ -134,7 +139,6 @@ func (a *attributes) AsSlice() []attribute.KeyValue {
 	)
 	if a.client != nil {
 		s = append(s,
-			semconv.ClientDeviceIDKey.String(a.client.DeviceID),
 			semconv.ClientPlatformKey.String(a.client.Platform),
 			semconv.ClientIsProKey.Bool(a.client.IsPro),
 			semconv.ClientVersionKey.String(a.client.Version),

@@ -126,16 +126,13 @@ func TestTrackerWithClientInfo(t *testing.T) {
 		var rm metricdata.ResourceMetrics
 		reader.Collect(ctx, &rm)
 
-		// Every metric series should carry client attrs.
+		// All metrics carry low-cardinality client attrs.
 		for _, name := range []string{
 			"proxy.io",
 			"sing.connections",
 			"sing.connection_duration",
 		} {
 			attrs := extractAttrs(rm, name)
-			assert.Equal(t, "dev-42",
-				attrs["client.device_id"],
-				"%s: device_id", name)
 			assert.Equal(t, "android",
 				attrs["client.platform"],
 				"%s: platform", name)
@@ -146,6 +143,18 @@ func TestTrackerWithClientInfo(t *testing.T) {
 				attrs["client.version"],
 				"%s: version", name)
 		}
+
+		// device_id only on proxy.io (high-cardinality).
+		ioAttrs := extractAttrs(rm, "proxy.io")
+		assert.Equal(t, "dev-42", ioAttrs["client.device_id"])
+
+		connAttrs := extractAttrs(rm, "sing.connections")
+		assert.Nil(t, connAttrs["client.device_id"],
+			"sing.connections should not have device_id")
+
+		durAttrs := extractAttrs(rm, "sing.connection_duration")
+		assert.Nil(t, durAttrs["client.device_id"],
+			"sing.connection_duration should not have device_id")
 	})
 }
 
