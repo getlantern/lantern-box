@@ -274,7 +274,6 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	case N.NetworkTCP:
 		return o.dialTCPLocked(ctx, destination)
 	case N.NetworkUDP:
-		o.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
 		return o.uotClient.DialContext(ctx, network, destination)
 	}
 	return nil, E.New("unsupported network: ", network)
@@ -299,11 +298,8 @@ func (o *Outbound) dialTCPLocked(ctx context.Context, destination M.Socksaddr) (
 
 // ListenPacket creates a UoT packet connection through the WATER transport.
 func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
-	o.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
 	return o.uotClient.ListenPacket(ctx, destination)
 }
