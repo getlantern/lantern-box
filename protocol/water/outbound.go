@@ -291,7 +291,7 @@ func (o *Outbound) dialTCPLocked(ctx context.Context, destination M.Socksaddr) (
 		return nil, err
 	}
 
-	conn, err := dialer.DialContext(ctx, N.NetworkTCP, "localhost:0")
+	conn, err := dialer.DialContext(context.Background(), N.NetworkTCP, "localhost:0")
 	if err != nil {
 		o.logger.ErrorContext(ctx, "WATER failed to dial", slog.Any("error", err))
 		return nil, err
