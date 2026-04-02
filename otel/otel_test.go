@@ -14,7 +14,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 	sdkotel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+	semconv "github.com/getlantern/semconv"
 )
 
 func TestEnabled(t *testing.T) {
@@ -56,14 +56,15 @@ func TestEnabled(t *testing.T) {
 func TestBuildResource(t *testing.T) {
 	t.Run("default service name", func(t *testing.T) {
 		r := buildResource()
-		var found bool
+		m := make(map[attribute.Key]attribute.Value)
 		for _, attr := range r.Attributes() {
-			if attr.Key == semconv.ServiceNameKey {
-				assert.Equal(t, "lantern-box", attr.Value.AsString())
-				found = true
-			}
+			m[attr.Key] = attr.Value
 		}
-		assert.True(t, found, "service.name attribute not found")
+		assert.Equal(t, "lantern-box",
+			m[semconv.ServiceNameKey].AsString())
+		assert.NotEmpty(t,
+			m[semconv.ServiceVersionKey].AsString(),
+			"service.version should be set")
 	})
 
 	t.Run("OTEL_SERVICE_NAME overrides default", func(t *testing.T) {

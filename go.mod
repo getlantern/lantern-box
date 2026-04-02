@@ -17,7 +17,7 @@ require (
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260317143726-e0ee64a11d90
 	github.com/getlantern/samizdat v0.0.3-0.20260327203406-ef7323341974
-	github.com/getlantern/semconv v0.0.0-20260311010754-121098b82c93
+	github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb
 	github.com/gobwas/ws v1.4.0
 	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/sing v0.7.18
@@ -28,7 +28,7 @@ require (
 	github.com/tetratelabs/wazero v1.11.0
 	go.opentelemetry.io/otel v1.41.0
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.16.0
-	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.40.0
+	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.41.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.41.0
 	go.opentelemetry.io/otel/log v0.16.0
 	go.opentelemetry.io/otel/metric v1.41.0
