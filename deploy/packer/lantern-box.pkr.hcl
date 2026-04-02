@@ -187,7 +187,7 @@ variable "oci_availability_domain_gru" {
   default = env("OCI_AVAILABILITY_DOMAIN_GRU")
 }
 
-# ── North America (new) ────────────────────────────────────────────────
+# ---------- North America (new) ----------------------------------------
 
 # OCI per-region variables: us-chicago-1 (ORD)
 variable "oci_subnet_ocid_ord" {
@@ -255,7 +255,7 @@ variable "oci_availability_domain_qro" {
   default = env("OCI_AVAILABILITY_DOMAIN_QRO")
 }
 
-# ── Europe (new) ───────────────────────────────────────────────────────
+# ---------- Europe (new) -----------------------------------------------
 
 # OCI per-region variables: eu-marseille-1 (MRS)
 variable "oci_subnet_ocid_mrs" {
@@ -345,7 +345,7 @@ variable "oci_availability_domain_cwl" {
   default = env("OCI_AVAILABILITY_DOMAIN_CWL")
 }
 
-# ── Asia-Pacific (new) ────────────────────────────────────────────────
+# ---------- Asia-Pacific (new) -----------------------------------------
 
 # OCI per-region variables: ap-seoul-1 (ICN)
 variable "oci_subnet_ocid_icn" {
@@ -413,7 +413,7 @@ variable "oci_availability_domain_xsp" {
   default = env("OCI_AVAILABILITY_DOMAIN_XSP")
 }
 
-# ── Middle East / Africa (new) ────────────────────────────────────────
+# ---------- Middle East / Africa (new) ----------------------------------
 
 # OCI per-region variables: me-dubai-1 (DXB)
 variable "oci_subnet_ocid_dxb" {
@@ -470,7 +470,7 @@ variable "oci_availability_domain_jnb" {
   default = env("OCI_AVAILABILITY_DOMAIN_JNB")
 }
 
-# ── Latin America (new) ───────────────────────────────────────────────
+# ---------- Latin America (new) -----------------------------------------
 
 # OCI per-region variables: sa-santiago-1 (SCL)
 variable "oci_subnet_ocid_scl" {
@@ -505,6 +505,19 @@ variable "oci_availability_domain_vap" {
   default = env("OCI_AVAILABILITY_DOMAIN_VAP")
 }
 
+# ---------- Locals ----------
+
+# Shared OCI config used by all per-region source blocks. Centralizing these
+# values avoids error-prone repetition across 36 regions.
+locals {
+  oci_base_image_regex = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+  oci_base_image_os    = "Canonical Ubuntu"
+  oci_shape            = "VM.Standard.A1.Flex"
+  oci_ocpus            = 1
+  oci_memory_gbs       = 1
+  oci_ssh_username     = "ubuntu"
+}
+
 # ---------- Sources ----------
 
 source "digitalocean" "lantern-box" {
@@ -535,16 +548,16 @@ source "oracle-oci" "lantern-box-iad" {
   region              = "us-ashburn-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_iad
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-iad"
 }
@@ -559,16 +572,16 @@ source "oracle-oci" "lantern-box-fra" {
   region              = "eu-frankfurt-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_fra
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-fra"
 }
@@ -583,16 +596,16 @@ source "oracle-oci" "lantern-box-nrt" {
   region              = "ap-tokyo-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_nrt
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-nrt"
 }
@@ -607,16 +620,16 @@ source "oracle-oci" "lantern-box-sin" {
   region              = "ap-singapore-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_sin
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-sin"
 }
@@ -631,16 +644,16 @@ source "oracle-oci" "lantern-box-phx" {
   region              = "us-phoenix-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_phx
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-phx"
 }
@@ -655,16 +668,16 @@ source "oracle-oci" "lantern-box-ams" {
   region              = "eu-amsterdam-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_ams
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-ams"
 }
@@ -679,16 +692,16 @@ source "oracle-oci" "lantern-box-bom" {
   region              = "ap-mumbai-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_bom
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-bom"
 }
@@ -703,21 +716,21 @@ source "oracle-oci" "lantern-box-gru" {
   region              = "sa-saopaulo-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_gru
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-gru"
 }
 
-# ── North America (new) ──────────────────────────────────────────────────
+# ---------- North America (new) ----------------------------------------
 
 source "oracle-oci" "lantern-box-ord" {
   tenancy_ocid        = var.oci_tenancy_ocid
@@ -729,16 +742,16 @@ source "oracle-oci" "lantern-box-ord" {
   region              = "us-chicago-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_ord
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-ord"
 }
@@ -753,16 +766,16 @@ source "oracle-oci" "lantern-box-sjc" {
   region              = "us-sanjose-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_sjc
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-sjc"
 }
@@ -777,16 +790,16 @@ source "oracle-oci" "lantern-box-yyz" {
   region              = "ca-toronto-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_yyz
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-yyz"
 }
@@ -801,16 +814,16 @@ source "oracle-oci" "lantern-box-yul" {
   region              = "ca-montreal-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_yul
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-yul"
 }
@@ -825,16 +838,16 @@ source "oracle-oci" "lantern-box-mty" {
   region              = "mx-monterrey-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_mty
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-mty"
 }
@@ -849,21 +862,21 @@ source "oracle-oci" "lantern-box-qro" {
   region              = "mx-queretaro-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_qro
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-qro"
 }
 
-# ── Europe (new) ─────────────────────────────────────────────────────────
+# ---------- Europe (new) -----------------------------------------------
 
 source "oracle-oci" "lantern-box-mrs" {
   tenancy_ocid        = var.oci_tenancy_ocid
@@ -875,16 +888,16 @@ source "oracle-oci" "lantern-box-mrs" {
   region              = "eu-marseille-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_mrs
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-mrs"
 }
@@ -899,16 +912,16 @@ source "oracle-oci" "lantern-box-lin" {
   region              = "eu-milan-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_lin
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-lin"
 }
@@ -923,16 +936,16 @@ source "oracle-oci" "lantern-box-mad" {
   region              = "eu-madrid-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_mad
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-mad"
 }
@@ -947,16 +960,16 @@ source "oracle-oci" "lantern-box-arn" {
   region              = "eu-stockholm-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_arn
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-arn"
 }
@@ -971,16 +984,16 @@ source "oracle-oci" "lantern-box-zrh" {
   region              = "eu-zurich-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_zrh
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-zrh"
 }
@@ -995,16 +1008,16 @@ source "oracle-oci" "lantern-box-cdg" {
   region              = "eu-paris-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_cdg
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-cdg"
 }
@@ -1019,16 +1032,16 @@ source "oracle-oci" "lantern-box-lhr" {
   region              = "uk-london-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_lhr
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-lhr"
 }
@@ -1043,21 +1056,21 @@ source "oracle-oci" "lantern-box-cwl" {
   region              = "uk-cardiff-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_cwl
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-cwl"
 }
 
-# ── Asia-Pacific (new) ──────────────────────────────────────────────────
+# ---------- Asia-Pacific (new) -----------------------------------------
 
 source "oracle-oci" "lantern-box-icn" {
   tenancy_ocid        = var.oci_tenancy_ocid
@@ -1069,16 +1082,16 @@ source "oracle-oci" "lantern-box-icn" {
   region              = "ap-seoul-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_icn
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-icn"
 }
@@ -1093,16 +1106,16 @@ source "oracle-oci" "lantern-box-kix" {
   region              = "ap-osaka-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_kix
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-kix"
 }
@@ -1117,16 +1130,16 @@ source "oracle-oci" "lantern-box-mel" {
   region              = "ap-melbourne-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_mel
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-mel"
 }
@@ -1141,16 +1154,16 @@ source "oracle-oci" "lantern-box-syd" {
   region              = "ap-sydney-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_syd
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-syd"
 }
@@ -1165,16 +1178,16 @@ source "oracle-oci" "lantern-box-ynj" {
   region              = "ap-chuncheon-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_ynj
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-ynj"
 }
@@ -1189,21 +1202,21 @@ source "oracle-oci" "lantern-box-xsp" {
   region              = "ap-singapore-2"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_xsp
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-xsp"
 }
 
-# ── Middle East / Africa (new) ──────────────────────────────────────────
+# ---------- Middle East / Africa (new) ----------------------------------
 
 source "oracle-oci" "lantern-box-dxb" {
   tenancy_ocid        = var.oci_tenancy_ocid
@@ -1215,16 +1228,16 @@ source "oracle-oci" "lantern-box-dxb" {
   region              = "me-dubai-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_dxb
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-dxb"
 }
@@ -1239,16 +1252,16 @@ source "oracle-oci" "lantern-box-jed" {
   region              = "me-jeddah-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_jed
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-jed"
 }
@@ -1263,16 +1276,16 @@ source "oracle-oci" "lantern-box-ruh" {
   region              = "me-riyadh-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_ruh
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-ruh"
 }
@@ -1287,16 +1300,16 @@ source "oracle-oci" "lantern-box-jrs" {
   region              = "il-jerusalem-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_jrs
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-jrs"
 }
@@ -1311,21 +1324,21 @@ source "oracle-oci" "lantern-box-jnb" {
   region              = "af-johannesburg-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_jnb
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-jnb"
 }
 
-# ── Latin America (new) ─────────────────────────────────────────────────
+# ---------- Latin America (new) -----------------------------------------
 
 source "oracle-oci" "lantern-box-scl" {
   tenancy_ocid        = var.oci_tenancy_ocid
@@ -1337,16 +1350,16 @@ source "oracle-oci" "lantern-box-scl" {
   region              = "sa-santiago-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_scl
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-scl"
 }
@@ -1361,16 +1374,16 @@ source "oracle-oci" "lantern-box-bog" {
   region              = "sa-bogota-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_bog
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-bog"
 }
@@ -1385,16 +1398,16 @@ source "oracle-oci" "lantern-box-vap" {
   region              = "sa-valparaiso-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_vap
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-vap"
 }
