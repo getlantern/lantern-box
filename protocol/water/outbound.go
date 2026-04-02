@@ -23,6 +23,7 @@ import (
 	"github.com/sagernet/sing-box/common/conntrack"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/logger"
@@ -109,9 +110,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		cancelLoad:            cancelLoad,
 	}
 
-	o.uotClient = &uot.Client{
-		Dialer:  &waterDialer{outbound: o},
-		Version: uot.Version,
+	uotOptions := common.PtrValueOrDefault(options.UDPOverTCP)
+	if uotOptions.Enabled {
+		o.uotClient = &uot.Client{
+			Dialer:  &waterDialer{outbound: o},
+			Version: uotOptions.Version,
+		}
 	}
 
 	go o.loadConfig(loadCtx, logger, options, timeout, wasmDir)
