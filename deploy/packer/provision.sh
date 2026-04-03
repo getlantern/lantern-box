@@ -43,7 +43,15 @@ fi
 
 # DPkg::Lock::Timeout makes apt-get wait for the dpkg lock instead of failing
 # immediately. This is a safety net in case a dpkg process is still finishing.
-APT_OPTS=(-o DPkg::Lock::Timeout=300)
+# Acquire timeouts prevent apt from hanging indefinitely when an OCI region's
+# local Ubuntu mirror is slow or unreachable (e.g., ca-toronto-1 mirror timeout
+# caused a 38-minute hang that exceeded the Packer job timeout).
+APT_OPTS=(
+  -o DPkg::Lock::Timeout=300
+  -o Acquire::http::Timeout=30
+  -o Acquire::https::Timeout=30
+  -o Acquire::Retries=3
+)
 
 echo "==> Installing runtime dependencies"
 apt-get "${APT_OPTS[@]}" update -q
