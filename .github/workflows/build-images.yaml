@@ -154,8 +154,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    # Alicloud copies images to 8 regions (up to 2h). Others are fast.
-    timeout-minutes: ${{ matrix.builder == 'alicloud-ecs' && 150 || 45 }}
+    # Alicloud copies images to 8 regions (up to 2h). OCI builds 36 regions
+    # in parallel — usually ~7min but a slow mirror can push past 45min.
+    timeout-minutes: ${{ matrix.builder == 'alicloud-ecs' && 150 || 60 }}
 
     steps:
       - name: Checkout
