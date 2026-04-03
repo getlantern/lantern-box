@@ -1,7 +1,7 @@
 # OTel Collector config for VPS proxy instances.
 # Collects host metrics (CPU, memory, disk, network) and structured logs
-# (auto-update script, etc.) and ships to the Teleport telemetry endpoint
-# (same pipeline as http-proxy on phosts).
+# (auto-update script, etc.) and ships to the internal ops pipeline
+# (ops.lantr.net, reachable via Headscale VPN).
 # The OTEL_RESOURCE_ATTRIBUTES env var is set by cloud-init.
 
 receivers:
@@ -58,8 +58,8 @@ processors:
     limit_mib: 50
 
 exporters:
-  otlphttp/teleport:
-    endpoint: "https://telemetry.iantem.io:443"
+  otlphttp:
+    endpoint: "https://ops.lantr.net:443"
     tls:
       insecure: false
     retry_on_failure:
@@ -73,8 +73,8 @@ service:
     metrics:
       receivers: [hostmetrics]
       processors: [memory_limiter, resourcedetection, batch]
-      exporters: [otlphttp/teleport]
+      exporters: [otlphttp]
     logs:
       receivers: [filelog/lantern-box]
       processors: [memory_limiter, resourcedetection, batch]
-      exporters: [otlphttp/teleport]
+      exporters: [otlphttp]
