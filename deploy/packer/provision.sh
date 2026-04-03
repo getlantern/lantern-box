@@ -44,8 +44,9 @@ fi
 # DPkg::Lock::Timeout makes apt-get wait for the dpkg lock instead of failing
 # immediately. This is a safety net in case a dpkg process is still finishing.
 # Acquire timeouts prevent apt from hanging indefinitely when an OCI region's
-# local Ubuntu mirror is slow or unreachable (e.g., ca-toronto-1 mirror timeout
-# caused a 38-minute hang that exceeded the Packer job timeout).
+# local Ubuntu mirror is slow or unreachable (e.g., the ca-toronto-1 mirror
+# became unreachable and, without an acquire timeout, apt hung for 38 minutes
+# until the Packer job itself timed out).
 APT_OPTS=(
   -o DPkg::Lock::Timeout=300
   -o Acquire::http::Timeout=30
