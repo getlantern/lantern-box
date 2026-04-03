@@ -67,6 +67,8 @@ func preRun(cmd *cobra.Command, args []string) {
 		} else {
 			attrs = info.resourceAttrs()
 		}
+	} else {
+		log.Info("no proxy-info path provided, skipping attribute addition")
 	}
 
 	meterShutdown, err := otel.InitGlobalMeterProvider(attrs...)
@@ -83,7 +85,9 @@ func preRun(cmd *cobra.Command, args []string) {
 	}
 	otelShutdownFuncs = append(otelShutdownFuncs, tracerShutdown)
 
-	log.Info("telemetry enabled")
+	for _, attr := range attrs {
+		log.Info("reporting with attribute: ", fmt.Sprintf("%s=%v", attr.Key, attr.Value.AsString()))
+	}
 
 	// Report any crash from a previous run, then set up crash output
 	// for this run. Order matters: report first (reads crash.log),
@@ -106,6 +110,10 @@ func preRun(cmd *cobra.Command, args []string) {
 			geo.CountryCode,
 		)
 		metrics.SetupMetricsManager(geolookup)
+	}
+	if otel.Enabled() {
+		log.Info("telemetry enabled")
+
 	}
 }
 
