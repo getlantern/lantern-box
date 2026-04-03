@@ -87,7 +87,7 @@ rm -f "/tmp/${otelcol_deb}"
 cp /tmp/otelcol.yaml /etc/otelcol-contrib/config.yaml
 
 # Create empty env file with restrictive permissions — cloud-init populates it
-# with SIGNOZ_INGEST_KEY and OTEL_RESOURCE_ATTRIBUTES before starting the service.
+# with OTEL_RESOURCE_ATTRIBUTES before starting the service.
 install -m 600 -o root -g root /dev/null /etc/otelcol-contrib/otelcol.env
 
 # Systemd drop-in to load the env file
