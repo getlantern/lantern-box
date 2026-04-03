@@ -87,7 +87,7 @@ rm -f "/tmp/${otelcol_deb}"
 cp /tmp/otelcol.yaml /etc/otelcol-contrib/config.yaml
 
 # Create empty env file with restrictive permissions — cloud-init populates it
-# with SIGNOZ_INGEST_KEY and OTEL_RESOURCE_ATTRIBUTES before starting the service.
+# with OTEL_RESOURCE_ATTRIBUTES before starting the service.
 install -m 600 -o root -g root /dev/null /etc/otelcol-contrib/otelcol.env
 
 # Systemd drop-in to load the env file
@@ -242,6 +242,18 @@ chmod 644 /etc/cron.d/lantern-box-update
 # Re-enable unattended-upgrades so the final image receives security updates.
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
 systemctl enable unattended-upgrades.service 2>/dev/null || true
+
+echo "==> Installing Tailscale client (for Headscale VPN management)"
+# Add Tailscale apt repo — works on Ubuntu 24.04 (noble)
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | \
+  tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | \
+  tee /etc/apt/sources.list.d/tailscale.list
+apt-get "${APT_OPTS[@]}" update -q
+apt-get "${APT_OPTS[@]}" install -y -q tailscale
+systemctl enable tailscaled
+# Do NOT run 'tailscale up' here — cloud-init provides the auth key at runtime.
+echo "    tailscale installed at $(command -v tailscale)"
 
 echo "==> Verifying installation"
 if ! command -v lantern-box >/dev/null 2>&1; then
