@@ -243,6 +243,18 @@ chmod 644 /etc/cron.d/lantern-box-update
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
 systemctl enable unattended-upgrades.service 2>/dev/null || true
 
+echo "==> Installing Tailscale client (for Headscale VPN management)"
+# Add Tailscale apt repo — works on Ubuntu 24.04 (noble)
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | \
+  tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | \
+  tee /etc/apt/sources.list.d/tailscale.list
+apt-get "${APT_OPTS[@]}" update -q
+apt-get "${APT_OPTS[@]}" install -y -q tailscale
+systemctl enable tailscaled
+# Do NOT run 'tailscale up' here — cloud-init provides the auth key at runtime.
+echo "    tailscale installed at $(command -v tailscale)"
+
 echo "==> Verifying installation"
 if ! command -v lantern-box >/dev/null 2>&1; then
   echo "lantern-box not found on PATH" >&2
