@@ -105,7 +105,7 @@ func preRun(cmd *cobra.Command, args []string) {
 			24*time.Hour, cityDatabaseName,
 			geo.CountryCode,
 		)
-		metrics.SetupMetricsManager(geolookup)
+		metrics.SetupMetricsManager(geolookup, time.Millisecond)
 	}
 }
 

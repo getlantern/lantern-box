@@ -6,21 +6,13 @@
 package metrics
 
 import (
-	"net"
-	"sync/atomic"
+	"time"
 
 	"github.com/getlantern/geo"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 )
-
-const countryLookupWorkers = 4
-
-type countryLookupRequest struct {
-	ip      net.IP
-	country *atomic.Value
-}
 
 type metricsManager struct {
 	meter    metric.Meter
@@ -29,7 +21,7 @@ type metricsManager struct {
 	duration metric.Int64Histogram
 
 	countryLookup  geo.CountryLookup
-	countryLookupC chan countryLookupRequest
+	lookupTimeout  time.Duration
 }
 
 var metrics = &metricsManager{
@@ -39,7 +31,11 @@ var metrics = &metricsManager{
 	countryLookup: geo.NoLookup{},
 }
 
-func SetupMetricsManager(countryLookup geo.CountryLookup) {
+// SetupMetricsManager initialises the global metrics manager. lookupTimeout
+// controls how long an IP-based geo lookup may take before it is abandoned and
+// the client-reported country is used as a fallback; pass 0 to call the lookup
+// synchronously with no timeout.
+func SetupMetricsManager(countryLookup geo.CountryLookup, lookupTimeout time.Duration) {
 	meter := otel.GetMeterProvider().Meter("lantern-box")
 	if pIO, err := meter.Int64Counter("proxy.io", metric.WithUnit("bytes")); err == nil {
 		metrics.ProxyIO = pIO
@@ -58,18 +54,6 @@ func SetupMetricsManager(countryLookup geo.CountryLookup) {
 	if countryLookup != nil {
 		metrics.countryLookup = countryLookup
 	}
-	if _, ok := countryLookup.(geo.NoLookup); !ok {
-		metrics.countryLookupC = make(chan countryLookupRequest, 256)
-		for range countryLookupWorkers {
-			go countryLookupWorker(metrics.countryLookupC, metrics.countryLookup)
-		}
-	}
-
+	metrics.lookupTimeout = lookupTimeout
 	metrics.meter = meter
-}
-
-func countryLookupWorker(ch <-chan countryLookupRequest, lookup geo.CountryLookup) {
-	for req := range ch {
-		req.country.Store(lookup.CountryCode(req.ip))
-	}
 }
