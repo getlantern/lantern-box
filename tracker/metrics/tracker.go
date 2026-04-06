@@ -3,7 +3,7 @@ package metrics
 import (
 	"context"
 	"net"
-	"sync/atomic"
+	"time"
 
 	semconv "github.com/getlantern/semconv"
 	"github.com/sagernet/sing-box/adapter"
@@ -16,10 +16,10 @@ import (
 )
 
 const (
-	rx ioAttr = "receive"
-	tx ioAttr = "transmit"
-
-	ccNa = "n/a"
+	rx   ioAttr        = "receive"
+	tx   ioAttr        = "transmit"
+	ccNa                = "n/a"
+	geoSourceKey attribute.Key = "geo.source"
 )
 
 type ioAttr string
@@ -106,6 +106,10 @@ func (t *MetricsTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 	attrs := metadataToAttributes(metadata)
 	if info, ok := clientcontext.ClientInfoFromContext(ctx); ok {
 		attrs.client = &info
+		if attrs.country == "" && info.CountryCode != "" {
+			attrs.country = info.CountryCode
+			attrs.geoDB   = "client"
+		}
 	}
 	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return NewConn(conn, attrs, t)
@@ -116,6 +120,10 @@ func (t *MetricsTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 	attrs := metadataToAttributes(metadata)
 	if info, ok := clientcontext.ClientInfoFromContext(ctx); ok {
 		attrs.client = &info
+		if attrs.country == "" && info.CountryCode != "" {
+			attrs.country = info.CountryCode
+			attrs.geoDB   = "client"
+		}
 	}
 	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return NewPacketConn(conn, attrs, t)
@@ -129,13 +137,23 @@ func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
 
 type attributes struct {
 	attrs   []attribute.KeyValue
-	country atomic.Value // string
+	country string
+	geoDB   string
 	client  *clientcontext.ClientInfo
 }
 
 func (a *attributes) AsSlice() []attribute.KeyValue {
+	country := a.country
+	if country == "" {
+		country = ccNa
+	}
+	geoDB := a.geoDB
+	if geoDB == "" {
+		geoDB = ccNa
+	}
 	s := append(a.attrs,
-		semconv.GeoCountryISOCodeKey.String(a.country.Load().(string)),
+		semconv.GeoCountryISOCodeKey.String(country),
+		geoSourceKey.String(geoDB),
 	)
 	if a.client != nil {
 		s = append(s,
@@ -148,23 +166,41 @@ func (a *attributes) AsSlice() []attribute.KeyValue {
 }
 
 func metadataToAttributes(metadata adapter.InboundContext) *attributes {
-	attrs := &attributes{
+	country, geoDB := lookupCountry(metadata.Source.IPAddr().IP)
+	return &attributes{
 		attrs: []attribute.KeyValue{
 			semconv.NetworkProtocolNameKey.String(metadata.Protocol),
 			semconv.ProxyInboundKey.String(metadata.Inbound),
 			semconv.ProxyInboundTypeKey.String(metadata.InboundType),
 			semconv.ProxyOutboundKey.String(metadata.Outbound),
 		},
+		country: country,
+		geoDB:   geoDB,
 	}
-	attrs.country.Store(ccNa)
-	if metrics.countryLookupC != nil {
+}
+
+// lookupCountry resolves the ISO country code for ip using the configured geo
+// database. If a lookupTimeout is set the lookup runs in a goroutine and the
+// empty string is returned on timeout. Returns the country code and the source
+// label ("maxmind"), or both empty on failure.
+func lookupCountry(ip net.IP) (country, geoDB string) {
+	call := func() string { return metrics.countryLookup.CountryCode(ip) }
+
+	var cc string
+	if metrics.lookupTimeout > 0 {
+		ch := make(chan string, 1)
+		go func() { ch <- call() }()
 		select {
-		case metrics.countryLookupC <- countryLookupRequest{
-			ip:      metadata.Source.IPAddr().IP,
-			country: &attrs.country,
-		}:
-		default:
+		case cc = <-ch:
+		case <-time.After(metrics.lookupTimeout):
+			return "", ""
 		}
+	} else {
+		cc = call()
 	}
-	return attrs
+
+	if cc != "" {
+		return cc, "maxmind"
+	}
+	return "", ""
 }

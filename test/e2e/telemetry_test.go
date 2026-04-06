@@ -77,7 +77,7 @@ func TestTelemetryE2E(t *testing.T) {
 	shutdownTracer, err := otel.InitGlobalTracerProvider()
 	require.NoError(t, err)
 
-	metrics.SetupMetricsManager(geo.NoLookup{})
+	metrics.SetupMetricsManager(geo.NoLookup{}, 0)
 
 	// --- Start upstream HTTP server ---
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
