@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -23,11 +24,13 @@ import (
 	"github.com/sagernet/sing-box/common/conntrack"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/common/network"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 	"github.com/sagernet/sing/service"
 	"github.com/tetratelabs/wazero"
 
@@ -46,12 +49,28 @@ func RegisterOutbound(registry *outbound.Registry) {
 type Outbound struct {
 	outbound.Adapter
 	logger                logger.ContextLogger
-	serverAddr            string
 	skipHandshake         bool
 	dialerConfig          *water.Config
+	loadErr               error
 	transportModuleConfig map[string]any
-	dialMutex             sync.Mutex
+	mu                    sync.Mutex
 	seeder                *seed.Seeder
+	cancelLoad            context.CancelFunc
+	uotClient             *uot.Client
+}
+
+// waterDialer adapts the WATER outbound for use with uot.Client.
+// It must only be called while the outbound mutex is already held.
+type waterDialer struct {
+	outbound *Outbound
+}
+
+func (d *waterDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return d.outbound.dialTCPLocked(ctx, destination)
+}
+
+func (d *waterDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return nil, os.ErrInvalid
 }
 
 // NewOutbound creates a new WATER outbound adapter.
@@ -73,10 +92,52 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		}
 	}
 
+	// We're creating the compilation cache dir and setting the global value so during runtime
+	// it won't need to create one at a temp directory
+	compilationCache, err := wazero.NewCompilationCacheWithDir(wazeroCompilationDir)
+	if err != nil {
+		return nil, err
+	}
+	water.SetGlobalCompilationCache(compilationCache)
+
+	loadCtx, cancelLoad := context.WithCancel(ctx)
+
+	o := &Outbound{
+		Adapter:               outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+		logger:                logger,
+		transportModuleConfig: options.Config,
+		mu:                    sync.Mutex{},
+		skipHandshake:         options.SkipHandshake,
+		cancelLoad:            cancelLoad,
+	}
+
+	uotOptions := common.PtrValueOrDefault(options.UDPOverTCP)
+	if uotOptions.Enabled {
+		o.uotClient = &uot.Client{
+			Dialer:  &waterDialer{outbound: o},
+			Version: uotOptions.Version,
+		}
+	}
+
+	go o.loadConfig(loadCtx, logger, options, timeout, wasmDir)
+
+	return o, nil
+}
+
+func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, options option.WATEROutboundOptions, downloadTimeout time.Duration, wasmDir string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic in while loading water config", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+		}
+	}()
+	logger.DebugContext(ctx, "loading WATER configuration in background")
+
+	serverAddr := options.ServerOptions.Build()
+
 	slogLogger := slog.New(L.NewLogHandler(logger))
 	vc := waterVC.NewWaterVersionControl(wasmDir, slogLogger)
+	httpClient := &http.Client{Timeout: downloadTimeout}
 
-	httpClient := &http.Client{Timeout: timeout}
 	if options.DownloadDetour != "" {
 		logger.DebugContext(ctx, "download detour option set", slog.Any("detour", options.DownloadDetour))
 		outboundManager := service.FromContext[adapter.OutboundManager](ctx)
@@ -91,36 +152,45 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, httpClient)
 	if err != nil {
-		return nil, E.New("failed to create WASM downloader", err)
+		logger.ErrorContext(ctx, "failed to create WASM downloader", slog.Any("error", err))
+		o.mu.Lock()
+		o.loadErr = err
+		o.mu.Unlock()
+		return
 	}
 
 	rc, err := vc.GetWASM(ctx, options.Transport, d)
 	if err != nil {
-		return nil, err
+		logger.ErrorContext(ctx, "failed to load WASM file", slog.Any("error", err))
+		o.mu.Lock()
+		o.loadErr = err
+		o.mu.Unlock()
+		return
 	}
 	defer rc.Close()
 
 	b, err := io.ReadAll(rc)
 	if err != nil {
-		return nil, err
+		logger.ErrorContext(ctx, "failed to read WASM file", slog.Any("error", err))
+		o.mu.Lock()
+		o.loadErr = err
+		o.mu.Unlock()
+		return
 	}
+
+	logger.DebugContext(ctx, "successfully loaded WASM file", slog.String("transport", options.Transport))
 
 	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
-		return nil, err
-	}
-	serverAddr := options.ServerOptions.Build()
-
-	// We're creating the compilation cache dir and setting the global value so during runtime
-	// it won't need to create one at a temp directory
-	compilationCache, err := wazero.NewCompilationCacheWithDir(wazeroCompilationDir)
-	if err != nil {
-		return nil, err
+		logger.ErrorContext(ctx, "failed to create outbound dialer", slog.Any("error", err))
+		o.mu.Lock()
+		o.loadErr = err
+		o.mu.Unlock()
+		return
 	}
 
-	water.SetGlobalCompilationCache(compilationCache)
-
-	cfg := &water.Config{
+	o.mu.Lock()
+	o.dialerConfig = &water.Config{
 		TransportModuleBin: b,
 		OverrideLogger:     slogLogger,
 		NetworkDialerFunc: func(network, address string) (net.Conn, error) {
@@ -136,16 +206,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			}
 		},
 	}
-
-	outbound := &Outbound{
-		Adapter:               outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{network.NetworkTCP}, options.DialerOptions),
-		logger:                logger,
-		serverAddr:            serverAddr.String(),
-		dialerConfig:          cfg,
-		transportModuleConfig: options.Config,
-		dialMutex:             sync.Mutex{},
-		skipHandshake:         options.SkipHandshake,
-	}
+	o.mu.Unlock()
 
 	if options.SeedEnabled {
 		transportFilepath := filepath.Join(wasmDir, fmt.Sprintf("%s.%s", options.Transport, "wasm"))
@@ -169,13 +230,16 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		if seeder != nil {
 			logger.DebugContext(ctx, "seeding WASM file", slog.String("magnet_uri", seeder.MagnetURI()), slog.String("transport", transportFilepath))
 		}
-		outbound.seeder = seeder
+		o.mu.Lock()
+		o.seeder = seeder
+		o.mu.Unlock()
 	}
-
-	return outbound, nil
 }
 
 func (o *Outbound) Close() error {
+	o.cancelLoad()
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if o.seeder != nil {
 		return o.seeder.Close()
 	}
@@ -183,6 +247,12 @@ func (o *Outbound) Close() error {
 }
 
 func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (water.Dialer, error) {
+	if o.loadErr != nil {
+		return nil, fmt.Errorf("WATER outbound failed to load: %w", o.loadErr)
+	}
+	if o.dialerConfig == nil {
+		return nil, fmt.Errorf("WATER outbound is still loading, not ready to dial")
+	}
 	cfg := o.dialerConfig.Clone()
 
 	o.logger.DebugContext(ctx, "building new dialer", slog.String("destination", destination.String()))
@@ -204,19 +274,30 @@ func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (wate
 
 // DialContext dials a connection to the specified network and destination.
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	o.dialMutex.Lock()
-	defer o.dialMutex.Unlock()
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
 
+	switch N.NetworkName(network) {
+	case N.NetworkTCP:
+		return o.dialTCPLocked(ctx, destination)
+	case N.NetworkUDP:
+		return o.uotClient.DialContext(ctx, network, destination)
+	}
+	return nil, E.New("unsupported network: ", network)
+}
+
+// dialTCPLocked creates a new WATER TCP connection. The outbound mutex must be held by the caller.
+func (o *Outbound) dialTCPLocked(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
 	dialer, err := o.newDialer(ctx, destination)
 	if err != nil {
 		o.logger.ErrorContext(ctx, "failed to build new WATER dialer", slog.Any("error", err), slog.String("destination", destination.String()))
 		return nil, err
 	}
 
-	conn, err := dialer.DialContext(context.Background(), network, "localhost:0")
+	conn, err := dialer.DialContext(context.Background(), N.NetworkTCP, "localhost:0")
 	if err != nil {
 		o.logger.ErrorContext(ctx, "WATER failed to dial", slog.Any("error", err))
 		return nil, err
@@ -225,13 +306,10 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	return waterTransport.NewWATERConnection(conn, destination, o.skipHandshake), nil
 }
 
-// ListenPacket is not implemented
+// ListenPacket creates a UoT packet connection through the WATER transport.
 func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	return nil, E.New("not implemented")
-}
-
-// Network returns the supported network types for this outbound adapter.
-// In this case, it supports only TCP.
-func (o *Outbound) Network() []string {
-	return []string{network.NetworkTCP}
+	ctx, metadata := adapter.ExtendContext(ctx)
+	metadata.Outbound = o.Tag()
+	metadata.Destination = destination
+	return o.uotClient.ListenPacket(ctx, destination)
 }
