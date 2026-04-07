@@ -143,6 +143,381 @@ variable "oci_availability_domain_sin" {
   default = env("OCI_AVAILABILITY_DOMAIN_SIN")
 }
 
+# OCI per-region variables: us-phoenix-1 (PHX)
+variable "oci_subnet_ocid_phx" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_PHX")
+}
+
+variable "oci_availability_domain_phx" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_PHX")
+}
+
+# OCI per-region variables: eu-amsterdam-1 (AMS)
+variable "oci_subnet_ocid_ams" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_AMS")
+}
+
+variable "oci_availability_domain_ams" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_AMS")
+}
+
+# OCI per-region variables: ap-mumbai-1 (BOM)
+variable "oci_subnet_ocid_bom" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_BOM")
+}
+
+variable "oci_availability_domain_bom" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_BOM")
+}
+
+# OCI per-region variables: sa-saopaulo-1 (GRU)
+variable "oci_subnet_ocid_gru" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_GRU")
+}
+
+variable "oci_availability_domain_gru" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_GRU")
+}
+
+# ---------- North America (new) ----------------------------------------
+
+# OCI per-region variables: us-chicago-1 (ORD)
+variable "oci_subnet_ocid_ord" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_ORD")
+}
+
+variable "oci_availability_domain_ord" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_ORD")
+}
+
+# OCI per-region variables: us-sanjose-1 (SJC)
+variable "oci_subnet_ocid_sjc" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_SJC")
+}
+
+variable "oci_availability_domain_sjc" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_SJC")
+}
+
+# OCI per-region variables: ca-toronto-1 (YYZ)
+variable "oci_subnet_ocid_yyz" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_YYZ")
+}
+
+variable "oci_availability_domain_yyz" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_YYZ")
+}
+
+# OCI per-region variables: ca-montreal-1 (YUL)
+variable "oci_subnet_ocid_yul" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_YUL")
+}
+
+variable "oci_availability_domain_yul" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_YUL")
+}
+
+# OCI per-region variables: mx-monterrey-1 (MTY)
+variable "oci_subnet_ocid_mty" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_MTY")
+}
+
+variable "oci_availability_domain_mty" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_MTY")
+}
+
+# OCI per-region variables: mx-queretaro-1 (QRO)
+variable "oci_subnet_ocid_qro" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_QRO")
+}
+
+variable "oci_availability_domain_qro" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_QRO")
+}
+
+# ---------- Europe (new) -----------------------------------------------
+
+# OCI per-region variables: eu-marseille-1 (MRS)
+variable "oci_subnet_ocid_mrs" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_MRS")
+}
+
+variable "oci_availability_domain_mrs" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_MRS")
+}
+
+# OCI per-region variables: eu-milan-1 (LIN)
+variable "oci_subnet_ocid_lin" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_LIN")
+}
+
+variable "oci_availability_domain_lin" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_LIN")
+}
+
+# OCI per-region variables: eu-madrid-1 (MAD)
+variable "oci_subnet_ocid_mad" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_MAD")
+}
+
+variable "oci_availability_domain_mad" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_MAD")
+}
+
+# OCI per-region variables: eu-stockholm-1 (ARN)
+variable "oci_subnet_ocid_arn" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_ARN")
+}
+
+variable "oci_availability_domain_arn" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_ARN")
+}
+
+# OCI per-region variables: eu-zurich-1 (ZRH)
+variable "oci_subnet_ocid_zrh" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_ZRH")
+}
+
+variable "oci_availability_domain_zrh" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_ZRH")
+}
+
+# OCI per-region variables: eu-paris-1 (CDG)
+variable "oci_subnet_ocid_cdg" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_CDG")
+}
+
+variable "oci_availability_domain_cdg" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_CDG")
+}
+
+# OCI per-region variables: uk-london-1 (LHR)
+variable "oci_subnet_ocid_lhr" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_LHR")
+}
+
+variable "oci_availability_domain_lhr" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_LHR")
+}
+
+# OCI per-region variables: uk-cardiff-1 (CWL)
+variable "oci_subnet_ocid_cwl" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_CWL")
+}
+
+variable "oci_availability_domain_cwl" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_CWL")
+}
+
+# ---------- Asia-Pacific (new) -----------------------------------------
+
+# OCI per-region variables: ap-seoul-1 (ICN)
+variable "oci_subnet_ocid_icn" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_ICN")
+}
+
+variable "oci_availability_domain_icn" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_ICN")
+}
+
+# OCI per-region variables: ap-osaka-1 (KIX)
+variable "oci_subnet_ocid_kix" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_KIX")
+}
+
+variable "oci_availability_domain_kix" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_KIX")
+}
+
+# OCI per-region variables: ap-melbourne-1 (MEL)
+variable "oci_subnet_ocid_mel" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_MEL")
+}
+
+variable "oci_availability_domain_mel" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_MEL")
+}
+
+# OCI per-region variables: ap-sydney-1 (SYD)
+variable "oci_subnet_ocid_syd" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_SYD")
+}
+
+variable "oci_availability_domain_syd" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_SYD")
+}
+
+# OCI per-region variables: ap-chuncheon-1 (YNJ)
+variable "oci_subnet_ocid_ynj" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_YNJ")
+}
+
+variable "oci_availability_domain_ynj" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_YNJ")
+}
+
+# OCI per-region variables: ap-singapore-2 (XSP)
+variable "oci_subnet_ocid_xsp" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_XSP")
+}
+
+variable "oci_availability_domain_xsp" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_XSP")
+}
+
+# ---------- Middle East / Africa (new) ----------------------------------
+
+# OCI per-region variables: me-dubai-1 (DXB)
+variable "oci_subnet_ocid_dxb" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_DXB")
+}
+
+variable "oci_availability_domain_dxb" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_DXB")
+}
+
+# OCI per-region variables: me-jeddah-1 (JED)
+variable "oci_subnet_ocid_jed" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_JED")
+}
+
+variable "oci_availability_domain_jed" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_JED")
+}
+
+# OCI per-region variables: me-riyadh-1 (RUH)
+variable "oci_subnet_ocid_ruh" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_RUH")
+}
+
+variable "oci_availability_domain_ruh" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_RUH")
+}
+
+# OCI per-region variables: il-jerusalem-1 (JRS)
+variable "oci_subnet_ocid_jrs" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_JRS")
+}
+
+variable "oci_availability_domain_jrs" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_JRS")
+}
+
+# OCI per-region variables: af-johannesburg-1 (JNB)
+variable "oci_subnet_ocid_jnb" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_JNB")
+}
+
+variable "oci_availability_domain_jnb" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_JNB")
+}
+
+# ---------- Latin America (new) -----------------------------------------
+
+# OCI per-region variables: sa-santiago-1 (SCL)
+variable "oci_subnet_ocid_scl" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_SCL")
+}
+
+variable "oci_availability_domain_scl" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_SCL")
+}
+
+# OCI per-region variables: sa-bogota-1 (BOG)
+variable "oci_subnet_ocid_bog" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_BOG")
+}
+
+variable "oci_availability_domain_bog" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_BOG")
+}
+
+# OCI per-region variables: sa-valparaiso-1 (VAP)
+variable "oci_subnet_ocid_vap" {
+  type    = string
+  default = env("OCI_SUBNET_OCID_VAP")
+}
+
+variable "oci_availability_domain_vap" {
+  type    = string
+  default = env("OCI_AVAILABILITY_DOMAIN_VAP")
+}
+
+# ---------- Locals ----------
+
+# Shared OCI config used by all per-region source blocks. Centralizing these
+# values avoids error-prone repetition across 36 regions.
+locals {
+  oci_base_image_regex = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
+  oci_base_image_os    = "Canonical Ubuntu"
+  oci_shape            = "VM.Standard.A1.Flex"
+  oci_ocpus            = 1
+  oci_memory_gbs       = 1
+  oci_ssh_username     = "ubuntu"
+}
+
 # ---------- Sources ----------
 
 source "digitalocean" "lantern-box" {
@@ -173,16 +548,16 @@ source "oracle-oci" "lantern-box-iad" {
   region              = "us-ashburn-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_iad
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-iad"
 }
@@ -197,16 +572,16 @@ source "oracle-oci" "lantern-box-fra" {
   region              = "eu-frankfurt-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_fra
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-fra"
 }
@@ -221,16 +596,16 @@ source "oracle-oci" "lantern-box-nrt" {
   region              = "ap-tokyo-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_nrt
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-nrt"
 }
@@ -245,18 +620,796 @@ source "oracle-oci" "lantern-box-sin" {
   region              = "ap-singapore-1"
 
   base_image_filter {
-    display_name_search = "^Canonical-Ubuntu-24.04-Minimal-aarch64-"
-    operating_system    = "Canonical Ubuntu"
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
   }
-  shape = "VM.Standard.A1.Flex"
+  shape = local.oci_shape
   shape_config {
-    ocpus         = 1
-    memory_in_gbs = 1
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
   }
   subnet_ocid  = var.oci_subnet_ocid_sin
-  ssh_username = "ubuntu"
+  ssh_username = local.oci_ssh_username
 
   image_name = "lantern-box-${var.lantern_box_version}-arm64-sin"
+}
+
+source "oracle-oci" "lantern-box-phx" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_phx
+  region              = "us-phoenix-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_phx
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-phx"
+}
+
+source "oracle-oci" "lantern-box-ams" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_ams
+  region              = "eu-amsterdam-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_ams
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-ams"
+}
+
+source "oracle-oci" "lantern-box-bom" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_bom
+  region              = "ap-mumbai-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_bom
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-bom"
+}
+
+source "oracle-oci" "lantern-box-gru" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_gru
+  region              = "sa-saopaulo-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_gru
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-gru"
+}
+
+# ---------- North America (new) ----------------------------------------
+
+source "oracle-oci" "lantern-box-ord" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_ord
+  region              = "us-chicago-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_ord
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-ord"
+}
+
+source "oracle-oci" "lantern-box-sjc" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_sjc
+  region              = "us-sanjose-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_sjc
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-sjc"
+}
+
+source "oracle-oci" "lantern-box-yyz" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_yyz
+  region              = "ca-toronto-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_yyz
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-yyz"
+}
+
+source "oracle-oci" "lantern-box-yul" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_yul
+  region              = "ca-montreal-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_yul
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-yul"
+}
+
+source "oracle-oci" "lantern-box-mty" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_mty
+  region              = "mx-monterrey-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_mty
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-mty"
+}
+
+source "oracle-oci" "lantern-box-qro" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_qro
+  region              = "mx-queretaro-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_qro
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-qro"
+}
+
+# ---------- Europe (new) -----------------------------------------------
+
+source "oracle-oci" "lantern-box-mrs" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_mrs
+  region              = "eu-marseille-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_mrs
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-mrs"
+}
+
+source "oracle-oci" "lantern-box-lin" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_lin
+  region              = "eu-milan-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_lin
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-lin"
+}
+
+source "oracle-oci" "lantern-box-mad" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_mad
+  region              = "eu-madrid-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_mad
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-mad"
+}
+
+source "oracle-oci" "lantern-box-arn" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_arn
+  region              = "eu-stockholm-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_arn
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-arn"
+}
+
+source "oracle-oci" "lantern-box-zrh" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_zrh
+  region              = "eu-zurich-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_zrh
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-zrh"
+}
+
+source "oracle-oci" "lantern-box-cdg" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_cdg
+  region              = "eu-paris-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_cdg
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-cdg"
+}
+
+source "oracle-oci" "lantern-box-lhr" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_lhr
+  region              = "uk-london-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_lhr
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-lhr"
+}
+
+source "oracle-oci" "lantern-box-cwl" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_cwl
+  region              = "uk-cardiff-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_cwl
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-cwl"
+}
+
+# ---------- Asia-Pacific (new) -----------------------------------------
+
+source "oracle-oci" "lantern-box-icn" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_icn
+  region              = "ap-seoul-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_icn
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-icn"
+}
+
+source "oracle-oci" "lantern-box-kix" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_kix
+  region              = "ap-osaka-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_kix
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-kix"
+}
+
+source "oracle-oci" "lantern-box-mel" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_mel
+  region              = "ap-melbourne-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_mel
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-mel"
+}
+
+source "oracle-oci" "lantern-box-syd" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_syd
+  region              = "ap-sydney-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_syd
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-syd"
+}
+
+source "oracle-oci" "lantern-box-ynj" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_ynj
+  region              = "ap-chuncheon-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_ynj
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-ynj"
+}
+
+source "oracle-oci" "lantern-box-xsp" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_xsp
+  region              = "ap-singapore-2"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_xsp
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-xsp"
+}
+
+# ---------- Middle East / Africa (new) ----------------------------------
+
+source "oracle-oci" "lantern-box-dxb" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_dxb
+  region              = "me-dubai-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_dxb
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-dxb"
+}
+
+source "oracle-oci" "lantern-box-jed" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_jed
+  region              = "me-jeddah-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_jed
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-jed"
+}
+
+source "oracle-oci" "lantern-box-ruh" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_ruh
+  region              = "me-riyadh-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_ruh
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-ruh"
+}
+
+source "oracle-oci" "lantern-box-jrs" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_jrs
+  region              = "il-jerusalem-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_jrs
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-jrs"
+}
+
+source "oracle-oci" "lantern-box-jnb" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_jnb
+  region              = "af-johannesburg-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_jnb
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-jnb"
+}
+
+# ---------- Latin America (new) -----------------------------------------
+
+source "oracle-oci" "lantern-box-scl" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_scl
+  region              = "sa-santiago-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_scl
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-scl"
+}
+
+source "oracle-oci" "lantern-box-bog" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_bog
+  region              = "sa-bogota-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_bog
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-bog"
+}
+
+source "oracle-oci" "lantern-box-vap" {
+  tenancy_ocid        = var.oci_tenancy_ocid
+  user_ocid           = var.oci_user_ocid
+  fingerprint         = var.oci_fingerprint
+  key_file            = var.oci_key_file
+  compartment_ocid    = var.oci_compartment_ocid
+  availability_domain = var.oci_availability_domain_vap
+  region              = "sa-valparaiso-1"
+
+  base_image_filter {
+    display_name_search = local.oci_base_image_regex
+    operating_system    = local.oci_base_image_os
+  }
+  shape = local.oci_shape
+  shape_config {
+    ocpus         = local.oci_ocpus
+    memory_in_gbs = local.oci_memory_gbs
+  }
+  subnet_ocid  = var.oci_subnet_ocid_vap
+  ssh_username = local.oci_ssh_username
+
+  image_name = "lantern-box-${var.lantern_box_version}-arm64-vap"
 }
 
 source "linode" "lantern-box" {
@@ -342,6 +1495,43 @@ build {
     "source.oracle-oci.lantern-box-fra",
     "source.oracle-oci.lantern-box-nrt",
     "source.oracle-oci.lantern-box-sin",
+    "source.oracle-oci.lantern-box-phx",
+    "source.oracle-oci.lantern-box-ams",
+    "source.oracle-oci.lantern-box-bom",
+    "source.oracle-oci.lantern-box-gru",
+    # North America (new)
+    "source.oracle-oci.lantern-box-ord",
+    "source.oracle-oci.lantern-box-sjc",
+    "source.oracle-oci.lantern-box-yyz",
+    "source.oracle-oci.lantern-box-yul",
+    "source.oracle-oci.lantern-box-mty",
+    "source.oracle-oci.lantern-box-qro",
+    # Europe (new)
+    "source.oracle-oci.lantern-box-mrs",
+    "source.oracle-oci.lantern-box-lin",
+    "source.oracle-oci.lantern-box-mad",
+    "source.oracle-oci.lantern-box-arn",
+    "source.oracle-oci.lantern-box-zrh",
+    "source.oracle-oci.lantern-box-cdg",
+    "source.oracle-oci.lantern-box-lhr",
+    "source.oracle-oci.lantern-box-cwl",
+    # Asia-Pacific (new)
+    "source.oracle-oci.lantern-box-icn",
+    "source.oracle-oci.lantern-box-kix",
+    "source.oracle-oci.lantern-box-mel",
+    "source.oracle-oci.lantern-box-syd",
+    "source.oracle-oci.lantern-box-ynj",
+    "source.oracle-oci.lantern-box-xsp",
+    # Middle East / Africa (new)
+    "source.oracle-oci.lantern-box-dxb",
+    "source.oracle-oci.lantern-box-jed",
+    "source.oracle-oci.lantern-box-ruh",
+    "source.oracle-oci.lantern-box-jrs",
+    "source.oracle-oci.lantern-box-jnb",
+    # Latin America (new)
+    "source.oracle-oci.lantern-box-scl",
+    "source.oracle-oci.lantern-box-bog",
+    "source.oracle-oci.lantern-box-vap",
     "source.alicloud-ecs.lantern-box",
   ]
 

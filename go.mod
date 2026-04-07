@@ -1,6 +1,6 @@
 module github.com/getlantern/lantern-box
 
-go 1.25.0
+go 1.24.6
 
 replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.18-lantern
 
@@ -16,19 +16,19 @@ require (
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260317143726-e0ee64a11d90
-	github.com/getlantern/samizdat v0.0.3-0.20260310125445-325cf1bd1b60
-	github.com/getlantern/semconv v0.0.0-20260311010754-121098b82c93
+	github.com/getlantern/samizdat v0.0.3-0.20260327203406-ef7323341974
+	github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb
 	github.com/gobwas/ws v1.4.0
 	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/sing v0.7.18
 	github.com/sagernet/sing-box v1.12.22
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
-	github.com/testcontainers/testcontainers-go v0.41.0
+	github.com/testcontainers/testcontainers-go v0.40.0
 	github.com/tetratelabs/wazero v1.11.0
 	go.opentelemetry.io/otel v1.41.0
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.16.0
-	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.40.0
+	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.41.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.41.0
 	go.opentelemetry.io/otel/log v0.16.0
 	go.opentelemetry.io/otel/metric v1.41.0

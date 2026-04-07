@@ -43,7 +43,16 @@ fi
 
 # DPkg::Lock::Timeout makes apt-get wait for the dpkg lock instead of failing
 # immediately. This is a safety net in case a dpkg process is still finishing.
-APT_OPTS=(-o DPkg::Lock::Timeout=300)
+# Acquire timeouts prevent apt from hanging indefinitely when an OCI region's
+# local Ubuntu mirror is slow or unreachable (e.g., the ca-toronto-1 mirror
+# became unreachable and, without an acquire timeout, apt hung for 38 minutes
+# until the Packer job itself timed out).
+APT_OPTS=(
+  -o DPkg::Lock::Timeout=300
+  -o Acquire::http::Timeout=30
+  -o Acquire::https::Timeout=30
+  -o Acquire::Retries=3
+)
 
 echo "==> Installing runtime dependencies"
 apt-get "${APT_OPTS[@]}" update -q
@@ -87,7 +96,7 @@ rm -f "/tmp/${otelcol_deb}"
 cp /tmp/otelcol.yaml /etc/otelcol-contrib/config.yaml
 
 # Create empty env file with restrictive permissions — cloud-init populates it
-# with SIGNOZ_INGEST_KEY and OTEL_RESOURCE_ATTRIBUTES before starting the service.
+# with OTEL_RESOURCE_ATTRIBUTES before starting the service.
 install -m 600 -o root -g root /dev/null /etc/otelcol-contrib/otelcol.env
 
 # Systemd drop-in to load the env file
@@ -113,9 +122,40 @@ systemctl daemon-reload
 # Do NOT enable — cloud-init writes env vars first, then enables the service.
 
 echo "==> Setting up lantern-box auto-update (via GitHub Releases)"
+mkdir -p /var/log/lantern-box
 cat > /usr/local/bin/lantern-box-update <<'SCRIPT'
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
+# NOTE: no -e — we handle errors explicitly so we can log them to SigNoz.
+
+LOG_FILE="/var/log/lantern-box/update.log"
+
+# Structured JSON log line for the OTel filelog receiver → SigNoz pipeline.
+# Uses python3 json.dumps for safe escaping of all dynamic fields.
+log_json() {
+  local level="$1" msg="$2"
+  local ts json_line
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  json_line=$(
+    TS="$ts" \
+    LEVEL="$level" \
+    MSG="$msg" \
+    CURRENT_VER="${current_ver:-unknown}" \
+    LATEST_VER="${latest_ver:-unknown}" \
+    python3 -c '
+import json, os
+print(json.dumps({
+    "timestamp": os.environ["TS"],
+    "severity": os.environ["LEVEL"],
+    "body": os.environ["MSG"],
+    "source": "lantern-box-update",
+    "current_ver": os.environ.get("CURRENT_VER", "unknown"),
+    "latest_ver": os.environ.get("LATEST_VER", "unknown"),
+}, ensure_ascii=False))
+'
+  )
+  printf '%s\n' "$json_line" >> "$LOG_FILE"
+}
 
 # Prevent overlapping runs — cron may start a new instance while the
 # previous one is still sleeping or installing.
@@ -131,14 +171,19 @@ sleep $(( $(cksum /etc/machine-id | cut -d' ' -f1) % 600 ))
 arch=$(dpkg --print-architecture)
 current_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
 
-# Fetch latest release tag via the 302 redirect from /releases/latest.
-# This avoids the GitHub API rate limit (60 req/hr unauthenticated) entirely.
-redirect_url=$(curl -fsSI --retry 3 -o /dev/null -w '%{redirect_url}' \
-  https://github.com/getlantern/lantern-box/releases/latest)
-latest_tag="${redirect_url##*/}"
+# Fetch latest release tag by following the /releases/latest redirect and
+# extracting the tag from the final URL. This is more robust than reading
+# %{redirect_url} from a HEAD request, which can fail when curl is behind
+# a transparent proxy or CDN that follows the 302 before curl sees it.
+curl_err=$(mktemp)
+final_url=$(curl -fsSL --retry 3 --max-time 30 -o /dev/null -w '%{url_effective}' \
+  https://github.com/getlantern/lantern-box/releases/latest 2>"$curl_err") || true
+curl_stderr=$(cat "$curl_err" 2>/dev/null)
+rm -f "$curl_err"
+latest_tag="${final_url##*/}"
 
-if [ -z "$latest_tag" ]; then
-  echo "lantern-box-update: failed to fetch latest release tag" >&2
+if [ -z "$latest_tag" ] || [ "$latest_tag" = "latest" ]; then
+  log_json "ERROR" "failed to fetch latest release tag (final_url=${final_url:-empty}, curl_err=${curl_stderr:-none})"
   exit 1
 fi
 
@@ -148,26 +193,52 @@ if [ "$current_ver" = "$latest_ver" ]; then
   exit 0
 fi
 
-echo "lantern-box update available: $current_ver -> $latest_ver"
+log_json "INFO" "update available: ${current_ver} -> ${latest_ver}"
+
 deb_name="lantern-box_${latest_ver}_linux_${arch}.deb"
 deb_url="https://github.com/getlantern/lantern-box/releases/download/${latest_tag}/${deb_name}"
 
-tmpfile=$(mktemp /tmp/lantern-box-update-XXXXXX.deb)
+tmpfile=$(mktemp /tmp/lantern-box-update-XXXXXX.deb) || tmpfile=""
+if [ -z "$tmpfile" ]; then
+  log_json "ERROR" "failed to create temporary file for downloading ${deb_url}"
+  exit 1
+fi
 trap 'rm -f "$tmpfile"' EXIT
 
-curl -fsSL --retry 3 -o "$tmpfile" "${deb_url}"
-dpkg -o DPkg::Lock::Timeout=120 -i "$tmpfile" || { apt-get -o DPkg::Lock::Timeout=120 update -qq && apt-get -o DPkg::Lock::Timeout=120 install -f -y -qq; }
-
-new_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
-if [ "$new_ver" != "$latest_ver" ]; then
-  echo "lantern-box-update: install failed, expected $latest_ver but got $new_ver" >&2
+if ! curl -fsSL --retry 3 --max-time 120 -o "$tmpfile" "${deb_url}"; then
+  log_json "ERROR" "failed to download ${deb_url}"
   exit 1
 fi
 
-echo "lantern-box upgraded: $current_ver -> $new_ver, restarting"
-systemctl restart lantern-box
+if ! dpkg -o DPkg::Lock::Timeout=120 -i "$tmpfile"; then
+  apt-get -o DPkg::Lock::Timeout=120 update -qq && apt-get -o DPkg::Lock::Timeout=120 install -f -y -qq
+fi
+
+new_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
+if [ "$new_ver" != "$latest_ver" ]; then
+  log_json "ERROR" "install failed: expected ${latest_ver} but got ${new_ver}"
+  exit 1
+fi
+
+log_json "INFO" "upgraded ${current_ver} -> ${new_ver}, restarting service"
+if ! systemctl restart lantern-box; then
+  log_json "ERROR" "failed to restart lantern-box service after upgrade to ${new_ver}"
+  exit 1
+fi
 SCRIPT
 chmod 755 /usr/local/bin/lantern-box-update
+
+# Rotate the update log so it doesn't grow unbounded.
+cat > /etc/logrotate.d/lantern-box <<'LOGROTATE'
+/var/log/lantern-box/*.log {
+  daily
+  rotate 7
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+LOGROTATE
 
 cat > /etc/cron.d/lantern-box-update <<'CRON'
 SHELL=/bin/bash
@@ -180,6 +251,18 @@ chmod 644 /etc/cron.d/lantern-box-update
 # Re-enable unattended-upgrades so the final image receives security updates.
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
 systemctl enable unattended-upgrades.service 2>/dev/null || true
+
+echo "==> Installing Tailscale client (for Headscale VPN management)"
+# Add Tailscale apt repo — works on Ubuntu 24.04 (noble)
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | \
+  tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | \
+  tee /etc/apt/sources.list.d/tailscale.list
+apt-get "${APT_OPTS[@]}" update -q
+apt-get "${APT_OPTS[@]}" install -y -q tailscale
+systemctl enable tailscaled
+# Do NOT run 'tailscale up' here — cloud-init provides the auth key at runtime.
+echo "    tailscale installed at $(command -v tailscale)"
 
 echo "==> Verifying installation"
 if ! command -v lantern-box >/dev/null 2>&1; then

@@ -1,0 +1,1 @@
+- Telemetry attributes: follow rules in https://github.com/getlantern/semconv/blob/main/AGENTS.md

@@ -11,7 +11,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	otelsc "go.opentelemetry.io/otel/semconv/v1.37.0"
 
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 )
@@ -69,8 +68,13 @@ func trackIOLoop(ctx context.Context, reportC <-chan report) {
 			return
 		case r := <-reportC:
 			attrs := append(r.attrs.AsSlice(),
-				otelsc.NetworkIODirectionKey.String(string(r.direction)),
+				semconv.NetworkIODirectionKey.String(string(r.direction)),
 			)
+			if r.attrs.client != nil {
+				attrs = append(attrs,
+					semconv.ClientDeviceIDKey.String(r.attrs.client.DeviceID),
+				)
+			}
 			metrics.ProxyIO.Add(context.Background(), int64(r.n), metric.WithAttributes(attrs...))
 		}
 	}
@@ -91,7 +95,7 @@ func emitDeviceConnectedSpan(ctx context.Context) {
 		semconv.ClientDeviceIDKey.String(info.DeviceID),
 		semconv.ClientPlatformKey.String(info.Platform),
 		semconv.ClientIsProKey.Bool(info.IsPro),
-		otelsc.GeoCountryISOCodeKey.String(info.CountryCode),
+		semconv.GeoCountryISOCodeKey.String(info.CountryCode),
 		semconv.ClientVersionKey.String(info.Version),
 	)
 	span.End()
@@ -100,6 +104,9 @@ func emitDeviceConnectedSpan(ctx context.Context) {
 func (t *MetricsTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	emitDeviceConnectedSpan(ctx)
 	attrs := metadataToAttributes(metadata)
+	if info, ok := clientcontext.ClientInfoFromContext(ctx); ok {
+		attrs.client = &info
+	}
 	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return NewConn(conn, attrs, t)
 }
@@ -107,14 +114,15 @@ func (t *MetricsTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 func (t *MetricsTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
 	emitDeviceConnectedSpan(ctx)
 	attrs := metadataToAttributes(metadata)
+	if info, ok := clientcontext.ClientInfoFromContext(ctx); ok {
+		attrs.client = &info
+	}
 	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return NewPacketConn(conn, attrs, t)
 }
 
 func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
-	a := append(attrs.attrs,
-		otelsc.GeoCountryISOCodeKey.String(attrs.country.Load().(string)),
-	)
+	a := attrs.AsSlice()
 	metrics.duration.Record(context.Background(), duration, metric.WithAttributes(a...))
 	metrics.conns.Add(context.Background(), -1, metric.WithAttributes(a...))
 }
@@ -122,18 +130,27 @@ func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
 type attributes struct {
 	attrs   []attribute.KeyValue
 	country atomic.Value // string
+	client  *clientcontext.ClientInfo
 }
 
 func (a *attributes) AsSlice() []attribute.KeyValue {
-	return append(a.attrs,
-		otelsc.GeoCountryISOCodeKey.String(a.country.Load().(string)),
+	s := append(a.attrs,
+		semconv.GeoCountryISOCodeKey.String(a.country.Load().(string)),
 	)
+	if a.client != nil {
+		s = append(s,
+			semconv.ClientPlatformKey.String(a.client.Platform),
+			semconv.ClientIsProKey.Bool(a.client.IsPro),
+			semconv.ClientVersionKey.String(a.client.Version),
+		)
+	}
+	return s
 }
 
 func metadataToAttributes(metadata adapter.InboundContext) *attributes {
 	attrs := &attributes{
 		attrs: []attribute.KeyValue{
-			otelsc.NetworkProtocolNameKey.String(metadata.Protocol),
+			semconv.NetworkProtocolNameKey.String(metadata.Protocol),
 			semconv.ProxyInboundKey.String(metadata.Inbound),
 			semconv.ProxyInboundTypeKey.String(metadata.InboundType),
 			semconv.ProxyOutboundKey.String(metadata.Outbound),

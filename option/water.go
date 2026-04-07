@@ -35,6 +35,8 @@ type WATEROutboundOptions struct {
 	// SkipHandshake is used when the WATER module deals with the handshake
 	// instead of the sing-box WATER transport
 	SkipHandshake bool `json:"skip_handshake,omitempty"`
+	// Optional configuration for supporting UDP over TCP
+	UDPOverTCP *option.UDPOverTCPOptions `json:"udp_over_tcp,omitempty"`
 }
 
 type WATERDownloadOptions struct {
