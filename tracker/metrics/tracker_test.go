@@ -83,6 +83,81 @@ func TestTracker(t *testing.T) {
 	})
 }
 
+func TestTrackerWithClientInfo(t *testing.T) {
+	synctest.Run(func() {
+		reader := metric.NewManualReader()
+		provider := metric.NewMeterProvider(metric.WithReader(reader))
+		sdkotel.SetMeterProvider(provider)
+
+		SetupMetricsManager(geo.NoLookup{})
+
+		info := clientcontext.ClientInfo{
+			DeviceID: "dev-42",
+			Platform: "android",
+			IsPro:    true,
+			Version:  "7.0",
+		}
+		ctx := clientcontext.ContextWithClientInfo(
+			context.Background(), info,
+		)
+		tracker := NewTracker(ctx)
+		defer tracker.Close()
+
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+
+		tracked := tracker.RoutedConnection(
+			ctx, server, adapter.InboundContext{}, nil, nil,
+		)
+
+		// Exchange some bytes so proxy.io fires.
+		go func() {
+			buf := make([]byte, 16)
+			_, _ = tracked.Read(buf)
+		}()
+		_, _ = client.Write([]byte("hello"))
+		synctest.Wait()
+
+		// Close triggers Leave → duration + conns-1.
+		tracked.Close()
+		synctest.Wait()
+
+		var rm metricdata.ResourceMetrics
+		reader.Collect(ctx, &rm)
+
+		// All metrics carry low-cardinality client attrs.
+		for _, name := range []string{
+			"proxy.io",
+			"sing.connections",
+			"sing.connection_duration",
+		} {
+			attrs := extractAttrs(rm, name)
+			assert.Equal(t, "android",
+				attrs["client.platform"],
+				"%s: platform", name)
+			assert.Equal(t, true,
+				attrs["client.is_pro"],
+				"%s: is_pro", name)
+			assert.Equal(t, "7.0",
+				attrs["client.version"],
+				"%s: version", name)
+		}
+
+		// device_id only on proxy.io (high-cardinality).
+		ioAttrs := extractAttrs(rm, "proxy.io")
+		assert.Equal(t, "dev-42", ioAttrs["client.device_id"])
+
+		connAttrs := extractAttrs(rm, "sing.connections")
+		assert.Nil(t, connAttrs["client.device_id"],
+			"sing.connections should not have device_id")
+
+		durAttrs := extractAttrs(rm, "sing.connection_duration")
+		assert.Nil(t, durAttrs["client.device_id"],
+			"sing.connection_duration should not have device_id")
+	})
+}
+
 func TestDeviceConnectedSpan(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(
@@ -159,4 +234,41 @@ func extractCountersByAttribute(rm metricdata.ResourceMetrics, name string) map[
 		}
 	}
 	return result
+}
+
+// extractAttrs collects the attribute key→value pairs from the
+// first data point of the named metric, across all aggregation types.
+func extractAttrs(rm metricdata.ResourceMetrics, name string) map[string]any {
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			var set attribute.Set
+			switch d := m.Data.(type) {
+			case metricdata.Sum[int64]:
+				if len(d.DataPoints) > 0 {
+					set = d.DataPoints[0].Attributes
+				}
+			case metricdata.Histogram[int64]:
+				if len(d.DataPoints) > 0 {
+					set = d.DataPoints[0].Attributes
+				}
+			case metricdata.Histogram[float64]:
+				if len(d.DataPoints) > 0 {
+					set = d.DataPoints[0].Attributes
+				}
+			default:
+				continue
+			}
+			out := make(map[string]any)
+			iter := set.Iter()
+			for iter.Next() {
+				kv := iter.Attribute()
+				out[string(kv.Key)] = kv.Value.AsInterface()
+			}
+			return out
+		}
+	}
+	return nil
 }
