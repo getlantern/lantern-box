@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -124,6 +125,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 }
 
 func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, options option.WATEROutboundOptions, downloadTimeout time.Duration, wasmDir string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic in while loading water config", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+		}
+	}()
 	logger.DebugContext(ctx, "loading WATER configuration in background")
 
 	serverAddr := options.ServerOptions.Build()
