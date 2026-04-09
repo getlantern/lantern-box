@@ -261,8 +261,8 @@ github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb h1:c5YM7b3a4r2J
 github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb/go.mod h1:GkPT5P9JoOTIRXRmFWxYgu1hhXgTFFTNc2hoG7WQc3g=
 github.com/getlantern/sing v0.7.18-lantern h1:QKGgIUA3LwmKYP/7JlQTRkxj9jnP4cX2Q/B+nd8XEjo=
 github.com/getlantern/sing v0.7.18-lantern/go.mod h1:ARkL0gM13/Iv5VCZmci/NuoOlePoIsW0m7BWfln/Hak=
-github.com/getlantern/sing-box-minimal v1.12.20-lantern h1:dWdR/z0A1Ukn+kcOIgH7+aOc9+yh8kvQ3Odw53+uocQ=
-github.com/getlantern/sing-box-minimal v1.12.20-lantern/go.mod h1:LzlFRel9E92gX0HXWCdsxgeg+kuAEPzLR+Znixk9EI4=
+github.com/getlantern/sing-box-minimal v1.12.21-lantern h1:DUlwWDHrU60hd/83mvU/fR9aASiq4KaN5Z1wa8gaRtM=
+github.com/getlantern/sing-box-minimal v1.12.21-lantern/go.mod h1:LzlFRel9E92gX0HXWCdsxgeg+kuAEPzLR+Znixk9EI4=
 github.com/getlantern/water v0.7.1-alpha.0.20260309190745-bd547c14b4aa h1:goZee1cURbWPiqX1xyjfwLB/zByQ50hEwonnnyLmcJQ=
 github.com/getlantern/water v0.7.1-alpha.0.20260309190745-bd547c14b4aa/go.mod h1:Yo6Yk++Q9HRaCT+6/eYk3elNoNtjlJ3V5FufHY6ezto=
 github.com/getlantern/wazero v1.11.0-water.1 h1:mzUlaOoQKMDd16yL3mBIFrzg2nEK+gw7mdQgff1nOPQ=

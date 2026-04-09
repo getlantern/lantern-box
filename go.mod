@@ -4,7 +4,7 @@ go 1.25.0
 
 replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.18-lantern
 
-replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.12.20-lantern
+replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.12.21-lantern
 
 replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4
 
@@ -21,7 +21,7 @@ require (
 	github.com/gobwas/ws v1.4.0
 	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/sing v0.7.18
-	github.com/sagernet/sing-box v1.12.22
+	github.com/sagernet/sing-box v1.12.21-lantern
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.41.0
