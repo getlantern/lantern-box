@@ -252,6 +252,20 @@ chmod 644 /etc/cron.d/lantern-box-update
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
 systemctl enable unattended-upgrades.service 2>/dev/null || true
 
+echo "==> Creating lantern management user (for Tailscale SSH via Headscale ACL)"
+# The Headscale ACL grants group:dev SSH access to tag:external nodes as user "lantern".
+# Tailscale SSH looks up the user locally, so it must exist in /etc/passwd.
+if id -u lantern >/dev/null 2>&1; then
+  echo "    lantern user already exists"
+else
+  useradd --system --create-home --shell /bin/bash --comment "Lantern management" lantern
+fi
+# Grant passwordless sudo so operators can perform admin tasks after SSH.
+echo "lantern ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/lantern
+chmod 440 /etc/sudoers.d/lantern
+visudo -cf /etc/sudoers.d/lantern
+echo "    lantern user present at $(id lantern)"
+
 echo "==> Installing Tailscale client (for Headscale VPN management)"
 # Add Tailscale apt repo — works on Ubuntu 24.04 (noble)
 curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | \
