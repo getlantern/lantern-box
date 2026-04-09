@@ -247,6 +247,8 @@ func (o *Outbound) Close() error {
 }
 
 func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (water.Dialer, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if o.loadErr != nil {
 		return nil, fmt.Errorf("WATER outbound failed to load: %w", o.loadErr)
 	}
@@ -274,16 +276,16 @@ func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (wate
 
 // DialContext dials a connection to the specified network and destination.
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
 
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
+		o.logger.InfoContext(ctx, "outbound connection to ", destination)
 		return o.dialTCPLocked(ctx, destination)
 	case N.NetworkUDP:
+		o.logger.InfoContext(ctx, "outbound UDP packet to ", destination)
 		return o.uotClient.DialContext(ctx, network, destination)
 	}
 	return nil, E.New("unsupported network: ", network)
@@ -311,5 +313,6 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
+	o.logger.InfoContext(ctx, "outbound UDP packet to ", destination)
 	return o.uotClient.ListenPacket(ctx, destination)
 }
