@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -521,9 +522,10 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	}
 	g.logger.Trace("checking outbounds...")
 	defer g.checking.Store(false)
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
+	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](6))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
+	submitTime := time.Now() // track when outbounds were queued for delay reporting
 	for tag, outbound := range g.outbounds.Iter() {
 		// if outbound is an urltest group, start its own url test and skip
 		if testGroup, isURLTestGroup := outbound.(A.URLTestGroup); isURLTestGroup {
@@ -550,6 +552,13 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		}
 		testURL := g.testURLForTag(tag)
 		b.Go(realTag, func() (any, error) {
+			// Compute how long this outbound waited in the worker pool queue.
+			// Append as &cd=<ms> so the server can subtract scheduling overhead
+			// from the callback latency to get true proxy roundtrip time.
+			queueDelay := time.Since(submitTime)
+			if queueDelay > 5*time.Millisecond {
+				testURL = appendClientDelay(testURL, queueDelay)
+			}
 			testCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
 			defer cancel()
 			g.logger.Trace("checking outbound", "tag", realTag)
@@ -726,4 +735,16 @@ func urlTestGET(ctx context.Context, link string, detour N.Dialer) (uint16, erro
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	return uint16(time.Since(start) / time.Millisecond), nil
+}
+
+// appendClientDelay adds a &cd=<ms> query parameter to the given URL.
+func appendClientDelay(rawURL string, delay time.Duration) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	q.Set("cd", strconv.FormatInt(delay.Milliseconds(), 10))
+	u.RawQuery = q.Encode()
+	return u.String()
 }
