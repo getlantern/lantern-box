@@ -282,13 +282,16 @@ echo "==> Installing Lanternet internal CA certificate"
 # The internal ops pipeline (ops.lantr.net) uses a cert signed by the Lanternet
 # private CA. Install the CA cert so OTel collectors and the datacap sidecar
 # can reach internal services via TLS.
-mkdir -p /usr/local/share/ca-certificates/lantern
 curl -fsSL --retry 5 --connect-timeout 10 --max-time 60 \
-  -o /usr/local/share/ca-certificates/lantern/lanternet.crt \
+  -o /etc/ssl/certs/lanternet.crt \
   "https://privateca-content-62724385-0000-2889-acf2-f403043a1bac.storage.googleapis.com/71406e3543f7e5be892e/ca.crt"
-# Verify checksum (cert expires 2032)
-echo "c9d283c11de3b7d38f1eb38fabcfbcff9b77f302d3eaf506ae691bb14cca792d  /usr/local/share/ca-certificates/lantern/lanternet.crt" \
+# Verify checksum (cert expires 2032; URL/checksum from lantern-cloud ans/tasks/install-lanternet-ca.yaml)
+echo "c9d283c11de3b7d38f1eb38fabcfbcff9b77f302d3eaf506ae691bb14cca792d  /etc/ssl/certs/lanternet.crt" \
   | sha256sum -c -
+# Also add to the system CA store so Go's crypto/tls (used by otelcol-contrib
+# and lantern-box) trusts it for outgoing HTTPS connections.
+mkdir -p /usr/local/share/ca-certificates/lantern
+ln -sf /etc/ssl/certs/lanternet.crt /usr/local/share/ca-certificates/lantern/lanternet.crt
 update-ca-certificates
 echo "    lanternet CA installed"
 
