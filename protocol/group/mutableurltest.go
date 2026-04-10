@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -521,9 +523,10 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	}
 	g.logger.Trace("checking outbounds...")
 	defer g.checking.Store(false)
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
+	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](6))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
+	submitTime := time.Now() // track when outbounds were queued for delay reporting
 	for tag, outbound := range g.outbounds.Iter() {
 		// if outbound is an urltest group, start its own url test and skip
 		if testGroup, isURLTestGroup := outbound.(A.URLTestGroup); isURLTestGroup {
@@ -550,6 +553,13 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		}
 		testURL := g.testURLForTag(tag)
 		b.Go(realTag, func() (any, error) {
+			// Compute how long this outbound waited in the worker pool queue.
+			// Append as &cd=<ms> so the server can subtract scheduling overhead
+			// from the callback latency to get true proxy roundtrip time.
+			queueDelay := time.Since(submitTime)
+			if queueDelay > 5*time.Millisecond && strings.Contains(testURL, "?") {
+				testURL += "&cd=" + strconv.FormatInt(queueDelay.Milliseconds(), 10)
+			}
 			testCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
 			defer cancel()
 			g.logger.Trace("checking outbound", "tag", realTag)
