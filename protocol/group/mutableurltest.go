@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -557,8 +556,8 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			// Append as &cd=<ms> so the server can subtract scheduling overhead
 			// from the callback latency to get true proxy roundtrip time.
 			queueDelay := time.Since(submitTime)
-			if queueDelay > 5*time.Millisecond && strings.Contains(testURL, "?") {
-				testURL += "&cd=" + strconv.FormatInt(queueDelay.Milliseconds(), 10)
+			if queueDelay > 5*time.Millisecond {
+				testURL = appendClientDelay(testURL, queueDelay)
 			}
 			testCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
 			defer cancel()
@@ -736,4 +735,16 @@ func urlTestGET(ctx context.Context, link string, detour N.Dialer) (uint16, erro
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	return uint16(time.Since(start) / time.Millisecond), nil
+}
+
+// appendClientDelay adds a &cd=<ms> query parameter to the given URL.
+func appendClientDelay(rawURL string, delay time.Duration) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	q.Set("cd", strconv.FormatInt(delay.Milliseconds(), 10))
+	u.RawQuery = q.Encode()
+	return u.String()
 }
