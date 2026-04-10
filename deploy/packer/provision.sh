@@ -278,6 +278,20 @@ systemctl enable tailscaled
 # Do NOT run 'tailscale up' here — cloud-init provides the auth key at runtime.
 echo "    tailscale installed at $(command -v tailscale)"
 
+echo "==> Installing Lanternet internal CA certificate"
+# The internal ops pipeline (ops.lantr.net) uses a cert signed by the Lanternet
+# private CA. Install the CA cert so OTel collectors and the datacap sidecar
+# can reach internal services via TLS.
+mkdir -p /usr/local/share/ca-certificates/lantern
+curl -fsSL --retry 5 --connect-timeout 10 --max-time 60 \
+  -o /usr/local/share/ca-certificates/lantern/lanternet.crt \
+  "https://privateca-content-62724385-0000-2889-acf2-f403043a1bac.storage.googleapis.com/71406e3543f7e5be892e/ca.crt"
+# Verify checksum (cert expires 2032)
+echo "c9d283c11de3b7d38f1eb38fabcfbcff9b77f302d3eaf506ae691bb14cca792d  /usr/local/share/ca-certificates/lantern/lanternet.crt" \
+  | sha256sum -c -
+update-ca-certificates
+echo "    lanternet CA installed"
+
 echo "==> Verifying installation"
 if ! command -v lantern-box >/dev/null 2>&1; then
   echo "lantern-box not found on PATH" >&2
