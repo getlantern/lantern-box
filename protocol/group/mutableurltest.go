@@ -390,7 +390,7 @@ func (g *urlTestGroup) SetURLOverrides(overrides map[string]string) {
 	g.urlOverrides = maps.Clone(overrides)
 	// Clear URL test history for overridden tags so the next test cycle
 	// re-tests them with the new callback URLs. Without this, outbounds
-	// tested recently (within the 3-min interval) with OLD URLs would be
+	// tested recently (within the configured interval) with OLD URLs would be
 	// skipped, and the new bandit probe callbacks would never fire.
 	for tag := range overrides {
 		g.history.DeleteURLTestHistory(tag)
