@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"net/url"
 	"testing"
 	"time"
 
@@ -21,7 +22,7 @@ func TestURLTestGroup_CloseStopsCheckLoop(t *testing.T) {
 		sboxLog.NewNOPFactory().Logger(),
 		[]string{"test"},
 		"https://example.com",
-		nil, // no URL overrides
+		nil,                 // no URL overrides
 		10*time.Millisecond, // fast interval
 		time.Minute,
 		50,
@@ -331,4 +332,58 @@ func (m *mockPauseManager) RegisterCallback(callback pause.Callback) *list.Eleme
 }
 
 func (m *mockPauseManager) UnregisterCallback(element *list.Element[pause.Callback]) {
+}
+
+func TestAppendClientDelay(t *testing.T) {
+	tests := []struct {
+		name     string
+		rawURL   string
+		delay    time.Duration
+		wantCD   string
+		wantPath string
+	}{
+		{
+			name:   "URL with existing query params",
+			rawURL: "https://example.com/callback?token=abc",
+			delay:  150 * time.Millisecond,
+			wantCD: "150",
+		},
+		{
+			name:   "URL without query params",
+			rawURL: "https://example.com/callback",
+			delay:  42 * time.Millisecond,
+			wantCD: "42",
+		},
+		{
+			name:   "URL with multiple params",
+			rawURL: "https://example.com/cb?a=1&b=2",
+			delay:  300 * time.Millisecond,
+			wantCD: "300",
+		},
+		{
+			name:   "sub-millisecond delay rounds to zero",
+			rawURL: "https://example.com/cb?x=1",
+			delay:  500 * time.Microsecond,
+			wantCD: "0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := appendClientDelay(tt.rawURL, tt.delay)
+			u, err := url.Parse(result)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantCD, u.Query().Get("cd"))
+			// Original path preserved
+			orig, _ := url.Parse(tt.rawURL)
+			assert.Equal(t, orig.Path, u.Path)
+			assert.Equal(t, orig.Host, u.Host)
+		})
+	}
+}
+
+func TestAppendClientDelay_InvalidURL(t *testing.T) {
+	// Invalid URLs are returned unchanged
+	bad := "://not-a-url"
+	assert.Equal(t, bad, appendClientDelay(bad, 100*time.Millisecond))
 }

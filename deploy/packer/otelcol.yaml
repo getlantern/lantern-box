@@ -1,7 +1,7 @@
 # OTel Collector config for VPS proxy instances.
 # Collects host metrics (CPU, memory, disk, network) and structured logs
 # (auto-update script, etc.) and ships to the internal ops pipeline
-# (ops.lantr.net, reachable via Headscale VPN).
+# (ops.lantr.net, reachable via Headscale VPN relay with --accept-routes).
 # The OTEL_RESOURCE_ATTRIBUTES env var is set by cloud-init.
 
 receivers:
