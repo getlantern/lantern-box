@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	waterDownloader "github.com/getlantern/lantern-water/downloader"
@@ -50,9 +51,8 @@ type Outbound struct {
 	outbound.Adapter
 	logger                logger.ContextLogger
 	skipHandshake         bool
-	dialerConfig          *water.Config
-	loadErr               error
-	transportModuleConfig map[string]any
+	dialerConfig          atomic.Pointer[water.Config]
+	transportModuleConfig atomic.Pointer[map[string]any]
 	mu                    sync.Mutex
 	seeder                *seed.Seeder
 	cancelLoad            context.CancelFunc
@@ -103,12 +103,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	loadCtx, cancelLoad := context.WithCancel(ctx)
 
 	o := &Outbound{
-		Adapter:               outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
-		logger:                logger,
-		transportModuleConfig: options.Config,
-		mu:                    sync.Mutex{},
-		skipHandshake:         options.SkipHandshake,
-		cancelLoad:            cancelLoad,
+		Adapter:       outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+		logger:        logger,
+		mu:            sync.Mutex{},
+		skipHandshake: options.SkipHandshake,
+		cancelLoad:    cancelLoad,
+	}
+	if options.Config != nil {
+		o.transportModuleConfig.Store(&options.Config)
 	}
 
 	uotOptions := common.PtrValueOrDefault(options.UDPOverTCP)
@@ -153,18 +155,12 @@ func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, opt
 	d, err := waterDownloader.NewWASMDownloader(options.Hashsum, options.WASMAvailableAt, httpClient)
 	if err != nil {
 		logger.ErrorContext(ctx, "failed to create WASM downloader", slog.Any("error", err))
-		o.mu.Lock()
-		o.loadErr = err
-		o.mu.Unlock()
 		return
 	}
 
 	rc, err := vc.GetWASM(ctx, options.Transport, d)
 	if err != nil {
 		logger.ErrorContext(ctx, "failed to load WASM file", slog.Any("error", err))
-		o.mu.Lock()
-		o.loadErr = err
-		o.mu.Unlock()
 		return
 	}
 	defer rc.Close()
@@ -172,9 +168,6 @@ func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, opt
 	b, err := io.ReadAll(rc)
 	if err != nil {
 		logger.ErrorContext(ctx, "failed to read WASM file", slog.Any("error", err))
-		o.mu.Lock()
-		o.loadErr = err
-		o.mu.Unlock()
 		return
 	}
 
@@ -183,14 +176,10 @@ func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, opt
 	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
 		logger.ErrorContext(ctx, "failed to create outbound dialer", slog.Any("error", err))
-		o.mu.Lock()
-		o.loadErr = err
-		o.mu.Unlock()
 		return
 	}
 
-	o.mu.Lock()
-	o.dialerConfig = &water.Config{
+	o.dialerConfig.Store(&water.Config{
 		TransportModuleBin: b,
 		OverrideLogger:     slogLogger,
 		NetworkDialerFunc: func(network, address string) (net.Conn, error) {
@@ -205,8 +194,7 @@ func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, opt
 				return conn, nil
 			}
 		},
-	}
-	o.mu.Unlock()
+	})
 
 	if options.SeedEnabled {
 		transportFilepath := filepath.Join(wasmDir, fmt.Sprintf("%s.%s", options.Transport, "wasm"))
@@ -247,22 +235,24 @@ func (o *Outbound) Close() error {
 }
 
 func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (water.Dialer, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.loadErr != nil {
-		return nil, fmt.Errorf("WATER outbound failed to load: %w", o.loadErr)
+	dialerConfig := o.dialerConfig.Load()
+	if dialerConfig == nil {
+		o.logger.WarnContext(ctx, "dialer config not available")
+		return nil, fmt.Errorf("dialer config not available, config is loading or there was an error while loading")
 	}
-	if o.dialerConfig == nil {
-		return nil, fmt.Errorf("WATER outbound is still loading, not ready to dial")
-	}
-	cfg := o.dialerConfig.Clone()
+	cfg := dialerConfig.Clone()
 
 	o.logger.DebugContext(ctx, "building new dialer", slog.String("destination", destination.String()))
-	if o.transportModuleConfig != nil {
-		// currently this is the only way to share the destination with the WATER module.
-		o.transportModuleConfig["remote_addr"] = destination.AddrString()
-		o.transportModuleConfig["remote_port"] = strconv.FormatUint(uint64(destination.Port), 10)
-		transportModuleConfig, err := json.MarshalContext(ctx, o.transportModuleConfig)
+	if baseConfig := o.transportModuleConfig.Load(); baseConfig != nil {
+		// Clone the base config locally so concurrent dials never race on the shared map.
+		// This is currently the only way to share the destination with the WATER module.
+		transportModuleCfg := make(map[string]any)
+		for k, v := range *baseConfig {
+			transportModuleCfg[k] = v
+		}
+		transportModuleCfg["remote_addr"] = destination.AddrString()
+		transportModuleCfg["remote_port"] = strconv.FormatUint(uint64(destination.Port), 10)
+		transportModuleConfig, err := json.MarshalContext(ctx, transportModuleCfg)
 		if err != nil {
 			return nil, err
 		}
