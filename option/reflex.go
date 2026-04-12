@@ -1,0 +1,45 @@
+package option
+
+import "github.com/sagernet/sing-box/option"
+
+// ReflexOutboundOptions configures a Reflex outbound proxy.
+// In Reflex, the TCP client acts as the TLS server — the proxy server
+// initiates the TLS handshake (sends ClientHello). This defeats SNI
+// extraction and JA3/JA4 fingerprinting by the censor, since no
+// ClientHello ever appears in the client→server direction.
+//
+// Authentication: the server validates the client's TLS certificate
+// fingerprint (SHA-256 of the DER-encoded certificate). No pre-handshake
+// bytes are exchanged — the entire auth is within standard TLS.
+type ReflexOutboundOptions struct {
+	option.DialerOptions
+	option.ServerOptions
+
+	// TLS certificate for the client's TLS server role.
+	// The SHA-256 fingerprint of this cert serves as authentication —
+	// the server validates it during the TLS handshake.
+	CertPEM  string `json:"cert_pem,omitempty"`
+	KeyPEM   string `json:"key_pem,omitempty"`
+	CertPath string `json:"cert_path,omitempty"`
+	KeyPath  string `json:"key_path,omitempty"`
+
+	// ConnectTimeout for the TCP + reversed TLS handshake (default: "15s").
+	ConnectTimeout string `json:"connect_timeout,omitempty"`
+}
+
+// ReflexInboundOptions configures a Reflex inbound proxy.
+// The TCP server acts as the TLS client — it sends ClientHello immediately
+// upon accepting a connection, then validates the peer's certificate.
+type ReflexInboundOptions struct {
+	option.ListenOptions
+
+	// AuthTokens contains the SHA-256 fingerprints (lowercase hex-encoded) of
+	// allowed peer certificates. In Reflex, the TCP client acts as TLS server
+	// and presents a certificate; the TCP server validates its fingerprint.
+	// Only connections with a matching fingerprint are accepted.
+	AuthTokens []string `json:"auth_tokens"`
+
+	// ServerName is the SNI sent in the TLS ClientHello.
+	// Since the server sends the ClientHello, this is invisible to the censor.
+	ServerName string `json:"server_name,omitempty"`
+}
