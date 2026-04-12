@@ -3,12 +3,16 @@
 // server (proxy) acts as the TLS client. This defeats SNI-based censorship and
 // JA3/JA4 fingerprinting because no ClientHello appears in the client→server
 // direction.
+//
+// Authentication is embedded in the TLS handshake itself: the client presents
+// a certificate whose SHA-256 fingerprint the server validates against a
+// pre-shared expected value. No pre-handshake auth bytes are sent.
 package reflex
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"fmt"
 	"net"
 	"time"
@@ -30,29 +34,27 @@ func RegisterOutbound(registry *outbound.Registry) {
 }
 
 // Outbound implements the client side of Reflex. It dials a TCP connection,
-// sends an auth token, then acts as a TLS server (waits for ClientHello from
-// the proxy). After the reversed TLS handshake, it proxies traffic through
-// the encrypted channel.
+// then acts as a TLS server (waits for ClientHello from the proxy). The server
+// validates the client's TLS certificate fingerprint as authentication.
+// No pre-handshake bytes are sent — the entire auth is within the TLS handshake.
 type Outbound struct {
 	outbound.Adapter
 	logger  logger.ContextLogger
 	dialer  N.Dialer
 	server  string
 	port    uint16
-	token   []byte
 	tlsCert tls.Certificate
 	timeout time.Duration
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogger, tag string, options option.ReflexOutboundOptions) (adapter.Outbound, error) {
-	// Parse auth token
-	token, err := hex.DecodeString(options.AuthToken)
-	if err != nil || len(token) != 8 {
-		return nil, fmt.Errorf("reflex: auth_token must be 16 hex chars (8 bytes): %w", err)
-	}
-
-	// Load TLS certificate (client acts as TLS server, so needs a cert)
-	var tlsCert tls.Certificate
+	// Load TLS certificate (client acts as TLS server, so needs a cert).
+	// The SHA-256 fingerprint of this cert is the auth token — the server
+	// validates it during the handshake.
+	var (
+		tlsCert tls.Certificate
+		err     error
+	)
 	if options.CertPEM != "" && options.KeyPEM != "" {
 		tlsCert, err = tls.X509KeyPair([]byte(options.CertPEM), []byte(options.KeyPEM))
 		if err != nil {
@@ -86,7 +88,6 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		dialer:  outboundDialer,
 		server:  options.Server,
 		port:    options.ServerPort,
-		token:   token,
 		tlsCert: tlsCert,
 		timeout: timeout,
 	}, nil
@@ -106,29 +107,23 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, fmt.Errorf("reflex: TCP dial failed: %w", err)
 	}
 
-	// Set deadline for the auth + handshake phase
 	tcpConn.SetDeadline(time.Now().Add(o.timeout))
-	defer tcpConn.SetDeadline(time.Time{}) // clear after handshake
+	defer tcpConn.SetDeadline(time.Time{})
 
-	// 2. Send auth token (client speaks first with short ID)
-	if _, err := tcpConn.Write(o.token); err != nil {
-		tcpConn.Close()
-		return nil, fmt.Errorf("reflex: failed to send auth token: %w", err)
-	}
-
-	// 3. Act as TLS server — wait for ClientHello from the proxy
+	// 2. Act as TLS server — wait for ClientHello from the proxy.
+	// No pre-handshake bytes sent. Auth is the certificate fingerprint.
 	tlsConn := tls.Server(tcpConn, &tls.Config{
 		Certificates: []tls.Certificate{o.tlsCert},
 	})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		tcpConn.Close()
-		return nil, fmt.Errorf("reflex: reversed TLS handshake failed: %w", err)
+		return nil, fmt.Errorf("reflex: TLS handshake failed: %w", err)
 	}
 
 	o.logger.TraceContext(ctx, "reflex connection established")
 
-	// 4. Send the actual destination as the first message over the encrypted channel
-	destStr := destination.String() // host:port format
+	// 3. Send destination over the encrypted channel
+	destStr := destination.String()
 	destLen := byte(len(destStr))
 	if _, err := tlsConn.Write(append([]byte{destLen}, []byte(destStr)...)); err != nil {
 		tlsConn.Close()
@@ -148,4 +143,14 @@ func (o *Outbound) Network() []string {
 
 func (o *Outbound) Close() error {
 	return nil
+}
+
+// CertFingerprint returns the SHA-256 fingerprint of the outbound's TLS
+// certificate. This is what the server uses to authenticate the client.
+func CertFingerprint(cert tls.Certificate) string {
+	if len(cert.Certificate) == 0 {
+		return ""
+	}
+	hash := sha256.Sum256(cert.Certificate[0])
+	return fmt.Sprintf("%x", hash)
 }

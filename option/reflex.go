@@ -7,18 +7,19 @@ import "github.com/sagernet/sing-box/option"
 // initiates the TLS handshake (sends ClientHello). This defeats SNI
 // extraction and JA3/JA4 fingerprinting by the censor, since no
 // ClientHello ever appears in the client→server direction.
+//
+// Authentication: the server validates the client's TLS certificate
+// fingerprint (SHA-256 of the DER-encoded certificate). No pre-handshake
+// bytes are exchanged — the entire auth is within standard TLS.
 type ReflexOutboundOptions struct {
 	option.DialerOptions
 	option.ServerOptions
 
-	// AuthToken is a pre-shared 8-byte token (hex-encoded, 16 chars) sent
-	// before the TLS handshake to identify this as a Reflex client.
-	AuthToken string `json:"auth_token"`
-
 	// TLS certificate for the client's TLS server role.
-	// Can be provided inline or as file paths.
-	CertPEM string `json:"cert_pem,omitempty"`
-	KeyPEM  string `json:"key_pem,omitempty"`
+	// The SHA-256 fingerprint of this cert serves as authentication —
+	// the server validates it during the TLS handshake.
+	CertPEM  string `json:"cert_pem,omitempty"`
+	KeyPEM   string `json:"key_pem,omitempty"`
 	CertPath string `json:"cert_path,omitempty"`
 	KeyPath  string `json:"key_path,omitempty"`
 
@@ -27,13 +28,14 @@ type ReflexOutboundOptions struct {
 }
 
 // ReflexInboundOptions configures a Reflex inbound proxy.
-// The TCP server acts as the TLS client — it sends ClientHello after
-// receiving the auth token from the TCP client.
+// The TCP server acts as the TLS client — it sends ClientHello immediately
+// upon accepting a connection, then validates the peer's certificate.
 type ReflexInboundOptions struct {
 	option.ListenOptions
 
-	// AuthTokens is the set of valid pre-shared tokens (hex-encoded).
-	// Connections with invalid tokens are closed.
+	// AuthTokens contains the SHA-256 fingerprints (hex-encoded) of allowed
+	// client certificates. Only connections presenting a certificate with a
+	// matching fingerprint are accepted.
 	AuthTokens []string `json:"auth_tokens"`
 
 	// ServerName is the SNI sent in the TLS ClientHello.

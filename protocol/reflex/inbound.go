@@ -2,11 +2,10 @@ package reflex
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -25,30 +24,28 @@ func RegisterInbound(registry *inbound.Registry) {
 }
 
 // Inbound implements the server side of Reflex. It accepts TCP connections,
-// reads an auth token, then acts as a TLS client (sends ClientHello to the
-// TCP client). After the reversed TLS handshake, it reads the destination
-// and routes traffic through the sing-box router.
+// immediately sends a TLS ClientHello (reversed role), then validates the
+// client's TLS certificate fingerprint as authentication. No pre-handshake
+// bytes are exchanged — the entire flow looks like a TLS connection where
+// the server speaks first.
 type Inbound struct {
 	inbound.Adapter
-	ctx        context.Context
-	logger     log.ContextLogger
-	router     adapter.Router
-	listener   *listener.Listener
-	authTokens map[string]bool
-	serverName string
+	ctx            context.Context
+	logger         log.ContextLogger
+	router         adapter.Router
+	listener       *listener.Listener
+	certFPs        map[string]bool // allowed SHA-256 cert fingerprints (hex)
+	serverName     string
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger, tag string, options option.ReflexInboundOptions) (adapter.Inbound, error) {
-	tokens := make(map[string]bool, len(options.AuthTokens))
-	for _, t := range options.AuthTokens {
-		b, err := hex.DecodeString(t)
-		if err != nil || len(b) != 8 {
-			return nil, fmt.Errorf("reflex: invalid auth_token %q (must be 16 hex chars)", t)
-		}
-		tokens[string(b)] = true
+	// Parse allowed certificate fingerprints
+	fps := make(map[string]bool, len(options.AuthTokens))
+	for _, fp := range options.AuthTokens {
+		fps[fp] = true
 	}
-	if len(tokens) == 0 {
-		return nil, fmt.Errorf("reflex: at least one auth_token is required")
+	if len(fps) == 0 {
+		return nil, fmt.Errorf("reflex: at least one auth_token (cert fingerprint) is required")
 	}
 
 	serverName := options.ServerName
@@ -61,7 +58,7 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 		ctx:        ctx,
 		logger:     lg,
 		router:     router,
-		authTokens: tokens,
+		certFPs:    fps,
 		serverName: serverName,
 	}
 
@@ -77,22 +74,10 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 }
 
 // NewConnectionEx handles a new TCP connection with the reversed TLS handshake.
+// The server immediately acts as TLS client — no pre-handshake bytes needed.
 func (i *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	// 1. Read 8-byte auth token
-	token := make([]byte, 8)
-	if _, err := io.ReadFull(conn, token); err != nil {
-		N.CloseOnHandshakeFailure(conn, onClose, fmt.Errorf("reflex: read auth token: %w", err))
-		return
-	}
-
-	// 2. Validate token
-	if !i.authTokens[string(token)] {
-		slog.Debug("reflex: invalid auth token, closing connection")
-		N.CloseOnHandshakeFailure(conn, onClose, fmt.Errorf("reflex: invalid auth token"))
-		return
-	}
-
-	// 3. Act as TLS client — send ClientHello to the TCP client
+	// 1. Act as TLS client — send ClientHello immediately.
+	// Request the peer's certificate for authentication.
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName:         i.serverName,
 		InsecureSkipVerify: true,
@@ -102,7 +87,21 @@ func (i *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		return
 	}
 
-	// 4. Read destination: 1 byte length + host:port string
+	// 2. Validate the peer's certificate fingerprint
+	state := tlsConn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		N.CloseOnHandshakeFailure(tlsConn, onClose, fmt.Errorf("reflex: no peer certificate"))
+		return
+	}
+	hash := sha256.Sum256(state.PeerCertificates[0].Raw)
+	fp := fmt.Sprintf("%x", hash)
+	if !i.certFPs[fp] {
+		i.logger.DebugContext(ctx, "reflex: unknown cert fingerprint: ", fp)
+		N.CloseOnHandshakeFailure(tlsConn, onClose, fmt.Errorf("reflex: unauthorized"))
+		return
+	}
+
+	// 3. Read destination: 1 byte length + host:port string
 	lenBuf := make([]byte, 1)
 	if _, err := io.ReadFull(tlsConn, lenBuf); err != nil {
 		N.CloseOnHandshakeFailure(tlsConn, onClose, fmt.Errorf("reflex: read destination length: %w", err))
@@ -117,7 +116,7 @@ func (i *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 
 	i.logger.TraceContext(ctx, "reflex connection from ", metadata.Source, " to ", destination)
 
-	// 5. Route through sing-box
+	// 4. Route through sing-box
 	metadata.Inbound = i.Tag()
 	metadata.InboundType = constant.TypeReflex
 	metadata.Destination = destination
