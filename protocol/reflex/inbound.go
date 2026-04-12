@@ -84,6 +84,7 @@ func (i *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName:         i.serverName,
 		InsecureSkipVerify: true, //nolint:gosec // auth via cert fingerprint, not CA chain
+		MinVersion:         tls.VersionTLS13,
 	})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, fmt.Errorf("reflex: TLS handshake: %w", err))
