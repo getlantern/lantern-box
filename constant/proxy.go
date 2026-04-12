@@ -4,6 +4,7 @@ const (
 	TypeAmnezia  = "amnezia"
 	TypeALGeneva = "algeneva"
 	TypeOutline  = "outline"
+	TypeReflex   = "reflex"
 	TypeSamizdat = "samizdat"
 	TypeWATER    = "water"
 )
