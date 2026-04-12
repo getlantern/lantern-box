@@ -5,14 +5,16 @@
 // direction.
 //
 // Authentication is embedded in the TLS handshake itself: the client presents
-// a certificate whose SHA-256 fingerprint the server validates against a
-// pre-shared expected value. No pre-handshake auth bytes are sent.
+// a TLS certificate whose SHA-256 fingerprint the server validates against a
+// pre-shared expected value. No pre-handshake bytes are exchanged.
 package reflex
 
 import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"time"
@@ -36,7 +38,6 @@ func RegisterOutbound(registry *outbound.Registry) {
 // Outbound implements the client side of Reflex. It dials a TCP connection,
 // then acts as a TLS server (waits for ClientHello from the proxy). The server
 // validates the client's TLS certificate fingerprint as authentication.
-// No pre-handshake bytes are sent — the entire auth is within the TLS handshake.
 type Outbound struct {
 	outbound.Adapter
 	logger  logger.ContextLogger
@@ -48,25 +49,32 @@ type Outbound struct {
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogger, tag string, options option.ReflexOutboundOptions) (adapter.Outbound, error) {
-	// Load TLS certificate (client acts as TLS server, so needs a cert).
-	// The SHA-256 fingerprint of this cert is the auth token — the server
-	// validates it during the handshake.
 	var (
 		tlsCert tls.Certificate
 		err     error
 	)
-	if options.CertPEM != "" && options.KeyPEM != "" {
+
+	hasPEM := options.CertPEM != "" || options.KeyPEM != ""
+	hasFile := options.CertPath != "" || options.KeyPath != ""
+
+	if hasPEM && hasFile {
+		return nil, fmt.Errorf("reflex: specify either inline PEM (cert_pem+key_pem) or file paths (cert_path+key_path), not both")
+	}
+	if hasPEM {
+		if options.CertPEM == "" || options.KeyPEM == "" {
+			return nil, fmt.Errorf("reflex: both cert_pem and key_pem must be provided together")
+		}
 		tlsCert, err = tls.X509KeyPair([]byte(options.CertPEM), []byte(options.KeyPEM))
-		if err != nil {
-			return nil, fmt.Errorf("reflex: invalid inline cert/key: %w", err)
+	} else if hasFile {
+		if options.CertPath == "" || options.KeyPath == "" {
+			return nil, fmt.Errorf("reflex: both cert_path and key_path must be provided together")
 		}
-	} else if options.CertPath != "" && options.KeyPath != "" {
 		tlsCert, err = tls.LoadX509KeyPair(options.CertPath, options.KeyPath)
-		if err != nil {
-			return nil, fmt.Errorf("reflex: failed to load cert/key files: %w", err)
-		}
 	} else {
 		return nil, fmt.Errorf("reflex: outbound requires TLS certificate (cert_pem+key_pem or cert_path+key_path)")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reflex: loading TLS certificate: %w", err)
 	}
 
 	timeout := 15 * time.Second
@@ -100,7 +108,6 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 
 	o.logger.TraceContext(ctx, "dialing reflex connection to ", o.server, ":", o.port)
 
-	// 1. Establish TCP connection to proxy server
 	serverAddr := M.ParseSocksaddrHostPort(o.server, o.port)
 	tcpConn, err := o.dialer.DialContext(ctx, N.NetworkTCP, serverAddr)
 	if err != nil {
@@ -110,8 +117,8 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	tcpConn.SetDeadline(time.Now().Add(o.timeout))
 	defer tcpConn.SetDeadline(time.Time{})
 
-	// 2. Act as TLS server — wait for ClientHello from the proxy.
-	// No pre-handshake bytes sent. Auth is the certificate fingerprint.
+	// Act as TLS server — wait for ClientHello from the proxy.
+	// No pre-handshake bytes. Auth is the certificate fingerprint.
 	tlsConn := tls.Server(tcpConn, &tls.Config{
 		Certificates: []tls.Certificate{o.tlsCert},
 	})
@@ -122,10 +129,15 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 
 	o.logger.TraceContext(ctx, "reflex connection established")
 
-	// 3. Send destination over the encrypted channel
+	// Send destination over encrypted channel: 2-byte big-endian length + host:port
 	destStr := destination.String()
-	destLen := byte(len(destStr))
-	if _, err := tlsConn.Write(append([]byte{destLen}, []byte(destStr)...)); err != nil {
+	if len(destStr) == 0 || len(destStr) > 65535 {
+		tlsConn.Close()
+		return nil, fmt.Errorf("reflex: destination too long (%d bytes)", len(destStr))
+	}
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(destStr)))
+	if _, err := tlsConn.Write(append(lenBuf[:], []byte(destStr)...)); err != nil {
 		tlsConn.Close()
 		return nil, fmt.Errorf("reflex: failed to send destination: %w", err)
 	}
@@ -145,12 +157,8 @@ func (o *Outbound) Close() error {
 	return nil
 }
 
-// CertFingerprint returns the SHA-256 fingerprint of the outbound's TLS
-// certificate. This is what the server uses to authenticate the client.
-func CertFingerprint(cert tls.Certificate) string {
-	if len(cert.Certificate) == 0 {
-		return ""
-	}
-	hash := sha256.Sum256(cert.Certificate[0])
-	return fmt.Sprintf("%x", hash)
+// DERFingerprint returns the hex-encoded SHA-256 of DER-encoded certificate bytes.
+func DERFingerprint(der []byte) string {
+	hash := sha256.Sum256(der)
+	return hex.EncodeToString(hash[:])
 }

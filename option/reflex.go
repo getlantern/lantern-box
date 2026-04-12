@@ -33,9 +33,10 @@ type ReflexOutboundOptions struct {
 type ReflexInboundOptions struct {
 	option.ListenOptions
 
-	// AuthTokens contains the SHA-256 fingerprints (hex-encoded) of allowed
-	// client certificates. Only connections presenting a certificate with a
-	// matching fingerprint are accepted.
+	// AuthTokens contains the SHA-256 fingerprints (lowercase hex-encoded) of
+	// allowed peer certificates. In Reflex, the TCP client acts as TLS server
+	// and presents a certificate; the TCP server validates its fingerprint.
+	// Only connections with a matching fingerprint are accepted.
 	AuthTokens []string `json:"auth_tokens"`
 
 	// ServerName is the SNI sent in the TLS ClientHello.
