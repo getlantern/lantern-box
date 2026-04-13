@@ -121,6 +121,7 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	// No pre-handshake bytes. Auth is the certificate fingerprint.
 	tlsConn := tls.Server(tcpConn, &tls.Config{
 		Certificates: []tls.Certificate{o.tlsCert},
+		MinVersion:   tls.VersionTLS13,
 	})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		tcpConn.Close()
