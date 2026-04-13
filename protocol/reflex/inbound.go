@@ -69,6 +69,9 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 		if err != nil {
 			return nil, fmt.Errorf("reflex: invalid silence_timeout: %w", err)
 		}
+		if d < 0 {
+			return nil, fmt.Errorf("reflex: silence_timeout must be non-negative, got %s", d)
+		}
 		silenceTimeout = d
 	}
 	if silenceTimeout > 0 {
@@ -79,6 +82,9 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 			d, err := time.ParseDuration(options.SilenceJitter)
 			if err != nil {
 				return nil, fmt.Errorf("reflex: invalid silence_jitter: %w", err)
+			}
+			if d < 0 {
+				return nil, fmt.Errorf("reflex: silence_jitter must be non-negative, got %s", d)
 			}
 			silenceJitter = d
 		} else {
@@ -126,12 +132,13 @@ func (i *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		}
 		if len(prefix) > 0 {
 			i.logger.DebugContext(ctx, "reflex: client spoke during silence window from ", metadata.Source, "; masquerading to ", i.masqueradeUpstream)
-			if ferr := forwardToMasquerade(ctx, conn, i.masqueradeUpstream, prefix); ferr != nil {
+			ferr := forwardToMasquerade(ctx, conn, i.masqueradeUpstream, prefix)
+			if ferr != nil {
 				i.logger.DebugContext(ctx, "reflex: masquerade forward error: ", ferr)
 			}
 			conn.Close()
 			if onClose != nil {
-				onClose(nil)
+				onClose(ferr)
 			}
 			return
 		}

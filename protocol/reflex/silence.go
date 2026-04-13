@@ -2,6 +2,7 @@ package reflex
 
 import (
 	"errors"
+	"math"
 	"math/rand/v2"
 	"net"
 	"os"
@@ -55,12 +56,21 @@ func isTimeout(err error) bool {
 }
 
 // jitteredTimeout returns base ± a uniform random amount up to jitter.
-// If jitter is zero or base is zero, base is returned unchanged.
+// If jitter is zero or base is zero, base is returned unchanged. Large
+// jitter values are clamped to half the int64 range to avoid overflow in
+// 2*jitter and base+offset.
 func jitteredTimeout(base, jitter time.Duration) time.Duration {
 	if base <= 0 || jitter <= 0 {
 		return base
 	}
-	// Uniform in [-jitter, +jitter].
+	// Clamp jitter so 2*jitter cannot overflow int64 and base+offset stays
+	// representable. math.MaxInt64/4 leaves headroom for the addition below.
+	const maxJitter = time.Duration(math.MaxInt64 / 4)
+	if jitter > maxJitter {
+		jitter = maxJitter
+	}
+	// Uniform in [-jitter, +jitter]. rand.Int64N requires a positive bound,
+	// which the clamp above guarantees (maxJitter > 0 and jitter > 0).
 	offset := time.Duration(rand.Int64N(int64(2*jitter))) - jitter
 	result := base + offset
 	if result < 0 {
