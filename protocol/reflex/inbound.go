@@ -90,6 +90,12 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 		} else {
 			silenceJitter = defaultSilenceJitter
 		}
+		// Minimum wait is silence_timeout - silence_jitter. If jitter >=
+		// timeout, the minimum wait can reach zero and effectively skip the
+		// silence window — undermining probe resistance. Reject that config.
+		if silenceJitter >= silenceTimeout {
+			return nil, fmt.Errorf("reflex: silence_jitter (%s) must be less than silence_timeout (%s)", silenceJitter, silenceTimeout)
+		}
 	}
 
 	ib := &Inbound{

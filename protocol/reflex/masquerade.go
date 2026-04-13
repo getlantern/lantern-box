@@ -17,9 +17,11 @@ const masqueradeDialTimeout = 10 * time.Second
 // silence probe) before the client's stream.
 //
 // Blocks until both copy directions return. Returns the first non-EOF copy
-// error, or the dial/replay error, or nil on clean close. Context
-// cancellation closes both conns so copies unblock. conn is not closed by
-// this function — the caller owns conn's lifecycle.
+// error, or the dial/replay error, or nil on clean close.
+//
+// To unblock the copy loops on context cancellation and when either
+// direction finishes, this function may close both the upstream connection
+// and conn. Callers should treat conn as possibly-closed after return.
 func forwardToMasquerade(ctx context.Context, conn net.Conn, upstream string, prefix []byte) error {
 	if upstream == "" {
 		return fmt.Errorf("masquerade upstream not configured")

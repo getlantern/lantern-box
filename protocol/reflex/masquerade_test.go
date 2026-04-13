@@ -45,7 +45,9 @@ func TestForwardToMasquerade_ReplayPrefixAndForward(t *testing.T) {
 	upstream, stop := startEchoServer(t)
 	defer stop()
 
-	// Use a real loopback TCP pair so io.Copy semantics match production.
+	// net.Pipe() gives us an in-memory, synchronous conn pair. It's enough
+	// to exercise io.Copy and close semantics; the upstream half is a real
+	// loopback TCP echo server via startEchoServer above.
 	clientSide, serverSide := net.Pipe()
 	defer clientSide.Close()
 	defer serverSide.Close()
