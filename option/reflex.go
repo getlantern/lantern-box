@@ -42,4 +42,26 @@ type ReflexInboundOptions struct {
 	// ServerName is the SNI sent in the TLS ClientHello.
 	// Since the server sends the ClientHello, this is invisible to the censor.
 	ServerName string `json:"server_name,omitempty"`
+
+	// SilenceTimeout is the duration the server waits for client silence before
+	// sending ClientHello. Legitimate Lantern clients send no application data
+	// until the server speaks (that's the entire Reflex protocol). Active
+	// probes and misdirected TLS clients speak immediately.
+	//
+	// If the client sends any bytes before this timeout elapses, the connection
+	// is transparently forwarded to MasqueradeUpstream instead of receiving a
+	// ClientHello. Probes never see Reflex.
+	//
+	// Set to "0" or leave empty to disable (probing exposure for Reflex).
+	// Typical value: "5s". Jittered by SilenceJitter to avoid timing fingerprint.
+	SilenceTimeout string `json:"silence_timeout,omitempty"`
+
+	// SilenceJitter is the maximum random duration added to SilenceTimeout per
+	// connection. Defaults to "2s" when SilenceTimeout is set.
+	SilenceJitter string `json:"silence_jitter,omitempty"`
+
+	// MasqueradeUpstream is the host:port of a real TLS service to which
+	// connections that fail the silence test are forwarded. Required when
+	// SilenceTimeout is set. Example: "www.example.com:443".
+	MasqueradeUpstream string `json:"masquerade_upstream,omitempty"`
 }
