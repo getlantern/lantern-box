@@ -247,8 +247,8 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 			IP:   c.metadata.DestinationAddresses[0].AsSlice(),
 			Port: int(dest.Port),
 		}
-	} else {
-		return fmt.Errorf("no resolved address for destination %s", dest)
+	} else if addr, err = net.ResolveUDPAddr("udp", dest.String()); err != nil {
+		return fmt.Errorf("resolving destination %s: %w", dest, err)
 	}
 	packet := append([]byte(packetPrefix), buf...)
 	if _, err = conn.WriteTo(packet, addr); err != nil {
