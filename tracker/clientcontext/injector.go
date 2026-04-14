@@ -240,10 +240,9 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 	if dest.IsIP() {
 		addr = dest.UDPAddr()
 	} else if len(c.metadata.DestinationAddresses) > 0 {
-		// Use the already-resolved address from the routing pipeline instead of
-		// re-resolving via the TUN DNS. Re-resolving causes a 20-second blocking
-		// timeout when the system DNS points at the TUN address (10.10.1.2:53),
-		// because the query re-enters sing-box and can deadlock or stall.
+		// Use the already-resolved address from the routing pipeline. The
+		// destination was resolved earlier during DNS routing; re-resolving
+		// here is redundant and adds latency to every packet connection.
 		addr = &net.UDPAddr{
 			IP:   c.metadata.DestinationAddresses[0].AsSlice(),
 			Port: int(dest.Port),
