@@ -5,6 +5,13 @@
 # The OTEL_RESOURCE_ATTRIBUTES env var is set by cloud-init.
 
 receivers:
+  # OTLP receiver for traces and logs emitted by the lantern-box process.
+  # Listens on localhost only — the app runs on the same host.
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+
   # Host-level metrics: CPU, memory, disk, network, load, filesystem
   hostmetrics:
     collection_interval: 30s
@@ -74,7 +81,11 @@ service:
       receivers: [hostmetrics]
       processors: [memory_limiter, resourcedetection, batch]
       exporters: [otlphttp]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp]
     logs:
-      receivers: [filelog/lantern-box]
+      receivers: [filelog/lantern-box, otlp]
       processors: [memory_limiter, resourcedetection, batch]
       exporters: [otlphttp]

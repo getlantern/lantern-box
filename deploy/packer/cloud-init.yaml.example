@@ -31,5 +31,18 @@ write_files:
       provider = digitalocean
       proxyprotocol = algeneva
 
+  # OTel env for the lantern-box process — send to the local collector.
+  - path: /etc/lantern-box/otel.env
+    permissions: "0600"
+    content: |
+      OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+
+  # OTel resource attributes for the sidecar collector (host metrics, logs).
+  - path: /etc/otelcol-contrib/otelcol.env
+    permissions: "0600"
+    content: |
+      OTEL_RESOURCE_ATTRIBUTES=host.name=my-proxy-01,cloud.provider=digitalocean
+
 runcmd:
+  - systemctl enable --now otelcol-contrib
   - systemctl enable --now lantern-box
