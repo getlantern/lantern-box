@@ -51,31 +51,34 @@ func TestSendInfoWithIPDestination(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestSendInfoWithDomainDestination(t *testing.T) {
+func TestSendInfoWithDomainAndResolvedAddresses(t *testing.T) {
 	serverAddr := startUDPEchoOK(t)
 
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer conn.Close()
 
-	// Use a domain destination (simulating fakeip) — "localhost" resolves to 127.0.0.1
-	dest := M.Socksaddr{Fqdn: "localhost", Port: uint16(serverAddr.Port)}
+	// Simulate fakeip: destination is a domain, but DestinationAddresses has the resolved IP.
+	dest := M.Socksaddr{Fqdn: "example.com", Port: uint16(serverAddr.Port)}
 
 	wpc := &writePacketConn{
-		metadata: adapter.InboundContext{Destination: dest},
-		info:     &ClientInfo{DeviceID: "test-device", Platform: "test"},
+		metadata: adapter.InboundContext{
+			Destination:          dest,
+			DestinationAddresses: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
+		},
+		info: &ClientInfo{DeviceID: "test-device", Platform: "test"},
 	}
 
 	err = wpc.sendInfo(conn)
 	assert.NoError(t, err)
 }
 
-func TestSendInfoWithUnresolvableDomain(t *testing.T) {
+func TestSendInfoWithDomainNoResolvedAddresses(t *testing.T) {
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer conn.Close()
 
-	dest := M.Socksaddr{Fqdn: "this.domain.does.not.exist.invalid", Port: 12345}
+	dest := M.Socksaddr{Fqdn: "example.com", Port: 12345}
 
 	wpc := &writePacketConn{
 		metadata: adapter.InboundContext{Destination: dest},
@@ -84,5 +87,5 @@ func TestSendInfoWithUnresolvableDomain(t *testing.T) {
 
 	err = wpc.sendInfo(conn)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "resolving destination")
+	assert.Contains(t, err.Error(), "no resolved address")
 }

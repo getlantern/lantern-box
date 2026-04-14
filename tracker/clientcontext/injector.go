@@ -239,8 +239,17 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 	var addr *net.UDPAddr
 	if dest.IsIP() {
 		addr = dest.UDPAddr()
-	} else if addr, err = net.ResolveUDPAddr("udp", dest.String()); err != nil {
-		return fmt.Errorf("resolving destination %s: %w", dest, err)
+	} else if len(c.metadata.DestinationAddresses) > 0 {
+		// Use the already-resolved address from the routing pipeline instead of
+		// re-resolving via the TUN DNS. Re-resolving causes a 20-second blocking
+		// timeout when the system DNS points at the TUN address (10.10.1.2:53),
+		// because the query re-enters sing-box and can deadlock or stall.
+		addr = &net.UDPAddr{
+			IP:   c.metadata.DestinationAddresses[0].AsSlice(),
+			Port: int(dest.Port),
+		}
+	} else {
+		return fmt.Errorf("no resolved address for destination %s", dest)
 	}
 	packet := append([]byte(packetPrefix), buf...)
 	if _, err = conn.WriteTo(packet, addr); err != nil {
