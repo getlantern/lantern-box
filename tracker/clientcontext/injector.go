@@ -239,6 +239,14 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 	var addr *net.UDPAddr
 	if dest.IsIP() {
 		addr = dest.UDPAddr()
+	} else if len(c.metadata.DestinationAddresses) > 0 {
+		// Use the already-resolved address from the routing pipeline. The
+		// destination was resolved earlier during DNS routing; re-resolving
+		// here is redundant and adds latency to every packet connection.
+		addr = &net.UDPAddr{
+			IP:   c.metadata.DestinationAddresses[0].AsSlice(),
+			Port: int(dest.Port),
+		}
 	} else if addr, err = net.ResolveUDPAddr("udp", dest.String()); err != nil {
 		return fmt.Errorf("resolving destination %s: %w", dest, err)
 	}
