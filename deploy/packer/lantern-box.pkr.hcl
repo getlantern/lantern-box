@@ -1047,9 +1047,16 @@ build {
     "source.alicloud-ecs.lantern-box",
   ]
 
-  # Optionally upload the datacap binary if it exists locally for this arch.
-  # If you are building 'open source' lantern box image, create two empty files
-  # named datacap-amd64 and datacap-arm64 in /tmp to avoid provisioning errors.
+  # Ensure datacap placeholder files exist so the file provisioner never fails.
+  # In CI, the real binaries are downloaded from the build-datacap job artifact.
+  # For local/OSS builds, these will be empty (and skipped at install time).
+  provisioner "shell-local" {
+    inline = [
+      "touch /tmp/datacap-amd64 /tmp/datacap-arm64",
+    ]
+  }
+
+  # Upload the datacap binary for this arch.
   # OCI sources target arm64; DigitalOcean/Linode/Alicloud target amd64.
   provisioner "file" {
     only        = ["digitalocean.lantern-box", "linode.lantern-box", "alicloud-ecs.lantern-box"]
@@ -1068,8 +1075,8 @@ build {
     inline = [
       <<-EOF
       if [ -s /tmp/datacap ]; then
-        mv /tmp/datacap /usr/local/bin/datacap
-        chmod 755 /usr/local/bin/datacap
+        install -o root -g root -m 755 /tmp/datacap /usr/local/bin/datacap
+        rm -f /tmp/datacap
         echo "datacap installed to /usr/local/bin/datacap"
       else
         rm -f /tmp/datacap

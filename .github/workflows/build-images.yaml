@@ -158,14 +158,21 @@ jobs:
           repository: getlantern/lantern-cloud
           path: lantern-cloud
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: lantern-cloud/go.mod
+
       - name: Install cross-compilers
-        run: sudo apt-get install -y -q gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -q gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       - name: Build datacap binaries
         working-directory: lantern-cloud
         run: |
-          CGO_ENABLED=1 go build -gcflags "all=-N -l" -o /tmp/datacap-amd64 github.com/getlantern/lantern-cloud/cmd/datacap
-          GOARCH=arm64 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ CGO_ENABLED=1 go build -gcflags "all=-N -l" -o /tmp/datacap-arm64 github.com/getlantern/lantern-cloud/cmd/datacap
+          CGO_ENABLED=1 go build -o /tmp/datacap-amd64 github.com/getlantern/lantern-cloud/cmd/datacap
+          GOARCH=arm64 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ CGO_ENABLED=1 go build -o /tmp/datacap-arm64 github.com/getlantern/lantern-cloud/cmd/datacap
 
       - name: Upload datacap binaries
         uses: actions/upload-artifact@v5
@@ -206,7 +213,7 @@ jobs:
 
       - name: Init Packer plugins
         working-directory: deploy/packer
-        run: packer init lantern-box.pkr.hcl
+        run: packer init .
 
       - name: Map builder to packer -only flag
         id: only
@@ -328,12 +335,6 @@ jobs:
           fi
           echo "All OCI region secrets present"
 
-      - name: Download datacap binaries
-        uses: actions/download-artifact@v5
-        with:
-          name: datacap-binaries
-          path: /tmp
-
       - name: Build
         working-directory: deploy/packer
         env:
@@ -425,7 +426,7 @@ jobs:
           packer build \
             -var "lantern_box_version=$VERSION" \
             -only="$ONLY" \
-            lantern-box.pkr.hcl
+            .
 
       - name: Clean up OCI key
         if: always() && matrix.builder == 'oracle-oci'

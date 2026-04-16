@@ -33,6 +33,10 @@ packer build \
   .
 ```
 
+### Datacap (optional, closed-source)
+
+In CI, the `datacap` binary is built from `getlantern/lantern-cloud` and baked into the image. For local builds, empty placeholders are created automatically so the build succeeds without it. To include datacap locally, place the pre-built binaries at `/tmp/datacap-amd64` and `/tmp/datacap-arm64` before running `packer build`.
+
 ## Environment variables
 
 | Variable | Description |
