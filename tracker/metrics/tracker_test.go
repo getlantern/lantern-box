@@ -30,7 +30,7 @@ func TestTracker(t *testing.T) {
 		provider := metric.NewMeterProvider(metric.WithReader(reader))
 		sdkotel.SetMeterProvider(provider)
 
-		SetupMetricsManager(geo.NoLookup{})
+		SetupMetricsManager(geo.NoLookup{}, 0)
 
 		ctx := context.Background()
 		metricsTracker := NewTracker(ctx)
@@ -89,13 +89,14 @@ func TestTrackerWithClientInfo(t *testing.T) {
 		provider := metric.NewMeterProvider(metric.WithReader(reader))
 		sdkotel.SetMeterProvider(provider)
 
-		SetupMetricsManager(geo.NoLookup{})
+		SetupMetricsManager(geo.NoLookup{}, 0)
 
 		info := clientcontext.ClientInfo{
-			DeviceID: "dev-42",
-			Platform: "android",
-			IsPro:    true,
-			Version:  "7.0",
+			DeviceID:    "dev-42",
+			Platform:    "android",
+			IsPro:       true,
+			CountryCode: "US",
+			Version:     "7.0",
 		}
 		ctx := clientcontext.ContextWithClientInfo(
 			context.Background(), info,
@@ -142,6 +143,12 @@ func TestTrackerWithClientInfo(t *testing.T) {
 			assert.Equal(t, "7.0",
 				attrs["client.version"],
 				"%s: version", name)
+			assert.Equal(t, "US",
+				attrs["geo.country.iso_code"],
+				"%s: geo.country.iso_code", name)
+			assert.Equal(t, "client",
+				attrs["geo.source"],
+				"%s: geo.source", name)
 		}
 
 		// device_id only on proxy.io (high-cardinality).

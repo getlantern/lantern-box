@@ -109,7 +109,7 @@ func preRun(cmd *cobra.Command, args []string) {
 			24*time.Hour, cityDatabaseName,
 			geo.CountryCode,
 		)
-		metrics.SetupMetricsManager(geolookup)
+		metrics.SetupMetricsManager(geolookup, time.Millisecond)
 	}
 	if otel.Enabled() {
 		log.Info("telemetry enabled")
