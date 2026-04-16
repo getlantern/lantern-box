@@ -146,11 +146,48 @@ jobs:
             fi
           fi
 
+  build-datacap:
+    name: Build datacap binaries
+    runs-on: ubuntu-latest
+    needs: prepare
+    timeout-minutes: 15
+    steps:
+      - name: Checkout lantern-cloud
+        uses: actions/checkout@v6
+        with:
+          repository: getlantern/lantern-cloud
+          path: lantern-cloud
+          token: ${{ secrets.CI_PRIVATE_REPOS_GH_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: lantern-cloud/go.mod
+
+      - name: Install cross-compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -q gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Build datacap binaries
+        working-directory: lantern-cloud
+        run: |
+          CGO_ENABLED=1 go build -o /tmp/datacap-amd64 github.com/getlantern/lantern-cloud/cmd/datacap
+          GOARCH=arm64 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ CGO_ENABLED=1 go build -o /tmp/datacap-arm64 github.com/getlantern/lantern-cloud/cmd/datacap
+
+      - name: Upload datacap binaries
+        uses: actions/upload-artifact@v5
+        with:
+          name: datacap-binaries
+          path: |
+            /tmp/datacap-amd64
+            /tmp/datacap-arm64
+
   # Build each provider in parallel
   build:
     name: Build ${{ matrix.builder }}
     runs-on: ubuntu-latest
-    needs: [prepare, prune]
+    needs: [prepare, prune, build-datacap]
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -162,6 +199,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Download datacap binaries
+        uses: actions/download-artifact@v5
+        with:
+          name: datacap-binaries
+          path: /tmp
+
       - name: Setup Packer
         uses: hashicorp/setup-packer@v3
         env:
@@ -171,7 +214,7 @@ jobs:
 
       - name: Init Packer plugins
         working-directory: deploy/packer
-        run: packer init lantern-box.pkr.hcl
+        run: packer init .
 
       - name: Map builder to packer -only flag
         id: only
@@ -384,7 +427,7 @@ jobs:
           packer build \
             -var "lantern_box_version=$VERSION" \
             -only="$ONLY" \
-            lantern-box.pkr.hcl
+            .
 
       - name: Clean up OCI key
         if: always() && matrix.builder == 'oracle-oci'

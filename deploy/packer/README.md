@@ -19,19 +19,23 @@ Pre-baked VM images with lantern-box installed. Boot-to-proxy-ready in ~35-60 se
 
 ```bash
 cd deploy/packer
-packer init lantern-box.pkr.hcl
+packer init .
 
 # Build for a single provider
 packer build \
   -var "lantern_box_version=0.5.0" \
   -only="digitalocean.lantern-box" \
-  lantern-box.pkr.hcl
+  .
 
 # Build for all providers
 packer build \
   -var "lantern_box_version=0.5.0" \
-  lantern-box.pkr.hcl
+  .
 ```
+
+### Datacap (optional, closed-source)
+
+In CI, the `datacap` binary is built from `getlantern/lantern-cloud` and baked into the image. For local builds, empty placeholders are created automatically so the build succeeds without it. To include datacap locally, place the pre-built binaries at `/tmp/datacap-amd64` and `/tmp/datacap-arm64` before running `packer build`.
 
 ## Environment variables
 
