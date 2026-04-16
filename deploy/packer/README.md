@@ -19,18 +19,18 @@ Pre-baked VM images with lantern-box installed. Boot-to-proxy-ready in ~35-60 se
 
 ```bash
 cd deploy/packer
-packer init lantern-box.pkr.hcl
+packer init .
 
 # Build for a single provider
 packer build \
   -var "lantern_box_version=0.5.0" \
   -only="digitalocean.lantern-box" \
-  lantern-box.pkr.hcl
+  .
 
 # Build for all providers
 packer build \
   -var "lantern_box_version=0.5.0" \
-  lantern-box.pkr.hcl
+  .
 ```
 
 ## Environment variables
