@@ -149,12 +149,14 @@ func startWidget(ctx context.Context, freddieURL, egressURL, stunServer string) 
 	rtcOpt.STUNBatch = func(_ uint32) ([]string, error) {
 		return []string{stunServer}, nil
 	}
-	// The widget polls freddie over TLS. Our freddie is running on the same
-	// host with a self-signed cert, so the widget's http client has to skip
-	// verification. In production, widgets hit a real freddie deployment with
-	// a real cert and this is not needed.
+	// The widget polls freddie over TLS. This rig's freddie presents a
+	// self-signed cert, so the widget's http client skips verification only
+	// for this local-rig scenario. Real widgets in production hit a freddie
+	// deployment with a trusted cert and do not skip verification.
 	rtcOpt.HTTPClient = &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
 	}
 
 	egOpt := UBClientcore.NewDefaultEgressOptions()
@@ -177,23 +179,35 @@ func startWidget(ctx context.Context, freddieURL, egressURL, stunServer string) 
 func waitForFreddie(ctx context.Context, target string, timeout time.Duration) {
 	client := &http.Client{
 		Timeout: 1 * time.Second,
-		// freddie's cert is self-signed; the rig trusts its own cert.
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+		Transport: &http.Transport{
+			// freddie serves a self-signed cert in this local rig, so the
+			// readiness poll intentionally skips verification when probing that
+			// rig-managed endpoint. Not a general-purpose TLS policy.
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
 	}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-timer.C:
+			// Bail out rather than silently starting the widget against a
+			// dead freddie — the CI deploy step would otherwise proceed with
+			// a broken rig and only notice when the client test times out.
+			log.Fatalf("freddie never became ready at %s within %s", target, timeout)
+		case <-ticker.C:
+			resp, err := client.Get(target + "/v1/")
+			if err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				return
+			}
 		}
-		resp, err := client.Get(target + "/v1/")
-		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			return
-		}
-		time.Sleep(200 * time.Millisecond)
 	}
-	log.Printf("freddie never became ready at %s", target)
 }
 
 func envDefault(key, def string) string {

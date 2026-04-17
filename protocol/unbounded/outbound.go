@@ -264,7 +264,11 @@ func signalingClient(ctx context.Context, fallback N.Dialer, insecureSkipDiscove
 		},
 	}
 	if insecureSkipDiscoveryVerify {
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		// Test/dev escape hatch: the standalone/test signaling path accepts a
+		// self-signed freddie cert. Production operation prefers the direct
+		// transport returned above and never reaches this branch, so this
+		// is not a general-purpose TLS relaxation.
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
 	return &http.Client{Transport: tr}
 }
