@@ -60,14 +60,8 @@ func TestUnboundedE2E(t *testing.T) {
 	// Keep broflake's internal chatter off stderr for cleaner test output.
 	UBCommon.SetDebugLogger(stdlog.New(io.Discard, "", 0))
 
-	// NOTE: broflake's egress server panics from a goroutine when its listener
-	// is closed (see egress/egresslib.go:289 — it panics on any Serve() exit
-	// rather than returning the error). We therefore cannot safely cancel the
-	// context or close the egress listener during test cleanup; both paths
-	// propagate the panic to the test runner. Instead we use a background
-	// context and let OS-level cleanup at test-binary exit handle the
-	// listener. This is a broflake bug that should be fixed upstream.
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
 	// 1. Upstream target the proxied request lands at.
 	var upstreamHits int
@@ -98,7 +92,7 @@ func TestUnboundedE2E(t *testing.T) {
 		InsecureSkipVerify: true,
 	})
 	require.NoError(t, err, "egress.NewListener")
-	// No Close in cleanup — see note at top of test about broflake's panic.
+	t.Cleanup(func() { _ = egressWrapped.Close() })
 
 	socksServer, err := socks5.New(&socks5.Config{})
 	require.NoError(t, err, "socks5.New")

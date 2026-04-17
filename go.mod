@@ -15,7 +15,7 @@ replace github.com/refraction-networking/water => github.com/getlantern/water v0
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
-	github.com/getlantern/broflake v0.0.0-20260215213912-5f68e35de272
+	github.com/getlantern/broflake v0.0.0-20260417205057-3d93ed3e39da
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260317143726-e0ee64a11d90
 	github.com/getlantern/samizdat v0.0.3-0.20260327203406-ef7323341974
