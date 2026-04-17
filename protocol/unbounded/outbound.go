@@ -31,6 +31,7 @@ package unbounded
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"fmt"
 	"math/big"
 	"net"
@@ -142,7 +143,7 @@ func NewOutbound(
 		return nil, fmt.Errorf("unbounded: build pion net shim: %w", err)
 	}
 	rtcOpt.Net = rtcNet
-	rtcOpt.HTTPClient = signalingClient(ctx, outboundDialer)
+	rtcOpt.HTTPClient = signalingClient(ctx, outboundDialer, opts.InsecureDoNotVerifyDiscoveryCert)
 
 	o := &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(
@@ -253,7 +254,7 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 //  2. Fall back to a plain transport that dials via the outbound's own dialer.
 //     This does NOT bypass the tunnel, so it's only suitable for standalone
 //     sing-box use and tests — not on-device production.
-func signalingClient(ctx context.Context, fallback N.Dialer) *http.Client {
+func signalingClient(ctx context.Context, fallback N.Dialer, insecureSkipDiscoveryVerify bool) *http.Client {
 	if rt := lbAdapter.DirectTransportFromContext(ctx); rt != nil {
 		return &http.Client{Transport: rt}
 	}
@@ -261,6 +262,9 @@ func signalingClient(ctx context.Context, fallback N.Dialer) *http.Client {
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return fallback.DialContext(ctx, network, M.ParseSocksaddr(addr))
 		},
+	}
+	if insecureSkipDiscoveryVerify {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 	return &http.Client{Transport: tr}
 }

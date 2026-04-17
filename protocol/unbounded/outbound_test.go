@@ -28,7 +28,7 @@ func TestSignalingClient_UsesInjectedTransport(t *testing.T) {
 	rt := http.DefaultTransport
 	ctx := lbAdapter.ContextWithDirectTransport(context.Background(), rt)
 
-	client := signalingClient(ctx, nil /* no fallback — should not be called */)
+	client := signalingClient(ctx, nil /* no fallback — should not be called */, false)
 	req, _ := http.NewRequest("GET", srv.URL, nil)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -47,7 +47,7 @@ func TestSignalingClient_UsesInjectedTransport(t *testing.T) {
 // direct transport on the context, so we fall back to the outbound dialer
 // via a plain http.Transport.
 func TestSignalingClient_FallbackWhenNoTransport(t *testing.T) {
-	client := signalingClient(context.Background(), &noopDialer{})
+	client := signalingClient(context.Background(), &noopDialer{}, false)
 	if client == nil || client.Transport == nil {
 		t.Fatal("fallback signaling client should not be nil")
 	}
