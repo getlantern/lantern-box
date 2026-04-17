@@ -4,8 +4,8 @@ import (
 	"context"
 	"net"
 
-	"github.com/pion/transport/v3"
-	"github.com/pion/transport/v3/stdnet"
+	"github.com/pion/transport/v4"
+	"github.com/pion/transport/v4/stdnet"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
