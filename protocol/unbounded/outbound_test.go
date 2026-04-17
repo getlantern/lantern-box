@@ -56,39 +56,11 @@ func TestSignalingClient_FallbackWhenNoTransport(t *testing.T) {
 	}
 }
 
-func TestSupportedProtocolsIncludesUnbounded(t *testing.T) {
-	// Package-level smoke test: the outbound has no useful meaning unless
-	// SupportedProtocols() reports it as registered. Breaking this slice is
-	// exactly the regression Copilot flagged on #76 (the old draft forgot to
-	// add "unbounded" to the list even though it registered the outbound).
-	//
-	// This lives in this package rather than protocol/ so it's colocated with
-	// the outbound source — easier for future maintainers to spot the
-	// dependency.
-	found := false
-	for _, p := range supportedProtocolsSnapshot() {
-		if p == "unbounded" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error(`SupportedProtocols() does not include "unbounded" — ` +
-			`add it to protocol/register.go's supportedProtocols slice`)
-	}
-}
-
-// supportedProtocolsSnapshot re-reads the list from the registry package via
-// a small indirection so this test stays self-contained even if the public
-// API of protocol/register.go changes.
-func supportedProtocolsSnapshot() []string {
-	// Intentionally hard-coded here. Kept in sync via the test above.
-	return []string{
-		"algeneva", "amnezia", "outline", "reflex", "samizdat", "unbounded", "water",
-		"http", "hysteria", "hysteria2", "shadowsocks", "shadowtls", "socks",
-		"ssh", "tor", "trojan", "tuic", "vless", "vmess", "wireguard",
-	}
-}
+// The "supportedProtocols includes unbounded" assertion lives in
+// protocol/register_test.go (package protocol_test), where it can call the
+// real protocol.SupportedProtocols() without a circular import. Keeping it
+// there means the test actually validates the production slice rather than
+// a hard-coded copy.
 
 // noopDialer satisfies N.Dialer for tests that don't need real dials.
 type noopDialer struct{}

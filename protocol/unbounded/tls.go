@@ -9,7 +9,13 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"time"
 )
+
+// selfSignedCertLifetime is how long the freshly-minted cert is valid.
+// We regenerate on every outbound construction, so a short window is fine and
+// keeps the cert out of long-term fingerprinting buckets.
+const selfSignedCertLifetime = 24 * time.Hour
 
 // selfSignedTLSConfig builds the TLS config the consumer uses when serving
 // QUIC to the producer peer. Unbounded reverses the TLS role relative to TCP:
@@ -31,7 +37,24 @@ func selfSignedTLSConfig(insecureDoNotVerify bool, egressCA, egressServerName st
 		return nil, fmt.Errorf("generate ECDSA key: %w", err)
 	}
 
-	template := x509.Certificate{SerialNumber: big.NewInt(1)}
+	// A bare template with only SerialNumber set would produce a cert with
+	// year-0001 validity and no key-usage extensions, which modern TLS
+	// verifiers reject as expired/invalid. Populate the minimum set a QUIC
+	// server cert needs. Serial is randomized so successive certs on the
+	// same host don't collide in fingerprint heuristics.
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("generate serial: %w", err)
+	}
+	now := time.Now()
+	template := x509.Certificate{
+		SerialNumber:          serial,
+		NotBefore:             now.Add(-1 * time.Minute), // small skew tolerance
+		NotAfter:              now.Add(selfSignedCertLifetime),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	if err != nil {
 		return nil, fmt.Errorf("create self-signed certificate: %w", err)
@@ -59,6 +82,10 @@ func selfSignedTLSConfig(insecureDoNotVerify bool, egressCA, egressServerName st
 		Certificates: []tls.Certificate{tlsCert},
 		NextProtos:   []string{"broflake"},
 		ClientAuth:   clientAuth,
+		// QUIC requires TLS 1.3. Set explicitly rather than rely on the
+		// QUIC library to enforce it, so non-QUIC uses of this config
+		// (tests, debugging tools) don't silently downgrade.
+		MinVersion: tls.VersionTLS13,
 	}
 
 	if insecureDoNotVerify {

@@ -31,8 +31,8 @@ package unbounded
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -303,16 +303,19 @@ func randomSTUNBatch(pool []string) func(size uint32) ([]string, error) {
 	}
 }
 
-// cryptoRandIntN returns a uniform random int in [0, n).
+// cryptoRandIntN returns a uniform random int in [0, n). Delegates to
+// crypto/rand.Int, which uses rejection sampling to avoid modulo bias —
+// important for a small pool where a naive `% n` would skew toward the
+// lower end of the range when n doesn't divide 2^64 evenly.
 func cryptoRandIntN(n int) (int, error) {
 	if n <= 0 {
 		return 0, fmt.Errorf("n must be positive, got %d", n)
 	}
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	v, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
 		return 0, err
 	}
-	return int(binary.BigEndian.Uint64(b[:]) % uint64(n)), nil
+	return int(v.Int64()), nil
 }
 
 // uotDialer adapts the broflake SOCKS5 dialer to N.Dialer so uot.Client can use
