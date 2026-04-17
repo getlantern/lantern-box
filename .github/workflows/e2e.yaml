@@ -2,13 +2,16 @@ name: E2E Protocol Tests
 
 on:
   workflow_dispatch:
+  # Run on every PR — stacked PRs against feature branches (e.g. the Unbounded
+  # outbound stack) should still get live-machine coverage before they merge
+  # into main. The path filter keeps doc-only PRs from consuming droplets.
   pull_request:
-    branches: [main]
     paths:
       - '**.go'
       - 'go.mod'
       - 'go.sum'
       - 'Dockerfile'
+      - '.github/workflows/e2e.yaml'
 
 env:
   DROPLET_NAME: "e2e-lantern-box-${{ github.run_id }}"
