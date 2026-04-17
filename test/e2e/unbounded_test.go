@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,9 +65,11 @@ func TestUnboundedE2E(t *testing.T) {
 	t.Cleanup(cancel)
 
 	// 1. Upstream target the proxied request lands at.
-	var upstreamHits int
+	// Atomic counter because httptest serves handlers on its own goroutine;
+	// a plain int would race the test goroutine's final assertion under -race.
+	var upstreamHits atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamHits++
+		upstreamHits.Add(1)
 		w.Header().Set("X-Upstream", "ok")
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, "hello")
@@ -124,7 +127,7 @@ func TestUnboundedE2E(t *testing.T) {
 			resp.Body.Close()
 			require.Equal(t, http.StatusOK, resp.StatusCode)
 			require.Equal(t, "ok", resp.Header.Get("X-Upstream"))
-			require.GreaterOrEqual(t, upstreamHits, 1, "upstream should have been hit at least once")
+			require.GreaterOrEqual(t, upstreamHits.Load(), int64(1), "upstream should have been hit at least once")
 			return
 		}
 		lastErr = err
