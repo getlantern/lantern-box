@@ -2,13 +2,16 @@ name: E2E Protocol Tests
 
 on:
   workflow_dispatch:
+  # Run on every PR — stacked PRs against feature branches (e.g. the Unbounded
+  # outbound stack) should still get live-machine coverage before they merge
+  # into main. The path filter keeps doc-only PRs from consuming droplets.
   pull_request:
-    branches: [main]
     paths:
       - '**.go'
       - 'go.mod'
       - 'go.sum'
       - 'Dockerfile'
+      - '.github/workflows/e2e.yaml'
 
 env:
   DROPLET_NAME: "e2e-lantern-box-${{ github.run_id }}"
@@ -38,6 +41,14 @@ jobs:
             -o lantern-box \
             ./cmd
           ls -lh lantern-box
+
+      - name: Build unbounded-rig (linux/amd64)
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags="-s -w" \
+            -o unbounded-rig \
+            ./test/e2e/unbounded-rig
+          ls -lh unbounded-rig
 
       - name: Generate test credentials
         id: creds
@@ -143,20 +154,28 @@ jobs:
         run: |
           SSH_OPTS="-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -i e2e_key"
 
-          # Compress binary before upload
+          # Compress binaries before upload
           gzip -1 -c lantern-box > lantern-box.gz
-          ls -lh lantern-box.gz
+          gzip -1 -c unbounded-rig > unbounded-rig.gz
+          ls -lh lantern-box.gz unbounded-rig.gz
+
+          # Generate a self-signed cert pair for the unbounded rig (freddie TLS
+          # and the inner QUIC handshake presented by egress).
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout unbounded-rig-key.pem -out unbounded-rig-cert.pem -days 1 \
+            -nodes -subj "/CN=${DROPLET_IP}" \
+            -addext "subjectAltName=IP:${DROPLET_IP}"
 
           # Upload files
           echo "Starting SCP upload..."
-          scp $SSH_OPTS lantern-box.gz cert.pem key.pem plain.wasm reflex-client-cert.pem reflex-client-key.pem root@"$DROPLET_IP":/root/
+          scp $SSH_OPTS lantern-box.gz unbounded-rig.gz cert.pem key.pem plain.wasm reflex-client-cert.pem reflex-client-key.pem unbounded-rig-cert.pem unbounded-rig-key.pem root@"$DROPLET_IP":/root/
           echo "SCP upload complete"
 
-          # Decompress and make binary executable
-          echo "Decompressing binary..."
+          # Decompress and make binaries executable
+          echo "Decompressing binaries..."
           ssh $SSH_OPTS root@"$DROPLET_IP" \
-            "gzip -d /root/lantern-box.gz && chmod +x /root/lantern-box"
-          echo "Binary ready"
+            "gzip -d /root/lantern-box.gz /root/unbounded-rig.gz && chmod +x /root/lantern-box /root/unbounded-rig"
+          echo "Binaries ready"
 
           # Start Python HTTP server to serve plain.wasm (for WATER)
           echo "Starting WASM HTTP server..."
@@ -247,20 +266,24 @@ jobs:
           JSONEOF
           scp $SSH_OPTS /tmp/reflex-server.json root@"$DROPLET_IP":/root/reflex-server.json
 
-          # Start all 4 server processes
+          # Start all 4 sing-box protocol servers + the Unbounded rig
+          # (freddie signaling on 9000 + egress SOCKS5+QUIC/WS on 8000 +
+          # in-process broflake widget)
           echo "Starting servers..."
           ssh $SSH_OPTS root@"$DROPLET_IP" "nohup /root/lantern-box run --config /root/algeneva-server.json > /root/algeneva-server.log 2>&1 < /dev/null &
           nohup /root/lantern-box run --config /root/samizdat-server.json > /root/samizdat-server.log 2>&1 < /dev/null &
           nohup /root/lantern-box run --config /root/water-server.json > /root/water-server.log 2>&1 < /dev/null &
           nohup /root/lantern-box run --config /root/reflex-server.json > /root/reflex-server.log 2>&1 < /dev/null &
+          TLS_CERT_FILE=/root/unbounded-rig-cert.pem TLS_KEY_FILE=/root/unbounded-rig-key.pem FREDDIE_ADDR=:9000 EGRESS_ADDR=:8000 nohup /root/unbounded-rig > /root/unbounded-rig.log 2>&1 < /dev/null &
           sleep 1"
           echo "Servers launched"
 
-          # Wait for servers to be ready (WATER needs time to download/compile WASM)
+          # Wait for servers to be ready (WATER needs time to download/compile
+          # WASM; unbounded-rig needs freddie + egress TCP to bind).
           echo "Checking port readiness..."
           # Note: must use bash explicitly since Ubuntu default shell is dash (no /dev/tcp support)
           ssh $SSH_OPTS root@"$DROPLET_IP" bash << 'READYEOF'
-            for port in 9001 9002 9003 9004; do
+            for port in 9001 9002 9003 9004 9000 8000; do
               echo "Waiting for port $port to be ready..."
               for i in $(seq 1 60); do
                 if echo > /dev/tcp/127.0.0.1/$port 2>/dev/null; then
@@ -565,6 +588,86 @@ jobs:
 
           kill $CLIENT_PID 2>/dev/null || true
 
+      - name: Test Unbounded
+        id: test_unbounded
+        continue-on-error: true
+        env:
+          DROPLET_IP: ${{ steps.droplet.outputs.droplet_ip }}
+        run: |
+          # Client config: unbounded outbound talks to the rig's freddie (TLS,
+          # self-signed, hence insecure_do_not_verify_discovery_cert) and egress
+          # (plain ws://; inner QUIC handshake is self-signed hence
+          # insecure_do_not_verify_client_cert).
+          cat > /tmp/unbounded-client.json << JSONEOF
+          {
+            "log": {"level": "debug"},
+            "inbounds": [{
+              "type": "mixed",
+              "tag": "mixed-in",
+              "listen": "127.0.0.1",
+              "listen_port": 1085
+            }],
+            "outbounds": [{
+              "type": "unbounded",
+              "tag": "unbounded-out",
+              "discovery_srv": "https://${DROPLET_IP}:9000",
+              "egress_addr": "ws://${DROPLET_IP}:8000",
+              "stun_servers": ["stun:stun.l.google.com:19302"],
+              "stun_batch_size": 1,
+              "consumer_session_id": "ci-e2e",
+              "insecure_do_not_verify_client_cert": true,
+              "insecure_do_not_verify_discovery_cert": true
+            }],
+            "route": {"final": "unbounded-out"}
+          }
+          JSONEOF
+
+          setsid ./lantern-box run --config /tmp/unbounded-client.json > /tmp/unbounded-client.log 2>&1 &
+          CLIENT_PID=$!
+          # Generous startup grace — ICE + DTLS + QUIC handshake on first dial
+          # can take 10-20s over real network paths.
+          sleep 15
+
+          if ! kill -0 $CLIENT_PID 2>/dev/null; then
+            echo "Unbounded client failed to start"
+            cat /tmp/unbounded-client.log
+            exit 1
+          fi
+
+          # Test HTTP — the whole chain: mixed inbound -> unbounded outbound
+          # -> broflake consumer -> WebRTC/DTLS -> broflake widget (on droplet)
+          # -> QUIC/WS -> egress SOCKS5 (on droplet) -> example.com
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1085 -m 60 http://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "Unbounded HTTP test PASSED"
+          else
+            echo "Unbounded HTTP test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/unbounded-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Test HTTPS
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1085 -m 60 https://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "Unbounded HTTPS test PASSED"
+          else
+            echo "Unbounded HTTPS test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/unbounded-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          kill $CLIENT_PID 2>/dev/null || true
+
       - name: Check test results
         if: always()
         run: |
@@ -592,6 +695,12 @@ jobs:
             echo "Reflex:    PASSED"
           else
             echo "Reflex:    FAILED"
+            FAILED=1
+          fi
+          if [ "${{ steps.test_unbounded.outcome }}" = "success" ]; then
+            echo "Unbounded: PASSED"
+          else
+            echo "Unbounded: FAILED"
             FAILED=1
           fi
           echo "========================"
