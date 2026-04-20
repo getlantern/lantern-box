@@ -6,9 +6,12 @@ import (
 
 	"github.com/pion/transport/v4"
 	"github.com/pion/transport/v4/stdnet"
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/control"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 )
 
 // rtcNet is a pion transport.Net backed by a sing-box N.Dialer. Every pion
@@ -45,6 +48,72 @@ func (n *rtcNet) Dial(network, address string) (net.Conn, error) {
 
 func (n *rtcNet) ListenPacket(network, address string) (net.PacketConn, error) {
 	return n.dialer.ListenPacket(n.ctx, metadata.ParseSocksaddr(address))
+}
+
+// ListenUDP is the path pion's ICE agent takes for every host candidate
+// (see pion/ice/v4 gather.go → listenUDPInPortRange → a.net.ListenUDP).
+// Without this override, the call would fall through to the embedded
+// *stdnet.Net, which is a thin wrapper around net.ListenUDP — that
+// creates sockets with no platform socket-protection, so on a VPN
+// client where the host process also serves the default TUN, the
+// sockets' egress packets follow the routing table straight back
+// through the TUN. ICE connectivity checks never reach the peer and
+// every session dies with "NAT failure, aborting!" after 5s.
+//
+// We can't funnel this through n.dialer.ListenPacket because that API
+// doesn't take a local bind address (its signature is destination-only),
+// and pion needs one socket per interface IP to gather per-interface
+// host candidates. So we construct a net.ListenConfig directly and
+// attach the NetworkManager's bind-to-physical-interface Control
+// function (the same one sing-box's DefaultDialer appends when
+// auto_detect_interface is set at the route level — via ProtectFunc
+// on platforms with a platformInterface, or AutoDetectInterfaceFunc
+// otherwise). Sockets still bind to the per-interface local address
+// pion requested, but their egress interface is force-bound via
+// IP_BOUND_IF (macOS/iOS) / SO_BINDTODEVICE (Linux/Android).
+func (n *rtcNet) ListenUDP(network string, laddr *net.UDPAddr) (transport.UDPConn, error) {
+	lc := net.ListenConfig{
+		Control: bindEgressToPhysicalInterface(n.ctx),
+	}
+	addr := ""
+	if laddr != nil {
+		addr = laddr.String()
+	}
+	pc, err := lc.ListenPacket(n.ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	udpConn, ok := pc.(*net.UDPConn)
+	if !ok {
+		pc.Close()
+		return nil, &net.OpError{
+			Op:  "listen",
+			Net: network,
+			Err: net.InvalidAddrError("ListenConfig did not return *net.UDPConn"),
+		}
+	}
+	return udpConn, nil
+}
+
+// bindEgressToPhysicalInterface returns a net.ListenConfig.Control
+// function that force-binds newly-created sockets to the platform's
+// default physical interface. When no NetworkManager is registered on
+// ctx (tests, standalone sing-box without the tunnel wrapper), it's a
+// no-op — the socket follows the routing table like a plain
+// net.ListenUDP. In a VPN host process this keeps UDP sockets off the
+// TUN the host itself is serving. Source: the same plumbing
+// sing-box/common/dialer/default.go:NewDefault appends when
+// networkManager.AutoDetectInterface() is true (see the
+// ProtectFunc/AutoDetectInterfaceFunc branches).
+func bindEgressToPhysicalInterface(ctx context.Context) control.Func {
+	nm := service.FromContext[adapter.NetworkManager](ctx)
+	if nm == nil {
+		return nil
+	}
+	if pf := nm.ProtectFunc(); pf != nil {
+		return pf
+	}
+	return nm.AutoDetectInterfaceFunc()
 }
 
 func (n *rtcNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.TCPConn, error) {
