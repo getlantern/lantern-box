@@ -175,6 +175,18 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 		return nil
 	}
 
+	startCtx := context.Background()
+	o.logger.InfoContext(startCtx, "unbounded Start begin",
+		"tag", o.Tag(),
+		"discovery_srv", o.rtcOpt.DiscoverySrv,
+		"egress_addr", o.egOpt.Addr,
+		"ctable_size", o.bfOpt.CTableSize,
+		"ptable_size", o.bfOpt.PTableSize,
+		"client_type", o.bfOpt.ClientType,
+		"insecure_tls", o.tlsCfg.insecure,
+	)
+	startedAt := time.Now()
+
 	tlsConf, err := selfSignedTLSConfig(o.tlsCfg.insecure, o.tlsCfg.ca, o.tlsCfg.serverName)
 	if err != nil {
 		return fmt.Errorf("unbounded: build TLS config: %w", err)
@@ -184,6 +196,7 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 	if err != nil {
 		return fmt.Errorf("unbounded: start broflake: %w", err)
 	}
+	o.logger.InfoContext(startCtx, "unbounded broflake built", "elapsed", time.Since(startedAt))
 	ql, err := UBClientcore.NewQUICLayer(bfConn, tlsConf)
 	if err != nil {
 		ui.Stop()
@@ -196,6 +209,8 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 	o.dial = UBClientcore.CreateSOCKS5Dialer(ql)
 
 	go o.ql.ListenAndMaintainQUICConnection()
+	o.logger.InfoContext(startCtx, "unbounded Start complete, SOCKS5Dialer ready",
+		"elapsed", time.Since(startedAt))
 	return nil
 }
 
@@ -221,13 +236,37 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	if o.dial == nil {
 		return nil, fmt.Errorf("unbounded: not started (DialContext called before Start)")
 	}
+	started := time.Now()
+	dest := destination.String()
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
-		o.logger.DebugContext(ctx, "unbounded TCP dial to ", destination)
-		return o.dial(ctx, network, destination.String())
+		o.logger.DebugContext(ctx, "unbounded TCP dial start", "dest", dest)
+		conn, err := o.dial(ctx, network, dest)
+		if err != nil {
+			o.logger.ErrorContext(ctx, "unbounded TCP dial failed",
+				"dest", dest,
+				"elapsed", time.Since(started),
+				"err", err)
+			return nil, err
+		}
+		o.logger.DebugContext(ctx, "unbounded TCP dial ok",
+			"dest", dest,
+			"elapsed", time.Since(started))
+		return conn, nil
 	case N.NetworkUDP:
-		o.logger.DebugContext(ctx, "unbounded UoT dial to ", destination)
-		return o.uot.DialContext(ctx, network, destination)
+		o.logger.DebugContext(ctx, "unbounded UoT dial start", "dest", dest)
+		conn, err := o.uot.DialContext(ctx, network, destination)
+		if err != nil {
+			o.logger.ErrorContext(ctx, "unbounded UoT dial failed",
+				"dest", dest,
+				"elapsed", time.Since(started),
+				"err", err)
+			return nil, err
+		}
+		o.logger.DebugContext(ctx, "unbounded UoT dial ok",
+			"dest", dest,
+			"elapsed", time.Since(started))
+		return conn, nil
 	}
 	return nil, fmt.Errorf("unbounded: unsupported network %q", network)
 }
@@ -240,8 +279,21 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if o.dial == nil {
 		return nil, fmt.Errorf("unbounded: not started (ListenPacket called before Start)")
 	}
-	o.logger.DebugContext(ctx, "unbounded UoT packet dial to ", destination)
-	return o.uot.ListenPacket(ctx, destination)
+	started := time.Now()
+	dest := destination.String()
+	o.logger.DebugContext(ctx, "unbounded UoT ListenPacket start", "dest", dest)
+	pc, err := o.uot.ListenPacket(ctx, destination)
+	if err != nil {
+		o.logger.ErrorContext(ctx, "unbounded UoT ListenPacket failed",
+			"dest", dest,
+			"elapsed", time.Since(started),
+			"err", err)
+		return nil, err
+	}
+	o.logger.DebugContext(ctx, "unbounded UoT ListenPacket ok",
+		"dest", dest,
+		"elapsed", time.Since(started))
+	return pc, nil
 }
 
 // signalingClient returns the HTTP client broflake uses to reach freddie.
