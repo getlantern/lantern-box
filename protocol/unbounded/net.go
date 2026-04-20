@@ -100,11 +100,18 @@ func (n *rtcNet) ListenUDP(network string, laddr *net.UDPAddr) (transport.UDPCon
 // default physical interface. When no NetworkManager is registered on
 // ctx (tests, standalone sing-box without the tunnel wrapper), it's a
 // no-op — the socket follows the routing table like a plain
-// net.ListenUDP. In a VPN host process this keeps UDP sockets off the
-// TUN the host itself is serving. Source: the same plumbing
-// sing-box/common/dialer/default.go:NewDefault appends when
-// networkManager.AutoDetectInterface() is true (see the
-// ProtectFunc/AutoDetectInterfaceFunc branches).
+// net.ListenUDP.
+//
+// Implementation-wise we borrow the same ProtectFunc /
+// AutoDetectInterfaceFunc hooks sing-box's default dialer uses, but we
+// apply them UNCONDITIONALLY whenever a NetworkManager is present —
+// not gated on networkManager.AutoDetectInterface() the way
+// sing-box/common/dialer/default.go:NewDefault is. This is
+// intentional: pion's ICE host-candidate gathering fails if sockets
+// aren't kept off the TUN we're serving, even when the user hasn't
+// explicitly set auto_detect_interface on the outbound. Gating on
+// AutoDetectInterface() would reintroduce the "NAT failure, aborting!"
+// regression this override exists to fix.
 func bindEgressToPhysicalInterface(ctx context.Context) control.Func {
 	nm := service.FromContext[adapter.NetworkManager](ctx)
 	if nm == nil {

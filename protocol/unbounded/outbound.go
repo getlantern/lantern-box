@@ -237,33 +237,34 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, fmt.Errorf("unbounded: not started (DialContext called before Start)")
 	}
 	started := time.Now()
+	dest := destination.String()
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
-		o.logger.DebugContext(ctx, "unbounded TCP dial start", "dest", destination.String())
-		conn, err := o.dial(ctx, network, destination.String())
+		o.logger.DebugContext(ctx, "unbounded TCP dial start", "dest", dest)
+		conn, err := o.dial(ctx, network, dest)
 		if err != nil {
 			o.logger.ErrorContext(ctx, "unbounded TCP dial failed",
-				"dest", destination.String(),
+				"dest", dest,
 				"elapsed", time.Since(started),
 				"err", err)
 			return nil, err
 		}
 		o.logger.DebugContext(ctx, "unbounded TCP dial ok",
-			"dest", destination.String(),
+			"dest", dest,
 			"elapsed", time.Since(started))
 		return conn, nil
 	case N.NetworkUDP:
-		o.logger.DebugContext(ctx, "unbounded UoT dial start", "dest", destination.String())
+		o.logger.DebugContext(ctx, "unbounded UoT dial start", "dest", dest)
 		conn, err := o.uot.DialContext(ctx, network, destination)
 		if err != nil {
 			o.logger.ErrorContext(ctx, "unbounded UoT dial failed",
-				"dest", destination.String(),
+				"dest", dest,
 				"elapsed", time.Since(started),
 				"err", err)
 			return nil, err
 		}
 		o.logger.DebugContext(ctx, "unbounded UoT dial ok",
-			"dest", destination.String(),
+			"dest", dest,
 			"elapsed", time.Since(started))
 		return conn, nil
 	}
@@ -279,17 +280,18 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 		return nil, fmt.Errorf("unbounded: not started (ListenPacket called before Start)")
 	}
 	started := time.Now()
-	o.logger.InfoContext(ctx, "unbounded UoT ListenPacket start", "dest", destination.String())
+	dest := destination.String()
+	o.logger.DebugContext(ctx, "unbounded UoT ListenPacket start", "dest", dest)
 	pc, err := o.uot.ListenPacket(ctx, destination)
 	if err != nil {
 		o.logger.ErrorContext(ctx, "unbounded UoT ListenPacket failed",
-			"dest", destination.String(),
+			"dest", dest,
 			"elapsed", time.Since(started),
 			"err", err)
 		return nil, err
 	}
-	o.logger.InfoContext(ctx, "unbounded UoT ListenPacket ok",
-		"dest", destination.String(),
+	o.logger.DebugContext(ctx, "unbounded UoT ListenPacket ok",
+		"dest", dest,
 		"elapsed", time.Since(started))
 	return pc, nil
 }
