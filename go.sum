@@ -235,8 +235,8 @@ github.com/gaukas/wazerofs v0.1.0 h1:wIkW1bAxSnpaaVkQ5LOb1tm1BXdVap3eKjJpVWIqt2E
 github.com/gaukas/wazerofs v0.1.0/go.mod h1:+JECB9Fwt0taPqSgHckG9lmT3tcoVK+9VJozTsq9UlI=
 github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52 h1:w2/RqYPw7PbTYfUMS2aToD5DMKLBnQed+fkTEYTKAqQ=
 github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52/go.mod h1:PrNR8tMXO26YNs8K9653XCUH7u2Kv4OdfFC3Ke1GsX0=
-github.com/getlantern/broflake v0.0.0-20260417230047-38c1be9d5596 h1:GOBIUbTocst8THjzHMruS//yscy+hwXVQk8k3Arutc0=
-github.com/getlantern/broflake v0.0.0-20260417230047-38c1be9d5596/go.mod h1:/BvO5fiSg0r9zIN40RIzyGKRlbvg8A29WGXcNAxYit0=
+github.com/getlantern/broflake v0.0.0-20260421172440-caea0799b63a h1:WQ11Ms5jGvBaH6v/u1QBvmnnzRY0ckMiifCnDM/x6TI=
+github.com/getlantern/broflake v0.0.0-20260421172440-caea0799b63a/go.mod h1:bZGGfTwne9NIsy3Kc1avcXNWn/yA8ghUwlXdS2z+AlA=
 github.com/getlantern/context v0.0.0-20190109183933-c447772a6520/go.mod h1:L+mq6/vvYHKjCX2oez0CgEAJmbq1fbb/oNJIWQkBybY=
 github.com/getlantern/context v0.0.0-20220418194847-3d5e7a086201 h1:oEZYEpZo28Wdx+5FZo4aU7JFXu0WG/4wJWese5reQSA=
 github.com/getlantern/context v0.0.0-20220418194847-3d5e7a086201/go.mod h1:Y9WZUHEb+mpra02CbQ/QczLUe6f0Dezxaw5DCJlJQGo=
@@ -261,8 +261,8 @@ github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f/go.mod h1:D5ao98qkA
 github.com/getlantern/ops v0.0.0-20220713155959-1315d978fff7/go.mod h1:D5ao98qkA6pxftxoqzibIBBrLSUli+kYnJqrgBf9cIA=
 github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534 h1:3BwvWj0JZzFEvNNiMhCu4bf60nqcIuQpTYb00Ezm1ag=
 github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534/go.mod h1:ZsLfOY6gKQOTyEcPYNA9ws5/XHZQFroxqCOhHjGcs9Y=
-github.com/getlantern/quic-go-unbounded-fork v0.56.1-unbounded h1:cW8oimnpBMnq8lrEoKhIXxqVe30eN53/YCmTwBwhbtE=
-github.com/getlantern/quic-go-unbounded-fork v0.56.1-unbounded/go.mod h1:9gx5KsFQtw2oZ6GZTyh+7YEvOxWCL9WZAepnHxgAo6c=
+github.com/getlantern/quic-go-unbounded-fork v0.59.0-unbounded h1:1vTizA6U8YdyvZT0RIsEaY5fuhuZumnR8myyCF3qiZs=
+github.com/getlantern/quic-go-unbounded-fork v0.59.0-unbounded/go.mod h1:upnsH4Ju1YkqpLXC305eW3yDZ4NfnNbmQRCMWS58IKU=
 github.com/getlantern/samizdat v0.0.3-0.20260327203406-ef7323341974 h1:k+/qNo5YNO+8M8LVUp6G5Evm1OQdEs3Z4ye8top4AhI=
 github.com/getlantern/samizdat v0.0.3-0.20260327203406-ef7323341974/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
 github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb h1:c5YM7b3a4r2J8Eh89KkI6M/iTFe6Bi+b8AJlfkKdFq4=
@@ -756,6 +756,8 @@ github.com/testcontainers/testcontainers-go v0.40.0 h1:pSdJYLOVgLE8YdUY2FHQ1Fxu+
 github.com/testcontainers/testcontainers-go v0.40.0/go.mod h1:FSXV5KQtX2HAMlm7U3APNyLkkap35zNLxukw9oBi/MY=
 github.com/tevino/abool/v2 v2.1.0 h1:7w+Vf9f/5gmKT4m4qkayb33/92M+Um45F2BkHOR+L/c=
 github.com/tevino/abool/v2 v2.1.0/go.mod h1:+Lmlqk6bHDWHqN1cbxqhwEAwMPXgc8I1SDEamtseuXY=
+github.com/theodorsm/covert-dtls v1.5.0 h1:kGUnCuGB65kLrga0e1mYv8t2RA4vfRMN0iYlakY0z/c=
+github.com/theodorsm/covert-dtls v1.5.0/go.mod h1:MTb9IO4aqSxrcrh569UGO4PlC1Yel37M440z+gcm13E=
 github.com/things-go/go-socks5 v0.0.5 h1:qvKaGcBkfDrUL33SchHN93srAmYGzb4CxSM2DPYufe8=
 github.com/things-go/go-socks5 v0.0.5/go.mod h1:mtzInf8v5xmsBpHZVbIw2YQYhc4K0jRwzfsH64Uh0IQ=
 github.com/tidwall/btree v1.8.1 h1:27ehoXvm5AG/g+1VxLS1SD3vRhp/H7LuEfwNvddEdmA=
