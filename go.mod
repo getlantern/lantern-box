@@ -311,4 +311,11 @@ require (
 
 replace github.com/quic-go/quic-go => github.com/getlantern/quic-go-unbounded-fork v0.59.0-unbounded
 
+// Keep qpack on v0.5.1 for sing-box-minimal/sagernet quic-go HTTP/3 compatibility:
+// sing-box-minimal@v1.12.21-lantern pins sagernet/quic-go@v0.52.0-sing-box-mod.3,
+// whose http3 package (used by hysteria2, DoQ, v2rayquic) was compiled against
+// qpack's v0.5.1 API (NewDecoder(cb) + DecodeFull, both removed in v0.6.0).
+// Without this override, MVS picks v0.6.0 via quic-go/quic-go v0.59.0's require
+// and the build breaks. Remove once sing-box-minimal bumps to a sagernet/quic-go
+// release that uses the qpack v0.6.0 API (v0.59.0-sing-box-mod.4 or later).
 replace github.com/quic-go/qpack => github.com/quic-go/qpack v0.5.1
