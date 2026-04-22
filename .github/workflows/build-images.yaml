@@ -1,16 +1,23 @@
 name: Build Packer Images
 
 on:
-  # Run after a release is published
-  release:
-    types: [published]
+  # Packer image contents changed — rebuild. Under Reflog's Option B the
+  # lantern-box binary no longer lives in the image, so a plain Go release
+  # doesn't require an image rebuild. This trigger fires only when
+  # something in the image itself actually changed (provision.sh,
+  # cloud-init scripts, packer HCL, otel config, the workflow itself).
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/packer/**'
+      - '.github/workflows/build-images.yaml'
 
-  # Allow manual trigger for testing
+  # Allow manual trigger for ad-hoc rebuilds (base-image updates, etc.)
   workflow_dispatch:
     inputs:
       version:
-        description: "lantern-box version to bake into the image (e.g. 1.2.3)"
-        required: true
+        description: "Label to apply to the built image (e.g. 1.2.3 — used only for image naming; the lantern-box binary comes from cloud-init at boot time)"
+        required: false
         type: string
       builders:
         description: "Comma-separated builders (linode,oracle-oci,alicloud-ecs)"
@@ -31,22 +38,38 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
+      - name: Checkout (full history — needed to find the latest tag)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - name: Determine version
         id: version
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "$EVENT_NAME" = "release" ]; then
-            echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            if [[ "$INPUT_VERSION" == v* ]]; then
-              echo "::error::Version should not start with 'v' (got '$INPUT_VERSION'). Use e.g. 1.2.3"
-              exit 1
-            fi
-            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
-          fi
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              if [ -z "$INPUT_VERSION" ]; then
+                # Operator didn't specify — fall through to "latest tag" path.
+                :
+              elif [[ "$INPUT_VERSION" == v* ]]; then
+                echo "::error::Version should not start with 'v' (got '$INPUT_VERSION'). Use e.g. 1.2.3"
+                exit 1
+              else
+                echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+          esac
+          # push or workflow_dispatch without version: label the image with
+          # the latest tag on main. The image itself is version-agnostic
+          # under Option B — this is purely for image-name bookkeeping and
+          # the per-provider latestImage() helpers that filter on prefix.
+          latest=$(git tag -l 'v*' --sort=-v:refname | head -1)
+          latest="${latest:-v0.0.0}"
+          echo "version=${latest#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build matrix
         id: matrix
@@ -54,10 +77,12 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_BUILDERS: ${{ inputs.builders }}
         run: |
-          if [ "$EVENT_NAME" = "release" ]; then
+          if [ "$EVENT_NAME" = "push" ]; then
             builders="linode,oracle-oci,alicloud-ecs"
-          else
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_BUILDERS" ]; then
             builders="$INPUT_BUILDERS"
+          else
+            builders="linode,oracle-oci,alicloud-ecs"
           fi
           # Validate that we have at least one builder
           if [ -z "$builders" ]; then

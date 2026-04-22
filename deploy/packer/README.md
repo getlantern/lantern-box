@@ -9,7 +9,6 @@ Pre-baked VM images with lantern-box installed. Boot-to-proxy-ready in ~35-60 se
 - otelcol-contrib + systemd drop-in for host metrics
 - systemd drop-ins for lantern-box env (OTel, etc.)
 - `/etc/lantern-box/` and `/var/lib/lantern-box/` directories
-- `/etc/cron.d/lantern-box-update` fallback auto-update cron
 
 **Not in the image (Reflog's Option B):** the `lantern-box` binary itself.
 Under the central-orchestration design in
