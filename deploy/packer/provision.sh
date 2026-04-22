@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# VERSION is passed as an environment variable by Packer.
+# VERSION is passed as an environment variable by Packer. Under Reflog's
+# Option B the packer image no longer installs a specific lantern-box
+# release — cloud-init installs the target tag on first boot. VERSION is
+# still required and used purely as a label for the built image (see
+# lantern-box.pkr.hcl's `image_name = "lantern-box-${var.lantern_box_version}-..."`).
+# It stays set so tooling that slices by image label (e.g. the per-provider
+# latestImage() helpers in lantern-cloud/cmd/api/vps/*.go) keeps working.
 : "${VERSION:?VERSION must be set}"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -62,25 +68,35 @@ apt-get "${APT_OPTS[@]}" install -y -q \
   tzdata \
   nftables
 
-echo "==> Downloading lantern-box .deb from GitHub release"
-arch=$(dpkg --print-architecture)  # amd64 or arm64
-deb_name="lantern-box_${VERSION}_linux_${arch}.deb"
-deb_url="https://github.com/getlantern/lantern-box/releases/download/v${VERSION}/${deb_name}"
-echo "    URL: ${deb_url}"
-curl -fsSL -o "/tmp/${deb_name}" "${deb_url}"
-
-echo "==> Installing ${deb_name}"
-apt-get "${APT_OPTS[@]}" install -y -q "/tmp/${deb_name}"
-rm -f "/tmp/${deb_name}"
+# Reflog's Option B (Slack thread ts=1776197690.140869 in
+# #infrastructure-and-services, 2026-04-16): the packer image no longer
+# bakes in a specific lantern-box version. Cloud-init apt-installs the
+# release tag the orchestrator picked for this route — see
+# `getlantern/lantern-cloud` cmd/api/vps/cloudinit_packer.go. This
+# decouples release cadence (frequent) from base-image cadence (rare).
+#
+# The packer image contributes: runtime deps (installed above), systemd
+# drop-ins for OTel env (below), /etc/lantern-box and /var/lib/lantern-box
+# dirs, and the auto-update fallback cron. The lantern-box .deb itself
+# lands via cloud-init on first boot.
+#
+# Operators: BEFORE building + rolling out new images from this change,
+# set bandit_vps_default_release_tag in the lantern-cloud settings table
+# (or a per-track override in bandit_vps_image_targets). Without either,
+# cloud-init will skip the apt-install step and new VMs will boot
+# without a lantern-box binary — `systemctl enable --now lantern-box`
+# during config push will then fail. Revert is: re-merge the pre-Option-B
+# provision.sh.
+arch=$(dpkg --print-architecture)  # amd64 or arm64 — still used below
 
 echo "==> Setting up directories"
 mkdir -p /etc/lantern-box /var/lib/lantern-box
 
+# daemon-reload is a no-op here for the (not-yet-installed) lantern-box
+# service, but the otelcol-contrib service below needs it to pick up its
+# env drop-in. The apt install that runs under cloud-init will
+# daemon-reload again after the service unit appears on disk.
 systemctl daemon-reload
-
-# Do NOT enable the service here — it would start on boot before cloud-init
-# writes the config, causing a startup failure loop. Cloud-init should run:
-#   systemctl enable --now lantern-box
 
 echo "==> Installing OTel Collector for host metrics"
 otelcol_version="0.120.0"
