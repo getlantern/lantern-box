@@ -3,22 +3,10 @@ variable "lantern_box_version" {
   description = "Version tag to install (e.g. 1.2.3). Downloaded from GitHub release."
 }
 
-variable "do_api_token" {
-  type      = string
-  sensitive = true
-  default   = env("DIGITALOCEAN_API_TOKEN")
-}
-
 variable "linode_token" {
   type      = string
   sensitive = true
   default   = env("LINODE_TOKEN")
-}
-
-
-variable "do_region" {
-  type    = string
-  default = "sfo3"
 }
 
 variable "linode_region" {
