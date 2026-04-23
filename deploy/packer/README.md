@@ -1,6 +1,12 @@
 # Packer Images for lantern-box
 
-Pre-baked VM images with lantern-box installed. Boot-to-proxy-ready in ~35-60 seconds (vs 2-4 minutes with a stock image).
+Pre-baked VM images with runtime dependencies, systemd drop-ins, and
+sidecars (otelcol-contrib, Tailscale) already present. The
+`lantern-box` binary itself is **not** baked in — cloud-init apt-installs
+it on first boot (Reflog's Option B; see the "Not in the image" section
+below). Boot-to-proxy-ready is still fast because the heavy work
+(package install, otel config, CA cert, user setup) is done at image
+build time; only the small apt-install step runs on first boot.
 
 ## What's in the image
 

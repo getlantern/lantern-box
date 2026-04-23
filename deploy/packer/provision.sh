@@ -66,7 +66,8 @@ apt-get "${APT_OPTS[@]}" update -q
 apt-get "${APT_OPTS[@]}" install -y -q \
   ca-certificates \
   tzdata \
-  nftables
+  nftables \
+  wireguard-tools
 
 # Reflog's Option B (Slack thread ts=1776197690.140869 in
 # #infrastructure-and-services, 2026-04-16): the packer image no longer
@@ -76,9 +77,9 @@ apt-get "${APT_OPTS[@]}" install -y -q \
 # decouples release cadence (frequent) from base-image cadence (rare).
 #
 # The packer image contributes: runtime deps (installed above), systemd
-# drop-ins for OTel env (below), /etc/lantern-box and /var/lib/lantern-box
-# dirs, and the auto-update fallback cron. The lantern-box .deb itself
-# lands via cloud-init on first boot.
+# drop-ins for OTel env (below), and /etc/lantern-box and
+# /var/lib/lantern-box dirs. The lantern-box .deb itself lands via
+# cloud-init on first boot.
 #
 # Operators: BEFORE building + rolling out new images from this change,
 # set bandit_vps_default_release_tag in the lantern-cloud settings table
@@ -192,10 +193,32 @@ ln -sf /etc/ssl/certs/lanternet.crt /usr/local/share/ca-certificates/lantern/lan
 update-ca-certificates
 echo "    lanternet CA installed"
 
-echo "==> Verifying installation"
-if ! command -v lantern-box >/dev/null 2>&1; then
-  echo "lantern-box not found on PATH" >&2
+echo "==> Verifying image contents"
+# Under Option B the lantern-box binary is NOT expected in the image —
+# cloud-init apt-installs it on first boot. Check the things the packer
+# image actually contributes instead: the systemd drop-ins, the data
+# dirs, and the sidecars that ARE baked in here.
+missing=""
+for path in \
+  /etc/systemd/system/lantern-box.service.d/otel.conf \
+  /etc/systemd/system/otelcol-contrib.service.d/env.conf \
+  /etc/lantern-box \
+  /var/lib/lantern-box \
+  /etc/otelcol-contrib/config.yaml \
+  /etc/ssl/certs/lanternet.crt; do
+  [ -e "$path" ] || missing="$missing $path"
+done
+if [ -n "$missing" ]; then
+  echo "image verification failed; missing:$missing" >&2
   exit 1
 fi
-echo "    lantern-box installed at $(command -v lantern-box)"
+if ! command -v tailscale >/dev/null 2>&1; then
+  echo "tailscale not found on PATH" >&2
+  exit 1
+fi
+if ! command -v otelcol-contrib >/dev/null 2>&1; then
+  echo "otelcol-contrib not found on PATH" >&2
+  exit 1
+fi
+echo "    image contents verified"
 echo "==> Done. Image ready."

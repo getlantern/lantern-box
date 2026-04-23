@@ -47,7 +47,13 @@ jobs:
         id: version
         env:
           EVENT_NAME: ${{ github.event_name }}
-          INPUT_VERSION: ${{ inputs.version }}
+          # github.event.inputs.version resolves on every event type
+          # (including push, where it's simply empty). Plain
+          # `inputs.version` is only defined for workflow_dispatch /
+          # workflow_call — using it on a push trigger risks a stricter
+          # evaluator rejecting the expression before the shell script
+          # even runs.
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           case "$EVENT_NAME" in
             workflow_dispatch)
@@ -75,7 +81,10 @@ jobs:
         id: matrix
         env:
           EVENT_NAME: ${{ github.event_name }}
-          INPUT_BUILDERS: ${{ inputs.builders }}
+          # See note on INPUT_VERSION above — same reasoning for using
+          # github.event.inputs rather than bare inputs so push events
+          # don't choke on an undefined context.
+          INPUT_BUILDERS: ${{ github.event.inputs.builders }}
         run: |
           if [ "$EVENT_NAME" = "push" ]; then
             builders="linode,oracle-oci,alicloud-ecs"
