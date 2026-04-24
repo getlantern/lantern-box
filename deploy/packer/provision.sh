@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# VERSION is passed as an environment variable by Packer.
+# VERSION is passed as an environment variable by Packer. Under Reflog's
+# Option B the packer image no longer installs a specific lantern-box
+# release — cloud-init installs the target tag on first boot. VERSION is
+# still required and used purely as a label for the built image (see
+# lantern-box.pkr.hcl's `image_name = "lantern-box-${var.lantern_box_version}-..."`).
+# It stays set so tooling that slices by image label (e.g. the per-provider
+# latestImage() helpers in lantern-cloud/cmd/api/vps/*.go) keeps working.
 : "${VERSION:?VERSION must be set}"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -60,27 +66,38 @@ apt-get "${APT_OPTS[@]}" update -q
 apt-get "${APT_OPTS[@]}" install -y -q \
   ca-certificates \
   tzdata \
-  nftables
+  nftables \
+  wireguard-tools
 
-echo "==> Downloading lantern-box .deb from GitHub release"
-arch=$(dpkg --print-architecture)  # amd64 or arm64
-deb_name="lantern-box_${VERSION}_linux_${arch}.deb"
-deb_url="https://github.com/getlantern/lantern-box/releases/download/v${VERSION}/${deb_name}"
-echo "    URL: ${deb_url}"
-curl -fsSL -o "/tmp/${deb_name}" "${deb_url}"
-
-echo "==> Installing ${deb_name}"
-apt-get "${APT_OPTS[@]}" install -y -q "/tmp/${deb_name}"
-rm -f "/tmp/${deb_name}"
+# Reflog's Option B (Slack thread ts=1776197690.140869 in
+# #infrastructure-and-services, 2026-04-16): the packer image no longer
+# bakes in a specific lantern-box version. Cloud-init apt-installs the
+# release tag the orchestrator picked for this route — see
+# `getlantern/lantern-cloud` cmd/api/vps/cloudinit_packer.go. This
+# decouples release cadence (frequent) from base-image cadence (rare).
+#
+# The packer image contributes: runtime deps (installed above), systemd
+# drop-ins for OTel env (below), and /etc/lantern-box and
+# /var/lib/lantern-box dirs. The lantern-box .deb itself lands via
+# cloud-init on first boot.
+#
+# Operators: BEFORE building + rolling out new images from this change,
+# set bandit_vps_default_release_tag in the lantern-cloud settings table
+# (or a per-track override in bandit_vps_image_targets). Without either,
+# cloud-init will skip the apt-install step and new VMs will boot
+# without a lantern-box binary — `systemctl enable --now lantern-box`
+# during config push will then fail. Revert is: re-merge the pre-Option-B
+# provision.sh.
+arch=$(dpkg --print-architecture)  # amd64 or arm64 — still used below
 
 echo "==> Setting up directories"
 mkdir -p /etc/lantern-box /var/lib/lantern-box
 
+# daemon-reload is a no-op here for the (not-yet-installed) lantern-box
+# service, but the otelcol-contrib service below needs it to pick up its
+# env drop-in. The apt install that runs under cloud-init will
+# daemon-reload again after the service unit appears on disk.
 systemctl daemon-reload
-
-# Do NOT enable the service here — it would start on boot before cloud-init
-# writes the config, causing a startup failure loop. Cloud-init should run:
-#   systemctl enable --now lantern-box
 
 echo "==> Installing OTel Collector for host metrics"
 otelcol_version="0.120.0"
@@ -121,132 +138,13 @@ DROPIN
 systemctl daemon-reload
 # Do NOT enable — cloud-init writes env vars first, then enables the service.
 
-echo "==> Setting up lantern-box auto-update (via GitHub Releases)"
-mkdir -p /var/log/lantern-box
-cat > /usr/local/bin/lantern-box-update <<'SCRIPT'
-#!/bin/bash
-set -uo pipefail
-# NOTE: no -e — we handle errors explicitly so we can log them to SigNoz.
-
-LOG_FILE="/var/log/lantern-box/update.log"
-
-# Structured JSON log line for the OTel filelog receiver → SigNoz pipeline.
-# Uses python3 json.dumps for safe escaping of all dynamic fields.
-log_json() {
-  local level="$1" msg="$2"
-  local ts json_line
-  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  json_line=$(
-    TS="$ts" \
-    LEVEL="$level" \
-    MSG="$msg" \
-    CURRENT_VER="${current_ver:-unknown}" \
-    LATEST_VER="${latest_ver:-unknown}" \
-    python3 -c '
-import json, os
-print(json.dumps({
-    "timestamp": os.environ["TS"],
-    "severity": os.environ["LEVEL"],
-    "body": os.environ["MSG"],
-    "source": "lantern-box-update",
-    "current_ver": os.environ.get("CURRENT_VER", "unknown"),
-    "latest_ver": os.environ.get("LATEST_VER", "unknown"),
-}, ensure_ascii=False))
-'
-  )
-  printf '%s\n' "$json_line" >> "$LOG_FILE"
-}
-
-# Prevent overlapping runs — cron may start a new instance while the
-# previous one is still sleeping or installing.
-exec 9>/var/lock/lantern-box-update.lock
-if ! flock -n 9; then
-  exit 0
-fi
-
-# Derive a per-machine sleep (0-599s) from machine-id so instances stagger naturally
-# within the 10-minute check interval.
-sleep $(( $(cksum /etc/machine-id | cut -d' ' -f1) % 600 ))
-
-arch=$(dpkg --print-architecture)
-current_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
-
-# Fetch latest release tag by following the /releases/latest redirect and
-# extracting the tag from the final URL. This is more robust than reading
-# %{redirect_url} from a HEAD request, which can fail when curl is behind
-# a transparent proxy or CDN that follows the 302 before curl sees it.
-curl_err=$(mktemp)
-final_url=$(curl -fsSL --retry 3 --max-time 30 -o /dev/null -w '%{url_effective}' \
-  https://github.com/getlantern/lantern-box/releases/latest 2>"$curl_err") || true
-curl_stderr=$(cat "$curl_err" 2>/dev/null)
-rm -f "$curl_err"
-latest_tag="${final_url##*/}"
-
-if [ -z "$latest_tag" ] || [ "$latest_tag" = "latest" ]; then
-  log_json "ERROR" "failed to fetch latest release tag (final_url=${final_url:-empty}, curl_err=${curl_stderr:-none})"
-  exit 1
-fi
-
-latest_ver="${latest_tag#v}"
-
-if [ "$current_ver" = "$latest_ver" ]; then
-  exit 0
-fi
-
-log_json "INFO" "update available: ${current_ver} -> ${latest_ver}"
-
-deb_name="lantern-box_${latest_ver}_linux_${arch}.deb"
-deb_url="https://github.com/getlantern/lantern-box/releases/download/${latest_tag}/${deb_name}"
-
-tmpfile=$(mktemp /tmp/lantern-box-update-XXXXXX.deb) || tmpfile=""
-if [ -z "$tmpfile" ]; then
-  log_json "ERROR" "failed to create temporary file for downloading ${deb_url}"
-  exit 1
-fi
-trap 'rm -f "$tmpfile"' EXIT
-
-if ! curl -fsSL --retry 3 --max-time 120 -o "$tmpfile" "${deb_url}"; then
-  log_json "ERROR" "failed to download ${deb_url}"
-  exit 1
-fi
-
-if ! dpkg -o DPkg::Lock::Timeout=120 -i "$tmpfile"; then
-  apt-get -o DPkg::Lock::Timeout=120 update -qq && apt-get -o DPkg::Lock::Timeout=120 install -f -y -qq
-fi
-
-new_ver=$(dpkg-query -W -f='${Version}' lantern-box 2>/dev/null || echo "none")
-if [ "$new_ver" != "$latest_ver" ]; then
-  log_json "ERROR" "install failed: expected ${latest_ver} but got ${new_ver}"
-  exit 1
-fi
-
-log_json "INFO" "upgraded ${current_ver} -> ${new_ver}, restarting service"
-if ! systemctl restart lantern-box; then
-  log_json "ERROR" "failed to restart lantern-box service after upgrade to ${new_ver}"
-  exit 1
-fi
-SCRIPT
-chmod 755 /usr/local/bin/lantern-box-update
-
-# Rotate the update log so it doesn't grow unbounded.
-cat > /etc/logrotate.d/lantern-box <<'LOGROTATE'
-/var/log/lantern-box/*.log {
-  daily
-  rotate 7
-  compress
-  missingok
-  notifempty
-  copytruncate
-}
-LOGROTATE
-
-cat > /etc/cron.d/lantern-box-update <<'CRON'
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-MAILTO=""
-*/10 * * * * root /usr/local/bin/lantern-box-update 2>&1 | logger -t lantern-box-update
-CRON
-chmod 644 /etc/cron.d/lantern-box-update
+# Auto-update is now centrally orchestrated from lantern-cloud — see
+# docs/design/central-vps-updates.md. BanditVPSHotSwapWorker SSHes in
+# and installs the target release tag; if SSH fails repeatedly,
+# BanditVPSAutoreplaceWorker drains the route and a fresh VM provisions
+# with the right tag via cloud-init. No more per-host cron, no more
+# silent "install failed" errors with no way to identify affected
+# hosts (we had 266/hour of those at peak).
 
 # Re-enable unattended-upgrades so the final image receives security updates.
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
@@ -295,10 +193,32 @@ ln -sf /etc/ssl/certs/lanternet.crt /usr/local/share/ca-certificates/lantern/lan
 update-ca-certificates
 echo "    lanternet CA installed"
 
-echo "==> Verifying installation"
-if ! command -v lantern-box >/dev/null 2>&1; then
-  echo "lantern-box not found on PATH" >&2
+echo "==> Verifying image contents"
+# Under Option B the lantern-box binary is NOT expected in the image —
+# cloud-init apt-installs it on first boot. Check the things the packer
+# image actually contributes instead: the systemd drop-ins, the data
+# dirs, and the sidecars that ARE baked in here.
+missing=""
+for path in \
+  /etc/systemd/system/lantern-box.service.d/otel.conf \
+  /etc/systemd/system/otelcol-contrib.service.d/env.conf \
+  /etc/lantern-box \
+  /var/lib/lantern-box \
+  /etc/otelcol-contrib/config.yaml \
+  /etc/ssl/certs/lanternet.crt; do
+  [ -e "$path" ] || missing="$missing $path"
+done
+if [ -n "$missing" ]; then
+  echo "image verification failed; missing:$missing" >&2
   exit 1
 fi
-echo "    lantern-box installed at $(command -v lantern-box)"
+if ! command -v tailscale >/dev/null 2>&1; then
+  echo "tailscale not found on PATH" >&2
+  exit 1
+fi
+if ! command -v otelcol-contrib >/dev/null 2>&1; then
+  echo "otelcol-contrib not found on PATH" >&2
+  exit 1
+fi
+echo "    image contents verified"
 echo "==> Done. Image ready."
