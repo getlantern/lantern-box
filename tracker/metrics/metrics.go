@@ -20,8 +20,9 @@ type metricsManager struct {
 	conns    metric.Int64UpDownCounter
 	duration metric.Int64Histogram
 
-	countryLookup  geo.CountryLookup
-	lookupTimeout  time.Duration
+	countryLookup geo.CountryLookup
+	lookupTimeout time.Duration
+	lookupSem     chan struct{}
 }
 
 var metrics = &metricsManager{
@@ -55,5 +56,6 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, lookupTimeout time.Dur
 		metrics.countryLookup = countryLookup
 	}
 	metrics.lookupTimeout = lookupTimeout
+	metrics.lookupSem = make(chan struct{}, 64)
 	metrics.meter = meter
 }

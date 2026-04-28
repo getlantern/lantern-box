@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	sdkotel "go.opentelemetry.io/otel"
 
@@ -226,6 +227,40 @@ func TestDeviceConnectedSpanNoClientInfo(t *testing.T) {
 	emitDeviceConnectedSpan(context.Background())
 	assert.Empty(t, exporter.GetSpans(),
 		"no span should be emitted without client info")
+}
+
+type stubLookup struct{ code string }
+
+func (s stubLookup) CountryCode(_ net.IP) string { return s.code }
+
+type blockingLookup struct{ ch chan struct{} }
+
+func (b blockingLookup) CountryCode(_ net.IP) string {
+	<-b.ch
+	return "XX"
+}
+
+func TestLookupCountryTimeout(t *testing.T) {
+	synctest.Run(func() {
+		bl := blockingLookup{ch: make(chan struct{})}
+		defer close(bl.ch)
+
+		SetupMetricsManager(bl, time.Millisecond)
+
+		cc, src := lookupCountry(net.IPv4(1, 2, 3, 4))
+		assert.Equal(t, "", cc)
+		assert.Equal(t, "", src)
+	})
+}
+
+func TestLookupCountrySuccess(t *testing.T) {
+	synctest.Run(func() {
+		SetupMetricsManager(stubLookup{code: "DE"}, 5*time.Millisecond)
+
+		cc, src := lookupCountry(net.IPv4(1, 2, 3, 4))
+		assert.Equal(t, "DE", cc)
+		assert.Equal(t, "maxmind", src)
+	})
 }
 
 func extractCountersByAttribute(rm metricdata.ResourceMetrics, name string) map[string]int64 {

@@ -188,11 +188,21 @@ func lookupCountry(ip net.IP) (country, geoDB string) {
 
 	var cc string
 	if metrics.lookupTimeout > 0 {
+		select {
+		case metrics.lookupSem <- struct{}{}:
+		default:
+			return "", ""
+		}
 		ch := make(chan string, 1)
-		go func() { ch <- call() }()
+		go func() {
+			defer func() { <-metrics.lookupSem }()
+			ch <- call()
+		}()
+		timer := time.NewTimer(metrics.lookupTimeout)
+		defer timer.Stop()
 		select {
 		case cc = <-ch:
-		case <-time.After(metrics.lookupTimeout):
+		case <-timer.C:
 			return "", ""
 		}
 	} else {
