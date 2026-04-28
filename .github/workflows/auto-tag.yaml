@@ -10,6 +10,7 @@ on:
       - 'Dockerfile'
       - 'Dockerfile.goreleaser'
       - 'cmd/release/*.service'
+      - 'deploy/packer/**'
 
 permissions:
   contents: write

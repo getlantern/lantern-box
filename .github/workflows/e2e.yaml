@@ -68,11 +68,19 @@ jobs:
           WASM_HASH=$(sha256sum "$WASM_PATH" | awk '{print $1}')
           cp "$WASM_PATH" plain.wasm
 
+          # Reflex client TLS cert (client acts as TLS server in Reflex)
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout reflex-client-key.pem -out reflex-client-cert.pem -days 1 -nodes \
+            -subj "/CN=www.example.com"
+          REFLEX_CERT_FP=$(openssl x509 -in reflex-client-cert.pem -outform DER \
+            | sha256sum | awk '{print $1}')
+
           echo "::add-mask::$SAMIZDAT_PRIV"
           echo "samizdat_priv=$SAMIZDAT_PRIV" >> "$GITHUB_OUTPUT"
           echo "samizdat_pub=$SAMIZDAT_PUB" >> "$GITHUB_OUTPUT"
           echo "samizdat_short_id=$SAMIZDAT_SHORT_ID" >> "$GITHUB_OUTPUT"
           echo "wasm_hash=$WASM_HASH" >> "$GITHUB_OUTPUT"
+          echo "reflex_cert_fp=$REFLEX_CERT_FP" >> "$GITHUB_OUTPUT"
 
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
@@ -131,6 +139,7 @@ jobs:
           SAMIZDAT_PRIV: ${{ steps.creds.outputs.samizdat_priv }}
           SAMIZDAT_SHORT_ID: ${{ steps.creds.outputs.samizdat_short_id }}
           WASM_HASH: ${{ steps.creds.outputs.wasm_hash }}
+          REFLEX_CERT_FP: ${{ steps.creds.outputs.reflex_cert_fp }}
         run: |
           SSH_OPTS="-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -i e2e_key"
 
@@ -140,7 +149,7 @@ jobs:
 
           # Upload files
           echo "Starting SCP upload..."
-          scp $SSH_OPTS lantern-box.gz cert.pem key.pem plain.wasm root@"$DROPLET_IP":/root/
+          scp $SSH_OPTS lantern-box.gz cert.pem key.pem plain.wasm reflex-client-cert.pem reflex-client-key.pem root@"$DROPLET_IP":/root/
           echo "SCP upload complete"
 
           # Decompress and make binary executable
@@ -218,11 +227,32 @@ jobs:
           JSONEOF
           scp $SSH_OPTS /tmp/water-server.json root@"$DROPLET_IP":/root/water-server.json
 
-          # Start all 3 server processes
+          # --- Reflex server config ---
+          cat > /tmp/reflex-server.json << JSONEOF
+          {
+            "log": {"level": "debug"},
+            "inbounds": [{
+              "type": "reflex",
+              "tag": "reflex-in",
+              "listen": "::",
+              "listen_port": 9004,
+              "auth_tokens": ["${REFLEX_CERT_FP}"],
+              "server_name": "www.example.com"
+            }],
+            "outbounds": [{
+              "type": "direct",
+              "tag": "direct"
+            }]
+          }
+          JSONEOF
+          scp $SSH_OPTS /tmp/reflex-server.json root@"$DROPLET_IP":/root/reflex-server.json
+
+          # Start all 4 server processes
           echo "Starting servers..."
           ssh $SSH_OPTS root@"$DROPLET_IP" "nohup /root/lantern-box run --config /root/algeneva-server.json > /root/algeneva-server.log 2>&1 < /dev/null &
           nohup /root/lantern-box run --config /root/samizdat-server.json > /root/samizdat-server.log 2>&1 < /dev/null &
           nohup /root/lantern-box run --config /root/water-server.json > /root/water-server.log 2>&1 < /dev/null &
+          nohup /root/lantern-box run --config /root/reflex-server.json > /root/reflex-server.log 2>&1 < /dev/null &
           sleep 1"
           echo "Servers launched"
 
@@ -230,7 +260,7 @@ jobs:
           echo "Checking port readiness..."
           # Note: must use bash explicitly since Ubuntu default shell is dash (no /dev/tcp support)
           ssh $SSH_OPTS root@"$DROPLET_IP" bash << 'READYEOF'
-            for port in 9001 9002 9003; do
+            for port in 9001 9002 9003 9004; do
               echo "Waiting for port $port to be ready..."
               for i in $(seq 1 60); do
                 if echo > /dev/tcp/127.0.0.1/$port 2>/dev/null; then
@@ -463,6 +493,78 @@ jobs:
 
           kill $CLIENT_PID 2>/dev/null || true
 
+      - name: Test Reflex
+        id: test_reflex
+        continue-on-error: true
+        env:
+          DROPLET_IP: ${{ steps.droplet.outputs.droplet_ip }}
+        run: |
+          # Read client cert/key from the files generated in the creds step
+          REFLEX_CERT=$(cat reflex-client-cert.pem | jq -Rs .)
+          REFLEX_KEY=$(cat reflex-client-key.pem | jq -Rs .)
+
+          cat > /tmp/reflex-client.json << JSONEOF
+          {
+            "log": {"level": "debug"},
+            "inbounds": [{
+              "type": "mixed",
+              "tag": "mixed-in",
+              "listen": "127.0.0.1",
+              "listen_port": 1084
+            }],
+            "outbounds": [{
+              "type": "reflex",
+              "tag": "reflex-out",
+              "server": "${DROPLET_IP}",
+              "server_port": 9004,
+              "cert_pem": ${REFLEX_CERT},
+              "key_pem": ${REFLEX_KEY}
+            }]
+          }
+          JSONEOF
+
+          setsid ./lantern-box run --config /tmp/reflex-client.json > /tmp/reflex-client.log 2>&1 &
+          CLIENT_PID=$!
+          sleep 3
+
+          if ! kill -0 $CLIENT_PID 2>/dev/null; then
+            echo "Reflex client failed to start"
+            cat /tmp/reflex-client.log
+            exit 1
+          fi
+
+          # Test HTTP
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1084 -m 30 http://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "Reflex HTTP test PASSED"
+          else
+            echo "Reflex HTTP test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/reflex-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Test HTTPS
+          set +e
+          RESPONSE=$(curl -sf -x socks5h://127.0.0.1:1084 -m 30 https://example.com)
+          CURL_EXIT=$?
+          set -e
+          if echo "$RESPONSE" | grep -q "Example Domain"; then
+            echo "Reflex HTTPS test PASSED"
+          else
+            echo "Reflex HTTPS test FAILED (curl exit code: $CURL_EXIT)"
+            echo "Response: $RESPONSE"
+            cat /tmp/reflex-client.log
+            kill $CLIENT_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          kill $CLIENT_PID 2>/dev/null || true
+
       - name: Check test results
         if: always()
         run: |
@@ -484,6 +586,12 @@ jobs:
             echo "WATER:     PASSED"
           else
             echo "WATER:     FAILED"
+            FAILED=1
+          fi
+          if [ "${{ steps.test_reflex.outcome }}" = "success" ]; then
+            echo "Reflex:    PASSED"
+          else
+            echo "Reflex:    FAILED"
             FAILED=1
           fi
           echo "========================"

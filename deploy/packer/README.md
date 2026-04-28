@@ -19,25 +19,28 @@ Pre-baked VM images with lantern-box installed. Boot-to-proxy-ready in ~35-60 se
 
 ```bash
 cd deploy/packer
-packer init lantern-box.pkr.hcl
+packer init .
 
 # Build for a single provider
 packer build \
   -var "lantern_box_version=0.5.0" \
-  -only="digitalocean.lantern-box" \
-  lantern-box.pkr.hcl
+  -only="linode.lantern-box" \
+  .
 
 # Build for all providers
 packer build \
   -var "lantern_box_version=0.5.0" \
-  lantern-box.pkr.hcl
+  .
 ```
+
+### Datacap (optional, closed-source)
+
+In CI, the `datacap` binary is built from `getlantern/lantern-cloud` and baked into the image. For local builds, empty placeholders are created automatically so the build succeeds without it. To include datacap locally, place the pre-built binaries at `/tmp/datacap-amd64` and `/tmp/datacap-arm64` before running `packer build`.
 
 ## Environment variables
 
 | Variable | Description |
 |---|---|
-| `DIGITALOCEAN_API_TOKEN` | DigitalOcean API token |
 | `LINODE_TOKEN` | Linode/Akamai API token |
 | `FURY_TOKEN` | Gemfury token for .deb repo |
 | `OCI_TENANCY_OCID` | OCI tenancy OCID |
@@ -70,17 +73,6 @@ packer build \
 2. Pass a cloud-init user-data file that writes the config and starts the service
 
 See `cloud-init.yaml.example` for the template.
-
-### DigitalOcean example
-
-```bash
-doctl compute droplet create my-proxy \
-  --image <snapshot-id> \
-  --region sfo3 \
-  --size s-1vcpu-1gb \
-  --user-data-file cloud-init.yaml \
-  --wait
-```
 
 ### Linode example
 

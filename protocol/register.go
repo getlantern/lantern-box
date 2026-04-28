@@ -13,7 +13,9 @@ import (
 	"github.com/getlantern/lantern-box/protocol/amnezia"
 	"github.com/getlantern/lantern-box/protocol/group"
 	"github.com/getlantern/lantern-box/protocol/outline"
+	"github.com/getlantern/lantern-box/protocol/reflex"
 	"github.com/getlantern/lantern-box/protocol/samizdat"
+	"github.com/getlantern/lantern-box/protocol/unbounded"
 	"github.com/getlantern/lantern-box/protocol/water"
 )
 
@@ -22,7 +24,9 @@ var supportedProtocols = []string{
 	"algeneva",
 	"amnezia",
 	"outline",
+	"reflex",
 	"samizdat",
+	"unbounded",
 	"water",
 
 	// sing-box built-in protocols
@@ -66,6 +70,7 @@ func RegisterProtocols(ctx context.Context) context.Context {
 
 func registerInbounds(registry *inbound.Registry) {
 	algeneva.RegisterInbound(registry)
+	reflex.RegisterInbound(registry)
 	samizdat.RegisterInbound(registry)
 	water.RegisterInbound(registry)
 }
@@ -74,7 +79,9 @@ func registerOutbounds(registry *outbound.Registry) {
 	// custom protocol outbounds
 	algeneva.RegisterOutbound(registry)
 	outline.RegisterOutbound(registry)
+	reflex.RegisterOutbound(registry)
 	samizdat.RegisterOutbound(registry)
+	unbounded.RegisterOutbound(registry)
 	water.RegisterOutbound(registry)
 
 	// utility outbounds

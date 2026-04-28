@@ -1,6 +1,6 @@
 # lantern-box
 
-Lantern Box is a censorship circumvention proxy and client platform that's built on [sing-box](https://github.com/SagerNet/sing-box) -- the universal proxy platform -- with extra protocols built for places where the internet comes with walls. It adds [Samizdat](https://github.com/getlantern/samizdat), [WATER](https://arxiv.org/html/2312.00163v2), [Outline SDK smart dialer](https://github.com/Jigsaw-Code/outline-sdk/tree/main/x/smart), [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/), and [ALGeneva](https://www.usenix.org/system/files/sec22-harrity.pdf) to the sing-box ecosystem.
+Lantern Box is a censorship circumvention proxy and client platform that's built on [sing-box](https://github.com/SagerNet/sing-box) -- the universal proxy platform -- with extra protocols built for places where the internet comes with walls. It adds [Samizdat](https://github.com/getlantern/samizdat), [Reflex](https://github.com/getlantern/engineering/issues/3166), [WATER](https://arxiv.org/html/2312.00163v2), [Outline SDK smart dialer](https://github.com/Jigsaw-Code/outline-sdk/tree/main/x/smart), [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/), and [ALGeneva](https://www.usenix.org/system/files/sec22-harrity.pdf) to the sing-box ecosystem.
 
 The goal is to be as useful as possible to the censorship circumvention community. Operators are encouraged to run servers and hand configs to users. We contribute changes upstream whenever we can.
 
@@ -75,6 +75,7 @@ Pick the protocol that fits your threat model.
 | Protocol | Threat Model | Keys/Certs? | Server Needed? |
 |---|---|---|---|
 | **Samizdat** | Full DPI resistance (Russia-grade TSPU) | X25519 + TLS cert | Yes |
+| **Reflex** | TLS fingerprinting + SNI extraction | TLS cert (self-signed) | Yes |
 | **WATER** | Pluggable transport (swap WASM modules) | WASM hash | Yes |
 | **Outline SDK** | DNS/SNI blocking (smart dialer) | No | No |
 | **AmneziaWG** | WireGuard protocol fingerprinting | WireGuard keys | Yes |
@@ -211,6 +212,132 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 | `masquerade_idle_timeout` | string | `"5m"` | Masquerade connection idle timeout |
 | `masquerade_max_duration` | string | `"10m"` | Max masquerade connection duration |
 | `max_concurrent_streams` | int | `250` | Max H2 streams per connection |
+
+---
+
+### Reflex
+
+Reflex reverses TLS roles: the **server** sends the TLS ClientHello, and the **client** acts as the TLS server. This defeats censorship techniques that inspect outbound traffic from censored users:
+
+- **No ClientHello in the client→server direction** -- censors can't extract SNI or compute JA3/JA4 fingerprints
+- **Client's first data is a TLS ServerHello** (`\x16\x03...`) -- satisfies the [GFW's fully encrypted traffic exemption rules](https://gfw.report/publications/usenixsecurity23/en/)
+- **Authentication via certificate fingerprint** -- the server validates the SHA-256 hash of the client's TLS certificate during the handshake. No pre-handshake bytes are exchanged.
+- **Active probe resistance** -- an unauthorized client that doesn't present the expected certificate is rejected during the TLS handshake
+
+**When to use it:** The censor is fingerprinting TLS ClientHello (JA3/JA4), extracting SNI, or detecting "fully encrypted" traffic. Reflex makes these techniques structurally impossible because the data they analyze never appears in the direction they inspect.
+
+**How it works:**
+
+```
+Censored Client (TCP client, TLS server)     Proxy Server (TCP server, TLS client)
+  |                                                |
+  |--- TCP SYN ---------------------------------->|
+  |<-- TCP SYN-ACK -------------------------------|
+  |                                                |
+  |<-- TLS ClientHello ----------------------------|  Server speaks first!
+  |--- TLS ServerHello + Certificate ------------>|  Client presents cert
+  |<-- TLS Finished -------------------------------|  Server validates fingerprint
+  |--- TLS Finished ------------------------------>|
+  |                                                |
+  |--- destination (encrypted) ------------------>|
+  |   Proxy tunnel active                          |
+```
+
+**What the censor sees in client→server direction:** TCP SYN, then a TLS ServerHello. No ClientHello, no SNI, no JA3.
+
+#### Credential generation
+
+You need a TLS certificate for the client (which acts as TLS server). The server validates its SHA-256 fingerprint.
+
+```bash
+# Generate ECDSA P-256 certificate for the client
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout client-key.pem -out client-cert.pem -days 365 -nodes \
+  -subj "/CN=www.example.com"
+
+# Compute the SHA-256 fingerprint (this goes in the server config)
+openssl x509 -in client-cert.pem -outform DER | shasum -a 256 | cut -d' ' -f1
+```
+
+#### Server config
+
+The server acts as TLS client -- it sends ClientHello and validates the peer's certificate fingerprint.
+
+```json
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "reflex",
+      "tag": "reflex-in",
+      "listen": "::",
+      "listen_port": 443,
+      "auth_tokens": ["CERT_SHA256_FINGERPRINT"],
+      "server_name": "www.microsoft.com"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+```
+
+#### Client config
+
+The client acts as TLS server -- it presents a certificate that the server validates.
+
+```json
+{
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "reflex",
+      "tag": "reflex-out",
+      "server": "YOUR_SERVER_IP",
+      "server_port": 443,
+      "cert_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+      "key_pem": "-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----"
+    }
+  ]
+}
+```
+
+#### All client (outbound) options
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `cert_pem` | string | | Inline TLS certificate PEM (client acts as TLS server) |
+| `key_pem` | string | | Inline TLS private key PEM |
+| `cert_path` | string | | Path to TLS certificate file (alternative to inline) |
+| `key_path` | string | | Path to TLS key file (alternative to inline) |
+| `connect_timeout` | string | `"15s"` | TCP + reversed TLS handshake timeout |
+
+#### All server (inbound) options
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `auth_tokens` | string[] | *required* | SHA-256 cert fingerprints of allowed clients (lowercase hex, 64 chars) |
+| `server_name` | string | `"www.example.com"` | SNI in the server's ClientHello (invisible to censor -- sent server→client) |
+
+#### Composing with other techniques
+
+Reflex composes powerfully with other evasion techniques:
+
+- **Peer proxies** (residential IPs) + Reflex = no IP reputation issue + no TLS fingerprint
+- **[Knock](https://github.com/getlantern/engineering/issues/3167)** (proxy connects inbound to censored user) + Reflex = natural TLS direction, defeats all outbound detection
+- **CDN fronting** + Reflex = CDN terminates TLS normally, Reflex operates on the inner connection
+
+See the [engineering ticket](https://github.com/getlantern/engineering/issues/3166) for the full design rationale.
 
 ---
 

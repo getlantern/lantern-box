@@ -252,6 +252,20 @@ chmod 644 /etc/cron.d/lantern-box-update
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
 systemctl enable unattended-upgrades.service 2>/dev/null || true
 
+echo "==> Creating lantern management user (for Tailscale SSH via Headscale ACL)"
+# The Headscale ACL grants group:dev SSH access to tag:external nodes as user "lantern".
+# Tailscale SSH looks up the user locally, so it must exist in /etc/passwd.
+if id -u lantern >/dev/null 2>&1; then
+  echo "    lantern user already exists"
+else
+  useradd --system --create-home --shell /bin/bash --comment "Lantern management" lantern
+fi
+# Grant passwordless sudo so operators can perform admin tasks after SSH.
+echo "lantern ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/lantern
+chmod 440 /etc/sudoers.d/lantern
+visudo -cf /etc/sudoers.d/lantern
+echo "    lantern user present at $(id lantern)"
+
 echo "==> Installing Tailscale client (for Headscale VPN management)"
 # Add Tailscale apt repo — works on Ubuntu 24.04 (noble)
 curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | \
@@ -263,6 +277,23 @@ apt-get "${APT_OPTS[@]}" install -y -q tailscale
 systemctl enable tailscaled
 # Do NOT run 'tailscale up' here — cloud-init provides the auth key at runtime.
 echo "    tailscale installed at $(command -v tailscale)"
+
+echo "==> Installing Lanternet internal CA certificate"
+# The internal ops pipeline (ops.lantr.net) uses a cert signed by the Lanternet
+# private CA. Install the CA cert so OTel collectors and the datacap sidecar
+# can reach internal services via TLS.
+curl -fsSL --retry 5 --connect-timeout 10 --max-time 60 \
+  -o /etc/ssl/certs/lanternet.crt \
+  "https://privateca-content-62724385-0000-2889-acf2-f403043a1bac.storage.googleapis.com/71406e3543f7e5be892e/ca.crt"
+# Verify checksum (cert expires 2032; URL/checksum from lantern-cloud ans/tasks/install-lanternet-ca.yaml)
+echo "c9d283c11de3b7d38f1eb38fabcfbcff9b77f302d3eaf506ae691bb14cca792d  /etc/ssl/certs/lanternet.crt" \
+  | sha256sum -c -
+# Also add to the system CA store so Go's crypto/tls (used by otelcol-contrib
+# and lantern-box) trusts it for outgoing HTTPS connections.
+mkdir -p /usr/local/share/ca-certificates/lantern
+ln -sf /etc/ssl/certs/lanternet.crt /usr/local/share/ca-certificates/lantern/lanternet.crt
+update-ca-certificates
+echo "    lanternet CA installed"
 
 echo "==> Verifying installation"
 if ! command -v lantern-box >/dev/null 2>&1; then
