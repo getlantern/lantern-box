@@ -282,7 +282,7 @@ func newURLTestGroup(
 ) *urlTestGroup {
 	ctx, cancel := context.WithCancel(ctx)
 	var history A.URLTestHistoryStorage
-	if historyFromCtx := service.PtrFromContext[urltest.HistoryStorage](ctx); historyFromCtx != nil {
+	if historyFromCtx := service.FromContext[A.URLTestHistoryStorage](ctx); historyFromCtx != nil {
 		history = historyFromCtx
 	} else if clashServer := service.FromContext[A.ClashServer](ctx); clashServer != nil {
 		history = clashServer.HistoryStorage()

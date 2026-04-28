@@ -53,11 +53,15 @@ type ReflexInboundOptions struct {
 	// ClientHello. Probes never see Reflex.
 	//
 	// Set to "0" or leave empty to disable (probing exposure for Reflex).
-	// Typical value: "5s". Jittered by SilenceJitter to avoid timing fingerprint.
+	// Typical value: "2s". Jittered by SilenceJitter to avoid timing fingerprint.
 	SilenceTimeout string `json:"silence_timeout,omitempty"`
 
-	// SilenceJitter is the maximum random duration added to SilenceTimeout per
-	// connection. Defaults to "2s" when SilenceTimeout is set.
+	// SilenceJitter is the half-width of a symmetric random offset applied to
+	// SilenceTimeout per connection. The actual wait is uniformly distributed
+	// in [SilenceTimeout - SilenceJitter, SilenceTimeout + SilenceJitter), so
+	// SilenceJitter must be strictly less than SilenceTimeout (otherwise the
+	// minimum wait could reach zero and the silence window would be skipped).
+	// Defaults to "600ms" when SilenceTimeout is set.
 	SilenceJitter string `json:"silence_jitter,omitempty"`
 
 	// MasqueradeUpstream is the host:port of a real TLS service to which
