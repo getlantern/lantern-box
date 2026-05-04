@@ -82,6 +82,13 @@ type Outbound struct {
 	ui           UBClientcore.UI
 	ql           *UBClientcore.QUICLayer
 	uot          *uot.Client
+
+	// Constructed in NewOutbound; observes successful dial latencies and
+	// emits structured warnings when the current pairing's dials look
+	// pathological. Purely passive in this PR — the soft-reset action is
+	// gated on a follow-up that adds a re-pairing API in broflake. See
+	// watchdog.go for the trip heuristic.
+	watchdog *dialWatchdog
 }
 
 // tlsProvider carries the inputs needed to generate a TLS config lazily at
@@ -165,6 +172,7 @@ func NewOutbound(
 		Dialer:  (*uotDialer)(o),
 		Version: uot.Version,
 	}
+	o.watchdog = newDialWatchdog()
 	return o, nil
 }
 
@@ -249,9 +257,11 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 				"err", err)
 			return nil, err
 		}
+		elapsed := time.Since(started)
 		o.logger.DebugContext(ctx, "unbounded TCP dial ok",
 			"dest", dest,
-			"elapsed", time.Since(started))
+			"elapsed", elapsed)
+		o.recordWatchdog(ctx, elapsed)
 		return conn, nil
 	case N.NetworkUDP:
 		o.logger.DebugContext(ctx, "unbounded UoT dial start", "dest", dest)
@@ -263,9 +273,11 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 				"err", err)
 			return nil, err
 		}
+		elapsed := time.Since(started)
 		o.logger.DebugContext(ctx, "unbounded UoT dial ok",
 			"dest", dest,
-			"elapsed", time.Since(started))
+			"elapsed", elapsed)
+		o.recordWatchdog(ctx, elapsed)
 		return conn, nil
 	}
 	return nil, fmt.Errorf("unbounded: unsupported network %q", network)
@@ -290,10 +302,37 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 			"err", err)
 		return nil, err
 	}
+	elapsed := time.Since(started)
 	o.logger.DebugContext(ctx, "unbounded UoT ListenPacket ok",
 		"dest", dest,
-		"elapsed", time.Since(started))
+		"elapsed", elapsed)
+	o.recordWatchdog(ctx, elapsed)
 	return pc, nil
+}
+
+// recordWatchdog feeds a successful dial's elapsed time into the per-outbound
+// dialWatchdog and surfaces any verdict change at the appropriate log level.
+// Failed dials are deliberately NOT recorded: they conflate destination
+// availability with peer quality and would noise up the trip heuristic.
+func (o *Outbound) recordWatchdog(ctx context.Context, elapsed time.Duration) {
+	if o.watchdog == nil {
+		return
+	}
+	ev := o.watchdog.record(elapsed)
+	switch {
+	case ev.tripped:
+		o.logger.WarnContext(ctx, "unbounded peer flagged unhealthy",
+			"reason", ev.reason,
+			"median_slow", ev.medianSlow,
+			"trips_total", ev.tripsTotal,
+			"window_size", ev.sampleCount,
+		)
+	case ev.rearmed:
+		o.logger.InfoContext(ctx, "unbounded peer recovered (fast dial seen)",
+			"elapsed", elapsed,
+			"trips_total", ev.tripsTotal,
+		)
+	}
 }
 
 // signalingClient returns the HTTP client broflake uses to reach freddie.
