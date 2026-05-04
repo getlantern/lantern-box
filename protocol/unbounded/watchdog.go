@@ -11,9 +11,8 @@ import (
 // observational: on a trip it returns information for the caller to log, but
 // takes no action against the broflake state machine. The reset-on-trip
 // behavior is deferred to a follow-up that adds a soft re-pairing API in
-// broflake (see PR #357 et al.); landing this passive observer first gives
-// us empirical data on how often the symptom actually fires before we touch
-// FSM ownership.
+// broflake; landing this passive observer first gives us empirical data on
+// how often the symptom actually fires before we touch FSM ownership.
 //
 // Design rationale (region-agnostic by construction):
 //
@@ -25,21 +24,32 @@ import (
 //     consumer's geography. Networks in restrictive regions tend to land
 //     consistently in the 1–4s band — slower than ideal but not >5s, so
 //     they don't trip.
-//   - everSeenFast is read from the rolling window, not a per-pairing flag,
-//     so re-arm happens automatically as soon as a fresh pairing produces
-//     a fast dial — no need to detect "new pairing" from the outbound layer.
-//   - The window size matches the consecutive-slow limit: with N=10 and
-//     limit=5, we trip when 5 of the last 10 dials are slow AND none are
-//     fast. That's the "any fast dial saves the pairing" property the
-//     design called for.
+//   - "Any fast dial in window" is read from the rolling buffer, not a
+//     per-pairing flag, so re-arm happens automatically as soon as a fresh
+//     pairing produces a fast dial — no need to detect "new pairing" from
+//     the outbound layer.
+//   - Window size and consecutive-slow limit (10 and 5 by default) make the
+//     "any fast dial saves the pairing" property concrete: even a single
+//     sub-1s sample anywhere in the last 10 dials prevents a trip.
 type dialWatchdog struct {
-	mu         sync.Mutex
-	samples    []time.Duration // ring buffer, capped at window
+	mu sync.Mutex
+
+	// Fixed-size circular buffer of recent dial elapsed times. We use a
+	// true ring (write index + filled flag) instead of a slice slid via
+	// append + reslice. The slice approach steadily eats the underlying
+	// array's capacity (each `samples = samples[1:]` advances the slice's
+	// start offset) and forces a reallocation roughly every `window`
+	// records. Since record() runs on every dial — potentially hundreds
+	// per minute on an active client — we want to avoid the churn.
+	ring     []time.Duration
+	writeIdx int
+	filled   bool
+
 	tripped    bool
 	tripsTotal int
 
 	// Configurable, but defaults are baked in. Exposed as fields so tests
-	// can shrink the window / thresholds without sleeping.
+	// can shrink the trip cap and thresholds without sleeping.
 	fastThreshold       time.Duration
 	slowThreshold       time.Duration
 	window              int
@@ -55,24 +65,55 @@ const (
 	watchdogMaxTripsPerLifetime = 1000 // safety cap on log-spam
 )
 
+// newDialWatchdog constructs a watchdog using the package-level defaults.
+// Tests construct via the struct literal directly to override individual
+// fields; that path goes through validate() too via a constructor wrapper
+// in the test file (newTestWatchdog).
 func newDialWatchdog() *dialWatchdog {
-	return &dialWatchdog{
+	w := &dialWatchdog{
 		fastThreshold:       watchdogFastThreshold,
 		slowThreshold:       watchdogSlowThreshold,
 		window:              watchdogWindow,
 		consecutiveSlowMin:  watchdogConsecutiveSlowMin,
 		maxTripsPerLifetime: watchdogMaxTripsPerLifetime,
 	}
+	w.init()
+	return w
 }
 
-// watchdogEvent is the verdict from a single record() call. Exactly one of
-// the boolean fields is true on any return: the caller can switch on it to
-// decide whether to log anything (and at what level).
+// init validates configuration and allocates the ring. Called once at
+// construction. Misconfiguration is clamped rather than panicked: the
+// watchdog is a debug aid, not load-bearing logic, and a zero-window or
+// inverted limit must not bring down a Lantern client.
+func (w *dialWatchdog) init() {
+	if w.window <= 0 {
+		w.window = 1
+	}
+	if w.consecutiveSlowMin <= 0 {
+		w.consecutiveSlowMin = 1
+	}
+	if w.consecutiveSlowMin > w.window {
+		w.consecutiveSlowMin = w.window
+	}
+	if w.maxTripsPerLifetime < 0 {
+		w.maxTripsPerLifetime = 0
+	}
+	w.ring = make([]time.Duration, w.window)
+	w.writeIdx = 0
+	w.filled = false
+}
+
+// watchdogEvent is the verdict from a single record() call. The two booleans
+// are state-transition signals — at most one is true on any given return,
+// and most calls return both false (no transition; suppressed write while
+// tripped, ramp-up before window is full, no-op while medium-band, etc.).
+// The caller is expected to switch on `tripped` / `rearmed` to decide
+// whether to log anything; the remaining fields are diagnostic context.
 type watchdogEvent struct {
 	tripped     bool          // a new trip just fired
 	rearmed     bool          // a fast dial cleared a previously-tripped state
 	reason      string        // human-readable trip cause, set on tripped
-	medianSlow  time.Duration // median elapsed of the slow window, set on tripped
+	medianSlow  time.Duration // median elapsed of the slow tail, set on tripped
 	tripsTotal  int           // cumulative trips this watchdog has fired
 	sampleCount int           // current ring-buffer fill
 }
@@ -86,10 +127,15 @@ func (w *dialWatchdog) record(elapsed time.Duration) watchdogEvent {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	w.samples = append(w.samples, elapsed)
-	if len(w.samples) > w.window {
-		w.samples = w.samples[1:]
+	// Write into the ring and advance.
+	w.ring[w.writeIdx] = elapsed
+	w.writeIdx++
+	if w.writeIdx >= len(w.ring) {
+		w.writeIdx = 0
+		w.filled = true
 	}
+
+	count := w.sampleCountLocked()
 
 	// Re-arm: a fast dial while tripped clears the trip flag. We log the
 	// transition once so a reader of lantern.log can see when a pairing
@@ -100,24 +146,24 @@ func (w *dialWatchdog) record(elapsed time.Duration) watchdogEvent {
 		return watchdogEvent{
 			rearmed:     true,
 			tripsTotal:  w.tripsTotal,
-			sampleCount: len(w.samples),
+			sampleCount: count,
 		}
 	}
 
 	// While currently tripped, suppress further trip events: we already
 	// emitted the warning, no signal in repeating it on every slow dial.
 	if w.tripped {
-		return watchdogEvent{tripsTotal: w.tripsTotal, sampleCount: len(w.samples)}
+		return watchdogEvent{tripsTotal: w.tripsTotal, sampleCount: count}
 	}
 
 	// Need a full window before evaluating; otherwise a startup burst of
 	// 5 slow dials would always trip on first pair.
-	if len(w.samples) < w.window {
-		return watchdogEvent{tripsTotal: w.tripsTotal, sampleCount: len(w.samples)}
+	if !w.filled {
+		return watchdogEvent{tripsTotal: w.tripsTotal, sampleCount: count}
 	}
 
 	if w.tripsTotal >= w.maxTripsPerLifetime {
-		return watchdogEvent{tripsTotal: w.tripsTotal, sampleCount: len(w.samples)}
+		return watchdogEvent{tripsTotal: w.tripsTotal, sampleCount: count}
 	}
 
 	// Trip if the most recent consecutiveSlowMin dials are all slow AND
@@ -129,15 +175,15 @@ func (w *dialWatchdog) record(elapsed time.Duration) watchdogEvent {
 	//   - The "consecutive slow" guard ensures we don't trip on an
 	//     intermittently slow pairing that's interleaving fast dials with
 	//     occasional slow ones at a tolerable rate.
-	for _, s := range w.samples {
+	for _, s := range w.ring {
 		if s < w.fastThreshold {
-			return watchdogEvent{tripsTotal: w.tripsTotal, sampleCount: len(w.samples)}
+			return watchdogEvent{tripsTotal: w.tripsTotal, sampleCount: count}
 		}
 	}
-	tail := w.samples[len(w.samples)-w.consecutiveSlowMin:]
+	tail := w.recentLocked(w.consecutiveSlowMin)
 	for _, s := range tail {
 		if s <= w.slowThreshold {
-			return watchdogEvent{tripsTotal: w.tripsTotal, sampleCount: len(w.samples)}
+			return watchdogEvent{tripsTotal: w.tripsTotal, sampleCount: count}
 		}
 	}
 
@@ -148,18 +194,43 @@ func (w *dialWatchdog) record(elapsed time.Duration) watchdogEvent {
 		reason:      "no fast dial in window and >=5 consecutive slow",
 		medianSlow:  medianDuration(tail),
 		tripsTotal:  w.tripsTotal,
-		sampleCount: len(w.samples),
+		sampleCount: count,
 	}
 }
 
-// snapshot returns a copy of the current ring buffer for diagnostic logging.
-// Caller is free to log/format without holding the watchdog mutex.
+// sampleCountLocked returns the number of valid entries in the ring.
+// Caller must hold w.mu.
+func (w *dialWatchdog) sampleCountLocked() int {
+	if w.filled {
+		return len(w.ring)
+	}
+	return w.writeIdx
+}
+
+// recentLocked returns the n most-recent samples in arrival order (oldest
+// of the n first, newest last). Caller must hold w.mu and ensure
+// n <= sampleCountLocked().
+func (w *dialWatchdog) recentLocked(n int) []time.Duration {
+	out := make([]time.Duration, n)
+	// Walk backwards from the most recently written slot.
+	for i := 0; i < n; i++ {
+		idx := (w.writeIdx - 1 - i + len(w.ring)) % len(w.ring)
+		out[n-1-i] = w.ring[idx]
+	}
+	return out
+}
+
+// snapshot returns a copy of the current ring contents in arrival order
+// (oldest first), for diagnostic logging. Caller is free to log/format
+// without holding the watchdog mutex.
 func (w *dialWatchdog) snapshot() []time.Duration {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	out := make([]time.Duration, len(w.samples))
-	copy(out, w.samples)
-	return out
+	count := w.sampleCountLocked()
+	if count == 0 {
+		return nil
+	}
+	return w.recentLocked(count)
 }
 
 func medianDuration(xs []time.Duration) time.Duration {

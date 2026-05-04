@@ -5,17 +5,23 @@ import (
 	"time"
 )
 
-// newTestWatchdog builds a watchdog with shorter windows + lower trip caps
-// so tests can exercise the trip / re-arm branches without massaging real
-// time. Production callers go through newDialWatchdog().
+// newTestWatchdog builds a watchdog with the production thresholds and
+// window so the tests exercise the same code paths real Lantern clients
+// will. (An earlier draft set "shorter windows" here, but every test
+// reasoned in terms of the production window/limit pair, so shrinking
+// only made the tests harder to read without exercising new branches.)
+// Tests that need to bypass the trip cap can set maxTripsPerLifetime
+// after construction.
 func newTestWatchdog() *dialWatchdog {
-	return &dialWatchdog{
+	w := &dialWatchdog{
 		fastThreshold:       1 * time.Second,
 		slowThreshold:       5 * time.Second,
 		window:              10,
 		consecutiveSlowMin:  5,
 		maxTripsPerLifetime: 1000,
 	}
+	w.init()
+	return w
 }
 
 // feed N samples of the same elapsed value and return the events emitted.
@@ -133,7 +139,7 @@ func TestWatchdog_RearmsOnFastDialAfterTrip(t *testing.T) {
 // log spam so a stuck client doesn't write GB of warnings overnight.
 func TestWatchdog_MaxTripsCapsTrips(t *testing.T) {
 	w := newTestWatchdog()
-	w.maxTripsPerLifetime = 2
+	w.maxTripsPerLifetime = 2 // safe to mutate post-init: ring already allocated
 
 	// First trip.
 	feed(t, w, 12*time.Second, 10)
@@ -151,5 +157,67 @@ func TestWatchdog_MaxTripsCapsTrips(t *testing.T) {
 	}
 	if w.tripsTotal != 2 {
 		t.Errorf("tripsTotal: want 2 (cap), got %d", w.tripsTotal)
+	}
+}
+
+// init() clamps invalid configurations rather than panicking — the watchdog
+// is a debug aid, and a misconfigured one must not bring down the Lantern
+// client. Cover a few representative degenerate inputs and assert the
+// invariants we rely on (window > 0, consecutiveSlowMin in [1, window]).
+func TestWatchdog_InitClampsBadConfig(t *testing.T) {
+	cases := []struct {
+		name                 string
+		setup                func(*dialWatchdog)
+		wantWindow           int
+		wantConsecutiveMin   int
+		wantMaxTripsAtLeast0 bool
+	}{
+		{
+			name:               "zero window",
+			setup:              func(w *dialWatchdog) { w.window = 0; w.consecutiveSlowMin = 5 },
+			wantWindow:         1,
+			wantConsecutiveMin: 1, // clamped down to fit window
+		},
+		{
+			name:               "negative window",
+			setup:              func(w *dialWatchdog) { w.window = -3; w.consecutiveSlowMin = 5 },
+			wantWindow:         1,
+			wantConsecutiveMin: 1,
+		},
+		{
+			name:               "consecutiveSlowMin > window",
+			setup:              func(w *dialWatchdog) { w.window = 4; w.consecutiveSlowMin = 99 },
+			wantWindow:         4,
+			wantConsecutiveMin: 4, // clamped to window so the recent-tail slice doesn't go OOB
+		},
+		{
+			name:                 "negative maxTrips",
+			setup:                func(w *dialWatchdog) { w.window = 10; w.consecutiveSlowMin = 5; w.maxTripsPerLifetime = -1 },
+			wantWindow:           10,
+			wantConsecutiveMin:   5,
+			wantMaxTripsAtLeast0: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &dialWatchdog{fastThreshold: 1 * time.Second, slowThreshold: 5 * time.Second}
+			tc.setup(w)
+			w.init()
+			if w.window != tc.wantWindow {
+				t.Errorf("window: want %d, got %d", tc.wantWindow, w.window)
+			}
+			if w.consecutiveSlowMin != tc.wantConsecutiveMin {
+				t.Errorf("consecutiveSlowMin: want %d, got %d", tc.wantConsecutiveMin, w.consecutiveSlowMin)
+			}
+			if tc.wantMaxTripsAtLeast0 && w.maxTripsPerLifetime < 0 {
+				t.Errorf("maxTripsPerLifetime: want >=0, got %d", w.maxTripsPerLifetime)
+			}
+			// Most important: a record() against a clamped watchdog must
+			// not panic. Feed a few samples; we don't care about the
+			// trip verdict here, only that the ring indexing is safe.
+			for i := 0; i < 20; i++ {
+				_ = w.record(2 * time.Second)
+			}
+		})
 	}
 }
