@@ -587,7 +587,7 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 // markFailedAndReselect drops the URL-test history for outbound and recomputes
 // the selection.
 func (g *urlTestGroup) markFailedAndReselect(outbound A.Outbound) {
-	g.history.DeleteURLTestHistory(outbound.Tag())
+	g.history.DeleteURLTestHistory(realTag(outbound))
 	g.updateSelected()
 }
 
