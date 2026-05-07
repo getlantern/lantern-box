@@ -171,7 +171,7 @@ func (s *MutableURLTest) DialContext(ctx context.Context, network string, destin
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err != nil {
 		s.logger.ErrorContext(ctx, err)
-		s.group.history.DeleteURLTestHistory(outbound.Tag())
+		s.group.markFailedAndReselect(outbound)
 		span.RecordError(err)
 		return nil, err
 	}
@@ -199,7 +199,7 @@ func (s *MutableURLTest) ListenPacket(ctx context.Context, destination M.Socksad
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err != nil {
 		s.logger.ErrorContext(ctx, err)
-		s.group.history.DeleteURLTestHistory(outbound.Tag())
+		s.group.markFailedAndReselect(outbound)
 		span.RecordError(err)
 		return nil, err
 	}
@@ -584,6 +584,13 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	return result, nil
 }
 
+// markFailedAndReselect drops the URL-test history for outbound and recomputes
+// the selection.
+func (g *urlTestGroup) markFailedAndReselect(outbound A.Outbound) {
+	g.history.DeleteURLTestHistory(outbound.Tag())
+	g.updateSelected()
+}
+
 func (g *urlTestGroup) updateSelected() {
 	if len(g.tags) == 0 {
 		g.selectedOutboundTCP.Store(nil)
@@ -632,7 +639,13 @@ func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound) A.Ou
 	if minOutbound != nil {
 		return minOutbound
 	}
+	// Reaching this loop means no candidate has URL-test history. Skip current:
+	// any other choice is no worse, and avoids re-picking an outbound just
+	// deleted by markFailedAndReselect.
 	for _, outbound := range g.outbounds.Iter() {
+		if outbound == current {
+			continue
+		}
 		if slices.Contains(outbound.Network(), network) && realTag(outbound) != "" {
 			return outbound
 		}
