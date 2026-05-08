@@ -19,16 +19,37 @@ package peerconn
 
 import "sync"
 
+// Event describes a single connection lifecycle transition surfaced from
+// a lantern-box inbound to the peer-share consumer (radiance peer client).
+//
+//   State        +1 on accept, -1 on close
+//   Source       remote peer's "ip:port" string (empty if unavailable)
+//   Destination  the host:port the remote peer requested through the
+//                inbound (only meaningful on +1; close events leave it
+//                empty since the abuse aggregator already pairs each
+//                close with the prior accept by source identity)
+//
+// Destination carries the load-bearing abuse-detection signal: source
+// IP alone is insufficient (mobile clients change IPs, NAT pools
+// collapse to one address) but the destination distribution per source
+// bucket is highly diagnostic — one source making thousands of port-25
+// connections is a spam relay; one source making millions of HTTPS
+// connections to a fixed e-commerce list is credential stuffing.
+//
+// Bucket aggregation lives outside this package (see radiance/peer);
+// the registry just hands raw events off to whoever's listening.
+type Event struct {
+	State       int
+	Source      string
+	Destination string
+}
+
 // Listener receives connection lifecycle notifications from lantern-box
-// inbound protocols.
-//
-//   state  +1 on accept, -1 on close
-//   source remote peer's "ip:port" string (empty if unavailable)
-//
-// The listener is invoked synchronously on the inbound's accept/close path,
-// so implementations should not block on heavy work — fan out to a buffered
-// channel or goroutine if more than a few microseconds is expected.
-type Listener func(state int, source string)
+// inbound protocols. Invoked synchronously on the inbound's accept/close
+// path, so implementations should not block on heavy work — fan out to
+// a buffered channel or goroutine if more than a few microseconds is
+// expected.
+type Listener func(evt Event)
 
 var (
 	listenerMu sync.RWMutex
@@ -44,15 +65,27 @@ func SetListener(l Listener) {
 	listener = l
 }
 
-// Notify dispatches a state transition to the registered listener if one
-// is set. No-op when nothing is registered, so lantern-box uses that don't
-// care about peer-share connection events (cmd_run, the standalone CLI,
-// the radiance VPN client) pay zero cost beyond a mutex read.
-func Notify(state int, source string) {
+// Notify dispatches an event to the registered listener if one is set.
+// No-op when nothing is registered — non-peer-share consumers (cmd_run,
+// the standalone CLI, the radiance VPN client) pay zero cost beyond a
+// mutex read. Lower-level entry exposed for future hooks (byte-counting
+// conn wrappers, periodic flush emitters); accept/close call sites
+// should prefer NotifyAccept / NotifyClose.
+func Notify(evt Event) {
 	listenerMu.RLock()
 	l := listener
 	listenerMu.RUnlock()
 	if l != nil {
-		l(state, source)
+		l(evt)
 	}
+}
+
+// NotifyAccept is the convenience caller for inbound accept paths.
+func NotifyAccept(source, destination string) {
+	Notify(Event{State: +1, Source: source, Destination: destination})
+}
+
+// NotifyClose is the convenience caller for inbound close paths.
+func NotifyClose(source string) {
+	Notify(Event{State: -1, Source: source})
 }
