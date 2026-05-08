@@ -44,9 +44,14 @@ func RegisterMutableURLTest(registry *outbound.Registry) {
 	outbound.Register[option.MutableURLTestOutboundOptions](registry, constant.TypeMutableURLTest, NewMutableURLTest)
 }
 
+// ErrAllOutboundsFailed is returned by [MutableURLTest.DialContext] and [MutableURLTest.ListenPacket]
+// after every attempted outbound has failed.
+var ErrAllOutboundsFailed = errors.New("all outbounds failed")
+
+const maxDialRetries = 3
+
 var (
 	_ adapter.MutableOutboundGroup = (*MutableURLTest)(nil)
-	_ A.OutboundGroup              = (*MutableURLTest)(nil)
 	_ A.InterfaceUpdateListener    = (*MutableURLTest)(nil)
 	_ A.ConnectionHandlerEx        = (*MutableURLTest)(nil)
 	_ A.PacketConnectionHandlerEx  = (*MutableURLTest)(nil)
@@ -161,24 +166,16 @@ func (s *MutableURLTest) DialContext(ctx context.Context, network string, destin
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
-
-	s.group.keepAlive()
-	outbound, err := s.selectOutbound(network)
+	conn, tag, err := tryEachOutbound(ctx, s, network, "dial_failed",
+		func(o A.Outbound) (net.Conn, error) { return o.DialContext(ctx, network, destination) },
+	)
 	if err != nil {
-		span.RecordError(err)
 		return nil, err
 	}
-	conn, err := outbound.DialContext(ctx, network, destination)
-	if err != nil {
-		s.logger.ErrorContext(ctx, err)
-		s.group.markFailedAndReselect(outbound)
-		span.RecordError(err)
-		return nil, err
+	if tc, ok := conn.(*adapter.TaggedConn); ok {
+		return tc, nil
 	}
-	if taggedConn, ok := conn.(*adapter.TaggedConn); ok {
-		return taggedConn, nil
-	}
-	return adapter.NewTaggedConn(conn, realTag(outbound)), nil
+	return adapter.NewTaggedConn(conn, tag), nil
 }
 
 func (s *MutableURLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -189,27 +186,72 @@ func (s *MutableURLTest) ListenPacket(ctx context.Context, destination M.Socksad
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
-
-	s.group.keepAlive()
-	outbound, err := s.selectOutbound("udp")
+	conn, tag, err := tryEachOutbound(ctx, s, "udp", "listen_failed",
+		func(o A.Outbound) (net.PacketConn, error) { return o.ListenPacket(ctx, destination) },
+	)
 	if err != nil {
-		span.RecordError(err)
 		return nil, err
 	}
-	conn, err := outbound.ListenPacket(ctx, destination)
-	if err != nil {
-		s.logger.ErrorContext(ctx, err)
-		s.group.markFailedAndReselect(outbound)
-		span.RecordError(err)
-		return nil, err
+	if tc, ok := conn.(*adapter.TaggedPacketConn); ok {
+		return tc, nil
 	}
-	if taggedConn, ok := conn.(*adapter.TaggedPacketConn); ok {
-		return taggedConn, nil
-	}
-	return adapter.NewTaggedPacketConn(conn, realTag(outbound)), nil
+	return adapter.NewTaggedPacketConn(conn, tag), nil
 }
 
-func (s *MutableURLTest) selectOutbound(network string) (A.Outbound, error) {
+// tryEachOutbound attempts to dial or listen with each candidate outbound for the given network,
+// up to maxDialRetries times.
+func tryEachOutbound[T any](
+	ctx context.Context,
+	s *MutableURLTest,
+	network string,
+	failEvent string,
+	dial func(A.Outbound) (T, error),
+) (T, string, error) {
+	s.group.keepAlive()
+	var (
+		tried   = make(map[string]bool)
+		lastErr error
+		zero    T
+	)
+	span := trace.SpanFromContext(ctx)
+	for n := range maxDialRetries {
+		outbound, err := s.selectOutbound(network, tried)
+		if err != nil {
+			if !errors.Is(err, errNetworkNotSupported) && lastErr != nil {
+				err = fmt.Errorf("%w: %w", ErrAllOutboundsFailed, lastErr)
+			}
+			span.RecordError(err)
+			return zero, "", err
+		}
+		tag := realTag(outbound)
+		conn, err := dial(outbound)
+		if err == nil {
+			return conn, tag, nil
+		}
+		s.logger.ErrorContext(ctx, err)
+		span.AddEvent(failEvent, trace.WithAttributes(
+			attribute.String("outbound", tag),
+			attribute.Int("attempt", n+1),
+			attribute.String("error", err.Error()),
+		))
+		s.group.markFailedAndReselect(outbound)
+		lastErr = err
+		if ctx.Err() != nil {
+			span.RecordError(ctx.Err())
+			return zero, "", ctx.Err()
+		}
+		tried[tag] = true
+	}
+	err := fmt.Errorf("%w: %w", ErrAllOutboundsFailed, lastErr)
+	span.RecordError(err)
+	return zero, "", err
+}
+
+var errNetworkNotSupported = errors.New("network not supported")
+
+// selectOutbound returns the best candidate outbound for network whose realTag
+// is not in excludedTags. excludedTags may be nil.
+func (s *MutableURLTest) selectOutbound(network string, excluded map[string]bool) (A.Outbound, error) {
 	var outbound A.Outbound
 	switch network {
 	case "tcp":
@@ -217,13 +259,18 @@ func (s *MutableURLTest) selectOutbound(network string) (A.Outbound, error) {
 	case "udp":
 		outbound = s.group.selectedOutboundUDP.Load()
 	default:
-		return nil, fmt.Errorf("network %s not supported", network)
+		return nil, fmt.Errorf("%w: %s", errNetworkNotSupported, network)
+	}
+	if outbound != nil {
+		if rTag := realTag(outbound); rTag == "" || excluded[rTag] {
+			outbound = nil
+		}
 	}
 	if outbound == nil {
-		outbound = s.group.pickBestOutbound(network, nil)
+		outbound = s.group.pickBestOutbound(network, nil, excluded)
 	}
 	recoveryStarted := false
-	if outbound == nil && len(s.group.tags) > 0 {
+	if outbound == nil && len(excluded) == 0 && len(s.group.tags) > 0 {
 		recoveryStarted = true
 		s.logger.Warn("no outbound available, starting async URL test for recovery")
 		go s.group.CheckOutbounds(true)
@@ -598,22 +645,26 @@ func (g *urlTestGroup) updateSelected() {
 		return
 	}
 	tcpOutbound := g.selectedOutboundTCP.Load()
-	if outbound := g.pickBestOutbound("tcp", tcpOutbound); outbound != tcpOutbound {
+	if outbound := g.pickBestOutbound("tcp", tcpOutbound, nil); outbound != tcpOutbound {
 		g.selectedOutboundTCP.Store(outbound)
 	}
 
 	udpOutbound := g.selectedOutboundUDP.Load()
-	if outbound := g.pickBestOutbound("udp", udpOutbound); outbound != udpOutbound {
+	if outbound := g.pickBestOutbound("udp", udpOutbound, nil); outbound != udpOutbound {
 		g.selectedOutboundUDP.Store(outbound)
 	}
 }
 
-func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound) A.Outbound {
+// pickBestOutbound returns the lowest-latency outbound supporting network,
+// preferring current within tolerance. Outbounds whose realTag is in excluded
+// are skipped (excluded may be nil). Falls back to any non-current candidate
+// when no outbound has URL-test history.
+func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound, excluded map[string]bool) A.Outbound {
 	var (
 		minDelay    uint16
 		minOutbound A.Outbound
 	)
-	if current != nil {
+	if current != nil && !excluded[realTag(current)] {
 		if history := g.history.LoadURLTestHistory(realTag(current)); history != nil {
 			minOutbound = current
 			minDelay = history.Delay
@@ -624,7 +675,7 @@ func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound) A.Ou
 			continue
 		}
 		rTag := realTag(outbound)
-		if rTag == "" {
+		if rTag == "" || excluded[rTag] {
 			continue
 		}
 		history := g.history.LoadURLTestHistory(rTag)
@@ -646,7 +697,11 @@ func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound) A.Ou
 		if outbound == current {
 			continue
 		}
-		if slices.Contains(outbound.Network(), network) && realTag(outbound) != "" {
+		rTag := realTag(outbound)
+		if rTag == "" || excluded[rTag] {
+			continue
+		}
+		if slices.Contains(outbound.Network(), network) {
 			return outbound
 		}
 	}
