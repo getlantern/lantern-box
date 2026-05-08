@@ -80,6 +80,7 @@ Pick the protocol that fits your threat model.
 | **Outline SDK** | DNS/SNI blocking (smart dialer) | No | No |
 | **AmneziaWG** | WireGuard protocol fingerprinting | WireGuard keys | Yes |
 | **ALGeneva** | HTTP-level DPI (header inspection) | No | Yes |
+| **Lanturn** | TLS-at-byte-0 detection + SNI extraction (mimics WebRTC TURN media flow) | OAuth-shaped TURN cred | Yes (coturn + egress) |
 
 ---
 
@@ -602,6 +603,74 @@ The server doesn't need a strategy -- it just accepts connections and forwards t
 ```
 
 Point your browser's SOCKS5 proxy at `127.0.0.1:1080` and you're done.
+
+---
+
+### Lanturn
+
+[Lanturn](https://github.com/getlantern/lanturn) is a TURN-as-cover circumvention transport that mimics WebRTC TURN-relayed media flow on plain UDP/3478. It's the wire-distinct counterpart to the TLS-shaped Lantern protocols (Samizdat, Reflex, TLSMasq) — instead of looking like HTTPS-at-byte-0, it looks like a WebRTC peer relaying audio/video through a self-hosted [coturn](https://github.com/coturn/coturn) instance.
+
+- **STUN+ChannelData wire shape** (RFC 8656 TURN) on UDP/3478 — magic cookie `0x2112A442` at offset 4, ChannelData channel-number range `0x4000-0x7FFF`
+- **Inner DTLS-SRTP layer** between client and egress (relayed opaquely by coturn) — AES-128-CM-HMAC-SHA1-80 keyed via RFC 5764 EXTRACTOR-dtls_srtp
+- **covert-dtls fingerprint randomization** on the inner DTLS handshake (random Chrome ClientHello per session) — defeats the TSPU pion-default-DTLS-fingerprint matcher deployed since 2026-03
+- **Per-session media profile** (Opus audio / VP8 / VP9 / screen-share) shapes payload sizes + cadence to match real WebRTC byte distributions
+- **Behavioral mimicry**: jitter envelope, RTCP Sender Reports every ~5s, DTX state machine for audio quiet periods, session rotation every 25-35 min
+- **TURNS-on-5349 fallback** (TLS-wrapped TURN over TCP) when plain UDP/3478 is unreachable
+- **Coturn-fleet rotation** with recency weighting + per-endpoint health tracking
+
+**When to use it:** Iran (highest international-WebRTC dependency, weakest DPI of the three priority markets — recommended primary). Russia (TSPU pion-DTLS matcher exists but covert-dtls inner layer defeats it; experimental). NOT recommended for China in v0.1 (lower WebRTC-collateral budget + most-sophisticated DPI; design needs measurement-driven confidence first).
+
+See the [lanturn README](https://github.com/getlantern/lanturn/blob/main/README.md) for the protocol design and the validation spike sequence (Phases 0-5). See [docs/INTEGRATION.md](https://github.com/getlantern/lanturn/blob/main/docs/INTEGRATION.md) for the full lantern-box wiring guide including config-service plumbing.
+
+#### Server config (egress)
+
+The lanturn egress runs alongside coturn on a Lantern VPS. v0.1 ships the egress as a separate Go binary (`lanturn.Listen`); future versions will integrate it as a sing-box inbound here.
+
+For now, run the [lanturn-phase4 egress](https://github.com/getlantern/lanturn/blob/main/cmd/lanturn-phase4/main.go) binary alongside your coturn install:
+
+```bash
+# On the Lantern VPS, alongside coturn:
+go install github.com/getlantern/lanturn/cmd/lanturn-phase4@latest
+lanturn-phase4 egress -listen 127.0.0.1:9999
+```
+
+#### Client config
+
+```json
+{
+  "outbounds": [
+    {
+      "type": "lanturn",
+      "tag": "lanturn-out",
+      "coturn_endpoints": [
+        { "udp_addr": "vps-de-1.example.com:3478", "tls_addr": "vps-de-1.example.com:5349", "server_name": "vps-de-1.example.com" },
+        { "udp_addr": "vps-de-2.example.com:3478", "tls_addr": "vps-de-2.example.com:5349", "server_name": "vps-de-2.example.com" }
+      ],
+      "peer_addr": "127.0.0.1:9999",
+      "lanturn_auth_secret": "<coturn use-auth-secret value>",
+      "fingerprint_mode": "mimic",
+      "profile": "random",
+      "session_duration_secs": 1500,
+      "idle_gap_min_secs": 30,
+      "idle_gap_max_secs": 300,
+      "udp_timeout_ms": 1500
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `coturn_endpoints` | array | Fleet of coturn instances. Production target: 20-50 endpoints per region. Each entry has `udp_addr` (TURN UDP/3478), optional `tls_addr` (TURNS TCP/5349), and `server_name` (TLS SNI). |
+| `peer_addr` | string | Egress address that coturn's relay forwards client traffic to. |
+| `lanturn_auth_secret` | string | The coturn `use-auth-secret` shared secret. v0.1 uses a single secret across the fleet; production should rotate per-endpoint via Lantern config service. |
+| `fingerprint_mode` | string | `mimic` (default, recommended) / `randomize` / `none`. |
+| `profile` | string | `opus` / `vp8` / `vp9` / `screen` / `random` (default). |
+| `session_duration_secs` | int | Target session lifetime before rotation (default 1500 = 25min). |
+| `idle_gap_min_secs` / `idle_gap_max_secs` | int | Random gap between sessions (default 30-300s). |
+| `udp_timeout_ms` | int | Allocate timeout before falling back to TURNS-on-5349 (default 1500). |
+
+**Rollout note:** lanturn is alpha as of 2026-05. The MVP outbound implementation in lantern-box opens a fresh TURN session per `DialContext` call (heavy but simple); production will multiplex destinations over a persistent session via SOCKS5-over-lanturn, matching the pattern Unbounded uses.
 
 ---
 
