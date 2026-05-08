@@ -18,6 +18,7 @@ import (
 
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/tracker/peerconn"
 
 	samizdat "github.com/getlantern/samizdat"
 )
@@ -162,6 +163,13 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	metadata.InboundType = i.Type()
 	metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
 	metadata.Destination = M.ParseSocksaddr(destination)
+
+	// Surface accept/close to the peer-connection listener (registered by
+	// the radiance peer client when Share My Connection is active). Cheap
+	// no-op when no listener is set.
+	source := metadata.Source.String()
+	peerconn.Notify(+1, source)
+	defer peerconn.Notify(-1, source)
 
 	i.logger.InfoContext(ctx, "inbound connection to ", destination)
 	done := make(chan struct{})
