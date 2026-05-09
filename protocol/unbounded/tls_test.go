@@ -6,22 +6,36 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
 	"strings"
 	"testing"
+	"time"
 )
 
-// newTestCA builds a minimal self-signed ECDSA CA PEM valid enough for
-// x509.CertPool.AppendCertsFromPEM. It's re-generated per test rather than
-// hardcoded so we never have expiry / fingerprint drift.
+// newTestCA builds a self-signed ECDSA CA PEM. It's re-generated per test
+// rather than hardcoded so we never have expiry / fingerprint drift.
+//
+// The template sets IsCA, BasicConstraintsValid, KeyUsageCertSign, and a
+// sensible NotBefore/NotAfter — so if future tests actually verify peer
+// chains against a ClientCAs pool (not just AppendCertsFromPEM), the cert
+// behaves the way egress_ca is expected to behave in production.
 func newTestCA(t *testing.T) string {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("gen CA key: %v", err)
 	}
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1)}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "lantern-box test CA"},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatalf("create CA cert: %v", err)

@@ -1,9 +1,5 @@
 packer {
   required_plugins {
-    digitalocean = {
-      version = ">= 1.4.0"
-      source  = "github.com/digitalocean/digitalocean"
-    }
     linode = {
       version = ">= 1.1.0"
       source  = "github.com/linode/linode"
@@ -31,20 +27,6 @@ locals {
 }
 
 # ---------- Sources ----------
-
-source "digitalocean" "lantern-box" {
-  api_token    = var.do_api_token
-  image        = "ubuntu-24-04-x64"
-  region       = var.do_region
-  size         = "s-1vcpu-1gb"
-  ssh_username = "root"
-  snapshot_name = "lantern-box-${var.lantern_box_version}-{{timestamp}}"
-  snapshot_regions = [
-    "sfo3", "nyc3", "ams3", "sgp1", "lon1", "fra1", "blr1", "syd1",
-  ]
-  tags = ["lantern-box", "packer"]
-  state_timeout = "10m"
-}
 
 # OCI sources — one per region. All share auth + compartment but use
 # region-specific subnet, AD, and produce region-local images.
@@ -1001,7 +983,6 @@ source "alicloud-ecs" "lantern-box" {
 
 build {
   sources = [
-    "source.digitalocean.lantern-box",
     "source.linode.lantern-box",
     "source.oracle-oci.lantern-box-iad",
     "source.oracle-oci.lantern-box-fra",
@@ -1057,15 +1038,15 @@ build {
   }
 
   # Upload the datacap binary for this arch.
-  # OCI sources target arm64; DigitalOcean/Linode/Alicloud target amd64.
+  # OCI sources target arm64; Linode/Alicloud target amd64.
   provisioner "file" {
-    only        = ["digitalocean.lantern-box", "linode.lantern-box", "alicloud-ecs.lantern-box"]
+    only        = ["linode.lantern-box", "alicloud-ecs.lantern-box"]
     source      = "/tmp/datacap-amd64"
     destination = "/tmp/datacap"
   }
 
   provisioner "file" {
-    except      = ["digitalocean.lantern-box", "linode.lantern-box", "alicloud-ecs.lantern-box"]
+    except      = ["linode.lantern-box", "alicloud-ecs.lantern-box"]
     source      = "/tmp/datacap-arm64"
     destination = "/tmp/datacap"
   }

@@ -24,7 +24,7 @@ packer init .
 # Build for a single provider
 packer build \
   -var "lantern_box_version=0.5.0" \
-  -only="digitalocean.lantern-box" \
+  -only="linode.lantern-box" \
   .
 
 # Build for all providers
@@ -41,7 +41,6 @@ In CI, the `datacap` binary is built from `getlantern/lantern-cloud` and baked i
 
 | Variable | Description |
 |---|---|
-| `DIGITALOCEAN_API_TOKEN` | DigitalOcean API token |
 | `LINODE_TOKEN` | Linode/Akamai API token |
 | `FURY_TOKEN` | Gemfury token for .deb repo |
 | `OCI_TENANCY_OCID` | OCI tenancy OCID |
@@ -74,17 +73,6 @@ In CI, the `datacap` binary is built from `getlantern/lantern-cloud` and baked i
 2. Pass a cloud-init user-data file that writes the config and starts the service
 
 See `cloud-init.yaml.example` for the template.
-
-### DigitalOcean example
-
-```bash
-doctl compute droplet create my-proxy \
-  --image <snapshot-id> \
-  --region sfo3 \
-  --size s-1vcpu-1gb \
-  --user-data-file cloud-init.yaml \
-  --wait
-```
 
 ### Linode example
 

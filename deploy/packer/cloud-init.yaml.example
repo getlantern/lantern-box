@@ -28,7 +28,7 @@ write_files:
       proxyname = my-proxy-01
       pro = false
       track = stable
-      provider = digitalocean
+      provider = linode
       proxyprotocol = algeneva
 
 runcmd:

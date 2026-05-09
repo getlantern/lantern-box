@@ -13,9 +13,9 @@ on:
         required: true
         type: string
       builders:
-        description: "Comma-separated builders (digitalocean,linode,oracle-oci,alicloud-ecs)"
+        description: "Comma-separated builders (linode,oracle-oci,alicloud-ecs)"
         required: false
-        default: "digitalocean,linode,oracle-oci,alicloud-ecs"
+        default: "linode,oracle-oci,alicloud-ecs"
         type: string
 
 permissions:
@@ -55,7 +55,7 @@ jobs:
           INPUT_BUILDERS: ${{ inputs.builders }}
         run: |
           if [ "$EVENT_NAME" = "release" ]; then
-            builders="digitalocean,linode,oracle-oci,alicloud-ecs"
+            builders="linode,oracle-oci,alicloud-ecs"
           else
             builders="$INPUT_BUILDERS"
           fi
@@ -78,40 +78,6 @@ jobs:
     timeout-minutes: 5
     needs: prepare
     steps:
-      - name: Prune old DigitalOcean snapshots
-        if: contains(needs.prepare.outputs.matrix, 'digitalocean')
-        env:
-          DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
-        run: |
-          KEEP=3
-          echo "Fetching DigitalOcean snapshots..."
-          snapshots=$(curl -sS -f -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
-            "https://api.digitalocean.com/v2/snapshots?resource_type=droplet&per_page=200" \
-            | jq -r '.snapshots[] | select(.name | startswith("lantern-box-")) | "\(.created_at)\t\(.id)\t\(.name)"' \
-            | sort -r)
-          total=$(echo "$snapshots" | grep -c . || true)
-          echo "Found $total lantern-box snapshots (keeping $KEEP most recent)"
-          if [ "$total" -le "$KEEP" ]; then
-            echo "Nothing to prune."
-          else
-            failures=0
-            echo "$snapshots" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id name; do
-              echo "Deleting $name ($id, created $created)..."
-              http_code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
-                "https://api.digitalocean.com/v2/snapshots/$id")
-              if [ "$http_code" = "404" ]; then
-                echo "  Already gone (404), skipping."
-              elif [ "$http_code" -ge 400 ]; then
-                echo "::error::Failed to delete DO snapshot $name ($id): HTTP $http_code"
-                failures=$((failures + 1))
-              fi
-            done
-            if [ "$failures" -gt 0 ]; then
-              echo "::error::$failures snapshot(s) failed to delete"
-              exit 1
-            fi
-          fi
-
       - name: Prune old Linode images
         if: contains(needs.prepare.outputs.matrix, 'linode')
         env:
@@ -232,7 +198,7 @@ jobs:
               done
               echo "flag=$joined" >> "$GITHUB_OUTPUT"
               ;;
-            digitalocean|linode|alicloud-ecs)
+            linode|alicloud-ecs)
               echo "flag=${BUILDER}.lantern-box" >> "$GITHUB_OUTPUT"
               ;;
             *)
@@ -341,7 +307,6 @@ jobs:
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           ONLY: ${{ steps.only.outputs.flag }}
-          DIGITALOCEAN_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
           LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}

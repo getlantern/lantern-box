@@ -23,7 +23,7 @@ import (
 
 // defaultSilenceJitter is applied when SilenceTimeout is set but
 // SilenceJitter is not explicitly configured.
-const defaultSilenceJitter = 2 * time.Second
+const defaultSilenceJitter = 600 * time.Millisecond
 
 func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.ReflexInboundOptions](registry, constant.TypeReflex, NewInbound)
