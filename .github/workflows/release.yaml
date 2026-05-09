@@ -44,10 +44,9 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           FURY_TOKEN: ${{ secrets.FURY_TOKEN }}
 
-      - name: Trigger Packer image builds
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Strip 'v' prefix for the version input
-          version="${GITHUB_REF_NAME#v}"
-          gh workflow run build-images.yaml -f "version=$version"
+      # Under Reflog's Option B the packer image no longer bakes in a
+      # specific lantern-box version — cloud-init installs the target
+      # tag on first boot, and the central-orchestration hot-swap
+      # worker pulls existing boxes forward. So a Go release no longer
+      # needs a packer image rebuild. build-images.yaml self-triggers
+      # on deploy/packer/** changes and on manual workflow_dispatch.

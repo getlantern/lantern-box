@@ -1,13 +1,34 @@
 # Packer Images for lantern-box
 
-Pre-baked VM images with lantern-box installed. Boot-to-proxy-ready in ~35-60 seconds (vs 2-4 minutes with a stock image).
+Pre-baked VM images with runtime dependencies, systemd drop-ins, and
+sidecars (otelcol-contrib, Tailscale) already present. The
+`lantern-box` binary itself is **not** baked in — cloud-init apt-installs
+it on first boot (Reflog's Option B; see the "Not in the image" section
+below). Boot-to-proxy-ready is still fast because the heavy work
+(package install, otel config, CA cert, user setup) is done at image
+build time; only the small apt-install step runs on first boot.
 
 ## What's in the image
 
 - Ubuntu 24.04 LTS
 - Runtime deps: ca-certificates, tzdata, nftables, wireguard-tools
-- lantern-box binary (from Gemfury .deb)
-- systemd service (installed but not enabled — cloud-init starts it)
+- otelcol-contrib + systemd drop-in for host metrics
+- systemd drop-ins for lantern-box env (OTel, etc.)
+- `/etc/lantern-box/` and `/var/lib/lantern-box/` directories
+
+**Not in the image (Reflog's Option B):** the `lantern-box` binary itself.
+Under the central-orchestration design in
+`lantern-cloud/docs/design/central-vps-updates.md`, cloud-init
+apt-installs the target release tag on first boot — decoupling release
+cadence (frequent) from base-image cadence (rare). The packer image is
+now version-agnostic; only base-image changes (Ubuntu patches, systemd
+drop-in updates, new sidecars) need a rebuild.
+
+**Operators:** before rolling out a new image built from this code,
+ensure `bandit_vps_default_release_tag` (or a per-track override) is set
+in the lantern-cloud settings. Otherwise new VMs boot without lantern-box
+installed and the provision worker's `systemctl enable --now lantern-box`
+call will fail.
 
 ## Prerequisites
 
