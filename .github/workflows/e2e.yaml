@@ -177,6 +177,37 @@ jobs:
             "gzip -d /root/lantern-box.gz /root/unbounded-rig.gz && chmod +x /root/lantern-box /root/unbounded-rig"
           echo "Binaries ready"
 
+          # Pin DNS to public resolvers. The default DO Ubuntu image points
+          # /etc/resolv.conf at systemd-resolved (127.0.0.53), which forwards
+          # to DO's 67.207.67.x infrastructure; we observed that resolver
+          # break partway through a test run on 2026-05-09, causing the
+          # later sing-box servers (Reflex + the unbounded-rig's egress)
+          # to fail DNS lookups for example.com / stun.l.google.com with
+          # `context deadline exceeded`. The earlier servers had already
+          # resolved successfully, so the failure was non-deterministic
+          # and bisected to "DO resolver flake mid-run".
+          #
+          # Pinning to 1.1.1.1 + 8.8.8.8 directly bypasses systemd-resolved
+          # and any DO-side caching layer. We disable systemd-resolved so
+          # it can't reclaim /etc/resolv.conf on a service restart.
+          echo "Pinning DNS to public resolvers..."
+          ssh $SSH_OPTS root@"$DROPLET_IP" bash << 'DNSEOF'
+            systemctl disable --now systemd-resolved 2>/dev/null || true
+            rm -f /etc/resolv.conf
+            cat > /etc/resolv.conf << RESOLV
+          nameserver 1.1.1.1
+          nameserver 8.8.8.8
+          options timeout:2 attempts:2
+          RESOLV
+            # Quick sanity check — fail fast if pinning didn't take.
+            if ! getent hosts example.com >/dev/null; then
+              echo "DNS pinning sanity check FAILED" >&2
+              cat /etc/resolv.conf
+              exit 1
+            fi
+            echo "DNS pinned: $(grep nameserver /etc/resolv.conf | tr '\n' ' ')"
+          DNSEOF
+
           # Start Python HTTP server to serve plain.wasm (for WATER)
           echo "Starting WASM HTTP server..."
           ssh -f $SSH_OPTS root@"$DROPLET_IP" \
