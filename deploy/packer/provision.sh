@@ -93,12 +93,6 @@ arch=$(dpkg --print-architecture)  # amd64 or arm64 — still used below
 echo "==> Setting up directories"
 mkdir -p /etc/lantern-box /var/lib/lantern-box
 
-# daemon-reload is a no-op here for the (not-yet-installed) lantern-box
-# service, but the otelcol-contrib service below needs it to pick up its
-# env drop-in. The apt install that runs under cloud-init will
-# daemon-reload again after the service unit appears on disk.
-systemctl daemon-reload
-
 echo "==> Installing OTel Collector for host metrics"
 otelcol_version="0.120.0"
 otelcol_deb="otelcol-contrib_${otelcol_version}_linux_${arch}.deb"
