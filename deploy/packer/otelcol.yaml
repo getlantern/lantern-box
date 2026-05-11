@@ -42,6 +42,27 @@ receivers:
         from: attributes.body
         to: body
 
+  # Cloud-init journald logs (the `logger -t cloud-init …` step + ERR-trap
+  # output from lantern-cloud's cloudinit_packer.go). Without this receiver
+  # those messages stay on-host in /var/log/cloud-init-output.log and
+  # journald only — invisible to SigNoz. That gap is exactly why the
+  # May 8 dpkg-flag regression needed an SSH session to diagnose; with
+  # this in place, a future cloud-init halt surfaces directly in the
+  # logs pipeline tagged with the same OTEL_RESOURCE_ATTRIBUTES we set
+  # on metrics (route.id, deployment.environment, cloud.provider, etc.),
+  # so operators can grep for it without leaving SigNoz.
+  #
+  # Filtered to `cloud-init` to avoid shipping every systemd unit's
+  # output (sshd, unattended-upgrades, etc.). The receiver runs as the
+  # otelcol-contrib user, which needs `systemd-journal` group access
+  # (granted via systemd drop-in in deploy/packer/provision.sh).
+  journald:
+    units: [cloud-init.service, cloud-final.service]
+    # Match anything tagged via `logger -t cloud-init …` even when emitted
+    # outside the cloud-init systemd unit (e.g. the ERR trap firing late).
+    matches:
+      - SYSLOG_IDENTIFIER: cloud-init
+
 processors:
   batch:
     send_batch_size: 1024
@@ -75,6 +96,6 @@ service:
       processors: [memory_limiter, resourcedetection, batch]
       exporters: [otlphttp]
     logs:
-      receivers: [filelog/lantern-box]
+      receivers: [filelog/lantern-box, journald]
       processors: [memory_limiter, resourcedetection, batch]
       exporters: [otlphttp]
