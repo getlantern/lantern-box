@@ -207,6 +207,7 @@ missing=""
 for path in \
   /etc/systemd/system/lantern-box.service.d/otel.conf \
   /etc/systemd/system/otelcol-contrib.service.d/env.conf \
+  /etc/systemd/system/otelcol-contrib.service.d/journald.conf \
   /etc/lantern-box \
   /var/lib/lantern-box \
   /etc/otelcol-contrib/config.yaml \
@@ -223,6 +224,17 @@ if ! command -v tailscale >/dev/null 2>&1; then
 fi
 if ! command -v otelcol-contrib >/dev/null 2>&1; then
   echo "otelcol-contrib not found on PATH" >&2
+  exit 1
+fi
+
+# Validate otelcol config at image-build time so malformed YAML, unknown
+# receivers/exporters, or missing pipeline references fail the packer
+# build instead of silently breaking otelcol-contrib's first start on
+# every VPS provisioned from this image. Cheap (sub-second), runs once
+# per image build, catches the cheapest class of mistake at the cheapest
+# point in the lifecycle.
+if ! otelcol-contrib validate --config /etc/otelcol-contrib/config.yaml; then
+  echo "otelcol-contrib config validation failed" >&2
   exit 1
 fi
 echo "    image contents verified"
