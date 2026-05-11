@@ -15,17 +15,27 @@ import (
 //   - AES-128-CM-HMAC-SHA1-80 encryption (SRTP)
 //   - DTLS-derived keying material (RFC 5764 §4.2)
 //   - TURN ChannelData wrapping (RFC 8656 §12)
-//   - Plain UDP/3478 to a coturn endpoint from CoturnEndpoints, with
-//     auto-fallback to TURNS-on-TCP/5349 when UDP is unreachable
+//   - Plain UDP/3478 to a coturn endpoint from CoturnEndpoints
 //
 // See [getlantern/lanturn](https://github.com/getlantern/lanturn) and
-// [the design draft in circumvention-corpus-private] for the full
+// the design draft in `circumvention-corpus-private` for the full
 // protocol design.
 //
-// Only JSON-serializable fields live here. Runtime-only dependencies
-// (Credential callback, FleetSelector, Logger) come from the hosting
-// process via context at service startup, matching the pattern used
-// by Unbounded.
+// # v0.1 alpha note
+//
+// Only the fields below are honored by the outbound today. Production
+// fields planned for later (fingerprint_mode, session_duration_secs,
+// idle_gap_*, udp_timeout_ms, prefer_transport) are intentionally
+// absent until the upstream pkg/lanturn API supports them — see the
+// PHASE-5-TODO markers in github.com/getlantern/lanturn/pkg/lanturn.
+//
+// Runtime-only dependencies (Credential generation, fleet selection,
+// logger) are currently hard-coded in the outbound's NewOutbound: the
+// Credential is derived from LanturnAuthSecret, the fleet is iterated
+// in order, and the logger is the sing-box ContextLogger. A follow-up
+// will plumb these in via context (matching Unbounded's pattern) so a
+// hosting process can inject a real config-service Credential callback
+// and a recency-weighted FleetSelector.
 type LanturnOutboundOptions struct {
 	option.DialerOptions
 	option.ServerOptions
@@ -33,7 +43,9 @@ type LanturnOutboundOptions struct {
 	// CoturnEndpoints is the fleet of coturn instances the client may
 	// allocate from. Production target is 20-50 active endpoints per
 	// region (lanturn design §6.2). Each entry has both UDP/3478 +
-	// TURNS TCP/5349 addresses.
+	// TURNS TCP/5349 addresses (the TURNS addr is parsed but the
+	// TURNS-on-5349 fallback path is not wired through in v0.1 — see
+	// pkg/lanturn PHASE-5-TODO).
 	CoturnEndpoints []LanturnCoturnEndpoint `json:"coturn_endpoints,omitempty"`
 
 	// PeerAddr is the egress's UDP address on the same VPS as coturn
@@ -42,35 +54,11 @@ type LanturnOutboundOptions struct {
 	// server-side stack to receive it.
 	PeerAddr string `json:"peer_addr"`
 
-	// FingerprintMode controls covert-dtls behavior on the inner DTLS
-	// handshake. Default = "mimic" (random Chrome ClientHello per
-	// session — design §4.4 + cover-dtls catalog §Censor Practice).
-	// "randomize" gives per-session diversity at ~85% handshake
-	// success rate. "none" uses pion-default (TSPU-blocked since
-	// 2026-03; for diagnostic A/B only).
-	FingerprintMode string `json:"fingerprint_mode,omitempty"`
-
-	// Profile selects the SRTP-layer media shape: "opus" | "vp8" |
-	// "vp9" | "screen" | "random". Default "random".
+	// Profile selects the SRTP-layer media shape. v0.1 only honors
+	// "opus" (the upstream MVP only implements that profile). Other
+	// values are accepted but silently fall back to Opus until
+	// pkg/lanturn fills in vp8 / vp9 / screen-share.
 	Profile string `json:"profile,omitempty"`
-
-	// SessionDuration is the target lifetime of one "call" before
-	// rotation. Production target 25-35 minutes (lanturn design §6.1).
-	// Default 25 min if zero. In seconds.
-	SessionDurationSecs int `json:"session_duration_secs,omitempty"`
-
-	// IdleGapMinSecs / IdleGapMaxSecs bracket the random pause between
-	// sessions. Production target 30s-5min. In seconds.
-	IdleGapMinSecs int `json:"idle_gap_min_secs,omitempty"`
-	IdleGapMaxSecs int `json:"idle_gap_max_secs,omitempty"`
-
-	// UDPTimeoutMs caps how long the client waits on UDP/3478 before
-	// falling back to TURNS-on-5349. Default 1500ms.
-	UDPTimeoutMs int `json:"udp_timeout_ms,omitempty"`
-
-	// PreferTransport overrides UDP-first selection: "" (auto, default),
-	// "udp", or "tls".
-	PreferTransport string `json:"prefer_transport,omitempty"`
 
 	// LanturnAuthSecret is the static-auth-secret shared with the
 	// coturn instance for OAUTH-shaped credential generation
@@ -83,7 +71,7 @@ type LanturnOutboundOptions struct {
 // LanturnCoturnEndpoint identifies one coturn instance in the fleet.
 type LanturnCoturnEndpoint struct {
 	UDPAddr    string `json:"udp_addr"`              // host:port plain TURN UDP/3478
-	TLSAddr    string `json:"tls_addr,omitempty"`    // host:port TURNS TCP/5349 (optional)
+	TLSAddr    string `json:"tls_addr,omitempty"`    // host:port TURNS TCP/5349 (optional; fallback not yet wired through)
 	ServerName string `json:"server_name,omitempty"` // TLS SNI / cert verify
 }
 

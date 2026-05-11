@@ -10,38 +10,58 @@
 //
 // # Architecture
 //
-// The outbound calls [lanturn.Dial] at Start time to establish a
-// persistent connection to a Lantern egress process colocated with a
-// coturn instance on a Lantern VPS. Bytes flow:
+// Each DialContext call opens a fresh lanturn session — one TURN
+// allocation + DTLS handshake + SRTP key set — to a Lantern egress
+// process colocated with a coturn instance on a Lantern VPS. Bytes
+// flow:
 //
 //	caller bytes
 //	  → SRTP-paced chunks at the chosen MediaProfile cadence
 //	  → AES-128-CM-HMAC-SHA1-80 (SRTP)
 //	  → DTLS-derived keying material (RFC 5764 §4.2)
 //	  → TURN ChannelData wrapping
-//	  → Plain UDP/3478 to coturn (or TURNS-on-TCP/5349 fallback)
+//	  → Plain UDP/3478 to coturn (TURNS-on-5349 fallback planned)
 //
 // The egress is the lanturn server listening on the same VPS as
 // coturn. It receives client bytes on the UDP path coturn relays into
 // it; from the egress's perspective, lanturn looks like a SOCKS-shaped
-// proxy and it forwards bytes onward to the user's destination.
+// proxy and would forward bytes onward to the user's destination once
+// destination-forwarding is implemented.
 //
-// # Multiplexing
+// # v0.1 alpha status
 //
-// MVP opens a fresh [lanturn.Dial] PER outbound DialContext call —
-// one TURN allocation + DTLS handshake + SRTP key set per TCP dial.
-// This is heavy but simple and matches the spike's behavior. Production
-// follow-up work is to maintain a long-lived lanturn session and
-// multiplex destinations via a SOCKS5 control protocol on top, the
-// same pattern Unbounded uses (the consumer-side outbound holds one
-// QUIC-over-WebRTC session and SOCKS5-CONNECTs per destination).
+// **The outbound is not yet operational.** DialContext returns a
+// clear error because the destination-forwarding handshake between
+// the lanturn client and the egress (planned as SOCKS5 CONNECT over
+// the lanturn conn) is not yet implemented in pkg/lanturn — without
+// it, dialed bytes would be forwarded to a single hardcoded egress
+// destination, not the destination the caller asked for. Failing fast
+// avoids silent misrouting.
+//
+// What's wired up:
+//
+//   - Option validation (NewOutbound rejects missing required fields)
+//   - Network advertisement: TCP-only (no UDP — DialContext on UDP
+//     would error)
+//   - Type registration in the OutboundRegistry
+//
+// What's deferred to follow-up PRs (working code lives in the
+// cmd/lanturn-phase{2,3,4} spike binaries in the lanturn repo):
+//
+//   - Per-DialContext session multiplexing via SOCKS5-over-lanturn
+//     (same pattern Unbounded uses)
+//   - covert-dtls fingerprint randomization (currently pion-default;
+//     deploy-blocking for Russia / China per design §4.4 + §11.2)
+//   - Session rotation across SessionDuration / IdleGap pattern
+//   - TURNS-on-5349 fallback
+//   - Multi-profile selection (currently Opus-only)
+//   - Recency-weighted fleet selection
 package lanturn
 
 import (
 	"context"
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -119,41 +139,42 @@ func NewOutbound(
 		},
 	}
 
+	// TCP-only network advertisement — DialContext on UDP would error
+	// and ListenPacket isn't implemented, so don't claim to support
+	// UDP at the routing layer.
 	return &Outbound{
-		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeLanturn, tag, []string{N.NetworkTCP, N.NetworkUDP}, opts.DialerOptions),
+		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeLanturn, tag, []string{N.NetworkTCP}, opts.DialerOptions),
 		logger:  lg,
 		cfg:     cfg,
 	}, nil
 }
 
-// DialContext opens a lanturn-tunneled TCP connection. MVP allocates a
-// fresh TURN session per dial; production should multiplex over a
-// persistent session.
+// DialContext returns a clear "not yet operational" error.
+//
+// v0.1 alpha: the destination-forwarding handshake between the lanturn
+// client and the egress (planned as SOCKS5 CONNECT) is not yet
+// implemented in pkg/lanturn. Returning a real net.Conn here would
+// silently forward bytes to a hardcoded egress destination rather than
+// the caller-requested one — a correctness bug. The outbound is
+// registered as scaffolding for the follow-up that wires destination
+// forwarding through; until then, every dial fails fast with a clear
+// error.
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	ctx, md := adapter.ExtendContext(ctx)
 	md.Outbound = o.Tag()
 	md.Destination = destination
 
-	switch N.NetworkName(network) {
-	case N.NetworkTCP:
-		dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		o.logger.DebugContext(ctx, "lanturn TCP dial start", "dest", destination.String())
-		conn, err := upstream.Dial(dialCtx, o.cfg)
-		if err != nil {
-			o.logger.ErrorContext(ctx, "lanturn TCP dial failed", "dest", destination.String(), "err", err)
-			return nil, fmt.Errorf("lanturn dial: %w", err)
-		}
-		// PHASE-5-TODO: send SOCKS5 CONNECT(destination) handshake
-		// to the egress over the lanturn conn so the egress knows
-		// where to forward bytes. For MVP, the egress acts as a
-		// transparent forwarder to a single hardcoded destination.
-		o.logger.DebugContext(ctx, "lanturn TCP dial ok", "dest", destination.String())
-		return conn, nil
-	case N.NetworkUDP:
-		return nil, fmt.Errorf("lanturn: UDP destinations not yet supported (MVP TCP only)")
+	if N.NetworkName(network) != N.NetworkTCP {
+		return nil, fmt.Errorf("lanturn: %s not supported (TCP only)", network)
 	}
-	return nil, fmt.Errorf("lanturn: unsupported network %q", network)
+
+	o.logger.WarnContext(ctx, "lanturn DialContext invoked but outbound is not yet operational",
+		"dest", destination.String())
+	return nil, fmt.Errorf(
+		"lanturn: destination forwarding to %s not yet implemented (v0.1 alpha); "+
+			"see https://github.com/getlantern/lantern-box/pull/257 — pkg/lanturn needs the SOCKS5-CONNECT-over-lanturn handshake before this outbound can proxy arbitrary destinations",
+		destination.String(),
+	)
 }
 
 func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {

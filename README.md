@@ -622,6 +622,8 @@ Point your browser's SOCKS5 proxy at `127.0.0.1:1080` and you're done.
 
 See the [lanturn README](https://github.com/getlantern/lanturn/blob/main/README.md) for the protocol design and the validation spike sequence (Phases 0-5). See [docs/INTEGRATION.md](https://github.com/getlantern/lanturn/blob/main/docs/INTEGRATION.md) for the full lantern-box wiring guide including config-service plumbing.
 
+> ⚠ **v0.1 alpha — not yet operational.** The outbound is registered and validates config, but `DialContext` returns a clear error pending the destination-forwarding handshake (planned as SOCKS5 CONNECT over lanturn) being wired through in `pkg/lanturn`. Use this section as a forward-looking config reference; do not expect a working tunnel until the follow-up PR lands. Behavioral-mimicry features (covert-dtls fingerprint, session rotation, TURNS-on-5349 fallback, multi-profile selection, fleet recency-weighting) are also deferred to follow-up.
+
 #### Server config (egress)
 
 The lanturn egress runs alongside coturn on a Lantern VPS. v0.1 ships the egress as a separate Go binary (`lanturn.Listen`); future versions will integrate it as a sing-box inbound here.
@@ -636,6 +638,8 @@ lanturn-phase4 egress -listen 127.0.0.1:9999
 
 #### Client config
 
+The fields actually honored by the v0.1 outbound:
+
 ```json
 {
   "outbounds": [
@@ -648,12 +652,7 @@ lanturn-phase4 egress -listen 127.0.0.1:9999
       ],
       "peer_addr": "127.0.0.1:9999",
       "lanturn_auth_secret": "<coturn use-auth-secret value>",
-      "fingerprint_mode": "mimic",
-      "profile": "random",
-      "session_duration_secs": 1500,
-      "idle_gap_min_secs": 30,
-      "idle_gap_max_secs": 300,
-      "udp_timeout_ms": 1500
+      "profile": "opus"
     }
   ]
 }
@@ -661,16 +660,20 @@ lanturn-phase4 egress -listen 127.0.0.1:9999
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `coturn_endpoints` | array | Fleet of coturn instances. Production target: 20-50 endpoints per region. Each entry has `udp_addr` (TURN UDP/3478), optional `tls_addr` (TURNS TCP/5349), and `server_name` (TLS SNI). |
+| `coturn_endpoints` | array | Fleet of coturn instances. Production target: 20-50 endpoints per region. Each entry has `udp_addr` (TURN UDP/3478), optional `tls_addr` (TURNS TCP/5349, parsed but fallback path not yet wired through), and `server_name` (TLS SNI). |
 | `peer_addr` | string | Egress address that coturn's relay forwards client traffic to. |
 | `lanturn_auth_secret` | string | The coturn `use-auth-secret` shared secret. v0.1 uses a single secret across the fleet; production should rotate per-endpoint via Lantern config service. |
-| `fingerprint_mode` | string | `mimic` (default, recommended) / `randomize` / `none`. |
-| `profile` | string | `opus` / `vp8` / `vp9` / `screen` / `random` (default). |
-| `session_duration_secs` | int | Target session lifetime before rotation (default 1500 = 25min). |
-| `idle_gap_min_secs` / `idle_gap_max_secs` | int | Random gap between sessions (default 30-300s). |
-| `udp_timeout_ms` | int | Allocate timeout before falling back to TURNS-on-5349 (default 1500). |
+| `profile` | string | v0.1 only honors `opus`. Other values (`vp8` / `vp9` / `screen` / `random`) are accepted but silently fall back to Opus until `pkg/lanturn` fills in the other profiles. |
 
-**Rollout note:** lanturn is alpha as of 2026-05. The MVP outbound implementation in lantern-box opens a fresh TURN session per `DialContext` call (heavy but simple); production will multiplex destinations over a persistent session via SOCKS5-over-lanturn, matching the pattern Unbounded uses.
+Fields like `fingerprint_mode`, `session_duration_secs`, `idle_gap_*`, `udp_timeout_ms`, and `prefer_transport` are deliberately absent from v0.1 — `pkg/lanturn`'s MVP API doesn't honor them yet, and shipping them in the option schema would have suggested they did. Working code for each lives in the [lanturn spike binaries](https://github.com/getlantern/lanturn/tree/main/cmd) (Phases 2a/2b/2c/2d/4) and will return to this options struct as `pkg/lanturn` adds support.
+
+**Rollout note:** lanturn is alpha. The current outbound:
+
+- registers as a sing-box outbound type and validates option fields
+- advertises **TCP only** (no UDP — `ListenPacket` is unimplemented)
+- returns a clear error from `DialContext` until destination-forwarding (SOCKS5 CONNECT over lanturn) is wired through in `pkg/lanturn`
+
+Once destination forwarding lands, the MVP will open a fresh TURN session per `DialContext` call; production will multiplex destinations over a persistent session, matching the pattern Unbounded uses.
 
 ---
 
