@@ -28,3 +28,17 @@ func TestSupportedProtocolsIncludesUnbounded(t *testing.T) {
 	t.Error(`protocol.SupportedProtocols() does not include "unbounded" — ` +
 		`add it to the supportedProtocols slice in protocol/register.go`)
 }
+
+// TestSupportedProtocolsIncludesLanturn mirrors the Unbounded test for the
+// new lanturn outbound — same regression hazard (register without slice
+// addition silently disables the outbound from the client config
+// negotiator's perspective).
+func TestSupportedProtocolsIncludesLanturn(t *testing.T) {
+	for _, p := range protocol.SupportedProtocols() {
+		if p == "lanturn" {
+			return
+		}
+	}
+	t.Error(`protocol.SupportedProtocols() does not include "lanturn" — ` +
+		`add it to the supportedProtocols slice in protocol/register.go`)
+}

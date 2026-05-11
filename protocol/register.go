@@ -12,6 +12,7 @@ import (
 	"github.com/getlantern/lantern-box/protocol/algeneva"
 	"github.com/getlantern/lantern-box/protocol/amnezia"
 	"github.com/getlantern/lantern-box/protocol/group"
+	"github.com/getlantern/lantern-box/protocol/lanturn"
 	"github.com/getlantern/lantern-box/protocol/outline"
 	"github.com/getlantern/lantern-box/protocol/reflex"
 	"github.com/getlantern/lantern-box/protocol/samizdat"
@@ -23,6 +24,7 @@ var supportedProtocols = []string{
 	// custom protocols
 	"algeneva",
 	"amnezia",
+	"lanturn",
 	"outline",
 	"reflex",
 	"samizdat",
@@ -78,6 +80,7 @@ func registerInbounds(registry *inbound.Registry) {
 func registerOutbounds(registry *outbound.Registry) {
 	// custom protocol outbounds
 	algeneva.RegisterOutbound(registry)
+	lanturn.RegisterOutbound(registry)
 	outline.RegisterOutbound(registry)
 	reflex.RegisterOutbound(registry)
 	samizdat.RegisterOutbound(registry)
