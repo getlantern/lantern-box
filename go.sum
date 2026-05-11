@@ -259,6 +259,8 @@ github.com/getlantern/lantern-water v0.0.0-20260317143726-e0ee64a11d90 h1:P9JX1y
 github.com/getlantern/lantern-water v0.0.0-20260317143726-e0ee64a11d90/go.mod h1:3JpJgwi4KEI6rS9loOAvcBp+F2jP65d0tTg2GQcTPBU=
 github.com/getlantern/lanturn v0.0.0-20260508194301-fa20d8cb3edd h1:atf0Sh4HhPr90qDllPIVQ3MsDmI6xkC4uNDb+EzEQa8=
 github.com/getlantern/lanturn v0.0.0-20260508194301-fa20d8cb3edd/go.mod h1:pRbdtBPri+6CmBNc7acWqD5eGC9GF+8is9wltr1J8mM=
+github.com/getlantern/lanturn v0.0.0-20260511201526-9d796d36e9d6 h1:OtXgkYnoWvDrfH/wCDxcwSqm22EEQzOca26v2FqthKo=
+github.com/getlantern/lanturn v0.0.0-20260511201526-9d796d36e9d6/go.mod h1:Ye72gAz+vkr2TcW1lKMviDakNy46djhH47RPY26elAQ=
 github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f/go.mod h1:D5ao98qkA6pxftxoqzibIBBrLSUli+kYnJqrgBf9cIA=
 github.com/getlantern/ops v0.0.0-20220713155959-1315d978fff7/go.mod h1:D5ao98qkA6pxftxoqzibIBBrLSUli+kYnJqrgBf9cIA=
 github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534 h1:3BwvWj0JZzFEvNNiMhCu4bf60nqcIuQpTYb00Ezm1ag=

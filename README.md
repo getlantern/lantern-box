@@ -622,7 +622,7 @@ Point your browser's SOCKS5 proxy at `127.0.0.1:1080` and you're done.
 
 See the [lanturn README](https://github.com/getlantern/lanturn/blob/main/README.md) for the protocol design and the validation spike sequence (Phases 0-5). See [docs/INTEGRATION.md](https://github.com/getlantern/lanturn/blob/main/docs/INTEGRATION.md) for the full lantern-box wiring guide including config-service plumbing.
 
-> ⚠ **v0.1 alpha — not yet operational.** The outbound is registered and validates config, but `DialContext` returns a clear error pending the destination-forwarding handshake (planned as SOCKS5 CONNECT over lanturn) being wired through in `pkg/lanturn`. Use this section as a forward-looking config reference; do not expect a working tunnel until the follow-up PR lands. Behavioral-mimicry features (covert-dtls fingerprint, session rotation, TURNS-on-5349 fallback, multi-profile selection, fleet recency-weighting) are also deferred to follow-up.
+> **v0.1 alpha.** The outbound dials destinations and forwards bytes end-to-end through the lanturn stack (TURN allocate → inner DTLS-SRTP → SRTP-paced byte chunker → `M.SocksaddrSerializer` destination prefix → coturn → egress → dial → io.Copy). Production-deploy behaviors deferred to follow-up: persistent-session multiplexing (currently fresh session per dial — heavy for short connections), covert-dtls fingerprint randomization (deploy-blocking for Russia / China), session rotation with idle gaps, TURNS-on-5349 fallback, multi-profile selection, recency-weighted fleet selection. Working code for each lives in the [lanturn spike binaries](https://github.com/getlantern/lanturn/tree/main/cmd).
 
 #### Server config (egress)
 
@@ -670,10 +670,11 @@ Fields like `fingerprint_mode`, `session_duration_secs`, `idle_gap_*`, `udp_time
 **Rollout note:** lanturn is alpha. The current outbound:
 
 - registers as a sing-box outbound type and validates option fields
-- advertises **TCP only** (no UDP — `ListenPacket` is unimplemented)
-- returns a clear error from `DialContext` until destination-forwarding (SOCKS5 CONNECT over lanturn) is wired through in `pkg/lanturn`
-
-Once destination forwarding lands, the MVP will open a fresh TURN session per `DialContext` call; production will multiplex destinations over a persistent session, matching the pattern Unbounded uses.
+- advertises **TCP only** (no UDP — `pkg/lanturn` doesn't support UDP destinations yet)
+- opens a **fresh lanturn session per `DialContext`** call — full TURN allocate + DTLS handshake + SRTP key set every time. Heavy for short-lived connections; persistent-session multiplexing (Unbounded pattern) is the next milestone.
+- uses pion-default DTLS fingerprint (**NOT TSPU-safe**; do not deploy to Russia / China before covert-dtls is wired in)
+- uses Opus profile only regardless of `profile` value
+- no session rotation, no TURNS-on-5349 fallback, no recency-weighted fleet selection — those are all next-milestone work
 
 ---
 

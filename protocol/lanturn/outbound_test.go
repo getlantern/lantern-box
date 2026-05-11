@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -93,16 +94,17 @@ func TestNewOutbound_ValidConfig(t *testing.T) {
 	}
 }
 
-// TestDialContext_AlphaError asserts DialContext fails fast with a clear
-// message rather than returning a misrouted connection. This is the
-// behavioral contract called out in the package doc — "the outbound is
-// not yet operational" — and it's load-bearing: a hidden silent success
-// here would forward proxy bytes to a hardcoded egress destination instead
-// of the user's actual destination.
-func TestDialContext_AlphaError(t *testing.T) {
+// TestDialContext_UnreachableCoturn asserts DialContext surfaces a
+// TURN-allocation failure as a wrapped "lanturn dial ..." error when
+// the configured coturn endpoint is unreachable. This is the closest
+// the unit suite can get to exercising the real dial path without a
+// running TURN server — the actual end-to-end is in
+// test/e2e/lanturn_test.go (Phase-5 follow-up, in-process).
+func TestDialContext_UnreachableCoturn(t *testing.T) {
 	ob, err := NewOutbound(context.Background(), nil, logger.NOP(), "lanturn-test",
 		lbopt.LanturnOutboundOptions{
-			CoturnEndpoints:   []lbopt.LanturnCoturnEndpoint{{UDPAddr: "host:3478"}},
+			// 127.0.0.1:1 — guaranteed unreachable UDP for the test.
+			CoturnEndpoints:   []lbopt.LanturnCoturnEndpoint{{UDPAddr: "127.0.0.1:1"}},
 			PeerAddr:          "127.0.0.1:9999",
 			LanturnAuthSecret: "secret",
 		})
@@ -111,12 +113,14 @@ func TestDialContext_AlphaError(t *testing.T) {
 	}
 
 	dest := M.ParseSocksaddrHostPort("example.com", 443)
-	_, err = ob.(*Outbound).DialContext(context.Background(), "tcp", dest)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	_, err = ob.(*Outbound).DialContext(ctx, "tcp", dest)
 	if err == nil {
-		t.Fatal("expected error from alpha DialContext; got nil — would silently misroute bytes")
+		t.Fatal("expected error dialing unreachable coturn; got nil")
 	}
-	if !strings.Contains(err.Error(), "not yet implemented") {
-		t.Errorf("error should explain v0.1 limitation, got: %v", err)
+	if !strings.Contains(err.Error(), "lanturn dial") {
+		t.Errorf("error should be wrapped by outbound's dial-failure message, got: %v", err)
 	}
 }
 

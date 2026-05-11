@@ -28,28 +28,36 @@
 // proxy and would forward bytes onward to the user's destination once
 // destination-forwarding is implemented.
 //
-// # v0.1 alpha status
+// # Destination forwarding
 //
-// **The outbound is not yet operational.** DialContext returns a
-// clear error because the destination-forwarding handshake between
-// the lanturn client and the egress (planned as SOCKS5 CONNECT over
-// the lanturn conn) is not yet implemented in pkg/lanturn — without
-// it, dialed bytes would be forwarded to a single hardcoded egress
-// destination, not the destination the caller asked for. Failing fast
-// avoids silent misrouting.
+// pkg/lanturn.Dial takes the destination as a parameter and prepends
+// the sing-box-native M.SocksaddrSerializer wire format (1B address-
+// type + addr + 2B port) to the first inner-stream bytes — same
+// pattern trojan / anytls / vmess / shadowsocks use. The egress
+// reads the prefix in Accept and dials the destination itself. From
+// the outbound's perspective, the returned net.Conn is a transparent
+// byte pipe to the destination.
+//
+// # v0.1 alpha status
 //
 // What's wired up:
 //
 //   - Option validation (NewOutbound rejects missing required fields)
-//   - Network advertisement: TCP-only (no UDP — DialContext on UDP
-//     would error)
+//   - Network advertisement: TCP-only (no UDP — pkg/lanturn doesn't
+//     support UDP destinations yet)
 //   - Type registration in the OutboundRegistry
+//   - DialContext: opens a fresh lanturn session per call (heavy but
+//     correct); destination forwarding via M.SocksaddrSerializer prefix
 //
 // What's deferred to follow-up PRs (working code lives in the
 // cmd/lanturn-phase{2,3,4} spike binaries in the lanturn repo):
 //
-//   - Per-DialContext session multiplexing via SOCKS5-over-lanturn
-//     (same pattern Unbounded uses)
+//   - Persistent-session multiplexing (instead of fresh session per
+//     DialContext) — every dial currently does a full TURN allocate
+//     + DTLS handshake + SRTP key set, which is heavy for short-lived
+//     connections. Unbounded's pattern is one persistent session +
+//     SOCKS5-style multiplexing of destinations; lanturn will follow
+//     the same path once we have measured the per-dial overhead.
 //   - covert-dtls fingerprint randomization (currently pion-default;
 //     deploy-blocking for Russia / China per design §4.4 + §11.2)
 //   - Session rotation across SessionDuration / IdleGap pattern
@@ -62,6 +70,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -149,16 +158,9 @@ func NewOutbound(
 	}, nil
 }
 
-// DialContext returns a clear "not yet operational" error.
-//
-// v0.1 alpha: the destination-forwarding handshake between the lanturn
-// client and the egress (planned as SOCKS5 CONNECT) is not yet
-// implemented in pkg/lanturn. Returning a real net.Conn here would
-// silently forward bytes to a hardcoded egress destination rather than
-// the caller-requested one — a correctness bug. The outbound is
-// registered as scaffolding for the follow-up that wires destination
-// forwarding through; until then, every dial fails fast with a clear
-// error.
+// DialContext opens a lanturn-tunneled connection to destination.
+// Allocates a fresh TURN session + DTLS handshake + SRTP key set per
+// call (the persistent-session multiplex is follow-up work).
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	ctx, md := adapter.ExtendContext(ctx)
 	md.Outbound = o.Tag()
@@ -168,13 +170,25 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, fmt.Errorf("lanturn: %s not supported (TCP only)", network)
 	}
 
-	o.logger.WarnContext(ctx, "lanturn DialContext invoked but outbound is not yet operational",
-		"dest", destination.String())
-	return nil, fmt.Errorf(
-		"lanturn: destination forwarding to %s not yet implemented (v0.1 alpha); "+
-			"see https://github.com/getlantern/lantern-box/pull/257 — pkg/lanturn needs the SOCKS5-CONNECT-over-lanturn handshake before this outbound can proxy arbitrary destinations",
-		destination.String(),
-	)
+	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	o.logger.DebugContext(ctx, "lanturn dial start", "dest", destination.String())
+
+	conn, err := upstream.Dial(dialCtx, o.cfg, destination)
+	if err != nil {
+		o.logger.ErrorContext(ctx, "lanturn dial failed",
+			"dest", destination.String(),
+			"elapsed", time.Since(started),
+			"err", err)
+		return nil, fmt.Errorf("lanturn dial %s: %w", destination, err)
+	}
+
+	o.logger.DebugContext(ctx, "lanturn dial ok",
+		"dest", destination.String(),
+		"elapsed", time.Since(started))
+	return conn, nil
 }
 
 func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {

@@ -18,13 +18,13 @@ require (
 	github.com/getlantern/broflake v0.0.0-20260504215251-ed3cf75062d1
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260317143726-e0ee64a11d90
-	github.com/getlantern/lanturn v0.0.0-20260508194301-fa20d8cb3edd
+	github.com/getlantern/lanturn v0.0.0-20260511201526-9d796d36e9d6
 	github.com/getlantern/samizdat v0.0.3-0.20260327203406-ef7323341974
 	github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb
 	github.com/gobwas/ws v1.4.0
 	github.com/pion/transport/v4 v4.0.1
 	github.com/refraction-networking/water v0.7.1-alpha
-	github.com/sagernet/sing v0.7.18
+	github.com/sagernet/sing v0.8.9
 	github.com/sagernet/sing-box v1.12.22
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
