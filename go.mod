@@ -18,7 +18,7 @@ require (
 	github.com/getlantern/broflake v0.0.0-20260504215251-ed3cf75062d1
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260317143726-e0ee64a11d90
-	github.com/getlantern/samizdat v0.0.3-0.20260327203406-ef7323341974
+	github.com/getlantern/samizdat v0.0.3-0.20260511220916-bbb8ba1a28db
 	github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb
 	github.com/gobwas/ws v1.4.0
 	github.com/pion/transport/v4 v4.0.1
