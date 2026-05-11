@@ -48,7 +48,10 @@ func RegisterMutableURLTest(registry *outbound.Registry) {
 // after every attempted outbound has failed.
 var ErrAllOutboundsFailed = errors.New("all outbounds failed")
 
-const maxDialRetries = 3
+// maxOutboundAttempts caps the number of outbounds DialContext / ListenPacket
+// will try in a single call. Bounds worst-case latency when many outbounds are
+// down (~maxOutboundAttempts * TCPTimeout instead of unbounded).
+const maxOutboundAttempts = 3
 
 var (
 	_ adapter.MutableOutboundGroup = (*MutableURLTest)(nil)
@@ -214,7 +217,7 @@ func tryEachOutbound[T any](
 		zero    T
 	)
 	span := trace.SpanFromContext(ctx)
-	for n := range maxDialRetries {
+	for n := range maxOutboundAttempts {
 		outbound, err := s.selectOutbound(network, tried)
 		if err != nil {
 			if !errors.Is(err, errNetworkNotSupported) && lastErr != nil {
@@ -223,14 +226,18 @@ func tryEachOutbound[T any](
 			span.RecordError(err)
 			return zero, "", err
 		}
-		tag := realTag(outbound)
+		triedTag := realTag(outbound)
 		conn, err := dial(outbound)
 		if err == nil {
-			return conn, tag, nil
+			// Re-evaluate post-attempt so the returned tag reflects the
+			// nested group's current selection rather than the stale pre-dial
+			// snapshot.
+			return conn, realTag(outbound), nil
 		}
-		s.logger.ErrorContext(ctx, err)
+		s.logger.DebugContext(ctx, "outbound attempt failed",
+			"outbound", triedTag, "attempt", n+1, "error", err)
 		span.AddEvent(failEvent, trace.WithAttributes(
-			attribute.String("outbound", tag),
+			attribute.String("outbound", triedTag),
 			attribute.Int("attempt", n+1),
 			attribute.String("error", err.Error()),
 		))
@@ -240,7 +247,7 @@ func tryEachOutbound[T any](
 			span.RecordError(ctx.Err())
 			return zero, "", ctx.Err()
 		}
-		tried[tag] = true
+		tried[triedTag] = true
 	}
 	err := fmt.Errorf("%w: %w", ErrAllOutboundsFailed, lastErr)
 	span.RecordError(err)

@@ -57,14 +57,6 @@ func TestUpdateSelected(t *testing.T) {
 	assert.Contains(t, want, testGroup.selectedOutboundUDP.Load().Tag())
 }
 
-func (m *mockOutbound) Tag() string {
-	return m.tag
-}
-
-func (m *mockOutbound) Network() []string {
-	return []string{"tcp", "udp"}
-}
-
 func TestMarkFailedAndReselect_SwitchesToHealthyOutbound(t *testing.T) {
 	g := &urlTestGroup{
 		tags:      []string{},
@@ -98,144 +90,141 @@ func TestMarkFailedAndReselect_SwitchesToHealthyOutbound(t *testing.T) {
 	require.Equal("beta", g.selectedOutboundUDP.Load().Tag())
 }
 
-func TestMutableURLTest_DialContext_RetriesEachOutbound(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// retryMode parameterizes the table-driven tests across DialContext (tcp) and
+// ListenPacket (udp), which share the same retry machinery.
+type retryMode struct {
+	method      string
+	setSelected func(g *urlTestGroup, o adapter.Outbound)
+	invoke      func(s *MutableURLTest, ctx context.Context) (any, error)
+}
 
-	delays := map[string]uint16{"alpha": 50, "beta": 1000, "gamma": 2000}
-	outboundByTag := make(map[string]*mockOutbound, len(delays))
+var retryModes = []retryMode{
+	{
+		method:      "DialContext",
+		setSelected: func(g *urlTestGroup, o adapter.Outbound) { g.selectedOutboundTCP.Store(o) },
+		invoke: func(s *MutableURLTest, ctx context.Context) (any, error) {
+			return s.DialContext(ctx, "tcp", metadata.Socksaddr{})
+		},
+	},
+	{
+		method:      "ListenPacket",
+		setSelected: func(g *urlTestGroup, o adapter.Outbound) { g.selectedOutboundUDP.Store(o) },
+		invoke: func(s *MutableURLTest, ctx context.Context) (any, error) {
+			return s.ListenPacket(ctx, metadata.Socksaddr{})
+		},
+	},
+}
+
+func newRetryRig(mode retryMode, ctx context.Context, delays map[string]uint16, firstSelected string) (*MutableURLTest, map[string]*mockOutbound) {
 	g := &urlTestGroup{
 		ctx:       ctx,
 		logger:    sbLog.NewNOPFactory().Logger(),
-		tags:      []string{},
 		outbounds: sync.TypedMap[string, adapter.Outbound]{},
 		tolerance: 50,
 		history:   urltest.NewHistoryStorage(),
 	}
+	outbounds := make(map[string]*mockOutbound, len(delays))
 	for tag, delay := range delays {
 		ob := &mockOutbound{tag: tag}
 		g.tags = append(g.tags, tag)
 		g.outbounds.Store(tag, ob)
 		g.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{Time: time.Now(), Delay: delay})
-		outboundByTag[tag] = ob
+		outbounds[tag] = ob
 	}
-	g.selectedOutboundTCP.Store(outboundByTag["alpha"])
-
+	if first, ok := outbounds[firstSelected]; ok {
+		mode.setSelected(g, first)
+	}
 	s := &MutableURLTest{
 		Adapter: O.NewAdapter(constant.TypeMutableURLTest, "test", []string{"tcp", "udp"}, nil),
 		ctx:     ctx,
 		logger:  sbLog.NewNOPFactory().Logger(),
 		group:   g,
 	}
-
-	outboundByTag["alpha"].On("DialContext").Return(nil, assert.AnError)
-	outboundByTag["beta"].On("DialContext").Return(nil, assert.AnError)
-	outboundByTag["gamma"].On("DialContext").Return(&net.IPConn{}, nil)
-
-	conn, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
-	assert.NoError(t, err)
-	assert.NotNil(t, conn)
-	for tag, ob := range outboundByTag {
-		ob.AssertExpectations(t)
-		assert.Equalf(t, 1, callCount(ob, "DialContext"), "outbound %s should have been dialed exactly once", tag)
-	}
+	return s, outbounds
 }
 
-func TestMutableURLTest_DialContext_AllFail(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func TestMutableURLTest_RetriesEachOutbound(t *testing.T) {
+	for _, mode := range retryModes {
+		t.Run(mode.method, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-	delays := map[string]uint16{"alpha": 50, "beta": 1000}
-	outboundByTag := make(map[string]*mockOutbound, len(delays))
-	g := &urlTestGroup{
-		ctx:       ctx,
-		logger:    sbLog.NewNOPFactory().Logger(),
-		tags:      []string{},
-		outbounds: sync.TypedMap[string, adapter.Outbound]{},
-		tolerance: 50,
-		history:   urltest.NewHistoryStorage(),
-	}
-	for tag, delay := range delays {
-		ob := &mockOutbound{tag: tag}
-		g.tags = append(g.tags, tag)
-		g.outbounds.Store(tag, ob)
-		g.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{Time: time.Now(), Delay: delay})
-		outboundByTag[tag] = ob
-	}
-	g.selectedOutboundTCP.Store(outboundByTag["alpha"])
+			delays := map[string]uint16{"alpha": 50, "beta": 1000, "gamma": 2000}
+			s, outbounds := newRetryRig(mode, ctx, delays, "alpha")
 
-	s := &MutableURLTest{
-		Adapter: O.NewAdapter(constant.TypeMutableURLTest, "test", []string{"tcp", "udp"}, nil),
-		ctx:     ctx,
-		logger:  sbLog.NewNOPFactory().Logger(),
-		group:   g,
-	}
+			outbounds["alpha"].On(mode.method).Return(nil, assert.AnError)
+			outbounds["beta"].On(mode.method).Return(nil, assert.AnError)
+			outbounds["gamma"].On(mode.method).Return(&net.IPConn{}, nil)
 
-	for _, ob := range outboundByTag {
-		ob.On("DialContext").Return(nil, assert.AnError)
-	}
-
-	conn, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
-	assert.Error(t, err)
-	assert.Nil(t, conn)
-	assert.True(t, errors.Is(err, ErrAllOutboundsFailed),
-		"err should be ErrAllOutboundsFailed so callers can trigger a URL test; got: %v", err)
-	assert.True(t, errors.Is(err, assert.AnError),
-		"the last underlying dial error should still be wrapped; got: %v", err)
-	for tag, ob := range outboundByTag {
-		assert.Equalf(t, 1, callCount(ob, "DialContext"), "outbound %s should have been dialed exactly once", tag)
-	}
-}
-
-func TestMutableURLTest_DialContext_RetryCap(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// More outbounds than maxDialRetries so the cap is the binding constraint.
-	tags := []string{"a", "b", "c", "d", "e"}
-	outboundByTag := make(map[string]*mockOutbound, len(tags))
-	g := &urlTestGroup{
-		ctx:       ctx,
-		logger:    sbLog.NewNOPFactory().Logger(),
-		tags:      []string{},
-		outbounds: sync.TypedMap[string, adapter.Outbound]{},
-		tolerance: 50,
-		history:   urltest.NewHistoryStorage(),
-	}
-	for i, tag := range tags {
-		ob := &mockOutbound{tag: tag}
-		g.tags = append(g.tags, tag)
-		g.outbounds.Store(tag, ob)
-		g.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
-			Time:  time.Now(),
-			Delay: uint16(100 * (i + 1)),
+			conn, err := mode.invoke(s, ctx)
+			assert.NoError(t, err)
+			assert.NotNil(t, conn)
+			for tag, ob := range outbounds {
+				ob.AssertExpectations(t)
+				assert.Equalf(t, 1, callCount(ob, mode.method),
+					"outbound %s should have been attempted exactly once", tag)
+			}
 		})
-		outboundByTag[tag] = ob
 	}
-	g.selectedOutboundTCP.Store(outboundByTag["a"])
+}
 
-	s := &MutableURLTest{
-		Adapter: O.NewAdapter(constant.TypeMutableURLTest, "test", []string{"tcp", "udp"}, nil),
-		ctx:     ctx,
-		logger:  sbLog.NewNOPFactory().Logger(),
-		group:   g,
-	}
-	for _, ob := range outboundByTag {
-		ob.On("DialContext").Return(nil, assert.AnError)
-	}
+func TestMutableURLTest_AllFail(t *testing.T) {
+	for _, mode := range retryModes {
+		t.Run(mode.method, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-	conn, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
-	assert.Error(t, err)
-	assert.Nil(t, conn)
-	assert.True(t, errors.Is(err, ErrAllOutboundsFailed),
-		"err should be ErrAllOutboundsFailed; got: %v", err)
+			delays := map[string]uint16{"alpha": 50, "beta": 1000}
+			s, outbounds := newRetryRig(mode, ctx, delays, "alpha")
+			for _, ob := range outbounds {
+				ob.On(mode.method).Return(nil, assert.AnError)
+			}
 
-	total := 0
-	for _, ob := range outboundByTag {
-		total += callCount(ob, "DialContext")
+			conn, err := mode.invoke(s, ctx)
+			assert.Error(t, err)
+			assert.Nil(t, conn)
+			assert.True(t, errors.Is(err, ErrAllOutboundsFailed),
+				"err should be ErrAllOutboundsFailed so callers can trigger a URL test; got: %v", err)
+			assert.True(t, errors.Is(err, assert.AnError),
+				"the last underlying error should still be wrapped; got: %v", err)
+			for tag, ob := range outbounds {
+				assert.Equalf(t, 1, callCount(ob, mode.method),
+					"outbound %s should have been attempted exactly once", tag)
+			}
+		})
 	}
-	assert.Equalf(t, maxDialRetries, total,
-		"DialContext should have been attempted exactly maxDialRetries times across all outbounds; got %d", total)
+}
+
+func TestMutableURLTest_RetryCap(t *testing.T) {
+	for _, mode := range retryModes {
+		t.Run(mode.method, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			// More outbounds than maxOutboundAttempts so the cap is the binding constraint.
+			delays := map[string]uint16{}
+			for i, tag := range []string{"a", "b", "c", "d", "e"} {
+				delays[tag] = uint16(100 * (i + 1))
+			}
+			s, outbounds := newRetryRig(mode, ctx, delays, "a")
+			for _, ob := range outbounds {
+				ob.On(mode.method).Return(nil, assert.AnError)
+			}
+
+			conn, err := mode.invoke(s, ctx)
+			assert.Error(t, err)
+			assert.Nil(t, conn)
+			assert.True(t, errors.Is(err, ErrAllOutboundsFailed),
+				"err should be ErrAllOutboundsFailed; got: %v", err)
+
+			total := 0
+			for _, ob := range outbounds {
+				total += callCount(ob, mode.method)
+			}
+			assert.Equalf(t, maxOutboundAttempts, total,
+				"attempts should equal maxOutboundAttempts; got %d", total)
+		})
+	}
 }
 
 func callCount(m *mockOutbound, method string) int {
