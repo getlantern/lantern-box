@@ -117,6 +117,17 @@ cat > /etc/systemd/system/otelcol-contrib.service.d/env.conf <<'DROPIN'
 EnvironmentFile=/etc/otelcol-contrib/otelcol.env
 DROPIN
 
+# Grant otelcol-contrib read access to journald so the `journald` receiver
+# (see deploy/packer/otelcol.yaml) can ship cloud-init's `logger -t cloud-init …`
+# step logs + ERR-trap output to SigNoz. Without this the service would log
+# "permission denied" trying to open /run/log/journal and silently drop all
+# cloud-init diagnostic messages — which is precisely what happened during
+# the May 8 dpkg-flag regression that needed an SSH session to diagnose.
+cat > /etc/systemd/system/otelcol-contrib.service.d/journald.conf <<'DROPIN'
+[Service]
+SupplementaryGroups=systemd-journal
+DROPIN
+
 # Create empty env file for lantern-box OTel — cloud-init populates it
 # with OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS, and
 # OTEL_RESOURCE_ATTRIBUTES before starting the service.
