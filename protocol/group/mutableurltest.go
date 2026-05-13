@@ -774,7 +774,10 @@ func urlTestGET(ctx context.Context, link string, detour N.Dialer) (uint16, erro
 	if err != nil {
 		return 0, err
 	}
-	defer instance.Close()
+	// WATER's Close blocks in WaitWorker until the wasm relay exits, which can
+	// take 35–90s after a context cancellation; a background goroutine avoids
+	// stalling b.Wait() in the caller for that window.
+	defer func() { go instance.Close() }()
 	if earlyConn, isEarlyConn := common.Cast[N.EarlyConn](instance); isEarlyConn && earlyConn.NeedHandshake() {
 		start = time.Now()
 	}
