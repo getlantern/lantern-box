@@ -313,13 +313,36 @@ func (o *Outbound) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Co
 		return nil, err
 	}
 
-	conn, err := dialer.DialContext(context.Background(), N.NetworkTCP, "localhost:0")
-	if err != nil {
-		o.logger.ErrorContext(ctx, "WATER failed to dial", slog.Any("error", err))
-		return nil, err
+	// DialContext uses context.Background() so wazero's wasm execution isn't
+	// interrupted mid-run. Race it against ctx so callers (e.g. URL-test
+	// goroutines with a 5s deadline) aren't blocked for the full OS TCP timeout
+	// if the WASM can't reach the server.
+	type dialResult struct {
+		conn net.Conn
+		err  error
 	}
-
-	return waterTransport.NewWATERConnection(conn, destination, o.skipHandshake), nil
+	ch := make(chan dialResult, 1)
+	go func() {
+		conn, err := dialer.DialContext(ctx, N.NetworkTCP, "localhost:0")
+		ch <- dialResult{conn, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			o.logger.ErrorContext(ctx, "WATER failed to dial", slog.Any("error", r.err))
+			return nil, r.err
+		}
+		return waterTransport.NewWATERConnection(r.conn, destination, o.skipHandshake), nil
+	case <-ctx.Done():
+		// Drain the background dial when it finishes to avoid leaving an open
+		// server connection unreferenced.
+		go func() {
+			if r := <-ch; r.err == nil && r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
 }
 
 // ListenPacket creates a UoT packet connection through the WATER transport.
