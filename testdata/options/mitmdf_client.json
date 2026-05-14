@@ -1,0 +1,65 @@
+{
+	"log": { "disabled": true },
+	"inbounds": [
+		{
+			"type": "mixed",
+			"tag": "mixed-in",
+			"listen": "127.0.0.1",
+			"listen_port": 10808
+		}
+	],
+	"outbounds": [
+		{ "type": "direct", "tag": "direct" },
+		{
+			"type": "mitm-df",
+			"tag":  "mitm-df",
+			"ca": {
+				"cert_path": "/tmp/lantern-mitm-df-example/ca.crt",
+				"key_path":  "/tmp/lantern-mitm-df-example/ca.key",
+				"permitted_domains": [
+					"vercel.app", "vercel.com", "nextjs.org",
+					"google.com", "googleapis.com", "googlevideo.com",
+					"github.com", "githubusercontent.com",
+					"fastly.com", "fastly.net", "reddit.com"
+				],
+				"validity": "720h"
+			},
+			"fronts": [
+				{
+					"names":        ["vercel.app", "vercel.com"],
+					"fronted_sni":  "nextjs.org",
+					"verify_san":   ["nextjs.org", "vercel.app", "vercel.com", "react.dev"],
+					"redirect_addr": "nextjs.org:443"
+				},
+				{
+					"names":        ["google.com", "googleapis.com", "googlevideo.com"],
+					"fronted_sni":  "www.google.com",
+					"verify_san":   ["www.google.com", "dns.google", "googlevideo.com"],
+					"redirect_addr": "www.google.com:443"
+				},
+				{
+					"names":        ["github.com", "githubusercontent.com"],
+					"fronted_sni":  "github.com",
+					"verify_san":   ["github.com", "githubusercontent.com"]
+				}
+			],
+			"deny_domains": ["bank.example", "gov.example"],
+			"audit_log_path": "/tmp/lantern-mitm-df-example/audit.log",
+			"fingerprint": "chrome",
+			"egress_handshake_timeout": "10s"
+		}
+	],
+	"route": {
+		"rules": [
+			{
+				"domain_suffix": [
+					"vercel.app", "vercel.com",
+					"google.com", "googleapis.com", "googlevideo.com",
+					"github.com", "githubusercontent.com"
+				],
+				"outbound": "mitm-df"
+			}
+		],
+		"final": "direct"
+	}
+}
