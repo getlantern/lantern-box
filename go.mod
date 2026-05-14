@@ -22,6 +22,7 @@ require (
 	github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb
 	github.com/gobwas/ws v1.4.0
 	github.com/pion/transport/v4 v4.0.1
+	github.com/refraction-networking/utls v1.8.2
 	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/sing v0.7.18
 	github.com/sagernet/sing-box v1.12.22
@@ -223,7 +224,6 @@ require (
 	github.com/protolambda/ctxlock v0.1.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/quic-go v0.59.0 // indirect
-	github.com/refraction-networking/utls v1.8.2 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rs/dnscache v0.0.0-20211102005908-e0241e321417 // indirect
 	github.com/safchain/ethtool v0.3.0 // indirect
