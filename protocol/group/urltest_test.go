@@ -122,6 +122,47 @@ func TestURLTestGET_BlockingConnCloseDoesNotBlockReturn(t *testing.T) {
 		"urlTestGET blocked for %v after context expiry; asyncCloseConn should prevent blocking", elapsed)
 }
 
+// TestURLTestGET_BlockingDialContextDoesNotBlockReturn is a regression test for
+// outbounds whose DialContext ignores context cancellation because they block
+// in host-function callbacks that Go's runtime cannot interrupt (e.g. WATER's
+// WASM TCP dial). Before the goroutine-race fix, urlTestGET blocked for the
+// full OS TCP timeout (~87 s) even when the testCtx had already expired.
+//
+// The blocking window is simulated by a dialer that ignores ctx and returns
+// only after released is closed, 3 s after the request context expires.
+// Without the fix, urlTestGET blocks for those 3 s. With the fix, the
+// ctx.Done() select arm fires and urlTestGET returns at ~200 ms.
+func TestURLTestGET_BlockingDialContextDoesNotBlockReturn(t *testing.T) {
+	released := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(released) }) }
+
+	dialer := &stubNetDialer{
+		dialFn: func(ctx context.Context, network string, dest metadata.Socksaddr) (net.Conn, error) {
+			select {
+			case <-released:
+			case <-time.After(10 * time.Second):
+			}
+			return nil, errors.New("never connected")
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// Release 3 s after the context expires; without the fix urlTestGET blocks for those 3 s.
+	time.AfterFunc(200*time.Millisecond+3*time.Second, release)
+
+	start := time.Now()
+	_, _ = urlTestGET(ctx, "http://192.0.2.1/", dialer)
+	elapsed := time.Since(start)
+
+	release()
+
+	assert.Less(t, elapsed, 2*time.Second,
+		"urlTestGET blocked for %v after context expiry; DialContext goroutine race should prevent blocking", elapsed)
+}
+
 func TestUpdateSelected(t *testing.T) {
 	outbounds := map[string]uint16{
 		"kangaskhan": 36,

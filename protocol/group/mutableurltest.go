@@ -770,9 +770,32 @@ func urlTestGET(ctx context.Context, link string, detour N.Dialer) (uint16, erro
 	}
 
 	start := time.Now()
-	instance, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
-	if err != nil {
-		return 0, err
+	// Some outbound DialContext implementations (e.g. WATER) block in WASM→host
+	// callbacks that the Go runtime cannot interrupt via context cancellation;
+	// racing against ctx.Done() enforces the test deadline regardless.
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan dialResult, 1)
+	go func() {
+		conn, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
+		ch <- dialResult{conn, err}
+	}()
+	var instance net.Conn
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return 0, r.err
+		}
+		instance = r.conn
+	case <-ctx.Done():
+		go func() {
+			if r := <-ch; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return 0, ctx.Err()
 	}
 	conn := &asyncCloseConn{Conn: instance}
 	defer conn.Close()
