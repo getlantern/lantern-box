@@ -22,7 +22,7 @@ graph TB
     Router["sing-box router<br/>(SNI sniffing)"]
     Tunnel["outbound: tunnel<br/>→ Lantern proxies"]
     Direct["outbound: direct<br/>(local/private bypass)"]
-    MITM["outbound: mitm-df (NEW)<br/>internal/mitmdf"]
+    MITM["outbound: mitm-df (NEW)<br/>protocol/mitmdf"]
     CA["internal/mitmca<br/>(NameConstraints CA,<br/>hardware-backed keys)"]
     CDN["CDN edge<br/>(Vercel / Fastly / Google /<br/>Netlify-on-CloudFront / GitHub)"]
 
@@ -48,21 +48,31 @@ lantern-box/
                          hardware-backed via build tags: keystore_macos.go,
                          keystore_android.go, keystore_windows.go)
       keystore_test.go
-    mitmdf/            ← The MITM-DF outbound itself
-      outbound.go      ← sing-box outbound type; implements N.Dialer
-      fronts.go        ← Fronts table parsing, matcher
-      session.go       ← per-connection MITM session (TLS terminate ↔ TLS re-dial)
-      pinner.go        ← SPKI pinning for the outbound (proxy→CDN) TLS
-      audit.go         ← Audit log writer (every mint)
+  protocol/
+    mitmdf/            ← The MITM-DF outbound itself (sibling to algeneva/,
+                         lanturn/, samizdat/, unbounded/, water/)
+      outbound.go      ← sing-box outbound type; implements N.Dialer; owns the
+                         per-dial serve goroutine that bridges user TLS ↔ egress TLS
+      fronts.go        ← Fronts table parsing, suffix-aware matcher, deny-list
+      audit.go         ← JSONL audit log of every decision (allow/deny/no-match/error)
+      utls_preset.go   ← uTLS HelloCustom + ApplyPreset so the user's negotiated
+                         ALPN survives the egress handshake (named presets bake
+                         [h2, http/1.1] into the ClientHello extension otherwise)
+      pinner.go        ← SPKI pinning for the egress (proxy→CDN) TLS [follow-up]
       *_test.go
   option/
     mitmdf.go          ← Config struct for "type": "mitm-df" outbounds
+  test/e2e/
+    mitmdf_test.go     ← in-process fronting-server e2e: captures egress SNI +
+                         ALPN, asserts allow + deny paths and audit records
   docs/
     mitm-df/
       architecture.md  ← this file
-      operations.md    ← runbook: weekly fronts validation, kill-switch path
-      security.md      ← residual-risk summary (link to engineering#3482)
+      operations.md    ← runbook: weekly fronts validation, kill-switch path [follow-up]
+      security.md      ← residual-risk summary (link to engineering#3482) [follow-up]
 ```
+
+`internal/mitmca/` stays under `internal/` because it's a private helper consumed only by `protocol/mitmdf/`; the outbound itself moves under `protocol/` to match the existing sibling transports.
 
 ## Public Go types
 
@@ -243,9 +253,9 @@ Roughly the order we'll ship the foundation in:
 
 1. **`internal/mitmca`** — CA generator, name constraints, file-based keystore, tests. *Starting point of the first PR; lives behind no feature flag, ships even before the outbound is wired.*
 2. **`internal/mitmca/keystore_*.go`** — per-platform hardware-backed key storage.
-3. **`internal/mitmdf/fronts.go`** — fronts-table parsing and matcher; reusable against sing-box's domain matchers.
-4. **`internal/mitmdf/session.go`** — per-connection MITM session.
-5. **`internal/mitmdf/outbound.go`** — sing-box outbound registration.
+3. **`protocol/mitmdf/fronts.go`** — fronts-table parsing and matcher; reusable against sing-box's domain matchers.
+4. **`protocol/mitmdf/outbound.go`** — sing-box outbound registration; owns the per-dial `serve` goroutine (bridges user TLS ↔ egress uTLS via `net.Pipe()` so there is no listening port).
+5. **`protocol/mitmdf/utls_preset.go`** + **`protocol/mitmdf/audit.go`** — fingerprint preset (with ALPN inheritance via `HelloCustom`+`ApplyPreset`) and JSONL audit writer.
 6. **`option/mitmdf.go`** — config schema.
 7. **Cross-repo wiring**: Flutter UI, config-server push channel, weekly validation CI.
 
