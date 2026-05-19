@@ -198,22 +198,32 @@ func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, opt
 		TransportModuleBin: b,
 		OverrideLogger:     slogLogger,
 	}
+
+	// Use the wazero interpreter instead of the JIT compiler.
+	//
+	// The JIT compiler allocates a large native-code arena at runtime-creation
+	// time (typically 5-20 MB of resident memory on arm64) in addition to
+	// per-instance WASM linear memory.  In memory-constrained environments
+	// such as the macOS or iOS NetworkExtension process (jetsam limit ~50 MB)
+	// this pushes resident memory over the limit and the OS kills the process
+	// silently, manifesting as a VPN disconnect with no Go error or panic.
+	//
+	// The interpreter avoids the JIT arena entirely.  WASM execution is
+	// slower, but the bottleneck for a proxy is network I/O, not instruction
+	// throughput, so the tradeoff is acceptable.
+	o.dialerConfig.RuntimeConfig().Interpreter()
 	o.mu.Unlock()
 
-	// Pre-compile the WASM module to warm up the on-disk compilation cache
-	// before setting ready=true. On platforms like macOS NetworkExtension the
-	// JIT compilation spike can exceed the process memory budget and cause a
-	// silent kill during the first URL-test dial. By doing it here — in the
-	// background goroutine before the TUN is fully up — total memory pressure
-	// is lower and subsequent dials get a cheap cache-hit instead.
-	logger.DebugContext(ctx, "pre-compiling WASM module to warm compilation cache",
+	// Validate and warm the interpreter by doing a lightweight parse of the
+	// WASM module before setting ready=true so any module errors surface early.
+	logger.DebugContext(ctx, "validating WASM module via interpreter",
 		slog.String("transport", options.Transport))
 	if preErr := preCompileWASM(ctx, b, o.dialerConfig); preErr != nil {
-		logger.WarnContext(ctx, "WASM pre-compilation failed (non-fatal, will compile on first dial)",
+		logger.WarnContext(ctx, "WASM module validation failed (non-fatal)",
 			slog.String("transport", options.Transport),
 			slog.Any("error", preErr))
 	} else {
-		logger.DebugContext(ctx, "WASM pre-compilation complete",
+		logger.DebugContext(ctx, "WASM module validation complete",
 			slog.String("transport", options.Transport))
 	}
 
@@ -257,11 +267,12 @@ func (o *Outbound) Close() error {
 	return nil
 }
 
-// preCompileWASM compiles the WASM binary using the same runtime config that
-// live dials will use, writing the result into the on-disk compilation cache.
-// After this returns, every subsequent NewCoreWithContext → CompileModule call
-// gets a cheap cache-hit instead of a full JIT compilation. This is a
-// best-effort operation; callers must handle a non-nil error gracefully.
+// preCompileWASM validates the WASM binary against the provided runtime config
+// by compiling it once.  In interpreter mode (the default for WATER dials) this
+// is a lightweight parse+validate step; in compiler mode it warms the on-disk
+// JIT compilation cache.  Either way this surfaces module-load errors early,
+// before ready is set to true.  It is best-effort; callers must handle a
+// non-nil error gracefully.
 func preCompileWASM(ctx context.Context, wasmBin []byte, cfg *water.Config) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
