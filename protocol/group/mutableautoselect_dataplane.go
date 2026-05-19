@@ -33,23 +33,19 @@ func (s *MutableAutoSelect) makeHooks(outerTag string) (onStall, onRead func()) 
 	return onStall, onRead
 }
 
-// dataPlaneWatchdog drives the no-traffic stall timer and the three
-// optional activity callbacks shared by the stream and packet wrappers.
-//
-//   - onStall fires once if the idle threshold elapses with no I/O.
-//   - onActivity fires on every non-empty Read or Write (Write-as-liveness
-//     is good enough for the adaptive probe-cadence signal).
-//   - onRead fires only on non-empty Read; the user-failure reset needs
-//     unambiguous bidirectional evidence because a QUIC/HTTP2 Write only
-//     proves the local stack accepted the bytes, not that the peer did.
+// dataPlaneWatchdog is the no-traffic stall timer shared by the stream
+// and packet wrappers.
 type dataPlaneWatchdog struct {
 	idle       time.Duration
 	onStall    func()
 	onActivity func()
-	onRead     func()
-	stalled    atomic.Bool
-	timer      *time.Timer
-	closeOnce  sync.Once
+	// onRead fires only on non-empty Read: the user-failure reset needs
+	// bidirectional evidence, since a QUIC/HTTP2 Write only proves the
+	// local stack accepted the bytes, not that the peer did.
+	onRead    func()
+	stalled   atomic.Bool
+	timer     *time.Timer
+	closeOnce sync.Once
 }
 
 func (w *dataPlaneWatchdog) init(idle time.Duration, onStall, onActivity, onRead func()) {
@@ -64,6 +60,11 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	if n <= 0 || err != nil {
 		return
 	}
+	// Short-circuit once stalled: a late onRead would reset the
+	// userFailure the stall just recorded.
+	if w.stalled.Load() {
+		return
+	}
 	w.timer.Reset(w.idle)
 	if w.onActivity != nil {
 		w.onActivity()
@@ -73,9 +74,9 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	}
 }
 
-// closeWatchdog stops the timer and sets stalled=true so a Read/Write
-// that races Close — returning n>0 just before Stop and then re-arming
-// via Reset — can't deliver a phantom onStall after the conn is gone.
+// closeWatchdog sets stalled=true before Stop so any concurrent noteIO
+// short-circuits and any concurrent fireStall CAS-fails — late I/O can't
+// deliver a phantom onStall after Close.
 func (w *dataPlaneWatchdog) closeWatchdog() (firstClose bool) {
 	w.closeOnce.Do(func() {
 		w.stalled.Store(true)
@@ -91,8 +92,8 @@ func (w *dataPlaneWatchdog) fireStall() {
 	}
 }
 
-// dataPlaneStream wraps a net.Conn with the stall watchdog and activity
-// hooks. Detects tunnels that handshake successfully but never carry data.
+// dataPlaneStream detects tunnels that handshake successfully but never
+// carry data.
 type dataPlaneStream struct {
 	net.Conn
 	dataPlaneWatchdog

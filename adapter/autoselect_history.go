@@ -41,20 +41,15 @@ type TagHistory struct {
 }
 
 // AutoSelectHistoryStorage is the store the MutableAutoSelect group
-// writes to whenever a member's history changes. A host that wants
-// durability registers a hook via SetHook and periodically reads All()
-// to flush to disk; on next startup it seeds entries back into a fresh
-// storage via Store.
+// writes to whenever a member's history changes.
 //
 // Implementations must be safe for concurrent use. Store and Delete
 // must be non-blocking and fast: the group calls them while holding
-// internal locks (s.access), so blocking work — disk I/O,
-// network calls, slow serialization — must happen out-of-band via the
-// hook, not inline. When a state change actually occurs, the hook
-// fires after the change is visible to subsequent Load callers so a
-// hook-driven flusher that calls Load observes what fired its hook.
-// A Store of nil is equivalent to Delete. Calls that arrive after
-// Close are dropped without panic.
+// internal locks, so blocking work — disk I/O, network calls, slow
+// serialization — must happen out-of-band via the hook, not inline.
+// When a state change actually occurs, the hook fires after the change
+// is visible to subsequent Load callers. A Store of nil is equivalent
+// to Delete. Calls that arrive after Close are dropped without panic.
 type AutoSelectHistoryStorage interface {
 	Load(tag string) *TagHistory
 	Store(tag string, h *TagHistory)
@@ -177,8 +172,6 @@ func (h *TagHistory) LatestSuccessTime() time.Time {
 	return h.UpdatedAt
 }
 
-// cloneTagHistory returns a deep copy so callers can mutate the
-// returned struct (or the storage's internal copy) without racing.
 func cloneTagHistory(h *TagHistory) *TagHistory {
 	if h == nil {
 		return nil

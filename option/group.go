@@ -21,13 +21,8 @@ type MutableURLTestOutboundOptions struct {
 	IdleTimeout  badoption.Duration `json:"idle_timeout,omitempty"`
 }
 
-// MutableAutoSelectOutboundOptions configures the client-side
-// server-selection group. The group probes its members in parallel,
-// selects the lowest-delay healthy candidate (with a switch tolerance to
-// dampen churn), maintains a per-server outcome ring to demote
-// chronically-bad servers, and emits an exhaustion signal when its
-// reconnection ladder fails. Zero values fall back to documented
-// defaults.
+// MutableAutoSelectOutboundOptions configures the MutableAutoSelect
+// group. Zero values fall back to documented defaults.
 type MutableAutoSelectOutboundOptions struct {
 	Outbounds    []string          `json:"outbounds"`
 	URL          string            `json:"url,omitempty"`

@@ -74,8 +74,7 @@ func newLocalHistory(ringMax int) *localHistory {
 	return &localHistory{ringMax: ringMax}
 }
 
-// append records one outcome, evicting the oldest entry when the ring is
-// full. now is a parameter so tests can drive a fake clock.
+// now is a parameter so tests can drive a fake clock.
 func (h *localHistory) append(o localOutcome, delayMs uint32, now time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -107,8 +106,6 @@ func (h *localHistory) resetUserFailures() bool {
 
 func (h *localHistory) userFailureCount() uint32 { return h.userFailures.Load() }
 
-// snapshot returns a copy of the outcomes ring along with the running
-// consecutive-failure and user-failure counters.
 func (h *localHistory) snapshot() ([]timestampedOutcome, uint32, uint32) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -186,8 +183,6 @@ func hydrateLocalHistory(t *adapter.TagHistory, ringMax int) *localHistory {
 	return h
 }
 
-// lastSuccessDelay returns the delay (ms) of the most recent success, or
-// 0 if none.
 func lastSuccessDelay(entries []timestampedOutcome) uint32 {
 	for i := len(entries) - 1; i >= 0; i-- {
 		if entries[i].outcome == outcomeSuccess {
@@ -197,8 +192,6 @@ func lastSuccessDelay(entries []timestampedOutcome) uint32 {
 	return 0
 }
 
-// hasOutcomeSince reports whether the snapshot contains at least one
-// outcome recorded at or after t.
 func hasOutcomeSince(entries []timestampedOutcome, t time.Time) bool {
 	for i := len(entries) - 1; i >= 0; i-- {
 		if !entries[i].timestamp.Before(t) {

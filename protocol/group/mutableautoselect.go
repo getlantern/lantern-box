@@ -49,11 +49,7 @@ var (
 
 const probeConcurrency = 6
 
-// MutableAutoSelect is the client-side server-selection group. It probes
-// its members in parallel, picks the lowest-delay healthy candidate with
-// switch-tolerance hysteresis, demotes servers whose probes pass but whose
-// user traffic fails, watches connections for data-plane stalls, and
-// emits an exhaustion signal when every candidate is blocked.
+// MutableAutoSelect is the client-side server-selection group.
 type MutableAutoSelect struct {
 	outbound.Adapter
 	ctx         context.Context
@@ -216,9 +212,7 @@ func (s *MutableAutoSelect) Start() error {
 	return nil
 }
 
-// hydrateHistoryLocked seeds the in-memory localHistory from the persisted
-// snapshot. No-op when an in-memory entry already exists. Caller must hold
-// s.access.
+// Caller must hold s.access. No-op when an in-memory entry already exists.
 func (s *MutableAutoSelect) hydrateHistoryLocked(tag string) {
 	if _, ok := s.histories[tag]; ok {
 		return
@@ -369,8 +363,7 @@ func (s *MutableAutoSelect) SetURLOverrides(overrides map[string]string) {
 	}
 }
 
-// invalidateHistoryLocked drops both the in-memory ring and the persisted
-// snapshot for tag. Caller must hold s.access.
+// Caller must hold s.access.
 func (s *MutableAutoSelect) invalidateHistoryLocked(tag string) {
 	delete(s.histories, tag)
 	if s.history != nil {
@@ -497,9 +490,6 @@ func (s *MutableAutoSelect) NewPacketConnectionEx(ctx context.Context, conn N.Pa
 	s.connMgr.NewPacketConnection(ctx, s, conn, metadata, onClose)
 }
 
-// selectFor ranks every viable member, applies the three-tier demote
-// fallback per network, and picks the winner with switch-tolerance
-// hysteresis against the previous sticky tag.
 func (s *MutableAutoSelect) selectFor(network string) (A.Outbound, error) {
 	var slot *atomic.Value
 	switch network {
@@ -600,9 +590,7 @@ func (s *MutableAutoSelect) peekHistoryLocked(tag string) (*localHistory, bool) 
 	return h, ok
 }
 
-// collectProbeJobsLocked snapshots the current member set into a slice of
-// probe jobs. Excluded protocols (tor, unbounded) are skipped. Caller must
-// hold s.access.
+// Caller must hold s.access. Skips excludeFromPool members.
 func (s *MutableAutoSelect) collectProbeJobsLocked() []probeJob {
 	jobs := make([]probeJob, 0, len(s.tags))
 	for _, tag := range s.tags {
@@ -830,15 +818,6 @@ func (s *MutableAutoSelect) recordOutcome(tag string, o localOutcome, delayMs ui
 	})
 }
 
-// runLadder runs the two-step reconnection ladder (fast retry of target,
-// then a full parallel re-probe) and emits the exhaustion signal if
-// neither step produced a working candidate. Concurrent invocations
-// collapse via the laddering CAS guard. An empty target falls back to
-// the most recent sticky tag (TCP preferred, UDP secondary).
-//
-// Step 1 is skipped when target has any user-failure evidence: probe
-// URLs can still pass while real traffic doesn't (a common censorship
-// shape), and step 1 would just launder those failures.
 func (s *MutableAutoSelect) runLadder(target string) {
 	if s.isClosed() {
 		return
@@ -870,6 +849,9 @@ func (s *MutableAutoSelect) runLadder(target string) {
 			}
 		}
 	}
+	// Skip step 1 when the target has any user-failure evidence: probes
+	// can pass while real traffic doesn't, and step 1 would just launder
+	// that.
 	skipStep1 := false
 	if current != nil {
 		s.access.Lock()
@@ -958,10 +940,6 @@ func (s *MutableAutoSelect) nextProbeInterval() time.Duration {
 	return s.cfg.activeInterval
 }
 
-// runBackgroundLoop drives the low-priority probe cycle that keeps
-// alternative members warm. The ticker is registered with the pause
-// manager so probes are suppressed while the device is paused; the
-// adaptive cadence reasserts on every tick via nextProbeInterval.
 // TODO: skip on metered connections once lantern-box's platform interface
 // gains a network-cost API.
 func (s *MutableAutoSelect) runBackgroundLoop() {

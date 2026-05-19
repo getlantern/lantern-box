@@ -253,7 +253,6 @@ func TestBehaviorFor_SamizdatGetsSubstituteDelay(t *testing.T) {
 	assert.Equal(t, samizdatNominalDelay, beh.substituteDelay)
 }
 
-// --- selectFor: switch tolerance via sticky-tag hysteresis ---
 
 func TestSelectFor_ThreeTierFallback(t *testing.T) {
 	// Tier ordering: clean > soft > hard. Each row picks the cleanest
@@ -371,7 +370,6 @@ func TestPeekHistoryLocked_DoesNotCreateEntry(t *testing.T) {
 	assert.False(t, present, "peek leaked an empty history entry into the map")
 }
 
-// --- Add / Remove invariants ---
 
 func TestRemove_PreservesTagOrder(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b", "c", "d")
@@ -396,7 +394,6 @@ func TestAdd_DoesNotDuplicateAlreadyListedTag(t *testing.T) {
 	assert.Equal(t, []string{"a"}, s.All(), "Add must not duplicate the already-listed tag")
 }
 
-// --- SetURLOverrides invalidates history on removed override ---
 
 func TestSetURLOverrides_RemovingOverrideInvalidatesHistory(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
@@ -412,7 +409,6 @@ func TestSetURLOverrides_RemovingOverrideInvalidatesHistory(t *testing.T) {
 	assert.True(t, bPresent, "history for 'b' should be preserved (no override change)")
 }
 
-// --- runProbeCycle freshness gate ---
 
 func TestRankCandidates_ExcludesEntriesBeforeCycleStart(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
@@ -422,7 +418,6 @@ func TestRankCandidates_ExcludesEntriesBeforeCycleStart(t *testing.T) {
 	assert.Empty(t, ranked, "entries before cycleStart must not appear in the ranked set")
 }
 
-// --- dataPlaneStream stall and idempotent close ---
 
 type stallConn struct{ net.Conn }
 
@@ -487,7 +482,6 @@ func (stallPacketConn) SetDeadline(time.Time) error               { return nil }
 func (stallPacketConn) SetReadDeadline(time.Time) error           { return nil }
 func (stallPacketConn) SetWriteDeadline(time.Time) error          { return nil }
 
-// --- runLadder closed-group guard ---
 
 func TestRunLadder_DoesNotEmitExhaustionWhenClosed(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
@@ -500,7 +494,6 @@ func TestRunLadder_DoesNotEmitExhaustionWhenClosed(t *testing.T) {
 	}
 }
 
-// --- persistence via AutoSelectHistoryStorage ---
 
 func TestRecordOutcome_Persists(t *testing.T) {
 	tests := []struct {
@@ -570,7 +563,6 @@ func TestRecordOutcome_DropsOutcomesForRemovedTag(t *testing.T) {
 		"recordOutcome must not resurrect the persisted entry")
 }
 
-// --- user-failure anti-laundering ---
 
 func TestRecordUserFailure_BumpsCounterAndIsBoundedByMembership(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
@@ -645,7 +637,6 @@ func TestDemoted_UserFailuresTriggerEvenWithCleanProbes(t *testing.T) {
 		"healthy probe ring but user-failure limit reached: demoted")
 }
 
-// --- selectFor: membership changes & seed-driven cold start ---
 
 func TestSelectFor_PreservesStickyAfterUnrelatedRemove(t *testing.T) {
 	// A Remove that doesn't touch the sticky tag must not flip
@@ -743,7 +734,6 @@ func TestSelectFor_UnknownBeatsSubstitutedSeed(t *testing.T) {
 		"unknown candidate must beat a substituted-delay seed")
 }
 
-// --- adaptive probe cadence ---
 
 func TestNextProbeInterval(t *testing.T) {
 	tests := []struct {
@@ -815,7 +805,6 @@ func TestSetURLOverrides_ClearsPersistedEntryOnChange(t *testing.T) {
 		"override change must clear the persisted entry")
 }
 
-// --- recordUserFailure pushes a member into the soft-demote tier ---
 
 func TestRecordUserFailure_DemotesTagInNextSelectFor(t *testing.T) {
 	// After recordUserFailure("a"), "a" is in the soft tier and the
@@ -835,7 +824,6 @@ func TestRecordUserFailure_DemotesTagInNextSelectFor(t *testing.T) {
 		"soft-demoted a must lose to clean b on the next selectFor")
 }
 
-// --- selectFor: soft-demote three-tier fallback ---
 
 func TestSplitHealthyFor_PrefersCleanOverSoftOverHard(t *testing.T) {
 	ob := &mockOutbound{networks: []string{"tcp", "udp"}}
@@ -856,7 +844,6 @@ func TestSplitHealthyFor_PrefersCleanOverSoftOverHard(t *testing.T) {
 	assert.Equal(t, 1, len(pool), "hard-only returns the hard slice as last resort")
 }
 
-// --- ladder skipStep1 at the first user failure ---
 
 func TestRunLadder_SkipStep1(t *testing.T) {
 	// Step 1 is skipped when the target has any user-failure evidence
@@ -886,7 +873,6 @@ func TestRunLadder_SkipStep1(t *testing.T) {
 	}
 }
 
-// --- splitHealthyFor: per-network three-tier fallback ---
 
 func TestSplitHealthyFor_KeepsSoftWhenCleanIsOtherNetwork(t *testing.T) {
 	// The clean candidate is TCP-only; the only UDP-capable member is
@@ -936,7 +922,6 @@ func TestSelectFor_PerNetworkPool(t *testing.T) {
 		"udp must fall through to the soft both-soft member when no clean udp candidate exists")
 }
 
-// --- selectFor kind tie-break ---
 
 func TestSelectFor_PrefersRealSeededOverSubstituted(t *testing.T) {
 	// Both "sami" (substituted via samizdat protocol) and "real" are
@@ -992,7 +977,6 @@ func TestURLTest_HydratesBeforeRecordingOutcomes(t *testing.T) {
 	assert.Equal(t, uint32(42), got.Outcomes[0].DelayMs)
 }
 
-// --- exhaustion signal end-to-end ---
 
 // drainExhaustion empties any pending pre-existing signal so tests can
 // observe the next emission deterministically.
@@ -1062,7 +1046,6 @@ func TestExhaustionSignal_CloseClosesChannelForRangeLoop(t *testing.T) {
 	}
 }
 
-// --- InterfaceUpdated triggers a probe cycle ---
 
 func TestInterfaceUpdated_TriggersReprobe(t *testing.T) {
 	s, obs := newTestMUR(t, "a")
@@ -1089,7 +1072,6 @@ func TestInterfaceUpdated_TriggersReprobe(t *testing.T) {
 	obs["a"].AssertNumberOfCalls(t, "DialContext", 1)
 }
 
-// --- pause.Manager lookup in runBackgroundLoop ---
 
 type fakePauseManager struct {
 	pause.Manager
@@ -1146,7 +1128,6 @@ func TestRunBackgroundLoop_NoPauseManagerIsNoOp(t *testing.T) {
 	}
 }
 
-// --- Close racing emitExhaustion under -race ---
 
 func TestClose_RaceWithEmitExhaustionDoesNotPanic(t *testing.T) {
 	// emitExhaustion sends on exhaustionCh and Close closes it; both
