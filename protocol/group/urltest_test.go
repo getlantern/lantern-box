@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,8 +19,149 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/getlantern/lantern-box/constant"
-	"github.com/getlantern/lantern-box/internal/sync"
+	isync "github.com/getlantern/lantern-box/internal/sync"
 )
+
+// blockingCloseConn wraps a net.Conn whose Close blocks until released is closed.
+// It simulates transports like WATER that call WaitWorker inside Close.
+type blockingCloseConn struct {
+	net.Conn
+	released <-chan struct{}
+}
+
+func (c *blockingCloseConn) Close() error {
+	<-c.released
+	return c.Conn.Close()
+}
+
+type stubNetDialer struct {
+	dialFn func(ctx context.Context, network string, dest metadata.Socksaddr) (net.Conn, error)
+}
+
+func (d *stubNetDialer) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
+	return d.dialFn(ctx, network, destination)
+}
+
+func (d *stubNetDialer) ListenPacket(ctx context.Context, destination metadata.Socksaddr) (net.PacketConn, error) {
+	return nil, errors.New("not supported")
+}
+
+func TestAsyncCloseConn_CloseReturnsImmediately(t *testing.T) {
+	released := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-released:
+		default:
+			close(released)
+		}
+	})
+	p1, p2 := net.Pipe()
+	defer p2.Close()
+
+	c := &asyncCloseConn{Conn: &blockingCloseConn{Conn: p1, released: released}}
+	start := time.Now()
+	_ = c.Close()
+	assert.Less(t, time.Since(start), 100*time.Millisecond)
+}
+
+// TestURLTestGET_BlockingConnCloseDoesNotBlockReturn is a regression test for
+// the case where the HTTP transport's context-cancellation path calls
+// conn.Close() synchronously. Before asyncCloseConn was applied to the conn
+// passed to the transport's DialContext, WATER's WaitWorker would block
+// client.Do() for 35–90 s after the test context expired.
+//
+// The blocking window is simulated by keeping released closed for 3 s after
+// the request context expires. Without asyncCloseConn, client.Do blocks for
+// those 3 s, making elapsed > 2 s and the assertion fail. With the fix,
+// Close() dispatches to a goroutine, client.Do returns at ~200 ms, and
+// elapsed stays well under 2 s.
+func TestURLTestGET_BlockingConnCloseDoesNotBlockReturn(t *testing.T) {
+	released := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(released) }) }
+
+	// The server delays its response well beyond the context timeout so the
+	// HTTP transport is forced to cancel and close the conn.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	dialer := &stubNetDialer{
+		dialFn: func(ctx context.Context, network string, dest metadata.Socksaddr) (net.Conn, error) {
+			c, err := net.DialTimeout("tcp", srv.Listener.Addr().String(), 2*time.Second)
+			if err != nil {
+				return nil, err
+			}
+			return &blockingCloseConn{Conn: c, released: released}, nil
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// Release the blocking conn 3 s after the request context expires.
+	// Without asyncCloseConn, the HTTP transport calls blockingCloseConn.Close()
+	// synchronously inside client.Do, so urlTestGET can't return until released fires.
+	// With the fix, Close() is dispatched to a goroutine and urlTestGET returns at ~200 ms.
+	time.AfterFunc(200*time.Millisecond+3*time.Second, release)
+
+	start := time.Now()
+	_, _ = urlTestGET(ctx, "http://"+srv.Listener.Addr().String()+"/", dialer)
+	elapsed := time.Since(start)
+
+	// Unblock the async-close goroutine before closing the server so the server
+	// handler can exit and srv.Close() returns promptly.
+	release()
+	srv.Close()
+
+	assert.Less(t, elapsed, 2*time.Second,
+		"urlTestGET blocked for %v after context expiry; asyncCloseConn should prevent blocking", elapsed)
+}
+
+// TestURLTestGET_BlockingDialContextDoesNotBlockReturn is a regression test for
+// outbounds whose DialContext ignores context cancellation because they block
+// in host-function callbacks that Go's runtime cannot interrupt (e.g. WATER's
+// WASM TCP dial). Before the goroutine-race fix, urlTestGET blocked for the
+// full OS TCP timeout (~87 s) even when the testCtx had already expired.
+//
+// The blocking window is simulated by a dialer that ignores ctx and returns
+// only after released is closed, 3 s after the request context expires.
+// Without the fix, urlTestGET blocks for those 3 s. With the fix, the
+// ctx.Done() select arm fires and urlTestGET returns at ~200 ms.
+func TestURLTestGET_BlockingDialContextDoesNotBlockReturn(t *testing.T) {
+	released := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(released) }) }
+
+	dialer := &stubNetDialer{
+		dialFn: func(ctx context.Context, network string, dest metadata.Socksaddr) (net.Conn, error) {
+			select {
+			case <-released:
+			case <-time.After(10 * time.Second):
+			}
+			return nil, errors.New("never connected")
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// Release 3 s after the context expires; without the fix urlTestGET blocks for those 3 s.
+	time.AfterFunc(200*time.Millisecond+3*time.Second, release)
+
+	start := time.Now()
+	_, _ = urlTestGET(ctx, "http://192.0.2.1/", dialer)
+	elapsed := time.Since(start)
+
+	release()
+
+	assert.Less(t, elapsed, 2*time.Second,
+		"urlTestGET blocked for %v after context expiry; DialContext goroutine race should prevent blocking", elapsed)
+}
 
 func TestUpdateSelected(t *testing.T) {
 	outbounds := map[string]uint16{
@@ -31,7 +175,7 @@ func TestUpdateSelected(t *testing.T) {
 	}
 	testGroup := &urlTestGroup{
 		tags:                []string{},
-		outbounds:           sync.TypedMap[string, adapter.Outbound]{},
+		outbounds:           isync.TypedMap[string, adapter.Outbound]{},
 		tolerance:           50,
 		history:             urltest.NewHistoryStorage(),
 		selectedOutboundTCP: common.TypedValue[adapter.Outbound]{},
@@ -60,7 +204,7 @@ func TestUpdateSelected(t *testing.T) {
 func TestMarkFailedAndReselect_SwitchesToHealthyOutbound(t *testing.T) {
 	g := &urlTestGroup{
 		tags:      []string{},
-		outbounds: sync.TypedMap[string, adapter.Outbound]{},
+		outbounds: isync.TypedMap[string, adapter.Outbound]{},
 		tolerance: 50,
 		history:   urltest.NewHistoryStorage(),
 	}
@@ -119,7 +263,7 @@ func newRetryRig(mode retryMode, ctx context.Context, delays map[string]uint16, 
 	g := &urlTestGroup{
 		ctx:       ctx,
 		logger:    sbLog.NewNOPFactory().Logger(),
-		outbounds: sync.TypedMap[string, adapter.Outbound]{},
+		outbounds: isync.TypedMap[string, adapter.Outbound]{},
 		tolerance: 50,
 		history:   urltest.NewHistoryStorage(),
 	}
@@ -240,7 +384,7 @@ func callCount(m *mockOutbound, method string) int {
 func TestPickBestOutbound_FallbackSkipsCurrent(t *testing.T) {
 	g := &urlTestGroup{
 		tags:      []string{"alpha", "beta"},
-		outbounds: sync.TypedMap[string, adapter.Outbound]{},
+		outbounds: isync.TypedMap[string, adapter.Outbound]{},
 		tolerance: 50,
 		history:   urltest.NewHistoryStorage(),
 	}

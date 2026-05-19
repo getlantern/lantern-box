@@ -770,11 +770,35 @@ func urlTestGET(ctx context.Context, link string, detour N.Dialer) (uint16, erro
 	}
 
 	start := time.Now()
-	instance, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
-	if err != nil {
-		return 0, err
+	// Some outbound DialContext implementations (e.g. WATER) block in WASM→host
+	// callbacks that the Go runtime cannot interrupt via context cancellation;
+	// racing against ctx.Done() enforces the test deadline regardless.
+	type dialResult struct {
+		conn net.Conn
+		err  error
 	}
-	defer instance.Close()
+	ch := make(chan dialResult, 1)
+	go func() {
+		conn, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
+		ch <- dialResult{conn, err}
+	}()
+	var instance net.Conn
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return 0, r.err
+		}
+		instance = r.conn
+	case <-ctx.Done():
+		go func() {
+			if r := <-ch; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return 0, ctx.Err()
+	}
+	conn := &asyncCloseConn{Conn: instance}
+	defer conn.Close()
 	if earlyConn, isEarlyConn := common.Cast[N.EarlyConn](instance); isEarlyConn && earlyConn.NeedHandshake() {
 		start = time.Now()
 	}
@@ -790,7 +814,7 @@ func urlTestGET(ctx context.Context, link string, detour N.Dialer) (uint16, erro
 	client := http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return instance, nil
+				return conn, nil
 			},
 			TLSClientConfig: &tls.Config{
 				Time:    ntp.TimeFuncFromContext(ctx),
@@ -810,6 +834,19 @@ func urlTestGET(ctx context.Context, link string, detour N.Dialer) (uint16, erro
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	return uint16(time.Since(start) / time.Millisecond), nil
+}
+
+// asyncCloseConn wraps a net.Conn whose Close can block for tens of seconds
+// (e.g. WATER's WaitWorker); dispatching to a goroutine prevents stalling the
+// HTTP client's synchronous cancellation path.
+type asyncCloseConn struct {
+	net.Conn
+	closeOnce sync.Once
+}
+
+func (c *asyncCloseConn) Close() error {
+	c.closeOnce.Do(func() { go c.Conn.Close() })
+	return nil
 }
 
 // appendClientDelay adds a &cd=<ms> query parameter to the given URL.
