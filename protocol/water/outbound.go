@@ -325,30 +325,14 @@ func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (wate
 	cfg.NetworkDialerFunc = func(network, address string) (net.Conn, error) {
 		conn, err := o.outboundDialer.DialContext(ctx, network, o.serverAddr)
 		if err != nil {
-			o.logger.ErrorContext(ctx, "WATER: failed to dial SS server",
-				slog.String("server", o.serverAddr.String()),
-				slog.String("destination", destination.String()),
-				slog.Any("error", err))
 			return nil, err
 		}
-		o.logger.DebugContext(ctx, "WATER: SS server connection established",
-			slog.String("server", o.serverAddr.String()),
-			slog.String("destination", destination.String()))
-		// Wrap conn to log when the server closes the connection.
-		var underlying net.Conn
-		switch c := conn.(type) {
+		switch conn := conn.(type) {
 		case *conntrack.Conn:
-			underlying = c.Conn
+			return conn.Conn, nil
 		default:
-			underlying = conn
+			return conn, nil
 		}
-		return &monitoredConn{
-			Conn:        underlying,
-			logger:      o.logger,
-			ctx:         ctx,
-			server:      o.serverAddr.String(),
-			destination: destination.String(),
-		}, nil
 	}
 
 	o.logger.DebugContext(ctx, "building new dialer", slog.String("destination", destination.String()))
@@ -447,44 +431,4 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
 	return o.uotClient.ListenPacket(ctx, destination)
-}
-
-// monitoredConn wraps a net.Conn and logs when the connection is closed, to
-// help diagnose cases where the SS server closes the connection unexpectedly
-// before the WASM worker has finished proxying data.
-type monitoredConn struct {
-	net.Conn
-	logger      log.ContextLogger
-	ctx         context.Context
-	server      string
-	destination string
-}
-
-func (c *monitoredConn) Read(b []byte) (int, error) {
-	n, err := c.Conn.Read(b)
-	if err != nil {
-		c.logger.WarnContext(c.ctx, "WATER: SS server connection read error",
-			slog.String("server", c.server),
-			slog.String("destination", c.destination),
-			slog.Any("error", err))
-	}
-	return n, err
-}
-
-func (c *monitoredConn) Write(b []byte) (int, error) {
-	n, err := c.Conn.Write(b)
-	if err != nil {
-		c.logger.WarnContext(c.ctx, "WATER: SS server connection write error",
-			slog.String("server", c.server),
-			slog.String("destination", c.destination),
-			slog.Any("error", err))
-	}
-	return n, err
-}
-
-func (c *monitoredConn) Close() error {
-	c.logger.DebugContext(c.ctx, "WATER: SS server connection closed",
-		slog.String("server", c.server),
-		slog.String("destination", c.destination))
-	return c.Conn.Close()
 }
