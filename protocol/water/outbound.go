@@ -212,6 +212,23 @@ func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, opt
 	// slower, but the bottleneck for a proxy is network I/O, not instruction
 	// throughput, so the tradeoff is acceptable.
 	o.dialerConfig.RuntimeConfig().Interpreter()
+
+	// Disable wazero's CloseOnContextDone behaviour.
+	//
+	// By default water sets WithCloseOnContextDone(true), which tells wazero to
+	// forcibly terminate any in-flight WASM function call the moment the context
+	// passed to NewCoreWithContext is cancelled.  Each WATER dial creates a core
+	// whose context is derived from the per-dial context.  In sing-box a dial
+	// context is cancelled as soon as the dial phase completes (URL tests
+	// included), which is well before the established connection is closed.
+	// With CloseOnContextDone active, that cancellation kills the wazero
+	// runtime while the WASM worker is still running, producing an
+	// "input/output error" from the worker goroutine.
+	//
+	// We disable this and rely instead on conn.Close() to terminate the WASM
+	// worker: closing the underlying TCPConnPair causes the worker's blocking
+	// read/write calls to return with EOF, exiting the worker cleanly.
+	o.dialerConfig.RuntimeConfig().SetCloseOnContextDone(false)
 	o.mu.Unlock()
 
 	// Validate and warm the interpreter by doing a lightweight parse of the
