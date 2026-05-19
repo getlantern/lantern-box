@@ -3,6 +3,7 @@ package constant
 const (
 	TypeAmnezia   = "amnezia"
 	TypeALGeneva  = "algeneva"
+	TypeMeek      = "meek"
 	TypeOutline   = "outline"
 	TypeReflex    = "reflex"
 	TypeSamizdat  = "samizdat"
