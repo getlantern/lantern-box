@@ -199,6 +199,24 @@ func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, opt
 		OverrideLogger:     slogLogger,
 	}
 	o.mu.Unlock()
+
+	// Pre-compile the WASM module to warm up the on-disk compilation cache
+	// before setting ready=true. On platforms like macOS NetworkExtension the
+	// JIT compilation spike can exceed the process memory budget and cause a
+	// silent kill during the first URL-test dial. By doing it here — in the
+	// background goroutine before the TUN is fully up — total memory pressure
+	// is lower and subsequent dials get a cheap cache-hit instead.
+	logger.DebugContext(ctx, "pre-compiling WASM module to warm compilation cache",
+		slog.String("transport", options.Transport))
+	if preErr := preCompileWASM(ctx, b, o.dialerConfig); preErr != nil {
+		logger.WarnContext(ctx, "WASM pre-compilation failed (non-fatal, will compile on first dial)",
+			slog.String("transport", options.Transport),
+			slog.Any("error", preErr))
+	} else {
+		logger.DebugContext(ctx, "WASM pre-compilation complete",
+			slog.String("transport", options.Transport))
+	}
+
 	o.ready.Store(true)
 
 	if options.SeedEnabled {
@@ -237,6 +255,26 @@ func (o *Outbound) Close() error {
 		return o.seeder.Close()
 	}
 	return nil
+}
+
+// preCompileWASM compiles the WASM binary using the same runtime config that
+// live dials will use, writing the result into the on-disk compilation cache.
+// After this returns, every subsequent NewCoreWithContext → CompileModule call
+// gets a cheap cache-hit instead of a full JIT compilation. This is a
+// best-effort operation; callers must handle a non-nil error gracefully.
+func preCompileWASM(ctx context.Context, wasmBin []byte, cfg *water.Config) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic during WASM pre-compilation",
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())))
+			err = fmt.Errorf("WASM pre-compilation panicked: %v", r)
+		}
+	}()
+	rt := wazero.NewRuntimeWithConfig(ctx, cfg.RuntimeConfig().GetConfig())
+	defer rt.Close(ctx)
+	_, err = rt.CompileModule(ctx, wasmBin)
+	return
 }
 
 func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (water.Dialer, error) {
@@ -306,23 +344,37 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	return nil, E.New("unsupported network: ", network)
 }
 
-func (o *Outbound) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+func (o *Outbound) dialTCP(ctx context.Context, destination M.Socksaddr) (conn net.Conn, err error) {
+	// wazero can panic during WASM core creation or execution; convert to error
+	// so a single bad outbound doesn't crash the daemon process.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic in WATER dial", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+			err = fmt.Errorf("WATER dial panicked: %v", r)
+		}
+	}()
+
 	dialer, err := o.newDialer(ctx, destination)
 	if err != nil {
 		o.logger.ErrorContext(ctx, "failed to build new WATER dialer", slog.Any("error", err), slog.String("destination", destination.String()))
 		return nil, err
 	}
 
-	// DialContext uses context.Background() so wazero's wasm execution isn't
-	// interrupted mid-run. Race it against ctx so callers (e.g. URL-test
-	// goroutines with a 5s deadline) aren't blocked for the full OS TCP timeout
-	// if the WASM can't reach the server.
+	// wazero's DialContext does not respect context cancellation mid-run, so
+	// racing it in a goroutine ensures callers with short deadlines (e.g. URL-test)
+	// are not blocked for the full OS TCP timeout when the server is unreachable.
 	type dialResult struct {
 		conn net.Conn
 		err  error
 	}
 	ch := make(chan dialResult, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("panic in WATER DialContext", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+				ch <- dialResult{nil, fmt.Errorf("WATER DialContext panicked: %v", r)}
+			}
+		}()
 		conn, err := dialer.DialContext(ctx, N.NetworkTCP, "localhost:0")
 		ch <- dialResult{conn, err}
 	}()
