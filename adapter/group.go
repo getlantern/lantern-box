@@ -22,6 +22,14 @@ type OutboundChecker interface {
 	CheckOutbounds()
 }
 
+// ExhaustionSignaler exposes a channel the host can select on to learn that
+// the group's reconnection ladder finished without finding a working
+// candidate. At most one value is sent per ladder run; the host decides
+// what to do (typically a rate-limited config refetch).
+type ExhaustionSignaler interface {
+	ExhaustionSignal() <-chan struct{}
+}
+
 // TaggedConn is a net.Conn tagged with the outbound tag used to create it.
 type TaggedConn struct {
 	net.Conn

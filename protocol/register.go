@@ -88,6 +88,7 @@ func registerOutbounds(registry *outbound.Registry) {
 	group.RegisterFallback(registry)
 	group.RegisterMutableSelector(registry)
 	group.RegisterMutableURLTest(registry)
+	group.RegisterMutableAutoSelect(registry)
 }
 
 func registerEndpoints(registry *endpoint.Registry) {

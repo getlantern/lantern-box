@@ -15,7 +15,9 @@ import (
 type mockOutbound struct {
 	mock.Mock
 	adapter.Outbound
-	tag string
+	tag      string
+	typeName string
+	networks []string
 }
 
 func (m *mockOutbound) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {

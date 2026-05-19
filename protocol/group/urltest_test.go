@@ -75,6 +75,9 @@ func (m *mockOutbound) Tag() string {
 }
 
 func (m *mockOutbound) Network() []string {
+	if len(m.networks) > 0 {
+		return m.networks
+	}
 	return []string{"tcp", "udp"}
 }
 

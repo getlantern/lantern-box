@@ -14,4 +14,5 @@ const (
 	TypeFallback        = "fallback"
 	TypeMutableSelector = "mutableselector"
 	TypeMutableURLTest  = "mutableurltest"
+	TypeMutableAutoSelect  = "mutableautoselect"
 )
