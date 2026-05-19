@@ -635,7 +635,9 @@ const (
 )
 
 // demoteLevel ranks how cautious selection should be about a candidate.
-// Ordering is load-bearing: see candidateKind.
+// Ordering is load-bearing: rank sorts on the integer value, so
+// demoteClean must compare < demoteSoft < demoteHard for the tiers to
+// land in the right order.
 type demoteLevel uint8
 
 const (
@@ -892,7 +894,7 @@ func (s *MutableAutoSelect) runLadder(target string) {
 		}
 	} else if skipStep1 {
 		s.logger.Info("ladder skipping step 1: ", current.Tag(),
-			" has crossed user-failure limit; jumping straight to step 2")
+			" has a non-zero user-failure count; jumping straight to step 2")
 	}
 
 	s.logger.Info("ladder step 2: full re-probe")

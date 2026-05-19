@@ -40,11 +40,11 @@ type TagHistory struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// AutoSelectHistoryStorage is the in-memory store the
-// MutableAutoSelect group writes to whenever a member's history
-// changes. A host that wants durability registers a hook via SetHook
-// and periodically reads All() to flush to disk; on next startup it
-// seeds entries back into a fresh storage via Store.
+// AutoSelectHistoryStorage is the store the MutableAutoSelect group
+// writes to whenever a member's history changes. A host that wants
+// durability registers a hook via SetHook and periodically reads All()
+// to flush to disk; on next startup it seeds entries back into a fresh
+// storage via Store.
 //
 // Implementations must be safe for concurrent use. Store and Delete
 // must be non-blocking and fast: the group calls them while holding
@@ -148,8 +148,6 @@ func (s *memoryAutoSelectHistoryStorage) Close() error {
 
 // LatestSuccessDelay returns the DelayMs of the most recent
 // OutcomeSuccess in h.Outcomes, or 0 when no success is recorded.
-// Used by UIs that want a single "last known good latency" number
-// without re-implementing the ring walk.
 func (h *TagHistory) LatestSuccessDelay() uint32 {
 	if h == nil {
 		return 0

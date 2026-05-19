@@ -23,11 +23,8 @@ import (
 	lConst "github.com/getlantern/lantern-box/constant"
 )
 
-// Type returns the protocol type used by behaviorFor; an empty
-// typeName keeps the default (non-excluded, 2s probe timeout), which is
-// the right shape for selection-logic tests that don't care about
-// per-protocol knobs. Set typeName to drive substituteDelay / excluded
-// branches.
+// Type returns m.typeName so tests can drive behaviorFor branches
+// (substituteDelay, excluded). Empty typeName keeps the default.
 func (m *mockOutbound) Type() string { return m.typeName }
 
 // newTestMUR builds a minimal MutableAutoSelect populated with the given
@@ -177,8 +174,7 @@ func TestLocalHistory_ConsecutiveFailuresResetOnSuccess(t *testing.T) {
 }
 
 func TestLocalHistory_UserFailuresAreIndependentOfProbeOutcomes(t *testing.T) {
-	// Regression: a probe success must not reset the user-failure counter.
-	// This is the core anti-laundering invariant.
+	// A probe success must not reset the user-failure counter.
 	h := newLocalHistory(defaultHistoryRingMax)
 	now := time.Now()
 	h.bumpUserFailures()
@@ -386,9 +382,8 @@ func TestRemove_PreservesTagOrder(t *testing.T) {
 }
 
 func TestAdd_DoesNotDuplicateAlreadyListedTag(t *testing.T) {
-	// Simulate a post-Start-failure inconsistency: tag is in s.tags but
-	// missing from s.members. Add must repopulate members without
-	// appending a duplicate to s.tags.
+	// When s.tags lists a tag but s.members is missing it, Add must
+	// repopulate members without appending a duplicate to s.tags.
 	s, _ := newTestMUR(t, "a")
 	mgr := &mockOutboundManager{outbounds: map[string]sbAdapter.Outbound{
 		"a": &mockOutbound{tag: "a"},
@@ -534,9 +529,9 @@ func TestRecordOutcome_Persists(t *testing.T) {
 }
 
 func TestAutoSelectHistoryStorage_StoreAfterCloseDoesNotPanic(t *testing.T) {
-	// Regression: in-flight probe/dataplane callbacks can outlive the
-	// storage on tunnel shutdown. Late Store must drop quietly rather
-	// than panic on a nil internal map.
+	// In-flight probe/dataplane callbacks can outlive the storage on
+	// tunnel shutdown. Late Store must drop quietly rather than panic
+	// on a nil internal map.
 	store := adapter.NewAutoSelectHistoryStorage()
 	require.NoError(t, store.Close())
 	assert.NotPanics(t, func() {
@@ -654,9 +649,7 @@ func TestDemoted_UserFailuresTriggerEvenWithCleanProbes(t *testing.T) {
 
 func TestSelectFor_PreservesStickyAfterUnrelatedRemove(t *testing.T) {
 	// A Remove that doesn't touch the sticky tag must not flip
-	// selection. (The bug this guards against was a routine server-list
-	// update silently reverting a probe-driven pick back to "first
-	// viable in tag order.")
+	// selection.
 	s, _ := newTestMUR(t, "a", "b", "c")
 	recordSuccess(s, "a", 200)
 	recordSuccess(s, "b", 150)
@@ -731,14 +724,9 @@ func TestSelectFor_FallsBackToTagOrderWithoutSeed(t *testing.T) {
 }
 
 func TestSelectFor_UnknownBeatsSubstitutedSeed(t *testing.T) {
-	// Regression: every 3-minute config refresh removed the live
-	// hysteria2 selection and added a fresh hysteria2 with no seed; the
-	// previous recompute biased toward samizdat (substituteDelay
-	// protocol with a real seed) over the unmeasured hysteria2, briefly
-	// flipping the visible selection before the immediate probe cycle
-	// switched back. The unified rank treats a kindUnknown candidate as
-	// strictly better than a kindSubstituted one — probing the unknown
-	// is preferable to committing to a deliberately deprioritized peer.
+	// The unified rank treats a kindUnknown candidate as strictly
+	// better than a kindSubstituted one — probing the unknown is
+	// preferable to committing to a deliberately deprioritized peer.
 	s, obs := newTestMUR(t, "sami", "hysteria2-new")
 	obs["sami"].typeName = lConst.TypeSamizdat
 	s.history.Store("sami", &adapter.TagHistory{

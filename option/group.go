@@ -21,12 +21,12 @@ type MutableURLTestOutboundOptions struct {
 	IdleTimeout  badoption.Duration `json:"idle_timeout,omitempty"`
 }
 
-// MutableAutoSelectOutboundOptions configures the client-side server-selection
-// group described in client-server-selection-spec.md. The group probes its
-// members in parallel, selects the lowest-delay healthy candidate (with a
-// switch tolerance to dampen churn), maintains a per-server outcome ring
-// to demote chronically-bad servers, and emits an exhaustion signal when
-// its reconnection ladder fails. Zero values fall back to documented
+// MutableAutoSelectOutboundOptions configures the client-side
+// server-selection group. The group probes its members in parallel,
+// selects the lowest-delay healthy candidate (with a switch tolerance to
+// dampen churn), maintains a per-server outcome ring to demote
+// chronically-bad servers, and emits an exhaustion signal when its
+// reconnection ladder fails. Zero values fall back to documented
 // defaults.
 type MutableAutoSelectOutboundOptions struct {
 	Outbounds    []string          `json:"outbounds"`
@@ -54,8 +54,9 @@ type MutableAutoSelectOutboundOptions struct {
 	// Default 5.
 	DemoteMinOutcomes uint32 `json:"demote_min_outcomes,omitempty"`
 
-	// ConsecutiveFailureLimit is the consecutive-failure count at which a
-	// server is unconditionally demoted. Default 3.
+	// ConsecutiveFailureLimit bounds both the consecutive probe-failure
+	// count and the user-failure count; reaching it on either counter
+	// unconditionally demotes the server. Default 3.
 	ConsecutiveFailureLimit uint32 `json:"consecutive_failure_limit,omitempty"`
 
 	// BackgroundIntervalSeconds is the active cadence for the low-priority
