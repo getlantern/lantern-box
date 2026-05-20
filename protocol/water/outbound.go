@@ -12,7 +12,6 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	waterDownloader "github.com/getlantern/lantern-water/downloader"
@@ -56,7 +55,6 @@ type Outbound struct {
 	transportModuleConfig map[string]any
 	outboundDialer        N.Dialer
 	serverAddr            M.Socksaddr
-	ready                 atomic.Bool
 	mu                    sync.Mutex
 	seeder                *seed.Seeder
 	cancelLoad            context.CancelFunc
@@ -108,7 +106,6 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		Adapter:               outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
 		logger:                logger,
 		transportModuleConfig: options.Config,
-		mu:                    sync.Mutex{},
 		skipHandshake:         options.SkipHandshake,
 		cancelLoad:            cancelLoad,
 	}
@@ -232,7 +229,7 @@ func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, opt
 	o.mu.Unlock()
 
 	// Validate and warm the interpreter by doing a lightweight parse of the
-	// WASM module before setting ready=true so any module errors surface early.
+	// WASM module so any module errors surface early.
 	logger.DebugContext(ctx, "validating WASM module via interpreter",
 		slog.String("transport", options.Transport))
 	if preErr := preCompileWASM(ctx, b, o.dialerConfig); preErr != nil {
@@ -243,8 +240,6 @@ func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, opt
 		logger.DebugContext(ctx, "WASM module validation complete",
 			slog.String("transport", options.Transport))
 	}
-
-	o.ready.Store(true)
 
 	if options.SeedEnabled {
 		transportFilepath := filepath.Join(wasmDir, fmt.Sprintf("%s.%s", options.Transport, "wasm"))
@@ -287,9 +282,8 @@ func (o *Outbound) Close() error {
 // preCompileWASM validates the WASM binary against the provided runtime config
 // by compiling it once.  In interpreter mode (the default for WATER dials) this
 // is a lightweight parse+validate step; in compiler mode it warms the on-disk
-// JIT compilation cache.  Either way this surfaces module-load errors early,
-// before ready is set to true.  It is best-effort; callers must handle a
-// non-nil error gracefully.
+// JIT compilation cache.  Either way this surfaces module-load errors early.
+// It is best-effort; callers must handle a non-nil error gracefully.
 func preCompileWASM(ctx context.Context, wasmBin []byte, cfg *water.Config) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
