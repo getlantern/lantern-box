@@ -388,41 +388,14 @@ func (o *Outbound) dialTCP(ctx context.Context, destination M.Socksaddr) (conn n
 		return nil, err
 	}
 
-	// wazero's DialContext does not respect context cancellation mid-run, so
-	// racing it in a goroutine ensures callers with short deadlines (e.g. URL-test)
-	// are not blocked for the full OS TCP timeout when the server is unreachable.
-	type dialResult struct {
-		conn net.Conn
-		err  error
+	// NetworkDialerFunc (called inside dialer.DialContext during Initialize/_start)
+	// uses the caller's ctx, so context cancellation unblocks the dial naturally.
+	conn, err = dialer.DialContext(ctx, N.NetworkTCP, "localhost:0")
+	if err != nil {
+		o.logger.ErrorContext(ctx, "WATER failed to dial", slog.Any("error", err))
+		return nil, err
 	}
-	ch := make(chan dialResult, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("panic in WATER DialContext", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
-				ch <- dialResult{nil, fmt.Errorf("WATER DialContext panicked: %v", r)}
-			}
-		}()
-		conn, err := dialer.DialContext(ctx, N.NetworkTCP, "localhost:0")
-		ch <- dialResult{conn, err}
-	}()
-	select {
-	case r := <-ch:
-		if r.err != nil {
-			o.logger.ErrorContext(ctx, "WATER failed to dial", slog.Any("error", r.err))
-			return nil, r.err
-		}
-		return waterTransport.NewWATERConnection(r.conn, destination, o.skipHandshake), nil
-	case <-ctx.Done():
-		// Drain the background dial when it finishes to avoid leaving an open
-		// server connection unreferenced.
-		go func() {
-			if r := <-ch; r.err == nil && r.conn != nil {
-				r.conn.Close()
-			}
-		}()
-		return nil, ctx.Err()
-	}
+	return waterTransport.NewWATERConnection(conn, destination, o.skipHandshake), nil
 }
 
 // ListenPacket creates a UoT packet connection through the WATER transport.
