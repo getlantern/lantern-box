@@ -196,35 +196,16 @@ func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, opt
 		OverrideLogger:     slogLogger,
 	}
 
-	// Use the wazero interpreter instead of the JIT compiler.
-	//
-	// The JIT compiler allocates a large native-code arena at runtime-creation
-	// time (typically 5-20 MB of resident memory on arm64) in addition to
-	// per-instance WASM linear memory.  In memory-constrained environments
-	// such as the macOS or iOS NetworkExtension process (jetsam limit ~50 MB)
-	// this pushes resident memory over the limit and the OS kills the process
-	// silently, manifesting as a VPN disconnect with no Go error or panic.
-	//
-	// The interpreter avoids the JIT arena entirely.  WASM execution is
-	// slower, but the bottleneck for a proxy is network I/O, not instruction
-	// throughput, so the tradeoff is acceptable.
+	// Use the interpreter, not the JIT. The JIT arena (5-20 MB on arm64) pushes
+	// the macOS/iOS NetworkExtension past its ~50 MB jetsam limit and the OS
+	// kills the process silently. Interpreted WASM is slower, but the proxy
+	// bottleneck is network I/O.
 	o.dialerConfig.RuntimeConfig().Interpreter()
 
-	// Disable wazero's CloseOnContextDone behaviour.
-	//
-	// By default water sets WithCloseOnContextDone(true), which tells wazero to
-	// forcibly terminate any in-flight WASM function call the moment the context
-	// passed to NewCoreWithContext is cancelled.  Each WATER dial creates a core
-	// whose context is derived from the per-dial context.  In sing-box a dial
-	// context is cancelled as soon as the dial phase completes (URL tests
-	// included), which is well before the established connection is closed.
-	// With CloseOnContextDone active, that cancellation kills the wazero
-	// runtime while the WASM worker is still running, producing an
-	// "input/output error" from the worker goroutine.
-	//
-	// We disable this and rely instead on conn.Close() to terminate the WASM
-	// worker: closing the underlying TCPConnPair causes the worker's blocking
-	// read/write calls to return with EOF, exiting the worker cleanly.
+	// Don't tie the WASM worker's lifetime to the dial ctx. sing-box cancels
+	// the dial ctx as soon as the dial phase completes — well before the conn
+	// closes — so the default tears down the worker mid-stream, surfacing as
+	// "input/output error". Shutdown is driven by conn.Close() instead.
 	o.dialerConfig.RuntimeConfig().SetCloseOnContextDone(false)
 	o.mu.Unlock()
 
@@ -369,10 +350,14 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 }
 
 func (o *Outbound) dialTCP(ctx context.Context, destination M.Socksaddr) (conn net.Conn, err error) {
+	var rawConn net.Conn
 	// wazero can panic during WASM core creation or execution; convert to error
 	// so a single bad outbound doesn't crash the daemon process.
 	defer func() {
 		if r := recover(); r != nil {
+			if rawConn != nil {
+				rawConn.Close()
+			}
 			slog.Error("panic in WATER dial", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 			err = fmt.Errorf("WATER dial panicked: %v", r)
 		}
@@ -386,12 +371,25 @@ func (o *Outbound) dialTCP(ctx context.Context, destination M.Socksaddr) (conn n
 
 	// NetworkDialerFunc (called inside dialer.DialContext during Initialize/_start)
 	// uses the caller's ctx, so context cancellation unblocks the dial naturally.
-	conn, err = dialer.DialContext(ctx, N.NetworkTCP, "localhost:0")
+	rawConn, err = dialer.DialContext(ctx, N.NetworkTCP, "localhost:0")
 	if err != nil {
 		o.logger.ErrorContext(ctx, "WATER failed to dial", slog.Any("error", err))
 		return nil, err
 	}
-	return waterTransport.NewWATERConnection(conn, destination, o.skipHandshake), nil
+	return &asyncCloseConn{Conn: waterTransport.NewWATERConnection(rawConn, destination, o.skipHandshake)}, nil
+}
+
+// asyncCloseConn wraps a net.Conn whose Close can block (e.g. WATER's
+// WaitWorker); dispatching to a goroutine prevents stalling callers on the
+// synchronous cancellation path.
+type asyncCloseConn struct {
+	net.Conn
+	closeOnce sync.Once
+}
+
+func (c *asyncCloseConn) Close() error {
+	c.closeOnce.Do(func() { go c.Conn.Close() })
+	return nil
 }
 
 // ListenPacket creates a UoT packet connection through the WATER transport.
