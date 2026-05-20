@@ -3,6 +3,10 @@ name: Auto-tag patch release
 on:
   push:
     branches: [main]
+    # Trigger on changes that affect the built lantern-box binary only.
+    # deploy/packer/** intentionally NOT in this list: under Reflog's
+    # Option B, packer changes don't produce a new .deb, so they don't
+    # need a version bump. build-images.yaml self-triggers on those.
     paths:
       - '**.go'
       - 'go.mod'
@@ -10,7 +14,6 @@ on:
       - 'Dockerfile'
       - 'Dockerfile.goreleaser'
       - 'cmd/release/*.service'
-      - 'deploy/packer/**'
 
 permissions:
   contents: write

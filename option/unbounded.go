@@ -45,6 +45,13 @@ type UnboundedOutboundOptions struct {
 	// WebRTC / signaling parameters.
 	DiscoverySrv      string   `json:"discovery_srv,omitempty"`
 	DiscoveryEndpoint string   `json:"discovery_endpoint,omitempty"`
+	// InsecureDoNotVerifyDiscoveryCert skips TLS verification of the
+	// signaling server's (freddie's) cert. Only for test/dev against
+	// self-signed rigs; production freddie deployments present a real cert
+	// and this flag must be false. Ignored when a direct transport is
+	// injected on the context (radiance's production path), which carries
+	// its own verification policy.
+	InsecureDoNotVerifyDiscoveryCert bool `json:"insecure_do_not_verify_discovery_cert,omitempty"`
 	GenesisAddr       string   `json:"genesis_addr,omitempty"`
 	NATFailTimeout    int      `json:"nat_fail_timeout,omitempty"` // seconds
 	STUNBatchSize     int      `json:"stun_batch_size,omitempty"`
