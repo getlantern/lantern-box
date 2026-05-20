@@ -306,24 +306,26 @@ func preCompileWASM(ctx context.Context, wasmBin []byte, cfg *water.Config) (err
 }
 
 func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (water.Dialer, error) {
-	if !o.ready.Load() {
-		o.mu.Lock()
-		loadErr := o.loadErr
-		dialerReady := o.dialerConfig != nil
-		o.mu.Unlock()
-		if loadErr != nil {
-			return nil, fmt.Errorf("WATER outbound failed to load: %w", loadErr)
-		}
-		if !dialerReady {
-			return nil, fmt.Errorf("WATER outbound is still loading, not ready to dial")
-		}
+	o.mu.Lock()
+	loadErr := o.loadErr
+	dialerCfg := o.dialerConfig
+	outboundDialer := o.outboundDialer
+	serverAddr := o.serverAddr
+	transportModuleConfig := o.transportModuleConfig
+	o.mu.Unlock()
+
+	if loadErr != nil {
+		return nil, fmt.Errorf("WATER outbound failed to load: %w", loadErr)
+	}
+	if dialerCfg == nil {
+		return nil, fmt.Errorf("WATER outbound is still loading, not ready to dial")
 	}
 
-	cfg := o.dialerConfig.Clone()
+	cfg := dialerCfg.Clone()
 
 	// NetworkDialerFunc is per-dial so it captures ctx; cancelling the dial also cancels the inner TCP connection.
 	cfg.NetworkDialerFunc = func(network, address string) (net.Conn, error) {
-		conn, err := o.outboundDialer.DialContext(ctx, network, o.serverAddr)
+		conn, err := outboundDialer.DialContext(ctx, network, serverAddr)
 		if err != nil {
 			return nil, err
 		}
@@ -336,22 +338,22 @@ func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (wate
 	}
 
 	o.logger.DebugContext(ctx, "building new dialer", slog.String("destination", destination.String()))
-	if o.transportModuleConfig != nil {
+	if transportModuleConfig != nil {
 		// Clone before mutating so concurrent dials don't race on the shared map.
 		// WATER's config API provides no other injection point for per-dial parameters.
-		merged := make(map[string]any, len(o.transportModuleConfig)+2)
-		for k, v := range o.transportModuleConfig {
+		merged := make(map[string]any, len(transportModuleConfig)+2)
+		for k, v := range transportModuleConfig {
 			merged[k] = v
 		}
 		merged["remote_addr"] = destination.AddrString()
 		merged["remote_port"] = strconv.FormatUint(uint64(destination.Port), 10)
-		transportModuleConfig, err := json.MarshalContext(ctx, merged)
+		transportModuleConfigJSON, err := json.MarshalContext(ctx, merged)
 		if err != nil {
 			return nil, err
 		}
 
-		o.logger.DebugContext(ctx, "building transport module config", slog.String("config_json", string(transportModuleConfig)))
-		cfg.TransportModuleConfig = water.TransportModuleConfigFromBytes(transportModuleConfig)
+		o.logger.DebugContext(ctx, "building transport module config", slog.String("config_json", string(transportModuleConfigJSON)))
+		cfg.TransportModuleConfig = water.TransportModuleConfigFromBytes(transportModuleConfigJSON)
 	}
 
 	return water.NewDialerWithContext(ctx, cfg)
