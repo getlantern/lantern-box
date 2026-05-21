@@ -53,20 +53,20 @@ type Outbound struct {
 	dialerConfig          *water.Config
 	loadErr               error
 	transportModuleConfig map[string]any
+	outboundDialer        N.Dialer
+	serverAddr            M.Socksaddr
 	mu                    sync.Mutex
 	seeder                *seed.Seeder
 	cancelLoad            context.CancelFunc
 	uotClient             *uot.Client
 }
 
-// waterDialer adapts the WATER outbound for use with uot.Client.
-// It must only be called while the outbound mutex is already held.
 type waterDialer struct {
 	outbound *Outbound
 }
 
 func (d *waterDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	return d.outbound.dialTCPLocked(ctx, destination)
+	return d.outbound.dialTCP(ctx, destination)
 }
 
 func (d *waterDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -106,7 +106,6 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		Adapter:               outbound.NewAdapterWithDialerOptions(constant.TypeWATER, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
 		logger:                logger,
 		transportModuleConfig: options.Config,
-		mu:                    sync.Mutex{},
 		skipHandshake:         options.SkipHandshake,
 		cancelLoad:            cancelLoad,
 	}
@@ -190,23 +189,38 @@ func (o *Outbound) loadConfig(ctx context.Context, logger log.ContextLogger, opt
 	}
 
 	o.mu.Lock()
+	o.outboundDialer = outboundDialer
+	o.serverAddr = serverAddr
 	o.dialerConfig = &water.Config{
 		TransportModuleBin: b,
 		OverrideLogger:     slogLogger,
-		NetworkDialerFunc: func(network, address string) (net.Conn, error) {
-			conn, err := outboundDialer.DialContext(log.ContextWithNewID(ctx), network, serverAddr)
-			if err != nil {
-				return nil, err
-			}
-			switch conn := conn.(type) {
-			case *conntrack.Conn:
-				return conn.Conn, nil
-			default:
-				return conn, nil
-			}
-		},
 	}
+
+	// Use the interpreter, not the JIT. The JIT arena (5-20 MB on arm64) pushes
+	// the macOS/iOS NetworkExtension past its ~50 MB jetsam limit and the OS
+	// kills the process silently. Interpreted WASM is slower, but the proxy
+	// bottleneck is network I/O.
+	o.dialerConfig.RuntimeConfig().Interpreter()
+
+	// Don't tie the WASM worker's lifetime to the dial ctx. sing-box cancels
+	// the dial ctx as soon as the dial phase completes — well before the conn
+	// closes — so the default tears down the worker mid-stream, surfacing as
+	// "input/output error". Shutdown is driven by conn.Close() instead.
+	o.dialerConfig.RuntimeConfig().SetCloseOnContextDone(false)
 	o.mu.Unlock()
+
+	// Validate and warm the interpreter by doing a lightweight parse of the
+	// WASM module so any module errors surface early.
+	logger.DebugContext(ctx, "validating WASM module via interpreter",
+		slog.String("transport", options.Transport))
+	if preErr := preCompileWASM(ctx, b, o.dialerConfig); preErr != nil {
+		logger.WarnContext(ctx, "WASM module validation failed (non-fatal)",
+			slog.String("transport", options.Transport),
+			slog.Any("error", preErr))
+	} else {
+		logger.DebugContext(ctx, "WASM module validation complete",
+			slog.String("transport", options.Transport))
+	}
 
 	if options.SeedEnabled {
 		transportFilepath := filepath.Join(wasmDir, fmt.Sprintf("%s.%s", options.Transport, "wasm"))
@@ -246,27 +260,75 @@ func (o *Outbound) Close() error {
 	return nil
 }
 
+// preCompileWASM validates the WASM binary against the provided runtime config
+// by compiling it once.  In interpreter mode (the default for WATER dials) this
+// is a lightweight parse+validate step; in compiler mode it warms the on-disk
+// JIT compilation cache.  Either way this surfaces module-load errors early.
+// It is best-effort; callers must handle a non-nil error gracefully.
+func preCompileWASM(ctx context.Context, wasmBin []byte, cfg *water.Config) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic during WASM pre-compilation",
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())))
+			err = fmt.Errorf("WASM pre-compilation panicked: %v", r)
+		}
+	}()
+	rt := wazero.NewRuntimeWithConfig(ctx, cfg.RuntimeConfig().GetConfig())
+	defer rt.Close(ctx)
+	_, err = rt.CompileModule(ctx, wasmBin)
+	return
+}
+
 func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (water.Dialer, error) {
-	if o.loadErr != nil {
-		return nil, fmt.Errorf("WATER outbound failed to load: %w", o.loadErr)
+	o.mu.Lock()
+	loadErr := o.loadErr
+	dialerCfg := o.dialerConfig
+	outboundDialer := o.outboundDialer
+	serverAddr := o.serverAddr
+	transportModuleConfig := o.transportModuleConfig
+	o.mu.Unlock()
+
+	if loadErr != nil {
+		return nil, fmt.Errorf("WATER outbound failed to load: %w", loadErr)
 	}
-	if o.dialerConfig == nil {
+	if dialerCfg == nil {
 		return nil, fmt.Errorf("WATER outbound is still loading, not ready to dial")
 	}
-	cfg := o.dialerConfig.Clone()
+
+	cfg := dialerCfg.Clone()
+
+	// NetworkDialerFunc is per-dial so it captures ctx; cancelling the dial also cancels the inner TCP connection.
+	cfg.NetworkDialerFunc = func(network, address string) (net.Conn, error) {
+		conn, err := outboundDialer.DialContext(ctx, network, serverAddr)
+		if err != nil {
+			return nil, err
+		}
+		switch conn := conn.(type) {
+		case *conntrack.Conn:
+			return conn.Conn, nil
+		default:
+			return conn, nil
+		}
+	}
 
 	o.logger.DebugContext(ctx, "building new dialer", slog.String("destination", destination.String()))
-	if o.transportModuleConfig != nil {
-		// currently this is the only way to share the destination with the WATER module.
-		o.transportModuleConfig["remote_addr"] = destination.AddrString()
-		o.transportModuleConfig["remote_port"] = strconv.FormatUint(uint64(destination.Port), 10)
-		transportModuleConfig, err := json.MarshalContext(ctx, o.transportModuleConfig)
+	if transportModuleConfig != nil {
+		// Clone before mutating so concurrent dials don't race on the shared map.
+		// WATER's config API provides no other injection point for per-dial parameters.
+		merged := make(map[string]any, len(transportModuleConfig)+2)
+		for k, v := range transportModuleConfig {
+			merged[k] = v
+		}
+		merged["remote_addr"] = destination.AddrString()
+		merged["remote_port"] = strconv.FormatUint(uint64(destination.Port), 10)
+		transportModuleConfigJSON, err := json.MarshalContext(ctx, merged)
 		if err != nil {
 			return nil, err
 		}
 
-		o.logger.DebugContext(ctx, "building transport module config", slog.String("config_json", string(transportModuleConfig)))
-		cfg.TransportModuleConfig = water.TransportModuleConfigFromBytes(transportModuleConfig)
+		o.logger.DebugContext(ctx, "building transport module config", slog.String("config_json", string(transportModuleConfigJSON)))
+		cfg.TransportModuleConfig = water.TransportModuleConfigFromBytes(transportModuleConfigJSON)
 	}
 
 	return water.NewDialerWithContext(ctx, cfg)
@@ -274,36 +336,60 @@ func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (wate
 
 // DialContext dials a connection to the specified network and destination.
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
 
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
-		return o.dialTCPLocked(ctx, destination)
+		return o.dialTCP(ctx, destination)
 	case N.NetworkUDP:
 		return o.uotClient.DialContext(ctx, network, destination)
 	}
 	return nil, E.New("unsupported network: ", network)
 }
 
-// dialTCPLocked creates a new WATER TCP connection. The outbound mutex must be held by the caller.
-func (o *Outbound) dialTCPLocked(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+func (o *Outbound) dialTCP(ctx context.Context, destination M.Socksaddr) (conn net.Conn, err error) {
+	var rawConn net.Conn
+	// wazero can panic during WASM core creation or execution; convert to error
+	// so a single bad outbound doesn't crash the daemon process.
+	defer func() {
+		if r := recover(); r != nil {
+			if rawConn != nil {
+				rawConn.Close()
+			}
+			slog.Error("panic in WATER dial", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+			err = fmt.Errorf("WATER dial panicked: %v", r)
+		}
+	}()
+
 	dialer, err := o.newDialer(ctx, destination)
 	if err != nil {
 		o.logger.ErrorContext(ctx, "failed to build new WATER dialer", slog.Any("error", err), slog.String("destination", destination.String()))
 		return nil, err
 	}
 
-	conn, err := dialer.DialContext(context.Background(), N.NetworkTCP, "localhost:0")
+	// NetworkDialerFunc (called inside dialer.DialContext during Initialize/_start)
+	// uses the caller's ctx, so context cancellation unblocks the dial naturally.
+	rawConn, err = dialer.DialContext(ctx, N.NetworkTCP, "localhost:0")
 	if err != nil {
 		o.logger.ErrorContext(ctx, "WATER failed to dial", slog.Any("error", err))
 		return nil, err
 	}
+	return &asyncCloseConn{Conn: waterTransport.NewWATERConnection(rawConn, destination, o.skipHandshake)}, nil
+}
 
-	return waterTransport.NewWATERConnection(conn, destination, o.skipHandshake), nil
+// asyncCloseConn wraps a net.Conn whose Close can block (e.g. WATER's
+// WaitWorker); dispatching to a goroutine prevents stalling callers on the
+// synchronous cancellation path.
+type asyncCloseConn struct {
+	net.Conn
+	closeOnce sync.Once
+}
+
+func (c *asyncCloseConn) Close() error {
+	c.closeOnce.Do(func() { go c.Conn.Close() })
+	return nil
 }
 
 // ListenPacket creates a UoT packet connection through the WATER transport.
