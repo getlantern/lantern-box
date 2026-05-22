@@ -22,10 +22,6 @@ type protocolBehavior struct {
 	substituteDelay time.Duration
 }
 
-// samizdatNominalDelay is the spec-fixed synthetic delay used to rank
-// samizdat candidates.
-const samizdatNominalDelay = 1000 * time.Millisecond
-
 func behaviorFor(outboundType string) protocolBehavior {
 	switch outboundType {
 	case lConst.TypeALGeneva:
@@ -43,10 +39,7 @@ func behaviorFor(outboundType string) protocolBehavior {
 	case lConst.TypeReflex:
 		return protocolBehavior{probeTimeout: 3000 * time.Millisecond}
 	case lConst.TypeSamizdat:
-		return protocolBehavior{
-			probeTimeout:    3000 * time.Millisecond,
-			substituteDelay: samizdatNominalDelay,
-		}
+		return protocolBehavior{probeTimeout: 3000 * time.Millisecond}
 	case C.TypeShadowsocks:
 		return protocolBehavior{probeTimeout: 2000 * time.Millisecond}
 	case C.TypeShadowTLS:

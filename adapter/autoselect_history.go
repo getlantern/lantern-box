@@ -5,39 +5,31 @@ import (
 	"time"
 )
 
-// Outcome classifies the result of a probe or user dial attempt. The
-// enum value is what gets persisted, so additions must append rather
-// than reorder.
-type Outcome uint8
-
-const (
-	OutcomeSuccess Outcome = iota
-	OutcomeTimeout
-	OutcomeHandshakeFailure
-)
-
-// TimestampedOutcome is one entry in a member's recent-outcome ring.
-type TimestampedOutcome struct {
-	Outcome   Outcome   `json:"outcome"`
-	DelayMs   uint32    `json:"delay_ms,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
 // TagHistory is a point-in-time snapshot of one member's selection
 // state, mirroring the in-memory history kept by the MutableAutoSelect
-// group.
+// group. Probe outcomes feed the scalar fields; real user-traffic
+// outcomes (dial errors, data-plane stalls) feed the UserFailures
+// sliding window. The two tracks are kept separate so a censor that
+// lets the probe URL through while dropping user traffic shows up as
+// elevated UserFailures with healthy probe scalars simultaneously.
 type TagHistory struct {
-	Outcomes []TimestampedOutcome `json:"outcomes,omitempty"`
-	// ConsecutiveFailures resets to zero on the next probe success.
+	// LastSuccessDelayMs is the most recent successful probe RTT
+	// (clamped to ≥1 ms). 0 means "no successful probe yet" — rank
+	// uses it as a sentinel to deprioritize against measured peers.
+	LastSuccessDelayMs uint32 `json:"last_success_delay_ms,omitempty"`
+	// LastOutcomeAt is the timestamp of the most recent probe outcome
+	// (success or failure). Used by the probe-cycle freshSince gate to
+	// distinguish "probed this cycle" from "stale outcome."
+	LastOutcomeAt time.Time `json:"last_outcome_at,omitempty"`
+	// ConsecutiveFailures counts probe failures since the last probe
+	// success. Resets to zero on probe success.
 	ConsecutiveFailures uint32 `json:"consecutive_failures,omitempty"`
-	// UserFailures counts real user-traffic failures (dial errors +
-	// data-plane stalls). Persisting it means a server that was about
-	// to be demoted on user traffic doesn't come back innocent after
-	// a tunnel close/open inside the current poll window. Laundering-
-	// resistant: probe successes do not decrement it; only a
-	// successful read on a wrapped data-plane conn resets it.
-	UserFailures uint32    `json:"user_failures,omitempty"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	// UserFailures is the sliding window of user-traffic failure
+	// timestamps (dial errors and data-plane stalls). Probe successes
+	// never enter this window; entries age out naturally on the next
+	// mutation older than the group's userFailureWindow.
+	UserFailures []time.Time `json:"user_failures,omitempty"`
+	UpdatedAt    time.Time   `json:"updated_at"`
 }
 
 // AutoSelectHistoryStorage is the store the MutableAutoSelect group
@@ -141,33 +133,24 @@ func (s *memoryAutoSelectHistoryStorage) Close() error {
 	return nil
 }
 
-// LatestSuccessDelay returns the DelayMs of the most recent
-// OutcomeSuccess in h.Outcomes, or 0 when no success is recorded.
+// LatestSuccessDelay returns LastSuccessDelayMs, or 0 when h is nil.
+// Kept as a method for symmetry with LatestSuccessTime and to let
+// callers handle nil snapshots without an extra branch.
 func (h *TagHistory) LatestSuccessDelay() uint32 {
 	if h == nil {
 		return 0
 	}
-	for i := len(h.Outcomes) - 1; i >= 0; i-- {
-		if h.Outcomes[i].Outcome == OutcomeSuccess {
-			return h.Outcomes[i].DelayMs
-		}
-	}
-	return 0
+	return h.LastSuccessDelayMs
 }
 
-// LatestSuccessTime returns the Timestamp of the most recent
-// OutcomeSuccess in h.Outcomes, or UpdatedAt when no success exists.
-// Falls back to UpdatedAt rather than the zero time so callers that
-// render "tested N seconds ago" still have a usable reference point
-// after a string of failures.
+// LatestSuccessTime is best-effort: the spec only persists the most
+// recent outcome timestamp (success or failure), so callers asking
+// "tested N seconds ago" get UpdatedAt as a usable reference even when
+// the most recent outcome was a failure. Returns the zero time when h
+// is nil.
 func (h *TagHistory) LatestSuccessTime() time.Time {
 	if h == nil {
 		return time.Time{}
-	}
-	for i := len(h.Outcomes) - 1; i >= 0; i-- {
-		if h.Outcomes[i].Outcome == OutcomeSuccess {
-			return h.Outcomes[i].Timestamp
-		}
 	}
 	return h.UpdatedAt
 }
@@ -177,9 +160,9 @@ func cloneTagHistory(h *TagHistory) *TagHistory {
 		return nil
 	}
 	out := *h
-	if len(h.Outcomes) > 0 {
-		out.Outcomes = make([]TimestampedOutcome, len(h.Outcomes))
-		copy(out.Outcomes, h.Outcomes)
+	if len(h.UserFailures) > 0 {
+		out.UserFailures = make([]time.Time, len(h.UserFailures))
+		copy(out.UserFailures, h.UserFailures)
 	}
 	return &out
 }

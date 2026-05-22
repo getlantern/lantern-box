@@ -7,52 +7,58 @@ import (
 	"time"
 )
 
-// makeHooks returns the (onStall, onRead) callback pair wired into the
-// data-plane wrappers. Callbacks re-look-up the member's history at fire
-// time so a Remove+Add cycle can't strand writes on a stale entry.
-func (s *MutableAutoSelect) makeHooks(outerTag string) (onStall, onRead func()) {
+// makeHooks returns the (onStall, onActivity) callback pair wired into
+// the data-plane wrappers. Callbacks re-look-up the member's history
+// at fire time so a Remove+Add cycle can't strand writes on a stale
+// entry. The stall callback short-circuits when recordUserFailure
+// reports a dedup/non-member, so a single broken outbound with N
+// orphan idle conns doesn't trigger N redundant full-fleet probe
+// sweeps.
+func (s *MutableAutoSelect) makeHooks(outerTag string) (onStall, onActivity func()) {
 	onStall = func() {
-		s.recordUserFailure(outerTag)
+		if !s.recordUserFailure(outerTag) {
+			return
+		}
 		go s.runLadder(outerTag)
 	}
-	onRead = func() {
-		// Peek (not historyForLocked): a tag whose first event is a
-		// successful Read has no user_failures to reset, and creating
-		// an empty entry just litters the map.
-		s.access.Lock()
-		defer s.access.Unlock()
-		if _, member := s.members.Load(outerTag); !member {
-			return
-		}
-		h, ok := s.peekHistoryLocked(outerTag)
-		if !ok || !h.resetUserFailures() || s.history == nil {
-			return
-		}
-		s.history.Store(outerTag, h.toTagHistory(time.Now()))
-	}
-	return onStall, onRead
+	return onStall, s.bumpActive
 }
 
 // dataPlaneWatchdog is the no-traffic stall timer shared by the stream
 // and packet wrappers.
+//
+// provedReadBytes gates whether the stall is real: until the wrapped conn
+// has delivered that many cumulative non-empty Read bytes, an
+// idle-window expiry is treated as "established but never carried real
+// traffic" (e.g. a handshake-only or keepalive-only conn) and the
+// stall handler is suppressed.
+//
+// lastWasWrite separately distinguishes "tunnel is broken" from "user
+// stopped sending traffic" on an already-proven conn. The stall fires
+// only when the most recent non-empty IO was a Write — i.e. we sent
+// bytes and got nothing back for the idle window. A proven conn whose
+// last activity was a Read (response arrived, then silence) is treated
+// as user-idle, not broken: a healthy keep-alive going unused looks
+// identical to a broken tunnel without this gate.
 type dataPlaneWatchdog struct {
-	idle       time.Duration
-	onStall    func()
-	onActivity func()
-	// onRead fires only on non-empty Read: the user-failure reset needs
-	// bidirectional evidence, since a QUIC/HTTP2 Write only proves the
-	// local stack accepted the bytes, not that the peer did.
-	onRead    func()
-	stalled   atomic.Bool
-	timer     *time.Timer
-	closeOnce sync.Once
+	idle            time.Duration
+	onStall         func()
+	onActivity      func()
+	provedReadBytes uint64
+	readBytes       atomic.Uint64
+	proven          atomic.Bool
+	lastWasWrite    atomic.Bool
+	stalled         atomic.Bool
+	fired           atomic.Bool
+	timer           *time.Timer
+	closeOnce       sync.Once
 }
 
-func (w *dataPlaneWatchdog) init(idle time.Duration, onStall, onActivity, onRead func()) {
+func (w *dataPlaneWatchdog) init(idle time.Duration, provedReadBytes uint64, onStall, onActivity func()) {
 	w.idle = idle
+	w.provedReadBytes = provedReadBytes
 	w.onStall = onStall
 	w.onActivity = onActivity
-	w.onRead = onRead
 	w.timer = time.AfterFunc(idle, w.fireStall)
 }
 
@@ -60,17 +66,34 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	if n <= 0 || err != nil {
 		return
 	}
-	// Short-circuit once stalled: a late onRead would reset the
-	// userFailure the stall just recorded.
+	// Short-circuit once stalled: a late noteIO must not re-arm the
+	// timer or fire onActivity after the conn is logically gone.
 	if w.stalled.Load() {
 		return
 	}
+	// Publish the gate value before re-arming the timer so a fireStall
+	// racing the Reset reads the fresh classification, not the previous
+	// IO's value. Otherwise a Read landing just as the timer fires
+	// could leave lastWasWrite=true from an earlier Write and trip
+	// the gate it's supposed to suppress.
+	w.lastWasWrite.Store(!isRead)
 	w.timer.Reset(w.idle)
 	if w.onActivity != nil {
 		w.onActivity()
 	}
-	if isRead && w.onRead != nil {
-		w.onRead()
+	if !isRead {
+		return
+	}
+	// Mark the conn proven once cumulative Read bytes cross the
+	// threshold. provedReadBytes==0 keeps the legacy "any non-empty Read
+	// proves" behavior for tests that don't care about the threshold;
+	// production callers always pass a non-zero default.
+	if w.proven.Load() {
+		return
+	}
+	total := w.readBytes.Add(uint64(n))
+	if total >= w.provedReadBytes {
+		w.proven.Store(true)
 	}
 }
 
@@ -86,22 +109,43 @@ func (w *dataPlaneWatchdog) closeWatchdog() (firstClose bool) {
 	return firstClose
 }
 
+// fireStall is the AfterFunc callback. The stall counts only if the
+// conn has delivered enough Read payload to be proven AND the most
+// recent non-empty IO was a Write — i.e. we sent bytes and heard
+// nothing back. A proven conn whose last activity was a Read is
+// treated as user-idle and suppressed: an unused HTTPS keep-alive
+// looks identical to a broken tunnel without this gate. Other failure
+// paths (dial errors, probe failures) still catch the cases this gate
+// suppresses. fired is the once-per-conn CAS so a re-armed timer
+// can't double-deliver onStall.
 func (w *dataPlaneWatchdog) fireStall() {
-	if w.stalled.CompareAndSwap(false, true) {
+	if !w.proven.Load() {
+		return
+	}
+	if !w.lastWasWrite.Load() {
+		return
+	}
+	if !w.stalled.CompareAndSwap(false, true) {
+		return
+	}
+	if !w.fired.CompareAndSwap(false, true) {
+		return
+	}
+	if w.onStall != nil {
 		w.onStall()
 	}
 }
 
-// dataPlaneStream detects tunnels that handshake successfully but never
-// carry data.
+// dataPlaneStream detects tunnels that handshake successfully but
+// stop carrying data after they have started carrying it.
 type dataPlaneStream struct {
 	net.Conn
 	dataPlaneWatchdog
 }
 
-func newDataPlaneStream(c net.Conn, idle time.Duration, onStall, onActivity, onRead func()) *dataPlaneStream {
+func newDataPlaneStream(c net.Conn, idle time.Duration, provedReadBytes uint64, onStall, onActivity func()) *dataPlaneStream {
 	d := &dataPlaneStream{Conn: c}
-	d.init(idle, onStall, onActivity, onRead)
+	d.init(idle, provedReadBytes, onStall, onActivity)
 	return d
 }
 
@@ -137,9 +181,9 @@ type dataPlanePacket struct {
 	dataPlaneWatchdog
 }
 
-func newDataPlanePacket(c net.PacketConn, idle time.Duration, onStall, onActivity, onRead func()) *dataPlanePacket {
+func newDataPlanePacket(c net.PacketConn, idle time.Duration, provedReadBytes uint64, onStall, onActivity func()) *dataPlanePacket {
 	d := &dataPlanePacket{PacketConn: c}
-	d.init(idle, onStall, onActivity, onRead)
+	d.init(idle, provedReadBytes, onStall, onActivity)
 	return d
 }
 

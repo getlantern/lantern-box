@@ -3,7 +3,6 @@ package group
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -20,7 +19,7 @@ import (
 
 type probeResult struct {
 	tag     string
-	outcome localOutcome
+	success bool
 	delayMs uint32
 }
 
@@ -36,11 +35,11 @@ func runProbe(
 ) probeResult {
 	tag := out.Tag()
 	if beh.excludeFromPool || probeURL == "" {
-		return probeResult{tag: tag, outcome: outcomeHandshakeFailure}
+		return probeResult{tag: tag}
 	}
 	linkURL, err := url.Parse(probeURL)
 	if err != nil {
-		return probeResult{tag: tag, outcome: outcomeHandshakeFailure}
+		return probeResult{tag: tag}
 	}
 	hostname := linkURL.Hostname()
 	port := linkURL.Port()
@@ -59,7 +58,7 @@ func runProbe(
 	start := time.Now()
 	conn, err := out.DialContext(probeCtx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
 	if err != nil {
-		return probeResult{tag: tag, outcome: classifyDialError(probeCtx, err)}
+		return probeResult{tag: tag}
 	}
 	defer conn.Close()
 	if earlyConn, ok := common.Cast[N.EarlyConn](conn); ok && earlyConn.NeedHandshake() {
@@ -68,7 +67,7 @@ func runProbe(
 
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
 	if err != nil {
-		return probeResult{tag: tag, outcome: outcomeHandshakeFailure}
+		return probeResult{tag: tag}
 	}
 	if tp := linkURL.Query().Get("tp"); tp != "" {
 		req.Header.Set("traceparent", tp)
@@ -91,7 +90,7 @@ func runProbe(
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
-		return probeResult{tag: tag, outcome: classifyDialError(probeCtx, err)}
+		return probeResult{tag: tag}
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
@@ -102,20 +101,13 @@ func runProbe(
 	if delayMs == 0 {
 		delayMs = 1
 	}
-	return probeResult{tag: tag, outcome: outcomeSuccess, delayMs: delayMs}
-}
-
-func classifyDialError(ctx context.Context, err error) localOutcome {
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return outcomeTimeout
-	}
-	return outcomeHandshakeFailure
+	return probeResult{tag: tag, success: true, delayMs: delayMs}
 }
 
 // probeAll fans out one probe per job over up to probeConcurrency
-// goroutines, recording each result via recordOutcome and streaming
-// successes through onSuccess (called serialized). Returns when every
-// probe completes or ctx fires.
+// goroutines, recording each outcome via recordProbeOutcome and
+// streaming successes through onSuccess (called serialized). Returns
+// when every probe completes or ctx fires.
 func (s *MutableAutoSelect) probeAll(
 	ctx context.Context,
 	jobs []probeJob,
@@ -140,8 +132,8 @@ func (s *MutableAutoSelect) probeAll(
 			}
 			defer func() { <-sem }()
 			res := runProbe(ctx, j.outbound, j.probeURL, j.beh)
-			s.recordOutcome(res.tag, res.outcome, res.delayMs)
-			if res.outcome != outcomeSuccess || onSuccess == nil {
+			s.recordProbeOutcome(res.tag, res.success, res.delayMs)
+			if !res.success || onSuccess == nil {
 				return
 			}
 			mu.Lock()

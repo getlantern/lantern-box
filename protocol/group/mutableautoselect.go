@@ -80,10 +80,9 @@ type MutableAutoSelect struct {
 	// probeMu serializes probe cycles. Fire-and-forget callers
 	// (runProbeCycle) TryLock; callers that need a deterministic outcome
 	// (URLTest, runLadder) Lock so they observe the cycle they triggered.
-	probeMu           sync.Mutex
-	laddering         atomic.Bool
-	exhaustionEmitted atomic.Bool
-	exhaustionCh      chan struct{}
+	probeMu      sync.Mutex
+	laddering    atomic.Bool
+	exhaustionCh chan struct{}
 
 	// Unix-nano of the most recent non-empty data-plane Read/Write; 0
 	// means no traffic observed yet. Drives the adaptive probe cadence.
@@ -94,24 +93,26 @@ type MutableAutoSelect struct {
 }
 
 type mutableAutoSelectConfig struct {
-	switchTolerance   time.Duration
-	activeInterval    time.Duration
-	idleInterval      time.Duration
-	idleThreshold     time.Duration
-	ladderFastRetry   time.Duration
-	ladderTotalBudget time.Duration
-	dataPlaneIdle     time.Duration
+	switchTolerance     time.Duration
+	activeInterval      time.Duration
+	idleInterval        time.Duration
+	idleThreshold       time.Duration
+	ladderTotalBudget   time.Duration
+	dataPlaneIdle       time.Duration
+	dataPlaneProvedRead uint64
+	maxPersistedAge     time.Duration
 }
 
 func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) (mutableAutoSelectConfig, historyParams) {
 	cfg := mutableAutoSelectConfig{
-		switchTolerance:   time.Duration(o.SwitchToleranceMs) * time.Millisecond,
-		activeInterval:    time.Duration(o.BackgroundIntervalSeconds) * time.Second,
-		idleInterval:      time.Duration(o.IdleIntervalSeconds) * time.Second,
-		idleThreshold:     time.Duration(o.IdleThresholdSeconds) * time.Second,
-		ladderFastRetry:   time.Duration(o.LadderFastRetryMs) * time.Millisecond,
-		ladderTotalBudget: time.Duration(o.LadderTotalBudgetSeconds) * time.Second,
-		dataPlaneIdle:     time.Duration(o.DataPlaneIdleSeconds) * time.Second,
+		switchTolerance:     time.Duration(o.SwitchToleranceMs) * time.Millisecond,
+		activeInterval:      time.Duration(o.BackgroundIntervalSeconds) * time.Second,
+		idleInterval:        time.Duration(o.IdleIntervalSeconds) * time.Second,
+		idleThreshold:       time.Duration(o.IdleThresholdSeconds) * time.Second,
+		ladderTotalBudget:   time.Duration(o.LadderTotalBudgetSeconds) * time.Second,
+		dataPlaneIdle:       time.Duration(o.DataPlaneIdleSeconds) * time.Second,
+		dataPlaneProvedRead: uint64(o.DataPlaneProvedReadBytes),
+		maxPersistedAge:     time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
 	}
 	if cfg.switchTolerance == 0 {
 		cfg.switchTolerance = 50 * time.Millisecond
@@ -125,31 +126,28 @@ func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) 
 	if cfg.idleThreshold == 0 {
 		cfg.idleThreshold = 600 * time.Second
 	}
-	if cfg.ladderFastRetry == 0 {
-		cfg.ladderFastRetry = 1000 * time.Millisecond
-	}
 	if cfg.ladderTotalBudget == 0 {
 		cfg.ladderTotalBudget = 10 * time.Second
 	}
 	if cfg.dataPlaneIdle == 0 {
 		cfg.dataPlaneIdle = defaultDataPlaneIdle
 	}
+	if cfg.dataPlaneProvedRead == 0 {
+		cfg.dataPlaneProvedRead = defaultDataPlaneProvedReadBytes
+	}
+	if cfg.maxPersistedAge == 0 {
+		cfg.maxPersistedAge = defaultMaxPersistedAge
+	}
 
 	hp := defaultHistoryParams()
-	if o.HistoryRingSize > 0 {
-		hp.ringMax = int(o.HistoryRingSize)
-	}
-	if o.SuccessRateWindowMinutes > 0 {
-		hp.successRateWindow = time.Duration(o.SuccessRateWindowMinutes) * time.Minute
-	}
-	if o.DemoteSuccessRateBelow > 0 {
-		hp.demoteSuccessRate = o.DemoteSuccessRateBelow
-	}
-	if o.DemoteMinOutcomes > 0 {
-		hp.demoteMinOutcomes = o.DemoteMinOutcomes
-	}
 	if o.ConsecutiveFailureLimit > 0 {
 		hp.consecutiveFailLimit = o.ConsecutiveFailureLimit
+	}
+	if o.SoftDemoteLimit > 0 {
+		hp.softFailLimit = o.SoftDemoteLimit
+	}
+	if o.UserFailureWindowSeconds > 0 {
+		hp.userFailureWindow = time.Duration(o.UserFailureWindowSeconds) * time.Second
 	}
 	return cfg, hp
 }
@@ -212,7 +210,8 @@ func (s *MutableAutoSelect) Start() error {
 	return nil
 }
 
-// Caller must hold s.access. No-op when an in-memory entry already exists.
+// Caller must hold s.access. No-op when an in-memory entry already exists
+// or when the persisted snapshot is older than cfg.maxPersistedAge.
 func (s *MutableAutoSelect) hydrateHistoryLocked(tag string) {
 	if _, ok := s.histories[tag]; ok {
 		return
@@ -224,7 +223,15 @@ func (s *MutableAutoSelect) hydrateHistoryLocked(tag string) {
 	if snap == nil {
 		return
 	}
-	s.histories[tag] = hydrateLocalHistory(snap, s.hist.ringMax)
+	now := time.Now()
+	if !snap.UpdatedAt.IsZero() && now.Sub(snap.UpdatedAt) > s.cfg.maxPersistedAge {
+		// Stale snapshot from a prior session — typically describes a
+		// candidate the bandit has rotated away from. Drop it from the
+		// store too so a later All() doesn't surface it.
+		s.history.Delete(tag)
+		return
+	}
+	s.histories[tag] = hydrateLocalHistory(snap, now, s.hist.userFailureWindow)
 }
 
 // PostStart is idempotent: a second invocation is a no-op rather than a
@@ -407,9 +414,9 @@ func (s *MutableAutoSelect) URLTest(ctx context.Context) (map[string]uint16, err
 			continue
 		}
 		s.members.Store(tag, o)
-		// Hydrate before the first recordOutcome lands so the persisted
-		// ring isn't clobbered by a one-entry write from an empty
-		// in-memory localHistory.
+		// Hydrate before the first recordProbeOutcome lands so the
+		// persisted scalars aren't clobbered by a one-entry write from
+		// an empty in-memory localHistory.
 		s.hydrateHistoryLocked(tag)
 	}
 	jobs := s.collectProbeJobsLocked()
@@ -438,20 +445,35 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	}
 	outerTag := o.Tag()
 	conn, err := o.DialContext(ctx, network, destination)
-	if err != nil {
-		s.logger.ErrorContext(ctx, err)
-		// Attribute the failure to the outer (member) tag so rank and
-		// runLadder's skip-step-1 check both see the bump. For nested
-		// groups, the inner tag isn't a member of this group, so
-		// recordUserFailure would drop on the member gate.
-		s.recordUserFailure(outerTag)
-		go s.runLadder(outerTag)
-		span.RecordError(err)
-		return nil, err
+	if err == nil {
+		return s.wrapStream(conn, o), nil
 	}
-	onStall, onRead := s.makeHooks(outerTag)
-	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, onStall, s.bumpActive, onRead)
-	return adapter.NewTaggedConn(wrapped, realTag(o)), nil
+	s.logger.ErrorContext(ctx, err)
+	// Attribute the failure to the outer (member) tag so rank and
+	// runLadder's gating both see it. For nested groups, the inner tag
+	// isn't a member of this group, so recordUserFailure would drop on
+	// the member gate.
+	s.recordUserFailure(outerTag)
+
+	// Fast failover: try one alternate from the current rank before
+	// kicking the ladder. The active 3-min cadence keeps the probe
+	// history fresh enough to pick a working peer without re-probing.
+	alt, altErr := s.selectForExcluding(network, outerTag)
+	if altErr == nil {
+		altTag := alt.Tag()
+		conn, err = alt.DialContext(ctx, network, destination)
+		if err == nil {
+			go s.runLadder(outerTag)
+			return s.wrapStream(conn, alt), nil
+		}
+		s.logger.ErrorContext(ctx, err)
+		s.recordUserFailure(altTag)
+		outerTag = altTag
+	}
+
+	go s.runLadder(outerTag)
+	span.RecordError(err)
+	return nil, err
 }
 
 func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -470,16 +492,40 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	}
 	outerTag := o.Tag()
 	conn, err := o.ListenPacket(ctx, destination)
-	if err != nil {
-		s.logger.ErrorContext(ctx, err)
-		s.recordUserFailure(outerTag)
-		go s.runLadder(outerTag)
-		span.RecordError(err)
-		return nil, err
+	if err == nil {
+		return s.wrapPacket(conn, o), nil
 	}
-	onStall, onRead := s.makeHooks(outerTag)
-	wrapped := newDataPlanePacket(conn, s.cfg.dataPlaneIdle, onStall, s.bumpActive, onRead)
-	return adapter.NewTaggedPacketConn(wrapped, realTag(o)), nil
+	s.logger.ErrorContext(ctx, err)
+	s.recordUserFailure(outerTag)
+
+	alt, altErr := s.selectForExcluding("udp", outerTag)
+	if altErr == nil {
+		altTag := alt.Tag()
+		conn, err = alt.ListenPacket(ctx, destination)
+		if err == nil {
+			go s.runLadder(outerTag)
+			return s.wrapPacket(conn, alt), nil
+		}
+		s.logger.ErrorContext(ctx, err)
+		s.recordUserFailure(altTag)
+		outerTag = altTag
+	}
+
+	go s.runLadder(outerTag)
+	span.RecordError(err)
+	return nil, err
+}
+
+func (s *MutableAutoSelect) wrapStream(conn net.Conn, o A.Outbound) net.Conn {
+	onStall, onActivity := s.makeHooks(o.Tag())
+	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, onStall, onActivity)
+	return adapter.NewTaggedConn(wrapped, realTag(o))
+}
+
+func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, o A.Outbound) net.PacketConn {
+	onStall, onActivity := s.makeHooks(o.Tag())
+	wrapped := newDataPlanePacket(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, onStall, onActivity)
+	return adapter.NewTaggedPacketConn(wrapped, realTag(o))
 }
 
 func (s *MutableAutoSelect) NewConnectionEx(ctx context.Context, conn net.Conn, metadata A.InboundContext, onClose N.CloseHandlerFunc) {
@@ -491,6 +537,18 @@ func (s *MutableAutoSelect) NewPacketConnectionEx(ctx context.Context, conn N.Pa
 }
 
 func (s *MutableAutoSelect) selectFor(network string) (A.Outbound, error) {
+	return s.selectForExcluding(network, "")
+}
+
+// selectForExcluding ranks the current members for the requested network
+// and returns the winner. excludeTag is dropped from the pool before
+// ranking — used by the dial-site fast-failover path to skip the tag
+// that just failed. An empty excludeTag is equivalent to plain selectFor.
+//
+// The sticky tag is only updated on the non-excluding path: a fast-
+// failover pick shouldn't poison the next dial's hysteresis with a tag
+// that was a fallback choice, not a steady-state winner.
+func (s *MutableAutoSelect) selectForExcluding(network, excludeTag string) (A.Outbound, error) {
 	var slot *atomic.Value
 	switch network {
 	case "tcp":
@@ -502,19 +560,33 @@ func (s *MutableAutoSelect) selectFor(network string) (A.Outbound, error) {
 	}
 	s.access.Lock()
 	ranked := s.rank(time.Now(), time.Time{})
+	if excludeTag != "" {
+		ranked = slices.DeleteFunc(ranked, func(c rankedCandidate) bool {
+			return c.tag == excludeTag
+		})
+	}
 	pool := splitHealthyFor(ranked, network)
 	if len(pool) == 0 {
 		s.access.Unlock()
-		s.CheckOutbounds()
+		if excludeTag == "" {
+			// No-pool on the primary path: kick a fresh probe cycle so
+			// the next attempt has data.
+			s.CheckOutbounds()
+		}
 		return nil, errors.New("no outbound available, recovery in progress")
 	}
-	winner := s.applyStickiness(network, slot, pool)
-	prev := loadString(slot)
-	if prev != winner.tag {
-		slot.Store(winner.tag)
-		if prev == "" {
-			s.logger.Info(network, " select: ", winner.tag)
+	var winner rankedCandidate
+	if excludeTag == "" {
+		winner = s.applyStickiness(network, slot, pool)
+		prev := loadString(slot)
+		if prev != winner.tag {
+			slot.Store(winner.tag)
+			if prev == "" {
+				s.logger.Info(network, " select: ", winner.tag)
+			}
 		}
+	} else {
+		winner = pool[0]
 	}
 	s.access.Unlock()
 	return winner.outbound, nil
@@ -579,7 +651,7 @@ func (s *MutableAutoSelect) probeURLForLocked(tag string) string {
 func (s *MutableAutoSelect) historyForLocked(tag string) *localHistory {
 	h, ok := s.histories[tag]
 	if !ok {
-		h = newLocalHistory(s.hist.ringMax)
+		h = newLocalHistory()
 		s.histories[tag] = h
 	}
 	return h
@@ -630,8 +702,8 @@ type demoteLevel uint8
 
 const (
 	demoteClean demoteLevel = iota
-	demoteSoft              // userFailures > 0 but demote() says no
-	demoteHard              // demote() returned true
+	demoteSoft              // window_count(userFailures) >= 1, hard threshold not reached
+	demoteHard              // consecutive_failures or windowed user-failures at limit
 )
 
 type rankedCandidate struct {
@@ -672,11 +744,19 @@ func splitHealthyFor(ranked []rankedCandidate, network string) []rankedCandidate
 
 // rank builds the candidate set for selection. A non-zero freshSince
 // restricts to members with a recorded outcome at or after freshSince
-// and drops those without a fresh success (rawDelay==0); the
+// and drops those without a fresh success (lastSuccessDelayMs==0); the
 // probe-cycle ranker uses this so the "is there a winner this cycle?"
 // check can't see stale outcomes. Caller must hold s.access.
 func (s *MutableAutoSelect) rank(now time.Time, freshSince time.Time) []rankedCandidate {
-	out := make([]rankedCandidate, 0, len(s.tags))
+	type pre struct {
+		o         A.Outbound
+		tag       string
+		delayMs   uint32
+		kind      candidateKind
+		consec    uint32
+		userFails uint32
+	}
+	pres := make([]pre, 0, len(s.tags))
 	for _, tag := range s.tags {
 		o, ok := s.members.Load(tag)
 		if !ok {
@@ -688,30 +768,31 @@ func (s *MutableAutoSelect) rank(now time.Time, freshSince time.Time) []rankedCa
 		}
 		var (
 			rawDelay  uint32
-			hard      bool
+			consec    uint32
 			userFails uint32
 			haveData  bool
 		)
 		if h, ok := s.peekHistoryLocked(tag); ok {
-			entries, consec, fails := h.snapshot()
-			if !freshSince.IsZero() && !hasOutcomeSince(entries, freshSince) {
+			lastDelay, lastAt, c, uf := h.snapshot(now, s.hist.userFailureWindow)
+			if !freshSince.IsZero() && lastAt.Before(freshSince) {
 				continue
 			}
-			rawDelay = lastSuccessDelay(entries)
-			hard = demoted(entries, consec, fails, now, s.hist)
-			userFails = fails
+			rawDelay = lastDelay
+			consec = c
+			userFails = uint32(len(uf))
 			haveData = true
 		} else if freshSince.IsZero() && s.history != nil {
 			// Cold member (added without going through hydrate). Fall back
 			// to the persisted snapshot so recompute-style callers see
-			// host-injected data. Probe-cycle callers (freshSince set) skip
-			// this branch — they only count outcomes from this cycle.
+			// host-injected data. Probe-cycle callers (freshSince set)
+			// skip this branch — they only count outcomes from this cycle.
 			if seed := s.history.Load(tag); seed != nil {
-				entries := localizeOutcomes(seed.Outcomes)
-				rawDelay = lastSuccessDelay(entries)
-				hard = demoted(entries, seed.ConsecutiveFailures, seed.UserFailures, now, s.hist)
-				userFails = seed.UserFailures
-				haveData = true
+				if seed.UpdatedAt.IsZero() || now.Sub(seed.UpdatedAt) <= s.cfg.maxPersistedAge {
+					rawDelay = seed.LastSuccessDelayMs
+					consec = seed.ConsecutiveFailures
+					userFails = countUserFailuresInWindow(seed.UserFailures, now, s.hist.userFailureWindow)
+					haveData = true
+				}
 			}
 		}
 		if !freshSince.IsZero() && (!haveData || rawDelay == 0) {
@@ -729,14 +810,51 @@ func (s *MutableAutoSelect) rank(now time.Time, freshSince time.Time) []rankedCa
 		default:
 			delay, kind = rawDelay, kindRealSeeded
 		}
+		pres = append(pres, pre{o: o, tag: tag, delayMs: delay, kind: kind, consec: consec, userFails: userFails})
+	}
+
+	// Switch-penalty awareness: when deciding whether to hard-demote a
+	// candidate, demoted() needs to see the best alternative's delay so
+	// the rule can soften when the only fallback is much slower. Only
+	// kindRealSeeded delays participate — substituted/unknown values are
+	// synthetic, so basing a "switching is costly" decision on them
+	// would be meaningless.
+	var min1, min2 uint32
+	for _, p := range pres {
+		if p.kind != kindRealSeeded || p.delayMs == 0 {
+			continue
+		}
+		switch {
+		case min1 == 0 || p.delayMs < min1:
+			min2 = min1
+			min1 = p.delayMs
+		case min2 == 0 || p.delayMs < min2:
+			min2 = p.delayMs
+		}
+	}
+
+	out := make([]rankedCandidate, 0, len(pres))
+	for _, p := range pres {
+		// Pass selfMs=0 for non-real-seeded candidates so the boost
+		// can't trigger off a synthetic delay. bestAlt for those is
+		// irrelevant — demoted gates the boost on selfMs>0.
+		var selfMs, bestAlt uint32
+		if p.kind == kindRealSeeded {
+			selfMs = p.delayMs
+			bestAlt = min1
+			if p.delayMs == min1 {
+				bestAlt = min2
+			}
+		}
+		hard, soft, _ := demoted(p.consec, p.userFails, selfMs, bestAlt, s.hist)
 		level := demoteClean
 		switch {
 		case hard:
 			level = demoteHard
-		case userFails > 0:
+		case soft:
 			level = demoteSoft
 		}
-		out = append(out, rankedCandidate{outbound: o, tag: tag, delayMs: delay, kind: kind, demote: level})
+		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, kind: p.kind, demote: level})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		a, b := out[i], out[j]
@@ -765,7 +883,8 @@ func (s *MutableAutoSelect) runProbeCycle(ctx context.Context) {
 // probeCycleInner probes every non-excluded member in parallel and
 // returns the lowest-delay candidate that succeeded at or after
 // cycleStart, or nil when no candidate succeeded. Caller must hold
-// s.probeMu so concurrent cycles can't interleave recordOutcome calls.
+// s.probeMu so concurrent cycles can't interleave recordProbeOutcome
+// calls.
 func (s *MutableAutoSelect) probeCycleInner(ctx context.Context, cycleStart time.Time) A.Outbound {
 	s.access.Lock()
 	jobs := s.collectProbeJobsLocked()
@@ -789,35 +908,60 @@ func (s *MutableAutoSelect) probeCycleInner(ctx context.Context, cycleStart time
 // member. Holds the lock through both the in-memory mutation and the
 // persistence write so a concurrent Remove can't be undone by a late
 // goroutine. fn is passed the timestamp used for both the entry and the
-// persisted snapshot.
-func (s *MutableAutoSelect) mutateHistory(tag string, fn func(*localHistory, time.Time) bool) {
+// persisted snapshot. Returns true only if fn ran and reported a change.
+func (s *MutableAutoSelect) mutateHistory(tag string, fn func(*localHistory, time.Time) bool) bool {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if _, member := s.members.Load(tag); !member {
-		return
+		return false
 	}
 	h := s.historyForLocked(tag)
 	now := time.Now()
-	if !fn(h, now) || s.history == nil {
-		return
+	if !fn(h, now) {
+		return false
 	}
-	s.history.Store(tag, h.toTagHistory(now))
+	if s.history != nil {
+		s.history.Store(tag, h.toTagHistory(now, s.hist.userFailureWindow))
+	}
+	return true
 }
 
-func (s *MutableAutoSelect) recordUserFailure(tag string) {
-	s.mutateHistory(tag, func(h *localHistory, _ time.Time) bool {
-		h.bumpUserFailures()
-		return true
+// recordUserFailure appends a single user-traffic failure timestamp to
+// the member's sliding window and persists the snapshot. Dial errors
+// and confirmed data-plane stalls both pass through here; each counts
+// as one failure, with softFailLimit tripping the soft tier and
+// consecutiveFailLimit tripping the hard tier. Returns true if the
+// failure was persisted; false on dedup or non-member tag, so callers
+// can suppress downstream side effects (e.g. ladder kicks) on collapsed
+// events.
+func (s *MutableAutoSelect) recordUserFailure(tag string) bool {
+	return s.mutateHistory(tag, func(h *localHistory, now time.Time) bool {
+		return h.addUserFailure(now, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
 	})
 }
 
-func (s *MutableAutoSelect) recordOutcome(tag string, o localOutcome, delayMs uint32) {
+func (s *MutableAutoSelect) recordProbeOutcome(tag string, success bool, delayMs uint32) {
 	s.mutateHistory(tag, func(h *localHistory, now time.Time) bool {
-		h.append(o, delayMs, now)
+		if success {
+			h.recordProbeSuccess(delayMs, now)
+		} else {
+			h.recordProbeFailure(now)
+		}
 		return true
 	})
 }
 
+// runLadder is invoked on any dial/listen error (after the dial-site
+// fast-failover step has already had its shot) and on data-plane stall
+// callbacks. It does not retry the failing member: the dial caller
+// already retries on its own schedule, and the fast-failover path has
+// already exercised the next-best alternate. The ladder's job is to
+// reshape the candidate pool: full parallel re-probe; if nothing
+// succeeds inside ladderTotalBudget, emit the exhaustion signal so
+// radiance can refetch /config-new.
+//
+// target is for diagnostic logging only and to gate concurrent
+// invocations through laddering's CAS.
 func (s *MutableAutoSelect) runLadder(target string) {
 	if s.isClosed() {
 		return
@@ -826,69 +970,13 @@ func (s *MutableAutoSelect) runLadder(target string) {
 		return
 	}
 	defer s.laddering.Store(false)
-	s.exhaustionEmitted.Store(false)
-	deadline := time.Now().Add(s.cfg.ladderTotalBudget)
 
-	var current A.Outbound
-	if target != "" {
-		if o, ok := s.members.Load(target); ok {
-			current = o
-		}
-	}
-	if current == nil {
-		for _, t := range [2]string{
-			loadString(&s.stickyTag.tcp),
-			loadString(&s.stickyTag.udp),
-		} {
-			if t == "" {
-				continue
-			}
-			if o, ok := s.members.Load(t); ok {
-				current = o
-				break
-			}
-		}
-	}
-	// Skip step 1 when the target has any user-failure evidence: probes
-	// can pass while real traffic doesn't, and step 1 would just launder
-	// that.
-	skipStep1 := false
-	if current != nil {
-		s.access.Lock()
-		if h, ok := s.peekHistoryLocked(current.Tag()); ok && h.userFailureCount() > 0 {
-			skipStep1 = true
-		}
-		s.access.Unlock()
-	}
-	if current != nil && !skipStep1 {
-		s.logger.Info("ladder step 1: fast retry of ", current.Tag())
-		fastCtx, cancel := context.WithTimeout(s.ctx, s.cfg.ladderFastRetry)
-		defer cancel()
-		s.access.Lock()
-		probeURL := s.probeURLForLocked(current.Tag())
-		beh := behaviorFor(current.Type())
-		s.access.Unlock()
-		res := runProbe(fastCtx, current, probeURL, beh)
-		s.recordOutcome(res.tag, res.outcome, res.delayMs)
-		if res.outcome == outcomeSuccess {
-			s.logger.Info("ladder step 1 succeeded for ", current.Tag())
-			return
-		}
-	} else if skipStep1 {
-		s.logger.Info("ladder skipping step 1: ", current.Tag(),
-			" has a non-zero user-failure count; jumping straight to step 2")
-	}
-
-	s.logger.Info("ladder step 2: full re-probe")
-	// Lock (not TryLock) so the exhaustion gate keys off this call's
-	// cycle, never a stale bg cycle. Compute the budget after the wait
-	// so serialization queueing doesn't eat probing time.
+	s.logger.Info("ladder: full re-probe (target=", target, ")")
+	// Acquire probeMu before computing the budget so a slow background
+	// cycle holding the mutex doesn't eat into the ladder's actual
+	// probing time.
 	s.probeMu.Lock()
-	remaining := time.Until(deadline)
-	if minStep2 := s.cfg.ladderTotalBudget / 2; remaining < minStep2 {
-		remaining = minStep2
-	}
-	fullCtx, cancel := context.WithTimeout(s.ctx, remaining)
+	fullCtx, cancel := context.WithTimeout(s.ctx, s.cfg.ladderTotalBudget)
 	defer cancel()
 	winner := s.probeCycleInner(fullCtx, time.Now())
 	s.probeMu.Unlock()
@@ -900,13 +988,10 @@ func (s *MutableAutoSelect) runLadder(target string) {
 		s.emitExhaustion()
 		return
 	}
-	s.logger.Info("ladder step 2 found winner: ", winner.Tag())
+	s.logger.Info("ladder found winner: ", winner.Tag())
 }
 
 func (s *MutableAutoSelect) emitExhaustion() {
-	if !s.exhaustionEmitted.CompareAndSwap(false, true) {
-		return
-	}
 	// Hold s.access across drain+send so Close (which closes the channel
 	// under the same lock) can't turn the send into a panic-on-closed.
 	s.access.Lock()
