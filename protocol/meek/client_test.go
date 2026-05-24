@@ -3,6 +3,7 @@ package meek
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -76,6 +77,40 @@ func TestConn_RequiresURL(t *testing.T) {
 	_, err := Dial(context.Background(), Config{HTTPClient: http.DefaultClient})
 	if err == nil {
 		t.Errorf("expected error when URL is empty")
+	}
+}
+
+// SetReadDeadline must unblock a parked Read when the deadline elapses
+// in real time, not only when set in the past.
+func TestConn_SetReadDeadlineUnblocksParkedRead(t *testing.T) {
+	srv := newMeekTestServer()
+	t.Cleanup(srv.Close)
+
+	cfg := Config{URL: srv.server.URL, HTTPClient: srv.server.Client(), PollInterval: 50 * time.Millisecond}
+	c, err := Dial(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	// No Write — server has no upstream bytes, so Read parks immediately.
+	c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	start := time.Now()
+	buf := make([]byte, 4)
+	_, err = c.Read(buf)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, errReadDeadline) {
+		t.Errorf("Read err = %v; want errReadDeadline", err)
+	}
+	// Allow generous slack for CI scheduling jitter, but fail hard if
+	// the Read either returned immediately (deadline not enforced at
+	// all) or hung past 1s (timer didn't fire).
+	if elapsed < 50*time.Millisecond {
+		t.Errorf("Read returned too fast: %v", elapsed)
+	}
+	if elapsed > time.Second {
+		t.Errorf("Read returned too slow: %v", elapsed)
 	}
 }
 

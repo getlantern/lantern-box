@@ -77,8 +77,9 @@ type Conn struct {
 	closed   bool
 	closeErr error
 
-	readDeadline  time.Time
-	writeDeadline time.Time
+	readDeadline      time.Time
+	readDeadlineTimer *time.Timer
+	writeDeadline     time.Time
 
 	pollDone chan struct{}
 }
@@ -168,6 +169,10 @@ func (c *Conn) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.readDeadlineTimer != nil {
+		c.readDeadlineTimer.Stop()
+		c.readDeadlineTimer = nil
+	}
 	c.readCond.Broadcast()
 	c.mu.Unlock()
 
@@ -186,11 +191,31 @@ func (c *Conn) SetDeadline(t time.Time) error {
 	return c.SetWriteDeadline(t)
 }
 
+// SetReadDeadline arranges for a parked Read to wake when t elapses.
+// readCond.Wait has no native timeout, so without an active signal a
+// Read would park past the deadline until data, close, or a new
+// deadline arrived. A zero t clears the deadline.
 func (c *Conn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.readDeadline = t
-	c.readCond.Broadcast()
-	c.mu.Unlock()
+	if c.readDeadlineTimer != nil {
+		c.readDeadlineTimer.Stop()
+		c.readDeadlineTimer = nil
+	}
+	if t.IsZero() {
+		return nil
+	}
+	d := time.Until(t)
+	if d <= 0 {
+		c.readCond.Broadcast()
+		return nil
+	}
+	c.readDeadlineTimer = time.AfterFunc(d, func() {
+		c.mu.Lock()
+		c.readCond.Broadcast()
+		c.mu.Unlock()
+	})
 	return nil
 }
 
