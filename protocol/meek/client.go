@@ -1,6 +1,7 @@
-// Package meek implements a domain-fronted meek client following the
-// Tor pluggable-transport meek v1 wire format: chunked TCP-over-HTTPS,
-// session-keyed by a per-Conn random ID sent in X-Session-Id.
+// Package meek implements a domain-fronted meek client: chunked
+// TCP-over-HTTPS, session-keyed by a per-Conn random ID sent in
+// X-Session-Id. The wire format is the meek-v1 polling scheme as used
+// by Psiphon and Lantern.
 //
 // Each Conn maintains a single polling goroutine that POSTs to the meek
 // server every PollIntervalMs, batching outbound bytes from Write into
