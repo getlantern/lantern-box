@@ -160,6 +160,7 @@ func (l *slogLogger) log(ctx context.Context, level slog.Level, args []any) stri
 	}
 	if ctx != nil {
 		if id, hasId := log.IDFromContext(ctx); hasId {
+			args = append(args, slog.Uint64("id", uint64(id.ID)))
 			args = append(args, slog.Duration("duration", time.Since(id.CreatedAt)))
 		}
 	}
