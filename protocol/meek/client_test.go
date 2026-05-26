@@ -114,6 +114,52 @@ func TestConn_SetReadDeadlineUnblocksParkedRead(t *testing.T) {
 	}
 }
 
+// A single Write larger than MaxWriteBufBytes must not buffer the whole
+// payload at once: when the poll loop can't drain (front stalled), Write
+// fills to the cap, blocks, and surfaces the write deadline having
+// accepted far fewer than len(p) bytes. Guards the chunked-append cap.
+func TestConn_LargeWriteRespectsBacklogCap(t *testing.T) {
+	// A transport that parks every POST until the conn's context is
+	// cancelled stalls the poll loop after at most one drained chunk, so
+	// writeBuf can't be emptied. Using the request context (which is the
+	// meek conn's ctx) means Close cancels it deterministically with no
+	// leaked server goroutine.
+	cfg := Config{
+		URL: "https://meek.example/",
+		HTTPClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		})},
+		PollInterval:     2 * time.Second, // long, so only the Write signal drives the loop
+		MaxBodyBytes:     512,
+		MaxWriteBufBytes: 4096,
+	}
+	c, err := Dial(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	const total = 1 << 20 // 1 MiB, far above the 4 KiB cap
+	c.SetWriteDeadline(time.Now().Add(300 * time.Millisecond))
+	n, err := c.Write(make([]byte, total))
+	if !errors.Is(err, errWriteDeadline) {
+		t.Fatalf("Write err = %v; want errWriteDeadline", err)
+	}
+	// At most the cap plus the single drained chunk should have been
+	// accepted — nowhere near the full payload.
+	if n >= total {
+		t.Errorf("Write accepted %d bytes; cap should have blocked well below %d", n, total)
+	}
+	if n > cfg.MaxWriteBufBytes+cfg.MaxBodyBytes {
+		t.Errorf("Write accepted %d bytes; want <= cap+chunk (%d)", n, cfg.MaxWriteBufBytes+cfg.MaxBodyBytes)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
 // meekTestServer is a minimal meek server that uppercases every byte the
 // client sends and queues it as response data on the next poll.
 type meekTestServer struct {

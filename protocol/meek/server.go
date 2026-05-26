@@ -16,8 +16,10 @@ import (
 type ServerConfig struct {
 	// Upstream is dialed for each new session and gets the bytes the
 	// client posts; bytes from the upstream flow back as response
-	// bodies. Typical deployment: a SOCKS5 inbound on the same host
-	// (e.g. "127.0.0.1:1080") that handles destination selection.
+	// bodies. The server pipes bytes verbatim and is agnostic to the
+	// upstream protocol, but the bundled meek outbound opens each session
+	// with a SOCKS5 CONNECT, so a SOCKS5 proxy on the same host
+	// (e.g. microsocks at "127.0.0.1:1080") is the expected deployment.
 	Upstream string
 
 	// MaxBodyBytes caps the response-body length. The server returns
@@ -144,9 +146,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Logger.Debug("meek server: new session", slog.String("sid", sid))
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, int64(s.cfg.MaxBodyBytes)))
+	// Read one byte past the cap so an oversized POST is rejected rather
+	// than silently truncated: forwarding a truncated prefix upstream
+	// would corrupt the tunneled TCP stream with no error to the client.
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(s.cfg.MaxBodyBytes)+1))
 	if err != nil {
 		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	if len(body) > s.cfg.MaxBodyBytes {
+		http.Error(w, "request body exceeds max_body_bytes", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -309,7 +318,11 @@ func (s *session) readPump(cap int) {
 		n, err := s.upstream.Read(buf)
 		if n > 0 {
 			s.mu.Lock()
-			for len(s.pending)+n > cap && !s.closed {
+			// Only block when there is already buffered data to drain.
+			// With an empty buffer we append unconditionally so a single
+			// read larger than cap (possible when MaxBodyBytes*4 < 32 KiB)
+			// can't wedge the pump waiting for room that never frees.
+			for len(s.pending) > 0 && len(s.pending)+n > cap && !s.closed {
 				s.drainCond.Wait()
 			}
 			if s.closed {

@@ -19,6 +19,8 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/protocol/socks"
+	"github.com/sagernet/sing/protocol/socks/socks5"
 
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
@@ -32,9 +34,10 @@ func RegisterOutbound(registry *outbound.Registry) {
 // Outbound is the sing-box outbound adapter wrapping the meek client.
 type Outbound struct {
 	outbound.Adapter
-	logger logger.ContextLogger
-	cfg    Config
-	fronts []option.FrontSpec
+	logger         logger.ContextLogger
+	cfg            Config
+	fronts         []option.FrontSpec
+	connectTimeout time.Duration
 }
 
 // NewOutbound constructs a meek outbound. Returns an error if no fronts
@@ -101,8 +104,9 @@ func NewOutbound(
 			[]string{N.NetworkTCP},
 			options.DialerOptions,
 		),
-		logger: logger,
-		fronts: options.Fronts,
+		logger:         logger,
+		fronts:         options.Fronts,
+		connectTimeout: connectTimeout,
 	}
 
 	o.cfg = Config{
@@ -119,8 +123,14 @@ func NewOutbound(
 }
 
 // DialContext opens a meek-tunneled TCP connection to destination.
-// destination is opaque to the meek client — bytes are forwarded
-// verbatim to the meek server which handles the outbound routing.
+//
+// sing-box treats this as a terminal outbound and writes the application
+// stream straight into the returned conn, so the destination must be
+// conveyed to the meek server's upstream before we hand the conn back.
+// That upstream is a SOCKS5 proxy (microsocks in the standard
+// deployment), so we run a SOCKS5 CONNECT to destination over the tunnel
+// first; without it the upstream would read the application's opening
+// bytes as a malformed SOCKS handshake and the connection would fail.
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if N.NetworkName(network) != N.NetworkTCP {
 		return nil, fmt.Errorf("meek: unsupported network %q", network)
@@ -129,7 +139,21 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
 	o.logger.InfoContext(ctx, "meek outbound to ", destination)
-	return Dial(ctx, o.cfg)
+
+	conn, err := Dial(ctx, o.cfg)
+	if err != nil {
+		return nil, err
+	}
+	// Bound the handshake: meek reads have no native ctx deadline, so a
+	// silent upstream would otherwise park here until the poll loop's own
+	// read timeout.
+	_ = conn.SetDeadline(time.Now().Add(o.connectTimeout))
+	if _, err := socks.ClientHandshake5(conn, socks5.CommandConnect, destination, "", ""); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("meek: socks5 connect to %s: %w", destination, err)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
 }
 
 // ListenPacket is unimplemented — meek is a TCP-stream-shaped transport.

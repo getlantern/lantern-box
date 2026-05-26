@@ -158,32 +158,44 @@ func (c *Conn) Read(p []byte) (int, error) {
 }
 
 func (c *Conn) Write(p []byte) (int, error) {
-	c.mu.Lock()
-	// Block while the backlog is at the cap so a fast sender applies
-	// backpressure instead of growing writeBuf without bound.
-	for c.writeBuf.Len() >= c.cfg.MaxWriteBufBytes && !c.closed {
+	total := len(p)
+	// Append in chunks bounded by the remaining backlog capacity so a
+	// single large Write can't grow writeBuf past MaxWriteBufBytes: each
+	// pass blocks until the poll loop has drained room, applying real
+	// backpressure rather than only checking the cap before a wholesale
+	// append.
+	for len(p) > 0 {
+		c.mu.Lock()
+		for c.writeBuf.Len() >= c.cfg.MaxWriteBufBytes && !c.closed {
+			if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
+				c.mu.Unlock()
+				return total - len(p), errWriteDeadline
+			}
+			c.writeCond.Wait()
+		}
+		if c.closed {
+			c.mu.Unlock()
+			return total - len(p), errors.New("meek: closed")
+		}
 		if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
 			c.mu.Unlock()
-			return 0, errWriteDeadline
+			return total - len(p), errWriteDeadline
 		}
-		c.writeCond.Wait()
-	}
-	if c.closed {
+		room := c.cfg.MaxWriteBufBytes - c.writeBuf.Len()
+		n := len(p)
+		if n > room {
+			n = room
+		}
+		c.writeBuf.Write(p[:n])
+		p = p[n:]
 		c.mu.Unlock()
-		return 0, errors.New("meek: closed")
-	}
-	if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
-		c.mu.Unlock()
-		return 0, errWriteDeadline
-	}
-	c.writeBuf.Write(p)
-	c.mu.Unlock()
 
-	select {
-	case c.writeReady <- struct{}{}:
-	default:
+		select {
+		case c.writeReady <- struct{}{}:
+		default:
+		}
 	}
-	return len(p), nil
+	return total, nil
 }
 
 func (c *Conn) Close() error {
