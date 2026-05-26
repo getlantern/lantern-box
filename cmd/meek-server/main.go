@@ -42,6 +42,7 @@ func run() error {
 	maxBody := flag.Int("max-body", 64*1024, "max response body bytes")
 	holdoff := flag.Duration("holdoff", 50*time.Millisecond, "how long to wait for upstream bytes before responding")
 	idleTimeout := flag.Duration("idle-timeout", 5*time.Minute, "session idle reap threshold")
+	authToken := flag.String("auth-token", "", "shared secret required in the X-Meek-Auth header; empty disables auth (open relay — only for local testing)")
 	debug := flag.Bool("debug", false, "verbose logging")
 	flag.Parse()
 
@@ -55,11 +56,16 @@ func run() error {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 
+	if *authToken == "" {
+		logger.Warn("meek-server: -auth-token not set; running as an OPEN RELAY into the upstream (fine for local testing, never in production)")
+	}
+
 	srv, err := meek.NewServer(meek.ServerConfig{
 		Upstream:           *upstream,
 		MaxBodyBytes:       *maxBody,
 		ResponseHoldoff:    *holdoff,
 		SessionIdleTimeout: *idleTimeout,
+		AuthToken:          *authToken,
 		Logger:             logger,
 	})
 	if err != nil {

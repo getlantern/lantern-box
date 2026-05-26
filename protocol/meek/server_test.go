@@ -149,6 +149,39 @@ func TestServer_MissingSessionID(t *testing.T) {
 	}
 }
 
+func TestServer_AuthTokenRequired(t *testing.T) {
+	upstream := newEchoUpstream(t)
+	t.Cleanup(upstream.Close)
+	srv, _ := NewServer(ServerConfig{Upstream: upstream.addr, AuthToken: "s3cret"})
+	t.Cleanup(func() { _ = srv.Close() })
+	hs := httptest.NewServer(srv)
+	t.Cleanup(hs.Close)
+
+	post := func(authHeader string) int {
+		req, _ := http.NewRequest(http.MethodPost, hs.URL, strings.NewReader(""))
+		req.Header.Set("X-Session-Id", "abcdef")
+		if authHeader != "" {
+			req.Header.Set("X-Meek-Auth", authHeader)
+		}
+		resp, err := hs.Client().Do(req)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := post(""); got != http.StatusForbidden {
+		t.Errorf("missing token: status = %d; want 403", got)
+	}
+	if got := post("wrong"); got != http.StatusForbidden {
+		t.Errorf("wrong token: status = %d; want 403", got)
+	}
+	if got := post("s3cret"); got == http.StatusForbidden {
+		t.Errorf("correct token: status = 403; want the request to proceed")
+	}
+}
+
 func TestServer_UpstreamDialFails(t *testing.T) {
 	srv, _ := NewServer(ServerConfig{
 		Upstream:        "127.0.0.1:1",

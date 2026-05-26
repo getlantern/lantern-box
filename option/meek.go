@@ -12,7 +12,7 @@ import "github.com/sagernet/sing-box/option"
 type MeekOutboundOptions struct {
 	option.DialerOptions
 
-	URL    string      `json:"url"`              // meek server URL (e.g. https://api.iantem.io/meek/)
+	URL    string      `json:"url"`              // meek server URL (e.g. https://meek.dsa.akamai.getiantem.org/)
 	Fronts []FrontSpec `json:"fronts"`           // candidate fronts
 	Header MeekHeaders `json:"header,omitempty"` // extra HTTP headers per request
 

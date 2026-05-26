@@ -122,6 +122,45 @@ type meekTestServer struct {
 	sessions map[string]*bytes.Buffer
 }
 
+// ExtraHeaders must not override protocol-critical headers: a config
+// trying to pin X-Session-Id (which would collapse every conn onto one
+// server-side session) is ignored, and the server sees the real
+// per-conn random ID.
+func TestConn_ReservedHeadersNotOverridable(t *testing.T) {
+	srv := newMeekTestServer()
+	t.Cleanup(srv.Close)
+
+	cfg := Config{
+		URL:          srv.server.URL,
+		HTTPClient:   srv.server.Client(),
+		PollInterval: 20 * time.Millisecond,
+		ExtraHeaders: map[string]string{
+			"X-Session-Id": "hijacked",
+			"Content-Type": "text/plain",
+			"X-Custom":     "ok", // non-reserved: should pass through
+		},
+	}
+	c, err := Dial(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	if _, err := c.Write([]byte("hi")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	time.Sleep(80 * time.Millisecond)
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if _, hijacked := srv.sessions["hijacked"]; hijacked {
+		t.Error("ExtraHeaders overrode X-Session-Id; reserved header not protected")
+	}
+	if _, ok := srv.sessions[c.sessionID]; !ok {
+		t.Errorf("server never saw the real session id %q", c.sessionID)
+	}
+}
+
 func newMeekTestServer() *meekTestServer {
 	s := &meekTestServer{sessions: map[string]*bytes.Buffer{}}
 	s.server = httptest.NewServer(http.HandlerFunc(s.handle))

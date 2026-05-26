@@ -32,10 +32,9 @@ func RegisterOutbound(registry *outbound.Registry) {
 // Outbound is the sing-box outbound adapter wrapping the meek client.
 type Outbound struct {
 	outbound.Adapter
-	logger    logger.ContextLogger
-	cfg       Config
-	fronts    []option.FrontSpec
-	innerHost string
+	logger logger.ContextLogger
+	cfg    Config
+	fronts []option.FrontSpec
 }
 
 // NewOutbound constructs a meek outbound. Returns an error if no fronts
@@ -57,6 +56,23 @@ func NewOutbound(
 	u, err := url.Parse(options.URL)
 	if err != nil {
 		return nil, fmt.Errorf("meek: parse url: %w", err)
+	}
+	// Must be https: the transport routes every dial through
+	// DialTLSContext (the fronted TLS dialer). An http:// URL would make
+	// http.Transport use DialContext instead, bypassing fronting and the
+	// cert pinning below — silently leaking traffic.
+	if u.Scheme != "https" {
+		return nil, fmt.Errorf("meek: url scheme must be https, got %q", u.Scheme)
+	}
+	// Every front must pin a cert identity. verifyChain runs with
+	// VerifyHostname (falling back to SNI); if both are empty the cert
+	// check degrades to "any publicly-trusted cert", which is no check at
+	// all for a fronted endpoint. Reject at config time rather than
+	// silently accepting MITM.
+	for i, f := range options.Fronts {
+		if f.VerifyHostname == "" && f.SNI == "" {
+			return nil, fmt.Errorf("meek: fronts[%d] must set verify_hostname or sni so the cert identity can be checked", i)
+		}
 	}
 
 	outboundDialer, err := dialer.New(ctx, options.DialerOptions, false)
@@ -85,16 +101,15 @@ func NewOutbound(
 			[]string{N.NetworkTCP},
 			options.DialerOptions,
 		),
-		logger:    logger,
-		fronts:    options.Fronts,
-		innerHost: u.Host,
+		logger: logger,
+		fronts: options.Fronts,
 	}
 
 	o.cfg = Config{
 		URL:          options.URL,
 		InnerHost:    u.Host,
 		ExtraHeaders: options.Header,
-		HTTPClient:   buildHTTPClient(outboundDialer, o.fronts, u, connectTimeout, readTimeout),
+		HTTPClient:   buildHTTPClient(outboundDialer, o.fronts, connectTimeout, readTimeout),
 		PollInterval: pollInterval,
 		MaxBodyBytes: options.MaxBodyBytes,
 		SessionIDLen: options.SessionIDLen,
@@ -130,7 +145,7 @@ func (o *Outbound) Close() error { return nil }
 // random front from fronts on every dial and connects to its IP with
 // the spec's outer SNI. cert validation uses VerifyHostname when
 // present so the spec drives both who-we-look-like and who-we-trust.
-func buildHTTPClient(d N.Dialer, fronts []option.FrontSpec, u *url.URL, connectTimeout, readTimeout time.Duration) *http.Client {
+func buildHTTPClient(d N.Dialer, fronts []option.FrontSpec, connectTimeout, readTimeout time.Duration) *http.Client {
 	tr := &http.Transport{
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			front := pickFront(fronts)
@@ -138,19 +153,29 @@ func buildHTTPClient(d N.Dialer, fronts []option.FrontSpec, u *url.URL, connectT
 			if _, _, err := net.SplitHostPort(addr); err != nil {
 				addr = net.JoinHostPort(addr, "443")
 			}
+			verifyHost := front.VerifyHostname
+			if verifyHost == "" {
+				verifyHost = front.SNI
+			}
+			// NewOutbound rejects fronts with neither set, but guard the
+			// dial too: an empty DNSName makes verifyChain skip the
+			// hostname check, which would silently accept any trusted cert.
+			if verifyHost == "" {
+				return nil, errors.New("meek: front has no verify_hostname or sni; refusing to dial without cert identity")
+			}
 			dialCtx, cancel := context.WithTimeout(ctx, connectTimeout)
 			defer cancel()
 			raw, err := d.DialContext(dialCtx, N.NetworkTCP, M.ParseSocksaddr(addr))
 			if err != nil {
 				return nil, fmt.Errorf("meek: tcp dial %s: %w", addr, err)
 			}
-			tlsConfig := &tls.Config{InsecureSkipVerify: true}
+			// InsecureSkipVerify disables the default CA+hostname check so
+			// we can run our own via VerifyPeerCertificate against the
+			// front's pinned identity (verifyHost) rather than the outer
+			// SNI — the SNI is cover, not the cert we trust.
+			tlsConfig := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // custom verification below pins verifyHost
 			if front.SNI != "" {
 				tlsConfig.ServerName = front.SNI
-			}
-			verifyHost := front.VerifyHostname
-			if verifyHost == "" {
-				verifyHost = front.SNI
 			}
 			tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 				return verifyChain(rawCerts, verifyHost)

@@ -26,22 +26,28 @@ import (
 )
 
 const (
-	defaultPollIntervalMs = 100
-	defaultMaxBodyBytes   = 64 * 1024
-	defaultSessionIDLen   = 16
-	defaultReadTimeout    = 30 * time.Second
+	defaultPollIntervalMs   = 100
+	defaultMaxBodyBytes     = 64 * 1024
+	defaultSessionIDLen     = 16
+	defaultReadTimeout      = 30 * time.Second
+	defaultMaxWriteBufBytes = 1 << 20 // 1 MiB
 )
 
 // Config is the runtime configuration for a meek Conn.
 type Config struct {
-	URL            string
-	InnerHost      string
-	ExtraHeaders   map[string]string
-	HTTPClient     *http.Client
-	PollInterval   time.Duration
-	MaxBodyBytes   int
-	SessionIDLen   int
-	ReadTimeout    time.Duration
+	URL          string
+	InnerHost    string
+	ExtraHeaders map[string]string
+	HTTPClient   *http.Client
+	PollInterval time.Duration
+	MaxBodyBytes int
+	SessionIDLen int
+	ReadTimeout  time.Duration
+	// MaxWriteBufBytes caps the unsent Write backlog. Write blocks once
+	// the buffer reaches this size and resumes as the poll loop drains
+	// it, so a sender outpacing a slow front applies backpressure
+	// instead of growing memory without bound.
+	MaxWriteBufBytes int
 }
 
 func (c *Config) applyDefaults() {
@@ -57,6 +63,9 @@ func (c *Config) applyDefaults() {
 	if c.ReadTimeout <= 0 {
 		c.ReadTimeout = defaultReadTimeout
 	}
+	if c.MaxWriteBufBytes <= 0 {
+		c.MaxWriteBufBytes = defaultMaxWriteBufBytes
+	}
 }
 
 // Conn is a net.Conn that tunnels through a meek server.
@@ -70,6 +79,9 @@ type Conn struct {
 	mu         sync.Mutex
 	writeBuf   bytes.Buffer
 	writeReady chan struct{}
+	// writeCond wakes a Write blocked on a full writeBuf when the poll
+	// loop drains it (or on close / write-deadline).
+	writeCond *sync.Cond
 
 	readBuf  bytes.Buffer
 	readCond *sync.Cond
@@ -77,9 +89,10 @@ type Conn struct {
 	closed   bool
 	closeErr error
 
-	readDeadline      time.Time
-	readDeadlineTimer *time.Timer
-	writeDeadline     time.Time
+	readDeadline       time.Time
+	readDeadlineTimer  *time.Timer
+	writeDeadline      time.Time
+	writeDeadlineTimer *time.Timer
 
 	pollDone chan struct{}
 }
@@ -117,6 +130,7 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 		pollDone:   make(chan struct{}),
 	}
 	c.readCond = sync.NewCond(&c.mu)
+	c.writeCond = sync.NewCond(&c.mu)
 	c.ctx, c.cancel = context.WithCancel(ctx)
 
 	go c.pollLoop()
@@ -144,11 +158,20 @@ func (c *Conn) Read(p []byte) (int, error) {
 
 func (c *Conn) Write(p []byte) (int, error) {
 	c.mu.Lock()
+	// Block while the backlog is at the cap so a fast sender applies
+	// backpressure instead of growing writeBuf without bound.
+	for c.writeBuf.Len() >= c.cfg.MaxWriteBufBytes && !c.closed {
+		if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
+			c.mu.Unlock()
+			return 0, errWriteDeadline
+		}
+		c.writeCond.Wait()
+	}
 	if c.closed {
 		c.mu.Unlock()
 		return 0, errors.New("meek: closed")
 	}
-	if !c.writeDeadline.IsZero() && time.Now().After(c.writeDeadline) {
+	if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
 		c.mu.Unlock()
 		return 0, errWriteDeadline
 	}
@@ -173,7 +196,12 @@ func (c *Conn) Close() error {
 		c.readDeadlineTimer.Stop()
 		c.readDeadlineTimer = nil
 	}
+	if c.writeDeadlineTimer != nil {
+		c.writeDeadlineTimer.Stop()
+		c.writeDeadlineTimer = nil
+	}
 	c.readCond.Broadcast()
+	c.writeCond.Broadcast()
 	c.mu.Unlock()
 
 	c.cancel()
@@ -219,10 +247,31 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
+// SetWriteDeadline arranges for a Write blocked on a full backlog to
+// wake when t elapses (mirrors SetReadDeadline): without an active
+// signal the writeCond.Wait would park past the deadline if the front
+// is hung and the poll loop never drains. A zero t clears the deadline.
 func (c *Conn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.writeDeadline = t
-	c.mu.Unlock()
+	if c.writeDeadlineTimer != nil {
+		c.writeDeadlineTimer.Stop()
+		c.writeDeadlineTimer = nil
+	}
+	if t.IsZero() {
+		return nil
+	}
+	d := time.Until(t)
+	if d <= 0 {
+		c.writeCond.Broadcast()
+		return nil
+	}
+	c.writeDeadlineTimer = time.AfterFunc(d, func() {
+		c.mu.Lock()
+		c.writeCond.Broadcast()
+		c.mu.Unlock()
+	})
 	return nil
 }
 
@@ -257,11 +306,18 @@ func (c *Conn) roundtrip() error {
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.Host = c.cfg.InnerHost
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Session-Id", c.sessionID)
+	// Apply caller headers first, then set the protocol-critical ones so
+	// config can't override the session keying or framing (e.g. pinning a
+	// fixed X-Session-Id across conns, or changing Content-Type). Host is
+	// set via req.Host above and likewise not overridable here.
 	for k, v := range c.cfg.ExtraHeaders {
+		if isReservedHeader(k) {
+			continue
+		}
 		req.Header.Set(k, v)
 	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Session-Id", c.sessionID)
 
 	resp, err := c.cfg.HTTPClient.Do(req)
 	if err != nil {
@@ -298,6 +354,8 @@ func (c *Conn) takeWriteChunkLocked() []byte {
 	out := make([]byte, len(chunk))
 	copy(out, chunk)
 	c.writeBuf.Next(len(chunk))
+	// Wake any Write parked on the backlog cap.
+	c.writeCond.Broadcast()
 	return out
 }
 
@@ -308,7 +366,19 @@ func (c *Conn) markClosed(err error) {
 		c.closeErr = err
 	}
 	c.readCond.Broadcast()
+	c.writeCond.Broadcast()
 	c.mu.Unlock()
+}
+
+// isReservedHeader reports whether name is a header the meek protocol
+// owns and config must not override.
+func isReservedHeader(name string) bool {
+	switch http.CanonicalHeaderKey(name) {
+	case "Host", "Content-Type", "X-Session-Id":
+		return true
+	default:
+		return false
+	}
 }
 
 type meekAddr string

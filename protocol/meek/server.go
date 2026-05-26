@@ -1,6 +1,7 @@
 package meek
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +38,14 @@ type ServerConfig struct {
 
 	// Dialer optionally overrides net.Dial for upstream connections.
 	Dialer func(network, address string) (net.Conn, error)
+
+	// AuthToken, when non-empty, is a shared secret every request must
+	// present in the X-Meek-Auth header. Without it the server is an
+	// open relay into Upstream — anyone who reaches the endpoint can
+	// create sessions and tunnel arbitrary traffic — so production
+	// deployments on a public/fronted hostname MUST set it. Empty
+	// disables the check (intended only for local tests).
+	AuthToken string
 
 	Logger *slog.Logger
 }
@@ -111,6 +120,12 @@ func (s *Server) Close() error {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Constant-time compare so a probe can't time-discover the token.
+	if s.cfg.AuthToken != "" &&
+		subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Meek-Auth")), []byte(s.cfg.AuthToken)) != 1 {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	sid := r.Header.Get("X-Session-Id")
@@ -244,16 +259,21 @@ type session struct {
 	last         time.Time
 	readWakeCh   chan struct{}
 	upstreamDone chan struct{}
+	// drainCond wakes a readPump paused because pending is at cap, when
+	// takeLocked frees space or the session closes.
+	drainCond *sync.Cond
 }
 
 func newSession(id string, upstream net.Conn) *session {
-	return &session{
+	s := &session{
 		id:           id,
 		upstream:     upstream,
 		last:         time.Now(),
 		readWakeCh:   make(chan struct{}, 1),
 		upstreamDone: make(chan struct{}),
 	}
+	s.drainCond = sync.NewCond(&s.mu)
+	return s
 }
 
 func (s *session) lastSeen() time.Time {
@@ -290,9 +310,7 @@ func (s *session) readPump(cap int) {
 		if n > 0 {
 			s.mu.Lock()
 			for len(s.pending)+n > cap && !s.closed {
-				s.mu.Unlock()
-				time.Sleep(5 * time.Millisecond)
-				s.mu.Lock()
+				s.drainCond.Wait()
 			}
 			if s.closed {
 				s.mu.Unlock()
@@ -343,6 +361,8 @@ func (s *session) takeLocked(max int) []byte {
 	out := make([]byte, n)
 	copy(out, s.pending[:n])
 	s.pending = s.pending[n:]
+	// Wake a readPump paused at the cap.
+	s.drainCond.Broadcast()
 	return out
 }
 
@@ -360,6 +380,7 @@ func (s *session) close() {
 		return
 	}
 	s.closed = true
+	s.drainCond.Broadcast()
 	s.mu.Unlock()
 	s.upstream.Close()
 	s.signalWake()
