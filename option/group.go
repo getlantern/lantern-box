@@ -29,7 +29,7 @@ type MutableAutoSelectOutboundOptions struct {
 	URLOverrides map[string]string `json:"url_overrides,omitempty"`
 
 	// SwitchToleranceMs is the delay improvement (in ms) a candidate must
-	// beat the current selection by before the group switches. Default 50.
+	// beat the current selection by before the group switches. Default 200.
 	SwitchToleranceMs uint32 `json:"switch_tolerance_ms,omitempty"`
 
 	// ConsecutiveFailureLimit hard-demotes a member once probe failures
@@ -78,6 +78,12 @@ type MutableAutoSelectOutboundOptions struct {
 	// LadderTotalBudgetSeconds is the total budget the reconnection ladder
 	// has before emitting the exhaustion signal. Default 10.
 	LadderTotalBudgetSeconds uint32 `json:"ladder_total_budget_seconds,omitempty"`
+
+	// LadderCooldownSeconds is the minimum time after a ladder run before
+	// another ladder run can fire. Suppresses repeated full-fleet
+	// re-probes when stalls or dial errors arrive in quick succession on
+	// the same already-shuffled pool. Default 60.
+	LadderCooldownSeconds uint32 `json:"ladder_cooldown_seconds,omitempty"`
 
 	// DataPlaneIdleSeconds is the no-traffic threshold after which an
 	// established and proven tunnel is treated as a data-plane stall.

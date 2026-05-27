@@ -82,6 +82,10 @@ type MutableAutoSelect struct {
 	// (URLTest, runLadder) Lock so they observe the cycle they triggered.
 	probeMu      sync.Mutex
 	laddering    atomic.Bool
+	// Unix-nano of the most recent runLadder completion. Read by the
+	// cooldown gate to suppress back-to-back full-fleet re-probes when
+	// stalls or dial errors arrive in quick succession.
+	lastLadderAt atomic.Int64
 	exhaustionCh chan struct{}
 
 	// Unix-nano of the most recent non-empty data-plane Read/Write; 0
@@ -98,6 +102,7 @@ type mutableAutoSelectConfig struct {
 	idleInterval        time.Duration
 	idleThreshold       time.Duration
 	ladderTotalBudget   time.Duration
+	ladderCooldown      time.Duration
 	dataPlaneIdle       time.Duration
 	dataPlaneProvedRead uint64
 	maxPersistedAge     time.Duration
@@ -110,12 +115,13 @@ func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) 
 		idleInterval:        time.Duration(o.IdleIntervalSeconds) * time.Second,
 		idleThreshold:       time.Duration(o.IdleThresholdSeconds) * time.Second,
 		ladderTotalBudget:   time.Duration(o.LadderTotalBudgetSeconds) * time.Second,
+		ladderCooldown:      time.Duration(o.LadderCooldownSeconds) * time.Second,
 		dataPlaneIdle:       time.Duration(o.DataPlaneIdleSeconds) * time.Second,
 		dataPlaneProvedRead: uint64(o.DataPlaneProvedReadBytes),
 		maxPersistedAge:     time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
 	}
 	if cfg.switchTolerance == 0 {
-		cfg.switchTolerance = 50 * time.Millisecond
+		cfg.switchTolerance = 200 * time.Millisecond
 	}
 	if cfg.activeInterval == 0 {
 		cfg.activeInterval = 180 * time.Second
@@ -128,6 +134,9 @@ func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) 
 	}
 	if cfg.ladderTotalBudget == 0 {
 		cfg.ladderTotalBudget = 10 * time.Second
+	}
+	if cfg.ladderCooldown == 0 {
+		cfg.ladderCooldown = 60 * time.Second
 	}
 	if cfg.dataPlaneIdle == 0 {
 		cfg.dataPlaneIdle = defaultDataPlaneIdle
@@ -960,11 +969,21 @@ func (s *MutableAutoSelect) recordProbeOutcome(tag string, success bool, delayMs
 // succeeds inside ladderTotalBudget, emit the exhaustion signal so
 // radiance can refetch /config-new.
 //
+// A ladderCooldown window after the previous run suppresses repeat
+// kicks: probe data is still fresh, and rank demotion via
+// recordUserFailure already moves traffic off bad peers without
+// needing the ladder to re-shape the pool.
+//
 // target is for diagnostic logging only and to gate concurrent
 // invocations through laddering's CAS.
 func (s *MutableAutoSelect) runLadder(target string) {
 	if s.isClosed() {
 		return
+	}
+	if last := s.lastLadderAt.Load(); last != 0 {
+		if time.Since(time.Unix(0, last)) < s.cfg.ladderCooldown {
+			return
+		}
 	}
 	if !s.laddering.CompareAndSwap(false, true) {
 		return
@@ -980,6 +999,9 @@ func (s *MutableAutoSelect) runLadder(target string) {
 	defer cancel()
 	winner := s.probeCycleInner(fullCtx, time.Now())
 	s.probeMu.Unlock()
+	// Stamp on completion, not entry, so a slow ladder's runtime counts
+	// toward the cooldown.
+	s.lastLadderAt.Store(time.Now().UnixNano())
 	if s.isClosed() {
 		return
 	}
