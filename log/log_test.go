@@ -46,6 +46,20 @@ func TestLogging(t *testing.T) {
 	}
 }
 
+func TestContextID(t *testing.T) {
+	var buf bytes.Buffer
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	f := &factory{handler: handler}
+	sl := &slogLogger{factory: f}
+
+	ctx := log.ContextWithNewID(context.Background())
+	sl.Log(ctx, log.LevelInfo, "test message")
+
+	out := buf.String()
+	assert.Contains(t, out, "id=", "expected context ID in log output")
+	assert.Contains(t, out, "duration=", "expected duration in log output")
+}
+
 func TestLevel(t *testing.T) {
 	tests := []struct {
 		name  string
