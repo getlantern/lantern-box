@@ -68,10 +68,13 @@ processors:
     send_batch_size: 1024
     timeout: 10s
 
-  # Tag every metric with route_id, instance_id, provider, region
-  # These are injected via OTEL_RESOURCE_ATTRIBUTES at service start
+  # Tag every metric/span with resource attrs from two sources:
+  #   env    — reads OTEL_RESOURCE_ATTRIBUTES (route.id, instance.id, cloud.*)
+  #   system — host.name, host.id, os.* from the running host
+  # Without `system`, host.name is null because the env var doesn't carry it.
   resourcedetection:
-    detectors: [env]
+    detectors: [env, system]
+    override: false
     timeout: 2s
 
   memory_limiter:
