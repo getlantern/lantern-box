@@ -14,6 +14,7 @@ import (
 	"github.com/getlantern/lantern-box/option"
 )
 
+// register a constructor that always errors to follow sing-box's convention
 func RegisterEndpoint(registry *endpoint.Registry) {
 	endpoint.Register[option.AmneziaEndpointOptions](registry, constant.TypeAmnezia,
 		func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AmneziaEndpointOptions) (adapter.Endpoint, error) {

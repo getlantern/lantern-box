@@ -9,9 +9,11 @@ import (
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/libbox"
 	"github.com/sagernet/sing/service"
 
+	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/protocol/algeneva"
 	"github.com/getlantern/lantern-box/protocol/amnezia"
 	"github.com/getlantern/lantern-box/protocol/group"
@@ -22,11 +24,6 @@ import (
 	"github.com/getlantern/lantern-box/protocol/water"
 )
 
-type _registry interface {
-	adapter.Registry
-	CreateOptions(string) (any, bool)
-}
-
 var supportedProtocols []string
 
 func init() {
@@ -34,17 +31,11 @@ func init() {
 	// tags, we can't hardcode this list and must collect it from the registries themselves.
 
 	ctx := RegisterProtocols(libbox.BaseContext(nil))
-	getProtos := func(reg _registry) []string {
+	getProtos := func(reg adapter.Registry) []string {
 		if reg == nil {
 			return nil
 		}
-		p := reg.Registered()
-		// sing-box still registers all protocols regardless but the registered constructor returns
-		// an error when the build tag is ommitted, so we remove ones that error
-		return slices.DeleteFunc(p, func(s string) bool {
-			_, ok := reg.CreateOptions(s)
-			return !ok
-		})
+		return reg.Registered()
 	}
 
 	iprotos := getProtos(service.FromContext[adapter.InboundRegistry](ctx))
@@ -59,6 +50,13 @@ func init() {
 	}
 	for _, p := range eprotos {
 		protocolSet[p] = struct{}{}
+	}
+	if !with_wireguard {
+		delete(protocolSet, constant.TypeAmnezia)
+		delete(protocolSet, C.TypeWireGuard)
+	}
+	if !with_ts {
+		delete(protocolSet, C.TypeTailscale)
 	}
 	supportedProtocols = slices.Collect(maps.Keys(protocolSet))
 }
