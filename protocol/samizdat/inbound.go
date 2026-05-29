@@ -157,6 +157,8 @@ func NewInbound(
 // which is required because the samizdat H2 handler closes the stream
 // when the Handler function returns.
 func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destination string) {
+	conn = &wrapConn{Conn: conn}
+
 	var metadata adapter.InboundContext
 	metadata.Inbound = i.Tag()
 	metadata.InboundType = i.Type()
