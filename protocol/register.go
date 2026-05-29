@@ -2,11 +2,14 @@ package protocol
 
 import (
 	"context"
+	"maps"
+	"slices"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/experimental/libbox"
 	"github.com/sagernet/sing/service"
 
 	"github.com/getlantern/lantern-box/protocol/algeneva"
@@ -19,30 +22,45 @@ import (
 	"github.com/getlantern/lantern-box/protocol/water"
 )
 
-var supportedProtocols = []string{
-	// custom protocols
-	"algeneva",
-	"amnezia",
-	"outline",
-	"reflex",
-	"samizdat",
-	"unbounded",
-	"water",
+type _registry interface {
+	adapter.Registry
+	CreateOptions(string) (any, bool)
+}
 
-	// sing-box built-in protocols
-	"http",
-	"hysteria",
-	"hysteria2",
-	"shadowsocks",
-	"shadowtls",
-	"socks",
-	"ssh",
-	"tor",
-	"trojan",
-	"tuic",
-	"vless",
-	"vmess",
-	"wireguard",
+var supportedProtocols []string
+
+func init() {
+	// collect supported protocols from all registries. since what's supported depends on the build
+	// tags, we can't hardcode this list and must collect it from the registries themselves.
+
+	ctx := RegisterProtocols(libbox.BaseContext(nil))
+	getProtos := func(reg _registry) []string {
+		if reg == nil {
+			return nil
+		}
+		p := reg.Registered()
+		// sing-box still registers all protocols regardless but the registered constructor returns
+		// an error when the build tag is ommitted, so we remove ones that error
+		return slices.DeleteFunc(p, func(s string) bool {
+			_, ok := reg.CreateOptions(s)
+			return !ok
+		})
+	}
+
+	iprotos := getProtos(service.FromContext[adapter.InboundRegistry](ctx))
+	oprotos := getProtos(service.FromContext[adapter.OutboundRegistry](ctx))
+	eprotos := getProtos(service.FromContext[adapter.EndpointRegistry](ctx))
+	protocolSet := make(map[string]struct{})
+	for _, p := range iprotos {
+		protocolSet[p] = struct{}{}
+	}
+	for _, p := range oprotos {
+		protocolSet[p] = struct{}{}
+	}
+	for _, p := range eprotos {
+		protocolSet[p] = struct{}{}
+	}
+	supportedProtocols = slices.Collect(maps.Keys(protocolSet))
 }
 
 // RegisterProtocols registers all lantern-box protocols to the given context's registries.
