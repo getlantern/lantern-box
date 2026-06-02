@@ -80,8 +80,8 @@ type MutableAutoSelect struct {
 	// probeMu serializes probe cycles. Fire-and-forget callers
 	// (runProbeCycle) TryLock; callers that need a deterministic outcome
 	// (URLTest, runLadder) Lock so they observe the cycle they triggered.
-	probeMu      sync.Mutex
-	laddering    atomic.Bool
+	probeMu   sync.Mutex
+	laddering atomic.Bool
 	// Unix-nano of the most recent runLadder completion. Read by the
 	// cooldown gate to suppress back-to-back full-fleet re-probes when
 	// stalls or dial errors arrive in quick succession.

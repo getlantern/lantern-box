@@ -580,7 +580,7 @@ func TestDataPlaneStream_CloseIsIdempotent(t *testing.T) {
 func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
 	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func() { calls.Add(1) }, nil)
-	d.proven.Store(true)      // simulate a proven conn so fireStall isn't gated on the proven check
+	d.proven.Store(true)       // simulate a proven conn so fireStall isn't gated on the proven check
 	d.lastWasWrite.Store(true) // ...nor on the write-without-read gate
 	d.Close()
 	d.fireStall()
@@ -622,11 +622,11 @@ func TestRunLadder_DoesNotEmitExhaustionWhenClosed(t *testing.T) {
 
 func TestRecordProbeOutcome_Persists(t *testing.T) {
 	tests := []struct {
-		name         string
-		success      bool
-		delayMs      uint32
-		wantDelayMs  uint32
-		wantConsec   uint32
+		name        string
+		success     bool
+		delayMs     uint32
+		wantDelayMs uint32
+		wantConsec  uint32
 	}{
 		{"success records delay and zeroes consecutive", true, 123, 123, 0},
 		{"failure increments consecutive, preserves delay", false, 0, 0, 1},
@@ -1094,4 +1094,3 @@ func TestClose_RaceWithEmitExhaustionDoesNotPanic(t *testing.T) {
 		wg.Wait()
 	}
 }
-

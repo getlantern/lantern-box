@@ -8,13 +8,13 @@ import (
 )
 
 const (
-	defaultConsecutiveFailLimit    = 3
-	defaultSoftFailLimit           = 2
-	defaultUserFailureWindow       = 5 * time.Minute
-	defaultUserFailureDedupeWindow = 30 * time.Second
-	defaultDataPlaneIdle           = 60 * time.Second
+	defaultConsecutiveFailLimit     = 3
+	defaultSoftFailLimit            = 2
+	defaultUserFailureWindow        = 5 * time.Minute
+	defaultUserFailureDedupeWindow  = 30 * time.Second
+	defaultDataPlaneIdle            = 60 * time.Second
 	defaultDataPlaneProvedReadBytes = 4096
-	defaultMaxPersistedAge         = 15 * time.Minute
+	defaultMaxPersistedAge          = 15 * time.Minute
 	// switchPenaltyAltFactor is the ratio at which the best alternative
 	// is considered "much slower" than the candidate under evaluation.
 	// When best_alt_delay > self_delay * this factor, the demote rule
