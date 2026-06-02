@@ -12,11 +12,18 @@ import (
 type mockOutbound struct {
 	mock.Mock
 	adapter.Outbound
-	tag string
+	tag      string
+	typeName string
+	networks []string
 }
 
-func (m *mockOutbound) Tag() string       { return m.tag }
-func (m *mockOutbound) Network() []string { return []string{"tcp", "udp"} }
+func (m *mockOutbound) Tag() string { return m.tag }
+func (m *mockOutbound) Network() []string {
+	if m.networks != nil {
+		return m.networks
+	}
+	return []string{"tcp", "udp"}
+}
 
 func (m *mockOutbound) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
 	args := m.Called()
