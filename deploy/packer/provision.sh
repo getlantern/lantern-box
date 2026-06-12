@@ -165,6 +165,8 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 SSHHARD
 chmod 644 /etc/ssh/sshd_config.d/01-lantern-harden.conf
+echo "    validating sshd config"
+sshd -t
 
 echo "==> Creating lantern management user (for Tailscale SSH via Headscale ACL)"
 # The Headscale ACL grants group:dev SSH access to tag:external nodes as user "lantern".
