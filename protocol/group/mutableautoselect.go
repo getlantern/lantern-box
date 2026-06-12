@@ -740,6 +740,7 @@ type rankedCandidate struct {
 // so each tier is contiguous. Requires access held: the result aliases s.scratchSplit
 // until the caller releases the lock.
 func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, network string) []rankedCandidate {
+	clear(s.scratchSplit)
 	out := s.scratchSplit[:0]
 	var nClean, nSoft int
 	for _, c := range ranked {
@@ -782,6 +783,7 @@ type preCandidate struct {
 // probe-cycle ranker uses this so the "is there a winner this cycle?"
 // check can't see stale outcomes. Caller must hold s.access.
 func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []rankedCandidate {
+	clear(s.scratchPres)
 	pres := s.scratchPres[:0]
 	for _, tag := range s.tags {
 		o, ok := s.members.Load(tag)
@@ -860,6 +862,7 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 		}
 	}
 
+	clear(s.scratchRanked)
 	out := s.scratchRanked[:0]
 	for _, p := range pres {
 		// Pass selfMs=0 for non-real-seeded candidates so the boost
