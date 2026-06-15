@@ -298,7 +298,7 @@ func TestRank_SwitchPenaltyOnlyAppliesToRealSeeded(t *testing.T) {
 	addUserFailureN(s, "unknown-mid", int(s.hist.consecutiveFailLimit))
 
 	s.access.Lock()
-	ranked := s.rank(time.Now(), time.Time{})
+	ranked := s.rankLocked(time.Now(), time.Time{})
 	s.access.Unlock()
 
 	var fast, unknown rankedCandidate
@@ -494,7 +494,7 @@ func TestRank_ExcludesEntriesBeforeCycleStart(t *testing.T) {
 	recordSuccess(s, "a", 100)
 	cycleStart := time.Now().Add(time.Second)
 	s.access.Lock()
-	ranked := s.rank(time.Now().Add(2*time.Second), cycleStart)
+	ranked := s.rankLocked(time.Now().Add(2*time.Second), cycleStart)
 	s.access.Unlock()
 	assert.Empty(t, ranked, "entries before cycleStart must not appear in the ranked set")
 }
@@ -729,21 +729,22 @@ func TestRecordUserFailure_DemotesTagInNextSelectFor(t *testing.T) {
 
 func TestSplitHealthyFor_PrefersCleanOverSoftOverHard(t *testing.T) {
 	ob := &mockOutbound{networks: []string{"tcp", "udp"}}
-	ranked := []rankedCandidate{
-		{outbound: ob, tag: "hard", demote: demoteHard, delayMs: 10},
-		{outbound: ob, tag: "soft", demote: demoteSoft, delayMs: 50},
-		{outbound: ob, tag: "clean", demote: demoteClean, delayMs: 100},
+	mk := func(tag string, d demoteLevel) rankedCandidate {
+		return rankedCandidate{outbound: ob, tag: tag, demote: d}
 	}
-	pool := splitHealthyFor(ranked, "tcp")
+
+	s := &MutableAutoSelect{}
+	// ranked must be demote-sorted (clean < soft < hard), as rankLocked returns it.
+	pool := s.splitHealthyForLocked([]rankedCandidate{mk("clean", demoteClean), mk("soft", demoteSoft), mk("hard", demoteHard)}, "tcp")
 	require.Len(t, pool, 1)
 	assert.Equal(t, "clean", pool[0].tag)
 
-	pool = splitHealthyFor(ranked[:2], "tcp")
+	pool = s.splitHealthyForLocked([]rankedCandidate{mk("soft", demoteSoft), mk("hard", demoteHard)}, "tcp")
 	require.Len(t, pool, 1)
 	assert.Equal(t, "soft", pool[0].tag)
 
-	pool = splitHealthyFor(ranked[:1], "tcp")
-	assert.Equal(t, 1, len(pool))
+	pool = s.splitHealthyForLocked([]rankedCandidate{mk("hard", demoteHard)}, "tcp")
+	assert.Len(t, pool, 1)
 }
 
 func TestSplitHealthyFor_KeepsSoftWhenCleanIsOtherNetwork(t *testing.T) {
@@ -753,11 +754,12 @@ func TestSplitHealthyFor_KeepsSoftWhenCleanIsOtherNetwork(t *testing.T) {
 		{outbound: tcpOnly, tag: "tcp-only", demote: demoteClean, delayMs: 10},
 		{outbound: bothSoft, tag: "both-soft", demote: demoteSoft, delayMs: 50},
 	}
-	tcpPool := splitHealthyFor(ranked, "tcp")
+	s := &MutableAutoSelect{}
+	tcpPool := s.splitHealthyForLocked(ranked, "tcp")
 	require.Len(t, tcpPool, 1, "tcp pool should be clean-only")
 	assert.Equal(t, "tcp-only", tcpPool[0].tag)
 
-	udpPool := splitHealthyFor(ranked, "udp")
+	udpPool := s.splitHealthyForLocked(ranked, "udp")
 	require.Len(t, udpPool, 1, "udp pool should fall through to soft when no clean udp candidate exists")
 	assert.Equal(t, "both-soft", udpPool[0].tag)
 }
