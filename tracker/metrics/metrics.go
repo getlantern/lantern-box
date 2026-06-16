@@ -23,20 +23,22 @@ type countryLookupRequest struct {
 }
 
 type metricsManager struct {
-	meter    metric.Meter
-	ProxyIO  metric.Int64Counter
-	conns    metric.Int64UpDownCounter
-	duration metric.Int64Histogram
+	meter          metric.Meter
+	ProxyIO        metric.Int64Counter
+	conns          metric.Int64UpDownCounter
+	duration       metric.Int64Histogram
+	sessionGoodput metric.Float64Histogram
 
 	countryLookup  geo.CountryLookup
 	countryLookupC chan countryLookupRequest
 }
 
 var metrics = &metricsManager{
-	ProxyIO:       &noop.Int64Counter{},
-	conns:         &noop.Int64UpDownCounter{},
-	duration:      &noop.Int64Histogram{},
-	countryLookup: geo.NoLookup{},
+	ProxyIO:        &noop.Int64Counter{},
+	conns:          &noop.Int64UpDownCounter{},
+	duration:       &noop.Int64Histogram{},
+	sessionGoodput: &noop.Float64Histogram{},
+	countryLookup:  geo.NoLookup{},
 }
 
 func SetupMetricsManager(countryLookup geo.CountryLookup) {
@@ -53,6 +55,17 @@ func SetupMetricsManager(countryLookup geo.CountryLookup) {
 	duration, err := meter.Int64Histogram("sing.connection_duration", metric.WithDescription("Connection duration"))
 	if err == nil {
 		metrics.duration = duration
+	}
+	// Track per-session download goodput (received bytes / connection seconds),
+	// recorded once at close for sessions that moved at least goodputMinBytes.
+	// Sliceable by track (resource attr) × cloud.region (resource attr) ×
+	// geo.country.iso_code (point attr) so the bandit experiment evaluator can
+	// compare a challenger track's median goodput against the incumbent's.
+	goodput, err := meter.Float64Histogram("proxy.session.goodput",
+		metric.WithUnit("By/s"),
+		metric.WithDescription("Per-session download goodput: received bytes / connection seconds"))
+	if err == nil {
+		metrics.sessionGoodput = goodput
 	}
 
 	if countryLookup != nil {
