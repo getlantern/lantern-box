@@ -144,7 +144,13 @@ func (t *MetricsTracker) recordGoodput(rxBytes, durationMs int64, attrs *attribu
 		return
 	}
 	goodput := float64(rxBytes) / (float64(durationMs) / 1000.0)
-	a := append(attrs.AsSlice(), semconv.NetworkIODirectionKey.String(string(rx)))
+	// Copy into a slice sized for the extra element rather than appending onto
+	// AsSlice()'s result in place, so we never share a backing array with a
+	// concurrent reporter.
+	base := attrs.AsSlice()
+	a := make([]attribute.KeyValue, 0, len(base)+1)
+	a = append(a, base...)
+	a = append(a, semconv.NetworkIODirectionKey.String(string(rx)))
 	metrics.sessionGoodput.Record(context.Background(), goodput, metric.WithAttributes(a...))
 }
 

@@ -239,6 +239,7 @@ func TestSessionGoodput(t *testing.T) {
 
 		client, server := net.Pipe()
 		defer client.Close()
+		defer server.Close()
 		serverTracked := mt.RoutedConnection(ctx, server, adapter.InboundContext{}, nil, nil)
 
 		const n = 1_100_000 // above the 1MB goodput threshold
@@ -296,6 +297,7 @@ func TestSessionGoodputBelowThreshold(t *testing.T) {
 
 		client, server := net.Pipe()
 		defer client.Close()
+		defer server.Close()
 		serverTracked := mt.RoutedConnection(ctx, server, adapter.InboundContext{}, nil, nil)
 
 		small := []byte("only a few bytes, well under the threshold")
