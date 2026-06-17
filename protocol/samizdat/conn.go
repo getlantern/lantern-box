@@ -5,6 +5,7 @@ import (
 
 	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/bufio/deadline"
+	N "github.com/sagernet/sing/common/network"
 )
 
 // wrapConn normalizes HTTP/2 read errors on a samizdat stream conn.
@@ -21,9 +22,10 @@ import (
 //
 // wrapConn is deliberately opaque: it does not expose Upstream(), so sing-box
 // cannot unwrap past it and read the underlying conn directly, which would
-// bypass the normalization. The cost of that opacity is the
-// NeedAdditionalReadDeadline hint sing-box would otherwise discover through the
-// Upstream() chain, so it is forwarded explicitly.
+// bypass the normalization. The cost of that opacity is that capabilities
+// sing-box would otherwise discover through the Upstream() chain must be
+// forwarded explicitly: the NeedAdditionalReadDeadline hint and TCP half-close
+// (CloseWrite), below.
 type wrapConn struct {
 	net.Conn
 }
@@ -35,4 +37,13 @@ func (c *wrapConn) Read(b []byte) (int, error) {
 
 func (c *wrapConn) NeedAdditionalReadDeadline() bool {
 	return deadline.NeedAdditionalReadDeadline(c.Conn)
+}
+
+// CloseWrite forwards TCP half-close to the underlying samizdat stream conn,
+// which maps it to an HTTP/2 END_STREAM (request side closed, response side
+// kept open). Without it, wrapConn hides the stream's CloseWrite (Upstream is
+// blocked above) and the sing-box relay silently downgrades half-close to a
+// full close.
+func (c *wrapConn) CloseWrite() error {
+	return N.CloseWrite(c.Conn)
 }
