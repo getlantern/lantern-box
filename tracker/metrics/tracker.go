@@ -134,7 +134,7 @@ func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
 }
 
 // recordGoodput records a session's download goodput (received bytes per
-// connection second) at close, for sessions that moved at least
+// second of connection lifetime) at close, for sessions that moved at least
 // goodputMinBytes. durationMs is the connection's open time; it includes idle
 // periods, so this is a floor on true transfer speed — but both arms of a
 // bandit experiment are measured identically, so it's a fair relative signal,
