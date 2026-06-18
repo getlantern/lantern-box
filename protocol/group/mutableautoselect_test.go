@@ -182,6 +182,46 @@ func TestLocalHistory_FailureDoesNotClearLastSuccessDelay(t *testing.T) {
 	assert.Equal(t, uint32(1), consec, "consecutive failures bump")
 }
 
+func TestToTagHistory_HardDemoted(t *testing.T) {
+	p := defaultHistoryParams()
+	now := time.Now()
+
+	assert.False(t, newLocalHistory().toTagHistory(now, p).HardDemoted,
+		"fresh history is not hard demoted")
+
+	// Failures are injected in the recent past so the snapshot's updatedAt
+	// (now) is >= every recorded outcome, as it is in real usage where a
+	// mutation and its persisted snapshot share one timestamp.
+
+	// Consecutive probe failures at the limit are hard even alongside a
+	// healthy prior success delay: toTagHistory zeroes selfMs/bestAltMs,
+	// so the switch-penalty boost can never rescue the persisted tier.
+	consecHard := newLocalHistory()
+	consecHard.recordProbeSuccess(10, now.Add(-time.Hour))
+	for i := uint32(0); i < p.consecutiveFailLimit; i++ {
+		consecHard.recordProbeFailure(now.Add(-time.Duration(i) * time.Second))
+	}
+	got := consecHard.toTagHistory(now, p)
+	assert.True(t, got.HardDemoted, "consecutive failures at limit are hard demoted")
+	assert.Equal(t, uint32(10), got.LastSuccessDelayMs, "a fast prior success must not clear the tier")
+
+	// User-traffic failures past the soft limit but below the hard limit
+	// are not hard demoted.
+	soft := newLocalHistory()
+	for i := uint32(0); i < p.softFailLimit; i++ {
+		soft.addUserFailure(now.Add(-time.Duration(i)*time.Second), p.userFailureWindow, 0)
+	}
+	assert.False(t, soft.toTagHistory(now, p).HardDemoted,
+		"user failures below the hard limit are not hard demoted")
+
+	userHard := newLocalHistory()
+	for i := uint32(0); i < p.consecutiveFailLimit; i++ {
+		userHard.addUserFailure(now.Add(-time.Duration(i)*time.Second), p.userFailureWindow, 0)
+	}
+	assert.True(t, userHard.toTagHistory(now, p).HardDemoted,
+		"user failures at the hard limit are hard demoted")
+}
+
 func TestLocalHistory_UserFailuresIndependentOfProbeOutcomes(t *testing.T) {
 	// A probe success must not clear user failures: probe and user
 	// destinations live behind different classifiers, and a censor that
