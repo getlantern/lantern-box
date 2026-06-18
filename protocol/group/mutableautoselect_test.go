@@ -189,13 +189,17 @@ func TestToTagHistory_HardDemoted(t *testing.T) {
 	assert.False(t, newLocalHistory().toTagHistory(now, p).HardDemoted,
 		"fresh history is not hard demoted")
 
+	// Failures are injected in the recent past so the snapshot's updatedAt
+	// (now) is >= every recorded outcome, as it is in real usage where a
+	// mutation and its persisted snapshot share one timestamp.
+
 	// Consecutive probe failures at the limit are hard even alongside a
 	// healthy prior success delay: toTagHistory zeroes selfMs/bestAltMs,
 	// so the switch-penalty boost can never rescue the persisted tier.
 	consecHard := newLocalHistory()
-	consecHard.recordProbeSuccess(10, now)
+	consecHard.recordProbeSuccess(10, now.Add(-time.Hour))
 	for i := uint32(0); i < p.consecutiveFailLimit; i++ {
-		consecHard.recordProbeFailure(now.Add(time.Duration(i) * time.Second))
+		consecHard.recordProbeFailure(now.Add(-time.Duration(i) * time.Second))
 	}
 	got := consecHard.toTagHistory(now, p)
 	assert.True(t, got.HardDemoted, "consecutive failures at limit are hard demoted")
@@ -205,14 +209,14 @@ func TestToTagHistory_HardDemoted(t *testing.T) {
 	// are not hard demoted.
 	soft := newLocalHistory()
 	for i := uint32(0); i < p.softFailLimit; i++ {
-		soft.addUserFailure(now.Add(time.Duration(i)*time.Second), p.userFailureWindow, 0)
+		soft.addUserFailure(now.Add(-time.Duration(i)*time.Second), p.userFailureWindow, 0)
 	}
 	assert.False(t, soft.toTagHistory(now, p).HardDemoted,
 		"user failures below the hard limit are not hard demoted")
 
 	userHard := newLocalHistory()
 	for i := uint32(0); i < p.consecutiveFailLimit; i++ {
-		userHard.addUserFailure(now.Add(time.Duration(i)*time.Second), p.userFailureWindow, 0)
+		userHard.addUserFailure(now.Add(-time.Duration(i)*time.Second), p.userFailureWindow, 0)
 	}
 	assert.True(t, userHard.toTagHistory(now, p).HardDemoted,
 		"user failures at the hard limit are hard demoted")
