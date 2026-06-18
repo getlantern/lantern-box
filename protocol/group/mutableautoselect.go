@@ -952,7 +952,7 @@ func (s *MutableAutoSelect) mutateHistory(tag string, fn func(*localHistory, tim
 		return false
 	}
 	if s.history != nil {
-		s.history.Store(tag, h.toTagHistory(now, s.hist.userFailureWindow))
+		s.history.Store(tag, h.toTagHistory(now, s.hist))
 	}
 	return true
 }

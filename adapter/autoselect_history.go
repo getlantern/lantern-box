@@ -29,7 +29,10 @@ type TagHistory struct {
 	// never enter this window; entries age out naturally on the next
 	// mutation older than the group's userFailureWindow.
 	UserFailures []time.Time `json:"user_failures,omitempty"`
-	UpdatedAt    time.Time   `json:"updated_at"`
+	// HardDemoted reports whether the member has reached the hard-demote
+	// tier from its own recorded probe and user-traffic failures.
+	HardDemoted bool      `json:"hard_demoted,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // AutoSelectHistoryStorage is the store the MutableAutoSelect group
