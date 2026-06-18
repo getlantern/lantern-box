@@ -30,6 +30,8 @@ func init() {
 	runCmd.Flags().String("config", "config.json", "Configuration file path")
 	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz", "URL for downloading GeoLite2-City database")
 	runCmd.Flags().String("city-database-name", "GeoLite2-City.mmdb", "Filename for storing GeoLite2-City database")
+	runCmd.Flags().String("geo-asn-url", "", "URL for downloading GeoLite2-ASN database (enables client.asn metric label)")
+	runCmd.Flags().String("asn-database-name", "GeoLite2-ASN.mmdb", "Filename for storing GeoLite2-ASN database")
 	runCmd.Flags().String("datacap-url", "", "Datacap server URL")
 	runCmd.Flags().String("proxy-info", "", "Path to proxy info INI file")
 }

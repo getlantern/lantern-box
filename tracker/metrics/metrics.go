@@ -15,11 +15,19 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 )
 
-const countryLookupWorkers = 4
+const (
+	countryLookupWorkers = 4
+	asnLookupWorkers     = 4
+)
 
 type countryLookupRequest struct {
 	ip      net.IP
 	country *atomic.Value
+}
+
+type asnLookupRequest struct {
+	ip  net.IP
+	asn *atomic.Value
 }
 
 type metricsManager struct {
@@ -30,6 +38,9 @@ type metricsManager struct {
 
 	countryLookup  geo.CountryLookup
 	countryLookupC chan countryLookupRequest
+
+	asnLookup  geo.ISPLookup
+	asnLookupC chan asnLookupRequest
 }
 
 var metrics = &metricsManager{
@@ -39,7 +50,7 @@ var metrics = &metricsManager{
 	countryLookup: geo.NoLookup{},
 }
 
-func SetupMetricsManager(countryLookup geo.CountryLookup) {
+func SetupMetricsManager(countryLookup geo.CountryLookup, asnLookup geo.ISPLookup) {
 	meter := otel.GetMeterProvider().Meter("lantern-box")
 	if pIO, err := meter.Int64Counter("proxy.io", metric.WithUnit("bytes")); err == nil {
 		metrics.ProxyIO = pIO
@@ -65,11 +76,27 @@ func SetupMetricsManager(countryLookup geo.CountryLookup) {
 		}
 	}
 
+	if asnLookup != nil {
+		metrics.asnLookup = asnLookup
+	}
+	if _, ok := asnLookup.(geo.NoLookup); !ok && asnLookup != nil {
+		metrics.asnLookupC = make(chan asnLookupRequest, 256)
+		for range asnLookupWorkers {
+			go asnLookupWorker(metrics.asnLookupC, metrics.asnLookup)
+		}
+	}
+
 	metrics.meter = meter
 }
 
 func countryLookupWorker(ch <-chan countryLookupRequest, lookup geo.CountryLookup) {
 	for req := range ch {
 		req.country.Store(lookup.CountryCode(req.ip))
+	}
+}
+
+func asnLookupWorker(ch <-chan asnLookupRequest, lookup geo.ISPLookup) {
+	for req := range ch {
+		req.asn.Store(lookup.ASN(req.ip))
 	}
 }

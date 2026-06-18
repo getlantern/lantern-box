@@ -130,6 +130,7 @@ func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
 type attributes struct {
 	attrs   []attribute.KeyValue
 	country atomic.Value // string
+	asn     atomic.Value // string
 	client  *clientcontext.ClientInfo
 }
 
@@ -137,6 +138,9 @@ func (a *attributes) AsSlice() []attribute.KeyValue {
 	s := append(a.attrs,
 		semconv.GeoCountryISOCodeKey.String(a.country.Load().(string)),
 	)
+	if asn := a.asn.Load().(string); asn != "" {
+		s = append(s, semconv.ClientAsnKey.String(asn))
+	}
 	if a.client != nil {
 		s = append(s,
 			semconv.ClientPlatformKey.String(a.client.Platform),
@@ -157,12 +161,17 @@ func metadataToAttributes(metadata adapter.InboundContext) *attributes {
 		},
 	}
 	attrs.country.Store(ccNa)
+	attrs.asn.Store("")
+	ip := metadata.Source.IPAddr().IP
 	if metrics.countryLookupC != nil {
 		select {
-		case metrics.countryLookupC <- countryLookupRequest{
-			ip:      metadata.Source.IPAddr().IP,
-			country: &attrs.country,
-		}:
+		case metrics.countryLookupC <- countryLookupRequest{ip: ip, country: &attrs.country}:
+		default:
+		}
+	}
+	if metrics.asnLookupC != nil {
+		select {
+		case metrics.asnLookupC <- asnLookupRequest{ip: ip, asn: &attrs.asn}:
 		default:
 		}
 	}

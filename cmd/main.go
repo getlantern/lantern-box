@@ -103,14 +103,27 @@ func preRun(cmd *cobra.Command, args []string) {
 
 	geoCityURL, _ := cmd.Flags().GetString("geo-city-url")
 	cityDatabaseName, _ := cmd.Flags().GetString("city-database-name")
+	var countryLookup geo.CountryLookup = geo.NoLookup{}
 	if geoCityURL != "" && cityDatabaseName != "" {
-		geolookup := geo.FromWeb(
+		countryLookup = geo.FromWeb(
 			geoCityURL, cityDatabaseName,
 			24*time.Hour, cityDatabaseName,
 			geo.CountryCode,
 		)
-		metrics.SetupMetricsManager(geolookup)
 	}
+
+	geoASNURL, _ := cmd.Flags().GetString("geo-asn-url")
+	asnDatabaseName, _ := cmd.Flags().GetString("asn-database-name")
+	var asnLookup geo.ISPLookup = geo.NoLookup{}
+	if geoASNURL != "" && asnDatabaseName != "" {
+		asnLookup = geo.FromWeb(
+			geoASNURL, asnDatabaseName,
+			24*time.Hour, asnDatabaseName,
+			geo.ASN,
+		)
+	}
+
+	metrics.SetupMetricsManager(countryLookup, asnLookup)
 	if otel.Enabled() {
 		log.Info("telemetry enabled")
 
