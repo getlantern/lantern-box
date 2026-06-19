@@ -20,6 +20,12 @@ const (
 	tx ioAttr = "transmit"
 
 	ccNa = "n/a"
+
+	// goodputMinBytes is the minimum received bytes a session must have moved
+	// before its goodput sample is recorded. Filters out idle/tiny connections
+	// whose bytes/duration is dominated by setup and idle time rather than
+	// actual transfer speed.
+	goodputMinBytes = 1_000_000
 )
 
 type ioAttr string
@@ -125,6 +131,27 @@ func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
 	a := attrs.AsSlice()
 	metrics.duration.Record(context.Background(), duration, metric.WithAttributes(a...))
 	metrics.conns.Add(context.Background(), -1, metric.WithAttributes(a...))
+}
+
+// recordGoodput records a session's download goodput (received bytes per
+// second of connection lifetime) at close, for sessions that moved at least
+// goodputMinBytes. durationMs is the connection's open time; it includes idle
+// periods, so this is a floor on true transfer speed — but both arms of a
+// bandit experiment are measured identically, so it's a fair relative signal,
+// and the byte floor filters the worst idle-dominated noise.
+func (t *MetricsTracker) recordGoodput(rxBytes, durationMs int64, attrs *attributes) {
+	if rxBytes < goodputMinBytes || durationMs <= 0 {
+		return
+	}
+	goodput := float64(rxBytes) / (float64(durationMs) / 1000.0)
+	// Copy into a slice sized for the extra element rather than appending onto
+	// AsSlice()'s result in place, so we never share a backing array with a
+	// concurrent reporter.
+	base := attrs.AsSlice()
+	a := make([]attribute.KeyValue, 0, len(base)+1)
+	a = append(a, base...)
+	a = append(a, semconv.NetworkIODirectionKey.String(string(rx)))
+	metrics.sessionGoodput.Record(context.Background(), goodput, metric.WithAttributes(a...))
 }
 
 type attributes struct {

@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing/common/buf"
@@ -14,6 +15,7 @@ type PacketConn struct {
 	attrs     *attributes
 	tracker   *MetricsTracker
 	startTime time.Time
+	rxBytes   atomic.Int64
 }
 
 // NewPacketConn creates a new PacketConn instance.
@@ -33,6 +35,7 @@ func (c *PacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, er
 		return dest, err
 	}
 	if buffer.Len() > 0 {
+		c.rxBytes.Add(int64(buffer.Len()))
 		c.tracker.TrackIO(rx, buffer.Len(), c.attrs)
 	}
 	return dest, nil
@@ -50,6 +53,7 @@ func (c *PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) er
 func (c *PacketConn) Close() error {
 	duration := time.Since(c.startTime).Milliseconds()
 	c.tracker.Leave(duration, c.attrs)
+	c.tracker.recordGoodput(c.rxBytes.Load(), duration, c.attrs)
 	return c.PacketConn.Close()
 }
 

@@ -134,14 +134,19 @@ func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay 
 // toTagHistory snapshots the localHistory into adapter.TagHistory form.
 // updatedAt is a parameter so a single mutation call uses one
 // timestamp across the in-memory entry and the persisted snapshot.
-func (h *localHistory) toTagHistory(updatedAt time.Time, window time.Duration) *adapter.TagHistory {
+// HardDemoted is the intrinsic tier: selfMs/bestAltMs are zeroed so the
+// switch-penalty boost can't apply, classifying the member from its own
+// failure history alone.
+func (h *localHistory) toTagHistory(updatedAt time.Time, p historyParams) *adapter.TagHistory {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.userFailures = pruneUserFailures(h.userFailures, updatedAt, window)
+	h.userFailures = pruneUserFailures(h.userFailures, updatedAt, p.userFailureWindow)
+	hard, _, _ := demoted(h.consecutiveFailures, uint32(len(h.userFailures)), 0, 0, p)
 	out := &adapter.TagHistory{
 		LastSuccessDelayMs:  h.lastSuccessDelayMs,
 		LastOutcomeAt:       h.lastOutcomeAt,
 		ConsecutiveFailures: h.consecutiveFailures,
+		HardDemoted:         hard,
 		UpdatedAt:           updatedAt,
 	}
 	if len(h.userFailures) > 0 {

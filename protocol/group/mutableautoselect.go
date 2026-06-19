@@ -68,6 +68,13 @@ type MutableAutoSelect struct {
 	hist         historyParams
 	history      adapter.AutoSelectHistoryStorage
 
+	// Scratch buffers reused across calls by rankLocked and splitHealthyForLocked
+	// to avoid per-dial allocation; guarded by access, which their callers hold
+	// while consuming the returned slice before releasing it.
+	scratchPres   []preCandidate
+	scratchRanked []rankedCandidate
+	scratchSplit  []rankedCandidate
+
 	// Last dial-time tag per network, for switch-tolerance hysteresis.
 	// atomic.Value (not access-guarded) so Now() can read without taking
 	// the access lock. A stale tag is harmless: the in-pool check in
@@ -346,7 +353,7 @@ func (s *MutableAutoSelect) Remove(tags ...string) (n int, err error) {
 		n++
 	}
 	if n > 0 {
-		// Preserve registration order; rank() ties on first-seen in s.tags.
+		// Preserve registration order; rankLocked() ties on first-seen in s.tags.
 		filtered := s.tags[:0]
 		for _, tag := range s.tags {
 			if _, gone := removed[tag]; gone {
@@ -458,7 +465,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		return s.wrapStream(conn, o), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	// Attribute the failure to the outer (member) tag so rank and
+	// Attribute the failure to the outer (member) tag so rankLocked and
 	// runLadder's gating both see it. For nested groups, the inner tag
 	// isn't a member of this group, so recordUserFailure would drop on
 	// the member gate.
@@ -568,13 +575,13 @@ func (s *MutableAutoSelect) selectForExcluding(network, excludeTag string) (A.Ou
 		return nil, fmt.Errorf("network %s not supported", network)
 	}
 	s.access.Lock()
-	ranked := s.rank(time.Now(), time.Time{})
+	ranked := s.rankLocked(time.Now(), time.Time{})
 	if excludeTag != "" {
 		ranked = slices.DeleteFunc(ranked, func(c rankedCandidate) bool {
 			return c.tag == excludeTag
 		})
 	}
-	pool := splitHealthyFor(ranked, network)
+	pool := s.splitHealthyForLocked(ranked, network)
 	if len(pool) == 0 {
 		s.access.Unlock()
 		if excludeTag == "" {
@@ -693,7 +700,7 @@ func (s *MutableAutoSelect) collectProbeJobsLocked() []probeJob {
 }
 
 // candidateKind classifies confidence in a candidate's delay measurement.
-// Ordering is load-bearing: rank's sort treats the integer value as the
+// Ordering is load-bearing: rankLocked's sort treats the integer value as the
 // tie-break key, so real-seeded must come first and substituted last.
 type candidateKind uint8
 
@@ -704,7 +711,7 @@ const (
 )
 
 // demoteLevel ranks how cautious selection should be about a candidate.
-// Ordering is load-bearing: rank sorts on the integer value, so
+// Ordering is load-bearing: rankLocked sorts on the integer value, so
 // demoteClean must compare < demoteSoft < demoteHard for the tiers to
 // land in the right order.
 type demoteLevel uint8
@@ -723,49 +730,61 @@ type rankedCandidate struct {
 	kind     candidateKind
 }
 
-// splitHealthyFor restricts ranked to candidates supporting network,
+// splitHealthyForLocked restricts ranked to candidates supporting network,
 // then returns the cleanest non-empty subset: clean if any exist, else
 // soft-demoted, else the network-filtered slice (hard-demoted as last
 // resort). Per-network so a soft-only UDP candidate isn't drowned out
 // by a clean TCP-only peer.
-func splitHealthyFor(ranked []rankedCandidate, network string) []rankedCandidate {
-	var filtered, clean, soft []rankedCandidate
+//
+// ranked must be demote-sorted ascending (clean < soft < hard), as rankLocked returns it,
+// so each tier is contiguous. Requires access held: the result aliases s.scratchSplit
+// until the caller releases the lock.
+func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, network string) []rankedCandidate {
+	clear(s.scratchSplit)
+	out := s.scratchSplit[:0]
+	var nClean, nSoft int
 	for _, c := range ranked {
 		if !slices.Contains(c.outbound.Network(), network) {
 			continue
 		}
-		filtered = append(filtered, c)
+		out = append(out, c)
 		switch c.demote {
 		case demoteClean:
-			clean = append(clean, c)
+			nClean++
 		case demoteSoft:
-			soft = append(soft, c)
+			nSoft++
 		}
 	}
-	if len(clean) > 0 {
-		return clean
+	s.scratchSplit = out
+	switch {
+	case nClean > 0:
+		return out[:nClean]
+	case nSoft > 0:
+		return out[nClean : nClean+nSoft]
+	default:
+		return out
 	}
-	if len(soft) > 0 {
-		return soft
-	}
-	return filtered
 }
 
-// rank builds the candidate set for selection. A non-zero freshSince
+// preCandidate holds a member's pre-demotion state while rankLocked assembles
+// the candidate set.
+type preCandidate struct {
+	o         A.Outbound
+	tag       string
+	delayMs   uint32
+	kind      candidateKind
+	consec    uint32
+	userFails uint32
+}
+
+// rankLocked builds the candidate set for selection. A non-zero freshSince
 // restricts to members with a recorded outcome at or after freshSince
 // and drops those without a fresh success (lastSuccessDelayMs==0); the
 // probe-cycle ranker uses this so the "is there a winner this cycle?"
 // check can't see stale outcomes. Caller must hold s.access.
-func (s *MutableAutoSelect) rank(now time.Time, freshSince time.Time) []rankedCandidate {
-	type pre struct {
-		o         A.Outbound
-		tag       string
-		delayMs   uint32
-		kind      candidateKind
-		consec    uint32
-		userFails uint32
-	}
-	pres := make([]pre, 0, len(s.tags))
+func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []rankedCandidate {
+	clear(s.scratchPres)
+	pres := s.scratchPres[:0]
 	for _, tag := range s.tags {
 		o, ok := s.members.Load(tag)
 		if !ok {
@@ -819,8 +838,9 @@ func (s *MutableAutoSelect) rank(now time.Time, freshSince time.Time) []rankedCa
 		default:
 			delay, kind = rawDelay, kindRealSeeded
 		}
-		pres = append(pres, pre{o: o, tag: tag, delayMs: delay, kind: kind, consec: consec, userFails: userFails})
+		pres = append(pres, preCandidate{o: o, tag: tag, delayMs: delay, kind: kind, consec: consec, userFails: userFails})
 	}
+	s.scratchPres = pres
 
 	// Switch-penalty awareness: when deciding whether to hard-demote a
 	// candidate, demoted() needs to see the best alternative's delay so
@@ -842,7 +862,8 @@ func (s *MutableAutoSelect) rank(now time.Time, freshSince time.Time) []rankedCa
 		}
 	}
 
-	out := make([]rankedCandidate, 0, len(pres))
+	clear(s.scratchRanked)
+	out := s.scratchRanked[:0]
 	for _, p := range pres {
 		// Pass selfMs=0 for non-real-seeded candidates so the boost
 		// can't trigger off a synthetic delay. bestAlt for those is
@@ -865,6 +886,7 @@ func (s *MutableAutoSelect) rank(now time.Time, freshSince time.Time) []rankedCa
 		}
 		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, kind: p.kind, demote: level})
 	}
+	s.scratchRanked = out
 	sort.SliceStable(out, func(i, j int) bool {
 		a, b := out[i], out[j]
 		if a.demote != b.demote {
@@ -905,7 +927,7 @@ func (s *MutableAutoSelect) probeCycleInner(ctx context.Context, cycleStart time
 
 	s.access.Lock()
 	defer s.access.Unlock()
-	ranked := s.rank(time.Now(), cycleStart)
+	ranked := s.rankLocked(time.Now(), cycleStart)
 	if len(ranked) == 0 {
 		return nil
 	}
@@ -930,7 +952,7 @@ func (s *MutableAutoSelect) mutateHistory(tag string, fn func(*localHistory, tim
 		return false
 	}
 	if s.history != nil {
-		s.history.Store(tag, h.toTagHistory(now, s.hist.userFailureWindow))
+		s.history.Store(tag, h.toTagHistory(now, s.hist))
 	}
 	return true
 }
