@@ -381,6 +381,12 @@ func (o *Outbound) dialTCP(ctx context.Context, destination M.Socksaddr) (conn n
 		return nil, fmt.Errorf("WATER outbound is still loading, not ready to dial")
 	}
 
+	// The dial below detaches from ctx, so an already-canceled caller would
+	// otherwise pay for a full dial before the post-dial check notices.
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
+
 	cfg, err := o.dialConfig(ctx, destination)
 	if err != nil {
 		o.logger.ErrorContext(ctx, "failed to build WATER dial config", slog.Any("error", err), slog.String("destination", destination.String()))
@@ -396,9 +402,10 @@ func (o *Outbound) dialTCP(ctx context.Context, destination M.Socksaddr) (conn n
 		return nil, err
 	}
 	// The detached dial ignores caller cancellation, so honor it here: tear down
-	// the freshly built conn (and its instance) instead of leaking it.
+	// the freshly built conn (and its instance) instead of leaking it. WATER's
+	// Close can block, so dispatch it off the cancellation path.
 	if cerr := ctx.Err(); cerr != nil {
-		rawConn.Close()
+		go rawConn.Close()
 		return nil, cerr
 	}
 	return &asyncCloseConn{Conn: waterTransport.NewWATERConnection(rawConn, destination, o.skipHandshake)}, nil
