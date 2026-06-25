@@ -22,16 +22,34 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 )
 
 const (
-	defaultPollIntervalMs   = 100
-	defaultMaxBodyBytes     = 64 * 1024
+	defaultPollIntervalMs = 100
+	// defaultMaxBodyBytes is the per-poll body cap. Throughput is bytes-per-poll
+	// ÷ round-trip-time; each poll is a full HTTPS request through the front, so
+	// the RTT (not the poll interval) paces them. 256 KiB keeps a healthy stream
+	// moving without making a single lost/retried poll expensive to replay.
+	defaultMaxBodyBytes = 256 * 1024
+	// legacyMaxBodyBytes is the response cap the server applies to clients that
+	// don't advertise X-Meek-Max-Body — i.e. pre-negotiation clients that read
+	// at most 64 KiB. Keeps old clients from truncating a larger response.
+	legacyMaxBodyBytes      = 64 * 1024
 	defaultSessionIDLen     = 16
 	defaultReadTimeout      = 30 * time.Second
 	defaultMaxWriteBufBytes = 1 << 20 // 1 MiB
+	// defaultMaxPollRetries is how many times a failed poll is retried before the
+	// session is torn down. Retries are safe because each poll carries a
+	// monotonic X-Meek-Seq the server dedupes (it replays the buffered response
+	// for a repeated seq), so a lost request or lost response can't dup or drop
+	// bytes — see roundtrip / the server's seq handling.
+	defaultMaxPollRetries = 4
+	retryBaseBackoff      = 250 * time.Millisecond
+	headerSeq             = "X-Meek-Seq"
+	headerMaxBody         = "X-Meek-Max-Body"
 )
 
 // Config is the runtime configuration for a meek Conn.
@@ -49,6 +67,10 @@ type Config struct {
 	// it, so a sender outpacing a slow front applies backpressure
 	// instead of growing memory without bound.
 	MaxWriteBufBytes int
+	// MaxPollRetries is how many times a failed poll is retried (with backoff)
+	// before the session is torn down. <=0 uses defaultMaxPollRetries. Retries
+	// are made safe by the per-poll X-Meek-Seq the server dedupes.
+	MaxPollRetries int
 }
 
 func (c *Config) applyDefaults() {
@@ -66,6 +88,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxWriteBufBytes <= 0 {
 		c.MaxWriteBufBytes = defaultMaxWriteBufBytes
+	}
+	if c.MaxPollRetries <= 0 {
+		c.MaxPollRetries = defaultMaxPollRetries
 	}
 }
 
@@ -86,6 +111,15 @@ type Conn struct {
 
 	readBuf  bytes.Buffer
 	readCond *sync.Cond
+
+	// seq is the monotonic sequence number of the next poll; the server dedupes
+	// on it so a retried poll replays rather than re-applies. inflight is the
+	// chunk taken for the current seq, held until the poll succeeds so a retry
+	// resends the same bytes; inflightTaken distinguishes "not yet taken" from
+	// "taken, empty" (an empty poll still has a seq).
+	seq           uint64
+	inflight      []byte
+	inflightTaken bool
 
 	closed   bool
 	closeErr error
@@ -302,16 +336,48 @@ func (c *Conn) pollLoop() {
 		case <-c.writeReady:
 		}
 
-		if err := c.roundtrip(); err != nil {
+		if err := c.roundtripWithRetry(); err != nil {
 			c.markClosed(err)
 			return
 		}
 	}
 }
 
+// roundtripWithRetry retries a failed poll up to MaxPollRetries with linear
+// backoff. Safe because the poll keeps the same seq + in-flight chunk across
+// attempts: the server replays the buffered response for a repeated seq (no dup
+// upstream, no dropped downstream). Aborts promptly if the conn is cancelled.
+func (c *Conn) roundtripWithRetry() error {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(time.Duration(attempt) * retryBaseBackoff)
+			select {
+			case <-c.ctx.Done():
+				timer.Stop()
+				return c.ctx.Err()
+			case <-timer.C:
+			}
+		}
+		if err := c.roundtrip(); err != nil {
+			lastErr = err
+			if attempt >= c.cfg.MaxPollRetries {
+				return fmt.Errorf("poll failed after %d retries: %w", c.cfg.MaxPollRetries, lastErr)
+			}
+			continue
+		}
+		return nil
+	}
+}
+
 func (c *Conn) roundtrip() error {
 	c.mu.Lock()
-	bodyBytes := c.takeWriteChunkLocked()
+	if !c.inflightTaken {
+		c.inflight = c.takeWriteChunkLocked() // may be nil for an empty (poll-only) request
+		c.inflightTaken = true
+	}
+	bodyBytes := c.inflight
+	seq := c.seq
 	c.mu.Unlock()
 
 	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, c.cfg.URL, bytes.NewReader(bodyBytes))
@@ -331,6 +397,10 @@ func (c *Conn) roundtrip() error {
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Session-Id", c.sessionID)
+	req.Header.Set(headerSeq, strconv.FormatUint(seq, 10))
+	// Advertise how large a response we can read, so the server can send bigger
+	// chunks without truncating older clients (which omit this header).
+	req.Header.Set(headerMaxBody, strconv.Itoa(c.cfg.MaxBodyBytes))
 
 	resp, err := c.cfg.HTTPClient.Do(req)
 	if err != nil {
@@ -347,12 +417,17 @@ func (c *Conn) roundtrip() error {
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}
+	// The poll succeeded: commit the response, release the in-flight chunk, and
+	// advance the seq so the next poll is a fresh one.
+	c.mu.Lock()
 	if len(buf) > 0 {
-		c.mu.Lock()
 		c.readBuf.Write(buf)
 		c.readCond.Broadcast()
-		c.mu.Unlock()
 	}
+	c.inflight = nil
+	c.inflightTaken = false
+	c.seq++
+	c.mu.Unlock()
 	return nil
 }
 
@@ -387,7 +462,7 @@ func (c *Conn) markClosed(err error) {
 // owns and config must not override.
 func isReservedHeader(name string) bool {
 	switch http.CanonicalHeaderKey(name) {
-	case "Host", "Content-Type", "X-Session-Id":
+	case "Host", "Content-Type", "X-Session-Id", headerSeq, headerMaxBody:
 		return true
 	default:
 		return false

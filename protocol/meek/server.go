@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -54,7 +55,7 @@ type ServerConfig struct {
 
 func (c *ServerConfig) defaults() {
 	if c.MaxBodyBytes <= 0 {
-		c.MaxBodyBytes = 64 * 1024
+		c.MaxBodyBytes = defaultMaxBodyBytes
 	}
 	if c.ResponseHoldoff <= 0 {
 		c.ResponseHoldoff = 50 * time.Millisecond
@@ -159,16 +160,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(body) > 0 {
-		if err := sess.writeUpstream(body); err != nil {
-			s.cfg.Logger.Debug("meek server: upstream write failed; closing session", slog.String("sid", sid), slog.Any("error", err))
-			s.dropSession(sid)
-			http.Error(w, "upstream write", http.StatusBadGateway)
-			return
+	// Response cap: honor the client's advertised read size (X-Meek-Max-Body),
+	// bounded by our own limit. Clients that don't advertise are pre-negotiation
+	// and read at most legacyMaxBodyBytes — never send them more, or they truncate.
+	respCap := s.cfg.MaxBodyBytes
+	if adv := parseMaxBody(r.Header.Get(headerMaxBody)); adv > 0 {
+		if adv < respCap {
+			respCap = adv
 		}
+	} else if respCap > legacyMaxBodyBytes {
+		respCap = legacyMaxBodyBytes
 	}
 
-	downstream := sess.takeDownstream(s.cfg.MaxBodyBytes, s.cfg.ResponseHoldoff)
+	seq, hasSeq := parseSeq(r.Header.Get(headerSeq))
+	downstream, err := sess.serveRequest(hasSeq, seq, body, respCap, s.cfg.ResponseHoldoff)
+	if err != nil {
+		s.cfg.Logger.Debug("meek server: upstream write failed; closing session", slog.String("sid", sid), slog.Any("error", err))
+		s.dropSession(sid)
+		http.Error(w, "upstream write", http.StatusBadGateway)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(downstream)))
@@ -176,6 +187,30 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(downstream) > 0 {
 		_, _ = w.Write(downstream)
 	}
+}
+
+// parseSeq parses an X-Meek-Seq header; ok is false when absent/invalid (legacy
+// client — no dedupe). parseMaxBody parses X-Meek-Max-Body; 0 when absent.
+func parseSeq(s string) (uint64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+func parseMaxBody(s string) int {
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 0 {
+		return 0
+	}
+	return v
 }
 
 func (s *Server) getOrCreateSession(sid string) (*session, bool, error) {
@@ -271,6 +306,15 @@ type session struct {
 	// drainCond wakes a readPump paused because pending is at cap, when
 	// takeLocked frees space or the session closes.
 	drainCond *sync.Cond
+
+	// reqMu serializes per-session request processing and guards the seq replay
+	// state below. Separate from mu (which guards pending/readPump) so holding it
+	// across writeUpstream+takeDownstream can't deadlock the read pump. lastResp
+	// is the response sent for lastSeq, replayed verbatim if that seq is retried.
+	reqMu    sync.Mutex
+	haveSeq  bool
+	lastSeq  uint64
+	lastResp []byte
 }
 
 func newSession(id string, upstream net.Conn) *session {
@@ -283,6 +327,40 @@ func newSession(id string, upstream net.Conn) *session {
 	}
 	s.drainCond = sync.NewCond(&s.mu)
 	return s
+}
+
+// serveRequest applies a client poll to the session and returns the bytes to
+// send back. With a sequence number it is idempotent: a repeated seq replays the
+// buffered response without re-writing upstream or re-draining downstream, so a
+// client that retries a lost poll neither duplicates upstream bytes nor drops
+// downstream ones. Without a seq (pre-negotiation clients) every request is
+// processed fresh — unchanged legacy behavior. reqMu serializes per-session
+// requests so a retry that races the original simply waits and then replays.
+func (s *session) serveRequest(hasSeq bool, seq uint64, body []byte, respCap int, holdoff time.Duration) ([]byte, error) {
+	if !hasSeq {
+		if len(body) > 0 {
+			if err := s.writeUpstream(body); err != nil {
+				return nil, err
+			}
+		}
+		return s.takeDownstream(respCap, holdoff), nil
+	}
+
+	s.reqMu.Lock()
+	defer s.reqMu.Unlock()
+	if s.haveSeq && seq == s.lastSeq {
+		return s.lastResp, nil // retry of the last poll — replay its response
+	}
+	if len(body) > 0 {
+		if err := s.writeUpstream(body); err != nil {
+			return nil, err
+		}
+	}
+	resp := s.takeDownstream(respCap, holdoff)
+	s.haveSeq = true
+	s.lastSeq = seq
+	s.lastResp = resp
+	return resp, nil
 }
 
 func (s *session) lastSeen() time.Time {
