@@ -388,7 +388,12 @@ func (c *Conn) roundtrip() error {
 	seq := c.seq
 	c.mu.Unlock()
 
-	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, c.cfg.URL, bytes.NewReader(bodyBytes))
+	// Bound each poll by ReadTimeout so one hung request can't block the poll loop
+	// forever when the caller's HTTPClient has no timeout of its own. Cancel runs
+	// after the response body is fully read below (deferred LIFO, after Body.Close).
+	reqCtx, cancel := context.WithTimeout(c.ctx, c.cfg.ReadTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.cfg.URL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}

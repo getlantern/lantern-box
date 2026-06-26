@@ -6,7 +6,7 @@ internet via the upstream proxy.
 
 ## Reference deployment (verified 2026-05-23)
 
-```
+```text
                             outer SNI = a248.e.akamai.net  (or any Akamai-fronted host)
                             inner Host = meek.dsa.akamai.getiantem.org
 client ──────HTTPS─────► Akamai DSA ──────HTTP/HTTPS─────► Linode :443
@@ -73,7 +73,7 @@ while the script was building the next request.
 
 ### What a successful run looks like
 
-```
+```console
 ✅ End-to-end SUCCESS: "origin": "139.162.181.47"
 The request traversed: curl → Akamai → Caddy → meek-server → microsocks → httpbin.org
 ```

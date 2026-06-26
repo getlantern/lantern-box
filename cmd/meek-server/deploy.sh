@@ -28,7 +28,10 @@ REMOTE_BIN="${MEEK_REMOTE_BIN:-/usr/local/bin/meek-server}"
 SERVICE="${MEEK_SERVICE:-meek-server}"
 RESTART_CMD="${MEEK_RESTART_CMD:-systemctl restart $SERVICE}"
 STATUS_CMD="${MEEK_STATUS_CMD:-systemctl is-active $SERVICE}"
-HEALTHZ_URL="${MEEK_HEALTHZ_URL:-https://meek.getiantem.org/healthz}"
+# No default: a fixed prod URL here would verify (and gate rollback on) the wrong
+# host for staging/canary deploys. Unset → the HTTP health check is skipped and we
+# rely on the service-status check after restart.
+HEALTHZ_URL="${MEEK_HEALTHZ_URL:-}"
 
 DRY_RUN=0
 case "${1:-}" in
@@ -105,21 +108,26 @@ sleep 2
 echo -n "service: "; $STATUS_CMD || true
 REMOTE
 
-say "verify /healthz"
-ok=0
-for _ in $(seq 1 10); do
-  if curl -fsS --max-time 10 "$HEALTHZ_URL" 2>/dev/null | grep -q "ok"; then ok=1; break; fi
-  sleep 2
-done
-if [ "$ok" != 1 ]; then
-  echo "healthz did not return ok — ROLLING BACK to $BAK" >&2
-  ssh_h bash -s <<REMOTE || true
+if [ -z "$HEALTHZ_URL" ]; then
+  say "verify /healthz (skipped — set MEEK_HEALTHZ_URL for an HTTP health gate)"
+  echo "relying on the post-restart service-status check above"
+else
+  say "verify /healthz"
+  ok=0
+  for _ in $(seq 1 10); do
+    if curl -fsS --max-time 10 "$HEALTHZ_URL" 2>/dev/null | grep -q "ok"; then ok=1; break; fi
+    sleep 2
+  done
+  if [ "$ok" != 1 ]; then
+    echo "healthz did not return ok — ROLLING BACK to $BAK" >&2
+    ssh_h bash -s <<REMOTE || true
 set -euo pipefail
 if [ -f "$BAK" ]; then install -m 0755 "$BAK" "$REMOTE_BIN"; $RESTART_CMD; echo "rolled back"; else echo "no backup present"; fi
 REMOTE
-  exit 1
+    exit 1
+  fi
+  echo "healthz ok"
 fi
-echo "healthz ok"
 
 say "end-to-end smoke test (best-effort)"
 if [ -x cmd/meek-server/smoketest/socks5.sh ]; then

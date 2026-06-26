@@ -80,9 +80,15 @@ func run() error {
 	})
 
 	httpServer := &http.Server{
-		Addr:              *listen,
-		Handler:           mux,
+		Addr:    *listen,
+		Handler: mux,
+		// Bound slow/abusive clients. Generous vs meek's poll model: each POST
+		// sends its body then gets a response within ResponseHoldoff, so these
+		// only kill genuinely-stuck connections, not normal polls.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	errCh := make(chan error, 1)

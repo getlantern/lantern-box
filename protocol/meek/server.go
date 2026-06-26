@@ -138,19 +138,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, isNew, err := s.getOrCreateSession(sid)
-	if err != nil {
-		s.cfg.Logger.Warn("meek server: upstream dial failed", slog.String("sid", sid), slog.Any("error", err))
-		http.Error(w, "upstream unreachable", http.StatusBadGateway)
-		return
-	}
-	if isNew {
-		s.cfg.Logger.Debug("meek server: new session", slog.String("sid", sid))
-	}
-
-	// Read one byte past the cap so an oversized POST is rejected rather
-	// than silently truncated: forwarding a truncated prefix upstream
-	// would corrupt the tunneled TCP stream with no error to the client.
+	// Read + size-check the body BEFORE creating/dialing a session, so malformed or
+	// oversized POSTs (e.g. spammed unique X-Session-Ids) can't open an upstream
+	// connection and leave a session alive until idle reap. Read one byte past the
+	// cap so an oversized POST is rejected rather than silently truncated (a
+	// truncated prefix forwarded upstream would corrupt the tunneled TCP stream).
 	body, err := io.ReadAll(io.LimitReader(r.Body, int64(s.cfg.MaxBodyBytes)+1))
 	if err != nil {
 		http.Error(w, "read body", http.StatusBadRequest)
@@ -159,6 +151,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(body) > s.cfg.MaxBodyBytes {
 		http.Error(w, "request body exceeds max_body_bytes", http.StatusRequestEntityTooLarge)
 		return
+	}
+
+	sess, isNew, err := s.getOrCreateSession(sid)
+	if err != nil {
+		s.cfg.Logger.Warn("meek server: upstream dial failed", slog.String("sid", sid), slog.Any("error", err))
+		http.Error(w, "upstream unreachable", http.StatusBadGateway)
+		return
+	}
+	if isNew {
+		s.cfg.Logger.Debug("meek server: new session", slog.String("sid", sid))
 	}
 
 	// Response cap: honor the client's advertised read size (X-Meek-Max-Body),

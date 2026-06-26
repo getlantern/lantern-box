@@ -12,6 +12,9 @@ set -euo pipefail
 
 FRONT_HOST="${FRONT_HOST:-a248.e.akamai.net}"
 INNER_HOST="${INNER_HOST:-meek.dsa.akamai.getiantem.org}"
+# Set to the server's -auth-token to smoke-test a hardened (authenticated)
+# deployment; unset for the open-relay/local-test default.
+AUTH_TOKEN="${MEEK_AUTH_TOKEN:-}"
 TARGET_HOST="httpbin.org"
 TARGET_PORT=80
 
@@ -44,6 +47,7 @@ meek_post() {
     -o "$out"
     -w "%{size_download}"
   )
+  [ -n "$AUTH_TOKEN" ] && args+=(-H "X-Meek-Auth: ${AUTH_TOKEN}")
   if [ -n "$data" ]; then
     args+=(--data-binary "@$data")
   else
@@ -52,11 +56,14 @@ meek_post() {
   curl "${args[@]}" "$POST_URL"
 }
 
-# Send <payload-file> then poll empty POSTs until at least <min-bytes> received,
-# concatenating each response chunk into <accum-file>.
-# usage: send_and_drain <payload-file> <accum-file> <min-bytes> <max-polls>
+# Send <payload-file> then poll empty POSTs, concatenating each response chunk into
+# <accum-file>, until <success-marker> appears (when given) or at least <min-bytes>
+# are received — whichever first. The meek server returns whatever upstream bytes
+# are ready per poll, so an HTTP response can span several polls; a marker stop
+# avoids exiting before the full response arrives (a fixed byte count can).
+# usage: send_and_drain <payload-file> <accum-file> <min-bytes> <max-polls> [success-marker]
 send_and_drain() {
-  local payload=$1 accum=$2 minb=$3 maxp=$4
+  local payload=$1 accum=$2 minb=$3 maxp=$4 marker=${5:-}
   : > "$accum"
   local tmp=$(mktemp)
   local sz
@@ -64,7 +71,11 @@ send_and_drain() {
   cat "$tmp" >> "$accum"
   local n=$(wc -c < "$accum")
   for i in $(seq 1 "$maxp"); do
-    [ "$n" -ge "$minb" ] && break
+    if [ -n "$marker" ]; then
+      grep -q "$marker" "$accum" && break
+    elif [ "$n" -ge "$minb" ]; then
+      break
+    fi
     sleep 0.3
     sz=$(meek_post "$tmp")
     cat "$tmp" >> "$accum"
@@ -116,7 +127,9 @@ echo "CONNECT succeeded"
 
 echo ""
 echo "--- Phase 3: HTTP GET /ip ---"
-n=$(send_and_drain ${WORKDIR}/p3-http.bin ${WORKDIR}/r3.bin 100 15)
+# Poll until the success marker arrives (the response can span multiple polls),
+# not a fixed byte count which could exit before "origin" is present.
+n=$(send_and_drain ${WORKDIR}/p3-http.bin ${WORKDIR}/r3.bin 1 30 '"origin"')
 echo "received ${n} bytes of HTTP response"
 
 echo ""
