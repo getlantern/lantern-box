@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"net"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,6 +12,7 @@ type Conn struct {
 	attrs     *attributes
 	tracker   *MetricsTracker
 	startTime time.Time
+	rxBytes   atomic.Int64
 }
 
 // NewConn creates a new Conn instance.
@@ -27,6 +29,7 @@ func NewConn(conn net.Conn, attrs *attributes, tracker *MetricsTracker) net.Conn
 func (c *Conn) Read(b []byte) (n int, err error) {
 	n, err = c.Conn.Read(b)
 	if n > 0 {
+		c.rxBytes.Add(int64(n))
 		c.tracker.TrackIO(rx, n, c.attrs)
 	}
 	return
@@ -45,6 +48,7 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 func (c *Conn) Close() error {
 	duration := time.Since(c.startTime).Milliseconds()
 	c.tracker.Leave(duration, c.attrs)
+	c.tracker.recordGoodput(c.rxBytes.Load(), duration, c.attrs)
 	return c.Conn.Close()
 }
 

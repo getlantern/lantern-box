@@ -42,7 +42,11 @@ type samizdatDialer struct {
 }
 
 func (d *samizdatDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	return d.client.DialContext(ctx, network, destination.String())
+	conn, err := d.client.DialContext(ctx, network, destination.String())
+	if err != nil {
+		return nil, err
+	}
+	return &wrapConn{Conn: conn}, nil
 }
 
 func (d *samizdatDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -108,7 +112,7 @@ func NewOutbound(
 		MaxJitterMs:         options.MaxJitterMs,
 		TCPFragmentation:    !options.DisableTCPFragmentation,
 		RecordFragmentation: !options.DisableRecordFragmentation,
-		MaxStreamsPerConn:    options.MaxStreamsPerConn,
+		MaxStreamsPerConn:   options.MaxStreamsPerConn,
 		IdleTimeout:         idleTimeout,
 		ConnectTimeout:      connectTimeout,
 		Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -149,7 +153,11 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		o.logger.InfoContext(ctx, "outbound connection to ", destination)
-		return o.client.DialContext(ctx, network, destination.String())
+		conn, err := o.client.DialContext(ctx, network, destination.String())
+		if err != nil {
+			return nil, err
+		}
+		return &wrapConn{Conn: conn}, nil
 	case N.NetworkUDP:
 		o.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
 		return o.uotClient.DialContext(ctx, network, destination)
@@ -166,11 +174,6 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return o.uotClient.ListenPacket(ctx, destination)
 }
 
-// Network returns the supported network types.
-func (o *Outbound) Network() []string {
-	return []string{N.NetworkTCP, N.NetworkUDP}
-}
-
 // Close shuts down the Samizdat client.
 func (o *Outbound) Close() error {
 	if o.client != nil {
@@ -178,4 +181,3 @@ func (o *Outbound) Close() error {
 	}
 	return nil
 }
-

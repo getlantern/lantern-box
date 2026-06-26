@@ -16,7 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/getlantern/lantern-box/constant"
-	"github.com/getlantern/lantern-box/internal/sync"
+	isync "github.com/getlantern/lantern-box/internal/sync"
 )
 
 func TestUpdateSelected(t *testing.T) {
@@ -31,7 +31,7 @@ func TestUpdateSelected(t *testing.T) {
 	}
 	testGroup := &urlTestGroup{
 		tags:                []string{},
-		outbounds:           sync.TypedMap[string, adapter.Outbound]{},
+		outbounds:           isync.TypedMap[string, adapter.Outbound]{},
 		tolerance:           50,
 		history:             urltest.NewHistoryStorage(),
 		selectedOutboundTCP: common.TypedValue[adapter.Outbound]{},
@@ -60,7 +60,7 @@ func TestUpdateSelected(t *testing.T) {
 func TestMarkFailedAndReselect_SwitchesToHealthyOutbound(t *testing.T) {
 	g := &urlTestGroup{
 		tags:      []string{},
-		outbounds: sync.TypedMap[string, adapter.Outbound]{},
+		outbounds: isync.TypedMap[string, adapter.Outbound]{},
 		tolerance: 50,
 		history:   urltest.NewHistoryStorage(),
 	}
@@ -119,7 +119,7 @@ func newRetryRig(mode retryMode, ctx context.Context, delays map[string]uint16, 
 	g := &urlTestGroup{
 		ctx:       ctx,
 		logger:    sbLog.NewNOPFactory().Logger(),
-		outbounds: sync.TypedMap[string, adapter.Outbound]{},
+		outbounds: isync.TypedMap[string, adapter.Outbound]{},
 		tolerance: 50,
 		history:   urltest.NewHistoryStorage(),
 	}
@@ -240,7 +240,7 @@ func callCount(m *mockOutbound, method string) int {
 func TestPickBestOutbound_FallbackSkipsCurrent(t *testing.T) {
 	g := &urlTestGroup{
 		tags:      []string{"alpha", "beta"},
-		outbounds: sync.TypedMap[string, adapter.Outbound]{},
+		outbounds: isync.TypedMap[string, adapter.Outbound]{},
 		tolerance: 50,
 		history:   urltest.NewHistoryStorage(),
 	}
