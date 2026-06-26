@@ -15,7 +15,25 @@ import (
 	"github.com/sagernet/sing/protocol/socks/socks5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/getlantern/lantern-box/option"
 )
+
+// TestNewInbound_RequiresAuthToken verifies a meek inbound refuses to start as an
+// open relay: an empty auth_token errors unless allow_unauthenticated is set. The
+// check runs before any listener is bound, so a nil router/empty options is fine.
+func TestNewInbound_RequiresAuthToken(t *testing.T) {
+	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "meek-in",
+		option.MeekInboundOptions{})
+	assert.Error(t, err, "empty auth_token without allow_unauthenticated must error")
+
+	_, err = NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "meek-in",
+		option.MeekInboundOptions{AllowUnauthenticated: true})
+	// With the opt-in, the auth gate passes (any later error is unrelated to auth).
+	if err != nil {
+		assert.NotContains(t, err.Error(), "auth_token is required")
+	}
+}
 
 // mockRouter implements adapter.ConnectionRouterEx with a controllable callback.
 type mockRouter struct {

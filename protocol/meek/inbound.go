@@ -20,6 +20,7 @@ import (
 	"github.com/sagernet/sing/protocol/socks/socks5"
 
 	"github.com/getlantern/lantern-box/constant"
+	L "github.com/getlantern/lantern-box/log"
 	"github.com/getlantern/lantern-box/option"
 )
 
@@ -60,6 +61,15 @@ func NewInbound(
 	tag string,
 	options option.MeekInboundOptions,
 ) (adapter.Inbound, error) {
+	// A meek inbound is a public/fronted relay into sing-box, so an empty auth
+	// token would make it an open relay. Require one unless the operator explicitly
+	// opts into the no-auth mode (test/private deployments only).
+	if options.AuthToken == "" && !options.AllowUnauthenticated {
+		return nil, errors.New(
+			"meek: auth_token is required (a meek inbound is a public relay into sing-box); " +
+				"set auth_token, or set allow_unauthenticated:true to deliberately run an open relay",
+		)
+	}
 	responseHoldoff, err := parseDurationOr(options.ResponseHoldoff, 50*time.Millisecond)
 	if err != nil {
 		return nil, fmt.Errorf("meek: response_holdoff: %w", err)
@@ -115,7 +125,9 @@ func NewInbound(
 		ResponseHoldoff:    responseHoldoff,
 		SessionIdleTimeout: sessionIdleTimeout,
 		AuthToken:          options.AuthToken,
-		Logger:             slog.Default(),
+		// Route meek-server logs through the inbound's sing-box logger (matches
+		// WATER), not slog.Default(), so levels/routing stay consistent.
+		Logger: slog.New(L.NewLogHandler(logger)),
 	})
 	if err != nil {
 		_ = socksLn.Close()
@@ -152,7 +164,13 @@ func (i *Inbound) acceptSocks() {
 	for {
 		conn, err := i.socksLn.Accept()
 		if err != nil {
-			return // listener closed on Close()
+			if errors.Is(err, net.ErrClosed) {
+				return // listener closed on Close()
+			}
+			// A transient Accept error must not permanently kill routing while the
+			// HTTP endpoint keeps serving — log and keep accepting.
+			i.logger.Error("meek inbound: socks accept: ", err)
+			continue
 		}
 		go i.handleSocks(conn)
 	}

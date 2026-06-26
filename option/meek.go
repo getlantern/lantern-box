@@ -54,10 +54,14 @@ type MeekInboundOptions struct {
 	// SessionIdleTimeout drops a session after this long without a poll; should
 	// be >= 2-3x the client's poll interval. Default "5m".
 	SessionIdleTimeout string `json:"session_idle_timeout,omitempty"`
-	// AuthToken, when set, is the shared secret every request must present in
-	// X-Meek-Auth. Strongly recommended for a public/fronted endpoint — without
-	// it the server is an open relay. Empty disables the check.
+	// AuthToken is the shared secret every request must present in X-Meek-Auth.
+	// Required by default — a meek inbound is a public/fronted relay into sing-box,
+	// so an empty token is an open relay. To deliberately run without auth (test or
+	// private deployments), set AllowUnauthenticated.
 	AuthToken string `json:"auth_token,omitempty"`
+	// AllowUnauthenticated explicitly opts into the no-auth mode (empty AuthToken).
+	// Off by default so the secure path is the default.
+	AllowUnauthenticated bool `json:"allow_unauthenticated,omitempty"`
 
 	// HTTP server timeouts (empty -> defaults). ReadTimeout/WriteTimeout bound a
 	// single poll; IdleTimeout bounds keep-alive reuse between polls.
