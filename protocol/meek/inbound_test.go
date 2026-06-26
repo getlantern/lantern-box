@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,11 +28,13 @@ func TestNewInbound_RequiresAuthToken(t *testing.T) {
 		option.MeekInboundOptions{})
 	assert.Error(t, err, "empty auth_token without allow_unauthenticated must error")
 
-	_, err = NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "meek-in",
+	ib, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "meek-in",
 		option.MeekInboundOptions{AllowUnauthenticated: true})
 	// With the opt-in, the auth gate passes (any later error is unrelated to auth).
 	if err != nil {
 		assert.NotContains(t, err.Error(), "auth_token is required")
+	} else {
+		t.Cleanup(func() { _ = ib.Close() }) // it opened listeners — don't leak them
 	}
 }
 
@@ -117,8 +120,14 @@ func TestInbound_HandleSocks_RoutesConnect(t *testing.T) {
 	require.NoError(t, readFull(c, got))
 	assert.Equal(t, "hello meek", string(got))
 
-	// 4. The router saw the right destination + inbound identity.
-	md := <-captured
+	// 4. The router saw the right destination + inbound identity (bounded wait so a
+	// routing failure surfaces promptly instead of hanging to the test timeout).
+	var md adapter.InboundContext
+	select {
+	case md = <-captured:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the router to be invoked")
+	}
 	assert.Equal(t, "meek-in", md.Inbound)
 	assert.Equal(t, "meek", md.InboundType)
 	assert.Equal(t, "93.184.216.34", md.Destination.Addr.String())
@@ -128,12 +137,12 @@ func TestInbound_HandleSocks_RoutesConnect(t *testing.T) {
 // TestInbound_HandleSocks_RejectsNonConnect verifies a non-CONNECT command is
 // refused (and the conn closed) rather than routed.
 func TestInbound_HandleSocks_RejectsNonConnect(t *testing.T) {
-	routed := false
+	var routed atomic.Bool // written by the handler goroutine, read by the test
 	ib := &Inbound{
 		Adapter: inbound.NewAdapter("meek", "meek-in"),
 		ctx:     context.Background(),
 		logger:  log.NewNOPFactory().Logger(),
-		router:  &mockRouter{onRoute: func(context.Context, net.Conn, adapter.InboundContext, N.CloseHandlerFunc) { routed = true }},
+		router:  &mockRouter{onRoute: func(context.Context, net.Conn, adapter.InboundContext, N.CloseHandlerFunc) { routed.Store(true) }},
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -159,7 +168,7 @@ func TestInbound_HandleSocks_RejectsNonConnect(t *testing.T) {
 	head := make([]byte, 4)
 	require.NoError(t, readFull(c, head))
 	assert.Equal(t, socks5.ReplyCodeUnsupported, head[1])
-	assert.False(t, routed, "a non-CONNECT command must not be routed")
+	assert.False(t, routed.Load(), "a non-CONNECT command must not be routed")
 }
 
 func readFull(r io.Reader, b []byte) error {
