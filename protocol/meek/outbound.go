@@ -193,7 +193,10 @@ func socks5ConnectSequenced(conn net.Conn, dst M.Socksaddr) error {
 		return fmt.Errorf("unexpected socks version %#x in connect reply", head[0])
 	}
 	if head[1] != 0 { // 0x00 = succeeded (RFC 1928)
-		return fmt.Errorf("connect failed (reply code %d)", head[1])
+		return fmt.Errorf("connect failed (reply code %#x)", head[1])
+	}
+	if head[2] != 0 { // RSV must be 0x00 (RFC 1928)
+		return fmt.Errorf("unexpected reserved byte %#x in connect reply", head[2])
 	}
 	var addrLen int
 	switch head[3] { // ATYP (RFC 1928): 1=IPv4, 3=domain, 4=IPv6
@@ -208,7 +211,7 @@ func socks5ConnectSequenced(conn net.Conn, dst M.Socksaddr) error {
 		}
 		addrLen = int(lb[0])
 	default:
-		return fmt.Errorf("unexpected atyp %d in connect reply", head[3])
+		return fmt.Errorf("unexpected atyp %#x in connect reply", head[3])
 	}
 	if _, err := io.ReadFull(conn, make([]byte, addrLen+2)); err != nil { // bound addr + port
 		return fmt.Errorf("read bound addr/port: %w", err)
