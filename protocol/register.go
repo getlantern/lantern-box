@@ -87,6 +87,7 @@ func RegisterProtocols(ctx context.Context) context.Context {
 
 func registerInbounds(registry *inbound.Registry) {
 	algeneva.RegisterInbound(registry)
+	meek.RegisterInbound(registry)
 	reflex.RegisterInbound(registry)
 	samizdat.RegisterInbound(registry)
 	water.RegisterInbound(registry)
