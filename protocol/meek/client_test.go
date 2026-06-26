@@ -255,3 +255,14 @@ func (s *meekTestServer) handle(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(resp)
 }
+
+// Deadline errors must implement net.Error with Timeout()==true so the meek Conn
+// behaves like a real net.Conn for callers that switch on net.Error/Timeout.
+func TestConn_DeadlineErrorsAreNetTimeouts(t *testing.T) {
+	if !errReadDeadline.Timeout() {
+		t.Error("read deadline error: Timeout() = false; want true (net.Conn contract)")
+	}
+	if !errWriteDeadline.Timeout() {
+		t.Error("write deadline error: Timeout() = false; want true")
+	}
+}

@@ -39,7 +39,7 @@ func run() error {
 	listen := flag.String("listen", ":8080", "address to listen on")
 	upstream := flag.String("upstream", "", "upstream TCP address (e.g. 127.0.0.1:1080)")
 	path := flag.String("path", "/", "URL path the server handles (other paths get 404)")
-	maxBody := flag.Int("max-body", 64*1024, "max response body bytes")
+	maxBody := flag.Int("max-body", 256*1024, "max request/response body bytes per poll (matches the client's 256 KiB default)")
 	holdoff := flag.Duration("holdoff", 50*time.Millisecond, "how long to wait for upstream bytes before responding")
 	idleTimeout := flag.Duration("idle-timeout", 5*time.Minute, "session idle reap threshold")
 	authToken := flag.String("auth-token", "", "shared secret required in the X-Meek-Auth header; empty disables auth (open relay — only for local testing)")

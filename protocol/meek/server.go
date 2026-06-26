@@ -23,8 +23,9 @@ type ServerConfig struct {
 	// (e.g. microsocks at "127.0.0.1:1080") is the expected deployment.
 	Upstream string
 
-	// MaxBodyBytes caps the response-body length. The server returns
-	// at most this many bytes per POST. Default 64 KiB.
+	// MaxBodyBytes caps both the request-body the server accepts (larger
+	// POSTs get 413) and the response-body it returns per POST. Default
+	// 256 KiB (matches the client's default).
 	MaxBodyBytes int
 
 	// ResponseHoldoff is how long the server waits for upstream bytes
@@ -175,9 +176,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	seq, hasSeq := parseSeq(r.Header.Get(headerSeq))
 	downstream, err := sess.serveRequest(hasSeq, seq, body, respCap, s.cfg.ResponseHoldoff)
 	if err != nil {
-		s.cfg.Logger.Debug("meek server: upstream write failed; closing session", slog.String("sid", sid), slog.Any("error", err))
 		s.dropSession(sid)
-		http.Error(w, "upstream write", http.StatusBadGateway)
+		if errors.Is(err, errUpstreamClosed) {
+			// Clean end-of-stream: upstream closed with nothing left. 410 tells the
+			// client the session is gone so its Conn surfaces EOF instead of polling forever.
+			s.cfg.Logger.Debug("meek server: upstream closed; ending session", slog.String("sid", sid))
+			http.Error(w, "upstream closed", http.StatusGone)
+		} else {
+			s.cfg.Logger.Debug("meek server: upstream write failed; closing session", slog.String("sid", sid), slog.Any("error", err))
+			http.Error(w, "upstream write", http.StatusBadGateway)
+		}
 		return
 	}
 
@@ -317,6 +325,10 @@ type session struct {
 	lastResp []byte
 }
 
+// errUpstreamClosed signals that the upstream is closed with nothing left to
+// send, so ServeHTTP should drop the session and tell the client to tear down.
+var errUpstreamClosed = errors.New("meek: upstream closed")
+
 func newSession(id string, upstream net.Conn) *session {
 	s := &session{
 		id:           id,
@@ -343,7 +355,11 @@ func (s *session) serveRequest(hasSeq bool, seq uint64, body []byte, respCap int
 				return nil, err
 			}
 		}
-		return s.takeDownstream(respCap, holdoff), nil
+		resp := s.takeDownstream(respCap, holdoff)
+		if len(resp) == 0 && s.upstreamFinished() {
+			return nil, errUpstreamClosed
+		}
+		return resp, nil
 	}
 
 	s.reqMu.Lock()
@@ -357,10 +373,28 @@ func (s *session) serveRequest(hasSeq bool, seq uint64, body []byte, respCap int
 		}
 	}
 	resp := s.takeDownstream(respCap, holdoff)
+	if len(resp) == 0 && s.upstreamFinished() {
+		return nil, errUpstreamClosed
+	}
 	s.haveSeq = true
 	s.lastSeq = seq
 	s.lastResp = resp
 	return resp, nil
+}
+
+// upstreamFinished reports whether the upstream is closed AND all buffered
+// downstream bytes have been drained — i.e. there is nothing left to ever send,
+// so the session should end and the client tear down (otherwise a read-only
+// client would poll forever on empty 200s, never seeing EOF).
+func (s *session) upstreamFinished() bool {
+	select {
+	case <-s.upstreamDone:
+	default:
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pending) == 0
 }
 
 func (s *session) lastSeen() time.Time {

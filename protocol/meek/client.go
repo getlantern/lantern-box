@@ -337,7 +337,11 @@ func (c *Conn) pollLoop() {
 		}
 
 		if err := c.roundtripWithRetry(); err != nil {
-			c.markClosed(err)
+			if errors.Is(err, io.EOF) {
+				c.markClosed(nil) // clean end-of-stream → Read returns io.EOF
+			} else {
+				c.markClosed(err)
+			}
 			return
 		}
 	}
@@ -361,6 +365,10 @@ func (c *Conn) roundtripWithRetry() error {
 		}
 		if err := c.roundtrip(); err != nil {
 			lastErr = err
+			var perm *permanentError
+			if errors.As(err, &perm) {
+				return err // session is gone — retrying would resurrect it
+			}
 			if attempt >= c.cfg.MaxPollRetries {
 				return fmt.Errorf("poll failed after %d retries: %w", c.cfg.MaxPollRetries, lastErr)
 			}
@@ -409,7 +417,14 @@ func (c *Conn) roundtrip() error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("meek: status %d", resp.StatusCode)
+		// Non-200 means the server dropped the session (it does so on every error
+		// path), so a retry would resurrect a fresh session instead of ending the
+		// stream — mark it permanent. A clean upstream-closed 410 maps to io.EOF so
+		// Read surfaces a proper end-of-stream.
+		if resp.StatusCode == http.StatusGone {
+			return &permanentError{io.EOF}
+		}
+		return &permanentError{fmt.Errorf("meek: status %d", resp.StatusCode)}
 	}
 
 	// Read one byte past the negotiated cap so an over-cap response is detected and
@@ -480,7 +495,24 @@ type meekAddr string
 func (a meekAddr) Network() string { return "meek" }
 func (a meekAddr) String() string  { return string(a) }
 
+// permanentError marks a poll failure that retrying won't fix — specifically a
+// non-200 response, since the server drops the session on every error path, so a
+// retry just resurrects a fresh session instead of surfacing end-of-stream.
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
+// timeoutError implements net.Error with Timeout()==true so the meek Conn behaves
+// like a real net.Conn for callers that switch on net.Error/Timeout (the stdlib
+// http client, io helpers, etc.) to distinguish a deadline from a hard failure.
+type timeoutError struct{ msg string }
+
+func (e *timeoutError) Error() string   { return e.msg }
+func (e *timeoutError) Timeout() bool   { return true }
+func (e *timeoutError) Temporary() bool { return true }
+
 var (
-	errReadDeadline  = errors.New("meek: read deadline exceeded")
-	errWriteDeadline = errors.New("meek: write deadline exceeded")
+	errReadDeadline  net.Error = &timeoutError{"meek: read deadline exceeded"}
+	errWriteDeadline net.Error = &timeoutError{"meek: write deadline exceeded"}
 )

@@ -507,3 +507,52 @@ func (u *echoUpstream) Close() {
 	_ = u.listener.Close()
 	u.wg.Wait()
 }
+
+// TestServer_PropagatesUpstreamEOF guards end-of-stream propagation: when the
+// upstream closes with nothing left, the server must end the session (410) and the
+// client's Read must surface io.EOF rather than polling forever on empty 200s.
+func TestServer_PropagatesUpstreamEOF(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close() // accept then drop → upstream EOF
+		}
+	}()
+
+	srv, err := NewServer(ServerConfig{
+		Upstream:           ln.Addr().String(),
+		ResponseHoldoff:    20 * time.Millisecond,
+		SessionIdleTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	hs := httptest.NewServer(srv)
+	t.Cleanup(hs.Close)
+
+	c, err := Dial(context.Background(), Config{URL: hs.URL, HTTPClient: hs.Client(), PollInterval: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	// Read-deadline bounds the test: a hang (the bug) trips the deadline instead,
+	// which is not io.EOF, so the assertion fails loudly rather than blocking.
+	if err := c.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, 16)
+	if _, err := c.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("Read err = %v; want io.EOF after upstream close", err)
+	}
+}

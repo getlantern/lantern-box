@@ -17,7 +17,7 @@ type MeekOutboundOptions struct {
 	Header MeekHeaders `json:"header,omitempty"` // extra HTTP headers per request
 
 	PollIntervalMs int    `json:"poll_interval_ms,omitempty"` // default 100
-	MaxBodyBytes   int    `json:"max_body_bytes,omitempty"`   // default 64 KiB
+	MaxBodyBytes   int    `json:"max_body_bytes,omitempty"`   // default 256 KiB (caps request + response bodies per poll)
 	SessionIDLen   int    `json:"session_id_len,omitempty"`   // default 16
 	ConnectTimeout string `json:"connect_timeout,omitempty"`  // default "15s"
 	ReadTimeout    string `json:"read_timeout,omitempty"`     // default "30s"
