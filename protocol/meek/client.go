@@ -412,10 +412,16 @@ func (c *Conn) roundtrip() error {
 		return fmt.Errorf("meek: status %d", resp.StatusCode)
 	}
 
-	limited := io.LimitReader(resp.Body, int64(c.cfg.MaxBodyBytes))
+	// Read one byte past the negotiated cap so an over-cap response is detected and
+	// rejected, not silently truncated (which would corrupt the tunneled byte stream).
+	// Mirrors the server's request-size check.
+	limited := io.LimitReader(resp.Body, int64(c.cfg.MaxBodyBytes)+1)
 	buf, err := io.ReadAll(limited)
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
+	}
+	if len(buf) > c.cfg.MaxBodyBytes {
+		return fmt.Errorf("meek: response body exceeds negotiated max %d bytes", c.cfg.MaxBodyBytes)
 	}
 	// The poll succeeded: commit the response, release the in-flight chunk, and
 	// advance the seq so the next poll is a fresh one.

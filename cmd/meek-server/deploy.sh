@@ -6,20 +6,22 @@
 # service, and verifies /healthz — rolling back automatically if it doesn't come
 # back. Finally runs the end-to-end SOCKS5 smoke test (best-effort).
 #
-# The repo doesn't pin the host's service layout, so everything is overridable
-# via env vars (shown with their defaults below). Confirm these match the host
-# before the first real run; use --dry-run to preview.
+# MEEK_HOST is REQUIRED (no default) so an env-less run can't silently deploy to a
+# live origin. The host's service layout isn't pinned in-repo, so the rest is
+# overridable via env (defaults below). Confirm these match the host before the
+# first real run; use --dry-run to preview.
 #
-#   MEEK_HOST=139.162.181.47   MEEK_SSH_USER=root   MEEK_SSH_KEY=~/.ssh/id
+#   MEEK_HOST=139.162.181.47   (required)   MEEK_SSH_USER=root   MEEK_SSH_KEY=~/.ssh/id
 #   MEEK_REMOTE_BIN=/usr/local/bin/meek-server      MEEK_SERVICE=meek-server
 #   MEEK_RESTART_CMD="systemctl restart $MEEK_SERVICE"
 #   MEEK_STATUS_CMD="systemctl is-active $MEEK_SERVICE"
 #   MEEK_HEALTHZ_URL=https://meek.getiantem.org/healthz
+#   MEEK_SSH_STRICT=accept-new   (set to "yes" for strict host-key checking)
 #
 # Usage: cmd/meek-server/deploy.sh [-n|--dry-run] [-h|--help]
 set -euo pipefail
 
-HOST="${MEEK_HOST:-139.162.181.47}"
+HOST="${MEEK_HOST:-}"
 SSH_USER="${MEEK_SSH_USER:-root}"
 SSH_KEY="${MEEK_SSH_KEY:-}"
 REMOTE_BIN="${MEEK_REMOTE_BIN:-/usr/local/bin/meek-server}"
@@ -31,22 +33,38 @@ HEALTHZ_URL="${MEEK_HEALTHZ_URL:-https://meek.getiantem.org/healthz}"
 DRY_RUN=0
 case "${1:-}" in
   -n|--dry-run) DRY_RUN=1 ;;
-  -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
   "") ;;
   *) echo "unknown arg: $1 (try --help)" >&2; exit 2 ;;
 esac
 
+# Required (checked after --help/-h so those don't need it): never default to a live host.
+: "${HOST:?required — set MEEK_HOST to the target origin (e.g. 139.162.181.47); refusing to default to a live host}"
+
 cd "$(dirname "$0")/../.." # repo root
 
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+# accept-new (TOFU) by default so a first deploy to operator-owned infra doesn't
+# require pre-seeding known_hosts; set MEEK_SSH_STRICT=yes for strict checking.
+SSH_STRICT="${MEEK_SSH_STRICT:-accept-new}"
+SSH_OPTS=(-o "StrictHostKeyChecking=$SSH_STRICT" -o ConnectTimeout=15)
 [ -n "$SSH_KEY" ] && SSH_OPTS+=(-i "$SSH_KEY")
 ssh_h() { ssh "${SSH_OPTS[@]}" "${SSH_USER}@${HOST}" "$@"; }
 say()   { printf '\n=== %s ===\n' "$*"; }
 
+# Hash locally with whichever tool exists: sha256sum (most Linux) or shasum -a 256
+# (macOS, some others). The remote always has sha256sum.
+sha256_local() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
 say "build meek-server (linux/amd64) from $(git rev-parse --short HEAD 2>/dev/null || echo '?')"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "$TMP/meek-server" ./cmd/meek-server
-LSHA=$(shasum -a 256 "$TMP/meek-server" | awk '{print $1}')
+LSHA=$(sha256_local "$TMP/meek-server")
 echo "built $(wc -c <"$TMP/meek-server") bytes  sha256=$LSHA"
 
 if [ "$DRY_RUN" = 1 ]; then
