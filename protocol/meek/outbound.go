@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -19,7 +20,6 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/protocol/socks"
 	"github.com/sagernet/sing/protocol/socks/socks5"
 
 	"github.com/getlantern/lantern-box/constant"
@@ -148,12 +148,75 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	// silent upstream would otherwise park here until the poll loop's own
 	// read timeout.
 	_ = conn.SetDeadline(time.Now().Add(o.connectTimeout))
-	if _, err := socks.ClientHandshake5(conn, socks5.CommandConnect, destination, "", ""); err != nil {
+	if err := socks5ConnectSequenced(conn, destination); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("meek: socks5 connect to %s: %w", destination, err)
 	}
 	_ = conn.SetDeadline(time.Time{})
 	return conn, nil
+}
+
+// socks5ConnectSequenced performs the SOCKS5 no-auth CONNECT handshake over the
+// meek Conn with reads done via io.ReadFull. sing's socks.ClientHandshake5 reads
+// the replies byte-at-a-time through varbin's stub ReadByte (which issues a
+// 1-byte Read and ignores n); over the meek polling Conn that desyncs the
+// handshake — DialContext returns instantly while microsocks actually replies
+// 0x05 0xFF ("no acceptable methods"), and that rejection leaks into the
+// application stream so every transfer stalls. io.ReadFull tolerates short/zero
+// reads and the explicit method-select→reply→CONNECT→reply ordering matches what
+// microsocks requires (strict, no pipelining).
+func socks5ConnectSequenced(conn net.Conn, dst M.Socksaddr) error {
+	// 1. Offer only NO_AUTH, then read the 2-byte method-select reply.
+	if err := socks5.WriteAuthRequest(conn, socks5.AuthRequest{Methods: []byte{socks5.AuthTypeNotRequired}}); err != nil {
+		return fmt.Errorf("write method-select: %w", err)
+	}
+	authReply := make([]byte, 2)
+	if _, err := io.ReadFull(conn, authReply); err != nil {
+		return fmt.Errorf("read method-select reply: %w", err)
+	}
+	if authReply[0] != socks5.Version {
+		return fmt.Errorf("unexpected socks version %#x", authReply[0])
+	}
+	if authReply[1] != socks5.AuthTypeNotRequired {
+		return fmt.Errorf("server rejected no-auth (method %#x)", authReply[1])
+	}
+
+	// 2. CONNECT, then read the reply: 4-byte header + bound addr + 2-byte port.
+	if err := socks5.WriteRequest(conn, socks5.Request{Command: socks5.CommandConnect, Destination: dst}); err != nil {
+		return fmt.Errorf("write connect: %w", err)
+	}
+	head := make([]byte, 4) // VER, REP, RSV, ATYP
+	if _, err := io.ReadFull(conn, head); err != nil {
+		return fmt.Errorf("read connect reply: %w", err)
+	}
+	if head[0] != socks5.Version {
+		return fmt.Errorf("unexpected socks version %#x in connect reply", head[0])
+	}
+	if head[1] != 0 { // 0x00 = succeeded (RFC 1928)
+		return fmt.Errorf("connect failed (reply code %#x)", head[1])
+	}
+	if head[2] != 0 { // RSV must be 0x00 (RFC 1928)
+		return fmt.Errorf("unexpected reserved byte %#x in connect reply", head[2])
+	}
+	var addrLen int
+	switch head[3] { // ATYP (RFC 1928): 1=IPv4, 3=domain, 4=IPv6
+	case 0x01:
+		addrLen = net.IPv4len
+	case 0x04:
+		addrLen = net.IPv6len
+	case 0x03:
+		lb := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lb); err != nil {
+			return fmt.Errorf("read bound-addr length: %w", err)
+		}
+		addrLen = int(lb[0])
+	default:
+		return fmt.Errorf("unexpected atyp %#x in connect reply", head[3])
+	}
+	if _, err := io.ReadFull(conn, make([]byte, addrLen+2)); err != nil { // bound addr + port
+		return fmt.Errorf("read bound addr/port: %w", err)
+	}
+	return nil
 }
 
 // ListenPacket is unimplemented — meek is a TCP-stream-shaped transport.
