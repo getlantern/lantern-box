@@ -161,6 +161,7 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 // acceptSocks accepts loopback connections from the meek server and routes each
 // through sing-box after terminating its SOCKS5 CONNECT.
 func (i *Inbound) acceptSocks() {
+	var failures int
 	for {
 		conn, err := i.socksLn.Accept()
 		if err != nil {
@@ -168,10 +169,16 @@ func (i *Inbound) acceptSocks() {
 				return // listener closed on Close()
 			}
 			// A transient Accept error must not permanently kill routing while the
-			// HTTP endpoint keeps serving — log and keep accepting.
-			i.logger.Error("meek inbound: socks accept: ", err)
+			// HTTP endpoint keeps serving — log and keep accepting, but back off
+			// (capped at 1s) so a persistent error (e.g. FD exhaustion) can't spin
+			// hot and flood the log.
+			failures++
+			backoff := min(time.Duration(failures)*10*time.Millisecond, time.Second)
+			i.logger.Error("meek inbound: socks accept (retry in ", backoff, "): ", err)
+			time.Sleep(backoff)
 			continue
 		}
+		failures = 0
 		go i.handleSocks(conn)
 	}
 }
