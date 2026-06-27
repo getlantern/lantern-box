@@ -35,3 +35,37 @@ type FrontSpec struct {
 
 // MeekHeaders carries fixed-value HTTP headers added to every POST.
 type MeekHeaders map[string]string
+
+// MeekInboundOptions configures a meek server inbound: an HTTP meek-v1 endpoint
+// (plain HTTP — TLS and CDN fronting are terminated by Caddy/a CDN in front)
+// whose tunneled sessions are routed through sing-box. Each session opens with a
+// SOCKS5 CONNECT (as the bundled meek outbound sends), which the inbound
+// terminates in-process and hands to the router — so no external SOCKS5 proxy
+// (microsocks) is required, unlike the standalone cmd/meek-server.
+type MeekInboundOptions struct {
+	option.ListenOptions
+
+	// MaxBodyBytes caps the request + response body per poll. Default 256 KiB
+	// (must match the client's cap, or bodies truncate).
+	MaxBodyBytes int `json:"max_body_bytes,omitempty"`
+	// ResponseHoldoff is how long the server waits for upstream bytes before
+	// responding (possibly empty). Default "50ms".
+	ResponseHoldoff string `json:"response_holdoff,omitempty"`
+	// SessionIdleTimeout drops a session after this long without a poll; should
+	// be >= 2-3x the client's poll interval. Default "5m".
+	SessionIdleTimeout string `json:"session_idle_timeout,omitempty"`
+	// AuthToken is the shared secret every request must present in X-Meek-Auth.
+	// Required by default — a meek inbound is a public/fronted relay into sing-box,
+	// so an empty token is an open relay. To deliberately run without auth (test or
+	// private deployments), set AllowUnauthenticated.
+	AuthToken string `json:"auth_token,omitempty"`
+	// AllowUnauthenticated explicitly opts into the no-auth mode (empty AuthToken).
+	// Off by default so the secure path is the default.
+	AllowUnauthenticated bool `json:"allow_unauthenticated,omitempty"`
+
+	// HTTP server timeouts (empty -> defaults). ReadTimeout/WriteTimeout bound a
+	// single poll; IdleTimeout bounds keep-alive reuse between polls.
+	ReadTimeout  string `json:"read_timeout,omitempty"`
+	WriteTimeout string `json:"write_timeout,omitempty"`
+	IdleTimeout  string `json:"idle_timeout,omitempty"`
+}
