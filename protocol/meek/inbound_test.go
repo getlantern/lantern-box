@@ -2,6 +2,7 @@ package meek
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"sync/atomic"
@@ -198,6 +199,8 @@ func readConnectReply(t *testing.T, r io.Reader) error {
 			return err
 		}
 		addrLen = int(lb[0])
+	default:
+		return fmt.Errorf("unexpected ATYP %#x in connect reply", head[3])
 	}
 	return readFull(r, make([]byte, addrLen+2))
 }
