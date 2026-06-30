@@ -17,6 +17,7 @@ import (
 	"github.com/getlantern/lantern-box/protocol/algeneva"
 	"github.com/getlantern/lantern-box/protocol/amnezia"
 	"github.com/getlantern/lantern-box/protocol/group"
+	"github.com/getlantern/lantern-box/protocol/meek"
 	"github.com/getlantern/lantern-box/protocol/outline"
 	"github.com/getlantern/lantern-box/protocol/reflex"
 	"github.com/getlantern/lantern-box/protocol/samizdat"
@@ -86,6 +87,7 @@ func RegisterProtocols(ctx context.Context) context.Context {
 
 func registerInbounds(registry *inbound.Registry) {
 	algeneva.RegisterInbound(registry)
+	meek.RegisterInbound(registry)
 	reflex.RegisterInbound(registry)
 	samizdat.RegisterInbound(registry)
 	water.RegisterInbound(registry)
@@ -94,6 +96,7 @@ func registerInbounds(registry *inbound.Registry) {
 func registerOutbounds(registry *outbound.Registry) {
 	// custom protocol outbounds
 	algeneva.RegisterOutbound(registry)
+	meek.RegisterOutbound(registry)
 	outline.RegisterOutbound(registry)
 	reflex.RegisterOutbound(registry)
 	samizdat.RegisterOutbound(registry)
