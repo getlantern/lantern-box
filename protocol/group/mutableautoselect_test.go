@@ -1099,8 +1099,8 @@ func TestDataPlaneStream_EOFDoesNotAttribute(t *testing.T) {
 	_, err = d.Read(buf)
 	require.Error(t, err, "second Read should have returned io.EOF")
 
-	time.Sleep(attributeSettle)
-	assert.Equal(t, uint32(0), calls.Load(), "io.EOF must not attribute a failure")
+	require.Never(t, func() bool { return calls.Load() != 0 }, 200*time.Millisecond, 5*time.Millisecond,
+		"io.EOF must not attribute a failure")
 }
 
 func TestDataPlaneStream_TimeoutDoesNotAttribute(t *testing.T) {
@@ -1118,8 +1118,8 @@ func TestDataPlaneStream_TimeoutDoesNotAttribute(t *testing.T) {
 	_, err = d.Read(buf)
 	require.Error(t, err, "second Read should have returned a timeout error")
 
-	time.Sleep(attributeSettle)
-	assert.Equal(t, uint32(0), calls.Load(), "a timeout must not attribute a failure")
+	require.Never(t, func() bool { return calls.Load() != 0 }, 200*time.Millisecond, 5*time.Millisecond,
+		"a timeout must not attribute a failure")
 }
 
 func TestDataPlaneStream_NoAttributeAfterClose(t *testing.T) {
@@ -1134,8 +1134,8 @@ func TestDataPlaneStream_NoAttributeAfterClose(t *testing.T) {
 	_, err := d.Read(make([]byte, 8))
 	require.Error(t, err, "Read after Close should return an error")
 
-	time.Sleep(attributeSettle)
-	assert.Equal(t, uint32(0), calls.Load(), "post-Close error must not attribute a failure")
+	require.Never(t, func() bool { return calls.Load() != 0 }, 200*time.Millisecond, 5*time.Millisecond,
+		"post-Close error must not attribute a failure")
 }
 
 func TestDataPlaneStream_FailureFiresOnce(t *testing.T) {
