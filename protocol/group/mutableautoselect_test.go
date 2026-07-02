@@ -3,9 +3,11 @@ package group
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -573,15 +575,17 @@ func TestDataPlaneStream_StallFiresAfterProven(t *testing.T) {
 	d := newDataPlaneStream(echoConn{}, 30*time.Millisecond, provedReadBytes,
 		func() { calls.Add(1) }, nil)
 	defer d.Close()
+
 	// Drive enough Read bytes to prove the conn.
-	if _, err := d.Read(make([]byte, provedReadBytes)); err != nil {
-		t.Fatalf("Read: %v", err)
-	}
+	_, err := d.Read(make([]byte, provedReadBytes))
+	require.NoError(t, err, "Read should succeed on echoConn")
+
 	require.True(t, d.proven.Load(), "Read should have proven the conn")
+
 	// Drive a Write so the watchdog sees "we sent bytes, no response."
-	if _, err := d.Write([]byte("ping")); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
+	_, err = d.Write([]byte("ping"))
+	require.NoError(t, err, "Write should succeed on echoConn")
+
 	require.True(t, d.lastWasWrite.Load(), "Write should set the last-was-write gate")
 	// Wait past the idle window.
 	require.Eventually(t, func() bool { return calls.Load() == 1 },
@@ -601,9 +605,10 @@ func TestDataPlaneStream_StallSuppressedOnReadOnlyIdle(t *testing.T) {
 	d := newDataPlaneStream(echoConn{}, 30*time.Millisecond, provedReadBytes,
 		func() { calls.Add(1) }, nil)
 	defer d.Close()
-	if _, err := d.Read(make([]byte, provedReadBytes)); err != nil {
-		t.Fatalf("Read: %v", err)
-	}
+
+	_, err := d.Read(make([]byte, provedReadBytes))
+	require.NoError(t, err, "Read should succeed on echoConn")
+
 	require.True(t, d.proven.Load(), "Read should have proven the conn")
 	require.False(t, d.lastWasWrite.Load(), "Read-only conn must not set the last-was-write gate")
 	time.Sleep(80 * time.Millisecond)
@@ -831,9 +836,9 @@ func TestSelectFor_PreservesStickyAfterUnrelatedRemove(t *testing.T) {
 	recordSuccess(s, "b", 150)
 	recordSuccess(s, "c", 50)
 	s.stickyTag.tcp.Store("c")
-	if _, err := s.Remove("b"); err != nil {
-		t.Fatalf("Remove: %v", err)
-	}
+	_, err := s.Remove("b")
+	require.NoError(t, err)
+
 	got, err := s.selectFor("tcp")
 	require.NoError(t, err)
 	require.NotNil(t, got)
@@ -846,9 +851,9 @@ func TestSelectFor_RepicksWhenStickyGone(t *testing.T) {
 	recordSuccess(s, "b", 50)
 	recordSuccess(s, "c", 200)
 	s.stickyTag.tcp.Store("b")
-	if _, err := s.Remove("b"); err != nil {
-		t.Fatalf("Remove: %v", err)
-	}
+	_, err := s.Remove("b")
+	require.NoError(t, err)
+
 	got, err := s.selectFor("tcp")
 	require.NoError(t, err)
 	require.NotNil(t, got)
@@ -946,15 +951,208 @@ func TestDataPlaneStream_OnActivityFiresOnNonEmptyIO(t *testing.T) {
 	var activity atomic.Uint32
 	d := newDataPlaneStream(echoConn{}, time.Hour, 0, func() {}, func() { activity.Add(1) })
 	defer d.Close()
-	if _, err := d.Write([]byte("hi")); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
+	_, err := d.Write([]byte("hi"))
+	require.NoError(t, err, "Write should succeed on echoConn")
+
 	buf := make([]byte, 8)
-	if _, err := d.Read(buf); err != nil {
-		t.Fatalf("Read: %v", err)
-	}
+	_, err = d.Read(buf)
+	require.NoError(t, err, "Read should succeed on echoConn")
+
 	assert.Equal(t, uint32(2), activity.Load(),
 		"onActivity should fire once per non-empty Read/Write")
+}
+
+// failingConn returns firstN bytes on the first Read, then returns err.
+// If failWrite is set, Write returns err instead of succeeding.
+type failingConn struct {
+	net.Conn
+	err       error
+	firstN    int
+	failWrite bool
+	firstDone atomic.Bool
+}
+
+func (c *failingConn) Read(p []byte) (int, error) {
+	if c.firstN > 0 && c.firstDone.CompareAndSwap(false, true) {
+		n := min(c.firstN, len(p))
+		return n, nil
+	}
+	return 0, c.err
+}
+func (c *failingConn) Write(p []byte) (int, error) {
+	if c.failWrite {
+		return 0, c.err
+	}
+	return len(p), nil
+}
+func (c *failingConn) Close() error { return nil }
+
+// failingPacketConn is the PacketConn equivalent of failingConn.
+type failingPacketConn struct {
+	net.PacketConn
+	err error
+}
+
+func (c *failingPacketConn) ReadFrom(p []byte) (int, net.Addr, error)  { return 0, nil, c.err }
+func (c *failingPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
+func (c *failingPacketConn) Close() error                              { return nil }
+
+func connResetErr() error {
+	return &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
+}
+
+// timeoutErr is a net.Error reporting a timeout.
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return false }
+
+// fireFailure dispatches onStall on its own goroutine, so failure assertions
+// poll and non-failure assertions let that goroutine settle before checking.
+const attributeSettle = 50 * time.Millisecond
+
+func TestDataPlaneStream_MidStreamReset_ConnReset_AttributesFailure(t *testing.T) {
+	// A conn reset mid-stream before it delivered enough to be proven must
+	// still attribute a failure — the reset-on-first-data DPI case that the
+	// proven-gated stall path cannot catch.
+	var calls atomic.Uint32
+	const provedReadBytes = 1 << 20 // never reached by the 16-byte read below
+	c := &failingConn{err: connResetErr(), firstN: 16}
+	d := newDataPlaneStream(c, time.Hour, provedReadBytes, func() { calls.Add(1) }, nil)
+	defer d.Close()
+
+	buf := make([]byte, 32)
+	n, err := d.Read(buf)
+	require.NoError(t, err, "first Read should succeed")
+	require.Equal(t, 16, n, "first Read should return the firstN bytes")
+
+	require.False(t, d.proven.Load(), "conn must be unproven for this case")
+
+	_, err = d.Read(buf)
+	require.Error(t, err, "second Read should have returned the reset error")
+
+	require.Eventually(t, func() bool { return calls.Load() == 1 },
+		time.Second, 5*time.Millisecond,
+		"mid-stream reset on an unproven conn must attribute exactly one failure")
+}
+
+func TestDataPlaneStream_MidStreamReset_ErrClosed_AttributesFailure(t *testing.T) {
+	// net.ErrClosed reaching noteIO without a prior local Close means the
+	// inner outbound tore its own fd down — a broken tunnel, so demote.
+	var calls atomic.Uint32
+	c := &failingConn{err: net.ErrClosed, firstN: 8}
+	d := newDataPlaneStream(c, time.Hour, 4, func() { calls.Add(1) }, nil)
+	defer d.Close()
+
+	buf := make([]byte, 32)
+	_, err := d.Read(buf)
+	require.NoError(t, err, "first Read should succeed")
+
+	_, err = d.Read(buf)
+	require.Error(t, err, "second Read should have returned net.ErrClosed")
+
+	require.Eventually(t, func() bool { return calls.Load() == 1 },
+		time.Second, 5*time.Millisecond, "inner-conn net.ErrClosed must attribute a failure")
+}
+
+func TestDataPlaneStream_MidStreamReset_WritePath_AttributesFailure(t *testing.T) {
+	// The failure path must fire on a reset Write too, not just Read.
+	var calls atomic.Uint32
+	c := &failingConn{err: connResetErr(), failWrite: true}
+	d := newDataPlaneStream(c, time.Hour, 4, func() { calls.Add(1) }, nil)
+	defer d.Close()
+
+	_, err := d.Write([]byte("req"))
+	require.Error(t, err, "Write should have returned the reset error")
+
+	require.Eventually(t, func() bool { return calls.Load() == 1 },
+		time.Second, 5*time.Millisecond, "mid-stream reset on Write must attribute a failure")
+}
+
+func TestDataPlanePacket_MidStreamReset_AttributesFailure(t *testing.T) {
+	// dataPlanePacket shares noteIO, so a reset on the UDP read path attributes
+	// the same way as the stream path.
+	var calls atomic.Uint32
+	c := &failingPacketConn{err: connResetErr()}
+	d := newDataPlanePacket(c, time.Hour, 4, func() { calls.Add(1) }, nil)
+	defer d.Close()
+
+	_, _, err := d.ReadFrom(make([]byte, 32))
+	require.Error(t, err, "ReadFrom should have returned the reset error")
+
+	require.Eventually(t, func() bool { return calls.Load() == 1 },
+		time.Second, 5*time.Millisecond, "mid-stream reset on the packet path must attribute a failure")
+}
+
+func TestDataPlaneStream_EOFDoesNotAttribute(t *testing.T) {
+	// io.EOF is an ordinary stream end, not a tunnel failure.
+	var calls atomic.Uint32
+	c := &failingConn{err: io.EOF, firstN: 8}
+	d := newDataPlaneStream(c, time.Hour, 4, func() { calls.Add(1) }, nil)
+	defer d.Close()
+
+	buf := make([]byte, 32)
+	_, err := d.Read(buf)
+	require.NoError(t, err, "first Read should succeed")
+
+	_, err = d.Read(buf)
+	require.Error(t, err, "second Read should have returned io.EOF")
+
+	require.Never(t, func() bool { return calls.Load() != 0 }, 200*time.Millisecond, 5*time.Millisecond,
+		"io.EOF must not attribute a failure")
+}
+
+func TestDataPlaneStream_TimeoutDoesNotAttribute(t *testing.T) {
+	// A deadline is the idle stall timer's job; attributing here would
+	// double-count and usurp that role.
+	var calls atomic.Uint32
+	c := &failingConn{err: timeoutErr{}, firstN: 8}
+	d := newDataPlaneStream(c, time.Hour, 4, func() { calls.Add(1) }, nil)
+	defer d.Close()
+
+	buf := make([]byte, 32)
+	_, err := d.Read(buf)
+	require.NoError(t, err, "first Read should succeed")
+
+	_, err = d.Read(buf)
+	require.Error(t, err, "second Read should have returned a timeout error")
+
+	require.Never(t, func() bool { return calls.Load() != 0 }, 200*time.Millisecond, 5*time.Millisecond,
+		"a timeout must not attribute a failure")
+}
+
+func TestDataPlaneStream_NoAttributeAfterClose(t *testing.T) {
+	// After our own Close, closeWatchdog has set stalled; a racing read that
+	// surfaces net.ErrClosed must short-circuit, not attribute a phantom
+	// failure.
+	var calls atomic.Uint32
+	c := &failingConn{err: net.ErrClosed}
+	d := newDataPlaneStream(c, time.Hour, 1, func() { calls.Add(1) }, nil)
+	require.True(t, d.closeWatchdog(), "first close")
+
+	_, err := d.Read(make([]byte, 8))
+	require.Error(t, err, "Read after Close should return an error")
+
+	require.Never(t, func() bool { return calls.Load() != 0 }, 200*time.Millisecond, 5*time.Millisecond,
+		"post-Close error must not attribute a failure")
+}
+
+func TestDataPlaneStream_FailureFiresOnce(t *testing.T) {
+	// Repeated errored reads attribute at most once per conn (the fired CAS).
+	var calls atomic.Uint32
+	c := &failingConn{err: connResetErr()}
+	d := newDataPlaneStream(c, time.Hour, 1, func() { calls.Add(1) }, nil)
+	defer d.Close()
+
+	for i := range 3 {
+		_, err := d.Read(make([]byte, 8))
+		require.Errorf(t, err, "Read %d should have returned an error", i)
+	}
+	require.Eventually(t, func() bool { return calls.Load() == 1 },
+		time.Second, 5*time.Millisecond, "first errored read must attribute")
+	time.Sleep(attributeSettle)
+	assert.Equal(t, uint32(1), calls.Load(), "multiple errored reads must attribute at most once")
 }
 
 type echoConn struct{ net.Conn }
@@ -989,7 +1187,7 @@ func TestExhaustionSignal_FiresOnFullLadderFailure(t *testing.T) {
 	case _, ok := <-sig:
 		assert.True(t, ok, "exhaustion channel should deliver a value, not be closed")
 	case <-time.After(2 * time.Second):
-		t.Fatal("exhaustion signal not delivered within timeout")
+		require.FailNow(t, "exhaustion signal not delivered within timeout")
 	}
 }
 
@@ -1006,11 +1204,11 @@ func TestExhaustionSignal_CoalescesPendingSignal(t *testing.T) {
 	select {
 	case <-s.ExhaustionSignal():
 	case <-time.After(2 * time.Second):
-		t.Fatal("coalesced exhaustion signal not delivered within timeout")
+		require.FailNow(t, "coalesced exhaustion signal not delivered within timeout")
 	}
 	select {
 	case <-s.ExhaustionSignal():
-		t.Fatal("second receive should block")
+		require.FailNow(t, "exhaustion signal should not deliver a second value")
 	default:
 	}
 }
@@ -1027,7 +1225,7 @@ func TestExhaustionSignal_CloseClosesChannelForRangeLoop(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("range loop did not exit after Close")
+		require.FailNow(t, "exhaustion signal range loop did not exit after Close")
 	}
 }
 
@@ -1060,7 +1258,7 @@ func TestInterfaceUpdated_TriggersReprobe(t *testing.T) {
 	select {
 	case <-dialed:
 	case <-time.After(2 * time.Second):
-		t.Fatal("InterfaceUpdated did not trigger a probe of member a")
+		require.FailNow(t, "InterfaceUpdated did not trigger a probe of member a")
 	}
 	s.probeMu.Lock()
 	s.probeMu.Unlock()
@@ -1115,7 +1313,7 @@ func TestRunBackgroundLoop_NoPauseManagerIsNoOp(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("runBackgroundLoop did not exit after ctx cancel")
+		require.FailNow(t, "runBackgroundLoop did not exit after ctx cancel")
 	}
 }
 
