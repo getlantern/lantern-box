@@ -1,6 +1,9 @@
 package group
 
 import (
+	"context"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -62,13 +65,33 @@ func (w *dataPlaneWatchdog) init(idle time.Duration, provedReadBytes uint64, onS
 	w.timer = time.AfterFunc(idle, w.fireStall)
 }
 
+// isDataPlaneFailure reports whether err should demote the outbound.
+// Clean closes, caller cancellation, and timeouts are ignored.
+func isDataPlaneFailure(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	return true
+}
+
 func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
-	if n <= 0 || err != nil {
+	// Short-circuit once stalled: a late noteIO must not re-arm the
+	// timer, fire onActivity, or attribute a failure after the conn is
+	// logically gone.
+	if w.stalled.Load() {
 		return
 	}
-	// Short-circuit once stalled: a late noteIO must not re-arm the
-	// timer or fire onActivity after the conn is logically gone.
-	if w.stalled.Load() {
+	// Attribute mid-stream transport failures immediately.
+	if isDataPlaneFailure(err) {
+		w.fireFailure()
+		return
+	}
+	// Ignore empty I/O and benign terminal conditions.
+	if n <= 0 || err != nil {
 		return
 	}
 	// Publish the gate value before re-arming the timer so a fireStall
@@ -109,15 +132,9 @@ func (w *dataPlaneWatchdog) closeWatchdog() (firstClose bool) {
 	return firstClose
 }
 
-// fireStall is the AfterFunc callback. The stall counts only if the
-// conn has delivered enough Read payload to be proven AND the most
-// recent non-empty IO was a Write — i.e. we sent bytes and heard
-// nothing back. A proven conn whose last activity was a Read is
-// treated as user-idle and suppressed: an unused HTTPS keep-alive
-// looks identical to a broken tunnel without this gate. Other failure
-// paths (dial errors, probe failures) still catch the cases this gate
-// suppresses. fired is the once-per-conn CAS so a re-armed timer
-// can't double-deliver onStall.
+// fireStall is the idle-timer callback: it demotes a conn that went quiet
+// mid-stream. It fires only on a proven conn whose last non-empty IO was a
+// Write.
 func (w *dataPlaneWatchdog) fireStall() {
 	if !w.proven.Load() {
 		return
@@ -133,6 +150,23 @@ func (w *dataPlaneWatchdog) fireStall() {
 	}
 	if w.onStall != nil {
 		w.onStall()
+	}
+}
+
+// fireFailure demotes on a mid-stream transport error. Unlike fireStall it skips
+// the proven/lastWasWrite gates — an explicit reset is unambiguous even before a
+// conn is proven. Fire and attribution happens at most once.
+func (w *dataPlaneWatchdog) fireFailure() {
+	if !w.stalled.CompareAndSwap(false, true) {
+		return
+	}
+	if !w.fired.CompareAndSwap(false, true) {
+		return
+	}
+	if w.onStall != nil {
+		// run onStall in a goroutine to avoid deadlocks: the callback may call back
+		// into the selector, which may hold locks that the data-plane IO path also needs.
+		go w.onStall()
 	}
 }
 
