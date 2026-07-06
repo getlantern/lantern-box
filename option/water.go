@@ -35,12 +35,6 @@ type WATEROutboundOptions struct {
 	// SkipHandshake is used when the WATER module deals with the handshake
 	// instead of the sing-box WATER transport
 	SkipHandshake bool `json:"skip_handshake,omitempty"`
-	// UseCompiler runs the WASM transport with wazero's optimizing compiler
-	// instead of the interpreter. Defaults to off: the compiler's per-instance
-	// JIT arena can push the macOS/iOS NetworkExtension past its jetsam limit and
-	// get the process killed. Only enable on hosts without that limit (e.g. the
-	// standalone daemon), where it substantially lowers CPU.
-	UseCompiler bool `json:"use_compiler,omitempty"`
 	// Optional configuration for supporting UDP over TCP
 	UDPOverTCP *option.UDPOverTCPOptions `json:"udp_over_tcp,omitempty"`
 }
