@@ -8,23 +8,25 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/getlantern/lantern-box/adapter"
 )
 
-// makeHooks returns the (onStall, onActivity) callback pair wired into
+// makeHooks returns the (onFailure, onActivity) callback pair wired into
 // the data-plane wrappers. Callbacks re-look-up the member's history
 // at fire time so a Remove+Add cycle can't strand writes on a stale
 // entry. The stall callback short-circuits when recordUserFailure
 // reports a dedup/non-member, so a single broken outbound with N
 // orphan idle conns doesn't trigger N redundant full-fleet probe
 // sweeps.
-func (s *MutableAutoSelect) makeHooks(outerTag string) (onStall, onActivity func()) {
-	onStall = func() {
-		if !s.recordUserFailure(outerTag) {
+func (s *MutableAutoSelect) makeHooks(outerTag string) (onFailure func(adapter.UserFailureKind), onActivity func()) {
+	onFailure = func(kind adapter.UserFailureKind) {
+		if !s.recordUserFailure(outerTag, kind) {
 			return
 		}
 		go s.runLadder(outerTag)
 	}
-	return onStall, s.bumpActive
+	return onFailure, s.bumpActive
 }
 
 // dataPlaneWatchdog is the no-traffic stall timer shared by the stream
@@ -45,7 +47,7 @@ func (s *MutableAutoSelect) makeHooks(outerTag string) (onStall, onActivity func
 // identical to a broken tunnel without this gate.
 type dataPlaneWatchdog struct {
 	idle            time.Duration
-	onStall         func()
+	onFailure       func(adapter.UserFailureKind)
 	onActivity      func()
 	provedReadBytes uint64
 	readBytes       atomic.Uint64
@@ -57,10 +59,10 @@ type dataPlaneWatchdog struct {
 	closeOnce       sync.Once
 }
 
-func (w *dataPlaneWatchdog) init(idle time.Duration, provedReadBytes uint64, onStall, onActivity func()) {
+func (w *dataPlaneWatchdog) init(idle time.Duration, provedReadBytes uint64, onFailure func(adapter.UserFailureKind), onActivity func()) {
 	w.idle = idle
 	w.provedReadBytes = provedReadBytes
-	w.onStall = onStall
+	w.onFailure = onFailure
 	w.onActivity = onActivity
 	w.timer = time.AfterFunc(idle, w.fireStall)
 }
@@ -87,7 +89,7 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	}
 	// Attribute mid-stream transport failures immediately.
 	if isDataPlaneFailure(err) {
-		w.fireFailure()
+		w.fireResetFailure()
 		return
 	}
 	// Ignore empty I/O and benign terminal conditions.
@@ -122,7 +124,7 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 
 // closeWatchdog sets stalled=true before Stop so any concurrent noteIO
 // short-circuits and any concurrent fireStall CAS-fails — late I/O can't
-// deliver a phantom onStall after Close.
+// deliver a phantom onFailure after Close.
 func (w *dataPlaneWatchdog) closeWatchdog() (firstClose bool) {
 	w.closeOnce.Do(func() {
 		w.stalled.Store(true)
@@ -148,25 +150,25 @@ func (w *dataPlaneWatchdog) fireStall() {
 	if !w.fired.CompareAndSwap(false, true) {
 		return
 	}
-	if w.onStall != nil {
-		w.onStall()
+	if w.onFailure != nil {
+		w.onFailure(adapter.UserFailureStall)
 	}
 }
 
-// fireFailure demotes on a mid-stream transport error. Unlike fireStall it skips
+// fireResetFailure demotes on a mid-stream transport error. Unlike fireStall it skips
 // the proven/lastWasWrite gates — an explicit reset is unambiguous even before a
 // conn is proven. Fire and attribution happens at most once.
-func (w *dataPlaneWatchdog) fireFailure() {
+func (w *dataPlaneWatchdog) fireResetFailure() {
 	if !w.stalled.CompareAndSwap(false, true) {
 		return
 	}
 	if !w.fired.CompareAndSwap(false, true) {
 		return
 	}
-	if w.onStall != nil {
-		// run onStall in a goroutine to avoid deadlocks: the callback may call back
+	if w.onFailure != nil {
+		// run onFailure in a goroutine to avoid deadlocks: the callback may call back
 		// into the selector, which may hold locks that the data-plane IO path also needs.
-		go w.onStall()
+		go w.onFailure(adapter.UserFailureReset)
 	}
 }
 
@@ -177,9 +179,9 @@ type dataPlaneStream struct {
 	dataPlaneWatchdog
 }
 
-func newDataPlaneStream(c net.Conn, idle time.Duration, provedReadBytes uint64, onStall, onActivity func()) *dataPlaneStream {
+func newDataPlaneStream(c net.Conn, idle time.Duration, provedReadBytes uint64, onFailure func(adapter.UserFailureKind), onActivity func()) *dataPlaneStream {
 	d := &dataPlaneStream{Conn: c}
-	d.init(idle, provedReadBytes, onStall, onActivity)
+	d.init(idle, provedReadBytes, onFailure, onActivity)
 	return d
 }
 
@@ -215,9 +217,15 @@ type dataPlanePacket struct {
 	dataPlaneWatchdog
 }
 
-func newDataPlanePacket(c net.PacketConn, idle time.Duration, provedReadBytes uint64, onStall, onActivity func()) *dataPlanePacket {
+func newDataPlanePacket(
+	c net.PacketConn,
+	idle time.Duration,
+	provedReadBytes uint64,
+	onFailure func(adapter.UserFailureKind),
+	onActivity func(),
+) *dataPlanePacket {
 	d := &dataPlanePacket{PacketConn: c}
-	d.init(idle, provedReadBytes, onStall, onActivity)
+	d.init(idle, provedReadBytes, onFailure, onActivity)
 	return d
 }
 
