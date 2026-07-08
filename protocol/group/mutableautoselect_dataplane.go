@@ -15,7 +15,7 @@ import (
 // makeHooks returns the (onFailure, onActivity) callback pair wired into
 // the data-plane wrappers. Callbacks re-look-up the member's history
 // at fire time so a Remove+Add cycle can't strand writes on a stale
-// entry. The stall callback short-circuits when recordUserFailure
+// entry. The failure callback short-circuits when recordUserFailure
 // reports a dedup/non-member, so a single broken outbound with N
 // orphan idle conns doesn't trigger N redundant full-fleet probe
 // sweeps.

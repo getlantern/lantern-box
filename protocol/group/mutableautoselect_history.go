@@ -160,7 +160,7 @@ func (h *localHistory) toTagHistory(updatedAt time.Time, p historyParams) *adapt
 
 // pruneUserFailures returns the subset of failures whose age is within
 // window. Ages are clamped to zero to tolerate clock skew between
-// cached entries and now.
+// cached entries and now. failures must be sorted by At ascending.
 func pruneUserFailures(failures []adapter.UserFailure, now time.Time, window time.Duration) []adapter.UserFailure {
 	if len(failures) == 0 {
 		return nil
@@ -203,11 +203,7 @@ func countUserFailuresInWindow(failures []adapter.UserFailure, now time.Time, wi
 // (cached entries with future timestamps from clock skew) clamp to 0
 // so they still count as "in window."
 func ageWithin(now, t time.Time, window time.Duration) bool {
-	age := now.Sub(t)
-	if age < 0 {
-		age = 0
-	}
-	return age < window
+	return max(0, now.Sub(t)) < window
 }
 
 // hydrateLocalHistory rebuilds a localHistory from a persisted snapshot.
@@ -223,6 +219,10 @@ func hydrateLocalHistory(t *adapter.TagHistory, now time.Time, window time.Durat
 	h.lastOutcomeAt = t.LastOutcomeAt
 	h.consecutiveFailures = t.ConsecutiveFailures
 	if len(t.UserFailures) > 0 {
+		// ensure the slice is sorted by At ascending
+		slices.SortFunc(t.UserFailures, func(a, b adapter.UserFailure) int {
+			return a.At.Compare(b.At)
+		})
 		copies := make([]adapter.UserFailure, len(t.UserFailures))
 		copy(copies, t.UserFailures)
 		h.userFailures = pruneUserFailures(copies, now, window)

@@ -1040,7 +1040,7 @@ func (timeoutErr) Error() string   { return "i/o timeout" }
 func (timeoutErr) Timeout() bool   { return true }
 func (timeoutErr) Temporary() bool { return false }
 
-// fireResetFailure dispatches onStall on its own goroutine, so failure assertions
+// fireResetFailure dispatches onFailure on its own goroutine, so failure assertions
 // poll and non-failure assertions let that goroutine settle before checking.
 const attributeSettle = 50 * time.Millisecond
 
