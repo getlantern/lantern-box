@@ -469,7 +469,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	// runLadder's gating both see it. For nested groups, the inner tag
 	// isn't a member of this group, so recordUserFailure would drop on
 	// the member gate.
-	s.recordUserFailure(outerTag)
+	s.recordUserFailure(outerTag, adapter.UserFailureDial)
 
 	// Fast failover: try one alternate from the current rank before
 	// kicking the ladder. The active 3-min cadence keeps the probe
@@ -483,7 +483,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 			return s.wrapStream(conn, alt), nil
 		}
 		s.logger.ErrorContext(ctx, err)
-		s.recordUserFailure(altTag)
+		s.recordUserFailure(altTag, adapter.UserFailureDial)
 		outerTag = altTag
 	}
 
@@ -512,7 +512,7 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		return s.wrapPacket(conn, o), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.recordUserFailure(outerTag)
+	s.recordUserFailure(outerTag, adapter.UserFailureDial)
 
 	alt, altErr := s.selectForExcluding("udp", outerTag)
 	if altErr == nil {
@@ -523,7 +523,7 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 			return s.wrapPacket(conn, alt), nil
 		}
 		s.logger.ErrorContext(ctx, err)
-		s.recordUserFailure(altTag)
+		s.recordUserFailure(altTag, adapter.UserFailureDial)
 		outerTag = altTag
 	}
 
@@ -957,17 +957,17 @@ func (s *MutableAutoSelect) mutateHistory(tag string, fn func(*localHistory, tim
 	return true
 }
 
-// recordUserFailure appends a single user-traffic failure timestamp to
-// the member's sliding window and persists the snapshot. Dial errors
-// and confirmed data-plane stalls both pass through here; each counts
+// recordUserFailure appends a single user-traffic failure of the given
+// kind to the member's sliding window and persists the snapshot. Dial
+// errors and confirmed data-plane stalls both pass through here; each counts
 // as one failure, with softFailLimit tripping the soft tier and
 // consecutiveFailLimit tripping the hard tier. Returns true if the
 // failure was persisted; false on dedup or non-member tag, so callers
 // can suppress downstream side effects (e.g. ladder kicks) on collapsed
 // events.
-func (s *MutableAutoSelect) recordUserFailure(tag string) bool {
+func (s *MutableAutoSelect) recordUserFailure(tag string, kind adapter.UserFailureKind) bool {
 	return s.mutateHistory(tag, func(h *localHistory, now time.Time) bool {
-		return h.addUserFailure(now, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
+		return h.addUserFailure(adapter.UserFailure{At: now, Kind: kind}, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
 	})
 }
 

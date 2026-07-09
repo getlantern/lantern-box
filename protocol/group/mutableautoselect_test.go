@@ -84,14 +84,18 @@ func TestPruneUserFailures(t *testing.T) {
 		want   int
 	}{
 		{"empty", nil, time.Minute, 0},
-		{"all in window", []time.Time{now.Add(-1 * time.Minute), now.Add(-2 * time.Minute)}, 5 * time.Minute, 2},
-		{"some aged out", []time.Time{now.Add(-1 * time.Minute), now.Add(-10 * time.Minute)}, 5 * time.Minute, 1},
+		{"all in window", []time.Time{now.Add(-2 * time.Minute), now.Add(-1 * time.Minute)}, 5 * time.Minute, 2},
+		{"some aged out", []time.Time{now.Add(-10 * time.Minute), now.Add(-1 * time.Minute)}, 5 * time.Minute, 1},
 		{"future-stamped clamps age to 0", []time.Time{now.Add(time.Hour)}, 5 * time.Minute, 1},
 		{"all aged out returns nil", []time.Time{now.Add(-10 * time.Minute)}, 5 * time.Minute, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := pruneUserFailures(append([]time.Time(nil), tt.in...), now, tt.window)
+			in := make([]adapter.UserFailure, len(tt.in))
+			for i, at := range tt.in {
+				in[i] = adapter.UserFailure{At: at, Kind: adapter.UserFailureStall}
+			}
+			got := pruneUserFailures(in, now, tt.window)
 			assert.Len(t, got, tt.want)
 		})
 	}
@@ -211,14 +215,14 @@ func TestToTagHistory_HardDemoted(t *testing.T) {
 	// are not hard demoted.
 	soft := newLocalHistory()
 	for i := uint32(0); i < p.softFailLimit; i++ {
-		soft.addUserFailure(now.Add(-time.Duration(i)*time.Second), p.userFailureWindow, 0)
+		soft.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, p.userFailureWindow, 0)
 	}
 	assert.False(t, soft.toTagHistory(now, p).HardDemoted,
 		"user failures below the hard limit are not hard demoted")
 
 	userHard := newLocalHistory()
 	for i := uint32(0); i < p.consecutiveFailLimit; i++ {
-		userHard.addUserFailure(now.Add(-time.Duration(i)*time.Second), p.userFailureWindow, 0)
+		userHard.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, p.userFailureWindow, 0)
 	}
 	assert.True(t, userHard.toTagHistory(now, p).HardDemoted,
 		"user failures at the hard limit are hard demoted")
@@ -231,8 +235,8 @@ func TestLocalHistory_UserFailuresIndependentOfProbeOutcomes(t *testing.T) {
 	// laundered to clean by a passing probe.
 	h := newLocalHistory()
 	now := time.Now()
-	h.addUserFailure(now, 5*time.Minute, 0)
-	h.addUserFailure(now.Add(time.Second), 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now.Add(time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(2*time.Second), 5*time.Minute))
 	h.recordProbeSuccess(100, now.Add(3*time.Second))
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(4*time.Second), 5*time.Minute),
@@ -245,8 +249,8 @@ func TestLocalHistory_UserFailuresAgeOut(t *testing.T) {
 	// regardless of whether traffic gets routed through it.
 	h := newLocalHistory()
 	now := time.Now()
-	h.addUserFailure(now, 5*time.Minute, 0)
-	h.addUserFailure(now.Add(time.Minute), 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now.Add(time.Minute), Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(time.Minute), 5*time.Minute))
 	// Six minutes later, both are stale.
 	assert.Equal(t, uint32(0), h.userFailureCount(now.Add(6*time.Minute), 5*time.Minute),
@@ -262,12 +266,12 @@ func TestLocalHistory_AddUserFailureDedupesBurst(t *testing.T) {
 	now := time.Now()
 	dedupe := 30 * time.Second
 
-	require.True(t, h.addUserFailure(now, 5*time.Minute, dedupe), "first failure must record")
-	require.False(t, h.addUserFailure(now.Add(time.Second), 5*time.Minute, dedupe), "burst within dedupe must drop")
-	require.False(t, h.addUserFailure(now.Add(29*time.Second), 5*time.Minute, dedupe), "still within dedupe must drop")
+	require.True(t, h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "first failure must record")
+	require.False(t, h.addUserFailure(adapter.UserFailure{At: now.Add(time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "burst within dedupe must drop")
+	require.False(t, h.addUserFailure(adapter.UserFailure{At: now.Add(29 * time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "still within dedupe must drop")
 	assert.Equal(t, uint32(1), h.userFailureCount(now.Add(30*time.Second), 5*time.Minute), "burst collapsed to one")
 
-	require.True(t, h.addUserFailure(now.Add(30*time.Second), 5*time.Minute, dedupe), "at-or-past dedupe must record")
+	require.True(t, h.addUserFailure(adapter.UserFailure{At: now.Add(30 * time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "at-or-past dedupe must record")
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(30*time.Second), 5*time.Minute))
 }
 
@@ -276,9 +280,9 @@ func TestHydrateLocalHistory_DropsAgedUserFailures(t *testing.T) {
 	persisted := &adapter.TagHistory{
 		LastSuccessDelayMs: 120,
 		LastOutcomeAt:      now.Add(-time.Minute),
-		UserFailures: []time.Time{
-			now.Add(-30 * time.Minute), // outside 5-min window
-			now.Add(-1 * time.Minute),  // inside window
+		UserFailures: []adapter.UserFailure{
+			{At: now.Add(-30 * time.Minute), Kind: adapter.UserFailureDial}, // outside 5-min window
+			{At: now.Add(-1 * time.Minute), Kind: adapter.UserFailureStall}, // inside window
 		},
 		UpdatedAt: now.Add(-time.Minute),
 	}
@@ -370,7 +374,7 @@ func addUserFailureN(s *MutableAutoSelect, tag string, n int) {
 	h := s.historyForLocked(tag)
 	now := time.Now()
 	for i := 0; i < n; i++ {
-		h.addUserFailure(now.Add(time.Duration(i)*time.Millisecond), s.hist.userFailureWindow, 0)
+		h.addUserFailure(adapter.UserFailure{At: now.Add(time.Duration(i) * time.Millisecond), Kind: adapter.UserFailureStall}, s.hist.userFailureWindow, 0)
 	}
 }
 
@@ -559,7 +563,7 @@ func TestDataPlaneStream_StallSuppressedUntilProven(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 100
 	d := newDataPlaneStream(stallConn{}, 10*time.Millisecond, provedReadBytes,
-		func() { calls.Add(1) }, nil)
+		func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	defer d.Close()
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, uint32(0), calls.Load(),
@@ -573,7 +577,7 @@ func TestDataPlaneStream_StallFiresAfterProven(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 50
 	d := newDataPlaneStream(echoConn{}, 30*time.Millisecond, provedReadBytes,
-		func() { calls.Add(1) }, nil)
+		func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	defer d.Close()
 
 	// Drive enough Read bytes to prove the conn.
@@ -603,7 +607,7 @@ func TestDataPlaneStream_StallSuppressedOnReadOnlyIdle(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 50
 	d := newDataPlaneStream(echoConn{}, 30*time.Millisecond, provedReadBytes,
-		func() { calls.Add(1) }, nil)
+		func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	defer d.Close()
 
 	_, err := d.Read(make([]byte, provedReadBytes))
@@ -617,14 +621,14 @@ func TestDataPlaneStream_StallSuppressedOnReadOnlyIdle(t *testing.T) {
 }
 
 func TestDataPlaneStream_CloseIsIdempotent(t *testing.T) {
-	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func() {}, nil)
+	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func(adapter.UserFailureKind) {}, nil)
 	require.NoError(t, d.Close())
 	assert.NoError(t, d.Close(), "second Close should be a no-op")
 }
 
 func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
-	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func() { calls.Add(1) }, nil)
+	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	d.proven.Store(true)       // simulate a proven conn so fireStall isn't gated on the proven check
 	d.lastWasWrite.Store(true) // ...nor on the write-without-read gate
 	d.Close()
@@ -634,7 +638,7 @@ func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 
 func TestDataPlanePacket_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
-	d := newDataPlanePacket(stallPacketConn{}, time.Hour, 0, func() { calls.Add(1) }, nil)
+	d := newDataPlanePacket(stallPacketConn{}, time.Hour, 0, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	d.proven.Store(true)
 	d.lastWasWrite.Store(true)
 	d.Close()
@@ -724,8 +728,8 @@ func TestRecordProbeOutcome_DropsOutcomesForRemovedTag(t *testing.T) {
 
 func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	assert.True(t, s.recordUserFailure("a"), "first call must persist")
-	assert.False(t, s.recordUserFailure("a"), "immediate burst must return false (deduped)")
+	assert.True(t, s.recordUserFailure("a", adapter.UserFailureDial), "first call must persist")
+	assert.False(t, s.recordUserFailure("a", adapter.UserFailureStall), "immediate burst must return false (deduped)")
 	s.access.Lock()
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
@@ -733,7 +737,7 @@ func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	assert.Equal(t, uint32(1), h.userFailureCount(time.Now(), s.hist.userFailureWindow),
 		"successive calls within dedupe window must collapse")
 
-	assert.False(t, s.recordUserFailure("nonexistent"), "non-member must return false")
+	assert.False(t, s.recordUserFailure("nonexistent", adapter.UserFailureDial), "non-member must return false")
 	s.access.Lock()
 	_, exists := s.peekHistoryLocked("nonexistent")
 	s.access.Unlock()
@@ -746,13 +750,41 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// one. (Spec change from earlier "one-shot hard demote.")
 	s, _ := newTestMUR(t, "a")
 	onStall, _ := s.makeHooks("a")
-	onStall()
+	onStall(adapter.UserFailureStall)
 	s.access.Lock()
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
 	require.True(t, ok)
 	assert.Equal(t, uint32(1), h.userFailureCount(time.Now(), s.hist.userFailureWindow),
 		"a single stall must contribute exactly one user-failure timestamp")
+	require.Len(t, h.userFailures, 1)
+	assert.Equal(t, adapter.UserFailureStall, h.userFailures[0].Kind,
+		"the stall hook must record the failure as a stall")
+}
+
+func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	onStall, _ := s.makeHooks("a")
+	onStall(adapter.UserFailureReset)
+	s.access.Lock()
+	h, ok := s.peekHistoryLocked("a")
+	s.access.Unlock()
+	require.True(t, ok)
+	require.Len(t, h.userFailures, 1)
+	assert.Equal(t, adapter.UserFailureReset, h.userFailures[0].Kind,
+		"makeHooks must record the failure under the kind the watchdog reports")
+}
+
+func TestRecordUserFailure_AttributesDialKind(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	require.True(t, s.recordUserFailure("a", adapter.UserFailureDial))
+	s.access.Lock()
+	h, ok := s.peekHistoryLocked("a")
+	s.access.Unlock()
+	require.True(t, ok)
+	require.Len(t, h.userFailures, 1)
+	assert.Equal(t, adapter.UserFailureDial, h.userFailures[0].Kind,
+		"a dial-site failure must record the failure as a dial error")
 }
 
 func TestRecordUserFailure_DemotesTagInNextSelectFor(t *testing.T) {
@@ -949,7 +981,7 @@ func TestNextProbeInterval(t *testing.T) {
 
 func TestDataPlaneStream_OnActivityFiresOnNonEmptyIO(t *testing.T) {
 	var activity atomic.Uint32
-	d := newDataPlaneStream(echoConn{}, time.Hour, 0, func() {}, func() { activity.Add(1) })
+	d := newDataPlaneStream(echoConn{}, time.Hour, 0, func(adapter.UserFailureKind) {}, func() { activity.Add(1) })
 	defer d.Close()
 	_, err := d.Write([]byte("hi"))
 	require.NoError(t, err, "Write should succeed on echoConn")
@@ -1008,7 +1040,7 @@ func (timeoutErr) Error() string   { return "i/o timeout" }
 func (timeoutErr) Timeout() bool   { return true }
 func (timeoutErr) Temporary() bool { return false }
 
-// fireFailure dispatches onStall on its own goroutine, so failure assertions
+// fireResetFailure dispatches onFailure on its own goroutine, so failure assertions
 // poll and non-failure assertions let that goroutine settle before checking.
 const attributeSettle = 50 * time.Millisecond
 
@@ -1019,7 +1051,7 @@ func TestDataPlaneStream_MidStreamReset_ConnReset_AttributesFailure(t *testing.T
 	var calls atomic.Uint32
 	const provedReadBytes = 1 << 20 // never reached by the 16-byte read below
 	c := &failingConn{err: connResetErr(), firstN: 16}
-	d := newDataPlaneStream(c, time.Hour, provedReadBytes, func() { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, provedReadBytes, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1037,12 +1069,46 @@ func TestDataPlaneStream_MidStreamReset_ConnReset_AttributesFailure(t *testing.T
 		"mid-stream reset on an unproven conn must attribute exactly one failure")
 }
 
+func TestDataPlaneStream_MidStreamReset_AttributesResetKind(t *testing.T) {
+	// fireResetFailure must report the failure as a reset, not a stall, so the two
+	// mid-stream failure modes stay separable downstream.
+	var got atomic.Value // adapter.UserFailureKind
+	c := &failingConn{err: connResetErr(), firstN: 16}
+	d := newDataPlaneStream(c, time.Hour, 1<<20, func(k adapter.UserFailureKind) { got.Store(k) }, nil)
+	defer d.Close()
+
+	buf := make([]byte, 32)
+	_, err := d.Read(buf)
+	require.NoError(t, err)
+	_, err = d.Read(buf)
+	require.Error(t, err)
+
+	require.Eventually(t, func() bool { return got.Load() != nil },
+		time.Second, 5*time.Millisecond, "a mid-stream reset must attribute a failure")
+	assert.Equal(t, adapter.UserFailureReset, got.Load().(adapter.UserFailureKind),
+		"a mid-stream reset must be recorded as a reset")
+}
+
+func TestDataPlaneStream_Stall_AttributesStallKind(t *testing.T) {
+	// The idle-timeout path must report a stall, complementing the reset path.
+	var got atomic.Value // adapter.UserFailureKind
+	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func(k adapter.UserFailureKind) { got.Store(k) }, nil)
+	defer d.Close()
+	d.proven.Store(true)
+	d.lastWasWrite.Store(true)
+	d.fireStall()
+
+	require.NotNil(t, got.Load(), "a stall must attribute a failure")
+	assert.Equal(t, adapter.UserFailureStall, got.Load().(adapter.UserFailureKind),
+		"an idle stall must be recorded as a stall")
+}
+
 func TestDataPlaneStream_MidStreamReset_ErrClosed_AttributesFailure(t *testing.T) {
 	// net.ErrClosed reaching noteIO without a prior local Close means the
 	// inner outbound tore its own fd down — a broken tunnel, so demote.
 	var calls atomic.Uint32
 	c := &failingConn{err: net.ErrClosed, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, func() { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 4, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1060,7 +1126,7 @@ func TestDataPlaneStream_MidStreamReset_WritePath_AttributesFailure(t *testing.T
 	// The failure path must fire on a reset Write too, not just Read.
 	var calls atomic.Uint32
 	c := &failingConn{err: connResetErr(), failWrite: true}
-	d := newDataPlaneStream(c, time.Hour, 4, func() { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 4, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	defer d.Close()
 
 	_, err := d.Write([]byte("req"))
@@ -1075,7 +1141,7 @@ func TestDataPlanePacket_MidStreamReset_AttributesFailure(t *testing.T) {
 	// the same way as the stream path.
 	var calls atomic.Uint32
 	c := &failingPacketConn{err: connResetErr()}
-	d := newDataPlanePacket(c, time.Hour, 4, func() { calls.Add(1) }, nil)
+	d := newDataPlanePacket(c, time.Hour, 4, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	defer d.Close()
 
 	_, _, err := d.ReadFrom(make([]byte, 32))
@@ -1089,7 +1155,7 @@ func TestDataPlaneStream_EOFDoesNotAttribute(t *testing.T) {
 	// io.EOF is an ordinary stream end, not a tunnel failure.
 	var calls atomic.Uint32
 	c := &failingConn{err: io.EOF, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, func() { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 4, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1108,7 +1174,7 @@ func TestDataPlaneStream_TimeoutDoesNotAttribute(t *testing.T) {
 	// double-count and usurp that role.
 	var calls atomic.Uint32
 	c := &failingConn{err: timeoutErr{}, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, func() { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 4, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1128,7 +1194,7 @@ func TestDataPlaneStream_NoAttributeAfterClose(t *testing.T) {
 	// failure.
 	var calls atomic.Uint32
 	c := &failingConn{err: net.ErrClosed}
-	d := newDataPlaneStream(c, time.Hour, 1, func() { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 1, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	require.True(t, d.closeWatchdog(), "first close")
 
 	_, err := d.Read(make([]byte, 8))
@@ -1142,7 +1208,7 @@ func TestDataPlaneStream_FailureFiresOnce(t *testing.T) {
 	// Repeated errored reads attribute at most once per conn (the fired CAS).
 	var calls atomic.Uint32
 	c := &failingConn{err: connResetErr()}
-	d := newDataPlaneStream(c, time.Hour, 1, func() { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 1, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	defer d.Close()
 
 	for i := range 3 {

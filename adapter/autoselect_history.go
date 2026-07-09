@@ -1,9 +1,62 @@
 package adapter
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 )
+
+// UserFailureKind distinguishes how a member's user traffic failed.
+type UserFailureKind string
+
+const (
+	// UserFailureDial is a failure to establish the connection to the member.
+	UserFailureDial UserFailureKind = "dial"
+	// UserFailureStall is a data-plane stall on an already-dialed connection:
+	// the tunnel carried traffic, then went silent for the idle window.
+	UserFailureStall UserFailureKind = "stall"
+	// UserFailureReset is a non-benign transport error (e.g. RST) on an
+	// already-established connection — the tunnel broke mid-stream rather
+	// than going quiet.
+	UserFailureReset   UserFailureKind = "reset"
+	UserFailureUnknown UserFailureKind = "unknown"
+)
+
+// UserFailure stores when a user-traffic failure happened and what kind it was.
+type UserFailure struct {
+	At   time.Time       `json:"at"`
+	Kind UserFailureKind `json:"kind,omitempty"`
+}
+
+func normalizeUserFailureKind(kind UserFailureKind) UserFailureKind {
+	switch kind {
+	case UserFailureDial, UserFailureStall, UserFailureReset:
+		return kind
+	default:
+		return UserFailureUnknown
+	}
+}
+
+// UnmarshalJSON accepts both the current object form and the legacy bare
+// timestamp form. Legacy entries are tagged as unknown.
+func (u *UserFailure) UnmarshalJSON(data []byte) error {
+	var at time.Time
+	if err := json.Unmarshal(data, &at); err == nil {
+		u.At = at
+		u.Kind = UserFailureUnknown
+		return nil
+	}
+
+	type rawUserFailure UserFailure
+	var raw rawUserFailure
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*u = UserFailure(raw)
+	u.Kind = normalizeUserFailureKind(u.Kind)
+	return nil
+}
 
 // TagHistory is a point-in-time snapshot of one member's selection
 // state, mirroring the in-memory history kept by the MutableAutoSelect
@@ -13,22 +66,19 @@ import (
 // lets the probe URL through while dropping user traffic shows up as
 // elevated UserFailures with healthy probe scalars simultaneously.
 type TagHistory struct {
-	// LastSuccessDelayMs is the most recent successful probe RTT
-	// (clamped to ≥1 ms). 0 means "no successful probe yet" — rank
-	// uses it as a sentinel to deprioritize against measured peers.
+	// LastSuccessDelayMs is the most recent successful probe RTT.
+	// 0 means "no successful probe yet".
 	LastSuccessDelayMs uint32 `json:"last_success_delay_ms,omitempty"`
-	// LastOutcomeAt is the timestamp of the most recent probe outcome
-	// (success or failure). Used by the probe-cycle freshSince gate to
-	// distinguish "probed this cycle" from "stale outcome."
+	// LastOutcomeAt is the timestamp of the most recent probe outcome.
 	LastOutcomeAt time.Time `json:"last_outcome_at,omitempty"`
 	// ConsecutiveFailures counts probe failures since the last probe
 	// success. Resets to zero on probe success.
 	ConsecutiveFailures uint32 `json:"consecutive_failures,omitempty"`
-	// UserFailures is the sliding window of user-traffic failure
-	// timestamps (dial errors and data-plane stalls). Probe successes
-	// never enter this window; entries age out naturally on the next
-	// mutation older than the group's userFailureWindow.
-	UserFailures []time.Time `json:"user_failures,omitempty"`
+	// UserFailures is the sliding window of user-traffic failures, each
+	// tagged with its kind. Probe successes never enter this window; entries
+	// age out naturally on the next mutation older than the group's
+	// userFailureWindow.
+	UserFailures []UserFailure `json:"user_failures,omitempty"`
 	// HardDemoted reports whether the member has reached the hard-demote
 	// tier from its own recorded probe and user-traffic failures.
 	HardDemoted bool      `json:"hard_demoted,omitempty"`
@@ -164,7 +214,7 @@ func cloneTagHistory(h *TagHistory) *TagHistory {
 	}
 	out := *h
 	if len(h.UserFailures) > 0 {
-		out.UserFailures = make([]time.Time, len(h.UserFailures))
+		out.UserFailures = make([]UserFailure, len(h.UserFailures))
 		copy(out.UserFailures, h.UserFailures)
 	}
 	return &out

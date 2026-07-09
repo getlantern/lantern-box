@@ -1,6 +1,7 @@
 package group
 
 import (
+	"slices"
 	"sync"
 	"time"
 
@@ -58,7 +59,7 @@ type localHistory struct {
 	lastSuccessDelayMs  uint32
 	lastOutcomeAt       time.Time
 	consecutiveFailures uint32
-	userFailures        []time.Time
+	userFailures        []adapter.UserFailure
 }
 
 func newLocalHistory() *localHistory { return &localHistory{} }
@@ -84,26 +85,27 @@ func (h *localHistory) recordProbeFailure(now time.Time) {
 	h.lastOutcomeAt = now
 }
 
-// addUserFailure appends a user-traffic failure timestamp and prunes
-// entries older than window in place. A data-plane stall and a dial
-// error each count as one failure; hard demotion requires three in
-// the window.
+// addUserFailure appends the failure and prunes entries older than window
+// in place. A data-plane stall and a dial error each count as one failure;
+// hard demotion requires three in the window.
 //
 // dedupe collapses bursts to a single failure: if the most recent
 // entry is newer than dedupe, the append is dropped. A single broken
 // outbound with many idle conns hitting their stall timer in sequence
 // would otherwise inflate the count out of proportion to the event.
+// The dedupe window spans kinds so a dial error immediately followed by
+// a stall on the retry counts once, matching the one-event intent.
 // Returns true if the failure was recorded.
-func (h *localHistory) addUserFailure(now time.Time, window, dedupe time.Duration) bool {
+func (h *localHistory) addUserFailure(failure adapter.UserFailure, window, dedupe time.Duration) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if dedupe > 0 && len(h.userFailures) > 0 {
 		last := h.userFailures[len(h.userFailures)-1]
-		if now.Sub(last) < dedupe {
+		if failure.At.Sub(last.At) < dedupe {
 			return false
 		}
 	}
-	h.userFailures = pruneUserFailures(append(h.userFailures, now), now, window)
+	h.userFailures = pruneUserFailures(append(h.userFailures, failure), failure.At, window)
 	return true
 }
 
@@ -117,7 +119,7 @@ func (h *localHistory) userFailureCount(now time.Time, window time.Duration) uin
 	return uint32(len(h.userFailures))
 }
 
-func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay uint32, lastAt time.Time, consec uint32, userFails []time.Time) {
+func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay uint32, lastAt time.Time, consec uint32, userFails []adapter.UserFailure) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.userFailures = pruneUserFailures(h.userFailures, now, window)
@@ -125,7 +127,7 @@ func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay 
 	lastAt = h.lastOutcomeAt
 	consec = h.consecutiveFailures
 	if len(h.userFailures) > 0 {
-		userFails = make([]time.Time, len(h.userFailures))
+		userFails = make([]adapter.UserFailure, len(h.userFailures))
 		copy(userFails, h.userFailures)
 	}
 	return
@@ -150,7 +152,7 @@ func (h *localHistory) toTagHistory(updatedAt time.Time, p historyParams) *adapt
 		UpdatedAt:           updatedAt,
 	}
 	if len(h.userFailures) > 0 {
-		out.UserFailures = make([]time.Time, len(h.userFailures))
+		out.UserFailures = make([]adapter.UserFailure, len(h.userFailures))
 		copy(out.UserFailures, h.userFailures)
 	}
 	return out
@@ -158,8 +160,8 @@ func (h *localHistory) toTagHistory(updatedAt time.Time, p historyParams) *adapt
 
 // pruneUserFailures returns the subset of failures whose age is within
 // window. Ages are clamped to zero to tolerate clock skew between
-// cached entries and now.
-func pruneUserFailures(failures []time.Time, now time.Time, window time.Duration) []time.Time {
+// cached entries and now. failures must be sorted by At ascending.
+func pruneUserFailures(failures []adapter.UserFailure, now time.Time, window time.Duration) []adapter.UserFailure {
 	if len(failures) == 0 {
 		return nil
 	}
@@ -167,28 +169,30 @@ func pruneUserFailures(failures []time.Time, now time.Time, window time.Duration
 		// window<=0 disables aging — keep what we have.
 		return failures
 	}
-	out := failures[:0]
-	for _, t := range failures {
-		if ageWithin(now, t, window) {
-			out = append(out, t)
-		}
-	}
-	if len(out) == 0 {
+	firstLive := slices.IndexFunc(failures, func(f adapter.UserFailure) bool {
+		return ageWithin(now, f.At, window)
+	})
+	switch firstLive {
+	case 0:
+		return failures
+	case -1:
 		return nil
+	default:
+		copy(failures, failures[firstLive:])
+		return failures[:len(failures)-firstLive]
 	}
-	return out
 }
 
 // countUserFailuresInWindow returns the number of entries whose age is
 // within window without allocating. Use on the read-only rank hot path
 // where pruneUserFailures' in-place mutation isn't needed.
-func countUserFailuresInWindow(failures []time.Time, now time.Time, window time.Duration) uint32 {
+func countUserFailuresInWindow(failures []adapter.UserFailure, now time.Time, window time.Duration) uint32 {
 	if window <= 0 {
 		return uint32(len(failures))
 	}
 	var n uint32
-	for _, t := range failures {
-		if ageWithin(now, t, window) {
+	for _, f := range failures {
+		if ageWithin(now, f.At, window) {
 			n++
 		}
 	}
@@ -199,11 +203,7 @@ func countUserFailuresInWindow(failures []time.Time, now time.Time, window time.
 // (cached entries with future timestamps from clock skew) clamp to 0
 // so they still count as "in window."
 func ageWithin(now, t time.Time, window time.Duration) bool {
-	age := now.Sub(t)
-	if age < 0 {
-		age = 0
-	}
-	return age < window
+	return max(0, now.Sub(t)) < window
 }
 
 // hydrateLocalHistory rebuilds a localHistory from a persisted snapshot.
@@ -219,7 +219,11 @@ func hydrateLocalHistory(t *adapter.TagHistory, now time.Time, window time.Durat
 	h.lastOutcomeAt = t.LastOutcomeAt
 	h.consecutiveFailures = t.ConsecutiveFailures
 	if len(t.UserFailures) > 0 {
-		copies := make([]time.Time, len(t.UserFailures))
+		// ensure the slice is sorted by At ascending
+		slices.SortFunc(t.UserFailures, func(a, b adapter.UserFailure) int {
+			return a.At.Compare(b.At)
+		})
+		copies := make([]adapter.UserFailure, len(t.UserFailures))
 		copy(copies, t.UserFailures)
 		h.userFailures = pruneUserFailures(copies, now, window)
 	}
