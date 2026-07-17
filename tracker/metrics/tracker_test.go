@@ -225,8 +225,8 @@ func TestDeviceConnectedSpanNoClientInfo(t *testing.T) {
 // TestSessionGoodput verifies the per-session download goodput histogram is
 // emitted once at close, with the value ~= received bytes / connection seconds
 // and — crucially for the bandit evaluator — the three queryable POINT
-// attributes it filters/groups by: network.io.direction='receive', proxy.track,
-// and geo.country.iso_code.
+// attributes it filters/groups by: network.io.direction='receive', the bare
+// "track" key (NOT the "proxy.track" resource attr), and geo.country.iso_code.
 func TestSessionGoodput(t *testing.T) {
 	synctest.Run(func() {
 		reader := metric.NewManualReader()
