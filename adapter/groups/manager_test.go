@@ -267,6 +267,7 @@ func TestRemoveFromGroup(t *testing.T) {
 	t.Run("tag not in group is idempotent", func(t *testing.T) {
 		mgr := newMgr(&mockRemovableGroup{removeN: 0})
 		assert.NoError(t, mgr.RemoveFromGroup("auto-test", tag))
+		assert.True(t, pendingContains(mgr, tag), "outbound should still be queued for cleanup")
 	})
 
 	t.Run("other errors propagate", func(t *testing.T) {
