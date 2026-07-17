@@ -304,7 +304,7 @@ func (s *MutableAutoSelect) Add(tags ...string) (n int, err error) {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if s.isClosed() {
-		return 0, errors.New("group is closed")
+		return 0, adapter.ErrGroupClosed
 	}
 	var missing []string
 	for _, tag := range tags {
@@ -336,7 +336,7 @@ func (s *MutableAutoSelect) Remove(tags ...string) (n int, err error) {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if s.isClosed() {
-		return 0, errors.New("group is closed")
+		return 0, adapter.ErrGroupClosed
 	}
 	removed := make(map[string]struct{}, len(tags))
 	for _, tag := range tags {

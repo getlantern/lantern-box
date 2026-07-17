@@ -1,10 +1,15 @@
 package adapter
 
 import (
+	"errors"
 	"net"
 
 	"github.com/sagernet/sing-box/adapter"
 )
+
+// ErrGroupClosed is returned by MutableOutboundGroup Add/Remove when the
+// group has already been torn down.
+var ErrGroupClosed = errors.New("group is closed")
 
 type MutableOutboundGroup interface {
 	adapter.OutboundGroup

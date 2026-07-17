@@ -1,6 +1,7 @@
 package groups
 
 import (
+	"errors"
 	"slices"
 	"sync"
 	"testing"
@@ -225,6 +226,65 @@ func TestCheckOutbounds(t *testing.T) {
 		assert.ErrorIs(t, err, ErrIsClosed)
 		assert.False(t, mock.checked)
 	})
+}
+
+func TestRemoveFromGroup(t *testing.T) {
+	logger := log.NewNOPFactory().Logger()
+	tag := "outbound"
+
+	newMgr := func(group lbAdapter.MutableOutboundGroup) *MutableGroupManager {
+		return &MutableGroupManager{
+			outboundMgr: &mockOutboundManager{tags: []string{tag}},
+			endpointMgr: &mockEndpointManager{},
+			groups:      map[string]lbAdapter.MutableOutboundGroup{"auto-test": group},
+			removalQueue: newRemovalQueue(
+				logger, &mockOutboundManager{}, &mockEndpointManager{}, &mockConnectionManager{},
+				pollInterval, forceAfter,
+			),
+		}
+	}
+
+	pendingContains := func(mgr *MutableGroupManager, tag string) bool {
+		mgr.removalQueue.mu.RLock()
+		defer mgr.removalQueue.mu.RUnlock()
+		_, found := mgr.removalQueue.pending[tag]
+		return found
+	}
+
+	t.Run("removes and enqueues outbound", func(t *testing.T) {
+		mgr := newMgr(&mockRemovableGroup{removeN: 1})
+		require.NoError(t, mgr.RemoveFromGroup("auto-test", tag))
+		assert.True(t, pendingContains(mgr, tag), "outbound should be queued for removal")
+	})
+
+	t.Run("closed group treated as removed", func(t *testing.T) {
+		mgr := newMgr(&mockRemovableGroup{removeErr: lbAdapter.ErrGroupClosed})
+		require.NoError(t, mgr.RemoveFromGroup("auto-test", tag),
+			"removal racing group teardown must not error")
+		assert.True(t, pendingContains(mgr, tag), "outbound should still be queued for cleanup")
+	})
+
+	t.Run("tag not in group is idempotent", func(t *testing.T) {
+		mgr := newMgr(&mockRemovableGroup{removeN: 0})
+		assert.NoError(t, mgr.RemoveFromGroup("auto-test", tag))
+	})
+
+	t.Run("other errors propagate", func(t *testing.T) {
+		mgr := newMgr(&mockRemovableGroup{removeErr: errors.New("boom")})
+		err := mgr.RemoveFromGroup("auto-test", tag)
+		assert.ErrorContains(t, err, "boom")
+	})
+}
+
+// mockRemovableGroup implements MutableOutboundGroup with a configurable Remove.
+type mockRemovableGroup struct {
+	lbAdapter.MutableOutboundGroup
+	removeN   int
+	removeErr error
+}
+
+func (m *mockRemovableGroup) Remove(tags ...string) (int, error) {
+	return m.removeN, m.removeErr
 }
 
 // mockCheckerGroup implements both MutableOutboundGroup and OutboundChecker.
