@@ -267,8 +267,8 @@ github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb h1:c5YM7b3a4r2J
 github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb/go.mod h1:GkPT5P9JoOTIRXRmFWxYgu1hhXgTFFTNc2hoG7WQc3g=
 github.com/getlantern/sing v0.7.18-lantern h1:QKGgIUA3LwmKYP/7JlQTRkxj9jnP4cX2Q/B+nd8XEjo=
 github.com/getlantern/sing v0.7.18-lantern/go.mod h1:ARkL0gM13/Iv5VCZmci/NuoOlePoIsW0m7BWfln/Hak=
-github.com/getlantern/sing-box-minimal v1.12.22-lantern.0.20260529221144-439651539f38 h1:OfT3vn+nXMM9/D3clpakm1no8Hby3CuSg39DpV09Shg=
-github.com/getlantern/sing-box-minimal v1.12.22-lantern.0.20260529221144-439651539f38/go.mod h1:LzlFRel9E92gX0HXWCdsxgeg+kuAEPzLR+Znixk9EI4=
+github.com/getlantern/sing-box-minimal v1.12.22-lantern.0.20260717223538-d0cc8eb0fb17 h1:0L34+GKrF2zc6IVwncnh7AIcNHD5mPnfFtKe6uk4NrM=
+github.com/getlantern/sing-box-minimal v1.12.22-lantern.0.20260717223538-d0cc8eb0fb17/go.mod h1:LzlFRel9E92gX0HXWCdsxgeg+kuAEPzLR+Znixk9EI4=
 github.com/getlantern/telemetry v0.0.0-20250606052628-8960164ec1f5 h1:6ITBYqNkLbVZ1tQNXwmH8N80rZtvyW6IZa8L6EAhBQo=
 github.com/getlantern/telemetry v0.0.0-20250606052628-8960164ec1f5/go.mod h1:gx3dPUhZtQszPX5C+TshhxPXQHlY5t4gMnOOMA+viPA=
 github.com/getlantern/water v0.7.1-alpha.0.20260309190745-bd547c14b4aa h1:goZee1cURbWPiqX1xyjfwLB/zByQ50hEwonnnyLmcJQ=

@@ -215,11 +215,17 @@ func (m *MutableGroupManager) RemoveFromGroup(group, tag string) error {
 	}
 
 	n, err := groupObj.Remove(tag)
-	if err != nil || n == 0 {
-		if err == nil {
-			err = errors.New("unknown")
-		}
+	switch {
+	case errors.Is(err, adapter.ErrGroupClosed):
+		// The group was torn down concurrently (e.g. servers-updated racing
+		// tunnel shutdown). The tag is vacuously no longer a member, so fall
+		// through and still queue the underlying outbound for cleanup.
+		m.removalQueue.logger.Debug("group already closed, treating tag as removed and continuing outbound cleanup", slog.String("group", group), slog.String("tag", tag))
+	case err != nil:
 		return fmt.Errorf("failed to remove %s from %s: %w", tag, group, err)
+	case n == 0:
+		// Tag wasn't a member; removal is idempotent.
+		m.removalQueue.logger.Debug("tag not in group, continuing outbound cleanup", slog.String("group", group), slog.String("tag", tag))
 	}
 
 	outbound, exists := m.outboundMgr.Outbound(tag)
