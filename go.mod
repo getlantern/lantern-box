@@ -4,7 +4,7 @@ go 1.24.6
 
 replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.18-lantern
 
-replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.12.22-lantern.0.20260529221144-439651539f38
+replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.12.22-lantern.0.20260717223538-d0cc8eb0fb17
 
 replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4
 
