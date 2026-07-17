@@ -20,12 +20,6 @@ const (
 	tx ioAttr = "transmit"
 
 	ccNa = "n/a"
-
-	// goodputMinBytes is the minimum received bytes a session must have moved
-	// before its goodput sample is recorded. Filters out idle/tiny connections
-	// whose bytes/duration is dominated by setup and idle time rather than
-	// actual transfer speed.
-	goodputMinBytes = 1_000_000
 )
 
 type ioAttr string
@@ -134,23 +128,50 @@ func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
 }
 
 // recordGoodput records a session's download goodput (received bytes per
-// second of connection lifetime) at close, for sessions that moved at least
-// goodputMinBytes. durationMs is the connection's open time; it includes idle
-// periods, so this is a floor on true transfer speed — but both arms of a
-// bandit experiment are measured identically, so it's a fair relative signal,
-// and the byte floor filters the worst idle-dominated noise.
+// second of connection lifetime) at close. It emits for every session that
+// moved any bytes over a non-zero duration — there is NO byte floor.
+//
+// The floor used to be 1 MB, but the floored direction is the small
+// client→proxy (upload / "receive") side, which averages ~22 KB/session in
+// prod — ~45× under the old 1 MB floor. Only ~0.04% of sessions ever cleared
+// it, so the floor erased the goodput signal for the ~99.96% of real (probe,
+// connectivity-check, blocked-then-retry, small-page) traffic that dominates
+// censored markets, and the bandit evaluator false-retired live challengers as
+// "starved". Very short/tiny sessions do produce noisy per-second rates, but
+// the evaluator compares per-(track, country) p50 medians, which are robust to
+// that tail — so we keep the sample rather than drop, cap, or weight it.
+//
+// durationMs is the connection's open time; it includes idle periods, so this
+// is a floor on true transfer speed — but both arms of a bandit experiment are
+// measured identically, so it's a fair relative signal.
+//
+// The sample carries the track (point-attr key "track", not the resource attr
+// "proxy.track") and network.io.direction='receive' as point (not resource)
+// attributes, plus geo.country.iso_code via attrs.AsSlice(), so the evaluator
+// can filter/group by track and country.
 func (t *MetricsTracker) recordGoodput(rxBytes, durationMs int64, attrs *attributes) {
-	if rxBytes < goodputMinBytes || durationMs <= 0 {
+	if rxBytes <= 0 || durationMs <= 0 {
 		return
 	}
 	goodput := float64(rxBytes) / (float64(durationMs) / 1000.0)
-	// Copy into a slice sized for the extra element rather than appending onto
+	// Copy into a slice sized for the extra elements rather than appending onto
 	// AsSlice()'s result in place, so we never share a backing array with a
 	// concurrent reporter.
 	base := attrs.AsSlice()
-	a := make([]attribute.KeyValue, 0, len(base)+1)
+	a := make([]attribute.KeyValue, 0, len(base)+2)
 	a = append(a, base...)
-	a = append(a, semconv.NetworkIODirectionKey.String(string(rx)))
+	a = append(a,
+		semconv.NetworkIODirectionKey.String(string(rx)),
+		// The evaluator filters `track IN [...]` and groups by `track` on the
+		// bare, literal point-attribute key "track" (lantern-cloud
+		// GoodputByStratum: filter + queryScalar groupKeys{"track", ...} +
+		// series label s.labels["track"]). track is ALSO an OTEL resource attr,
+		// but keyed "proxy.track" (semconv.ProxyTrackKey) and the metrics
+		// pipeline doesn't expose resource attrs as queryable labels — so the
+		// point attr must use the bare "track" key, NOT semconv.ProxyTrackKey.
+		// (Mirrors http-proxy #675's attribute.String("track", ...).)
+		attribute.String("track", metrics.track),
+	)
 	metrics.sessionGoodput.Record(context.Background(), goodput, metric.WithAttributes(a...))
 }
 
