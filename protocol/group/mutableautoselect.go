@@ -966,9 +966,13 @@ func (s *MutableAutoSelect) mutateHistory(tag string, fn func(*localHistory, tim
 // can suppress downstream side effects (e.g. ladder kicks) on collapsed
 // events.
 func (s *MutableAutoSelect) recordUserFailure(tag string, kind adapter.UserFailureKind) bool {
-	return s.mutateHistory(tag, func(h *localHistory, now time.Time) bool {
+	recorded := s.mutateHistory(tag, func(h *localHistory, now time.Time) bool {
 		return h.addUserFailure(adapter.UserFailure{At: now, Kind: kind}, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
 	})
+	if recorded {
+		s.logger.Info("user failure: tag=", tag, " kind=", kind)
+	}
+	return recorded
 }
 
 func (s *MutableAutoSelect) recordProbeOutcome(tag string, success bool, delayMs uint32) {
