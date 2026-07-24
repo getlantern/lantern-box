@@ -4,7 +4,9 @@ import (
 	"context"
 
 	"github.com/sagernet/sing-box/experimental/libbox"
+	"github.com/sagernet/sing/service"
 
+	"github.com/getlantern/lantern-box/adapter"
 	"github.com/getlantern/lantern-box/protocol"
 )
 
@@ -12,19 +14,21 @@ type PlatformInterface interface {
 	LocalDNSTransport() libbox.LocalDNSTransport
 }
 
-// BaseContext returns a context with all sing-box and lantern-box protocols and DNS transports registered.
+// BaseContext returns a context with all sing-box and lantern-box protocols,
+// DNS transports, and an empty physical-endpoint registry.
 func BaseContext() context.Context {
 	return BaseContextWithDNSTransport(nil)
 }
 
-// BaseContextWithDNSTransport returns the [BaseContext] and registers the [libbox.LocalDNSTransport]
-// provided by the given [PlatformInterface].
+// BaseContextWithDNSTransport returns the [BaseContext] and registers the
+// [libbox.LocalDNSTransport] provided by the given [PlatformInterface].
 func BaseContextWithDNSTransport(platformInterface PlatformInterface) context.Context {
 	var pi libbox.PlatformInterface
 	if platformInterface != nil {
 		pi = &platformAdapter{pltIfc: platformInterface}
 	}
 	ctx := libbox.BaseContext(pi)
+	ctx = service.ContextWith[adapter.PhysicalEndpointRegistry](ctx, adapter.NewPhysicalEndpointRegistry())
 	return protocol.RegisterProtocols(ctx)
 }
 

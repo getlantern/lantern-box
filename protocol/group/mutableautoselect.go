@@ -22,6 +22,7 @@ import (
 	"github.com/sagernet/sing/service/pause"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/getlantern/lantern-box/adapter"
@@ -68,6 +69,8 @@ type MutableAutoSelect struct {
 	hist         historyParams
 	history      adapter.AutoSelectHistoryStorage
 
+	physicalEndpoints adapter.PhysicalEndpointRegistry
+
 	// Scratch buffers reused across calls by rankLocked and splitHealthyForLocked
 	// to avoid per-dial allocation; guarded by access, which their callers hold
 	// while consuming the returned slice before releasing it.
@@ -94,6 +97,10 @@ type MutableAutoSelect struct {
 	// stalls or dial errors arrive in quick succession.
 	lastLadderAt atomic.Int64
 	exhaustionCh chan struct{}
+
+	// Unix-nano of the latest routing-loop diagnostic. Rejections remain
+	// immediate; only the diagnostic is rate-limited.
+	lastRoutingLoopDiagnostic atomic.Int64
 
 	// Unix-nano of the most recent non-empty data-plane Read/Write; 0
 	// means no traffic observed yet. Drives the adaptive probe cadence.
@@ -186,6 +193,8 @@ func NewMutableAutoSelect(ctx context.Context, _ A.Router, logger log.ContextLog
 		hist:         hp,
 		history:      resolveHistoryStorage(ctx),
 		exhaustionCh: make(chan struct{}, 1),
+
+		physicalEndpoints: service.FromContext[adapter.PhysicalEndpointRegistry](ctx),
 	}
 	if slogger, ok := logger.(lLog.SLogger); ok {
 		nfact := lLog.NewFactory(slogger.SlogHandler().WithAttrs([]slog.Attr{slog.String("mutableautoselect_group", tag)}))
@@ -460,6 +469,10 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		return nil, err
 	}
 	outerTag := o.Tag()
+	if err := s.rejectRecursiveDial(ctx, outerTag, destination); err != nil {
+		span.SetStatus(codes.Error, adapter.ErrProxyRoutingLoop.Error())
+		return nil, err
+	}
 	conn, err := o.DialContext(ctx, network, destination)
 	if err == nil {
 		return s.wrapStream(conn, o), nil
@@ -477,6 +490,10 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	alt, altErr := s.selectForExcluding(network, outerTag)
 	if altErr == nil {
 		altTag := alt.Tag()
+		if err := s.rejectRecursiveDial(ctx, altTag, destination); err != nil {
+			span.SetStatus(codes.Error, adapter.ErrProxyRoutingLoop.Error())
+			return nil, err
+		}
 		conn, err = alt.DialContext(ctx, network, destination)
 		if err == nil {
 			go s.runLadder(outerTag)
@@ -507,6 +524,10 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		return nil, err
 	}
 	outerTag := o.Tag()
+	if err := s.rejectRecursiveDial(ctx, outerTag, destination); err != nil {
+		span.SetStatus(codes.Error, adapter.ErrProxyRoutingLoop.Error())
+		return nil, err
+	}
 	conn, err := o.ListenPacket(ctx, destination)
 	if err == nil {
 		return s.wrapPacket(conn, o), nil
@@ -517,6 +538,10 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	alt, altErr := s.selectForExcluding("udp", outerTag)
 	if altErr == nil {
 		altTag := alt.Tag()
+		if err := s.rejectRecursiveDial(ctx, altTag, destination); err != nil {
+			span.SetStatus(codes.Error, adapter.ErrProxyRoutingLoop.Error())
+			return nil, err
+		}
 		conn, err = alt.ListenPacket(ctx, destination)
 		if err == nil {
 			go s.runLadder(outerTag)
