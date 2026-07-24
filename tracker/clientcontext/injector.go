@@ -174,7 +174,7 @@ func (c *writeConn) sendInfo(conn net.Conn) error {
 		return fmt.Errorf("reading response: %w", err)
 	}
 	if string(resp[:]) != "OK" {
-		return fmt.Errorf("invalid response: %s", resp)
+		return fmt.Errorf("invalid response: %q", resp[:])
 	}
 	return nil
 }
@@ -282,7 +282,7 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 		return fmt.Errorf("reading response: %w", err)
 	}
 	if n < 2 || string(resp[:2]) != "OK" {
-		return fmt.Errorf("invalid response: %s", resp[:n])
+		return fmt.Errorf("invalid response: %q", resp[:n])
 	}
 	return nil
 }
