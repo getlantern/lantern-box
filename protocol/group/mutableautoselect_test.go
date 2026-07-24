@@ -12,6 +12,7 @@ import (
 	"time"
 
 	sbAdapter "github.com/sagernet/sing-box/adapter"
+	sbOutbound "github.com/sagernet/sing-box/adapter/outbound"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/x/list"
@@ -37,6 +38,7 @@ func newTestMUR(t *testing.T, tags ...string) (*MutableAutoSelect, map[string]*m
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	s := &MutableAutoSelect{
+		Adapter:      sbOutbound.NewAdapter(lConst.TypeMutableAutoSelect, "test", []string{"tcp", "udp"}, nil),
 		ctx:          ctx,
 		cancel:       cancel,
 		logger:       log.NewNOPFactory().Logger(),
@@ -52,9 +54,11 @@ func newTestMUR(t *testing.T, tags ...string) (*MutableAutoSelect, map[string]*m
 			dataPlaneIdle:     time.Hour,
 			maxPersistedAge:   defaultMaxPersistedAge,
 		},
-		hist:         defaultHistoryParams(),
-		history:      adapter.NewAutoSelectHistoryStorage(),
-		exhaustionCh: make(chan struct{}, 1),
+		hist:            defaultHistoryParams(),
+		history:         adapter.NewAutoSelectHistoryStorage(),
+		exhaustionCh:    make(chan struct{}, 1),
+		localCapacityCh: make(chan *adapter.LocalCapacityError, 1),
+		capacityGate:    &localCapacityGate{},
 	}
 	obs := make(map[string]*mockOutbound, len(tags))
 	for _, tag := range tags {

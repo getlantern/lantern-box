@@ -36,15 +36,16 @@ func RegisterMutableAutoSelect(registry *outbound.Registry) {
 }
 
 var (
-	_ adapter.MutableOutboundGroup = (*MutableAutoSelect)(nil)
-	_ A.OutboundGroup              = (*MutableAutoSelect)(nil)
-	_ A.URLTestGroup               = (*MutableAutoSelect)(nil)
-	_ A.InterfaceUpdateListener    = (*MutableAutoSelect)(nil)
-	_ A.ConnectionHandlerEx        = (*MutableAutoSelect)(nil)
-	_ A.PacketConnectionHandlerEx  = (*MutableAutoSelect)(nil)
-	_ adapter.URLOverrideSetter    = (*MutableAutoSelect)(nil)
-	_ adapter.OutboundChecker      = (*MutableAutoSelect)(nil)
-	_ adapter.ExhaustionSignaler   = (*MutableAutoSelect)(nil)
+	_ adapter.MutableOutboundGroup  = (*MutableAutoSelect)(nil)
+	_ A.OutboundGroup               = (*MutableAutoSelect)(nil)
+	_ A.URLTestGroup                = (*MutableAutoSelect)(nil)
+	_ A.InterfaceUpdateListener     = (*MutableAutoSelect)(nil)
+	_ A.ConnectionHandlerEx         = (*MutableAutoSelect)(nil)
+	_ A.PacketConnectionHandlerEx   = (*MutableAutoSelect)(nil)
+	_ adapter.URLOverrideSetter     = (*MutableAutoSelect)(nil)
+	_ adapter.OutboundChecker       = (*MutableAutoSelect)(nil)
+	_ adapter.ExhaustionSignaler    = (*MutableAutoSelect)(nil)
+	_ adapter.LocalCapacitySignaler = (*MutableAutoSelect)(nil)
 )
 
 const probeConcurrency = 6
@@ -94,6 +95,9 @@ type MutableAutoSelect struct {
 	// stalls or dial errors arrive in quick succession.
 	lastLadderAt atomic.Int64
 	exhaustionCh chan struct{}
+
+	localCapacityCh chan *adapter.LocalCapacityError
+	capacityGate    *localCapacityGate
 
 	// Unix-nano of the most recent non-empty data-plane Read/Write; 0
 	// means no traffic observed yet. Drives the adaptive probe cadence.
@@ -172,20 +176,22 @@ func NewMutableAutoSelect(ctx context.Context, _ A.Router, logger log.ContextLog
 	cfg, hp := resolveMutableAutoSelectOptions(options)
 	ctx, cancel := context.WithCancel(ctx)
 	out := &MutableAutoSelect{
-		Adapter:      outbound.NewAdapter(constant.TypeMutableAutoSelect, tag, []string{"tcp", "udp"}, nil),
-		ctx:          ctx,
-		cancel:       cancel,
-		outboundMgr:  service.FromContext[A.OutboundManager](ctx),
-		connMgr:      service.FromContext[A.ConnectionManager](ctx),
-		logger:       logger,
-		tags:         append([]string(nil), options.Outbounds...),
-		urlOverrides: maps.Clone(options.URLOverrides),
-		defaultURL:   options.URL,
-		histories:    make(map[string]*localHistory),
-		cfg:          cfg,
-		hist:         hp,
-		history:      resolveHistoryStorage(ctx),
-		exhaustionCh: make(chan struct{}, 1),
+		Adapter:         outbound.NewAdapter(constant.TypeMutableAutoSelect, tag, []string{"tcp", "udp"}, nil),
+		ctx:             ctx,
+		cancel:          cancel,
+		outboundMgr:     service.FromContext[A.OutboundManager](ctx),
+		connMgr:         service.FromContext[A.ConnectionManager](ctx),
+		logger:          logger,
+		tags:            append([]string(nil), options.Outbounds...),
+		urlOverrides:    maps.Clone(options.URLOverrides),
+		defaultURL:      options.URL,
+		histories:       make(map[string]*localHistory),
+		cfg:             cfg,
+		hist:            hp,
+		history:         resolveHistoryStorage(ctx),
+		exhaustionCh:    make(chan struct{}, 1),
+		localCapacityCh: make(chan *adapter.LocalCapacityError, 1),
+		capacityGate:    &globalLocalCapacityGate,
 	}
 	if slogger, ok := logger.(lLog.SLogger); ok {
 		nfact := lLog.NewFactory(slogger.SlogHandler().WithAttrs([]slog.Attr{slog.String("mutableautoselect_group", tag)}))
@@ -268,10 +274,11 @@ func (s *MutableAutoSelect) PostStart() error {
 func (s *MutableAutoSelect) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancel()
-		// Close under s.access so emitExhaustion (which holds the same
-		// lock around its send) can't race a send into a closed channel.
+		// Close under s.access so signal emitters (which hold the same
+		// lock around their sends) can't race a send into a closed channel.
 		s.access.Lock()
 		close(s.exhaustionCh)
+		close(s.localCapacityCh)
 		s.access.Unlock()
 	})
 	return nil
@@ -406,6 +413,13 @@ func (s *MutableAutoSelect) ExhaustionSignal() <-chan struct{} {
 	return s.exhaustionCh
 }
 
+// LocalCapacitySignal returns a receive-only channel for host-level socket
+// exhaustion. The channel buffers the latest pending signal and closes with
+// the group.
+func (s *MutableAutoSelect) LocalCapacitySignal() <-chan *adapter.LocalCapacityError {
+	return s.localCapacityCh
+}
+
 // URLTest implements sing-box's URLTestGroup contract: probes every
 // member in parallel and returns delay_ms per success. Used by the
 // offline pre-warm path before Start, so members are resolved lazily
@@ -454,6 +468,11 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	))
 	defer span.End()
 
+	if err := s.currentLocalCapacityError(); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
 	o, err := s.selectFor(network)
 	if err != nil {
 		span.RecordError(err)
@@ -465,6 +484,10 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		return s.wrapStream(conn, o), nil
 	}
 	s.logger.ErrorContext(ctx, err)
+	if capacityErr := s.localCapacityErrorFor(err); capacityErr != nil {
+		span.RecordError(capacityErr)
+		return nil, capacityErr
+	}
 	// Attribute the failure to the outer (member) tag so rankLocked and
 	// runLadder's gating both see it. For nested groups, the inner tag
 	// isn't a member of this group, so recordUserFailure would drop on
@@ -483,6 +506,10 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 			return s.wrapStream(conn, alt), nil
 		}
 		s.logger.ErrorContext(ctx, err)
+		if capacityErr := s.localCapacityErrorFor(err); capacityErr != nil {
+			span.RecordError(capacityErr)
+			return nil, capacityErr
+		}
 		s.recordUserFailure(altTag, adapter.UserFailureDial)
 		outerTag = altTag
 	}
@@ -501,6 +528,11 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	))
 	defer span.End()
 
+	if err := s.currentLocalCapacityError(); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
 	o, err := s.selectFor("udp")
 	if err != nil {
 		span.RecordError(err)
@@ -512,6 +544,10 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		return s.wrapPacket(conn, o), nil
 	}
 	s.logger.ErrorContext(ctx, err)
+	if capacityErr := s.localCapacityErrorFor(err); capacityErr != nil {
+		span.RecordError(capacityErr)
+		return nil, capacityErr
+	}
 	s.recordUserFailure(outerTag, adapter.UserFailureDial)
 
 	alt, altErr := s.selectForExcluding("udp", outerTag)
@@ -523,6 +559,10 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 			return s.wrapPacket(conn, alt), nil
 		}
 		s.logger.ErrorContext(ctx, err)
+		if capacityErr := s.localCapacityErrorFor(err); capacityErr != nil {
+			span.RecordError(capacityErr)
+			return nil, capacityErr
+		}
 		s.recordUserFailure(altTag, adapter.UserFailureDial)
 		outerTag = altTag
 	}
@@ -1003,7 +1043,7 @@ func (s *MutableAutoSelect) recordProbeOutcome(tag string, success bool, delayMs
 // target is for diagnostic logging only and to gate concurrent
 // invocations through laddering's CAS.
 func (s *MutableAutoSelect) runLadder(target string) {
-	if s.isClosed() {
+	if s.isClosed() || s.currentLocalCapacityError() != nil {
 		return
 	}
 	if last := s.lastLadderAt.Load(); last != 0 {
@@ -1021,6 +1061,10 @@ func (s *MutableAutoSelect) runLadder(target string) {
 	// cycle holding the mutex doesn't eat into the ladder's actual
 	// probing time.
 	s.probeMu.Lock()
+	if s.currentLocalCapacityError() != nil {
+		s.probeMu.Unlock()
+		return
+	}
 	fullCtx, cancel := context.WithTimeout(s.ctx, s.cfg.ladderTotalBudget)
 	defer cancel()
 	winner := s.probeCycleInner(fullCtx, time.Now())
