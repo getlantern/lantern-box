@@ -261,6 +261,13 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     # Alicloud copies images to 8 regions (up to 2h). OCI builds 36 regions
     # in parallel — usually ~7min but a slow mirror can push past 45min.
+    # NOTE: gcore also fans out — gcore-publish.sh imports+polls each region
+    # SEQUENTIALLY (worst case ~30min/region: POLL_ATTEMPTS×POLL_INTERVAL_SECS)
+    # — but keeps the 60min default. That's fine for the current single-region
+    # default (gcore_regions=180); before expanding gcore_regions to many
+    # regions, scale this timeout with the region count (e.g. compute it in the
+    # prepare job) or parallelize the imports in gcore-publish.sh, else the job
+    # can be killed mid-import and leave orphaned gcore tasks. See PR #292.
     timeout-minutes: ${{ matrix.builder == 'alicloud-ecs' && 150 || 60 }}
 
     steps:
