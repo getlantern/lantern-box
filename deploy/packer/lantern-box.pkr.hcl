@@ -1155,6 +1155,14 @@ build {
       "truncate -s 0 /etc/machine-id",
       "rm -f /var/lib/dbus/machine-id",
       "rm -f /etc/ssh/ssh_host_*",
+      # Remove the build-only SSH password-auth drop-in: cloud-init wrote it
+      # because the NoCloud build seed set `ssh_pwauth: true` (needed so Packer
+      # could SSH into the build VM with a password). provision.sh's
+      # 01-lantern-harden.conf (PasswordAuthentication no) is the authoritative
+      # hardening and sorts ahead of 50-, so password auth is already off — but
+      # dropping this leaves no contradictory `PasswordAuthentication yes` in the
+      # shipped image rather than relying on drop-in ordering.
+      "rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf",
       "passwd -l ubuntu",
     ]
   }
