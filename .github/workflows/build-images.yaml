@@ -513,10 +513,9 @@ jobs:
           GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
           GCORE_PROJECT_ID: ${{ secrets.GCORE_PROJECT_ID }}
           QEMU_SSH_PASSWORD: ${{ secrets.QEMU_SSH_PASSWORD }}
-          GCORE_IMAGE_GCS_BUCKET: ${{ secrets.GCORE_IMAGE_GCS_BUCKET }}
         run: |
           missing=""
-          for var in GCORE_API_KEY GCORE_PROJECT_ID QEMU_SSH_PASSWORD GCORE_IMAGE_GCS_BUCKET; do
+          for var in GCORE_API_KEY GCORE_PROJECT_ID QEMU_SSH_PASSWORD; do
             [ -z "${!var}" ] && missing="$missing $var"
           done
           if [ -n "$missing" ]; then
@@ -549,34 +548,42 @@ jobs:
             -only="qemu.lantern-box-gcore" \
             .
 
-      - name: Authenticate to Google Cloud (gcore)
+      - name: Provision gcore object storage (gcore)
+        id: gstore
         if: matrix.builder == 'gcore'
-        uses: google-github-actions/auth@v2
-        with:
-          token_format: access_token
-          workload_identity_provider: projects/472305719257/locations/global/workloadIdentityPools/github-actions/providers/ghactions-provider
-          service_account: ghactions@lantern-cloud.iam.gserviceaccount.com
+        env:
+          GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
+        run: |
+          # Find-or-create the dedicated gcore S3 storage + bucket and mint an
+          # ephemeral access key (revoked in the cleanup step below). Emits
+          # storage_id/address/bucket/access_key/secret_key as step outputs.
+          bash deploy/packer/gcore-storage.sh provision | while IFS='=' read -r k v; do
+            case "$k" in access_key | secret_key) echo "::add-mask::$v" ;; esac
+            echo "$k=$v" >> "$GITHUB_OUTPUT"
+          done
 
-      - name: Set up gcloud (gcore)
-        if: matrix.builder == 'gcore'
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Upload qcow2 to GCS and sign URL (gcore)
+      - name: Upload qcow2 and presign URL (gcore)
         id: gcs
         if: matrix.builder == 'gcore'
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-          BUCKET: ${{ secrets.GCORE_IMAGE_GCS_BUCKET }}
-          SIGNER_SA: ghactions@lantern-cloud.iam.gserviceaccount.com
+          AWS_ACCESS_KEY_ID: ${{ steps.gstore.outputs.access_key }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.gstore.outputs.secret_key }}
+          # gcore object storage is S3-compatible; the AWS CLI is used only as an
+          # S3 client pointed at gcore's endpoint (never AWS). SigV4 needs a region
+          # value and gcore doesn't validate it, so a placeholder is fine. If a
+          # live run rejects the request, the knobs to try are this region and
+          # path-style addressing: aws configure set default.s3.addressing_style path
+          AWS_DEFAULT_REGION: us-east-1
+          ADDRESS: ${{ steps.gstore.outputs.address }}
+          BUCKET: ${{ steps.gstore.outputs.bucket }}
         run: |
+          endpoint="https://${ADDRESS}"
+          key="lantern-box/lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
           qcow2="deploy/packer/output-gcore/lantern-box-${VERSION}-amd64.qcow2"
-          obj="gs://${BUCKET}/lantern-box/lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
-          echo "Uploading ${qcow2} -> ${obj}"
-          gcloud storage cp "$qcow2" "$obj"
-          url=$(gcloud storage sign-url "$obj" \
-            --duration=24h \
-            --impersonate-service-account="$SIGNER_SA" \
-            --format='value(signed_url)')
+          echo "Uploading ${qcow2} -> s3://${BUCKET}/${key} via ${endpoint}"
+          aws s3 cp "$qcow2" "s3://${BUCKET}/${key}" --endpoint-url "$endpoint"
+          url=$(aws s3 presign "s3://${BUCKET}/${key}" --endpoint-url "$endpoint" --expires-in 86400)
           echo "::add-mask::$url"
           echo "url=$url" >> "$GITHUB_OUTPUT"
 
@@ -589,6 +596,14 @@ jobs:
           GCORE_REGIONS: ${{ needs.prepare.outputs.gcore_regions }}
           IMAGE_URL: ${{ steps.gcs.outputs.url }}
         run: bash deploy/packer/gcore-publish.sh
+
+      - name: Clean up gcore access key (gcore)
+        if: always() && matrix.builder == 'gcore' && steps.gstore.outputs.access_key != ''
+        env:
+          GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
+          STORAGE_ID: ${{ steps.gstore.outputs.storage_id }}
+          ACCESS_KEY: ${{ steps.gstore.outputs.access_key }}
+        run: bash deploy/packer/gcore-storage.sh cleanup
 
       - name: Clean up OCI key
         if: always() && matrix.builder == 'oracle-oci'

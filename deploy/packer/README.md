@@ -90,7 +90,6 @@ In CI, the `datacap` binary is built from `getlantern/lantern-cloud` and baked i
 | `GCORE_API_KEY` | Gcore Cloud API token (sent as `Authorization: APIKey ...`) |
 | `GCORE_PROJECT_ID` | Gcore project ID (numeric); scopes every API call |
 | `QEMU_SSH_PASSWORD` | Build-time password for the ubuntu user in the QEMU (gcore) build |
-| `GCORE_IMAGE_GCS_BUCKET` | Private GCS bucket the built qcow2 is uploaded to for import |
 
 ## Deploy a VPS from the image
 
@@ -125,9 +124,13 @@ provider's image store) gcore uses a **build → host → import** pipeline:
    builder (so image contents match), then generalizes the disk (cloud-init
    clean, zero machine-id, drop SSH host keys, lock the build password) so the
    raw disk boots fresh on import.
-2. CI uploads the qcow2 to a private GCS bucket and mints a 24h V4 signed URL
-   (reusing the repo's existing Workload Identity Federation to the
-   `lantern-cloud` GCP project — no static key).
+2. CI stages the qcow2 in **gcore's own S3-compatible object storage** and hands
+   gcore a short-lived presigned URL — no external cloud, no stored bucket/key
+   secret. `deploy/packer/gcore-storage.sh` (gcore control plane, via the API)
+   find-or-creates a dedicated storage instance (`lantern-box-images`, location
+   `luxembourg-2`) + bucket and mints an **ephemeral** access key; the AWS CLI —
+   as a generic S3 client pointed at gcore's endpoint, not AWS — uploads the
+   qcow2 and `presign`s a 24h URL; a cleanup step revokes the key.
 3. `deploy/packer/gcore-publish.sh` imports that URL into each target region via
    `POST cloud/v1/downloadimage/{project}/{region}` (name `lantern-box-<version>`,
    `architecture=x86_64`, `os_type=linux`) and polls each task to `FINISHED`.
@@ -146,13 +149,12 @@ in CI, not on macOS. To validate the config anywhere:
 
 **Operator prerequisites (one-time):**
 
-- Repo secrets: `GCORE_API_KEY`, `GCORE_PROJECT_ID`, `QEMU_SSH_PASSWORD`,
-  `GCORE_IMAGE_GCS_BUCKET`.
-- GCP (lantern-cloud project): create the private GCS bucket (add a short
-  object-expiry lifecycle rule — the qcow2 in GCS is only needed transiently
-  during import); grant `ghactions@lantern-cloud.iam.gserviceaccount.com`
-  `roles/storage.objectAdmin` on the bucket and `roles/iam.serviceAccountTokenCreator`
-  **on itself** so `gcloud storage sign-url` can sign via IAM SignBlob under WIF.
+- Repo secrets: `GCORE_API_KEY` (must have **object-storage** permission, not just
+  cloud/compute), `GCORE_PROJECT_ID`, `QEMU_SSH_PASSWORD`.
+
+That's it — the storage instance, bucket, and (ephemeral) access keys are created
+and torn down by the workflow itself (`gcore-storage.sh`), so there's no bucket to
+pre-create and no cloud IAM to configure.
 
 ## Adding a new cloud provider
 
