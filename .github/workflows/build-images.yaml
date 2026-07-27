@@ -177,10 +177,13 @@ jobs:
             region="${region//[[:space:]]/}"
             [ -z "$region" ] && continue
             echo "Fetching gcore private images in region ${region}..."
-            images=$(curl -sS -f -H "$AUTH" \
-              "${API}/images/${GCORE_PROJECT_ID}/${region}?private=true" \
-              | jq -r '.results[] | select(.name | startswith("lantern-box-")) | "\(.created_at)\t\(.id)\t\(.name)"' \
-              | sort -r)
+            if ! raw=$(curl -sS -f -H "$AUTH" \
+              "${API}/images/${GCORE_PROJECT_ID}/${region}?private=true"); then
+              echo "::error::Failed to list gcore images in region ${region}"
+              failures=$((failures + 1))
+              continue
+            fi
+            images=$(echo "$raw" | jq -r '.results[] | select(.name | startswith("lantern-box-")) | "\(.created_at)\t\(.id)\t\(.name)"' | sort -r)
             total=$(echo "$images" | grep -c . || true)
             echo "Region ${region}: found ${total} lantern-box images (keeping ${KEEP})"
             if [ "$total" -le "$KEEP" ]; then
@@ -498,6 +501,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y -q qemu-system-x86 qemu-utils
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm not available on this runner — QEMU build requires KVM"
+            exit 1
+          fi
           sudo chmod 666 /dev/kvm
           echo "KVM device:"; ls -l /dev/kvm
 
