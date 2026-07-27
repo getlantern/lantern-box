@@ -45,11 +45,15 @@ mode="${FAKE_CURL_MODE:-ok}"
 for a in "$@"; do
   case "$a" in
     *downloadimage*)
-      if [ "$mode" = mixed ]; then
+      # import_region uses `curl -w '\n%{http_code}'`, so append a status line.
+      http="${FAKE_CURL_IMPORT_HTTP:-200}"
+      if [ "$http" != 200 ]; then
+        printf '%s\n%s' '{"detail":"import rejected"}' "$http"
+      elif [ "$mode" = mixed ]; then
         region="${a##*/}"
-        echo "{\"tasks\":[\"task-${region}\"]}"
+        printf '%s\n%s' "{\"tasks\":[\"task-${region}\"]}" 200
       else
-        echo '{"tasks":["task-abc"]}'
+        printf '%s\n%s' '{"tasks":["task-abc"]}' 200
       fi
       exit 0 ;;
     */tasks/*)
@@ -166,6 +170,19 @@ if [ "$rc" -ne 0 ] \
   echo "PASS: mixed multi-region outcome"
 else
   echo "FAIL: mixed multi-region outcome (rc=$rc)"; echo "$out"; FAILED=1
+fi
+
+# Test 7: downloadimage returns an HTTP error -> non-zero exit, status + body
+# surfaced (rather than the empty message the old `curl -f` produced).
+dir=$(make_fake_curl); TMP_DIRS+=("$dir")
+out=$(PATH="$dir:$PATH" FAKE_CURL_IMPORT_HTTP=422 \
+  GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
+  GCORE_REGIONS="180" POLL_INTERVAL_SECS=0 \
+  bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
+if [ "$rc" -ne 0 ] && grep -q "HTTP 422" <<<"$out" && grep -q "import rejected" <<<"$out"; then
+  echo "PASS: import HTTP error surfaces status + body"
+else
+  echo "FAIL: import HTTP error (rc=$rc)"; echo "$out"; FAILED=1
 fi
 
 if [ "$FAILED" -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi

@@ -34,18 +34,26 @@ IMAGE_NAME="lantern-box-${VERSION}"
 
 # import_region REGION -> prints the created task ID on stdout.
 import_region() {
-  local region="$1" body resp task
+  local region="$1" body resp http task
   body=$(jq -n \
     --arg name "$IMAGE_NAME" \
     --arg url "$IMAGE_URL" \
     '{name: $name, url: $url, architecture: "x86_64", os_type: "linux", os_distro: "ubuntu", os_version: "24.04"}')
-  resp=$("$CURL" -sS -f -X POST \
+  # Capture the response body AND HTTP status (NOT -f, which discards the error
+  # body) so a gcore rejection is surfaced instead of an empty message.
+  resp=$("$CURL" -sS -w $'\n%{http_code}' -X POST \
     -H "$AUTH" -H "Content-Type: application/json" \
     -d "$body" \
     "${API_BASE}/downloadimage/${GCORE_PROJECT_ID}/${region}")
+  http="${resp##*$'\n'}"
+  resp="${resp%$'\n'*}"
+  if [ "$http" -lt 200 ] || [ "$http" -ge 300 ]; then
+    echo "::error::gcore import in region ${region} failed: HTTP ${http}: ${resp}" >&2
+    return 1
+  fi
   task=$(printf '%s' "$resp" | jq -r '.tasks[0] // empty')
   if [ -z "$task" ]; then
-    echo "::error::gcore import in region ${region} returned no task id: ${resp}" >&2
+    echo "::error::gcore import in region ${region} returned no task id (HTTP ${http}): ${resp}" >&2
     return 1
   fi
   printf '%s' "$task"
