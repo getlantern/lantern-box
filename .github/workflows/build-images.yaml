@@ -192,8 +192,12 @@ jobs:
             fi
             while IFS=$'\t' read -r created id name; do
               echo "Deleting ${name} (${id}, created ${created}) in region ${region}..."
-              http_code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$AUTH" \
-                "${API}/images/${GCORE_PROJECT_ID}/${region}/${id}")
+              if ! http_code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$AUTH" \
+                "${API}/images/${GCORE_PROJECT_ID}/${region}/${id}"); then
+                echo "::error::Failed to reach gcore to delete ${name} (${id}) in region ${region}"
+                failures=$((failures + 1))
+                continue
+              fi
               if [ "$http_code" = "404" ]; then
                 echo "  Already gone (404), skipping."
               elif [ "$http_code" -ge 400 ]; then
