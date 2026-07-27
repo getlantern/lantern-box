@@ -20,9 +20,14 @@ on:
         required: false
         type: string
       builders:
-        description: "Comma-separated builders (linode,oracle-oci,alicloud-ecs)"
+        description: "Comma-separated builders (linode,oracle-oci,alicloud-ecs,gcore)"
         required: false
-        default: "linode,oracle-oci,alicloud-ecs"
+        default: "linode,oracle-oci,alicloud-ecs,gcore"
+        type: string
+      gcore_regions:
+        description: "Comma-separated Gcore numeric region IDs (gcore builder only). Default 180 = Frankfurt-2."
+        required: false
+        default: "180"
         type: string
 
 permissions:
@@ -37,6 +42,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       matrix: ${{ steps.matrix.outputs.matrix }}
+      gcore_regions: ${{ steps.gcore.outputs.regions }}
     steps:
       - name: Checkout (full history — needed to find the latest tag)
         uses: actions/checkout@v6
@@ -87,11 +93,11 @@ jobs:
           INPUT_BUILDERS: ${{ github.event.inputs.builders }}
         run: |
           if [ "$EVENT_NAME" = "push" ]; then
-            builders="linode,oracle-oci,alicloud-ecs"
+            builders="linode,oracle-oci,alicloud-ecs,gcore"
           elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_BUILDERS" ]; then
             builders="$INPUT_BUILDERS"
           else
-            builders="linode,oracle-oci,alicloud-ecs"
+            builders="linode,oracle-oci,alicloud-ecs,gcore"
           fi
           # Validate that we have at least one builder
           if [ -z "$builders" ]; then
@@ -104,6 +110,15 @@ jobs:
           json_array=$(printf '%s\n' "$builders" | tr ',' '\n' | jq -R . | jq -sc .)
           echo "matrix={\"builder\":$json_array}" >> "$GITHUB_OUTPUT"
           echo "Matrix: $json_array"
+
+      - name: Resolve gcore regions
+        id: gcore
+        env:
+          INPUT_REGIONS: ${{ github.event.inputs.gcore_regions }}
+        run: |
+          regions="${INPUT_REGIONS:-180}"
+          echo "regions=$regions" >> "$GITHUB_OUTPUT"
+          echo "gcore regions: $regions"
 
   # Prune old images before building (avoids provider quota limits)
   prune:
@@ -144,6 +159,49 @@ jobs:
               echo "::error::$failures image(s) failed to delete"
               exit 1
             fi
+          fi
+
+      - name: Prune old gcore images
+        if: contains(needs.prepare.outputs.matrix, 'gcore')
+        env:
+          GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
+          GCORE_PROJECT_ID: ${{ secrets.GCORE_PROJECT_ID }}
+          GCORE_REGIONS: ${{ needs.prepare.outputs.gcore_regions }}
+        run: |
+          KEEP=3
+          API="https://api.gcore.com/cloud/v1"
+          AUTH="Authorization: APIKey ${GCORE_API_KEY}"
+          failures=0
+          IFS=',' read -ra regions <<< "$GCORE_REGIONS"
+          for region in "${regions[@]}"; do
+            region="${region//[[:space:]]/}"
+            [ -z "$region" ] && continue
+            echo "Fetching gcore private images in region ${region}..."
+            images=$(curl -sS -f -H "$AUTH" \
+              "${API}/images/${GCORE_PROJECT_ID}/${region}?private=true" \
+              | jq -r '.results[] | select(.name | startswith("lantern-box-")) | "\(.created_at)\t\(.id)\t\(.name)"' \
+              | sort -r)
+            total=$(echo "$images" | grep -c . || true)
+            echo "Region ${region}: found ${total} lantern-box images (keeping ${KEEP})"
+            if [ "$total" -le "$KEEP" ]; then
+              echo "Nothing to prune."
+              continue
+            fi
+            while IFS=$'\t' read -r created id name; do
+              echo "Deleting ${name} (${id}, created ${created}) in region ${region}..."
+              http_code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$AUTH" \
+                "${API}/images/${GCORE_PROJECT_ID}/${region}/${id}")
+              if [ "$http_code" = "404" ]; then
+                echo "  Already gone (404), skipping."
+              elif [ "$http_code" -ge 400 ]; then
+                echo "::error::Failed to delete gcore image ${name} (${id}) in region ${region}: HTTP ${http_code}"
+                failures=$((failures + 1))
+              fi
+            done < <(echo "$images" | tail -n +$((KEEP + 1)))
+          done
+          if [ "$failures" -gt 0 ]; then
+            echo "::error::${failures} gcore image(s) failed to delete"
+            exit 1
           fi
 
   build-datacap:
@@ -188,6 +246,9 @@ jobs:
     name: Build ${{ matrix.builder }}
     runs-on: ubuntu-latest
     needs: [prepare, prune, build-datacap]
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -234,6 +295,9 @@ jobs:
               ;;
             linode|alicloud-ecs)
               echo "flag=${BUILDER}.lantern-box" >> "$GITHUB_OUTPUT"
+              ;;
+            gcore)
+              echo "flag=qemu.lantern-box-gcore" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "::error::Unsupported builder: $BUILDER"
@@ -337,6 +401,7 @@ jobs:
           echo "All OCI region secrets present"
 
       - name: Build
+        if: matrix.builder != 'gcore'
         working-directory: deploy/packer
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -427,6 +492,67 @@ jobs:
             -var "lantern_box_version=$VERSION" \
             -only="$ONLY" \
             .
+
+      - name: Enable KVM (gcore)
+        if: matrix.builder == 'gcore'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -q qemu-system-x86 qemu-utils
+          sudo chmod 666 /dev/kvm
+          echo "KVM device:"; ls -l /dev/kvm
+
+      - name: Build gcore qcow2
+        if: matrix.builder == 'gcore'
+        working-directory: deploy/packer
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          QEMU_SSH_PASSWORD: ${{ secrets.QEMU_SSH_PASSWORD }}
+        run: |
+          packer build \
+            -var "lantern_box_version=$VERSION" \
+            -only="qemu.lantern-box-gcore" \
+            .
+
+      - name: Authenticate to Google Cloud (gcore)
+        if: matrix.builder == 'gcore'
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: projects/472305719257/locations/global/workloadIdentityPools/github-actions/providers/ghactions-provider
+          service_account: ghactions@lantern-cloud.iam.gserviceaccount.com
+
+      - name: Set up gcloud (gcore)
+        if: matrix.builder == 'gcore'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload qcow2 to GCS and sign URL (gcore)
+        id: gcs
+        if: matrix.builder == 'gcore'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUCKET: ${{ secrets.GCORE_IMAGE_GCS_BUCKET }}
+          SIGNER_SA: ghactions@lantern-cloud.iam.gserviceaccount.com
+        run: |
+          qcow2="deploy/packer/output-gcore/lantern-box-${VERSION}-amd64.qcow2"
+          obj="gs://${BUCKET}/lantern-box/lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
+          echo "Uploading ${qcow2} -> ${obj}"
+          gcloud storage cp "$qcow2" "$obj"
+          url=$(gcloud storage sign-url "$obj" \
+            --duration=24h \
+            --impersonate-service-account="$SIGNER_SA" \
+            --format='value(signed_url)')
+          echo "::add-mask::$url"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Publish gcore image to regions
+        if: matrix.builder == 'gcore'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
+          GCORE_PROJECT_ID: ${{ secrets.GCORE_PROJECT_ID }}
+          GCORE_REGIONS: ${{ needs.prepare.outputs.gcore_regions }}
+          IMAGE_URL: ${{ steps.gcs.outputs.url }}
+        run: bash deploy/packer/gcore-publish.sh
 
       - name: Clean up OCI key
         if: always() && matrix.builder == 'oracle-oci'
