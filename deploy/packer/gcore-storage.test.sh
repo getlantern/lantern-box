@@ -38,6 +38,7 @@ case "$method $url" in
   "GET "*/access_keys*)        echo '{"results":[{"access_key":"OLDKEY"}]}' ;;
   "POST "*/buckets)            echo '{"name":"lantern-box-images"}' ;;
   "GET "*/buckets*)            echo '{"results":[]}' ;;
+  "GET "*/locations*)          echo '{"results":[{"name":"luxembourg-2","technical_name":"s-ed1","type":"s3_compatible"}]}' ;;
   "POST "*/object_storages)    echo '{"id":42,"address":"lux.storage.example","provisioning_status":"active"}' ;;
   "GET "*/object_storages/42)  echo '{"id":42,"address":"lux.storage.example","provisioning_status":"active"}' ;;
   "GET "*/object_storages*)
@@ -67,13 +68,13 @@ check() { # desc, expected-rc-zero(0/1), output, [grep patterns...]
 dir=$(make_fake_curl)
 out=$(PATH="$dir:$PATH" GCORE_API_KEY=k POLL_INTERVAL_SECS=0 bash "$SCRIPT" provision 2>/dev/null) && rc=0 || rc=$?
 check "provision (existing instance)" 0 "$out" "$rc" \
-  '^storage_id=42$' '^address=lux.storage.example$' '^bucket=lantern-box-images$' \
-  '^access_key=NEWKEY$' '^secret_key=NEWSECRET$'
+  '^storage_id=42$' '^region=s-ed1$' '^endpoint=https://s-ed1.cloud.gcore.lu$' \
+  '^bucket=lantern-box-images$' '^access_key=NEWKEY$' '^secret_key=NEWSECRET$'
 
 # Test 2: provision when the instance must be created.
 dir=$(make_fake_curl)
 out=$(PATH="$dir:$PATH" FAKE_MODE=create GCORE_API_KEY=k POLL_INTERVAL_SECS=0 bash "$SCRIPT" provision 2>/dev/null) && rc=0 || rc=$?
-check "provision (create instance)" 0 "$out" "$rc" '^storage_id=42$' '^access_key=NEWKEY$'
+check "provision (create instance)" 0 "$out" "$rc" '^storage_id=42$' '^region=s-ed1$' '^access_key=NEWKEY$'
 
 # Test 3: cleanup deletes the access key.
 dir=$(make_fake_curl)

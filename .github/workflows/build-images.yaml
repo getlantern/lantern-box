@@ -570,23 +570,21 @@ jobs:
         if: matrix.builder == 'gcore'
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          # gcore object storage is S3-compatible; the AWS CLI is used only as an
+          # S3 client pointed at gcore's regional S3 endpoint (never AWS). The
+          # endpoint + region come from gcore-storage.sh (the location's
+          # technical_name), e.g. https://s-ed1.cloud.gcore.lu with region s-ed1.
           AWS_ACCESS_KEY_ID: ${{ steps.gstore.outputs.access_key }}
           AWS_SECRET_ACCESS_KEY: ${{ steps.gstore.outputs.secret_key }}
-          # gcore object storage is S3-compatible; the AWS CLI is used only as an
-          # S3 client pointed at gcore's endpoint (never AWS). SigV4 needs a region
-          # value and gcore doesn't validate it, so a placeholder is fine. If a
-          # live run rejects the request, the knobs to try are this region and
-          # path-style addressing: aws configure set default.s3.addressing_style path
-          AWS_DEFAULT_REGION: us-east-1
-          ADDRESS: ${{ steps.gstore.outputs.address }}
+          AWS_DEFAULT_REGION: ${{ steps.gstore.outputs.region }}
+          ENDPOINT: ${{ steps.gstore.outputs.endpoint }}
           BUCKET: ${{ steps.gstore.outputs.bucket }}
         run: |
-          endpoint="https://${ADDRESS}"
           key="lantern-box/lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
           qcow2="deploy/packer/output-gcore/lantern-box-${VERSION}-amd64.qcow2"
-          echo "Uploading ${qcow2} -> s3://${BUCKET}/${key} via ${endpoint}"
-          aws s3 cp "$qcow2" "s3://${BUCKET}/${key}" --endpoint-url "$endpoint"
-          url=$(aws s3 presign "s3://${BUCKET}/${key}" --endpoint-url "$endpoint" --expires-in 86400)
+          echo "Uploading ${qcow2} -> s3://${BUCKET}/${key} via ${ENDPOINT}"
+          aws s3 cp "$qcow2" "s3://${BUCKET}/${key}" --endpoint-url "$ENDPOINT"
+          url=$(aws s3 presign "s3://${BUCKET}/${key}" --endpoint-url "$ENDPOINT" --expires-in 86400)
           echo "::add-mask::$url"
           echo "url=$url" >> "$GITHUB_OUTPUT"
 
@@ -610,12 +608,12 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           AWS_ACCESS_KEY_ID: ${{ steps.gstore.outputs.access_key }}
           AWS_SECRET_ACCESS_KEY: ${{ steps.gstore.outputs.secret_key }}
-          AWS_DEFAULT_REGION: us-east-1
-          ADDRESS: ${{ steps.gstore.outputs.address }}
+          AWS_DEFAULT_REGION: ${{ steps.gstore.outputs.region }}
+          ENDPOINT: ${{ steps.gstore.outputs.endpoint }}
           BUCKET: ${{ steps.gstore.outputs.bucket }}
         run: |
           key="lantern-box/lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
-          aws s3 rm "s3://${BUCKET}/${key}" --endpoint-url "https://${ADDRESS}" || true
+          aws s3 rm "s3://${BUCKET}/${key}" --endpoint-url "$ENDPOINT" || true
 
       - name: Clean up gcore access key (gcore)
         if: always() && matrix.builder == 'gcore' && steps.gstore.outputs.access_key != ''

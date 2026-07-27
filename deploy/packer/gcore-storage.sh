@@ -11,7 +11,8 @@
 #   provision  Find-or-create the dedicated S3 storage instance + bucket, mint a
 #              fresh access key, and print these key=value lines to stdout:
 #                storage_id=<int>
-#                address=<s3 host, e.g. luxembourg-2.storage.gcore.dev>
+#                region=<s3 region = location technical_name, e.g. s-ed1>
+#                endpoint=<s3 endpoint, e.g. https://s-ed1.cloud.gcore.lu>
 #                bucket=<name>
 #                access_key=<key>
 #                secret_key=<secret>
@@ -37,18 +38,29 @@ LOCATION_NAME="${LOCATION_NAME:-luxembourg-2}"
 BUCKET_NAME="${BUCKET_NAME:-lantern-box-images}"
 POLL_ATTEMPTS="${POLL_ATTEMPTS:-60}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-5}"
+# gcore's S3 API endpoint is https://<region>.<suffix>, where <region> is the
+# location's technical_name (luxembourg-2 -> s-ed1). NOTE: this is NOT the
+# object_storages `address` field — that host is not the S3 API endpoint.
+S3_ENDPOINT_SUFFIX="${GCORE_S3_ENDPOINT_SUFFIX:-cloud.gcore.lu}"
 
 # GET with fail-on-HTTP-error. A real API error propagates (pipefail); a valid
 # empty result does not.
 api_get() { "$CURL" -sS -f -H "$AUTH" "$@"; }
 
-# find_storage -> "<id>\t<address>\t<provisioning_status>" for the instance named
+# find_storage -> "<id>\t<provisioning_status>" for the instance named
 # STORAGE_NAME, or empty output if absent. Uses jq indexing (not `head`) so it
 # never triggers a SIGPIPE under `set -o pipefail`.
 find_storage() {
   api_get "${API_BASE}/object_storages?limit=1000" | jq -r --arg n "$STORAGE_NAME" '
     [.results[] | select(.name == $n)][0]
-    | if . then "\(.id)\t\(.address)\t\(.provisioning_status)" else empty end'
+    | if . then "\(.id)\t\(.provisioning_status)" else empty end'
+}
+
+# resolve_region -> the S3 region code (the location's technical_name) for
+# LOCATION_NAME, e.g. luxembourg-2 -> s-ed1. Empty output if not found.
+resolve_region() {
+  api_get "${API_BASE}/locations?limit=1000" | jq -r --arg n "$LOCATION_NAME" '
+    [.results[] | select(.name == $n)][0].technical_name // empty'
 }
 
 # storage_field ID FIELD -> a single field from the instance record.
@@ -73,17 +85,14 @@ wait_active() {
   return 1
 }
 
-# ensure_storage -> "<id>\t<address>"; creates the instance and waits for active
-# if it doesn't already exist. Diagnostics go to stderr so stdout stays clean.
+# ensure_storage -> "<id>"; creates the instance and waits for active if it
+# doesn't already exist. Diagnostics go to stderr so stdout stays clean.
 ensure_storage() {
-  local line id address status resp
+  local line id status resp
   line=$(find_storage)
   if [ -n "$line" ]; then
-    IFS=$'\t' read -r id address status <<<"$line"
-    if [ "$status" != "active" ]; then
-      wait_active "$id" || return 1
-      address=$(storage_field "$id" address)
-    fi
+    IFS=$'\t' read -r id status <<<"$line"
+    [ "$status" = "active" ] || wait_active "$id" || return 1
   else
     echo "creating gcore storage ${STORAGE_NAME} in ${LOCATION_NAME}" >&2
     resp=$("$CURL" -sS -f -X POST -H "$AUTH" -H 'Content-Type: application/json' \
@@ -91,9 +100,8 @@ ensure_storage() {
       "${API_BASE}/object_storages")
     id=$(printf '%s' "$resp" | jq -r '.id')
     wait_active "$id" || return 1
-    address=$(storage_field "$id" address)
   fi
-  printf '%s\t%s' "$id" "$address"
+  printf '%s' "$id"
 }
 
 # ensure_bucket ID -> creates BUCKET_NAME if absent.
@@ -129,17 +137,19 @@ mint_key() {
 }
 
 provision() {
-  local out id address ak sk
-  out=$(ensure_storage) || { echo "::error::failed to resolve gcore storage" >&2; exit 1; }
-  IFS=$'\t' read -r id address <<<"$out"
-  [ -n "$id" ] && [ -n "$address" ] || { echo "::error::empty gcore storage id/address" >&2; exit 1; }
+  local id region endpoint out ak sk
+  id=$(ensure_storage) || { echo "::error::failed to resolve gcore storage" >&2; exit 1; }
+  [ -n "$id" ] || { echo "::error::empty gcore storage id" >&2; exit 1; }
+  region=$(resolve_region || true)
+  [ -n "$region" ] || { echo "::error::could not resolve S3 region (technical_name) for location ${LOCATION_NAME}" >&2; exit 1; }
+  endpoint="https://${region}.${S3_ENDPOINT_SUFFIX}"
   ensure_bucket "$id"
   prune_keys "$id"
   out=$(mint_key "$id")
   IFS=$'\t' read -r ak sk <<<"$out"
   [ -n "$ak" ] && [ -n "$sk" ] || { echo "::error::failed to mint gcore access key" >&2; exit 1; }
-  printf 'storage_id=%s\naddress=%s\nbucket=%s\naccess_key=%s\nsecret_key=%s\n' \
-    "$id" "$address" "$BUCKET_NAME" "$ak" "$sk"
+  printf 'storage_id=%s\nregion=%s\nendpoint=%s\nbucket=%s\naccess_key=%s\nsecret_key=%s\n' \
+    "$id" "$region" "$endpoint" "$BUCKET_NAME" "$ak" "$sk"
 }
 
 cleanup() {
