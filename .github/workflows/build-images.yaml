@@ -500,6 +500,24 @@ jobs:
             -only="$ONLY" \
             .
 
+      - name: Verify gcore secrets
+        if: matrix.builder == 'gcore'
+        env:
+          GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
+          GCORE_PROJECT_ID: ${{ secrets.GCORE_PROJECT_ID }}
+          QEMU_SSH_PASSWORD: ${{ secrets.QEMU_SSH_PASSWORD }}
+          GCORE_IMAGE_GCS_BUCKET: ${{ secrets.GCORE_IMAGE_GCS_BUCKET }}
+        run: |
+          missing=""
+          for var in GCORE_API_KEY GCORE_PROJECT_ID QEMU_SSH_PASSWORD GCORE_IMAGE_GCS_BUCKET; do
+            [ -z "${!var}" ] && missing="$missing $var"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing gcore secrets:$missing"
+            exit 1
+          fi
+          echo "All gcore secrets present"
+
       - name: Enable KVM (gcore)
         if: matrix.builder == 'gcore'
         run: |
