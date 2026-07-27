@@ -597,6 +597,23 @@ jobs:
           IMAGE_URL: ${{ steps.gcs.outputs.url }}
         run: bash deploy/packer/gcore-publish.sh
 
+      - name: Delete staged qcow2 (gcore)
+        # Runs before the key revoke below because deleting the object needs the
+        # still-valid minted S3 credentials. The qcow2 is only needed during the
+        # import above, so remove it immediately rather than leaving a multi-GB
+        # object in the bucket. `|| true` so a missing object never fails the job.
+        if: always() && matrix.builder == 'gcore' && steps.gstore.outputs.access_key != ''
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          AWS_ACCESS_KEY_ID: ${{ steps.gstore.outputs.access_key }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.gstore.outputs.secret_key }}
+          AWS_DEFAULT_REGION: us-east-1
+          ADDRESS: ${{ steps.gstore.outputs.address }}
+          BUCKET: ${{ steps.gstore.outputs.bucket }}
+        run: |
+          key="lantern-box/lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
+          aws s3 rm "s3://${BUCKET}/${key}" --endpoint-url "https://${ADDRESS}" || true
+
       - name: Clean up gcore access key (gcore)
         if: always() && matrix.builder == 'gcore' && steps.gstore.outputs.access_key != ''
         env:
