@@ -12,6 +12,10 @@ packer {
       version = ">= 1.1.2"
       source  = "github.com/hashicorp/alicloud"
     }
+    qemu = {
+      version = ">= 1.1.0"
+      source  = "github.com/hashicorp/qemu"
+    }
   }
 }
 
@@ -907,12 +911,12 @@ source "oracle-oci" "lantern-box-vap" {
 }
 
 source "linode" "lantern-box" {
-  linode_token  = var.linode_token
-  image         = "linode/ubuntu24.04"
-  region        = var.linode_region
-  instance_type = "g6-nanode-1"
-  ssh_username  = "root"
-  image_label   = "lantern-box-${var.lantern_box_version}"
+  linode_token      = var.linode_token
+  image             = "linode/ubuntu24.04"
+  region            = var.linode_region
+  instance_type     = "g6-nanode-1"
+  ssh_username      = "root"
+  image_label       = "lantern-box-${var.lantern_box_version}"
   image_description = "lantern-box ${var.lantern_box_version} pre-baked image"
 
   # Replicate to Linode regions that support image replication.
@@ -931,12 +935,12 @@ source "linode" "lantern-box" {
 
 # Alibaba Cloud ECS — build in Singapore, copy to all Asia regions.
 source "alicloud-ecs" "lantern-box" {
-  access_key           = var.alicloud_access_key
-  secret_key           = var.alicloud_secret_key
-  region               = "ap-southeast-1"
-  instance_type        = "ecs.t6-c1m1.large"
-  image_name           = "lantern-box-${var.lantern_box_version}-{{timestamp}}"
-  image_ignore_data_disks       = true
+  access_key              = var.alicloud_access_key
+  secret_key              = var.alicloud_secret_key
+  region                  = "ap-southeast-1"
+  instance_type           = "ecs.t6-c1m1.large"
+  image_name              = "lantern-box-${var.lantern_box_version}-{{timestamp}}"
+  image_ignore_data_disks = true
   # Auto-discover the latest Ubuntu 24.04 base image via image_family
   # (requires alicloud plugin >= 1.1.2). This calls DescribeImageFromFamily
   # and always returns the latest system image in the family.
@@ -945,38 +949,80 @@ source "alicloud-ecs" "lantern-box" {
     disk_size     = 20
     disk_category = "cloud_essd"
   }
-  io_optimized                  = true
-  internet_charge_type          = "PayByTraffic"
-  internet_max_bandwidth_out    = 5
+  io_optimized               = true
+  internet_charge_type       = "PayByTraffic"
+  internet_max_bandwidth_out = 5
   # Disable Alibaba's "security enhancement" (China-specific Aegis/CloudMonitor agent).
   # We run our own monitoring and don't want the extra agent on proxy servers.
   security_enhancement_strategy = "Deactive"
   force_stop_instance           = true
-  ssh_username         = "root"
-  ssh_password         = var.alicloud_ssh_password
+  ssh_username                  = "root"
+  ssh_password                  = var.alicloud_ssh_password
 
   wait_copying_image_ready_timeout = 7200 # seconds (2h) — copying to 8 regions can be slow
 
   image_copy_regions = [
-    "ap-southeast-1",  # Singapore
-    "ap-southeast-3",  # Malaysia (Kuala Lumpur)
-    "ap-southeast-5",  # Indonesia (Jakarta)
-    "ap-southeast-6",  # Philippines (Manila)
-    "ap-southeast-7",  # Thailand (Bangkok)
-    "ap-northeast-1",  # Japan (Tokyo)
-    "ap-northeast-2",  # South Korea (Seoul)
-    "cn-hongkong",     # Hong Kong
+    "ap-southeast-1", # Singapore
+    "ap-southeast-3", # Malaysia (Kuala Lumpur)
+    "ap-southeast-5", # Indonesia (Jakarta)
+    "ap-southeast-6", # Philippines (Manila)
+    "ap-southeast-7", # Thailand (Bangkok)
+    "ap-northeast-1", # Japan (Tokyo)
+    "ap-northeast-2", # South Korea (Seoul)
+    "cn-hongkong",    # Hong Kong
   ]
   image_copy_names = [
-    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Singapore
-    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Malaysia
-    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Indonesia
-    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Philippines
-    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Thailand
-    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Japan
-    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # South Korea
-    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Hong Kong
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}", # Singapore
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}", # Malaysia
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}", # Indonesia
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}", # Philippines
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}", # Thailand
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}", # Japan
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}", # South Korea
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}", # Hong Kong
   ]
+}
+
+# QEMU source — Gcore has no Packer plugin, so we build a generic qcow2 here and
+# import it into each Gcore region via deploy/packer/gcore-publish.sh (there is
+# no cross-region copy API). Boots the stock Ubuntu 24.04 cloud image (which
+# ships the OpenStack cloud-init datasource Gcore uses at first boot), runs the
+# SAME shared provisioners as every other builder, then generalizes the disk
+# (see the qemu-only "generalize" provisioner in the build block below).
+source "qemu" "lantern-box-gcore" {
+  iso_url      = "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+  iso_checksum = "file:https://cloud-images.ubuntu.com/releases/noble/release/SHA256SUMS"
+  disk_image   = true
+  disk_size    = "10G"
+  format       = "qcow2"
+  accelerator  = "kvm"
+  cpus         = 2
+  memory       = 2048
+  headless     = true
+
+  # NoCloud seed: set the ubuntu user's password so Packer can SSH in. The
+  # ubuntu user has passwordless sudo (same as the OCI sources), so the shared
+  # `sudo sh -c` provisioners work unchanged.
+  cd_label = "cidata"
+  cd_content = {
+    "meta-data" = ""
+    "user-data" = <<-EOF
+      #cloud-config
+      ssh_pwauth: true
+      password: ${var.qemu_ssh_password}
+      chpasswd:
+        expire: false
+    EOF
+  }
+
+  ssh_username           = "ubuntu"
+  ssh_password           = var.qemu_ssh_password
+  ssh_timeout            = "20m"
+  ssh_handshake_attempts = 100
+
+  shutdown_command = "echo '${var.qemu_ssh_password}' | sudo -S shutdown -P now"
+  vm_name          = "lantern-box-${var.lantern_box_version}-amd64.qcow2"
+  output_directory = "output-gcore"
 }
 
 # ---------- Build ----------
@@ -1026,6 +1072,7 @@ build {
     "source.oracle-oci.lantern-box-bog",
     "source.oracle-oci.lantern-box-vap",
     "source.alicloud-ecs.lantern-box",
+    "source.qemu.lantern-box-gcore",
   ]
 
   # Ensure datacap placeholder files exist so the file provisioner never fails.
@@ -1040,13 +1087,13 @@ build {
   # Upload the datacap binary for this arch.
   # OCI sources target arm64; Linode/Alicloud target amd64.
   provisioner "file" {
-    only        = ["linode.lantern-box", "alicloud-ecs.lantern-box"]
+    only        = ["linode.lantern-box", "alicloud-ecs.lantern-box", "qemu.lantern-box-gcore"]
     source      = "/tmp/datacap-amd64"
     destination = "/tmp/datacap"
   }
 
   provisioner "file" {
-    except      = ["linode.lantern-box", "alicloud-ecs.lantern-box"]
+    except      = ["linode.lantern-box", "alicloud-ecs.lantern-box", "qemu.lantern-box-gcore"]
     source      = "/tmp/datacap-arm64"
     destination = "/tmp/datacap"
   }
@@ -1093,6 +1140,22 @@ build {
       "rm -f /root/.bash_history /home/*/.bash_history",
       "passwd -l root",
       "sed -i 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config",
+    ]
+  }
+
+  # Gcore-only: generalize the raw qcow2 so it boots fresh in every region. The
+  # managed builders (Linode/OCI/Alicloud) do this inside their plugins; for a
+  # raw disk import we must sysprep it ourselves. This changes no lantern-box
+  # payload — only per-instance identity that must be regenerated on first boot.
+  provisioner "shell" {
+    only            = ["qemu.lantern-box-gcore"]
+    execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
+    inline = [
+      "cloud-init clean --logs --seed",
+      "truncate -s 0 /etc/machine-id",
+      "rm -f /var/lib/dbus/machine-id",
+      "rm -f /etc/ssh/ssh_host_*",
+      "passwd -l ubuntu",
     ]
   }
 

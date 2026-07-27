@@ -33,6 +33,15 @@ variable "alicloud_ssh_password" {
   default   = env("ALICLOUD_SSH_PASSWORD")
 }
 
+# QEMU (gcore) — build-time password for the ubuntu user so Packer can SSH into
+# the cloud image during the build. Locked again in the generalize step; the
+# real SSH key is injected by cloud-init at first boot on gcore.
+variable "qemu_ssh_password" {
+  type      = string
+  sensitive = true
+  default   = env("QEMU_SSH_PASSWORD")
+}
+
 # OCI shared variables (same across all regions)
 variable "oci_tenancy_ocid" {
   type      = string
