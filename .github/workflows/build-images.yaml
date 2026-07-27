@@ -524,11 +524,14 @@ jobs:
           fi
           echo "All gcore secrets present"
 
-      - name: Enable KVM (gcore)
+      - name: Install QEMU deps and enable KVM (gcore)
         if: matrix.builder == 'gcore'
         run: |
           sudo apt-get update
-          sudo apt-get install -y -q qemu-system-x86 qemu-utils
+          # xorriso builds the NoCloud cidata seed ISO from the qemu source's
+          # cd_content; it isn't preinstalled on the runner. qemu-system-x86 and
+          # qemu-utils provide the emulator and qcow2 tooling.
+          sudo apt-get install -y -q qemu-system-x86 qemu-utils xorriso
           if [ ! -e /dev/kvm ]; then
             echo "::error::/dev/kvm not available on this runner — QEMU build requires KVM"
             exit 1
