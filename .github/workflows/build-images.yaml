@@ -9,8 +9,8 @@ on:
   push:
     branches: [main]
     paths:
-      - 'deploy/packer/**'
-      - '.github/workflows/build-images.yaml'
+      - "deploy/packer/**"
+      - ".github/workflows/build-images.yaml"
 
   # Allow manual trigger for ad-hoc rebuilds (base-image updates, etc.)
   workflow_dispatch:
@@ -25,9 +25,9 @@ on:
         default: "linode,oracle-oci,alicloud-ecs,gcore"
         type: string
       gcore_regions:
-        description: "Comma-separated Gcore numeric region IDs (gcore builder only). Default 180 = Frankfurt-2."
+        description: "Comma-separated Gcore numeric region IDs (gcore builder only)."
         required: false
-        default: "180"
+        default: "196,184,180,176,164,152,148,140,136,128,124,116,108,104,100,92,88,84,80,76,68,64,50,46,34,30,26,18,14,6"
         type: string
 
 permissions:
@@ -43,6 +43,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       matrix: ${{ steps.matrix.outputs.matrix }}
       gcore_regions: ${{ steps.gcore.outputs.regions }}
+      gcore_timeout: ${{ steps.gcore.outputs.timeout }}
     steps:
       - name: Checkout (full history — needed to find the latest tag)
         uses: actions/checkout@v6
@@ -111,7 +112,7 @@ jobs:
           echo "matrix={\"builder\":$json_array}" >> "$GITHUB_OUTPUT"
           echo "Matrix: $json_array"
 
-      - name: Resolve gcore regions
+      - name: Resolve gcore regions and build timeout
         id: gcore
         env:
           INPUT_REGIONS: ${{ github.event.inputs.gcore_regions }}
@@ -119,6 +120,34 @@ jobs:
           regions="${INPUT_REGIONS:-180}"
           echo "regions=$regions" >> "$GITHUB_OUTPUT"
           echo "gcore regions: $regions"
+          # The gcore build job's timeout is budgeted here because GitHub expressions have
+          # no arithmetic operators, so timeout-minutes cannot scale itself with the
+          # region count. gcore-publish.sh starts every import, then waits on them
+          # together, so the poll window is SHARED rather than per-region:
+          #   fixed 55min  qemu build (a slow apt mirror alone can approach 45min) +
+          #                storage provision + multi-GB upload + teardown
+          #   plus 35min   one shared poll window: POLL_ATTEMPTS(120) x
+          #                POLL_INTERVAL_SECS(15) = 30min, plus visibility/delete polling
+          #   plus 3/region the sequential import POSTs and visibility checks, and slack
+          #                for the fact that every region pulls the same object from one
+          #                bucket at once, so shared egress makes each import slower than
+          #                a solo one would be
+          # Keep these in step with gcore-publish.sh's poll defaults if those change. Note
+          # the real ceiling on many regions is not this timeout but POLL_ATTEMPTS: if
+          # shared egress pushes a single import past 30min, its task poll gives up no
+          # matter how long the job is allowed to run.
+          count=$(echo "$regions" | tr ',' '\n' | grep -c '[^[:space:]]' || true)
+          # Any failure above leaves count empty or 0; either way fall back to one
+          # region, so a miscount can never produce a nonsensical timeout.
+          [ "${count:-0}" -gt 0 ] 2>/dev/null || count=1
+          timeout=$((55 + 35 + count * 3))
+          # GitHub caps hosted-runner jobs at 360min.
+          if [ "$timeout" -gt 350 ]; then
+            timeout=350
+            echo "::warning::gcore build timeout capped at 350min for ${count} regions — raise POLL_ATTEMPTS or split the region list across runs rather than growing this further"
+          fi
+          echo "timeout=$timeout" >> "$GITHUB_OUTPUT"
+          echo "gcore build timeout: ${timeout}min (${count} region(s))"
 
   # Prune old images before building (avoids provider quota limits)
   prune:
@@ -163,6 +192,10 @@ jobs:
 
       - name: Prune old gcore images
         if: contains(needs.prepare.outputs.matrix, 'gcore')
+        # For `-eo pipefail`: without it a failing jq below leaves `sort` to report
+        # success, the image list comes back empty, and the step prints "Nothing to
+        # prune" instead of admitting it could not read the listing.
+        shell: bash
         env:
           GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
           GCORE_PROJECT_ID: ${{ secrets.GCORE_PROJECT_ID }}
@@ -176,22 +209,49 @@ jobs:
           for region in "${regions[@]}"; do
             region="${region//[[:space:]]/}"
             [ -z "$region" ] && continue
-            echo "Fetching gcore private images in region ${region}..."
-            if ! raw=$(curl -sS -f -H "$AUTH" \
+            echo "Fetching gcore lantern-box images in region ${region}..."
+            # Two passes, unioned by image ID. `?private=true` is the project's own
+            # images; the unfiltered list is the only place an import that landed
+            # "shared" or "public" shows up, and gcore has no API to change
+            # visibility after the fact. Listing only the private pass is how a
+            # non-private image becomes invisible here and is never collected.
+            # Both passes are kept rather than just the unfiltered one because
+            # gcore's default (whether it includes private images) is not something
+            # to bet the prune job on.
+            if ! priv=$(curl -sS -f -H "$AUTH" \
               "${API}/images/${GCORE_PROJECT_ID}/${region}?private=true"); then
+              echo "::error::Failed to list gcore private images in region ${region}"
+              failures=$((failures + 1))
+              continue
+            fi
+            if ! all=$(curl -sS -f -H "$AUTH" \
+              "${API}/images/${GCORE_PROJECT_ID}/${region}"); then
               echo "::error::Failed to list gcore images in region ${region}"
               failures=$((failures + 1))
               continue
             fi
-            images=$(echo "$raw" | jq -r '.results[] | select(.name | startswith("lantern-box-")) | "\(.created_at)\t\(.id)\t\(.name)"' | sort -r)
+            # The name filter is what keeps gcore's public catalog out of the union.
+            # Guarded because an empty result is indistinguishable from a parse failure
+            # once it reaches the keep-N check, and "no images" silently skips pruning.
+            if ! images=$(jq -rs '
+              ([.[0].results // [], .[1].results // []] | add)
+              | unique_by(.id)
+              | .[]
+              | select(.name | startswith("lantern-box-"))
+              | "\(.created_at)\t\(.id)\t\(.name)\t\(.visibility // "unknown")"' \
+              <<<"${priv}"$'\n'"${all}" | sort -r); then
+              echo "::error::Could not parse the gcore image listings for region ${region}"
+              failures=$((failures + 1))
+              continue
+            fi
             total=$(echo "$images" | grep -c . || true)
             echo "Region ${region}: found ${total} lantern-box images (keeping ${KEEP})"
             if [ "$total" -le "$KEEP" ]; then
               echo "Nothing to prune."
               continue
             fi
-            while IFS=$'\t' read -r created id name; do
-              echo "Deleting ${name} (${id}, created ${created}) in region ${region}..."
+            while IFS=$'\t' read -r created id name vis; do
+              echo "Deleting ${name} (${id}, created ${created}, visibility ${vis}) in region ${region}..."
               if ! http_code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$AUTH" \
                 "${API}/images/${GCORE_PROJECT_ID}/${region}/${id}"); then
                 echo "::error::Failed to reach gcore to delete ${name} (${id}) in region ${region}"
@@ -200,6 +260,11 @@ jobs:
               fi
               if [ "$http_code" = "404" ]; then
                 echo "  Already gone (404), skipping."
+              elif [ "$http_code" = "403" ]; then
+                # The unfiltered pass can surface a public image belonging to another
+                # project that happens to match the name prefix. Not ours to delete,
+                # and not a failure.
+                echo "  Not ours to delete (403), skipping."
               elif [ "$http_code" -ge 400 ]; then
                 echo "::error::Failed to delete gcore image ${name} (${id}) in region ${region}: HTTP ${http_code}"
                 failures=$((failures + 1))
@@ -258,14 +323,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    # Serialize each builder against itself across runs. gcore needs this: the
+    # storage instance is shared, so gcore-storage.sh prunes ALL its access keys and
+    # sweeps ALL its stage buckets, and two overlapping runs would revoke each
+    # other's credentials mid-upload. Keyed on the builder so the builders still run
+    # in parallel with one another. Never cancel in flight — a cancelled gcore build
+    # is the one case that can strand a public stage bucket.
+    concurrency:
+      group: build-images-${{ matrix.builder }}
+      cancel-in-progress: false
     # Alicloud copies images to 8 regions (up to 2h). OCI builds 36 regions
     # in parallel — usually ~7min but a slow mirror can push past 45min.
-    # NOTE: gcore-publish.sh imports+polls each region SEQUENTIALLY (worst case
-    # ~30min/region: POLL_ATTEMPTS×POLL_INTERVAL_SECS) on the 60min default. Fine
-    # for the single-region default; before expanding gcore_regions, scale this
-    # timeout with the region count or parallelize the imports, else the job can
-    # be killed mid-import and leave orphaned gcore tasks. See PR #292.
-    timeout-minutes: ${{ matrix.builder == 'alicloud-ecs' && 150 || 60 }}
+    # gcore's is computed in prepare (see "Resolve gcore regions and build timeout"),
+    # because GitHub expressions cannot do arithmetic. 60min was not enough for even one
+    # region: a slow qemu build plus a multi-GB upload plus 30min of import polling
+    # overruns it, and being killed mid-import leaves orphaned gcore tasks behind. The
+    # imports themselves wait concurrently, so adding regions costs little wall-clock.
+    timeout-minutes: ${{ matrix.builder == 'alicloud-ecs' && 150 || (matrix.builder == 'gcore' && fromJSON(needs.prepare.outputs.gcore_timeout || '90') || 60) }}
 
     steps:
       - name: Checkout
@@ -551,17 +625,35 @@ jobs:
       - name: Provision gcore object storage (gcore)
         id: gstore
         if: matrix.builder == 'gcore'
+        # Explicit `shell: bash` for `-eo pipefail`; the default `bash -e {0}` has no
+        # pipefail, which is what let the old pipeline form below hide a failure.
+        shell: bash
         env:
           GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
         run: |
-          # Find-or-create the storage instance, sweep leftover stage buckets, make
-          # a fresh randomly-named bucket, and mint an ephemeral access key — all
-          # torn down in the cleanup steps below. Emits
+          # Find-or-create the storage instance, mint an ephemeral access key, sweep
+          # leftover stage buckets with it, and make a fresh randomly-named bucket with a
+          # 1-day expiry rule — all torn down in the cleanup steps below. Emits
           # storage_id/region/endpoint/bucket/access_key/secret_key as step outputs.
-          bash deploy/packer/gcore-storage.sh provision | while IFS='=' read -r k v; do
+          #
+          # Captured rather than piped into `while`: a pipeline takes the loop's exit
+          # status, so a failed provision reported success here and the real error only
+          # surfaced two steps later inside `aws s3 cp`. Every teardown step gates on
+          # these outputs, so this must fail loudly and in place. Provision's own
+          # diagnostics go to stderr, so its ::error:: annotations still reach the log.
+          out=$(bash deploy/packer/gcore-storage.sh provision)
+          # Guard the other direction too: a provision that exited 0 without emitting
+          # usable values would silently strand every teardown step, which all gate on
+          # access_key. grep rather than echo, so no secret is printed while validating.
+          for required in storage_id region endpoint bucket access_key secret_key; do
+            grep -q "^${required}=." <<<"$out" \
+              || { echo "::error::gcore provision succeeded but emitted no ${required}"; exit 1; }
+          done
+          while IFS='=' read -r k v; do
+            [ -n "$k" ] || continue
             case "$k" in access_key | secret_key | bucket) echo "::add-mask::$v" ;; esac
             echo "$k=$v" >> "$GITHUB_OUTPUT"
-          done
+          done <<<"$out"
 
       - name: Upload qcow2 and expose it for gcore import (gcore)
         id: stage
@@ -612,21 +704,68 @@ jobs:
           IMAGE_URL: ${{ steps.stage.outputs.url }}
         run: bash deploy/packer/gcore-publish.sh
 
-      - name: Delete staged qcow2 (gcore)
-        # Before the bucket/key teardown below: deleting the object needs the
-        # still-valid S3 credentials, and the control-plane bucket delete needs an
-        # empty bucket. `|| true` so a missing object never fails the job.
+      - name: Revoke public access to the stage bucket (gcore)
+        # FIRST teardown action, ahead of the object and bucket deletes below.
+        # Dropping the anonymous-read policy is what actually ends the public window,
+        # and unlike the deletes it succeeds even on a non-empty bucket — so the
+        # exposure closes regardless of how the rest of the cleanup goes. Everything
+        # after this step is reclaiming storage, not containing a leak.
         if: always() && matrix.builder == 'gcore' && steps.gstore.outputs.access_key != ''
+        # For `-eo pipefail`; also keeps this step's semantics identical to the scripts.
+        shell: bash
         env:
-          VERSION: ${{ needs.prepare.outputs.version }}
           AWS_ACCESS_KEY_ID: ${{ steps.gstore.outputs.access_key }}
           AWS_SECRET_ACCESS_KEY: ${{ steps.gstore.outputs.secret_key }}
           AWS_DEFAULT_REGION: ${{ steps.gstore.outputs.region }}
           ENDPOINT: ${{ steps.gstore.outputs.endpoint }}
           BUCKET: ${{ steps.gstore.outputs.bucket }}
+          STORAGE_ID: ${{ steps.gstore.outputs.storage_id }}
         run: |
-          key="lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
-          aws s3 rm "s3://${BUCKET}/${key}" --endpoint-url "$ENDPOINT" || true
+          # This step also runs when the build failed before the policy was ever
+          # applied, so "no policy" is a success — but ONLY when that is confirmed.
+          # An unreadable policy must never be reported as an absent one: this is the
+          # step that contains the exposure, so "could not tell" has to fail loudly.
+          # The bucket name is masked in the log, hence the prefix hint for a human.
+          if aws s3api delete-bucket-policy --bucket "$BUCKET" --endpoint-url "$ENDPOINT" 2>/tmp/revoke.err; then
+            echo "revoked the anonymous-read policy on the stage bucket"
+            exit 0
+          fi
+          # The delete failed. Reaching for get-bucket-policy distinguishes the benign
+          # case (there was never a policy) from the dangerous one (a policy is there
+          # and could not be removed) — and from not knowing, e.g. revoked credentials
+          # or a network blip, which fails both calls and must not look benign.
+          if get_err=$(aws s3api get-bucket-policy --bucket "$BUCKET" --endpoint-url "$ENDPOINT" 2>&1); then
+            echo "::error::the gcore stage bucket still carries a policy that could not be removed — the staged qcow2 may still be publicly readable. Delete the policy or the bucket by hand: it is a lantern-box-stage-* bucket on gcore storage instance ${STORAGE_ID}."
+            cat /tmp/revoke.err >&2
+            exit 1
+          fi
+          if grep -qi 'NoSuchBucketPolicy\|NoSuchBucket\|not *found\|404' <<<"$get_err"; then
+            echo "no bucket policy present (never applied, or already gone)"
+            exit 0
+          fi
+          echo "::error::could not remove the gcore stage bucket's policy AND could not read it back, so it is unknown whether the staged qcow2 is still publicly readable — treat it as exposed. Check the lantern-box-stage-* buckets on gcore storage instance ${STORAGE_ID} by hand."
+          cat /tmp/revoke.err >&2
+          printf '%s\n' "$get_err" >&2
+          exit 1
+
+      - name: Empty the stage bucket (gcore)
+        # Between the revoke above and the bucket delete below: emptying needs the
+        # still-valid S3 credentials, and the control-plane bucket delete refuses a
+        # non-empty bucket. Shares gcore-storage.sh's empty_bucket with the stale-bucket
+        # sweep, so both paths abort incomplete multipart uploads before removing
+        # objects — `s3 rm` alone leaves the parts of a killed upload behind, and those
+        # would block the bucket delete forever. Best-effort by design: this also runs
+        # when the build never got as far as uploading, and the bucket delete below is
+        # what reports a genuinely stuck bucket.
+        if: always() && matrix.builder == 'gcore' && steps.gstore.outputs.access_key != ''
+        env:
+          GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ steps.gstore.outputs.access_key }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.gstore.outputs.secret_key }}
+          AWS_DEFAULT_REGION: ${{ steps.gstore.outputs.region }}
+          ENDPOINT: ${{ steps.gstore.outputs.endpoint }}
+          BUCKET: ${{ steps.gstore.outputs.bucket }}
+        run: bash deploy/packer/gcore-storage.sh empty-bucket
 
       - name: Clean up gcore stage bucket and access key (gcore)
         if: always() && matrix.builder == 'gcore' && steps.gstore.outputs.access_key != ''
