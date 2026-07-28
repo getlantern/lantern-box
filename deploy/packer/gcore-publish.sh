@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# Publish the Gcore lantern-box image: import a hosted qcow2 into each target
-# Gcore region and poll each import task to completion. Gcore has no Packer
-# plugin and no cross-region image copy, so the same URL is imported into every
-# region individually. See deploy/packer/README.md.
+# Import a hosted qcow2 into each target Gcore region, poll each task to
+# completion, and report the resulting image's visibility. Gcore has no Packer
+# plugin and no cross-region image copy, so the same URL is imported per region.
+# See deploy/packer/README.md.
 #
 # Required env:
-#   GCORE_API_KEY     Gcore Cloud API token (sent as "Authorization: APIKey ...")
+#   GCORE_API_KEY     Gcore Cloud API token ("Authorization: APIKey ...")
 #   GCORE_PROJECT_ID  Gcore project ID (numeric); scopes every API call
-#   VERSION           Image version label; image is named "lantern-box-$VERSION"
-#   IMAGE_URL         URL Gcore's importer fetches the qcow2 from (a signed URL)
-#   GCORE_REGIONS     Comma-separated numeric region IDs (e.g. "180" or "180,68")
+#   VERSION           Image is named "lantern-box-$VERSION"
+#   IMAGE_URL         URL Gcore's importer fetches the qcow2 from
+#   GCORE_REGIONS     Comma-separated numeric region IDs (e.g. "180,68")
 #
 # Optional env (mainly for tests):
 #   CURL (default "curl"), SLEEP (default "sleep"),
@@ -39,8 +39,8 @@ import_region() {
     --arg name "$IMAGE_NAME" \
     --arg url "$IMAGE_URL" \
     '{name: $name, url: $url, architecture: "x86_64", os_type: "linux", os_distro: "ubuntu", os_version: "24.04"}')
-  # Capture the response body AND HTTP status (NOT -f, which discards the error
-  # body) so a gcore rejection is surfaced instead of an empty message.
+  # Capture body AND status (not -f, which discards the error body) so a gcore
+  # rejection is surfaced instead of an empty message.
   resp=$("$CURL" -sS -w $'\n%{http_code}' -X POST \
     -H "$AUTH" -H "Content-Type: application/json" \
     -d "$body" \
@@ -81,6 +81,35 @@ poll_task() {
   return 1
 }
 
+# report_visibility REGION TASK_ID -> log the imported image's visibility, which is
+# one of "private" (this project only), "shared" (this project plus member
+# projects, and gcore exposes no API to add members) or "public" (every gcore
+# customer). Only public is an exposure, so only public returns 1. "shared" is
+# access-controlled too, but ?private=true listings skip it — including prune's —
+# so it only warns. Gcore has no API to *set* the field: this reports, not fixes.
+report_visibility() {
+  local region="$1" task="$2" image vis
+  if ! image=$("$CURL" -sS -f -H "$AUTH" "${API_BASE}/tasks/${task}" \
+      | jq -r '.created_resources.images[0] // empty') || [ -z "$image" ]; then
+    echo "::warning::region ${region}: could not resolve the imported image ID from task ${task}; skipping the visibility check" >&2
+    return 0
+  fi
+  if ! vis=$("$CURL" -sS -f -H "$AUTH" "${API_BASE}/images/${GCORE_PROJECT_ID}/${region}/${image}" \
+      | jq -r '.visibility // empty') || [ -z "$vis" ]; then
+    echo "::warning::region ${region}: could not read visibility of image ${image}; skipping the check" >&2
+    return 0
+  fi
+  case "$vis" in
+    private)
+      echo "region ${region}: image ${image} visibility=private" ;;
+    public)
+      echo "::error::region ${region}: image ${image} visibility=public — in gcore's global catalog, not private to project ${GCORE_PROJECT_ID}" >&2
+      return 1 ;;
+    *)
+      echo "::warning::region ${region}: image ${image} visibility=${vis}, not private — gcore has no API to change it, and ?private=true listings will NOT return this image" >&2 ;;
+  esac
+}
+
 main() {
   echo "Publishing ${IMAGE_NAME} to Gcore regions: ${GCORE_REGIONS}"
   local failures=0 region task
@@ -94,6 +123,10 @@ main() {
       continue
     fi
     if ! poll_task "$region" "$task"; then
+      failures=$((failures + 1))
+      continue
+    fi
+    if ! report_visibility "$region" "$task"; then
       failures=$((failures + 1))
     fi
   done

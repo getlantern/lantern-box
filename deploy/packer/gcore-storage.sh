@@ -1,25 +1,20 @@
 #!/usr/bin/env bash
 #
 # Manage the dedicated gcore object storage that stages the lantern-box qcow2 for
-# image import. gcore ingests images only by fetching from a URL, and its
-# importer does an *unauthenticated* HEAD then GET — there is no API field to
-# hand it credentials, and a presigned/SigV4 URL is bound to a single HTTP
-# method (its HEAD preflight would 403). So the qcow2 has to be reachable with no
-# credentials at all. We stage it in a throwaway, *randomly-named* bucket that is
-# made briefly public-read (the anonymous-read bucket policy is applied by the
-# AWS CLI in the workflow) for the duration of the import, then torn down. The
-# random name keeps the object unguessable during that short window, and the
-# bucket holds only that one qcow2.
+# image import. gcore ingests images only by URL, and its importer does an
+# *unauthenticated* HEAD then GET: there is no API field for source credentials,
+# and a presigned SigV4 URL is bound to one HTTP method (its HEAD preflight 403s).
+# So the qcow2 is staged in a throwaway, randomly-named bucket made briefly
+# public-read for the import, then torn down.
 #
 # This script owns the gcore *control plane* (storage instance + buckets + access
-# keys). The object upload, the public bucket policy, and the object delete are
-# done by the AWS CLI against gcore's S3 endpoint in the workflow.
+# keys); the upload, the public bucket policy, and the object delete are done by
+# the AWS CLI against gcore's S3 endpoint in the workflow.
 #
 # Subcommands:
-#   provision  Find-or-create the dedicated storage instance, sweep any leftover
-#              stage buckets from a crashed run, create a fresh randomly-named
-#              bucket, mint an ephemeral access key, and print these key=value
-#              lines to stdout:
+#   provision  Find-or-create the storage instance, sweep leftover stage buckets,
+#              create a fresh randomly-named bucket, mint an ephemeral access key,
+#              and print these key=value lines to stdout:
 #                storage_id=<int>
 #                region=<s3 region = location technical_name, e.g. s-ed1>
 #                endpoint=<s3 endpoint, e.g. https://s-ed1.cloud.gcore.lu>
@@ -45,31 +40,30 @@ API_BASE="${GCORE_STORAGE_API_BASE:-https://api.gcore.com/storage/v4}"
 AUTH="Authorization: APIKey ${GCORE_API_KEY}"
 STORAGE_NAME="${STORAGE_NAME:-lantern-box-images}"
 LOCATION_NAME="${LOCATION_NAME:-luxembourg-2}"
-# Each run stages into a fresh bucket named "<prefix><random>"; the prefix scopes
-# the stale-bucket sweep so the instance's other buckets are never touched.
+# Each run stages into a fresh "<prefix><random>" bucket; the prefix scopes the
+# stale-bucket sweep so the instance's other buckets are never touched.
 BUCKET_PREFIX="${BUCKET_PREFIX:-lantern-box-stage-}"
 POLL_ATTEMPTS="${POLL_ATTEMPTS:-60}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-5}"
 # gcore's S3 API endpoint is https://<region>.<suffix>, where <region> is the
-# location's technical_name (luxembourg-2 -> s-ed1). NOTE: this is NOT the
-# object_storages `address` field — that host is not the S3 API endpoint.
+# location's technical_name (luxembourg-2 -> s-ed1). NOT the object_storages
+# `address` field — that host is not the S3 API endpoint.
 S3_ENDPOINT_SUFFIX="${GCORE_S3_ENDPOINT_SUFFIX:-cloud.gcore.lu}"
 
-# GET with fail-on-HTTP-error. A real API error propagates (pipefail); a valid
+# GET with fail-on-HTTP-error: a real API error propagates (pipefail), a valid
 # empty result does not.
 api_get() { "$CURL" -sS -f -H "$AUTH" "$@"; }
 
-# find_storage -> "<id>\t<provisioning_status>" for the instance named
-# STORAGE_NAME, or empty output if absent. Uses jq indexing (not `head`) so it
-# never triggers a SIGPIPE under `set -o pipefail`.
+# find_storage -> "<id>\t<provisioning_status>" for STORAGE_NAME, or empty if
+# absent. jq indexing rather than `head`, which would SIGPIPE under pipefail.
 find_storage() {
   api_get "${API_BASE}/object_storages?limit=1000" | jq -r --arg n "$STORAGE_NAME" '
     [.results[] | select(.name == $n)][0]
     | if . then "\(.id)\t\(.provisioning_status)" else empty end'
 }
 
-# resolve_region -> the S3 region code (the location's technical_name) for
-# LOCATION_NAME, e.g. luxembourg-2 -> s-ed1. Empty output if not found.
+# resolve_region -> the S3 region code (LOCATION_NAME's technical_name), e.g.
+# luxembourg-2 -> s-ed1. Empty if not found.
 resolve_region() {
   api_get "${API_BASE}/locations?limit=1000" | jq -r --arg n "$LOCATION_NAME" '
     [.results[] | select(.name == $n)][0].technical_name // empty'
@@ -80,8 +74,8 @@ storage_field() {
   api_get "${API_BASE}/object_storages/$1" | jq -r --arg f "$2" '.[$f]'
 }
 
-# wait_active ID -> returns when provisioning_status == active; fails on a
-# terminal state or timeout. Diagnostics go to stderr.
+# wait_active ID -> returns when provisioning_status == active; fails on a terminal
+# state or timeout.
 wait_active() {
   local id="$1" attempt=0 status
   while [ "$attempt" -lt "$POLL_ATTEMPTS" ]; do
@@ -97,8 +91,8 @@ wait_active() {
   return 1
 }
 
-# ensure_storage -> "<id>"; creates the instance and waits for active if it
-# doesn't already exist. Diagnostics go to stderr so stdout stays clean.
+# ensure_storage -> "<id>"; creates the instance and waits for active if absent.
+# Diagnostics go to stderr so stdout stays clean.
 ensure_storage() {
   local line id status resp
   line=$(find_storage)
@@ -116,15 +110,14 @@ ensure_storage() {
   printf '%s' "$id"
 }
 
-# rand_suffix -> 16 lowercase hex chars from /dev/urandom. Reads a fixed number
-# of bytes with `od` (no `head`) so it can't trip SIGPIPE under set -o pipefail.
+# rand_suffix -> 16 lowercase hex chars. Fixed-size `od` read rather than `head`,
+# which would SIGPIPE under pipefail.
 rand_suffix() { od -An -N8 -tx1 /dev/urandom | tr -d ' \n'; }
 
-# sweep_stale_buckets ID -> best-effort delete of any leftover stage buckets from
-# a crashed run whose cleanup never ran. Only touches buckets whose name starts
-# with BUCKET_PREFIX, so the dedicated instance's other buckets are untouched.
-# (Control-plane delete generally requires the bucket be empty; a leftover that
-# still holds an object is left for the next run / operator — see README.)
+# sweep_stale_buckets ID -> best-effort delete of stage buckets left by a crashed
+# run. Only BUCKET_PREFIX-named buckets, so the instance's others are untouched.
+# Control-plane delete needs an empty bucket, so a leftover still holding an
+# object is left for the operator — see README.
 sweep_stale_buckets() {
   local id="$1" b
   for b in $(api_get "${API_BASE}/object_storages/${id}/buckets?limit=1000" \
@@ -144,8 +137,7 @@ create_bucket() {
 }
 
 # prune_keys ID -> delete every existing access key. Safe because the instance is
-# dedicated to this pipeline; recovers the max-2-keys-per-storage cap after a run
-# whose cleanup didn't run.
+# dedicated to this pipeline; recovers the max-2-keys cap after a crashed run.
 prune_keys() {
   local id="$1" k
   for k in $(api_get "${API_BASE}/object_storages/${id}/access_keys?limit=1000" | jq -r '.results[].access_key'); do
@@ -184,8 +176,8 @@ provision() {
 cleanup() {
   : "${STORAGE_ID:?STORAGE_ID must be set for cleanup}"
   : "${ACCESS_KEY:?ACCESS_KEY must be set for cleanup}"
-  # Delete the stage bucket (and thus its public policy). The workflow removes the
-  # staged object just before calling this, so the bucket is empty by now.
+  # Deleting the bucket drops its public policy too. The workflow removes the
+  # staged object just before this, so the bucket is empty by now.
   if [ -n "${BUCKET:-}" ]; then
     "$CURL" -sS -f -X DELETE -H "$AUTH" \
       "${API_BASE}/object_storages/${STORAGE_ID}/buckets/${BUCKET}" >/dev/null 2>&1 \

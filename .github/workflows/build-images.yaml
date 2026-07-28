@@ -260,13 +260,11 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     # Alicloud copies images to 8 regions (up to 2h). OCI builds 36 regions
     # in parallel — usually ~7min but a slow mirror can push past 45min.
-    # NOTE: gcore also fans out — gcore-publish.sh imports+polls each region
-    # SEQUENTIALLY (worst case ~30min/region: POLL_ATTEMPTS×POLL_INTERVAL_SECS)
-    # — but keeps the 60min default. That's fine for the current single-region
-    # default (gcore_regions=180); before expanding gcore_regions to many
-    # regions, scale this timeout with the region count (e.g. compute it in the
-    # prepare job) or parallelize the imports in gcore-publish.sh, else the job
-    # can be killed mid-import and leave orphaned gcore tasks. See PR #292.
+    # NOTE: gcore-publish.sh imports+polls each region SEQUENTIALLY (worst case
+    # ~30min/region: POLL_ATTEMPTS×POLL_INTERVAL_SECS) on the 60min default. Fine
+    # for the single-region default; before expanding gcore_regions, scale this
+    # timeout with the region count or parallelize the imports, else the job can
+    # be killed mid-import and leave orphaned gcore tasks. See PR #292.
     timeout-minutes: ${{ matrix.builder == 'alicloud-ecs' && 150 || 60 }}
 
     steps:
@@ -528,8 +526,8 @@ jobs:
         run: |
           sudo apt-get update
           # xorriso builds the NoCloud cidata seed ISO from the qemu source's
-          # cd_content; it isn't preinstalled on the runner. qemu-system-x86 and
-          # qemu-utils provide the emulator and qcow2 tooling.
+          # cd_content and isn't preinstalled; qemu-system-x86 and qemu-utils
+          # provide the emulator and qcow2 tooling.
           sudo apt-get install -y -q qemu-system-x86 qemu-utils xorriso
           if [ ! -e /dev/kvm ]; then
             echo "::error::/dev/kvm not available on this runner — QEMU build requires KVM"
@@ -556,12 +554,10 @@ jobs:
         env:
           GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
         run: |
-          # Find-or-create the dedicated gcore S3 storage instance, sweep any
-          # leftover stage buckets, create a fresh randomly-named bucket, and mint
-          # an ephemeral access key (all torn down in the cleanup steps below).
-          # Emits storage_id/region/endpoint/bucket/access_key/secret_key as step
-          # outputs. The bucket name is unguessable and the secret key is masked;
-          # the object goes public only briefly (see the next step).
+          # Find-or-create the storage instance, sweep leftover stage buckets, make
+          # a fresh randomly-named bucket, and mint an ephemeral access key — all
+          # torn down in the cleanup steps below. Emits
+          # storage_id/region/endpoint/bucket/access_key/secret_key as step outputs.
           bash deploy/packer/gcore-storage.sh provision | while IFS='=' read -r k v; do
             case "$k" in access_key | secret_key | bucket) echo "::add-mask::$v" ;; esac
             echo "$k=$v" >> "$GITHUB_OUTPUT"
@@ -572,10 +568,9 @@ jobs:
         if: matrix.builder == 'gcore'
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-          # gcore object storage is S3-compatible; the AWS CLI is used only as an
-          # S3 client pointed at gcore's regional S3 endpoint (never AWS). The
-          # endpoint + region come from gcore-storage.sh (the location's
-          # technical_name), e.g. https://s-ed1.cloud.gcore.lu with region s-ed1.
+          # The AWS CLI is used only as a generic S3 client pointed at gcore's
+          # regional endpoint (never AWS). Endpoint + region come from
+          # gcore-storage.sh, e.g. https://s-ed1.cloud.gcore.lu with region s-ed1.
           AWS_ACCESS_KEY_ID: ${{ steps.gstore.outputs.access_key }}
           AWS_SECRET_ACCESS_KEY: ${{ steps.gstore.outputs.secret_key }}
           AWS_DEFAULT_REGION: ${{ steps.gstore.outputs.region }}
@@ -583,12 +578,11 @@ jobs:
           BUCKET: ${{ steps.gstore.outputs.bucket }}
         run: |
           # gcore's importer fetches an UNAUTHENTICATED URL (HEAD then GET), so a
-          # presigned/method-bound URL can't satisfy it — the object must be
-          # anonymously readable. We upload it to the throwaway, randomly-named
-          # bucket from the previous step and grant anonymous s3:GetObject for the
-          # duration of the import; the whole bucket (policy included) is torn down
-          # in the cleanup steps below. The random bucket name is masked and the
-          # URL is not logged, so the short public window stays unguessable.
+          # method-bound presigned URL can't satisfy it — the object must be
+          # anonymously readable. Upload to the throwaway bucket from the previous
+          # step and grant anonymous s3:GetObject for the import; the bucket and its
+          # policy are torn down below. The bucket name is masked and the URL never
+          # logged, so the short public window stays unguessable.
           key="lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
           qcow2="deploy/packer/output-gcore/lantern-box-${VERSION}-amd64.qcow2"
           echo "Uploading ${qcow2} to the staging bucket via ${ENDPOINT}"
@@ -619,11 +613,9 @@ jobs:
         run: bash deploy/packer/gcore-publish.sh
 
       - name: Delete staged qcow2 (gcore)
-        # Runs before the bucket/key teardown below because emptying the object
-        # needs the still-valid minted S3 credentials, and the control-plane
-        # bucket delete needs the bucket empty. The qcow2 (and its public policy)
-        # is only needed during the import above, so remove it as soon as the
-        # import finishes. `|| true` so a missing object never fails the job.
+        # Before the bucket/key teardown below: deleting the object needs the
+        # still-valid S3 credentials, and the control-plane bucket delete needs an
+        # empty bucket. `|| true` so a missing object never fails the job.
         if: always() && matrix.builder == 'gcore' && steps.gstore.outputs.access_key != ''
         env:
           VERSION: ${{ needs.prepare.outputs.version }}

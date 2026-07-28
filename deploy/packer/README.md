@@ -125,36 +125,43 @@ provider's image store) gcore uses a **build → host → import** pipeline:
    clean, zero machine-id, drop SSH host keys, lock the build password) so the
    raw disk boots fresh on import.
 2. CI stages the qcow2 in **gcore's own S3-compatible object storage**, in a
-   throwaway, **randomly-named** bucket that is made briefly public-read for the
-   import and then torn down — no external cloud, no stored bucket/key secret.
-   This is required because gcore's importer fetches an **unauthenticated** URL
-   (it does a HEAD then a GET): the API has no field for source credentials, and
-   a presigned/SigV4 URL is bound to one HTTP method (its HEAD preflight 403s),
-   so the object has to be anonymously readable. `deploy/packer/gcore-storage.sh`
-   (gcore control plane, via the API) find-or-creates a dedicated storage
-   instance (`lantern-box-images`, location `luxembourg-2`), sweeps any leftover
-   stage buckets, creates a fresh `lantern-box-stage-<random>` bucket, and mints
-   an **ephemeral** access key; the AWS CLI — as a generic S3 client pointed at
-   gcore's endpoint, not AWS — uploads the qcow2 and applies an anonymous
-   `s3:GetObject` bucket policy. The plain
-   `https://<region>.cloud.gcore.lu/<bucket>/<key>` URL is handed to gcore. After
-   the imports, `always()` cleanup steps delete the object, then the bucket (with
-   its public policy) and the access key.
+   throwaway, **randomly-named** bucket made briefly public-read for the import
+   and then torn down — no external cloud, no stored bucket/key secret. Public is
+   required: gcore's importer fetches an **unauthenticated** URL (HEAD then GET),
+   the API has no field for source credentials, and a presigned SigV4 URL is bound
+   to one method (its HEAD preflight 403s). `deploy/packer/gcore-storage.sh` drives
+   the gcore control plane — find-or-create a dedicated storage instance
+   (`lantern-box-images`, location `luxembourg-2`), sweep leftover stage buckets,
+   create a fresh `lantern-box-stage-<random>` bucket, mint an **ephemeral** access
+   key — and the AWS CLI, as a generic S3 client pointed at gcore's endpoint,
+   uploads the qcow2 and applies an anonymous `s3:GetObject` policy. gcore is
+   handed the plain `https://<region>.cloud.gcore.lu/<bucket>/<key>` URL. `always()`
+   cleanup steps then delete the object, the bucket, and the access key.
 
-   The image is world-readable only for the length of the imports, and this is a
-   deliberate tradeoff: the bucket name is unguessable, the bucket holds only
-   that one qcow2, the URL is masked out of the CI logs, and teardown runs even
-   on failure. A run hard-killed between exposing and tearing down could leave a
-   public bucket behind until the next run's sweep removes it (the sweep can only
-   delete an *empty* leftover via the control plane; one that still holds an
-   object must be emptied — S3 `rm` — and deleted by hand).
+   The tradeoff: world-readable for the length of the imports only, with an
+   unguessable bucket name holding just that one qcow2, the URL masked out of CI
+   logs, and teardown running even on failure. A hard-killed run can leave a public
+   bucket until the next run's sweep — and the sweep can only delete an *empty*
+   leftover, so one still holding an object must be emptied (S3 `rm`) by hand.
 3. `deploy/packer/gcore-publish.sh` imports that URL into each target region via
    `POST cloud/v1/downloadimage/{project}/{region}` (name `lantern-box-<version>`,
-   `architecture=x86_64`, `os_type=linux`) and polls each task to `FINISHED`.
+   `architecture=x86_64`, `os_type=linux`), polls each task to `FINISHED`, and reads
+   back the created image's `visibility`.
 
-lantern-cloud's gcore provider then resolves the boot image by listing private
-images per region, keeping names prefixed `lantern-box-`, and picking the newest
-(x86_64, no fallback).
+**Image visibility** is read-only in gcore's API: neither
+`POST cloud/v1/downloadimage/...` nor `PATCH cloud/v1/images/...` accepts the
+field, and `private`/`visibility` exist only as *list filters*. It is not a
+boolean — an image is exactly one of:
+
+- `private` — this project only.
+- `shared` — this project plus any project added as a member. Gcore exposes no
+  image-member API, so in practice this is also project-only. **Not** public.
+- `public` — every gcore customer; gcore's global catalog.
+
+So step 3 reports the value rather than setting it: `private` is logged, `public`
+fails the publish, and `shared` only warns. `shared` is safe but invisible to
+`?private=true` listings — including the prune job's — so old images stop being
+collected and any lookup filtering that way finds nothing.
 
 **Regions** are numeric gcore region IDs. The workflow's `gcore_regions` input
 (default `180` = Frankfurt-2) controls where the image is published; the prune

@@ -983,12 +983,11 @@ source "alicloud-ecs" "lantern-box" {
   ]
 }
 
-# QEMU source — Gcore has no Packer plugin, so we build a generic qcow2 here and
-# import it into each Gcore region via deploy/packer/gcore-publish.sh (there is
-# no cross-region copy API). Boots the stock Ubuntu 24.04 cloud image (which
-# ships the OpenStack cloud-init datasource Gcore uses at first boot), runs the
-# SAME shared provisioners as every other builder, then generalizes the disk
-# (see the qemu-only "generalize" provisioner in the build block below).
+# QEMU source — Gcore has no Packer plugin, so build a generic qcow2 here and
+# import it per region via deploy/packer/gcore-publish.sh (no cross-region copy
+# API). Boots the stock Ubuntu 24.04 cloud image, which ships the OpenStack
+# cloud-init datasource Gcore uses at first boot, runs the SAME provisioners as
+# every other builder, then generalizes the disk (see "generalize" below).
 source "qemu" "lantern-box-gcore" {
   iso_url      = "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
   iso_checksum = "file:https://cloud-images.ubuntu.com/releases/noble/release/SHA256SUMS"
@@ -1000,9 +999,9 @@ source "qemu" "lantern-box-gcore" {
   memory       = 2048
   headless     = true
 
-  # NoCloud seed: set the ubuntu user's password so Packer can SSH in. The
-  # ubuntu user has passwordless sudo (same as the OCI sources), so the shared
-  # `sudo sh -c` provisioners work unchanged.
+  # NoCloud seed: set the ubuntu user's password so Packer can SSH in. That user
+  # has passwordless sudo (as on OCI), so the shared `sudo sh -c` provisioners
+  # work unchanged.
   cd_label = "cidata"
   cd_content = {
     "meta-data" = ""
@@ -1144,9 +1143,9 @@ build {
   }
 
   # Gcore-only: generalize the raw qcow2 so it boots fresh in every region. The
-  # managed builders (Linode/OCI/Alicloud) do this inside their plugins; for a
-  # raw disk import we must sysprep it ourselves. This changes no lantern-box
-  # payload — only per-instance identity that must be regenerated on first boot.
+  # managed builders do this inside their plugins; a raw disk import has to
+  # sysprep itself. Touches no lantern-box payload — only per-instance identity
+  # that must be regenerated on first boot.
   provisioner "shell" {
     only            = ["qemu.lantern-box-gcore"]
     execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
@@ -1155,13 +1154,10 @@ build {
       "truncate -s 0 /etc/machine-id",
       "rm -f /var/lib/dbus/machine-id",
       "rm -f /etc/ssh/ssh_host_*",
-      # Remove the build-only SSH password-auth drop-in: cloud-init wrote it
-      # because the NoCloud build seed set `ssh_pwauth: true` (needed so Packer
-      # could SSH into the build VM with a password). provision.sh's
-      # 01-lantern-harden.conf (PasswordAuthentication no) is the authoritative
-      # hardening and sorts ahead of 50-, so password auth is already off — but
-      # dropping this leaves no contradictory `PasswordAuthentication yes` in the
-      # shipped image rather than relying on drop-in ordering.
+      # Drop the build-only SSH password-auth file cloud-init wrote for the seed's
+      # `ssh_pwauth: true`. provision.sh's 01-lantern-harden.conf already wins on
+      # drop-in ordering, but removing this leaves no contradictory
+      # `PasswordAuthentication yes` in the shipped image at all.
       "rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf",
       "passwd -l ubuntu",
     ]

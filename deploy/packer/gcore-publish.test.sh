@@ -7,10 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PUBLISH="${SCRIPT_DIR}/gcore-publish.sh"
 FAILED=0
 
-# Every make_fake_curl call's temp dir is recorded here and removed on exit so
-# no stray dirs are left behind. This runs after $FAILED is already decided by
-# the final `exit "$FAILED"`, so it never masks a test failure or changes the
-# script's exit code.
+# Temp dirs to remove on exit. Runs after $FAILED is already decided, so it can
+# never mask a failure or change the exit code.
 TMP_DIRS=()
 cleanup() {
   local d
@@ -20,21 +18,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Writes a fake `curl` into a fresh temp dir and prints the dir. Runs via
-# command substitution, i.e. in a subshell, so it cannot append to TMP_DIRS
-# itself; every call site below does `dir=$(make_fake_curl); TMP_DIRS+=("$dir")`
-# so the dir is still tracked for cleanup. The fake curl ignores flags and
-# responds based on the request URL and FAKE_CURL_MODE (default "ok"):
+# Writes a fake `curl` into a fresh temp dir and prints the dir. It runs in a
+# subshell, so callers do `dir=$(make_fake_curl); TMP_DIRS+=("$dir")` to track it.
+# The fake ignores flags and answers on URL plus FAKE_CURL_MODE (default "ok"):
 #   ok             downloadimage -> task "task-abc"; /tasks/ -> FINISHED
 #   import_error   /tasks/ -> ERROR
-#   retry          /tasks/ -> RUNNING until a per-invocation counter file
-#                  (next to the fake curl) reaches FAKE_CURL_RETRY_THRESHOLD
-#                  (default 2), then FINISHED
+#   retry          /tasks/ -> RUNNING until a counter file next to the fake curl
+#                  reaches FAKE_CURL_RETRY_THRESHOLD (default 2), then FINISHED
 #   always_running /tasks/ -> RUNNING, always (for the timeout test)
-#   mixed          downloadimage -> task named after the region in the URL
-#                  (e.g. region 68 -> "task-68"); /tasks/ -> ERROR for
-#                  FAKE_CURL_ERROR_REGION's task, FINISHED for every other
-#                  region's task
+#   mixed          downloadimage -> task named for the region in the URL (region
+#                  68 -> "task-68"); /tasks/ -> ERROR only for
+#                  FAKE_CURL_ERROR_REGION's task
+# FINISHED tasks report created_resources.images == ["img-1"], and /images/...
+# returns FAKE_CURL_VISIBILITY (default "private") for report_visibility.
 make_fake_curl() {
   local dir
   dir=$(mktemp -d)
@@ -42,6 +38,7 @@ make_fake_curl() {
 #!/usr/bin/env bash
 self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mode="${FAKE_CURL_MODE:-ok}"
+finished='{"state":"FINISHED","created_resources":{"images":["img-1"]}}'
 for a in "$@"; do
   case "$a" in
     *downloadimage*)
@@ -68,7 +65,7 @@ for a in "$@"; do
           [ -f "$count_file" ] || echo 0 > "$count_file"
           count=$(cat "$count_file")
           if [ "$count" -ge "${FAKE_CURL_RETRY_THRESHOLD:-2}" ]; then
-            echo '{"state":"FINISHED"}'
+            echo "$finished"
           else
             echo $((count + 1)) > "$count_file"
             echo '{"state":"RUNNING"}'
@@ -78,11 +75,20 @@ for a in "$@"; do
           if [ "$region" = "${FAKE_CURL_ERROR_REGION:-}" ]; then
             echo '{"state":"ERROR"}'
           else
-            echo '{"state":"FINISHED"}'
+            echo "$finished"
           fi ;;
         *)
-          echo '{"state":"FINISHED"}' ;;
+          echo "$finished" ;;
       esac
+      exit 0 ;;
+    */images/*)
+      # report_visibility's GET /images/<project>/<region>/<image_id>. Deliberately
+      # does not match the downloadimage URL ("downloadimage/" is not "/images/").
+      if [ -n "${FAKE_CURL_VISIBILITY_MISSING:-}" ]; then
+        echo '{}'
+      else
+        printf '{"visibility":"%s"}\n' "${FAKE_CURL_VISIBILITY:-private}"
+      fi
       exit 0 ;;
   esac
 done
@@ -100,7 +106,9 @@ out=$(PATH="$dir:$PATH" \
   bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
 if [ "$rc" -eq 0 ] \
    && grep -q "region 180: import task task-abc FINISHED" <<<"$out" \
-   && grep -q "region 68: import task task-abc FINISHED" <<<"$out"; then
+   && grep -q "region 68: import task task-abc FINISHED" <<<"$out" \
+   && grep -q "region 180: image img-1 visibility=private" <<<"$out" \
+   && grep -q "region 68: image img-1 visibility=private" <<<"$out"; then
   echo "PASS: happy path (two regions)"
 else
   echo "FAIL: happy path (rc=$rc)"; echo "$out"; FAILED=1
@@ -126,9 +134,8 @@ else
   echo "FAIL: missing env path (rc=$rc)"; echo "$out"; FAILED=1
 fi
 
-# Test 4: poll retries on a non-terminal state, then succeeds -> the fake
-# curl returns RUNNING for the first two /tasks/ polls and FINISHED after,
-# exercising poll_task's sleep-and-retry branch; script still exits 0.
+# Test 4: RUNNING for the first two polls, then FINISHED -> exercises poll_task's
+# sleep-and-retry branch; still exits 0.
 dir=$(make_fake_curl); TMP_DIRS+=("$dir")
 out=$(PATH="$dir:$PATH" FAKE_CURL_MODE=retry FAKE_CURL_RETRY_THRESHOLD=2 \
   GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
@@ -142,9 +149,8 @@ else
   echo "FAIL: poll retry then success (rc=$rc, running_count=$running_count)"; echo "$out"; FAILED=1
 fi
 
-# Test 5: poll timeout -> the fake curl always returns RUNNING, so
-# poll_task exhausts POLL_ATTEMPTS and the script exits non-zero with the
-# "did not finish after" hard-failure message (no fallback).
+# Test 5: always RUNNING -> poll_task exhausts POLL_ATTEMPTS and hard-fails (no
+# fallback).
 dir=$(make_fake_curl); TMP_DIRS+=("$dir")
 out=$(PATH="$dir:$PATH" FAKE_CURL_MODE=always_running \
   GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
@@ -156,9 +162,8 @@ else
   echo "FAIL: poll timeout (rc=$rc)"; echo "$out"; FAILED=1
 fi
 
-# Test 6: mixed multi-region outcome -> region 180 FINISHED, region 68
-# ERROR; the failures counter aggregates across regions and the script
-# exits non-zero even though one region succeeded.
+# Test 6: region 180 FINISHED, region 68 ERROR -> failures aggregate across
+# regions, so the script exits non-zero even though one region succeeded.
 dir=$(make_fake_curl); TMP_DIRS+=("$dir")
 out=$(PATH="$dir:$PATH" FAKE_CURL_MODE=mixed FAKE_CURL_ERROR_REGION=68 \
   GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
@@ -172,8 +177,8 @@ else
   echo "FAIL: mixed multi-region outcome (rc=$rc)"; echo "$out"; FAILED=1
 fi
 
-# Test 7: downloadimage returns an HTTP error -> non-zero exit, status + body
-# surfaced (rather than the empty message the old `curl -f` produced).
+# Test 7: downloadimage HTTP error -> non-zero exit with status + body surfaced,
+# not the empty message `curl -f` used to produce.
 dir=$(make_fake_curl); TMP_DIRS+=("$dir")
 out=$(PATH="$dir:$PATH" FAKE_CURL_IMPORT_HTTP=422 \
   GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
@@ -185,9 +190,51 @@ else
   echo "FAIL: import HTTP error (rc=$rc)"; echo "$out"; FAILED=1
 fi
 
+# Test 8: image comes back public -> import succeeded, but exit non-zero, since
+# public means gcore's global catalog rather than private to the project.
+dir=$(make_fake_curl); TMP_DIRS+=("$dir")
+out=$(PATH="$dir:$PATH" FAKE_CURL_VISIBILITY=public \
+  GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
+  GCORE_REGIONS="180" POLL_INTERVAL_SECS=0 \
+  bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
+if [ "$rc" -ne 0 ] \
+   && grep -q "import task task-abc FINISHED" <<<"$out" \
+   && grep -q "visibility=public" <<<"$out"; then
+  echo "PASS: public image fails the publish"
+else
+  echo "FAIL: public image fails the publish (rc=$rc)"; echo "$out"; FAILED=1
+fi
+
+# Test 9: image comes back "shared" -> owner-only, so a warning rather than a
+# failure, because ?private=true listings won't return it.
+dir=$(make_fake_curl); TMP_DIRS+=("$dir")
+out=$(PATH="$dir:$PATH" FAKE_CURL_VISIBILITY=shared \
+  GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
+  GCORE_REGIONS="180" POLL_INTERVAL_SECS=0 \
+  bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] \
+   && grep -q "visibility=shared, not private" <<<"$out" \
+   && grep -q "will NOT return this image" <<<"$out"; then
+  echo "PASS: shared image warns but succeeds"
+else
+  echo "FAIL: shared image warns but succeeds (rc=$rc)"; echo "$out"; FAILED=1
+fi
+
+# Test 10: unreadable visibility -> warn and succeed; the import already finished,
+# so a failed diagnostic must not fail the publish.
+dir=$(make_fake_curl); TMP_DIRS+=("$dir")
+out=$(PATH="$dir:$PATH" FAKE_CURL_VISIBILITY_MISSING=1 \
+  GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
+  GCORE_REGIONS="180" POLL_INTERVAL_SECS=0 \
+  bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && grep -q "could not read visibility of image img-1" <<<"$out"; then
+  echo "PASS: unreadable visibility warns but succeeds"
+else
+  echo "FAIL: unreadable visibility warns but succeeds (rc=$rc)"; echo "$out"; FAILED=1
+fi
+
 if [ "$FAILED" -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
-# Explicit call (the EXIT trap above is a safety net for any other exit path);
-# cleanup is idempotent, and neither invocation touches $FAILED or calls exit,
-# so this cannot mask a test failure or change the exit code below.
+# The EXIT trap covers other exit paths; cleanup is idempotent and touches neither
+# $FAILED nor exit, so calling it twice is harmless.
 cleanup
 exit "$FAILED"
