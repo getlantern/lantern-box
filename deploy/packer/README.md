@@ -124,13 +124,30 @@ provider's image store) gcore uses a **build → host → import** pipeline:
    builder (so image contents match), then generalizes the disk (cloud-init
    clean, zero machine-id, drop SSH host keys, lock the build password) so the
    raw disk boots fresh on import.
-2. CI stages the qcow2 in **gcore's own S3-compatible object storage** and hands
-   gcore a short-lived presigned URL — no external cloud, no stored bucket/key
-   secret. `deploy/packer/gcore-storage.sh` (gcore control plane, via the API)
-   find-or-creates a dedicated storage instance (`lantern-box-images`, location
-   `luxembourg-2`) + bucket and mints an **ephemeral** access key; the AWS CLI —
-   as a generic S3 client pointed at gcore's endpoint, not AWS — uploads the
-   qcow2 and `presign`s a 24h URL; a cleanup step revokes the key.
+2. CI stages the qcow2 in **gcore's own S3-compatible object storage**, in a
+   throwaway, **randomly-named** bucket that is made briefly public-read for the
+   import and then torn down — no external cloud, no stored bucket/key secret.
+   This is required because gcore's importer fetches an **unauthenticated** URL
+   (it does a HEAD then a GET): the API has no field for source credentials, and
+   a presigned/SigV4 URL is bound to one HTTP method (its HEAD preflight 403s),
+   so the object has to be anonymously readable. `deploy/packer/gcore-storage.sh`
+   (gcore control plane, via the API) find-or-creates a dedicated storage
+   instance (`lantern-box-images`, location `luxembourg-2`), sweeps any leftover
+   stage buckets, creates a fresh `lantern-box-stage-<random>` bucket, and mints
+   an **ephemeral** access key; the AWS CLI — as a generic S3 client pointed at
+   gcore's endpoint, not AWS — uploads the qcow2 and applies an anonymous
+   `s3:GetObject` bucket policy. The plain
+   `https://<region>.cloud.gcore.lu/<bucket>/<key>` URL is handed to gcore. After
+   the imports, `always()` cleanup steps delete the object, then the bucket (with
+   its public policy) and the access key.
+
+   The image is world-readable only for the length of the imports, and this is a
+   deliberate tradeoff: the bucket name is unguessable, the bucket holds only
+   that one qcow2, the URL is masked out of the CI logs, and teardown runs even
+   on failure. A run hard-killed between exposing and tearing down could leave a
+   public bucket behind until the next run's sweep removes it (the sweep can only
+   delete an *empty* leftover via the control plane; one that still holds an
+   object must be emptied — S3 `rm` — and deleted by hand).
 3. `deploy/packer/gcore-publish.sh` imports that URL into each target region via
    `POST cloud/v1/downloadimage/{project}/{region}` (name `lantern-box-<version>`,
    `architecture=x86_64`, `os_type=linux`) and polls each task to `FINISHED`.
@@ -152,9 +169,10 @@ in CI, not on macOS. To validate the config anywhere:
 - Repo secrets: `GCORE_API_KEY` (must have **object-storage** permission, not just
   cloud/compute), `GCORE_PROJECT_ID`, `QEMU_SSH_PASSWORD`.
 
-That's it — the storage instance, bucket, and (ephemeral) access keys are created
-and torn down by the workflow itself (`gcore-storage.sh`), so there's no bucket to
-pre-create and no cloud IAM to configure.
+That's it — the storage instance, the per-run stage bucket, and the (ephemeral)
+access keys are created and torn down by the workflow itself
+(`gcore-storage.sh`), so there's no bucket to pre-create and no cloud IAM to
+configure.
 
 ## Adding a new cloud provider
 

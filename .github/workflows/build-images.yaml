@@ -255,7 +255,6 @@ jobs:
     needs: [prepare, prune, build-datacap]
     permissions:
       contents: read
-      id-token: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -557,16 +556,19 @@ jobs:
         env:
           GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
         run: |
-          # Find-or-create the dedicated gcore S3 storage + bucket and mint an
-          # ephemeral access key (revoked in the cleanup step below). Emits
-          # storage_id/address/bucket/access_key/secret_key as step outputs.
+          # Find-or-create the dedicated gcore S3 storage instance, sweep any
+          # leftover stage buckets, create a fresh randomly-named bucket, and mint
+          # an ephemeral access key (all torn down in the cleanup steps below).
+          # Emits storage_id/region/endpoint/bucket/access_key/secret_key as step
+          # outputs. The bucket name is unguessable and the secret key is masked;
+          # the object goes public only briefly (see the next step).
           bash deploy/packer/gcore-storage.sh provision | while IFS='=' read -r k v; do
-            case "$k" in access_key | secret_key) echo "::add-mask::$v" ;; esac
+            case "$k" in access_key | secret_key | bucket) echo "::add-mask::$v" ;; esac
             echo "$k=$v" >> "$GITHUB_OUTPUT"
           done
 
-      - name: Upload qcow2 and presign URL (gcore)
-        id: gcs
+      - name: Upload qcow2 and expose it for gcore import (gcore)
+        id: stage
         if: matrix.builder == 'gcore'
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -580,11 +582,29 @@ jobs:
           ENDPOINT: ${{ steps.gstore.outputs.endpoint }}
           BUCKET: ${{ steps.gstore.outputs.bucket }}
         run: |
-          key="lantern-box/lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
+          # gcore's importer fetches an UNAUTHENTICATED URL (HEAD then GET), so a
+          # presigned/method-bound URL can't satisfy it — the object must be
+          # anonymously readable. We upload it to the throwaway, randomly-named
+          # bucket from the previous step and grant anonymous s3:GetObject for the
+          # duration of the import; the whole bucket (policy included) is torn down
+          # in the cleanup steps below. The random bucket name is masked and the
+          # URL is not logged, so the short public window stays unguessable.
+          key="lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
           qcow2="deploy/packer/output-gcore/lantern-box-${VERSION}-amd64.qcow2"
-          echo "Uploading ${qcow2} -> s3://${BUCKET}/${key} via ${ENDPOINT}"
+          echo "Uploading ${qcow2} to the staging bucket via ${ENDPOINT}"
           aws s3 cp "$qcow2" "s3://${BUCKET}/${key}" --endpoint-url "$ENDPOINT"
-          url=$(aws s3 presign "s3://${BUCKET}/${key}" --endpoint-url "$ENDPOINT" --expires-in 86400)
+          aws s3api put-bucket-policy --bucket "$BUCKET" --endpoint-url "$ENDPOINT" \
+            --policy "$(jq -n --arg b "$BUCKET" '{
+              Version: "2012-10-17",
+              Statement: [{
+                Sid: "PublicReadForGcoreImport",
+                Effect: "Allow",
+                Principal: "*",
+                Action: "s3:GetObject",
+                Resource: "arn:aws:s3:::\($b)/*"
+              }]
+            }')"
+          url="${ENDPOINT}/${BUCKET}/${key}"
           echo "::add-mask::$url"
           echo "url=$url" >> "$GITHUB_OUTPUT"
 
@@ -595,14 +615,15 @@ jobs:
           GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
           GCORE_PROJECT_ID: ${{ secrets.GCORE_PROJECT_ID }}
           GCORE_REGIONS: ${{ needs.prepare.outputs.gcore_regions }}
-          IMAGE_URL: ${{ steps.gcs.outputs.url }}
+          IMAGE_URL: ${{ steps.stage.outputs.url }}
         run: bash deploy/packer/gcore-publish.sh
 
       - name: Delete staged qcow2 (gcore)
-        # Runs before the key revoke below because deleting the object needs the
-        # still-valid minted S3 credentials. The qcow2 is only needed during the
-        # import above, so remove it immediately rather than leaving a multi-GB
-        # object in the bucket. `|| true` so a missing object never fails the job.
+        # Runs before the bucket/key teardown below because emptying the object
+        # needs the still-valid minted S3 credentials, and the control-plane
+        # bucket delete needs the bucket empty. The qcow2 (and its public policy)
+        # is only needed during the import above, so remove it as soon as the
+        # import finishes. `|| true` so a missing object never fails the job.
         if: always() && matrix.builder == 'gcore' && steps.gstore.outputs.access_key != ''
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -612,14 +633,15 @@ jobs:
           ENDPOINT: ${{ steps.gstore.outputs.endpoint }}
           BUCKET: ${{ steps.gstore.outputs.bucket }}
         run: |
-          key="lantern-box/lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
+          key="lantern-box-${VERSION}-${GITHUB_RUN_ID}.qcow2"
           aws s3 rm "s3://${BUCKET}/${key}" --endpoint-url "$ENDPOINT" || true
 
-      - name: Clean up gcore access key (gcore)
+      - name: Clean up gcore stage bucket and access key (gcore)
         if: always() && matrix.builder == 'gcore' && steps.gstore.outputs.access_key != ''
         env:
           GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
           STORAGE_ID: ${{ steps.gstore.outputs.storage_id }}
+          BUCKET: ${{ steps.gstore.outputs.bucket }}
           ACCESS_KEY: ${{ steps.gstore.outputs.access_key }}
         run: bash deploy/packer/gcore-storage.sh cleanup
 
