@@ -24,10 +24,13 @@ on:
         required: false
         default: "linode,oracle-oci,alicloud-ecs,gcore"
         type: string
+      # Deliberately NOT prefilled with the default list. The list lives in exactly one
+      # place — the "Resolve gcore regions and build timeout" step — because a prefilled
+      # default here would be a second copy that a push-triggered run never uses, and the
+      # two silently drifted apart once already.
       gcore_regions:
-        description: "Comma-separated Gcore numeric region IDs (gcore builder only)."
+        description: "Comma-separated Gcore numeric region IDs (gcore builder only). Blank = every region lantern-cloud provisions in."
         required: false
-        default: "196,184,180,176,164,152,148,140,136,128,124,116,108,104,100,92,88,84,80,76,68,64,50,46,34,30,26,18,14,6"
         type: string
 
 permissions:
@@ -117,7 +120,15 @@ jobs:
         env:
           INPUT_REGIONS: ${{ github.event.inputs.gcore_regions }}
         run: |
-          regions="${INPUT_REGIONS:-180}"
+          # THE gcore region list — the only copy. Every gcore region lantern-cloud can
+          # provision a VPS in, because its provider looks the boot image up per region
+          # and fails outright where one is missing. Publishing to a subset is what
+          # caused the "no gcore image matching prefix lantern-box- in region 180"
+          # failure this builder exists to fix, so the automatic push-to-main build
+          # covers all of them, exactly as oracle-oci (36) and alicloud (8) already do.
+          # A dispatch may narrow it for a scoped test; nothing else should.
+          default_regions="196,184,180,176,164,152,148,140,136,128,124,116,108,104,100,92,88,84,80,76,68,64,50,46,34,30,26,18,14,6"
+          regions="${INPUT_REGIONS:-$default_regions}"
           echo "regions=$regions" >> "$GITHUB_OUTPUT"
           echo "gcore regions: $regions"
           # The gcore build job's timeout is budgeted here because GitHub expressions have
@@ -583,10 +594,9 @@ jobs:
         env:
           GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
           GCORE_PROJECT_ID: ${{ secrets.GCORE_PROJECT_ID }}
-          QEMU_SSH_PASSWORD: ${{ secrets.QEMU_SSH_PASSWORD }}
         run: |
           missing=""
-          for var in GCORE_API_KEY GCORE_PROJECT_ID QEMU_SSH_PASSWORD; do
+          for var in GCORE_API_KEY GCORE_PROJECT_ID; do
             [ -z "${!var}" ] && missing="$missing $var"
           done
           if [ -n "$missing" ]; then
@@ -615,8 +625,19 @@ jobs:
         working-directory: deploy/packer
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-          QEMU_SSH_PASSWORD: ${{ secrets.QEMU_SSH_PASSWORD }}
         run: |
+          # Mint the build-only SSH password here rather than reading a repo secret.
+          # Packer needs a password to reach the cloud image, and the generalize step
+          # locks the account afterwards — but the account's hash still ships in the
+          # qcow2's /etc/shadow, and that qcow2 is briefly world-readable while gcore
+          # imports it. A long-lived secret's hash would stay valid for every later
+          # build if that window were ever caught; a per-run value is worthless the
+          # moment this job ends. Hex, not base64: the value is interpolated into the
+          # cloud-init YAML and into shutdown_command's single-quoted shell string, and
+          # hex cannot carry a quote, a slash, or a YAML indicator.
+          QEMU_SSH_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$QEMU_SSH_PASSWORD"
+          export QEMU_SSH_PASSWORD
           packer build \
             -var "lantern_box_version=$VERSION" \
             -only="qemu.lantern-box-gcore" \

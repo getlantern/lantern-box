@@ -1008,7 +1008,7 @@ source "qemu" "lantern-box-gcore" {
     "user-data" = <<-EOF
       #cloud-config
       ssh_pwauth: true
-      password: ${var.qemu_ssh_password}
+      password: "${var.qemu_ssh_password}"
       chpasswd:
         expire: false
     EOF

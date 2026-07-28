@@ -89,7 +89,6 @@ In CI, the `datacap` binary is built from `getlantern/lantern-cloud` and baked i
 | `OCI_AVAILABILITY_DOMAIN_GRU` | OCI AD — sa-saopaulo-1                                                     |
 | `GCORE_API_KEY`               | Gcore Cloud API token (sent as `Authorization: APIKey ...`)                |
 | `GCORE_PROJECT_ID`            | Gcore project ID (numeric); scopes every API call                          |
-| `QEMU_SSH_PASSWORD`           | Build-time password for the ubuntu user in the QEMU (gcore) build          |
 
 ## Deploy a VPS from the image
 
@@ -215,9 +214,25 @@ would catch it, so treating "could not tell" as a pass would turn the exposure i
 a green build. The bounded retry is what keeps one API blip from failing an
 otherwise good build; exhausting it names the image so a human can check it.
 
-**Regions** are numeric gcore region IDs. The workflow's `gcore_regions` input
-(default `180` = Frankfurt-2) controls where the image is published; the prune
-job keeps the 3 newest `lantern-box-` images per region.
+**Regions** are numeric gcore region IDs. The default list — every region
+lantern-cloud provisions in — lives in exactly one place, the `prepare` job's
+"Resolve gcore regions and build timeout" step, and both push-to-main and
+default dispatches use it. lantern-cloud's provider resolves the boot image per
+region and fails where one is missing, so publishing to a subset is what caused
+the `no gcore image matching prefix "lantern-box-" in region 180` failure this
+builder fixes. The `gcore_regions` dispatch input overrides the list for a scoped
+test (e.g. a single region to verify a change) and is intentionally left blank
+rather than prefilled, so there is no second copy to drift. The prune job keeps
+the 3 newest `lantern-box-` images per region, over the same list.
+
+**The build-time SSH password is not a secret.** Packer needs a password to SSH
+into the stock cloud image; the generalize step locks the account, but its hash
+still ships in the qcow2 — and that qcow2 is briefly world-readable while gcore
+imports it. So the build job generates a fresh `openssl rand -hex 24` per run and
+masks it. A stored secret's hash would remain valid for every later build if that
+window were ever caught; a per-run value is worthless once the job ends. Keep any
+replacement hex or alphanumeric: it is interpolated into the cloud-init YAML and
+into `shutdown_command`'s single-quoted shell string.
 
 **Imports run concurrently.** There is one staged object and one URL, and each region's
 importer fetches it independently, so the transfers were never serial — only the waiting
@@ -256,7 +271,8 @@ in CI, not on macOS. To validate the config anywhere:
 **Operator prerequisites (one-time):**
 
 - Repo secrets: `GCORE_API_KEY` (must have **object-storage** permission, not just
-  cloud/compute), `GCORE_PROJECT_ID`, `QEMU_SSH_PASSWORD`.
+  cloud/compute) and `GCORE_PROJECT_ID`. There is no build-password secret: the
+  build job mints a random one per run (see below).
 
 That's it — the storage instance, the per-run stage bucket, and the (ephemeral)
 access keys are created and torn down by the workflow itself

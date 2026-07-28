@@ -35,7 +35,10 @@ variable "alicloud_ssh_password" {
 
 # QEMU (gcore) — build-time password so Packer can SSH into the cloud image.
 # Locked again in the generalize step; the real key is injected by cloud-init at
-# first boot.
+# first boot. NOT a stored secret: the build job mints a fresh random value per
+# run, because the account's hash ships in the qcow2 that gcore imports over a
+# brief public URL. Keep it hex/alphanumeric — it is interpolated into the
+# cloud-init YAML and into a single-quoted shell string.
 variable "qemu_ssh_password" {
   type      = string
   sensitive = true
