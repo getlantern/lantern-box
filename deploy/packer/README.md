@@ -186,7 +186,9 @@ provider's image store) gcore uses a **build → host → import** pipeline:
 3. `deploy/packer/gcore-publish.sh` imports that URL into each target region via
    `POST cloud/v1/downloadimage/{project}/{region}` (name `lantern-box-<version>`,
    `architecture=x86_64`, `os_type=linux`), polls each task to `FINISHED`, and checks
-   the created image's `visibility`.
+   the created image's `visibility`. POSTs are spaced by `IMPORT_STAGGER_SECS`
+   (default 30) because gcore reaps a task not *started* within 10min of its own
+   `created_on` — submitting ~30 at once gave them one deadline it could not meet.
 
 **Image visibility** is read-only in gcore's API: neither
 `POST cloud/v1/downloadimage/...` nor `PATCH cloud/v1/images/...` accepts the

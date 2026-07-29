@@ -20,6 +20,7 @@
 #   already-failing public-image path, so it must not eat the whole job timeout.
 #   VISIBILITY_ATTEMPTS (default 3) — tries for each of the two visibility lookups,
 #   which fail the publish once exhausted (see report_visibility).
+#   IMPORT_STAGGER_SECS (default 30) — pause between import POSTs; 0 disables.
 set -euo pipefail
 
 : "${GCORE_API_KEY:?GCORE_API_KEY must be set}"
@@ -35,6 +36,7 @@ POLL_ATTEMPTS="${POLL_ATTEMPTS:-120}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-15}"
 DELETE_POLL_ATTEMPTS="${DELETE_POLL_ATTEMPTS:-20}"
 VISIBILITY_ATTEMPTS="${VISIBILITY_ATTEMPTS:-3}"
+IMPORT_STAGGER_SECS="${IMPORT_STAGGER_SECS:-30}"
 AUTH="Authorization: APIKey ${GCORE_API_KEY}"
 IMAGE_NAME="lantern-box-${VERSION}"
 
@@ -202,6 +204,13 @@ main() {
   for region in "${raw[@]}"; do
     region="${region//[[:space:]]/}"
     [ -z "$region" ] && continue
+    # Gcore reaps a task not STARTED within 10min of its own created_on, so POSTing all
+    # ~30 imports in one window gives them a shared deadline the scheduler cannot meet.
+    # Before the POST, and only once a task exists: no trailing wait, and a rejected POST
+    # created nothing to space from.
+    if [ "${#tasks[@]}" -gt 0 ] && [ "$IMPORT_STAGGER_SECS" -gt 0 ]; then
+      "$SLEEP" "$IMPORT_STAGGER_SECS"
+    fi
     echo "==> Importing ${IMAGE_NAME} into region ${region}"
     if ! task=$(import_region "$region"); then
       failures=$((failures + 1))

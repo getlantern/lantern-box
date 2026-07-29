@@ -127,7 +127,8 @@ jobs:
           # failure this builder exists to fix, so the automatic push-to-main build
           # covers all of them, exactly as oracle-oci (36) and alicloud (8) already do.
           # A dispatch may narrow it for a scoped test; nothing else should.
-          default_regions="196,184,180,176,164,152,148,140,136,128,124,116,108,104,100,92,88,84,80,76,68,64,50,46,34,30,26,18,14,6"
+          # 6 not added because luxembourg is a "special" region
+          default_regions="196,184,180,176,164,152,148,140,136,128,124,116,108,104,100,92,88,84,80,76,68,64,50,46,34,30,26,18,14"
           regions="${INPUT_REGIONS:-$default_regions}"
           echo "regions=$regions" >> "$GITHUB_OUTPUT"
           echo "gcore regions: $regions"

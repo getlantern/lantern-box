@@ -7,6 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PUBLISH="${SCRIPT_DIR}/gcore-publish.sh"
 FAILED=0
 
+# No real 30s waits between imports. Tests 13/14 set their own per-command value.
+export IMPORT_STAGGER_SECS=0
+
 # Temp dirs to remove on exit. Runs after $FAILED is already decided, so it can
 # never mask a failure or change the exit code.
 TMP_DIRS=()
@@ -364,9 +367,10 @@ dir=$(make_fake_curl); TMP_DIRS+=("$dir")
 sleeplog="$dir/sleeps"
 printf '#!/usr/bin/env bash\necho s >> "%s"\n' "$sleeplog" > "$dir/fakesleep"
 chmod +x "$dir/fakesleep"
+# Stagger off: this counts POLL sleeps, and test 13 covers the per-import ones.
 out=$(PATH="$dir:$PATH" FAKE_CURL_MODE=always_running SLEEP="$dir/fakesleep" \
   GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
-  GCORE_REGIONS="180,68,45" POLL_ATTEMPTS=2 POLL_INTERVAL_SECS=0 \
+  GCORE_REGIONS="180,68,45" POLL_ATTEMPTS=2 POLL_INTERVAL_SECS=0 IMPORT_STAGGER_SECS=0 \
   bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
 sleeps=$(grep -c . "$sleeplog" 2>/dev/null || echo 0)
 # sed rather than head, which would SIGPIPE the grep feeding it under pipefail.
@@ -396,6 +400,38 @@ if [ "$rc" -ne 0 ] \
   echo "PASS: one failing region does not block the others"
 else
   echo "FAIL: one failing region does not block the others (rc=$rc)"; echo "$out"; FAILED=1
+fi
+
+# Test 13: N imports cost N-1 stagger sleeps — none before the first or after the last.
+dir=$(make_fake_curl); TMP_DIRS+=("$dir")
+sleeplog="$dir/sleeps"
+printf '#!/usr/bin/env bash\necho "$1" >> "%s"\n' "$sleeplog" > "$dir/fakesleep"
+chmod +x "$dir/fakesleep"
+out=$(PATH="$dir:$PATH" SLEEP="$dir/fakesleep" \
+  GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
+  GCORE_REGIONS="180,68,45" POLL_INTERVAL_SECS=0 IMPORT_STAGGER_SECS=7 \
+  bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
+staggers=$(grep -c '^7$' "$sleeplog" 2>/dev/null || echo 0)
+if [ "$rc" -eq 0 ] && [ "$staggers" -eq 2 ]; then
+  echo "PASS: 3 imports cost 2 stagger sleeps, none leading or trailing"
+else
+  echo "FAIL: import stagger (rc=$rc staggers=$staggers)"; echo "$out"; FAILED=1
+fi
+
+# Test 14: IMPORT_STAGGER_SECS=0 skips the stagger rather than sleeping 0.
+dir=$(make_fake_curl); TMP_DIRS+=("$dir")
+sleeplog="$dir/sleeps"
+printf '#!/usr/bin/env bash\necho "$1" >> "%s"\n' "$sleeplog" > "$dir/fakesleep"
+chmod +x "$dir/fakesleep"
+out=$(PATH="$dir:$PATH" SLEEP="$dir/fakesleep" \
+  GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
+  GCORE_REGIONS="180,68,45" POLL_INTERVAL_SECS=0 IMPORT_STAGGER_SECS=0 \
+  bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
+sleeps=$(grep -c . "$sleeplog" 2>/dev/null || echo 0)
+if [ "$rc" -eq 0 ] && [ "$sleeps" -eq 0 ]; then
+  echo "PASS: stagger of 0 issues no sleep at all"
+else
+  echo "FAIL: stagger disabled (rc=$rc sleeps=$sleeps)"; echo "$out"; FAILED=1
 fi
 
 if [ "$FAILED" -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
