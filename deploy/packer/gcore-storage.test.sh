@@ -194,10 +194,9 @@ out=$(PATH="$dir:$PATH" FAKE_BUCKET_DELETE_FAILS=1 GCORE_API_KEY=k \
 check "cleanup tolerates an already-gone bucket" 0 "$out" "$rc" \
   'already gone' 'deleted gcore access key'
 
-# Test 5c-2: the delete is refused AND the listing is unreadable, so cleanup cannot tell
-# whether the bucket survived. It must assume the worst and fail, never report the
-# reassuring "already gone" — folding unknown into absent is how a bucket still holding
-# the qcow2 gets signed off as cleaned up.
+# Test 5c-2: delete refused AND listing unreadable, so cleanup cannot tell whether the
+# bucket survived. It must fail, never report "already gone" — folding unknown into absent
+# is how a bucket still holding the qcow2 gets signed off as cleaned.
 dir=$(make_fake_curl)
 out=$(PATH="$dir:$PATH" FAKE_BUCKET_DELETE_FAILS=1 FAKE_BUCKET_LIST_FAILS=1 GCORE_API_KEY=k \
   STORAGE_ID=42 BUCKET=lantern-box-stage-abc ACCESS_KEY=NEWKEY \

@@ -32,15 +32,12 @@ trap cleanup EXIT
 #   mixed          downloadimage -> task named for the region in the URL (region
 #                  68 -> "task-68"); /tasks/ -> ERROR only for
 #                  FAKE_CURL_ERROR_REGION's task
-# FINISHED tasks report created_resources.images == ["img-1"] — unless
-# FAKE_CURL_NO_IMAGE_ID is set, which empties the list so report_visibility cannot
-# resolve the image at all. GET /images/... returns FAKE_CURL_VISIBILITY (default
-# "private") for report_visibility; FAKE_CURL_VISIBILITY_MISSING makes every such GET
-# unreadable, and FAKE_CURL_VISIBILITY_FLAKY=N makes only the first N unreadable so a
-# test can prove the bounded retry recovers.
-# DELETE /images/... (delete_image) answers FAKE_CURL_DELETE_HTTP (default 204) and
-# returns a "task-del" task, whose state comes from FAKE_CURL_DELETE_STATE
-# (default FINISHED).
+# FINISHED tasks report created_resources.images == ["img-1"]; FAKE_CURL_NO_IMAGE_ID
+# empties it so report_visibility cannot resolve the image. GET /images/... returns
+# FAKE_CURL_VISIBILITY (default "private"); _MISSING makes every such GET unreadable and
+# _FLAKY=N only the first N, to prove the bounded retry recovers. DELETE /images/...
+# answers FAKE_CURL_DELETE_HTTP (default 204) with a "task-del" task in
+# FAKE_CURL_DELETE_STATE (default FINISHED).
 make_fake_curl() {
   local dir
   dir=$(mktemp -d)
@@ -307,10 +304,8 @@ else
   echo "FAIL: shared image warns but succeeds (rc=$rc)"; echo "$out"; FAILED=1
 fi
 
-# Test 10: unreadable visibility -> FAIL the publish once the retries are exhausted.
-# This is the check that catches an image landing in gcore's public catalog, so "we
-# could not tell" must not read as "it is fine". Retries are bounded, so the failure
-# arrives after VISIBILITY_ATTEMPTS tries rather than hanging.
+# Test 10: unreadable visibility -> FAIL once retries are exhausted. "Could not tell"
+# must not read as "it is fine", and the bound means it fails rather than hangs.
 dir=$(make_fake_curl); TMP_DIRS+=("$dir")
 out=$(PATH="$dir:$PATH" FAKE_CURL_VISIBILITY_MISSING=1 \
   GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
@@ -358,11 +353,9 @@ else
   echo "FAIL: an unresolvable image ID fails the publish (rc=$rc)"; echo "$out"; FAILED=1
 fi
 
-# Test 11: every region's import is issued BEFORE any polling starts, and the wait costs
-# one sleep per round rather than one per region per round. That is the property making
-# wall-clock the slowest single region instead of the sum: draining regions one at a time
-# would cost regions x POLL_ATTEMPTS sleeps (6 here) and would not POST the later imports
-# until the earlier ones finished.
+# Test 11: every import is issued BEFORE polling starts, and the wait costs one sleep per
+# round, not per region per round — the property making wall-clock the slowest region
+# instead of the sum. Draining one at a time would cost 6 sleeps here.
 dir=$(make_fake_curl); TMP_DIRS+=("$dir")
 sleeplog="$dir/sleeps"
 printf '#!/usr/bin/env bash\necho s >> "%s"\n' "$sleeplog" > "$dir/fakesleep"

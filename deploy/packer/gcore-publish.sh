@@ -68,10 +68,9 @@ import_region() {
 }
 
 # poll_task REGION TASK_ID [WHAT] [MAX_ATTEMPTS] -> 0 on FINISHED, 1 on ERROR/timeout.
-# WHAT only labels the log lines. MAX_ATTEMPTS is an explicit parameter rather than an
-# env override in a subshell, so a caller wanting a shorter budget cannot accidentally
-# shadow POLL_ATTEMPTS for anyone else. Imports do not use this — main() waits on all of
-# them together — so in practice this is the delete path's poller.
+# MAX_ATTEMPTS is a parameter, not an env override, so a caller wanting a shorter budget
+# cannot shadow POLL_ATTEMPTS for everyone. In practice this is the delete path's poller;
+# main() waits on the imports together.
 poll_task() {
   local region="$1" task="$2" what="${3:-import}" max="${4:-$POLL_ATTEMPTS}" attempt=0 state
   while [ "$attempt" -lt "$max" ]; do
@@ -94,10 +93,8 @@ poll_task() {
 }
 
 # delete_image REGION IMAGE_ID -> remove an image we must not keep. Gcore deletes are
-# task-based, so issue the DELETE and poll the returned task: the request is what
-# matters, but polling is what lets the log state whether the image is actually gone
-# rather than merely accepted for deletion. Capture body AND status (not -f) so a
-# rejection is surfaced instead of an empty message.
+# task-based, so poll the returned task: that is what lets the log say the image is gone
+# rather than merely accepted. Capture body AND status (not -f) so a rejection surfaces.
 delete_image() {
   local region="$1" image="$2" resp http task
   resp=$("$CURL" -sS -w $'\n%{http_code}' -X DELETE -H "$AUTH" \
@@ -120,11 +117,10 @@ delete_image() {
   poll_task "$region" "$task" "delete" "$DELETE_POLL_ATTEMPTS"
 }
 
-# fetch_field URL JQ_FILTER WHAT -> print the extracted value, retrying an errored or
-# empty result up to VISIBILITY_ATTEMPTS times. Only the visibility check uses this,
-# and only because that check now fails closed: a bounded retry is what keeps one API
-# blip from failing an otherwise good build, without going back to assuming success.
-# Diagnostics go to stderr so the captured stdout stays just the value.
+# fetch_field URL JQ_FILTER WHAT -> print the value, retrying an errored or empty result
+# up to VISIBILITY_ATTEMPTS times. Used only by the visibility check, which fails closed:
+# the bounded retry keeps one API blip from failing a good build without going back to
+# assuming success. Diagnostics to stderr so stdout stays just the value.
 fetch_field() {
   local url="$1" filter="$2" what="$3" attempt=0 out
   while [ "$attempt" -lt "$VISIBILITY_ATTEMPTS" ]; do
@@ -141,21 +137,15 @@ fetch_field() {
   return 1
 }
 
-# report_visibility REGION TASK_ID -> check the imported image's visibility, which is
-# one of "private" (this project only), "shared" (this project plus member
-# projects, and gcore exposes no API to add members) or "public" (every gcore
-# customer). Only public is an exposure. Gcore has no API to *set* the field, so
-# deleting the image is the only remediation — and either way the publish failed,
-# because the region ends up with no usable private image, so public returns 1
-# whether or not the delete lands. "shared" is access-controlled too, so it only
-# warns; the prune job lists non-private images as well, so it still gets collected.
+# report_visibility REGION TASK_ID -> check the imported image's visibility: "private"
+# (this project), "shared" (plus member projects, which gcore has no API to add) or
+# "public" (every gcore customer). Only public is an exposure, and since gcore cannot
+# *set* the field, deleting is the only remediation — public returns 1 either way, since
+# the region ends up with no usable image. "shared" only warns; prune still collects it.
 #
-# Both lookups fail the publish once their retries are exhausted. This is the check
-# that catches an image landing in gcore's global catalog, so an unreadable answer
-# cannot be treated as a passing one: warning and returning 0 turned "we do not know
-# whether this image is public" into a green build that nobody would look at. The
-# import having already finished is not a reason to pass — the remediation is a human
-# checking the image, and the failure is what tells them to.
+# Both lookups fail the publish once retries are exhausted. This is the only check that
+# catches an image reaching gcore's global catalog, so "could not tell" must not pass as
+# "not public" — the failure is what tells a human to go look.
 report_visibility() {
   local region="$1" task="$2" image vis
   if ! image=$(fetch_field "${API_BASE}/tasks/${task}" \
@@ -184,14 +174,11 @@ report_visibility() {
   esac
 }
 
-# Imports run concurrently. There is one staged object and one URL, and every region's
-# importer fetches it independently — the transfers were never the serial part. What was
-# serial is the *waiting*: draining one region's task to FINISHED before starting the
-# next made wall-clock the SUM of the per-region imports. So start every import first,
-# then wait on all outstanding tasks together, checking each once per interval with a
-# single sleep per round. Wall-clock becomes the slowest single region rather than the
-# sum, which also shortens the window the staged qcow2 spends publicly readable.
-# Plain indexed arrays (no associative arrays) so this still runs under bash 3.2.
+# Imports run concurrently: the *waiting* was the serial part, since draining each task
+# before starting the next made wall-clock the SUM of the imports. Start them all, then
+# poll every outstanding task per round with one sleep. Wall-clock becomes the slowest
+# single region, which also shortens the qcow2's public window. Plain indexed arrays, no
+# associative ones, so this still runs under bash 3.2.
 main() {
   echo "Publishing ${IMAGE_NAME} to Gcore regions: ${GCORE_REGIONS}"
   local failures=0 region task attempt=0 pending i state

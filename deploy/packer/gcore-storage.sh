@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
 #
-# Manage the dedicated gcore object storage that stages the lantern-box qcow2 for
-# image import. gcore ingests images only by URL, and its importer does an
-# *unauthenticated* HEAD then GET: there is no API field for source credentials,
-# and a presigned SigV4 URL is bound to one HTTP method (its HEAD preflight 403s).
-# So the qcow2 is staged in a throwaway, randomly-named bucket made briefly
-# public-read for the import, then torn down.
+# Manage the gcore object storage that stages the lantern-box qcow2 for image import.
+# gcore ingests only by URL and its importer does an *unauthenticated* HEAD then GET — no
+# source-credential field, and a presigned SigV4 URL is method-bound (the HEAD 403s). So
+# the qcow2 is staged in a throwaway randomly-named bucket, made briefly public-read.
 #
-# This script owns the gcore *control plane* (storage instance + buckets + access
-# keys); the upload, the public bucket policy, and the object delete are done by
-# the AWS CLI against gcore's S3 endpoint in the workflow. The one place this
-# script reaches for the S3 API too is the stale-bucket sweep, which has to revoke
-# the policy and empty a leftover before the control plane will delete it.
+# This script owns the gcore *control plane* (instance + buckets + access keys); the
+# workflow does the upload, policy, and object delete via the AWS CLI. The exception is
+# the stale-bucket sweep, which needs S3 to revoke and empty a leftover first.
 #
 # Subcommands:
 #   provision  Find-or-create the storage instance, mint an ephemeral access key,
@@ -124,13 +120,10 @@ ensure_storage() {
 # which would SIGPIPE under pipefail.
 rand_suffix() { od -An -N8 -tx1 /dev/urandom | tr -d ' \n'; }
 
-# sweep_stale_buckets ID ENDPOINT -> best-effort teardown of stage buckets left by
-# a run that died before its own cleanup (a lost runner; a cancelled job still runs
-# its always() teardown). Only BUCKET_PREFIX-named buckets, so the instance's
-# others are untouched. Order matters: revoke the anonymous-read policy FIRST —
-# that is what ends the exposure, and it works whether or not the rest succeeds —
-# then empty the bucket, because the control-plane delete refuses a non-empty one.
-# Expects AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_DEFAULT_REGION in the env.
+# sweep_stale_buckets ID ENDPOINT -> best-effort teardown of stage buckets left by a run
+# that died before its own cleanup. Only BUCKET_PREFIX-named ones. Order matters: revoke
+# the policy FIRST (that ends the exposure), then empty, since the control-plane delete
+# refuses a non-empty bucket. Expects AWS_* in the env.
 sweep_stale_buckets() {
   local id="$1" endpoint="$2" b
   for b in $(api_get "${API_BASE}/object_storages/${id}/buckets?limit=1000" \
@@ -147,13 +140,10 @@ sweep_stale_buckets() {
   done
 }
 
-# bucket_exists ID NAME -> 0 present, 1 absent, 2 could not tell. Lets cleanup tell
-# "the delete raced something that already removed it" apart from "the delete was
-# refused and the bucket is still there". The third state matters: folding an
-# unreadable listing into "absent" would report a stranded bucket as cleaned up,
-# which is the exact failure this check exists to catch. So the fetch and the parse
-# are separated — api_get uses curl -f, whose non-zero covers auth, 5xx and network
-# alike, and jq -e exits 1 only for a listing it read and found no match in.
+# bucket_exists ID NAME -> 0 present, 1 absent, 2 could not tell. The third state
+# matters: folding an unreadable listing into "absent" would report a stranded bucket as
+# cleaned up. Hence fetch and parse are separate — curl -f covers auth/5xx/network, and
+# jq -e exits 1 only for a listing it read and found no match in.
 bucket_exists() {
   local listing rc=0
   listing=$(api_get "${API_BASE}/object_storages/$1/buckets?limit=1000") || return 2
@@ -165,15 +155,11 @@ bucket_exists() {
   esac
 }
 
-# set_bucket_expiry BUCKET ENDPOINT -> attach a 1-day object-expiry lifecycle rule.
-# This is the last-resort backstop: if a run dies so hard that no teardown runs at all
-# (a lost runner — a cancelled job still runs its always() steps), gcore deletes the
-# staged qcow2 on its own. That also un-sticks the bucket, because the control-plane
-# delete refuses a non-empty one. Gcore's expiry pass runs around midnight UTC and
-# lands a day later than Days suggests, so the worst case is ~48h — a floor under the
-# exposure, never a substitute for the workflow's policy revoke, which closes the
-# window in seconds. Gcore implements the legacy put-bucket-lifecycle, not
-# put-bucket-lifecycle-configuration.
+# set_bucket_expiry BUCKET ENDPOINT -> 1-day object-expiry rule. Last-resort backstop for
+# a run that dies with no teardown at all: gcore removes the qcow2 itself, which also
+# un-sticks the bucket. Its expiry pass runs near midnight UTC, so worst case is ~48h — a
+# floor under the exposure, not a substitute for the policy revoke. Gcore implements the
+# legacy put-bucket-lifecycle, not put-bucket-lifecycle-configuration.
 set_bucket_expiry() {
   local bucket="$1" endpoint="$2"
   "$AWS" s3api put-bucket-lifecycle --bucket "$bucket" --endpoint-url "$endpoint" \
@@ -183,12 +169,9 @@ set_bucket_expiry() {
 }
 
 # empty_bucket BUCKET ENDPOINT -> remove everything the control-plane delete counts.
-# Incomplete multipart uploads come first: the qcow2 is multi-GB so `aws s3 cp` uploads
-# it in parts, and a run killed mid-upload leaves parts that `s3 rm` does NOT touch and
-# that the expiry rule does not cover either (that needs AbortIncompleteMultipartUpload,
-# which gcore does not document). Skipping them is how a bucket becomes permanently
-# un-deletable. Best-effort throughout: a bucket that was never written to has nothing
-# to remove, and that is not an error.
+# Multipart uploads first: a run killed mid-upload leaves parts that `s3 rm` does NOT
+# touch and the expiry rule does not cover, which is how a bucket becomes permanently
+# un-deletable. Best-effort: a bucket never written to has nothing to remove.
 empty_bucket() {
   local bucket="$1" endpoint="$2" mpu key uploadid
   mpu=$("$AWS" s3api list-multipart-uploads --bucket "$bucket" --endpoint-url "$endpoint" \
@@ -273,14 +256,10 @@ cleanup() {
   : "${STORAGE_ID:?STORAGE_ID must be set for cleanup}"
   : "${ACCESS_KEY:?ACCESS_KEY must be set for cleanup}"
   local stuck=0 exists=0
-  # The workflow revokes the bucket policy and deletes the staged object before
-  # calling this, so the bucket should be empty and already non-public. If the
-  # delete is refused and the bucket is still there, it is still holding the qcow2:
-  # report that instead of swallowing it, because a silently-ignored failure here is
-  # how a stage bucket gets stranded with nothing watching it.
-  #
-  # The bucket NAME is ::add-mask::ed in CI, so it renders as *** in these messages —
-  # hence the prefix-and-instance hint, which is what an operator can actually act on.
+  # The workflow already revoked the policy and deleted the object, so the bucket should
+  # be empty and non-public. A refused delete means it is still holding the qcow2 — report
+  # it rather than swallowing it. The bucket NAME is masked in CI and renders as ***,
+  # hence the prefix-and-instance hint.
   if [ -n "${BUCKET:-}" ]; then
     if "$CURL" -sS -f -X DELETE -H "$AUTH" \
       "${API_BASE}/object_storages/${STORAGE_ID}/buckets/${BUCKET}" >/dev/null 2>&1; then
@@ -301,9 +280,8 @@ cleanup() {
       esac
     fi
   fi
-  # Drop the key even when the bucket is stuck: it only grants write access to a
-  # bucket already being left behind, and the sweep that reclaims that bucket mints
-  # a fresh key of its own.
+  # Drop the key even when the bucket is stuck: it only grants write to a bucket already
+  # being left behind, and the sweep that reclaims it mints its own key.
   "$CURL" -sS -f -X DELETE -H "$AUTH" \
     "${API_BASE}/object_storages/${STORAGE_ID}/access_keys/${ACCESS_KEY}" >/dev/null 2>&1 \
     && echo "deleted gcore access key on storage ${STORAGE_ID}" \
