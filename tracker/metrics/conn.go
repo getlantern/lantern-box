@@ -45,9 +45,8 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 	return
 }
 
-// Close records the session's metrics exactly once, then forwards the close.
-// sing-box closes a routed conn up to 3x on non-graceful teardown; the guard
-// stops the connections gauge and duration/goodput from being counted repeatedly.
+// Close records the session's metrics once, then forwards the close: sing-box
+// closes a routed conn up to 3x on non-graceful teardown.
 func (c *Conn) Close() error {
 	if !c.closed.Swap(true) {
 		duration := time.Since(c.startTime).Milliseconds()

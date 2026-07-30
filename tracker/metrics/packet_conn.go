@@ -50,8 +50,7 @@ func (c *PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) er
 	return c.PacketConn.WritePacket(buffer, destination)
 }
 
-// Close records the session's metrics exactly once, then forwards the close.
-// See Conn.Close.
+// Close mirrors Conn.Close: metrics once, then forward the close.
 func (c *PacketConn) Close() error {
 	if !c.closed.Swap(true) {
 		duration := time.Since(c.startTime).Milliseconds()
