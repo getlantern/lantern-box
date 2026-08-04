@@ -21,7 +21,6 @@ import (
 	_ "github.com/refraction-networking/water/transport/v1"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
-	"github.com/sagernet/sing-box/common/conntrack"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
@@ -304,12 +303,12 @@ func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (wate
 		if err != nil {
 			return nil, err
 		}
-		switch conn := conn.(type) {
-		case *conntrack.Conn:
-			return conn.Conn, nil
-		default:
-			return conn, nil
+		if uConn, ok := conn.(common.WithUpstream); ok {
+			if conn, ok := uConn.Upstream().(net.Conn); ok {
+				return conn, nil
+			}
 		}
+		return conn, nil
 	}
 
 	o.logger.DebugContext(ctx, "building new dialer", slog.String("destination", destination.String()))

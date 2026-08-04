@@ -100,8 +100,7 @@ func (m *MutableRuleSet) IsEnabled() bool {
 
 // Start initializes the [MutableRuleSet] with the given context.
 // Note, because [MutableRuleSet] uses the [adapter.Router] to find rules associated with the ruleset,
-// the [adapter.Router] must be created and added to ctx before calling Start. This is typically done
-// when creating a [boxService.BoxService].
+// the [adapter.Router] must be created and added to ctx before calling Start.
 func (m *MutableRuleSet) Start(ctx context.Context) error {
 	m.startMu.Lock()
 	defer m.startMu.Unlock()

@@ -55,8 +55,7 @@ import (
 )
 
 // RegisterOutbound registers the Unbounded outbound with the given sing-box
-// OutboundRegistry. The hosting process should call this once at startup,
-// before libbox.NewServiceWithContext.
+// OutboundRegistry.
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.UnboundedOutboundOptions](registry, C.TypeUnbounded, NewOutbound)
 }
