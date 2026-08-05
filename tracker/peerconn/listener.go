@@ -22,12 +22,12 @@ import "sync"
 // Event describes a single connection lifecycle transition surfaced from
 // a lantern-box inbound to the peer-share consumer (radiance peer client).
 //
-//   State        +1 on accept, -1 on close
-//   Source       remote peer's "ip:port" string (empty if unavailable)
-//   Destination  the host:port the remote peer requested through the
-//                inbound (only meaningful on +1; close events leave it
-//                empty since the abuse aggregator already pairs each
-//                close with the prior accept by source identity)
+//	State        +1 on accept, -1 on close
+//	Source       remote peer's "ip:port" string (empty if unavailable)
+//	Destination  the host:port the remote peer requested through the
+//	             inbound (only meaningful on +1; close events leave it
+//	             empty since the abuse aggregator already pairs each
+//	             close with the prior accept by source identity)
 //
 // Destination carries the load-bearing abuse-detection signal: source
 // IP alone is insufficient (mobile clients change IPs, NAT pools
@@ -65,12 +65,14 @@ func SetListener(l Listener) {
 	listener = l
 }
 
-// Notify dispatches an event to the registered listener if one is set.
-// No-op when nothing is registered — non-peer-share consumers (cmd_run,
-// the standalone CLI, the radiance VPN client) pay zero cost beyond a
-// mutex read. Lower-level entry exposed for future hooks (byte-counting
-// conn wrappers, periodic flush emitters); accept/close call sites
-// should prefer NotifyAccept / NotifyClose.
+// Notify dispatches a single event to the registered listener if one is set.
+// No-op when nothing is registered — non-peer-share consumers (cmd_run, the
+// standalone CLI, the radiance VPN client) pay zero cost beyond a mutex read.
+// Lower-level entry exposed for future one-shot hooks (byte-counting conn
+// wrappers, periodic flush emitters).
+//
+// Callers emitting both halves of one connection's lifecycle must use Acquire
+// instead, so the pair cannot be split across two listeners.
 func Notify(evt Event) {
 	listenerMu.RLock()
 	l := listener
@@ -80,12 +82,21 @@ func Notify(evt Event) {
 	}
 }
 
-// NotifyAccept is the convenience caller for inbound accept paths.
-func NotifyAccept(source, destination string) {
-	Notify(Event{State: +1, Source: source, Destination: destination})
-}
-
-// NotifyClose is the convenience caller for inbound close paths.
-func NotifyClose(source string) {
-	Notify(Event{State: -1, Source: source})
+// Acquire returns the registered listener, or nil if none is set.
+//
+// A connection emitting a matched accept/close pair must Acquire once and use
+// the returned listener for both halves. Reading the registry twice lets a
+// SetListener land in between, so the accept reaches one listener and the
+// close reaches another: the first is left holding a connection that never
+// closes, the second sees a close it never opened. Consumers keeping
+// per-connection state — counts, open-connection maps, abuse buckets keyed on
+// the accept — corrupt silently when that happens.
+//
+// The tradeoff is that a pair already in flight completes against the
+// listener that accepted it, so SetListener(nil) does not cancel the close
+// half. Consumers needing a hard stop must gate inside their own callback.
+func Acquire() Listener {
+	listenerMu.RLock()
+	defer listenerMu.RUnlock()
+	return listener
 }

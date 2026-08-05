@@ -171,9 +171,17 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	// no-op when no listener is set. Destination is carried on the accept
 	// event so abuse aggregators can bucket per-(source, destination)
 	// without re-parsing protocol metadata.
+	//
+	// Acquired once so a SetListener during the connection's lifetime cannot
+	// route the close to a different listener than the accept, which would
+	// leave this connection permanently open from the accepting listener's
+	// perspective — and would break the close-pairs-with-accept assumption
+	// the abuse aggregator relies on.
 	source := metadata.Source.String()
-	peerconn.NotifyAccept(source, destination)
-	defer peerconn.NotifyClose(source)
+	if notify := peerconn.Acquire(); notify != nil {
+		notify(peerconn.Event{State: +1, Source: source, Destination: destination})
+		defer notify(peerconn.Event{State: -1, Source: source})
+	}
 
 	i.logger.InfoContext(ctx, "inbound connection to ", destination)
 	done := make(chan struct{})
