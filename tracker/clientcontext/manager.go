@@ -153,13 +153,21 @@ func (c *readConn) Read(b []byte) (n int, err error) {
 // readInfo reads and decodes client info, then sends an HTTP 200 OK response.
 func (c *readConn) readInfo() (*ClientInfo, error) {
 	var buf [32]byte
-	n, err := c.Conn.Read(buf[:])
-	if err != nil {
+	// Read until the prefix can actually be judged. A single Read may return
+	// fewer bytes than the prefix on a segmented stream -- common under DPI
+	// throttling -- and deciding on that would misread client info as ordinary
+	// traffic: the OK would never be sent, leaving the client blocked on its
+	// response read, and the prefix bytes would be forwarded to the destination.
+	n, err := io.ReadAtLeast(c.Conn, buf[:], len(packetPrefix))
+	if n == 0 {
 		c.readErr = err
 		c.n = n
 		return nil, err
 	}
-	if !bytes.HasPrefix(buf[:n], []byte(packetPrefix)) {
+	// Short of the prefix, or unreadable: not client info. Fall through with the
+	// bytes preserved rather than failing -- this hook is telemetry and must
+	// never tear down a working flow.
+	if err != nil || !bytes.HasPrefix(buf[:n], []byte(packetPrefix)) {
 		c.reader = io.MultiReader(bytes.NewReader(buf[:n]), c.Conn)
 		return nil, nil
 	}
