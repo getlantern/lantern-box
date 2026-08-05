@@ -22,8 +22,8 @@ import "sync"
 // Listener receives connection lifecycle notifications from lantern-box
 // inbound protocols.
 //
-//   state  +1 on accept, -1 on close
-//   source remote peer's "ip:port" string (empty if unavailable)
+//	state  +1 on accept, -1 on close
+//	source remote peer's "ip:port" string (empty if unavailable)
 //
 // The listener is invoked synchronously on the inbound's accept/close path,
 // so implementations should not block on heavy work — fan out to a buffered
@@ -44,10 +44,13 @@ func SetListener(l Listener) {
 	listener = l
 }
 
-// Notify dispatches a state transition to the registered listener if one
-// is set. No-op when nothing is registered, so lantern-box uses that don't
-// care about peer-share connection events (cmd_run, the standalone CLI,
-// the radiance VPN client) pay zero cost beyond a mutex read.
+// Notify dispatches a single state transition to the registered listener if
+// one is set. No-op when nothing is registered, so lantern-box uses that
+// don't care about peer-share connection events (cmd_run, the standalone
+// CLI, the radiance VPN client) pay zero cost beyond a mutex read.
+//
+// Callers emitting both halves of one connection's lifecycle must use
+// Acquire instead.
 func Notify(state int, source string) {
 	listenerMu.RLock()
 	l := listener
@@ -55,4 +58,23 @@ func Notify(state int, source string) {
 	if l != nil {
 		l(state, source)
 	}
+}
+
+// Acquire returns the registered listener, or nil if none is set.
+//
+// A connection emitting a matched accept/close pair must Acquire once and use
+// the returned listener for both halves. Reading the registry twice lets a
+// SetListener land in between, so the accept reaches one listener and the
+// close reaches another: the first is left holding a connection that never
+// closes, the second sees a close it never opened. Consumers keeping
+// per-connection state — counts, open-connection maps, abuse buckets keyed on
+// the accept — corrupt silently when that happens.
+//
+// The tradeoff is that a pair already in flight completes against the
+// listener that accepted it, so SetListener(nil) does not cancel the close
+// half. Consumers needing a hard stop must gate inside their own callback.
+func Acquire() Listener {
+	listenerMu.RLock()
+	defer listenerMu.RUnlock()
+	return listener
 }
