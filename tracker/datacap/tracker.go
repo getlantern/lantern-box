@@ -59,10 +59,10 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 }
 
 func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
-	info, ok := clientcontext.ClientInfoFromContext(ctx)
+	info, ok := clientcontext.InfoFromConn(conn)
 	if !ok {
 		// conn is not from a clientcontext-aware client (e.g., not radiance)
-		t.logger.Debug("skipping datacap: no client info in context")
+		t.logger.Debug("skipping datacap: no client info on conn")
 		return conn
 	}
 	if info.IsPro {
@@ -79,10 +79,10 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 	})
 }
 func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
-	info, ok := clientcontext.ClientInfoFromContext(ctx)
+	info, ok := clientcontext.InfoFromConn(conn)
 	if !ok {
 		// conn is not from a clientcontext-aware client (e.g., not radiance)
-		t.logger.Debug("skipping datacap: no client info in context")
+		t.logger.Debug("skipping datacap: no client info on conn")
 		return conn
 	}
 	if info.IsPro {

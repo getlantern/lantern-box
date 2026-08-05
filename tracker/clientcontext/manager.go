@@ -11,6 +11,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/metadata"
@@ -19,23 +20,25 @@ import (
 
 var _ (adapter.ConnectionTracker) = (*Manager)(nil)
 
-type clientInfoKey struct{}
-
-// ContextWithClientInfo returns a new context with the given ClientInfo.
-func ContextWithClientInfo(ctx context.Context, info ClientInfo) context.Context {
-	return context.WithValue(ctx, clientInfoKey{}, info)
+// InfoCarrier carries ClientInfo decoded from a client-context frame.
+type InfoCarrier interface {
+	ClientInfo() (ClientInfo, bool)
 }
 
-// ClientInfoFromContext retrieves the ClientInfo from the context.
-func ClientInfoFromContext(ctx context.Context) (ClientInfo, bool) {
-	info, ok := ctx.Value(clientInfoKey{}).(ClientInfo)
-	return info, ok
+// InfoFromConn returns ClientInfo from a Manager-wrapped connection. It reports
+// false if none is present.
+func InfoFromConn(conn any) (ClientInfo, bool) {
+	carrier, ok := common.Cast[InfoCarrier](conn)
+	if !ok {
+		return ClientInfo{}, false
+	}
+	return carrier.ClientInfo()
 }
 
-// Manager is a ConnectionTracker that manages ClientInfo for connections.
+// Manager decodes ClientInfo from client-context frames and exposes it on the
+// wrapped connection.
 type Manager struct {
-	logger   log.ContextLogger
-	trackers []adapter.ConnectionTracker
+	logger log.ContextLogger
 
 	matchBounds  MatchBounds
 	inboundRule  *boundsRule
@@ -43,20 +46,14 @@ type Manager struct {
 	ruleMu       sync.RWMutex
 }
 
-// NewManager creates a new ClientContext Manager.
+// NewManager returns a new Manager.
 func NewManager(bounds MatchBounds, logger log.ContextLogger) *Manager {
 	return &Manager{
-		trackers:     []adapter.ConnectionTracker{},
 		logger:       logger,
 		matchBounds:  bounds,
 		inboundRule:  newBoundsRule(bounds.Inbound),
 		outboundRule: newBoundsRule(bounds.Outbound),
 	}
-}
-
-// AppendTracker appends a ConnectionTracker to the Manager.
-func (m *Manager) AppendTracker(tracker adapter.ConnectionTracker) {
-	m.trackers = append(m.trackers, tracker)
 }
 
 func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
@@ -72,19 +69,8 @@ func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata 
 	if err != c.readErr {
 		m.logger.Error("failed to read client info ", "tag", "clientcontext-tracker", "error", err)
 	}
-	if err != nil {
-		return c
-	}
-	if info == nil {
-		return c
-	}
-	ctx = ContextWithClientInfo(ctx, *info)
-
-	conn = c
-	for _, tracker := range m.trackers {
-		conn = tracker.RoutedConnection(ctx, conn, metadata, matchedRule, matchOutbound)
-	}
-	return conn
+	c.info = info
+	return c
 }
 
 func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
@@ -99,19 +85,8 @@ func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn,
 	if err != c.readErr {
 		m.logger.Error("failed to read client info ", "tag", "clientcontext-tracker", "error", err)
 	}
-	if err != nil {
-		return c
-	}
-	if info == nil {
-		return c
-	}
-	ctx = ContextWithClientInfo(ctx, *info)
-
-	conn = c
-	for _, tracker := range m.trackers {
-		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, matchedRule, matchOutbound)
-	}
-	return conn
+	c.info = info
+	return c
 }
 
 func (m *Manager) match(inbound, outbound string) bool {
@@ -139,6 +114,7 @@ type readConn struct {
 	net.Conn
 	mgr     *Manager
 	reader  io.Reader
+	info    *ClientInfo
 	n       int
 	readErr error
 }
@@ -150,39 +126,62 @@ func (c *readConn) Read(b []byte) (n int, err error) {
 	return c.reader.Read(b)
 }
 
-// readInfo reads and decodes client info, then sends an HTTP 200 OK response.
+func (c *readConn) ClientInfo() (ClientInfo, bool) {
+	if c.info == nil {
+		return ClientInfo{}, false
+	}
+	return *c.info, true
+}
+
+// matchMarker reports the frame marker at the start of b and whether it expects
+// ackResponse.
+func matchMarker(b []byte) (marker string, ack bool) {
+	switch {
+	case bytes.HasPrefix(b, []byte(packetPrefix)):
+		return packetPrefix, false
+	case bytes.HasPrefix(b, []byte(legacyPacketPrefix)):
+		return legacyPacketPrefix, true
+	default:
+		return "", false
+	}
+}
+
+// readInfo reads and decodes a client-info frame. If the stream does not begin
+// with one, it restores the consumed bytes and returns (nil, nil).
 func (c *readConn) readInfo() (*ClientInfo, error) {
 	var buf [32]byte
-	// Read until the prefix can actually be judged. A single Read may return
-	// fewer bytes than the prefix on a segmented stream -- common under DPI
-	// throttling -- and deciding on that would misread client info as ordinary
-	// traffic: the OK would never be sent, leaving the client blocked on its
-	// response read, and the prefix bytes would be forwarded to the destination.
+	// Read enough bytes to distinguish both markers even if the stream splits
+	// them across reads.
 	n, err := io.ReadAtLeast(c.Conn, buf[:], len(packetPrefix))
 	if n == 0 {
-		// Nothing was read, so there is nothing to pass through. Store and return
-		// the error unchanged: RoutedConnection compares the two to tell a dead
-		// connection from malformed client info, and only logs the latter.
+		// Preserve the original read error so callers can distinguish connection
+		// failure from decode failure.
 		c.readErr = err
 		c.n = n
 		return nil, err
 	}
-	// Bytes arrived but they are short of the prefix, or the read stopped early.
-	// Treat the flow as ordinary traffic and pass the bytes on rather than
-	// failing it: this hook is telemetry and must not tear down a working flow.
-	if err != nil || !bytes.HasPrefix(buf[:n], []byte(packetPrefix)) {
+	marker, ack := matchMarker(buf[:n])
+	// Treat short reads and non-markers as ordinary traffic.
+	if err != nil || marker == "" {
 		c.reader = io.MultiReader(bytes.NewReader(buf[:n]), c.Conn)
 		return nil, nil
 	}
 
 	var info ClientInfo
-	reader := io.MultiReader(bytes.NewReader(buf[len(packetPrefix):n]), c.Conn)
-	if err := json.NewDecoder(reader).Decode(&info); err != nil {
+	reader := io.MultiReader(bytes.NewReader(buf[len(marker):n]), c.Conn)
+	dec := json.NewDecoder(reader)
+	if err := dec.Decode(&info); err != nil {
 		return nil, fmt.Errorf("decoding client info: %w", err)
 	}
-
-	if _, err := c.Write([]byte("OK")); err != nil {
-		return nil, fmt.Errorf("writing OK response: %w", err)
+	// Restore any bytes buffered past the JSON frame.
+	leftover, _ := io.ReadAll(dec.Buffered()) // reads the decoder's own buffer: cannot fail
+	if len(leftover) > 0 {
+		c.reader = io.MultiReader(bytes.NewReader(leftover), c.Conn)
+	}
+	if ack {
+		if _, err := c.Write([]byte(ackResponse)); err != nil {
+			return nil, fmt.Errorf("writing %s response: %w", ackResponse, err)
+		}
 	}
 	return &info, nil
 }
@@ -194,6 +193,7 @@ func (c *readConn) Upstream() any {
 type readPacketConn struct {
 	N.PacketConn
 	mgr         *Manager
+	info        *ClientInfo
 	destination metadata.Socksaddr
 	readErr     error
 }
@@ -205,8 +205,15 @@ func (c *readPacketConn) ReadPacket(b *buf.Buffer) (destination metadata.Socksad
 	return c.PacketConn.ReadPacket(b)
 }
 
-// readInfo reads and decodes client info if the first packet is a CLIENTINFO packet, then sends an
-// OK response.
+func (c *readPacketConn) ClientInfo() (ClientInfo, bool) {
+	if c.info == nil {
+		return ClientInfo{}, false
+	}
+	return *c.info, true
+}
+
+// readInfo reads and decodes client info from the first packet when present.
+// Otherwise it caches the packet for replay.
 func (c *readPacketConn) readInfo() (*ClientInfo, error) {
 	buffer := buf.NewPacket()
 	defer buffer.Release()
@@ -218,33 +225,36 @@ func (c *readPacketConn) readInfo() (*ClientInfo, error) {
 		return nil, err
 	}
 	data := buffer.Bytes()
-	if !bytes.HasPrefix(data, []byte(packetPrefix)) {
-		// not a client info packet, wrap with cached packet conn so the packet can be read again
+	marker, ack := matchMarker(data)
+	if marker == "" {
+		// Cache the packet so it can be replayed as ordinary traffic.
 		c.PacketConn = bufio.NewCachedPacketConn(c.PacketConn, buffer, destination)
 		return nil, nil
 	}
 	var info ClientInfo
-	if err := json.Unmarshal(data[len(packetPrefix):], &info); err != nil {
+	if err := json.Unmarshal(data[len(marker):], &info); err != nil {
 		return nil, fmt.Errorf("unmarshaling client info: %w", err)
 	}
-
-	// CRITICAL: Use a new buffer for the response to ensure we have enough headroom
-	// for the packet headers (e.g. VMess). Reusing the old buffer with Reset()
-	// discards the headroom and causes 'buffer overflow' panics.
-	// advance buffer start, and reserve end, to leave room for headers/trailers on various protocols
-	respBuffer := buf.NewPacket()
-	defer respBuffer.Release()
-
-	headroom := N.CalculateFrontHeadroom(c)
-	rearHeadroom := N.CalculateRearHeadroom(c)
-	respBuffer.Advance(headroom)
-	respBuffer.Reserve(rearHeadroom)
-
-	respBuffer.WriteString("OK")
-	if err := c.WritePacket(respBuffer, destination); err != nil {
-		return nil, fmt.Errorf("writing OK response: %w", err)
+	if ack {
+		if err := c.writeAck(destination); err != nil {
+			return nil, err
+		}
 	}
 	return &info, nil
+}
+
+// writeAck replies to a legacy client with ackResponse using a fresh packet
+// buffer with header headroom.
+func (c *readPacketConn) writeAck(destination metadata.Socksaddr) error {
+	respBuffer := buf.NewPacket()
+	defer respBuffer.Release()
+	respBuffer.Advance(N.CalculateFrontHeadroom(c))
+	respBuffer.Reserve(N.CalculateRearHeadroom(c))
+	respBuffer.WriteString(ackResponse)
+	if err := c.WritePacket(respBuffer, destination); err != nil {
+		return fmt.Errorf("writing %s response: %w", ackResponse, err)
+	}
+	return nil
 }
 
 func (c *readPacketConn) Upstream() any {

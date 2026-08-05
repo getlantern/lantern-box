@@ -25,6 +25,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// infoConn stages a ClientInfo on a connection so clientcontext.InfoFromConn
+// resolves it, standing in for a Manager-wrapped conn.
+type infoConn struct {
+	net.Conn
+	info clientcontext.ClientInfo
+}
+
+func (c infoConn) ClientInfo() (clientcontext.ClientInfo, bool) { return c.info, true }
+
 func TestTracker(t *testing.T) {
 	synctest.Run(func() {
 		reader := metric.NewManualReader()
@@ -98,10 +107,7 @@ func TestTrackerWithClientInfo(t *testing.T) {
 			IsPro:    true,
 			Version:  "7.0",
 		}
-		ctx := clientcontext.ContextWithClientInfo(
-			context.Background(), info,
-		)
-		tracker := NewTracker(ctx)
+		tracker := NewTracker(context.Background())
 		defer tracker.Close()
 
 		client, server := net.Pipe()
@@ -109,7 +115,7 @@ func TestTrackerWithClientInfo(t *testing.T) {
 		defer server.Close()
 
 		tracked := tracker.RoutedConnection(
-			ctx, server, adapter.InboundContext{}, nil, nil,
+			context.Background(), infoConn{Conn: server, info: info}, adapter.InboundContext{}, nil, nil,
 		)
 
 		// Exchange some bytes so proxy.io fires.
@@ -125,7 +131,7 @@ func TestTrackerWithClientInfo(t *testing.T) {
 		synctest.Wait()
 
 		var rm metricdata.ResourceMetrics
-		reader.Collect(ctx, &rm)
+		reader.Collect(context.Background(), &rm)
 
 		// All metrics carry low-cardinality client attrs.
 		for _, name := range []string{
@@ -171,17 +177,14 @@ func TestDeviceConnectedSpan(t *testing.T) {
 		sdkotel.SetTracerProvider(prevTP)
 	})
 
-	ctx := clientcontext.ContextWithClientInfo(
-		context.Background(),
-		clientcontext.ClientInfo{
-			DeviceID:    "test-device-123",
-			Platform:    "android",
-			IsPro:       true,
-			CountryCode: "CA",
-			Version:     "10.0",
-		},
-	)
-	emitDeviceConnectedSpan(ctx)
+	info := clientcontext.ClientInfo{
+		DeviceID:    "test-device-123",
+		Platform:    "android",
+		IsPro:       true,
+		CountryCode: "CA",
+		Version:     "10.0",
+	}
+	emitDeviceConnectedSpan(context.Background(), info)
 
 	spans := exporter.GetSpans()
 	var deviceSpan *tracetest.SpanStub
@@ -203,23 +206,6 @@ func TestDeviceConnectedSpan(t *testing.T) {
 	assert.Equal(t, true, attrs["client.is_pro"])
 	assert.Equal(t, "CA", attrs["geo.country.iso_code"])
 	assert.Equal(t, "10.0", attrs["client.version"])
-}
-
-func TestDeviceConnectedSpanNoClientInfo(t *testing.T) {
-	exporter := tracetest.NewInMemoryExporter()
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSyncer(exporter),
-	)
-	prevTP := sdkotel.GetTracerProvider()
-	sdkotel.SetTracerProvider(tp)
-	t.Cleanup(func() {
-		_ = tp.Shutdown(context.Background())
-		sdkotel.SetTracerProvider(prevTP)
-	})
-
-	emitDeviceConnectedSpan(context.Background())
-	assert.Empty(t, exporter.GetSpans(),
-		"no span should be emitted without client info")
 }
 
 // TestSessionGoodput verifies the per-session download goodput histogram is
