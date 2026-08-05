@@ -106,3 +106,21 @@ func TestReadInfoPassesThroughNonClientInfo(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, payload, string(got))
 }
+
+// A peer that closes without sending anything leaves nothing to pass through.
+// The read error is returned and stored unchanged, so RoutedConnection's
+// `err != c.readErr` check treats it as a dead connection rather than
+// reporting it as a client-info failure.
+func TestReadInfoPropagatesErrorWhenNothingWasRead(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	client.Close()
+
+	c := &readConn{Conn: server, reader: server, mgr: &Manager{}}
+	info, err := c.readInfo()
+
+	require.Error(t, err)
+	require.Nil(t, info)
+	assert.Equal(t, err, c.readErr, "the caller distinguishes a dead conn from bad client info by identity")
+	assert.Zero(t, c.n)
+}
