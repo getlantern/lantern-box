@@ -24,8 +24,24 @@ type replayConn struct {
 	written bytes.Buffer
 }
 
-func (c *replayConn) Read(p []byte) (int, error)  { return c.stream.Read(p) }
-func (c *replayConn) Write(p []byte) (int, error) { return c.written.Write(p) }
+func (c *replayConn) Read(p []byte) (int, error)      { return c.stream.Read(p) }
+func (c *replayConn) Write(p []byte) (int, error)     { return c.written.Write(p) }
+func (c *replayConn) SetReadDeadline(time.Time) error { return nil }
+
+// A valid marker followed by malformed JSON must fail the connection rather than
+// continue with the marker and part of the frame already consumed.
+func TestReadInfoFailsOnMalformedFrame(t *testing.T) {
+	stream := &replayConn{stream: strings.NewReader(packetPrefix + "{not valid json")}
+	conn := &readConn{Conn: stream, reader: stream}
+
+	info, err := conn.readInfo()
+	require.Error(t, err)
+	require.Nil(t, info)
+	require.Error(t, conn.readErr, "a malformed frame must fail the connection")
+
+	_, readErr := conn.Read(make([]byte, 8))
+	require.Error(t, readErr, "subsequent reads must return the failure")
+}
 
 func TestReadInfoRestoresPayloadBehindFrame(t *testing.T) {
 	frame, err := json.Marshal(ClientInfo{DeviceID: "test-device", Platform: "linux"})
@@ -144,6 +160,35 @@ func TestReadInfoPassesThroughShortNonClientInfo(t *testing.T) {
 	got, err := io.ReadAll(c)
 	require.NoError(t, err)
 	assert.Equal(t, "hi", string(got), "the bytes already consumed must be replayed to the destination")
+}
+
+// A client that opens with fewer bytes than a marker and then waits for the
+// server must not stall the connection: the bounded read times out and the bytes
+// flow as ordinary traffic.
+func TestReadInfoTimesOutShortWaitingClient(t *testing.T) {
+	prev := readInfoTimeout
+	readInfoTimeout = 50 * time.Millisecond
+	defer func() { readInfoTimeout = prev }()
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	go func() { client.Write([]byte("hi")) }() // 2 bytes, then the peer keeps waiting
+
+	c := &readConn{Conn: server, reader: server, mgr: &Manager{}}
+	done := make(chan struct{})
+	var info *ClientInfo
+	var err error
+	go func() { info, err = c.readInfo(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("readInfo did not honor the read deadline")
+	}
+	require.NoError(t, err)
+	require.Nil(t, info, "a short, waiting opening must be treated as ordinary traffic")
 }
 
 // Ordinary traffic longer than the prefix keeps flowing untouched.

@@ -30,6 +30,17 @@ func TestNewDatacapTracker_MissingURL_ReturnsError(t *testing.T) {
 	assert.Contains(t, err.Error(), "url not defined")
 }
 
+// A connection carrying no client info (not clientcontext-aware) is returned
+// unchanged: data-cap enforcement only applies to identified free users.
+func TestRoutedConnection_NoClientInfo_SkipsTracking(t *testing.T) {
+	tracker, err := NewDatacapTracker(Options{URL: "http://example.com"}, log.NewNOPFactory().Logger())
+	require.NoError(t, err)
+
+	mockConn := newMockConn(nil)
+	routed := tracker.RoutedConnection(context.Background(), mockConn, adapter.InboundContext{}, nil, nil)
+	assert.Equal(t, mockConn, routed, "a connection without client info must be returned unchanged")
+}
+
 // Scenario 2: Datacap URL is present & Client is Pro
 func TestRoutedConnection_ProClient_SkipsTracking(t *testing.T) {
 	tracker, err := NewDatacapTracker(Options{URL: "http://example.com"}, log.NewNOPFactory().Logger())

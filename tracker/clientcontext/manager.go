@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
@@ -19,6 +20,11 @@ import (
 )
 
 var _ (adapter.ConnectionTracker) = (*Manager)(nil)
+
+// readInfoTimeout bounds the marker-classification read. The Manager runs on every
+// routed connection, so a client that opens with fewer bytes than a marker and then
+// waits for the server must not stall the connection here.
+var readInfoTimeout = 5 * time.Second
 
 // InfoCarrier carries ClientInfo decoded from a client-context frame.
 type InfoCarrier interface {
@@ -151,7 +157,10 @@ func matchMarker(b []byte) (marker string, ack bool) {
 func (c *readConn) readInfo() (*ClientInfo, error) {
 	var buf [32]byte
 	// Read enough bytes to distinguish both markers even if the stream splits
-	// them across reads.
+	// them across reads, bounded so a client that opens with fewer bytes than a
+	// marker and then waits for the server cannot stall the connection here.
+	_ = c.Conn.SetReadDeadline(time.Now().Add(readInfoTimeout))
+	defer c.Conn.SetReadDeadline(time.Time{})
 	n, err := io.ReadAtLeast(c.Conn, buf[:], len(packetPrefix))
 	if n == 0 {
 		// Preserve the original read error so callers can distinguish connection
@@ -161,7 +170,8 @@ func (c *readConn) readInfo() (*ClientInfo, error) {
 		return nil, err
 	}
 	marker, ack := matchMarker(buf[:n])
-	// Treat short reads and non-markers as ordinary traffic.
+	// Treat short reads (including a classification timeout) and non-markers as
+	// ordinary traffic.
 	if err != nil || marker == "" {
 		c.reader = io.MultiReader(bytes.NewReader(buf[:n]), c.Conn)
 		return nil, nil
@@ -171,13 +181,15 @@ func (c *readConn) readInfo() (*ClientInfo, error) {
 	reader := io.MultiReader(bytes.NewReader(buf[len(marker):n]), c.Conn)
 	dec := json.NewDecoder(reader)
 	if err := dec.Decode(&info); err != nil {
+		// The marker and part of the frame are already consumed; fail the
+		// connection rather than forward a truncated stream. The wrapped return
+		// differs from c.readErr, so RoutedConnection still logs it.
+		c.readErr = err
 		return nil, fmt.Errorf("decoding client info: %w", err)
 	}
-	// Restore any bytes buffered past the JSON frame.
-	leftover, _ := io.ReadAll(dec.Buffered()) // reads the decoder's own buffer: cannot fail
-	if len(leftover) > 0 {
-		c.reader = io.MultiReader(bytes.NewReader(leftover), c.Conn)
-	}
+	// Continue the stream from the decoder: dec.Buffered() holds what it read past
+	// the frame, and reader holds what it has not pulled yet.
+	c.reader = io.MultiReader(dec.Buffered(), reader)
 	if ack {
 		if _, err := c.Write([]byte(ackResponse)); err != nil {
 			return nil, fmt.Errorf("writing %s response: %w", ackResponse, err)
