@@ -168,14 +168,19 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 
 	// Surface accept/close to the peer-connection listener (registered by
 	// the radiance peer client when Share My Connection is active). Cheap
-	// no-op when no listener is set. Acquired once so a SetListener during
-	// the connection's lifetime cannot route the close to a different
-	// listener than the accept, which would leave this connection
-	// permanently open from the accepting listener's perspective.
+	// no-op when no listener is set. Destination is carried on the accept
+	// event so abuse aggregators can bucket per-(source, destination)
+	// without re-parsing protocol metadata.
+	//
+	// Acquired once so a SetListener during the connection's lifetime cannot
+	// route the close to a different listener than the accept, which would
+	// leave this connection permanently open from the accepting listener's
+	// perspective — and would break the close-pairs-with-accept assumption
+	// the abuse aggregator relies on.
 	source := metadata.Source.String()
 	if notify := peerconn.Acquire(); notify != nil {
-		notify(+1, source)
-		defer notify(-1, source)
+		notify(peerconn.Event{State: +1, Source: source, Destination: destination})
+		defer notify(peerconn.Event{State: -1, Source: source})
 	}
 
 	i.logger.InfoContext(ctx, "inbound connection to ", destination)
