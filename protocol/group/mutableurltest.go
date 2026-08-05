@@ -416,7 +416,7 @@ func (g *urlTestGroup) Add(tags []string) (n int, err error) {
 	defer g.access.Unlock()
 
 	if g.isClosed() {
-		return 0, errors.New("group is closed")
+		return 0, adapter.ErrGroupClosed
 	}
 
 	var missing []string
@@ -457,7 +457,7 @@ func (g *urlTestGroup) Remove(tags []string) (n int, err error) {
 	defer g.access.Unlock()
 
 	if g.isClosed() {
-		return 0, errors.New("group is closed")
+		return 0, adapter.ErrGroupClosed
 	}
 	if len(g.tags) == 0 {
 		return 0, nil

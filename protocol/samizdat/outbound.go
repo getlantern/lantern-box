@@ -112,7 +112,7 @@ func NewOutbound(
 		MaxJitterMs:         options.MaxJitterMs,
 		TCPFragmentation:    !options.DisableTCPFragmentation,
 		RecordFragmentation: !options.DisableRecordFragmentation,
-		MaxStreamsPerConn:    options.MaxStreamsPerConn,
+		MaxStreamsPerConn:   options.MaxStreamsPerConn,
 		IdleTimeout:         idleTimeout,
 		ConnectTimeout:      connectTimeout,
 		Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -174,11 +174,6 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return o.uotClient.ListenPacket(ctx, destination)
 }
 
-// Network returns the supported network types.
-func (o *Outbound) Network() []string {
-	return []string{N.NetworkTCP, N.NetworkUDP}
-}
-
 // Close shuts down the Samizdat client.
 func (o *Outbound) Close() error {
 	if o.client != nil {
@@ -186,4 +181,3 @@ func (o *Outbound) Close() error {
 	}
 	return nil
 }
-

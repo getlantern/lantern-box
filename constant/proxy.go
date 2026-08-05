@@ -3,6 +3,7 @@ package constant
 const (
 	TypeAmnezia   = "amnezia"
 	TypeALGeneva  = "algeneva"
+	TypeMeek      = "meek"
 	TypeOutline   = "outline"
 	TypeReflex    = "reflex"
 	TypeSamizdat  = "samizdat"
@@ -11,7 +12,8 @@ const (
 )
 
 const (
-	TypeFallback        = "fallback"
-	TypeMutableSelector = "mutableselector"
-	TypeMutableURLTest  = "mutableurltest"
+	TypeFallback          = "fallback"
+	TypeMutableSelector   = "mutableselector"
+	TypeMutableURLTest    = "mutableurltest"
+	TypeMutableAutoSelect = "mutableautoselect"
 )

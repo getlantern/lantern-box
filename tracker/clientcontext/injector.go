@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"sync"
+	"time"
 
 	lAdapter "github.com/getlantern/lantern-box/adapter"
 
@@ -13,6 +15,12 @@ import (
 	"github.com/sagernet/sing-box/protocol/group"
 	N "github.com/sagernet/sing/common/network"
 )
+
+// sendInfoTimeout bounds the client-info exchange. It runs on the connection's
+// critical path after the dial-layer timeouts no longer apply; without a
+// deadline, a server that stalls after the handshake (e.g. under DPI
+// throttling) holds the flow and its healthy-pool slot indefinitely.
+var sendInfoTimeout = 10 * time.Second
 
 var (
 	_ (adapter.ConnectionTracker)    = (*ClientContextInjector)(nil)
@@ -150,6 +158,11 @@ func (c *writeConn) sendInfo(conn net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("marshaling client info: %w", err)
 	}
+	// Best effort: conns that don't support deadlines keep the old unbounded
+	// behavior rather than failing the exchange.
+	_ = conn.SetDeadline(time.Now().Add(sendInfoTimeout))
+	defer conn.SetDeadline(time.Time{})
+
 	packet := append([]byte(packetPrefix), buf...)
 	if _, err = conn.Write(packet); err != nil {
 		return fmt.Errorf("writing client info: %w", err)
@@ -157,11 +170,11 @@ func (c *writeConn) sendInfo(conn net.Conn) error {
 
 	// wait for `OK` response
 	var resp [2]byte
-	if _, err := conn.Read(resp[:]); err != nil {
+	if _, err := io.ReadFull(conn, resp[:]); err != nil {
 		return fmt.Errorf("reading response: %w", err)
 	}
 	if string(resp[:]) != "OK" {
-		return fmt.Errorf("invalid response: %s", resp)
+		return fmt.Errorf("invalid response: %q", resp[:])
 	}
 	return nil
 }
@@ -250,18 +263,26 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 	} else if addr, err = net.ResolveUDPAddr("udp", dest.String()); err != nil {
 		return fmt.Errorf("resolving destination %s: %w", dest, err)
 	}
+	// Best effort: conns that don't support deadlines keep the old unbounded
+	// behavior rather than failing the exchange.
+	_ = conn.SetDeadline(time.Now().Add(sendInfoTimeout))
+	defer conn.SetDeadline(time.Time{})
+
 	packet := append([]byte(packetPrefix), buf...)
 	if _, err = conn.WriteTo(packet, addr); err != nil {
 		return fmt.Errorf("writing packet: %w", err)
 	}
 
-	// wait for `OK` response
-	var resp [2]byte
-	if _, _, err := conn.ReadFrom(resp[:]); err != nil {
+	// wait for `OK` response; the buffer must be able to hold a full datagram —
+	// wrapped conns return io.ErrShortBuffer instead of truncating, so a 2-byte
+	// buffer would reject any reply carrying transport overhead.
+	resp := make([]byte, 512)
+	n, _, err := conn.ReadFrom(resp)
+	if err != nil {
 		return fmt.Errorf("reading response: %w", err)
 	}
-	if string(resp[:]) != "OK" {
-		return fmt.Errorf("invalid response: %s", resp)
+	if n < 2 || string(resp[:2]) != "OK" {
+		return fmt.Errorf("invalid response: %q", resp[:n])
 	}
 	return nil
 }

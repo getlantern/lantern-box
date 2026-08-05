@@ -155,6 +155,19 @@ systemctl daemon-reload
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
 systemctl enable unattended-upgrades.service 2>/dev/null || true
 
+echo "==> Disabling SSH password authentication"
+# Stock cloud images drop /etc/ssh/sshd_config.d/50-cloud-init.conf with
+# PasswordAuthentication yes on first boot; first match in sshd_config.d
+# wins, so this override must sort earlier than 50-.
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/01-lantern-harden.conf <<'SSHHARD'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+SSHHARD
+chmod 644 /etc/ssh/sshd_config.d/01-lantern-harden.conf
+echo "    validating sshd config"
+sshd -t
+
 echo "==> Creating lantern management user (for Tailscale SSH via Headscale ACL)"
 # The Headscale ACL grants group:dev SSH access to tag:external nodes as user "lantern".
 # Tailscale SSH looks up the user locally, so it must exist in /etc/passwd.
@@ -211,7 +224,8 @@ for path in \
   /etc/lantern-box \
   /var/lib/lantern-box \
   /etc/otelcol-contrib/config.yaml \
-  /etc/ssl/certs/lanternet.crt; do
+  /etc/ssl/certs/lanternet.crt \
+  /etc/ssh/sshd_config.d/01-lantern-harden.conf; do
   [ -e "$path" ] || missing="$missing $path"
 done
 if [ -n "$missing" ]; then

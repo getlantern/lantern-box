@@ -58,6 +58,9 @@ func preRun(cmd *cobra.Command, args []string) {
 	}
 
 	var attrs []attribute.KeyValue
+	// track is emitted both as a resource attr (below, via resourceAttrs) and,
+	// for the goodput histogram, as a queryable point attr (via SetupMetricsManager).
+	var track string
 	// Attempt to read proxy info, but this is merely informational,
 	// and may not be needed for every subcommand.
 	proxyInfoPath, _ := cmd.Flags().GetString("proxy-info")
@@ -66,6 +69,7 @@ func preRun(cmd *cobra.Command, args []string) {
 			log.Warn("could not read proxy info, skipping attribute addition: ", err)
 		} else {
 			attrs = info.resourceAttrs()
+			track = info.Track
 		}
 	} else {
 		log.Info("no proxy-info path provided, skipping attribute addition")
@@ -109,7 +113,7 @@ func preRun(cmd *cobra.Command, args []string) {
 			24*time.Hour, cityDatabaseName,
 			geo.CountryCode,
 		)
-		metrics.SetupMetricsManager(geolookup)
+		metrics.SetupMetricsManager(geolookup, track)
 	}
 	if otel.Enabled() {
 		log.Info("telemetry enabled")

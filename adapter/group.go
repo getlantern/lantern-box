@@ -1,10 +1,15 @@
 package adapter
 
 import (
+	"errors"
 	"net"
 
 	"github.com/sagernet/sing-box/adapter"
 )
+
+// ErrGroupClosed is returned by MutableOutboundGroup Add/Remove when the
+// group has already been torn down.
+var ErrGroupClosed = errors.New("group is closed")
 
 type MutableOutboundGroup interface {
 	adapter.OutboundGroup
@@ -20,6 +25,14 @@ type URLOverrideSetter interface {
 // OutboundChecker is implemented by outbound groups that support on-demand URL testing.
 type OutboundChecker interface {
 	CheckOutbounds()
+}
+
+// ExhaustionSignaler exposes a channel the host can select on to learn that
+// the group's reconnection ladder finished without finding a working
+// candidate. At most one value is sent per ladder run; the host decides
+// what to do (typically a rate-limited config refetch).
+type ExhaustionSignaler interface {
+	ExhaustionSignal() <-chan struct{}
 }
 
 // TaggedConn is a net.Conn tagged with the outbound tag used to create it.
