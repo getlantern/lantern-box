@@ -403,6 +403,63 @@ func TestSessionGoodputZeroDuration(t *testing.T) {
 	assert.False(t, found, "no goodput sample for zero duration")
 }
 
+// TestSessionGoodputBucketLayout verifies the emitted histogram carries the
+// explicit log-scale bucket boundaries instead of the SDK defaults, whose
+// 10,000 B/s top boundary censored everything faster than 10 kB/s into the
+// final bucket. A ~101 kB/s sample must resolve into the (100_000, 300_000]
+// bucket, which only exists in the explicit layout.
+func TestSessionGoodputBucketLayout(t *testing.T) {
+	// Restore the global meter provider so the manual-reader provider doesn't
+	// leak into tests that run after this one.
+	prev := sdkotel.GetMeterProvider()
+	t.Cleanup(func() { sdkotel.SetMeterProvider(prev) })
+
+	reader := metric.NewManualReader()
+	provider := metric.NewMeterProvider(metric.WithReader(reader))
+	sdkotel.SetMeterProvider(provider)
+
+	SetupMetricsManager(geo.NoLookup{}, "challenger-01")
+
+	mt := &MetricsTracker{}
+	attrs := metadataToAttributes(adapter.InboundContext{})
+	// 202 KB over 2s → ~101 kB/s, ten times the SDK default's top boundary.
+	mt.recordGoodput(202_000, 2_000, attrs)
+
+	var rm metricdata.ResourceMetrics
+	reader.Collect(context.Background(), &rm)
+
+	dp, found := histogramDataPoint(rm, "proxy.session.goodput")
+	require.True(t, found, "goodput histogram should be emitted")
+	// Spelled out rather than referencing the package variable so an
+	// accidental edit to the layout fails here. Must stay identical to
+	// http-proxy's instrument/otelinstrument boundaries.
+	wantBounds := []float64{
+		1, 3, 10, 30, 100, 300,
+		1_000, 3_000, 10_000, 30_000, 100_000, 300_000,
+		1_000_000, 3_000_000, 10_000_000,
+	}
+	assert.Equal(t, wantBounds, dp.Bounds,
+		"histogram must carry the explicit log-scale boundaries")
+	require.Len(t, dp.BucketCounts, len(wantBounds)+1)
+	// Boundaries are upper-inclusive: 101_000 lands in (100_000, 300_000],
+	// i.e. bucket index 11 — not the overflow bucket.
+	assert.Equal(t, uint64(1), dp.BucketCounts[11], "~101 kB/s sample should land in the (100k, 300k] bucket")
+}
+
+func histogramDataPoint(rm metricdata.ResourceMetrics, name string) (metricdata.HistogramDataPoint[float64], bool) {
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			if d, ok := m.Data.(metricdata.Histogram[float64]); ok && len(d.DataPoints) > 0 {
+				return d.DataPoints[0], true
+			}
+		}
+	}
+	return metricdata.HistogramDataPoint[float64]{}, false
+}
+
 func histogramCountSum(rm metricdata.ResourceMetrics, name string) (uint64, float64, bool) {
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
