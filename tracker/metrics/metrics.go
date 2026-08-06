@@ -31,9 +31,9 @@ const countryLookupWorkers = 4
 // identical keeps the metric's ingest cost identical (this family is ~20% of
 // metric ingest; see lantern-cloud #3069).
 //
-// http-proxy emits the same metric from instrument/otelinstrument
-// (GoodputBucketBoundaries) and MUST use identical boundaries — SigNoz merges
-// the two streams, and quantiles over mixed bucket layouts are garbage.
+// http-proxy emits the same metric from instrument/otelinstrument and MUST
+// use identical boundaries — SigNoz merges the two streams, and quantiles
+// over mixed bucket layouts are garbage.
 var goodputBucketBoundaries = []float64{
 	1, 3, 10, 30, 100, 300,
 	1_000, 3_000, 10_000, 30_000, 100_000, 300_000,
