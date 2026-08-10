@@ -224,11 +224,16 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 }
 
 func (o *Outbound) Close() error {
-	if o.ql != nil {
-		o.ql.Close()
-	}
+	// Stop the broflake workers before closing the QUIC layer they drain into. A
+	// worker blocked mid-send cannot be cancelled until that send completes, so
+	// removing the drain first risks stranding one — which blocks the engine's
+	// teardown and retains its whole stack. broflake now guards its control-plane
+	// sends, so this ordering is defense in depth for any future blocking send.
 	if o.ui != nil {
 		o.ui.Stop()
+	}
+	if o.ql != nil {
+		o.ql.Close()
 	}
 	return nil
 }
