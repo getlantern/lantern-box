@@ -296,9 +296,9 @@ func TestHydrateLocalHistory_DropsAgedUserFailures(t *testing.T) {
 		UpdatedAt: now.Add(-time.Minute),
 	}
 	h := hydrateLocalHistory(persisted, now, 5*time.Minute)
-	lastDelay, _, _, userFails := h.snapshot(now, 5*time.Minute)
+	lastDelay, _, _, userFailCount := h.snapshot(now, 5*time.Minute)
 	assert.Equal(t, uint32(120), lastDelay)
-	assert.Len(t, userFails, 1, "stale user-failure timestamp must be dropped on hydrate")
+	assert.Equal(t, uint32(1), userFailCount, "stale user-failure timestamp must be dropped on hydrate")
 }
 
 func TestBehaviorFor_Timeouts(t *testing.T) {
@@ -566,9 +566,7 @@ func (stallConn) SetReadDeadline(time.Time) error  { return nil }
 func (stallConn) SetWriteDeadline(time.Time) error { return nil }
 
 func TestDataPlaneStream_StallSuppressedUntilProven(t *testing.T) {
-	// A handshake-only conn that never delivers payload is "established
-	// but inactive" — the stall timer fires but onStall is suppressed
-	// because provedReadBytes hasn't been crossed.
+	// A handshake-only conn never becomes proven, so idle is not a stall.
 	var calls atomic.Uint32
 	const provedReadBytes = 100
 	d := newDataPlaneStream(stallConn{}, 10*time.Millisecond, provedReadBytes,
@@ -599,7 +597,8 @@ func TestDataPlaneStream_StallFiresAfterProven(t *testing.T) {
 	_, err = d.Write([]byte("ping"))
 	require.NoError(t, err, "Write should succeed on echoConn")
 
-	require.True(t, d.lastWasWrite.Load(), "Write should set the last-was-write gate")
+	_, wasWrite := unpackActivity(d.activity.Load())
+	require.True(t, wasWrite, "Write should set the last-was-write gate")
 	// Wait past the idle window.
 	require.Eventually(t, func() bool { return calls.Load() == 1 },
 		time.Second, 5*time.Millisecond, "proven stall should have fired by now")
@@ -623,10 +622,56 @@ func TestDataPlaneStream_StallSuppressedOnReadOnlyIdle(t *testing.T) {
 	require.NoError(t, err, "Read should succeed on echoConn")
 
 	require.True(t, d.proven.Load(), "Read should have proven the conn")
-	require.False(t, d.lastWasWrite.Load(), "Read-only conn must not set the last-was-write gate")
+	_, wasWrite := unpackActivity(d.activity.Load())
+	require.False(t, wasWrite, "Read-only conn must not set the last-was-write gate")
 	time.Sleep(80 * time.Millisecond)
 	assert.Equal(t, uint32(0), calls.Load(),
 		"proven conn with read-only history must not fire stall")
+}
+
+func TestPackActivity_RoundTrip(t *testing.T) {
+	// fireStall depends on one atomic snapshot preserving both fields.
+	cases := []struct {
+		nanos    int64
+		wasWrite bool
+	}{
+		{0, false},
+		{0, true},
+		{1, false}, // odd timestamp: low bit must not leak into wasWrite
+		{1, true},
+		{123456788, true},
+		{idleForever, false},
+		{idleForever, true},
+	}
+	for _, c := range cases {
+		gotNanos, gotWrite := unpackActivity(packActivity(c.nanos, c.wasWrite))
+		assert.Equal(t, c.wasWrite, gotWrite, "wasWrite must survive the round-trip")
+		assert.Equal(t, c.nanos&^1, gotNanos, "timestamp must survive minus its low bit")
+	}
+}
+
+func TestDataPlaneStream_StallAfterReadIdleThenWrite(t *testing.T) {
+	// Read-only idle must keep the timer alive for a later unanswered Write.
+	var calls atomic.Uint32
+	const provedReadBytes = 50
+	d := newDataPlaneStream(echoConn{}, 20*time.Millisecond, provedReadBytes,
+		func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	defer d.Close()
+
+	_, err := d.Read(make([]byte, provedReadBytes))
+	require.NoError(t, err, "Read should succeed on echoConn")
+	require.True(t, d.proven.Load(), "Read should have proven the conn")
+
+	// Let several read-only idle windows lapse; each must re-arm, not fire.
+	time.Sleep(70 * time.Millisecond)
+	require.Equal(t, uint32(0), calls.Load(), "read-only idle must not stall")
+
+	// A now-unanswered Write on the still-armed watchdog must stall.
+	_, err = d.Write([]byte("ping"))
+	require.NoError(t, err, "Write should succeed on echoConn")
+	require.Eventually(t, func() bool { return calls.Load() == 1 },
+		time.Second, 5*time.Millisecond,
+		"unanswered Write after a read-idle window must still stall")
 }
 
 func TestDataPlaneStream_CloseIsIdempotent(t *testing.T) {
@@ -638,8 +683,8 @@ func TestDataPlaneStream_CloseIsIdempotent(t *testing.T) {
 func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
 	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
-	d.proven.Store(true)       // simulate a proven conn so fireStall isn't gated on the proven check
-	d.lastWasWrite.Store(true) // ...nor on the write-without-read gate
+	d.proven.Store(true)                              // simulate a proven conn so fireStall isn't gated on the proven check
+	d.activity.Store(packActivity(idleForever, true)) // ...nor on the write-without-read or freshness gates
 	d.Close()
 	d.fireStall()
 	assert.Equal(t, uint32(0), calls.Load(), "no stall callbacks must fire after Close")
@@ -649,7 +694,7 @@ func TestDataPlanePacket_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
 	d := newDataPlanePacket(stallPacketConn{}, time.Hour, 0, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	d.proven.Store(true)
-	d.lastWasWrite.Store(true)
+	d.activity.Store(packActivity(idleForever, true))
 	d.Close()
 	d.fireStall()
 	assert.Equal(t, uint32(0), calls.Load(), "no stall callbacks must fire after Close")
@@ -1104,7 +1149,7 @@ func TestDataPlaneStream_Stall_AttributesStallKind(t *testing.T) {
 	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func(k adapter.UserFailureKind) { got.Store(k) }, nil)
 	defer d.Close()
 	d.proven.Store(true)
-	d.lastWasWrite.Store(true)
+	d.activity.Store(packActivity(idleForever, true))
 	d.fireStall()
 
 	require.NotNil(t, got.Load(), "a stall must attribute a failure")
