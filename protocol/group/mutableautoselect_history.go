@@ -64,6 +64,13 @@ type localHistory struct {
 
 func newLocalHistory() *localHistory { return &localHistory{} }
 
+// outcomeAt returns the most recent probe outcome time, or zero if unset.
+func (h *localHistory) outcomeAt() time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastOutcomeAt
+}
+
 // recordProbeSuccess updates the probe scalars on a successful probe.
 // delayMs has already been clamped to ≥1 ms by the caller so the
 // "no measurement" sentinel (0) stays unambiguous.
