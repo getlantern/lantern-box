@@ -604,7 +604,7 @@ func TestDataPlaneStream_StallFiresAfterProven(t *testing.T) {
 		time.Second, 5*time.Millisecond, "proven stall should have fired by now")
 
 	d.fireStall()
-	assert.Equal(t, uint32(1), calls.Load(), "fired CAS should suppress duplicate fires")
+	assert.Equal(t, uint32(1), calls.Load(), "terminal activity state should suppress duplicate fires")
 }
 
 func TestDataPlaneStream_StallSuppressedOnReadOnlyIdle(t *testing.T) {
@@ -627,6 +627,30 @@ func TestDataPlaneStream_StallSuppressedOnReadOnlyIdle(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 	assert.Equal(t, uint32(0), calls.Load(),
 		"proven conn with read-only history must not fire stall")
+}
+
+func TestClaimStall_AbortsOnConcurrentActivity(t *testing.T) {
+	// fireStall samples activity, then commits; a Read that republishes
+	// activity in that gap must abort the stall so a live conn is not
+	// demoted.
+	d := newDataPlaneStream(echoConn{}, time.Hour, 0, func(adapter.UserFailureKind) {}, nil)
+
+	// Sample a stale write, then simulate a concurrent Read republishing
+	// fresh activity before the commit.
+	act := packActivity(idleForever, true)
+	d.activity.Store(act)
+	d.activity.Store(packActivity(sinceEpoch(), false))
+	assert.False(t, d.claimStall(act), "claim must abort when activity advanced since the sample")
+
+	// A successful claim marks the terminal state. Later activity must not
+	// overwrite it.
+	fresh := d.activity.Load()
+	assert.True(t, d.claimStall(fresh), "claim must succeed when activity is unchanged")
+	assert.False(t, d.publishActivity(false), "activity must not overwrite a terminal claim")
+	d.noteIO(1, nil, true)
+	assert.Equal(t, int64(activityTerminal), d.activity.Load(), "a claim marks the terminal state")
+	assert.False(t, d.proven.Load(), "terminal claims must suppress later Read-side proving")
+	assert.False(t, d.claimStall(activityTerminal), "the sentinel itself is not a claimable sample")
 }
 
 func TestPackActivity_RoundTrip(t *testing.T) {
@@ -798,6 +822,19 @@ func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	assert.False(t, exists)
 }
 
+// firstUserFailure reads the failure count and first-recorded kind under
+// h.mu. The stall/reset hooks kick a background runLadder that mutates
+// history concurrently, so these fields must not be read raw.
+func firstUserFailure(h *localHistory) (n int, kind adapter.UserFailureKind) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n = len(h.userFailures)
+	if n > 0 {
+		kind = h.userFailures[0].Kind
+	}
+	return
+}
+
 func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// A stall counts as one failure — same weight as a single dial
 	// error. The demote rule hits hard at three failures in window, not
@@ -811,8 +848,9 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, uint32(1), h.userFailureCount(time.Now(), s.hist.userFailureWindow),
 		"a single stall must contribute exactly one user-failure timestamp")
-	require.Len(t, h.userFailures, 1)
-	assert.Equal(t, adapter.UserFailureStall, h.userFailures[0].Kind,
+	n, kind := firstUserFailure(h)
+	require.Equal(t, 1, n, "a single stall must record exactly one failure")
+	assert.Equal(t, adapter.UserFailureStall, kind,
 		"the stall hook must record the failure as a stall")
 }
 
@@ -824,8 +862,9 @@ func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
 	require.True(t, ok)
-	require.Len(t, h.userFailures, 1)
-	assert.Equal(t, adapter.UserFailureReset, h.userFailures[0].Kind,
+	n, kind := firstUserFailure(h)
+	require.Equal(t, 1, n, "a single reset must record exactly one failure")
+	assert.Equal(t, adapter.UserFailureReset, kind,
 		"makeHooks must record the failure under the kind the watchdog reports")
 }
 
@@ -836,8 +875,9 @@ func TestRecordUserFailure_AttributesDialKind(t *testing.T) {
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
 	require.True(t, ok)
-	require.Len(t, h.userFailures, 1)
-	assert.Equal(t, adapter.UserFailureDial, h.userFailures[0].Kind,
+	n, kind := firstUserFailure(h)
+	require.Equal(t, 1, n, "a single dial error must record exactly one failure")
+	assert.Equal(t, adapter.UserFailureDial, kind,
 		"a dial-site failure must record the failure as a dial error")
 }
 
@@ -1243,9 +1283,9 @@ func TestDataPlaneStream_TimeoutDoesNotAttribute(t *testing.T) {
 }
 
 func TestDataPlaneStream_NoAttributeAfterClose(t *testing.T) {
-	// After our own Close, closeWatchdog has set stalled; a racing read that
-	// surfaces net.ErrClosed must short-circuit, not attribute a phantom
-	// failure.
+	// After our own Close, closeWatchdog has marked the watchdog
+	// terminal; a racing read that surfaces net.ErrClosed must not
+	// attribute a phantom failure.
 	var calls atomic.Uint32
 	c := &failingConn{err: net.ErrClosed}
 	d := newDataPlaneStream(c, time.Hour, 1, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
@@ -1259,7 +1299,7 @@ func TestDataPlaneStream_NoAttributeAfterClose(t *testing.T) {
 }
 
 func TestDataPlaneStream_FailureFiresOnce(t *testing.T) {
-	// Repeated errored reads attribute at most once per conn (the fired CAS).
+	// Repeated errored reads attribute at most once per conn.
 	var calls atomic.Uint32
 	c := &failingConn{err: connResetErr()}
 	d := newDataPlaneStream(c, time.Hour, 1, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
