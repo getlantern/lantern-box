@@ -1399,14 +1399,14 @@ func TestAdd_ProbesNewMembers(t *testing.T) {
 	newOb.AssertNumberOfCalls(t, "DialContext", 1)
 }
 
-func TestRunExternalProbe_DropsWhenInternalActive(t *testing.T) {
+func TestRunExternalProbe_DropsWhenInternalRunning(t *testing.T) {
 	s, obs := newTestMUR(t, "a")
 	s.defaultURL = "http://probe.test/"
 	obs["a"].On("DialContext").Return(nil, errors.New("dial denied"))
 
-	s.access.Lock()
-	s.internalActive = true
-	s.access.Unlock()
+	// External probes drop while an internal cycle holds probeMu.
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
 
 	s.runExternalProbe(nil)
 	obs["a"].AssertNumberOfCalls(t, "DialContext", 0)

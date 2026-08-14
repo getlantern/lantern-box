@@ -88,9 +88,9 @@ type MutableAutoSelect struct {
 		udp atomic.Value // string; "" when unset
 	}
 
-	// probeMu serializes probe cycles. Fire-and-forget callers
-	// (runProbeCycle) TryLock; callers that need a deterministic outcome
-	// (URLTest, runLadder) Lock so they observe the cycle they triggered.
+	// probeMu serializes all probeAll runs so outcomes can't interleave and
+	// the worker bound is global. Fire-and-forget callers TryLock; callers
+	// that need a deterministic result Lock.
 	probeMu   sync.Mutex
 	laddering atomic.Bool
 	// Unix-nano of the most recent runLadder completion. Read by the
@@ -99,12 +99,9 @@ type MutableAutoSelect struct {
 	lastLadderAt atomic.Int64
 	exhaustionCh chan struct{}
 
-	// externalProbeMu serializes Add / CheckOutbounds probes; overlapping
-	// external triggers are dropped. internalActive, guarded by access,
-	// prevents an external probe from starting while an internal cycle is
-	// already active.
+	// externalProbeMu drops overlapping Add / CheckOutbounds probes; probeMu
+	// also makes them drop during an internal cycle.
 	externalProbeMu sync.Mutex
-	internalActive  bool
 
 	// Unix-nano of the most recent non-empty data-plane Read/Write; 0
 	// means no traffic observed yet. Drives the adaptive probe cadence.
@@ -940,19 +937,19 @@ func (s *MutableAutoSelect) runProbeCycle(ctx context.Context) {
 }
 
 // runExternalProbe runs a fire-and-forget, freshness-filtered probe for tags,
-// or all members when tags is nil. It serializes only with other external
-// probes; unlike internal probes, it does not rank after refreshing history.
+// or all members when tags is nil. It drops if another external probe or
+// internal cycle is running and does not rank after refreshing history.
 func (s *MutableAutoSelect) runExternalProbe(tags []string) {
 	if !s.externalProbeMu.TryLock() {
 		return
 	}
 	defer s.externalProbeMu.Unlock()
-
-	s.access.Lock()
-	if s.internalActive {
-		s.access.Unlock()
+	if !s.probeMu.TryLock() {
 		return
 	}
+	defer s.probeMu.Unlock()
+
+	s.access.Lock()
 	jobs := s.collectProbeJobsLocked(time.Now(), tags, false)
 	s.access.Unlock()
 
@@ -960,20 +957,12 @@ func (s *MutableAutoSelect) runExternalProbe(tags []string) {
 }
 
 // internalProbe probes every non-excluded member, streaming successes to
-// onSuccess when provided. It marks internalActive for the duration so new
-// external probes drop instead of starting mid-cycle. Caller should hold
-// s.probeMu to serialize with other internal cycles.
+// onSuccess when provided. Caller must hold s.probeMu. Unlike external probes,
+// it bypasses freshness filtering; callers rank separately when needed.
 func (s *MutableAutoSelect) internalProbe(ctx context.Context, onSuccess func(probeResult)) {
 	s.access.Lock()
-	s.internalActive = true
 	jobs := s.collectProbeJobsLocked(time.Now(), nil, true)
 	s.access.Unlock()
-
-	defer func() {
-		s.access.Lock()
-		s.internalActive = false
-		s.access.Unlock()
-	}()
 	s.probeAll(ctx, jobs, onSuccess)
 }
 
