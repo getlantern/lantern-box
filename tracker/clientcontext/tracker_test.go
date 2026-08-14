@@ -3,6 +3,7 @@ package clientcontext
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -104,7 +105,7 @@ func TestClientContext(t *testing.T) {
 	addr := httpServer.URL
 
 	mTracker := &mockTracker{}
-	mgr.AppendTracker(mTracker)
+	serverBox.Router().AppendTracker(mTracker)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mTracker.info = nil
@@ -148,7 +149,13 @@ func runTrackerTest(
 
 	resp, err := client.Do(req)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, upstreamResponseBody, string(body),
+		"the proxied response must reach the client byte-intact")
 }
 
 func getOptions(ctx context.Context, t *testing.T, configPath string) option.Options {
@@ -182,9 +189,15 @@ func setSelectorDefaultTag(options *option.Options, tag string) {
 	options.Route.Rules[0].DefaultOptions.RouteOptions.Outbound = "selector"
 }
 
+// upstreamResponseBody is returned by the test origin so TestClientContext can
+// assert the proxied response reaches the client byte-intact -- a client-info
+// frame or ack leaking into the stream would corrupt it.
+const upstreamResponseBody = "hello from the upstream origin"
+
 func startHTTPServer() *httptest.Server {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(upstreamResponseBody))
 	})
 	return httptest.NewServer(handler)
 }
@@ -222,7 +235,7 @@ type mockTracker struct {
 }
 
 func (t *mockTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
-	info, ok := ClientInfoFromContext(ctx)
+	info, ok := InfoFromConn(conn)
 	if ok {
 		t.info = &info
 	}
@@ -231,4 +244,3 @@ func (t *mockTracker) RoutedConnection(ctx context.Context, conn net.Conn, metad
 func (t *mockTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
 	return conn
 }
-

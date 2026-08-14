@@ -1,6 +1,8 @@
 package clientcontext
 
 import (
+	"bytes"
+	"errors"
 	"net"
 	"net/netip"
 	"testing"
@@ -12,8 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// startUDPEchoOK starts a UDP server that expects a CLIENTINFO packet and responds "OK".
-func startUDPEchoOK(t *testing.T) *net.UDPAddr {
+// startUDPSink starts a UDP server that drains packets and sends no reply.
+func startUDPSink(t *testing.T) *net.UDPAddr {
 	t.Helper()
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -22,12 +24,9 @@ func startUDPEchoOK(t *testing.T) *net.UDPAddr {
 	go func() {
 		buf := make([]byte, 4096)
 		for {
-			n, addr, err := conn.ReadFrom(buf)
-			if err != nil {
+			if _, _, err := conn.ReadFrom(buf); err != nil {
 				return
 			}
-			_ = n
-			conn.WriteTo([]byte("OK"), addr)
 		}
 	}()
 
@@ -35,7 +34,7 @@ func startUDPEchoOK(t *testing.T) *net.UDPAddr {
 }
 
 func TestSendInfoWithIPDestination(t *testing.T) {
-	serverAddr := startUDPEchoOK(t)
+	serverAddr := startUDPSink(t)
 
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -53,7 +52,7 @@ func TestSendInfoWithIPDestination(t *testing.T) {
 }
 
 func TestSendInfoWithDomainAndResolvedAddresses(t *testing.T) {
-	serverAddr := startUDPEchoOK(t)
+	serverAddr := startUDPSink(t)
 
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -75,14 +74,14 @@ func TestSendInfoWithDomainAndResolvedAddresses(t *testing.T) {
 }
 
 func TestSendInfoWithDomainFallsBackToDNS(t *testing.T) {
-	serverAddr := startUDPEchoOK(t)
+	serverAddr := startUDPSink(t)
 
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer conn.Close()
 
-	// Domain destination with no DestinationAddresses — falls back to DNS resolution.
-	// "localhost" resolves to 127.0.0.1 so this reaches our echo server.
+	// With no DestinationAddresses, the domain falls back to DNS resolution.
+	// "localhost" resolves to 127.0.0.1, so this reaches the sink.
 	dest := M.Socksaddr{Fqdn: "localhost", Port: uint16(serverAddr.Port)}
 
 	wpc := &writePacketConn{
@@ -111,127 +110,29 @@ func TestSendInfoWithUnresolvableDomainFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "resolving destination")
 }
 
-func setSendInfoTimeout(t *testing.T, d time.Duration) {
-	t.Helper()
-	old := sendInfoTimeout
-	sendInfoTimeout = d
-	t.Cleanup(func() { sendInfoTimeout = old })
+// stubConn records writes and fails reads so tests catch unexpected ack reads.
+type stubConn struct {
+	net.Conn
+	written bytes.Buffer
+	reads   int
 }
 
-func TestStreamSendInfoReadsSplitOK(t *testing.T) {
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+func (c *stubConn) Write(p []byte) (int, error) { return c.written.Write(p) }
 
-	go func() {
-		buf := make([]byte, 4096)
-		server.Read(buf)
-		// "OK" delivered across two reads; sendInfo must not treat a short
-		// read as an invalid response.
-		server.Write([]byte("O"))
-		server.Write([]byte("K"))
-	}()
-
-	wc := &writeConn{info: &ClientInfo{DeviceID: "test-device", Platform: "test"}}
-	assert.NoError(t, wc.sendInfo(client))
+func (c *stubConn) Read([]byte) (int, error) {
+	c.reads++
+	return 0, errors.New("unexpected read")
 }
 
-func TestStreamSendInfoTimesOutWithoutResponse(t *testing.T) {
-	setSendInfoTimeout(t, 100*time.Millisecond)
+func (c *stubConn) SetDeadline(time.Time) error { return nil }
 
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+func TestConnHandshakeSuccessDoesNotWaitForAck(t *testing.T) {
+	server := &stubConn{}
+	conn := newWriteConn(&stubConn{}, &ClientInfo{DeviceID: "test-device"}, boundsRule{}, nil).(*writeConn)
 
-	go func() {
-		buf := make([]byte, 4096)
-		server.Read(buf)
-		// never respond
-	}()
+	require.NoError(t, conn.ConnHandshakeSuccess(server))
 
-	wc := &writeConn{info: &ClientInfo{DeviceID: "test-device", Platform: "test"}}
-	start := time.Now()
-	err := wc.sendInfo(client)
-	assert.Error(t, err)
-	assert.Less(t, time.Since(start), 5*time.Second)
-}
-
-func TestStreamSendInfoClearsDeadlineAfterSuccess(t *testing.T) {
-	setSendInfoTimeout(t, 100*time.Millisecond)
-
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-
-	go func() {
-		buf := make([]byte, 4096)
-		server.Read(buf)
-		server.Write([]byte("OK"))
-	}()
-
-	wc := &writeConn{info: &ClientInfo{DeviceID: "test-device", Platform: "test"}}
-	require.NoError(t, wc.sendInfo(client))
-
-	// The conn is piped for the connection's lifetime after sendInfo; a
-	// leftover deadline would kill reads that outlast the timeout.
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		server.Write([]byte("data"))
-	}()
-	buf := make([]byte, 4)
-	_, err := client.Read(buf)
-	assert.NoError(t, err)
-}
-
-func TestPacketSendInfoAcceptsOversizedResponse(t *testing.T) {
-	server, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { server.Close() })
-
-	go func() {
-		buf := make([]byte, 4096)
-		_, addr, err := server.ReadFrom(buf)
-		if err != nil {
-			return
-		}
-		server.WriteTo([]byte("OK with trailing transport overhead"), addr)
-	}()
-
-	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn.Close()
-
-	serverAddr := server.LocalAddr().(*net.UDPAddr)
-	dest := M.SocksaddrFrom(netip.MustParseAddr(serverAddr.IP.String()), uint16(serverAddr.Port))
-
-	wpc := &writePacketConn{
-		metadata: adapter.InboundContext{Destination: dest},
-		info:     &ClientInfo{DeviceID: "test-device", Platform: "test"},
-	}
-	assert.NoError(t, wpc.sendInfo(conn))
-}
-
-func TestPacketSendInfoTimesOutWithoutResponse(t *testing.T) {
-	setSendInfoTimeout(t, 100*time.Millisecond)
-
-	// Server reads but never responds.
-	server, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { server.Close() })
-
-	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn.Close()
-
-	serverAddr := server.LocalAddr().(*net.UDPAddr)
-	dest := M.SocksaddrFrom(netip.MustParseAddr(serverAddr.IP.String()), uint16(serverAddr.Port))
-
-	wpc := &writePacketConn{
-		metadata: adapter.InboundContext{Destination: dest},
-		info:     &ClientInfo{DeviceID: "test-device", Platform: "test"},
-	}
-	start := time.Now()
-	err = wpc.sendInfo(conn)
-	assert.Error(t, err)
-	assert.Less(t, time.Since(start), 5*time.Second)
+	assert.Zero(t, server.reads, "the handshake must not block on an acknowledgement")
+	assert.Contains(t, server.written.String(), packetPrefix)
+	assert.Contains(t, server.written.String(), "test-device")
 }

@@ -15,10 +15,8 @@ import (
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
-	"github.com/sagernet/sing/service"
 	"github.com/spf13/cobra"
 
-	"github.com/getlantern/lantern-box/adapter"
 	lbotel "github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
@@ -82,12 +80,13 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		Inbound:  []string{""},
 		Outbound: []string{""},
 	}, log.StdLogger())
+	// Register Manager before trackers that call clientcontext.InfoFromConn,
+	// because it wraps the connection they inspect.
 	instance.Router().AppendTracker(clientCtxMgr)
-	service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
 
 	if lbotel.Enabled() {
 		metricsTracker := metrics.NewTracker(ctx)
-		clientCtxMgr.AppendTracker(metricsTracker)
+		instance.Router().AppendTracker(metricsTracker)
 		log.Info("Metric Tracking Enabled")
 	}
 
@@ -104,7 +103,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 			cancel()
 			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
 		}
-		clientCtxMgr.AppendTracker(datacapTracker)
+		instance.Router().AppendTracker(datacapTracker)
 	}
 
 	osSignals := make(chan os.Signal, 1)
