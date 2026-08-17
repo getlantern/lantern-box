@@ -304,8 +304,8 @@ func (o *Outbound) newDialer(ctx context.Context, destination M.Socksaddr) (wate
 			return nil, err
 		}
 		if uConn, ok := conn.(common.WithUpstream); ok {
-			if conn, ok := uConn.Upstream().(net.Conn); ok {
-				return conn, nil
+			if upstreamConn, ok := uConn.Upstream().(net.Conn); ok {
+				return upstreamConn, nil
 			}
 		}
 		return conn, nil
