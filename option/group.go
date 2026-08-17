@@ -98,4 +98,7 @@ type MutableAutoSelectOutboundOptions struct {
 	// other failure paths (dial errors, probe failures) catch the
 	// actually-broken cases. Default 4096.
 	DataPlaneProvedReadBytes uint32 `json:"data_plane_proved_read_bytes,omitempty"`
+
+	// ProbeConcurrency caps parallel member probes per batch. Default 6.
+	ProbeConcurrency uint32 `json:"probe_concurrency,omitempty"`
 }

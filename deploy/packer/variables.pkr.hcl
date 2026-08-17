@@ -33,6 +33,16 @@ variable "alicloud_ssh_password" {
   default   = env("ALICLOUD_SSH_PASSWORD")
 }
 
+# QEMU (gcore) — build-time password so Packer can SSH into the cloud image; locked again
+# in generalize, and cloud-init injects the real key at first boot. NOT a stored secret:
+# the job mints a fresh value per run, since the hash ships in a briefly-public qcow2.
+# Keep it hex/alphanumeric — it is interpolated into YAML and a quoted shell string.
+variable "qemu_ssh_password" {
+  type      = string
+  sensitive = true
+  default   = env("QEMU_SSH_PASSWORD")
+}
+
 # OCI shared variables (same across all regions)
 variable "oci_tenancy_ocid" {
   type      = string

@@ -17,6 +17,29 @@ import (
 
 const countryLookupWorkers = 4
 
+// goodputBucketBoundaries are the explicit bucket boundaries, in bytes/s, for
+// the proxy.session.goodput histogram: a half-decade log scale from 1 B/s to
+// 10 MB/s. Session goodput spans ~6 decades — idle keepalive sessions sit
+// below 100 B/s while real page loads run 100 kB/s–10 MB/s — and the SDK
+// default boundaries top out at 10,000 B/s, which censored everything faster
+// than 10 kB/s into the final bucket (IR's daily p90 read as exactly 10000).
+// A log scale gives every decade the same relative resolution, so p50/p90/p99
+// interpolate to meaningful values across the whole range.
+//
+// Exactly 15 boundaries, matching the SDK default's count: SigNoz stores one
+// sample per bucket per series per export interval, so keeping the count
+// identical keeps the metric's ingest cost identical (this family is ~20% of
+// metric ingest; see lantern-cloud #3069).
+//
+// http-proxy emits the same metric from instrument/otelinstrument and MUST
+// use identical boundaries — SigNoz merges the two streams, and quantiles
+// over mixed bucket layouts are garbage.
+var goodputBucketBoundaries = []float64{
+	1, 3, 10, 30, 100, 300,
+	1_000, 3_000, 10_000, 30_000, 100_000, 300_000,
+	1_000_000, 3_000_000, 10_000_000,
+}
+
 type countryLookupRequest struct {
 	ip      net.IP
 	country *atomic.Value
@@ -78,7 +101,8 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 	// spelling for consistency within this package's metrics.
 	goodput, err := meter.Float64Histogram("proxy.session.goodput",
 		metric.WithUnit("bytes/s"),
-		metric.WithDescription("Per-session download goodput: received bytes per second of connection lifetime"))
+		metric.WithDescription("Per-session download goodput: received bytes per second of connection lifetime"),
+		metric.WithExplicitBucketBoundaries(goodputBucketBoundaries...))
 	if err == nil {
 		metrics.sessionGoodput = goodput
 	}

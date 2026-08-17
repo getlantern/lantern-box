@@ -51,6 +51,7 @@ func newTestMUR(t *testing.T, tags ...string) (*MutableAutoSelect, map[string]*m
 			ladderTotalBudget: 100 * time.Millisecond,
 			dataPlaneIdle:     time.Hour,
 			maxPersistedAge:   defaultMaxPersistedAge,
+			probeConcurrency:  defaultProbeConcurrency,
 		},
 		hist:         defaultHistoryParams(),
 		history:      adapter.NewAutoSelectHistoryStorage(),
@@ -73,6 +74,14 @@ func recordSuccess(s *MutableAutoSelect, tag string, delay uint32) time.Time {
 	h := s.historyForLocked(tag)
 	h.recordProbeSuccess(delay, now)
 	return now
+}
+
+func jobTags(jobs []probeJob) []string {
+	tags := make([]string, len(jobs))
+	for i, j := range jobs {
+		tags[i] = j.outbound.Tag()
+	}
+	return tags
 }
 
 func TestPruneUserFailures(t *testing.T) {
@@ -1329,6 +1338,115 @@ func TestInterfaceUpdated_TriggersReprobe(t *testing.T) {
 	s.probeMu.Lock()
 	s.probeMu.Unlock()
 	obs["a"].AssertNumberOfCalls(t, "DialContext", 1)
+}
+
+func TestCollectProbeJobs_FreshnessFilter(t *testing.T) {
+	s, _ := newTestMUR(t, "fresh", "stale")
+	now := time.Now()
+	s.historyForLocked("fresh").recordProbeSuccess(100, now)
+	s.historyForLocked("stale").recordProbeSuccess(100, now.Add(-2*probeFreshnessWindow))
+
+	s.access.Lock()
+	defer s.access.Unlock()
+
+	forced := s.collectProbeJobsLocked(now, nil, true)
+	assert.ElementsMatch(t, []string{"fresh", "stale"}, jobTags(forced),
+		"force=true probes every member regardless of freshness")
+
+	filtered := s.collectProbeJobsLocked(now, nil, false)
+	assert.Equal(t, []string{"stale"}, jobTags(filtered),
+		"force=false skips members probed within the freshness window")
+}
+
+func TestRunExternalProbe_SkipsFreshMembers(t *testing.T) {
+	s, obs := newTestMUR(t, "fresh", "stale")
+	s.defaultURL = "http://probe.test/"
+	obs["fresh"].On("DialContext").Return(nil, errors.New("dial denied"))
+	obs["stale"].On("DialContext").Return(nil, errors.New("dial denied"))
+	s.historyForLocked("fresh").recordProbeSuccess(100, time.Now())
+	s.historyForLocked("stale").recordProbeSuccess(100, time.Now().Add(-2*probeFreshnessWindow))
+
+	s.runExternalProbe(nil)
+
+	obs["fresh"].AssertNumberOfCalls(t, "DialContext", 0)
+	obs["stale"].AssertNumberOfCalls(t, "DialContext", 1)
+}
+
+func TestAdd_ProbesNewMembers(t *testing.T) {
+	s, _ := newTestMUR(t)
+	s.defaultURL = "http://probe.test/"
+	newOb := &mockOutbound{tag: "new"}
+	dialed := make(chan struct{}, 1)
+	newOb.On("DialContext").Run(func(mock.Arguments) {
+		select {
+		case dialed <- struct{}{}:
+		default:
+		}
+	}).Return(nil, errors.New("dial denied"))
+	s.outboundMgr = &mockOutboundManager{outbounds: map[string]sbAdapter.Outbound{"new": newOb}}
+
+	n, err := s.Add("new")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	select {
+	case <-dialed:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "Add did not trigger a probe of the new member")
+	}
+	s.externalProbeMu.Lock()
+	s.externalProbeMu.Unlock()
+	newOb.AssertNumberOfCalls(t, "DialContext", 1)
+}
+
+func TestRunExternalProbe_DropsWhenInternalRunning(t *testing.T) {
+	s, obs := newTestMUR(t, "a")
+	s.defaultURL = "http://probe.test/"
+	obs["a"].On("DialContext").Return(nil, errors.New("dial denied"))
+
+	// External probes drop while an internal cycle holds probeMu.
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+
+	s.runExternalProbe(nil)
+	obs["a"].AssertNumberOfCalls(t, "DialContext", 0)
+}
+
+func TestRunExternalProbe_DropsWhenAnotherExternalRunning(t *testing.T) {
+	s, obs := newTestMUR(t, "a")
+	s.defaultURL = "http://probe.test/"
+	obs["a"].On("DialContext").Return(nil, errors.New("dial denied"))
+
+	s.externalProbeMu.Lock()
+	defer s.externalProbeMu.Unlock()
+
+	s.runExternalProbe(nil)
+	obs["a"].AssertNumberOfCalls(t, "DialContext", 0)
+}
+
+func TestProbeAll_CanceledBatchDoesNotRecordOutcome(t *testing.T) {
+	// A probe whose batch ctx is canceled mid-flight (group shutdown or
+	// ladder budget) must not record a failure that would spuriously demote
+	// a member that simply didn't finish in time.
+	s, obs := newTestMUR(t, "a")
+	s.defaultURL = "http://probe.test/"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	obs["a"].On("DialContext").Run(func(mock.Arguments) {
+		cancel()
+	}).Return(nil, errors.New("dial denied"))
+
+	seed := time.Now().Add(-time.Hour)
+	s.historyForLocked("a").recordProbeSuccess(50, seed)
+
+	s.access.Lock()
+	jobs := s.collectProbeJobsLocked(time.Now(), nil, true)
+	s.access.Unlock()
+	s.probeAll(ctx, jobs, nil)
+
+	obs["a"].AssertNumberOfCalls(t, "DialContext", 1)
+	assert.Equal(t, seed, s.historyForLocked("a").outcomeAt(),
+		"canceled batch must not overwrite the seeded outcome")
 }
 
 type fakePauseManager struct {

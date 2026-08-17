@@ -1,6 +1,6 @@
 module github.com/getlantern/lantern-box
 
-go 1.24.7
+go 1.25
 
 // replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.18-lantern
 
@@ -24,7 +24,7 @@ replace github.com/sagernet/gvisor => github.com/sagernet/gvisor v0.0.0-20250811
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/getlantern/algeneva v0.0.0-20250307163401-1824e7b54f52
-	github.com/getlantern/broflake v0.0.0-20260717153233-f2cacf69fe86
+	github.com/getlantern/broflake v0.0.0-20260810172605-bef5e5234952
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260520145825-958775d51395
 	github.com/getlantern/samizdat v0.0.3-0.20260724223841-a5ee9ab56830

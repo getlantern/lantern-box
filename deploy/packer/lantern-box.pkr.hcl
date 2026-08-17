@@ -12,6 +12,10 @@ packer {
       version = ">= 1.1.2"
       source  = "github.com/hashicorp/alicloud"
     }
+    qemu = {
+      version = ">= 1.1.0"
+      source  = "github.com/hashicorp/qemu"
+    }
   }
 }
 
@@ -979,6 +983,45 @@ source "alicloud-ecs" "lantern-box" {
   ]
 }
 
+# QEMU source — Gcore has no Packer plugin and no cross-region copy API, so build a
+# generic qcow2 here and import it per region via gcore-publish.sh. Boots the stock
+# Ubuntu 24.04 cloud image for the OpenStack cloud-init datasource Gcore uses, runs the
+# SAME provisioners as every other builder, then generalizes the disk (see below).
+source "qemu" "lantern-box-gcore" {
+  iso_url      = "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+  iso_checksum = "file:https://cloud-images.ubuntu.com/releases/noble/release/SHA256SUMS"
+  disk_image   = true
+  disk_size    = "10G"
+  format       = "qcow2"
+  accelerator  = "kvm"
+  cpus         = 2
+  memory       = 2048
+  headless     = true
+
+  # NoCloud seed: set the ubuntu user's password so Packer can SSH in. That user has
+  # passwordless sudo (as on OCI), so the shared `sudo sh -c` provisioners work unchanged.
+  cd_label = "cidata"
+  cd_content = {
+    "meta-data" = ""
+    "user-data" = <<-EOF
+      #cloud-config
+      ssh_pwauth: true
+      password: "${var.qemu_ssh_password}"
+      chpasswd:
+        expire: false
+    EOF
+  }
+
+  ssh_username           = "ubuntu"
+  ssh_password           = var.qemu_ssh_password
+  ssh_timeout            = "20m"
+  ssh_handshake_attempts = 100
+
+  shutdown_command = "echo '${var.qemu_ssh_password}' | sudo -S shutdown -P now"
+  vm_name          = "lantern-box-${var.lantern_box_version}-amd64.qcow2"
+  output_directory = "output-gcore"
+}
+
 # ---------- Build ----------
 
 build {
@@ -1026,6 +1069,7 @@ build {
     "source.oracle-oci.lantern-box-bog",
     "source.oracle-oci.lantern-box-vap",
     "source.alicloud-ecs.lantern-box",
+    "source.qemu.lantern-box-gcore",
   ]
 
   # Ensure datacap placeholder files exist so the file provisioner never fails.
@@ -1040,13 +1084,13 @@ build {
   # Upload the datacap binary for this arch.
   # OCI sources target arm64; Linode/Alicloud target amd64.
   provisioner "file" {
-    only        = ["linode.lantern-box", "alicloud-ecs.lantern-box"]
+    only        = ["linode.lantern-box", "alicloud-ecs.lantern-box", "qemu.lantern-box-gcore"]
     source      = "/tmp/datacap-amd64"
     destination = "/tmp/datacap"
   }
 
   provisioner "file" {
-    except      = ["linode.lantern-box", "alicloud-ecs.lantern-box"]
+    except      = ["linode.lantern-box", "alicloud-ecs.lantern-box", "qemu.lantern-box-gcore"]
     source      = "/tmp/datacap-arm64"
     destination = "/tmp/datacap"
   }
@@ -1093,6 +1137,25 @@ build {
       "rm -f /root/.bash_history /home/*/.bash_history",
       "passwd -l root",
       "sed -i 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config",
+    ]
+  }
+
+  # Gcore-only: generalize the raw qcow2 so it boots fresh in every region — the managed
+  # builders do this in their plugins, a raw disk import must sysprep itself. Touches no
+  # lantern-box payload, only per-instance identity.
+  provisioner "shell" {
+    only            = ["qemu.lantern-box-gcore"]
+    execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
+    inline = [
+      "cloud-init clean --logs --seed",
+      "truncate -s 0 /etc/machine-id",
+      "rm -f /var/lib/dbus/machine-id",
+      "rm -f /etc/ssh/ssh_host_*",
+      # Drop the password-auth file cloud-init wrote for the seed's `ssh_pwauth: true`.
+      # 01-lantern-harden.conf already wins on drop-in ordering; removing this leaves no
+      # contradictory `PasswordAuthentication yes` in the image at all.
+      "rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf",
+      "passwd -l ubuntu",
     ]
   }
 

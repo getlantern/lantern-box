@@ -104,10 +104,9 @@ func runProbe(
 	return probeResult{tag: tag, success: true, delayMs: delayMs}
 }
 
-// probeAll fans out one probe per job over up to probeConcurrency
-// goroutines, recording each outcome via recordProbeOutcome and
-// streaming successes through onSuccess (called serialized). Returns
-// when every probe completes or ctx fires.
+// probeAll runs jobs with up to probeConcurrency workers, records each
+// outcome, and calls onSuccess serially for successful probes. It returns
+// after all queued probes complete or ctx is canceled.
 func (s *MutableAutoSelect) probeAll(
 	ctx context.Context,
 	jobs []probeJob,
@@ -117,29 +116,40 @@ func (s *MutableAutoSelect) probeAll(
 		return
 	}
 	var (
-		wg  sync.WaitGroup
-		mu  sync.Mutex
-		sem = make(chan struct{}, probeConcurrency)
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		queue   = make(chan probeJob)
+		workers = max(1, min(len(jobs), s.cfg.probeConcurrency))
 	)
-	for _, j := range jobs {
-		wg.Add(1)
-		go func(j probeJob) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				return
+	for range workers {
+		wg.Go(func() {
+			for j := range queue {
+				res := runProbe(ctx, j.outbound, j.probeURL, j.beh)
+				// Batch cancellation (shutdown or ladder budget) is not member
+				// evidence. Per-probe timeouts use a child context, so the
+				// batch ctx remains live and the failure still counts.
+				if ctx.Err() != nil {
+					continue
+				}
+				s.recordProbeOutcome(res.tag, res.success, res.delayMs)
+				if !res.success || onSuccess == nil {
+					continue
+				}
+				mu.Lock()
+				onSuccess(res)
+				mu.Unlock()
 			}
-			defer func() { <-sem }()
-			res := runProbe(ctx, j.outbound, j.probeURL, j.beh)
-			s.recordProbeOutcome(res.tag, res.success, res.delayMs)
-			if !res.success || onSuccess == nil {
-				return
-			}
-			mu.Lock()
-			onSuccess(res)
-			mu.Unlock()
-		}(j)
+		})
 	}
+	for _, j := range jobs {
+		select {
+		case queue <- j:
+		case <-ctx.Done():
+			close(queue)
+			wg.Wait()
+			return
+		}
+	}
+	close(queue)
 	wg.Wait()
 }

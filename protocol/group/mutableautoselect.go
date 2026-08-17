@@ -47,7 +47,11 @@ var (
 	_ adapter.ExhaustionSignaler   = (*MutableAutoSelect)(nil)
 )
 
-const probeConcurrency = 6
+const defaultProbeConcurrency = 6
+
+// probeFreshnessWindow lets external probes skip members with recent outcomes.
+// Internal probes always force a fresh probe.
+const probeFreshnessWindow = 30 * time.Second
 
 // MutableAutoSelect is the client-side server-selection group.
 type MutableAutoSelect struct {
@@ -84,9 +88,9 @@ type MutableAutoSelect struct {
 		udp atomic.Value // string; "" when unset
 	}
 
-	// probeMu serializes probe cycles. Fire-and-forget callers
-	// (runProbeCycle) TryLock; callers that need a deterministic outcome
-	// (URLTest, runLadder) Lock so they observe the cycle they triggered.
+	// probeMu serializes all probeAll runs so outcomes can't interleave and
+	// the worker bound is global. Fire-and-forget callers TryLock; callers
+	// that need a deterministic result Lock.
 	probeMu   sync.Mutex
 	laddering atomic.Bool
 	// Unix-nano of the most recent runLadder completion. Read by the
@@ -94,6 +98,10 @@ type MutableAutoSelect struct {
 	// stalls or dial errors arrive in quick succession.
 	lastLadderAt atomic.Int64
 	exhaustionCh chan struct{}
+
+	// externalProbeMu drops overlapping Add / CheckOutbounds probes; probeMu
+	// also makes them drop during an internal cycle.
+	externalProbeMu sync.Mutex
 
 	// Unix-nano of the most recent non-empty data-plane Read/Write; 0
 	// means no traffic observed yet. Drives the adaptive probe cadence.
@@ -113,6 +121,7 @@ type mutableAutoSelectConfig struct {
 	dataPlaneIdle       time.Duration
 	dataPlaneProvedRead uint64
 	maxPersistedAge     time.Duration
+	probeConcurrency    int
 }
 
 func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) (mutableAutoSelectConfig, historyParams) {
@@ -126,6 +135,7 @@ func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) 
 		dataPlaneIdle:       time.Duration(o.DataPlaneIdleSeconds) * time.Second,
 		dataPlaneProvedRead: uint64(o.DataPlaneProvedReadBytes),
 		maxPersistedAge:     time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
+		probeConcurrency:    int(o.ProbeConcurrency),
 	}
 	if cfg.switchTolerance == 0 {
 		cfg.switchTolerance = 200 * time.Millisecond
@@ -153,6 +163,9 @@ func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) 
 	}
 	if cfg.maxPersistedAge == 0 {
 		cfg.maxPersistedAge = defaultMaxPersistedAge
+	}
+	if cfg.probeConcurrency == 0 {
+		cfg.probeConcurrency = defaultProbeConcurrency
 	}
 
 	hp := defaultHistoryParams()
@@ -306,7 +319,7 @@ func (s *MutableAutoSelect) Add(tags ...string) (n int, err error) {
 	if s.isClosed() {
 		return 0, adapter.ErrGroupClosed
 	}
-	var missing []string
+	var missing, added []string
 	for _, tag := range tags {
 		if _, exists := s.members.Load(tag); exists {
 			continue
@@ -324,7 +337,13 @@ func (s *MutableAutoSelect) Add(tags ...string) (n int, err error) {
 		if !alreadyListed {
 			s.tags = append(s.tags, tag)
 		}
+		added = append(added, tag)
 		n++
+	}
+	// Probe new members so dial-time ranking has data before the next
+	// background cycle.
+	if len(added) > 0 {
+		go s.runExternalProbe(added)
 	}
 	if len(missing) > 0 {
 		return n, fmt.Errorf("%d outbounds not found: %v", len(missing), missing)
@@ -395,7 +414,7 @@ func (s *MutableAutoSelect) invalidateHistoryLocked(tag string) {
 }
 
 func (s *MutableAutoSelect) CheckOutbounds() {
-	go s.runProbeCycle(s.ctx)
+	go s.runExternalProbe(nil)
 }
 
 // ExhaustionSignal returns a receive-only channel that emits when every
@@ -417,10 +436,6 @@ func (s *MutableAutoSelect) URLTest(ctx context.Context) (map[string]uint16, err
 	defer s.probeMu.Unlock()
 
 	s.access.Lock()
-	if len(s.tags) == 0 {
-		s.access.Unlock()
-		return results, nil
-	}
 	for _, tag := range s.tags {
 		if _, ok := s.members.Load(tag); ok {
 			continue
@@ -435,10 +450,9 @@ func (s *MutableAutoSelect) URLTest(ctx context.Context) (map[string]uint16, err
 		// an empty in-memory localHistory.
 		s.hydrateHistoryLocked(tag)
 	}
-	jobs := s.collectProbeJobsLocked()
 	s.access.Unlock()
 
-	s.probeAll(ctx, jobs, func(res probeResult) {
+	s.internalProbe(ctx, func(res probeResult) {
 		results[res.tag] = uint16(min(65535, res.delayMs))
 	})
 	return results, nil
@@ -678,10 +692,15 @@ func (s *MutableAutoSelect) peekHistoryLocked(tag string) (*localHistory, bool) 
 	return h, ok
 }
 
-// Caller must hold s.access. Skips excludeFromPool members.
-func (s *MutableAutoSelect) collectProbeJobsLocked() []probeJob {
-	jobs := make([]probeJob, 0, len(s.tags))
-	for _, tag := range s.tags {
+// collectProbeJobsLocked builds jobs for tags, or all members when tags is nil.
+// excludeFromPool members are skipped. With force=false, members with outcomes
+// newer than probeFreshnessWindow are skipped. Caller must hold s.access.
+func (s *MutableAutoSelect) collectProbeJobsLocked(now time.Time, tags []string, force bool) []probeJob {
+	if tags == nil {
+		tags = s.tags
+	}
+	jobs := make([]probeJob, 0, len(tags))
+	for _, tag := range tags {
 		o, ok := s.members.Load(tag)
 		if !ok {
 			continue
@@ -689,6 +708,13 @@ func (s *MutableAutoSelect) collectProbeJobsLocked() []probeJob {
 		beh := behaviorFor(o.Type())
 		if beh.excludeFromPool {
 			continue
+		}
+		if !force {
+			if h, ok := s.peekHistoryLocked(tag); ok {
+				if at := h.outcomeAt(); !at.IsZero() && now.Sub(at) < probeFreshnessWindow {
+					continue
+				}
+			}
 		}
 		jobs = append(jobs, probeJob{
 			outbound: o,
@@ -900,38 +926,44 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 	return out
 }
 
-// runProbeCycle is the fire-and-forget entry point; it skips when another
-// cycle is in flight. Callers that need a deterministic outcome acquire
-// s.probeMu directly and call probeCycleInner.
+// runProbeCycle is the fire-and-forget internal probe path; it skips when
+// another internal cycle is already in flight.
 func (s *MutableAutoSelect) runProbeCycle(ctx context.Context) {
 	if !s.probeMu.TryLock() {
 		return
 	}
 	defer s.probeMu.Unlock()
-	s.probeCycleInner(ctx, time.Now())
+	s.internalProbe(ctx, nil)
 }
 
-// probeCycleInner probes every non-excluded member in parallel and
-// returns the lowest-delay candidate that succeeded at or after
-// cycleStart, or nil when no candidate succeeded. Caller must hold
-// s.probeMu so concurrent cycles can't interleave recordProbeOutcome
-// calls.
-func (s *MutableAutoSelect) probeCycleInner(ctx context.Context, cycleStart time.Time) A.Outbound {
-	s.access.Lock()
-	jobs := s.collectProbeJobsLocked()
-	s.access.Unlock()
-	if len(jobs) == 0 {
-		return nil
+// runExternalProbe runs a fire-and-forget, freshness-filtered probe for tags,
+// or all members when tags is nil. It drops if another external probe or
+// internal cycle is running and does not rank after refreshing history.
+func (s *MutableAutoSelect) runExternalProbe(tags []string) {
+	if !s.externalProbeMu.TryLock() {
+		return
 	}
-	s.probeAll(ctx, jobs, nil)
+	defer s.externalProbeMu.Unlock()
+	if !s.probeMu.TryLock() {
+		return
+	}
+	defer s.probeMu.Unlock()
 
 	s.access.Lock()
-	defer s.access.Unlock()
-	ranked := s.rankLocked(time.Now(), cycleStart)
-	if len(ranked) == 0 {
-		return nil
-	}
-	return ranked[0].outbound
+	jobs := s.collectProbeJobsLocked(time.Now(), tags, false)
+	s.access.Unlock()
+
+	s.probeAll(s.ctx, jobs, nil)
+}
+
+// internalProbe probes every non-excluded member, streaming successes to
+// onSuccess when provided. Caller must hold s.probeMu. Unlike external probes,
+// it bypasses freshness filtering; callers rank separately when needed.
+func (s *MutableAutoSelect) internalProbe(ctx context.Context, onSuccess func(probeResult)) {
+	s.access.Lock()
+	jobs := s.collectProbeJobsLocked(time.Now(), nil, true)
+	s.access.Unlock()
+	s.probeAll(ctx, jobs, onSuccess)
 }
 
 // mutateHistory applies fn to tag's history under s.access and persists
@@ -1023,7 +1055,14 @@ func (s *MutableAutoSelect) runLadder(target string) {
 	s.probeMu.Lock()
 	fullCtx, cancel := context.WithTimeout(s.ctx, s.cfg.ladderTotalBudget)
 	defer cancel()
-	winner := s.probeCycleInner(fullCtx, time.Now())
+	cycleStart := time.Now()
+	s.internalProbe(fullCtx, nil)
+	var winner A.Outbound
+	s.access.Lock()
+	if ranked := s.rankLocked(time.Now(), cycleStart); len(ranked) > 0 {
+		winner = ranked[0].outbound
+	}
+	s.access.Unlock()
 	s.probeMu.Unlock()
 	// Stamp on completion, not entry, so a slow ladder's runtime counts
 	// toward the cooldown.
