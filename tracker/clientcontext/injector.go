@@ -248,28 +248,13 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 	if err != nil {
 		return fmt.Errorf("marshaling client info: %w", err)
 	}
-	dest := c.metadata.Destination
-	var addr *net.UDPAddr
-	if dest.IsIP() {
-		addr = dest.UDPAddr()
-	} else if len(c.metadata.DestinationAddresses) > 0 {
-		// Use the already-resolved address from the routing pipeline. The
-		// destination was resolved earlier during DNS routing; re-resolving
-		// here is redundant and adds latency to every packet connection.
-		addr = &net.UDPAddr{
-			IP:   c.metadata.DestinationAddresses[0].AsSlice(),
-			Port: int(dest.Port),
-		}
-	} else if addr, err = net.ResolveUDPAddr("udp", dest.String()); err != nil {
-		return fmt.Errorf("resolving destination %s: %w", dest, err)
-	}
 	// Best effort: conns that don't support deadlines keep the old unbounded
 	// behavior rather than failing the exchange.
 	_ = conn.SetDeadline(time.Now().Add(sendInfoTimeout))
 	defer conn.SetDeadline(time.Time{})
 
 	packet := append([]byte(packetPrefix), buf...)
-	if _, err = conn.WriteTo(packet, addr); err != nil {
+	if _, err = conn.WriteTo(packet, c.metadata.Destination); err != nil {
 		return fmt.Errorf("writing packet: %w", err)
 	}
 
