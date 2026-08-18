@@ -248,13 +248,26 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 	if err != nil {
 		return fmt.Errorf("marshaling client info: %w", err)
 	}
+	dest := c.metadata.Destination
+	var addr net.Addr
+	switch {
+	case dest.IsIP():
+		addr = dest.UDPAddr()
+	case len(c.metadata.DestinationAddresses) > 0:
+		addr = &net.UDPAddr{
+			IP:   c.metadata.DestinationAddresses[0].AsSlice(),
+			Port: int(dest.Port),
+		}
+	default:
+		addr = dest
+	}
 	// Best effort: conns that don't support deadlines keep the old unbounded
 	// behavior rather than failing the exchange.
 	_ = conn.SetDeadline(time.Now().Add(sendInfoTimeout))
 	defer conn.SetDeadline(time.Time{})
 
 	packet := append([]byte(packetPrefix), buf...)
-	if _, err = conn.WriteTo(packet, c.metadata.Destination); err != nil {
+	if _, err = conn.WriteTo(packet, addr); err != nil {
 		return fmt.Errorf("writing packet: %w", err)
 	}
 
