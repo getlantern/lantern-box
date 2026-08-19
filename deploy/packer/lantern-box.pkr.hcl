@@ -959,7 +959,7 @@ source "alicloud-ecs" "lantern-box" {
   ssh_username         = "root"
   ssh_password         = var.alicloud_ssh_password
 
-  wait_copying_image_ready_timeout = 7200 # seconds (2h) — copying to 8 regions can be slow
+  wait_copying_image_ready_timeout = 7200 # seconds (2h) — copying to 10 regions can be slow
 
   image_copy_regions = [
     "ap-southeast-1",  # Singapore
@@ -970,6 +970,8 @@ source "alicloud-ecs" "lantern-box" {
     "ap-northeast-1",  # Japan (Tokyo)
     "ap-northeast-2",  # South Korea (Seoul)
     "cn-hongkong",     # Hong Kong
+    "eu-central-1",    # Germany (Frankfurt)
+    "eu-west-1",       # UK (London)
   ]
   image_copy_names = [
     "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Singapore
@@ -980,6 +982,8 @@ source "alicloud-ecs" "lantern-box" {
     "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Japan
     "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # South Korea
     "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Hong Kong
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Germany
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # UK
   ]
 }
 
