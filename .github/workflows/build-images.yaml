@@ -297,9 +297,18 @@ jobs:
                 # normal steady state for the oldest kept version, not a fault. Failing
                 # the job here blocked every image build (run 32238646926) while the
                 # correct action was to leave the image alone.
-                echo "  ::notice::Still in use by a live volume (409), skipping — it will prune once those boxes are replaced."
+                # Plain text, not ::notice::: a workflow command is only parsed at the
+                # start of a line, and this is routine steady state that would otherwise
+                # annotate every run for every in-use image. Matches the 404/403 lines.
+                echo "  Still in use by a live volume (409), skipping — it will prune once those boxes are replaced."
               elif [ "$http_code" -ge 400 ]; then
-                echo "::error::Failed to delete gcore image ${name} (${id}) in region ${region}: HTTP ${http_code}: ${body}"
+                # Body printed on its own indented lines rather than interpolated into
+                # the ::error::, which is a single line by definition: gcore's message
+                # could carry newlines, and any line of it starting with "::" would be
+                # read as another workflow command. The indent prefix makes that
+                # impossible.
+                echo "::error::Failed to delete gcore image ${name} (${id}) in region ${region}: HTTP ${http_code}"
+                printf '%s\n' "$body" | sed 's/^/    /'
                 failures=$((failures + 1))
               fi
             done < <(echo "$images" | tail -n +$((KEEP + 1)))
