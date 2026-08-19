@@ -29,6 +29,10 @@ trap cleanup EXIT
 #   retry          /tasks/ -> RUNNING until a counter file next to the fake curl
 #                  reaches FAKE_CURL_RETRY_THRESHOLD (default 2), then FINISHED
 #   always_running /tasks/ -> RUNNING, always (for the timeout test)
+#   error_once     each POST returns "task-<region>-<attempt>"; attempt 1 -> ERROR,
+#                  later attempts -> FINISHED (exercises the ERROR retry path)
+#   running_once   same ids; attempt 1 stays RUNNING until its polls run out,
+#                  attempt 2 -> FINISHED (exercises the timeout retry path)
 #   mixed          downloadimage -> task named for the region in the URL (region
 #                  68 -> "task-68"); /tasks/ -> ERROR only for
 #                  FAKE_CURL_ERROR_REGION's task
@@ -49,6 +53,9 @@ finished='{"state":"FINISHED","created_resources":{"images":["img-1"]}}'
 if [ -n "${FAKE_CURL_NO_IMAGE_ID:-}" ]; then
   finished='{"state":"FINISHED","created_resources":{"images":[]}}'
 fi
+# Verbatim from a real reaped task (run 32154320626, region 18) so the body-dump
+# assertion checks the string an operator would actually have to read.
+errbody='{"state":"ERROR","task_type":"download_image","error":"Task was not started within 10 minutes of creation. Marked as failed by scheduler cleanup."}'
 # The image DELETE and the visibility GET share a URL shape, so the method has to be
 # read off the flags before any URL matching.
 method=GET prev=""
@@ -89,6 +96,15 @@ for a in "$@"; do
       elif [ "$mode" = mixed ]; then
         region="${a##*/}"
         printf '%s\n%s' "{\"tasks\":[\"task-${region}\"]}" 200
+      elif [ "$mode" = error_once ] || [ "$mode" = running_once ]; then
+        # Task id carries the attempt number ("task-68-2"), which is what lets the
+        # /tasks/ handler below fail only a region's FIRST attempt.
+        region="${a##*/}"
+        cf="${self_dir}/post_${region}"
+        [ -f "$cf" ] || echo 0 > "$cf"
+        n=$(( $(cat "$cf") + 1 ))
+        echo "$n" > "$cf"
+        printf '%s\n%s' "{\"tasks\":[\"task-${region}-${n}\"]}" 200
       else
         printf '%s\n%s' '{"tasks":["task-abc"]}' 200
       fi
@@ -97,9 +113,21 @@ for a in "$@"; do
       task="${a##*/tasks/}"
       case "$mode" in
         import_error)
-          echo '{"state":"ERROR"}' ;;
+          echo "$errbody" ;;
         always_running)
           echo '{"state":"RUNNING"}' ;;
+        error_once)
+          # Attempt 1 errors, every later attempt finishes.
+          case "$task" in
+            *-1) echo "$errbody" ;;
+            *) echo "$finished" ;;
+          esac ;;
+        running_once)
+          # Attempt 1 never finishes (so it exhausts its polls), attempt 2 finishes.
+          case "$task" in
+            *-1) echo '{"state":"RUNNING"}' ;;
+            *) echo "$finished" ;;
+          esac ;;
         retry)
           count_file="${self_dir}/poll_count"
           [ -f "$count_file" ] || echo 0 > "$count_file"
@@ -113,7 +141,7 @@ for a in "$@"; do
         mixed)
           region="${task#task-}"
           if [ "$region" = "${FAKE_CURL_ERROR_REGION:-}" ]; then
-            echo '{"state":"ERROR"}'
+            echo "$errbody"
           else
             echo "$finished"
           fi ;;
@@ -200,17 +228,51 @@ else
   echo "FAIL: poll retry then success (rc=$rc, running_count=$running_count)"; echo "$out"; FAILED=1
 fi
 
-# Test 5: always RUNNING -> poll_task exhausts POLL_ATTEMPTS and hard-fails (no
-# fallback).
+# Test 5: always RUNNING -> the region exhausts its per-region polls and hard-fails
+# (no fallback). IMPORT_ATTEMPTS=1 keeps this a pure timeout test; 5b covers the retry.
 dir=$(make_fake_curl); TMP_DIRS+=("$dir")
 out=$(PATH="$dir:$PATH" FAKE_CURL_MODE=always_running \
   GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
-  GCORE_REGIONS="180" POLL_ATTEMPTS=2 POLL_INTERVAL_SECS=0 \
+  GCORE_REGIONS="180" POLL_ATTEMPTS=2 POLL_INTERVAL_SECS=0 IMPORT_ATTEMPTS=1 \
   bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
-if [ "$rc" -ne 0 ] && grep -q "did not finish after 2 attempts" <<<"$out"; then
+if [ "$rc" -ne 0 ] && grep -q "did not finish after 2 polls" <<<"$out" \
+   && grep -q "no attempts left (1/1)" <<<"$out"; then
   echo "PASS: poll timeout"
 else
   echo "FAIL: poll timeout (rc=$rc)"; echo "$out"; FAILED=1
+fi
+
+# Test 5b: a region whose FIRST import times out is re-POSTed, and the second attempt
+# landing is a publish success. This is the retry that both failed builds lacked.
+dir=$(make_fake_curl); TMP_DIRS+=("$dir")
+out=$(PATH="$dir:$PATH" FAKE_CURL_MODE=running_once \
+  GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
+  GCORE_REGIONS="180" POLL_ATTEMPTS=2 POLL_INTERVAL_SECS=0 IMPORT_ATTEMPTS=2 \
+  bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] \
+   && grep -q "did not finish after 2 polls — requeueing (attempt 2/2)" <<<"$out" \
+   && grep -q "region 180: import task task-180-2 FINISHED" <<<"$out" \
+   && grep -q "landed in 1/1 region(s): 180" <<<"$out"; then
+  echo "PASS: a timed-out import is retried and the retry succeeds"
+else
+  echo "FAIL: timeout retry (rc=$rc)"; echo "$out"; FAILED=1
+fi
+
+# Test 5c: same for an ERRORed import — and the full gcore task body must reach the log,
+# since the reaper message is the only thing that explains the failure.
+dir=$(make_fake_curl); TMP_DIRS+=("$dir")
+out=$(PATH="$dir:$PATH" FAKE_CURL_MODE=error_once \
+  GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
+  GCORE_REGIONS="180" POLL_INTERVAL_SECS=0 IMPORT_ATTEMPTS=2 \
+  bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] \
+   && grep -q "gcore task body follows" <<<"$out" \
+   && grep -q "Task was not started within 10 minutes of creation" <<<"$out" \
+   && grep -q "reported ERROR — requeueing (attempt 2/2)" <<<"$out" \
+   && grep -q "region 180: import task task-180-2 FINISHED" <<<"$out"; then
+  echo "PASS: an errored import dumps the task body and the retry succeeds"
+else
+  echo "FAIL: error retry + body dump (rc=$rc)"; echo "$out"; FAILED=1
 fi
 
 # Test 6: region 180 FINISHED, region 68 ERROR -> failures aggregate across
@@ -315,7 +377,7 @@ if [ "$rc" -ne 0 ] \
    && grep -q "could not read visibility of image img-1 after 2 attempts" <<<"$out" \
    && grep -q "treat it as exposed" <<<"$out" \
    && grep -q "visibility of image img-1 lookup failed (attempt 1/2)" <<<"$out" \
-   && grep -q "1 gcore region import(s) failed" <<<"$out"; then
+   && grep -q "left 1 of 1 region(s) without lantern-box-0.0.0" <<<"$out"; then
   echo "PASS: unverifiable visibility fails the publish after bounded retries"
 else
   echo "FAIL: unverifiable visibility fails the publish (rc=$rc)"; echo "$out"; FAILED=1
@@ -347,15 +409,15 @@ out=$(PATH="$dir:$PATH" FAKE_CURL_NO_IMAGE_ID=1 \
 if [ "$rc" -ne 0 ] \
    && grep -q "could not resolve the imported image ID from task task-abc after 2 attempts" <<<"$out" \
    && grep -q "lantern-box-0.0.0" <<<"$out" \
-   && grep -q "1 gcore region import(s) failed" <<<"$out"; then
+   && grep -q "left 1 of 1 region(s) without lantern-box-0.0.0" <<<"$out"; then
   echo "PASS: an unresolvable image ID fails the publish"
 else
   echo "FAIL: an unresolvable image ID fails the publish (rc=$rc)"; echo "$out"; FAILED=1
 fi
 
-# Test 11: every import is issued BEFORE polling starts, and the wait costs one sleep per
-# round, not per region per round — the property making wall-clock the slowest region
-# instead of the sum. Draining one at a time would cost 6 sleeps here.
+# Test 11: while regions fit inside MAX_INFLIGHT, every import is still issued before
+# polling starts and the wait costs one sleep per ROUND, not per region per round.
+# IMPORT_ATTEMPTS=1 keeps the sleep/timeout counts about concurrency, not retries.
 dir=$(make_fake_curl); TMP_DIRS+=("$dir")
 sleeplog="$dir/sleeps"
 printf '#!/usr/bin/env bash\necho s >> "%s"\n' "$sleeplog" > "$dir/fakesleep"
@@ -364,17 +426,43 @@ chmod +x "$dir/fakesleep"
 out=$(PATH="$dir:$PATH" FAKE_CURL_MODE=always_running SLEEP="$dir/fakesleep" \
   GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
   GCORE_REGIONS="180,68,45" POLL_ATTEMPTS=2 POLL_INTERVAL_SECS=0 IMPORT_STAGGER_SECS=0 \
+  MAX_INFLIGHT=6 IMPORT_ATTEMPTS=1 \
   bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
 sleeps=$(grep -c . "$sleeplog" 2>/dev/null || echo 0)
 # sed rather than head, which would SIGPIPE the grep feeding it under pipefail.
 last_import=$(grep -n '==> Importing' <<<"$out" | sed -n '$p' | cut -d: -f1)
 first_poll=$(grep -n 'state=RUNNING' <<<"$out" | sed -n '1p' | cut -d: -f1)
-timeouts=$(grep -c 'did not finish after 2 attempts' <<<"$out")
+timeouts=$(grep -c '::error::.*did not finish after 2 polls' <<<"$out")
 if [ "$rc" -ne 0 ] && [ "$timeouts" -eq 3 ] && [ "$sleeps" -le 2 ] \
    && [ -n "$last_import" ] && [ -n "$first_poll" ] && [ "$last_import" -lt "$first_poll" ]; then
-  echo "PASS: imports all start before polling, ${sleeps} sleep(s) for 3 regions x 2 attempts"
+  echo "PASS: imports within the slot limit all start before polling, ${sleeps} sleep(s)"
 else
   echo "FAIL: concurrent import/poll (rc=$rc timeouts=$timeouts sleeps=$sleeps import@$last_import poll@$first_poll)"
+  echo "$out"; FAILED=1
+fi
+
+# Test 11b: THE regression test for the reaped-task failure. More regions than slots must
+# never put more than MAX_INFLIGHT tasks in flight, and the overflow regions must not be
+# POSTed until a slot frees — creating a task gcore cannot start within 10min is exactly
+# what killed both failed builds.
+dir=$(make_fake_curl); TMP_DIRS+=("$dir")
+out=$(PATH="$dir:$PATH" \
+  GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
+  GCORE_REGIONS="180,68,45,22,11" POLL_INTERVAL_SECS=0 IMPORT_STAGGER_SECS=0 \
+  MAX_INFLIGHT=2 \
+  bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
+# Every import line reports "<n>/<max> in flight"; n must never exceed the cap.
+over=$(grep -oE '[0-9]+/2 in flight' <<<"$out" | cut -d/ -f1 | awk '$1>2' | grep -c . || true)
+imports=$(grep -c '==> Importing' <<<"$out")
+# With 2 slots and 5 regions the 3rd import can only follow a completed poll.
+third_import=$(grep -n '==> Importing' <<<"$out" | sed -n '3p' | cut -d: -f1)
+first_done=$(grep -n 'FINISHED' <<<"$out" | sed -n '1p' | cut -d: -f1)
+if [ "$rc" -eq 0 ] && [ "$imports" -eq 5 ] && [ "$over" -eq 0 ] \
+   && [ -n "$third_import" ] && [ -n "$first_done" ] && [ "$first_done" -lt "$third_import" ] \
+   && grep -q "landed in 5/5 region(s)" <<<"$out"; then
+  echo "PASS: MAX_INFLIGHT caps in-flight imports and overflow waits for a slot"
+else
+  echo "FAIL: bounded concurrency (rc=$rc imports=$imports over=$over third@$third_import done@$first_done)"
   echo "$out"; FAILED=1
 fi
 
@@ -389,7 +477,9 @@ if [ "$rc" -ne 0 ] \
    && grep -q "region 180: import task task-180 FINISHED" <<<"$out" \
    && grep -q "region 45: import task task-45 FINISHED" <<<"$out" \
    && grep -q "region 68: import task task-68 state ERROR" <<<"$out" \
-   && grep -q "1 gcore region import(s) failed" <<<"$out"; then
+   && grep -q "landed in 2/3 region(s): 180 45" <<<"$out" \
+   && grep -q "MISSING the image in 1 region(s): 68" <<<"$out" \
+   && grep -q "left 1 of 3 region(s) without lantern-box-0.0.0: 68" <<<"$out"; then
   echo "PASS: one failing region does not block the others"
 else
   echo "FAIL: one failing region does not block the others (rc=$rc)"; echo "$out"; FAILED=1

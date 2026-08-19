@@ -186,9 +186,32 @@ provider's image store) gcore uses a **build → host → import** pipeline:
 3. `deploy/packer/gcore-publish.sh` imports that URL into each target region via
    `POST cloud/v1/downloadimage/{project}/{region}` (name `lantern-box-<version>`,
    `architecture=x86_64`, `os_type=linux`), polls each task to `FINISHED`, and checks
-   the created image's `visibility`. POSTs are spaced by `IMPORT_STAGGER_SECS`
-   (default 30) because gcore reaps a task not *started* within 10min of its own
-   `created_on` — submitting ~30 at once gave them one deadline it could not meet.
+   the created image's `visibility`.
+
+   **Imports run at most `MAX_INFLIGHT` (default 6) at a time, and that bound is the
+   point.** Gcore fails any task it has not *started* within 10min of that task's own
+   `created_on`, while its per-project scheduler runs only a handful of image imports
+   concurrently and each takes 8-16min (observed tail: 75min). Creating all ~30 imports
+   up front therefore guaranteed the tail of the queue was reaped before it ever ran:
+   in runs 32154320626 and 32158844992 *every* errored region came back with gcore's
+   `Task was not started within 10 minutes of creation. Marked as failed by scheduler
+   cleanup.` `IMPORT_STAGGER_SECS` (default 30) alone did not fix it, because a fixed
+   stagger still lets the queue grow without limit — it now just spaces the POSTs that
+   refill a freed slot.
+
+   A region is re-POSTed once (`IMPORT_ATTEMPTS`, default 2) if its import ERRORs or
+   outruns its polls; a retry reuses the already-hosted qcow2, so it costs one API call
+   and no re-upload. `POLL_ATTEMPTS` (default 360) is **per region per attempt**, not a
+   budget shared across regions, so one slow region cannot spend what the others still
+   need. On ERROR the whole gcore task body is dumped to the log rather than a field
+   this script picked in advance — that reaper message was invisible for two builds
+   precisely because only `state` was read.
+
+   The publish ends with a summary naming which regions received the image and which
+   did not, and fails the job when any region is missing. Landing in 27 of 29 regions
+   is a different event from landing nowhere, and the old all-or-nothing
+   `N region import(s) failed` hid the difference from whoever had to judge whether
+   production was affected.
 
 **Image visibility** is read-only in gcore's API: neither
 `POST cloud/v1/downloadimage/...` nor `PATCH cloud/v1/images/...` accepts the

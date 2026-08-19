@@ -122,28 +122,39 @@ jobs:
           # in, since its provider fails outright where the image is missing. A dispatch
           # may narrow it for a scoped test; nothing else should.
           # 6 not added because luxembourg is a "special" region
-          default_regions="196,184,180,176,164,152,148,140,136,128,124,116,108,104,100,92,88,84,80,76,68,64,50,46,34,30,26,18,14"
+          #
+          # 18 and 68 are deliberately absent: lantern-cloud has ZERO routes with
+          # provider_region_id 18 or 68, so importing there buys nothing and each import
+          # occupies one of the few concurrent slots gcore grants the project (see
+          # MAX_INFLIGHT in deploy/packer/gcore-publish.sh). They are NOT excluded for
+          # being broken — both failed runs 32154320626/32158844992 reaped them with the
+          # same generic "not started within 10 minutes" scheduler message that also hit
+          # 30/64/76, and both regions do hold a healthy lantern-box image today. Add
+          # them back if we ever route there.
+          default_regions="196,184,180,176,164,152,148,140,136,128,124,116,108,104,100,92,88,84,80,76,64,50,46,34,30,26,14"
           regions="${INPUT_REGIONS:-$default_regions}"
           echo "regions=$regions" >> "$GITHUB_OUTPUT"
           echo "gcore regions: $regions"
           # Budgeted here because GitHub expressions have no arithmetic, so
-          # timeout-minutes cannot scale with the region count. The poll window is
-          # SHARED, not per-region: 55min build/upload/teardown + 35min for
-          # POLL_ATTEMPTS(120) x POLL_INTERVAL_SECS(15) and visibility/delete polling
-          # + 3/region for the staggered POSTs and checks. Keep in step with
-          # gcore-publish.sh's poll defaults. The real ceiling on many regions is
-          # POLL_ATTEMPTS, not this timeout.
+          # timeout-minutes cannot scale with the region count. Imports now run at most
+          # MAX_INFLIGHT(6) at a time, so wall-clock is per WAVE of 6 regions rather
+          # than one shared poll window: 55min build/upload/teardown + 35min per wave
+          # (observed gcore import time is 8-16min typical and has reached 75min) +
+          # 1/region for the staggered POSTs. Keep MAX_INFLIGHT here in step with
+          # gcore-publish.sh. This is a ceiling, not the expected runtime.
           count=$(echo "$regions" | tr ',' '\n' | grep -c '[^[:space:]]' || true)
           # Empty or 0 falls back to one region, never a nonsensical timeout.
           [ "${count:-0}" -gt 0 ] 2>/dev/null || count=1
-          timeout=$((55 + 35 + count * 3))
+          max_inflight=6
+          waves=$(( (count + max_inflight - 1) / max_inflight ))
+          timeout=$((55 + waves * 35 + count))
           # GitHub caps hosted-runner jobs at 360min.
           if [ "$timeout" -gt 350 ]; then
             timeout=350
-            echo "::warning::gcore build timeout capped at 350min for ${count} regions — raise POLL_ATTEMPTS or split the region list across runs rather than growing this further"
+            echo "::warning::gcore build timeout capped at 350min for ${count} regions — split the region list across runs, or raise MAX_INFLIGHT if gcore will actually schedule more imports at once, rather than growing this further"
           fi
           echo "timeout=$timeout" >> "$GITHUB_OUTPUT"
-          echo "gcore build timeout: ${timeout}min (${count} region(s))"
+          echo "gcore build timeout: ${timeout}min (${count} region(s), ${waves} wave(s) of ${max_inflight})"
 
   # Prune old images before building (avoids provider quota limits)
   prune:
