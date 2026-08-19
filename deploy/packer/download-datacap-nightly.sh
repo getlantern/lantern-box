@@ -6,12 +6,24 @@ if [[ $# -ne 1 ]]; then
   exit 2
 fi
 
+require_command() {
+  local command="$1"
+  local install_hint="$2"
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "missing required command '$command'; $install_hint" >&2
+    exit 1
+  fi
+}
+
+require_command gh "install GitHub CLI: https://cli.github.com/"
+require_command dpkg-deb "install the dpkg package (for example: sudo apt-get install dpkg)"
+
 readonly output_directory="$1"
 readonly repository="getlantern/lantern-cloud"
 readonly package_directory="$(mktemp -d)"
 trap 'rm -rf "$package_directory"' EXIT
 
-tag="$(gh release list --repo "$repository" --limit 50 --json tagName,isDraft \
+tag="$(gh release list --repo "$repository" --limit 1000 --json tagName,isDraft \
   --jq 'map(select(.isDraft == false and (.tagName | startswith("datacap-nightly-"))))[0].tagName // ""')"
 if [[ -z "$tag" ]]; then
   echo "no published datacap-nightly-* release found in $repository" >&2
