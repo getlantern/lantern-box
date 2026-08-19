@@ -1,0 +1,90 @@
+name: Release Datacap Nightly
+
+on:
+  repository_dispatch:
+    types: [datacap-nightly]
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full lantern-cloud commit SHA to build
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: datacap-nightly-${{ github.event.client_payload.source_sha || inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate source revision
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      short_sha: ${{ steps.source.outputs.short_sha }}
+    steps:
+      - id: source
+        name: Validate lantern-cloud commit SHA
+        env:
+          SOURCE_SHA: ${{ github.event.client_payload.source_sha || inputs.source_sha }}
+        run: |
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::source_sha must be a full lowercase commit SHA"
+            exit 1
+          fi
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SOURCE_SHA:0:8}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build datacap (${{ matrix.arch }})
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Check out lantern-cloud source
+        uses: actions/checkout@v6
+        with:
+          repository: getlantern/lantern-cloud
+          ref: ${{ needs.validate.outputs.source_sha }}
+          token: ${{ secrets.CI_PRIVATE_REPOS_GH_TOKEN }}
+          path: source
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: source/go.mod
+          cache-dependency-path: source/go.sum
+      - name: Install arm64 cross compiler
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      - name: Build Debian package
+        working-directory: source
+        run: bash .github/scripts/build-datacap-deb "${{ matrix.arch }}" "${{ needs.validate.outputs.short_sha }}" ../dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: datacap-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    name: Publish immutable nightly
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: datacap-*
+          merge-multiple: true
+          path: dist
+      - name: Create GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash deploy/packer/release-datacap-nightly.sh "${{ needs.validate.outputs.source_sha }}" dist

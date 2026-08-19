@@ -327,7 +327,7 @@ jobs:
 
       - name: Download and extract datacap packages
         env:
-          GH_TOKEN: ${{ secrets.CI_PRIVATE_REPOS_GH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: bash deploy/packer/download-datacap-nightly.sh /tmp
 
       - name: Upload datacap binaries

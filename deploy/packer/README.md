@@ -57,7 +57,7 @@ packer build \
 ### Datacap fallback
 
 CI downloads the newest immutable `datacap-nightly-*` Debian packages from
-`getlantern/lantern-cloud`, extracts their binaries, and bakes them into the
+the public `getlantern/lantern-box` release feed, extracts their binaries, and bakes them into the
 image as a first-boot fallback. It does not compile lantern-cloud. The active
 version is selected and updated independently by lantern-cloud's cloud-init and
 SSH hotswap workers, so a datacap release does not trigger a Packer rebuild.

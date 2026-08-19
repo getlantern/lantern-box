@@ -19,7 +19,7 @@ require_command gh "install GitHub CLI: https://cli.github.com/"
 require_command dpkg-deb "install the dpkg package (for example: sudo apt-get install dpkg)"
 
 readonly output_directory="$1"
-readonly repository="getlantern/lantern-cloud"
+readonly repository="getlantern/lantern-box"
 readonly package_directory="$(mktemp -d)"
 trap 'rm -rf "$package_directory"' EXIT
 
