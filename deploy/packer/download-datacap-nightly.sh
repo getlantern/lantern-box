@@ -20,7 +20,8 @@ require_command dpkg-deb "install the dpkg package (for example: sudo apt-get in
 
 readonly output_directory="$1"
 readonly repository="getlantern/lantern-box"
-readonly package_directory="$(mktemp -d)"
+package_directory="$(mktemp -d)"
+readonly package_directory
 trap 'rm -rf "$package_directory"' EXIT
 
 tag="$(gh release list --repo "$repository" --limit 1000 --json tagName,isDraft \

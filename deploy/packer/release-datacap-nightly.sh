@@ -8,8 +8,7 @@ fi
 
 readonly source_sha="$1"
 readonly asset_directory="$2"
-readonly short_sha="${source_sha:0:8}"
-readonly tag="datacap-nightly-${short_sha}"
+readonly tag="datacap-nightly-${source_sha}"
 
 if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
   echo "invalid source commit SHA: $source_sha" >&2
@@ -22,6 +21,6 @@ if gh release view "$tag" >/dev/null 2>&1; then
 fi
 
 gh release create "$tag" "$asset_directory"/*.deb \
-  --title "Datacap nightly ${short_sha}" \
+  --title "Datacap nightly ${source_sha}" \
   --notes "Immutable datacap VPS build from https://github.com/getlantern/lantern-cloud/commit/${source_sha}." \
   --prerelease
