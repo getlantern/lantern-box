@@ -273,20 +273,33 @@ jobs:
             fi
             while IFS=$'\t' read -r created id name vis; do
               echo "Deleting ${name} (${id}, created ${created}, visibility ${vis}) in region ${region}..."
-              if ! http_code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$AUTH" \
+              # Body kept, not sent to /dev/null: an unexpected status is undiagnosable
+              # without gcore's reason, which is how a 409 read as a mystery failure.
+              if ! resp=$(curl -sS -w $'\n%{http_code}' -X DELETE -H "$AUTH" \
                 "${API}/images/${GCORE_PROJECT_ID}/${region}/${id}"); then
                 echo "::error::Failed to reach gcore to delete ${name} (${id}) in region ${region}"
                 failures=$((failures + 1))
                 continue
               fi
+              http_code="${resp##*$'\n'}"
+              body="${resp%$'\n'*}"
               if [ "$http_code" = "404" ]; then
                 echo "  Already gone (404), skipping."
               elif [ "$http_code" = "403" ]; then
                 # The unfiltered pass can surface another project's public image that
                 # matches the prefix. Not ours to delete, not a failure.
                 echo "  Not ours to delete (403), skipping."
+              elif [ "$http_code" = "409" ]; then
+                # Still referenced by a live volume, so gcore refuses — and it is right
+                # to. These are the images the running VPS boxes booted from; the whole
+                # point of keeping them is that deleting one is destructive. An image
+                # becomes prunable on its own once those boxes are replaced, so this is a
+                # normal steady state for the oldest kept version, not a fault. Failing
+                # the job here blocked every image build (run 32238646926) while the
+                # correct action was to leave the image alone.
+                echo "  ::notice::Still in use by a live volume (409), skipping — it will prune once those boxes are replaced."
               elif [ "$http_code" -ge 400 ]; then
-                echo "::error::Failed to delete gcore image ${name} (${id}) in region ${region}: HTTP ${http_code}"
+                echo "::error::Failed to delete gcore image ${name} (${id}) in region ${region}: HTTP ${http_code}: ${body}"
                 failures=$((failures + 1))
               fi
             done < <(echo "$images" | tail -n +$((KEEP + 1)))
