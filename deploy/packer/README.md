@@ -259,26 +259,33 @@ window were ever caught; a per-run value is worthless once the job ends. Keep an
 replacement hex or alphanumeric: it is interpolated into the cloud-init YAML and
 into `shutdown_command`'s single-quoted shell string.
 
-**Imports run concurrently.** There is one staged object and one URL, and each region's
-importer fetches it independently, so the transfers were never serial — only the waiting
-was. `gcore-publish.sh` starts every region's import first, then polls all outstanding
-tasks together, one sleep per round rather than per region. Wall-clock is the slowest
-single region instead of the sum, which also shortens the window the qcow2 spends
-publicly readable. A region whose import is rejected is counted as a failure without
+**Imports run concurrently, but bounded.** There is one staged object and one URL, and
+each region's importer fetches it independently, so the transfers were never serial —
+only the waiting was. `gcore-publish.sh` keeps at most `MAX_INFLIGHT` imports
+outstanding, POSTing a region's import only once a slot frees, then polls every
+outstanding task together, one sleep per round rather than per region. The bound is not
+a throughput tuning knob: it exists because gcore reaps a task it has not started within
+10min of that task's `created_on` (see step 3 above). A region whose import is rejected,
+errors, or outruns its polls is retried once and otherwise recorded as missing, without
 holding up the others.
 
-The build job's timeout is budgeted in the `prepare` job (55min fixed + a 35min shared
-poll window + 3min per region, capped at 350) rather than in `timeout-minutes`, which
-cannot do arithmetic. Adding regions therefore needs no timeout edit and costs little
-wall-clock. The per-region term is not the poll window — it covers the sequential import
-POSTs and visibility checks plus the fact that every region pulls the same object from one
-bucket at once, so shared egress makes each import slower than a solo one.
+Slots behave as a sliding window rather than lockstep waves — a slow region holds one
+slot while the others keep cycling.
 
-With a long region list the binding constraint is **not** this timeout but `POLL_ATTEMPTS`
-(120 x 15s = 30min per task): if shared bucket egress pushes a single import past that,
-its poll gives up however long the job is allowed to run. That is the knob to raise
-first, and getting killed mid-import is worth avoiding since it leaves orphaned gcore
-tasks.
+The build job's timeout is budgeted in the `prepare` job rather than in
+`timeout-minutes`, which cannot do arithmetic. It is **derived from the publisher's own
+knobs**, so the two must be kept in step: 55min fixed for build/upload/teardown, plus a
+publish allowance of whichever is larger of one region's worst case
+(`IMPORT_ATTEMPTS x POLL_ATTEMPTS x POLL_INTERVAL_SECS`, 180min at the defaults) and the
+aggregate (one wave-equivalent per `MAX_INFLIGHT` regions at 35min each), plus 1min per
+region for the staggered POSTs and visibility checks, capped at 350. Adding regions
+therefore needs no timeout edit.
+
+Budgeting it this way rather than under-budgeting matters because a job killed mid-publish
+loses the summary naming which regions actually landed — the output an operator needs
+most — and leaves orphaned gcore tasks behind. If the cap is ever hit, split the region
+list across runs, or raise `MAX_INFLIGHT` if gcore will genuinely schedule more imports
+at once.
 
 Prune lists each region **twice** — `?private=true` plus unfiltered — and unions the
 results by image ID, because a `shared` or `public` image never appears in the
