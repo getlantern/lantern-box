@@ -1073,7 +1073,7 @@ build {
   ]
 
   # Ensure datacap placeholder files exist so the file provisioner never fails.
-  # In CI, the real binaries are downloaded from the build-datacap job artifact.
+  # In CI, the real binaries come from the fetch-datacap nightly artifact.
   # For local/OSS builds, these will be empty (and skipped at install time).
   provisioner "shell-local" {
     inline = [
