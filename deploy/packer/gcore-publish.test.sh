@@ -415,6 +415,39 @@ else
   echo "FAIL: an unresolvable image ID fails the publish (rc=$rc)"; echo "$out"; FAILED=1
 fi
 
+# Test 10d: the scheduler knobs are loop bounds, and a bad one used to hang the publish
+# until the job timeout rather than fail — MAX_INFLIGHT=0 POSTs nothing while every region
+# stays QUEUED. Each must be rejected up front, and the valid-but-zero sleeps must not be.
+for bad in "MAX_INFLIGHT=0" "MAX_INFLIGHT=abc" "IMPORT_ATTEMPTS=0" "POLL_ATTEMPTS=0" \
+           "VISIBILITY_ATTEMPTS=0" "DELETE_POLL_ATTEMPTS=0" "POLL_INTERVAL_SECS=-1"; do
+  dir=$(make_fake_curl); TMP_DIRS+=("$dir")
+  name="${bad%%=*}"
+  out=$(PATH="$dir:$PATH" \
+    GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
+    GCORE_REGIONS="180" POLL_INTERVAL_SECS=0 IMPORT_STAGGER_SECS=0 \
+    env "$bad" timeout 10 bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
+  if [ "$rc" -eq 1 ] && grep -q "::error::${name} must be" <<<"$out"; then
+    continue
+  fi
+  echo "FAIL: ${bad} should fail fast (rc=$rc)"; echo "$out"; FAILED=1
+  bad_knob_failed=1
+done
+if [ -z "${bad_knob_failed:-}" ]; then
+  echo "PASS: invalid scheduler knobs fail fast instead of hanging"
+fi
+
+# Test 10e: 0 is legitimate for the two sleep lengths, and the tests themselves rely on it.
+dir=$(make_fake_curl); TMP_DIRS+=("$dir")
+out=$(PATH="$dir:$PATH" \
+  GCORE_API_KEY=k GCORE_PROJECT_ID=1 VERSION=0.0.0 IMAGE_URL=http://example/x.qcow2 \
+  GCORE_REGIONS="180" POLL_INTERVAL_SECS=0 IMPORT_STAGGER_SECS=0 \
+  bash "$PUBLISH" 2>&1) && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && grep -q "landed in 1/1 region(s): 180" <<<"$out"; then
+  echo "PASS: zero-length sleeps are accepted"
+else
+  echo "FAIL: zero-length sleeps rejected (rc=$rc)"; echo "$out"; FAILED=1
+fi
+
 # Test 11: while regions fit inside MAX_INFLIGHT, every import is still issued before
 # polling starts and the wait costs one sleep per ROUND, not per region per round.
 # IMPORT_ATTEMPTS=1 keeps the sleep/timeout counts about concurrency, not retries.

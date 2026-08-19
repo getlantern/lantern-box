@@ -51,6 +51,34 @@ IMPORT_STAGGER_SECS="${IMPORT_STAGGER_SECS:-30}"
 AUTH="Authorization: APIKey ${GCORE_API_KEY}"
 IMAGE_NAME="lantern-box-${VERSION}"
 
+# require_int NAME VALUE MIN -> fail unless VALUE is an integer >= MIN. These knobs are
+# loop bounds, and a bad one does not degrade gracefully: MAX_INFLIGHT=0 (or a typo that
+# is not a number at all) makes the fill loop POST nothing while regions stay QUEUED
+# forever, so the publish hangs until the job timeout instead of failing. Validated once,
+# here, rather than defended at each comparison.
+require_int() {
+  local name="$1" value="$2" min="$3"
+  case "$value" in
+    '' | *[!0-9]*)
+      echo "::error::${name} must be a non-negative integer, got '${value}'" >&2
+      exit 1 ;;
+  esac
+  if [ "$value" -lt "$min" ]; then
+    echo "::error::${name} must be >= ${min}, got '${value}'" >&2
+    exit 1
+  fi
+}
+
+# Loop bounds that must allow at least one pass.
+require_int POLL_ATTEMPTS "$POLL_ATTEMPTS" 1
+require_int MAX_INFLIGHT "$MAX_INFLIGHT" 1
+require_int IMPORT_ATTEMPTS "$IMPORT_ATTEMPTS" 1
+require_int DELETE_POLL_ATTEMPTS "$DELETE_POLL_ATTEMPTS" 1
+require_int VISIBILITY_ATTEMPTS "$VISIBILITY_ATTEMPTS" 1
+# Sleep lengths, where 0 is meaningful (tests disable waiting entirely).
+require_int POLL_INTERVAL_SECS "$POLL_INTERVAL_SECS" 0
+require_int IMPORT_STAGGER_SECS "$IMPORT_STAGGER_SECS" 0
+
 # import_region REGION -> prints the created task ID on stdout.
 import_region() {
   local region="$1" body resp http task
