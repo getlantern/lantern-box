@@ -15,6 +15,10 @@ type mockOutbound struct {
 	tag      string
 	typeName string
 	networks []string
+	// dial, when set, supersedes the mock expectation so each call gets
+	// its own conn; runProbe closes what it dials, so a shared one breaks
+	// on the second probe.
+	dial func() (net.Conn, error)
 }
 
 func (m *mockOutbound) Tag() string { return m.tag }
@@ -26,6 +30,9 @@ func (m *mockOutbound) Network() []string {
 }
 
 func (m *mockOutbound) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
+	if m.dial != nil {
+		return m.dial()
+	}
 	args := m.Called()
 	conn, _ := args.Get(0).(net.Conn)
 	return conn, args.Error(1)

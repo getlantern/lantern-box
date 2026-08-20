@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -1250,19 +1252,66 @@ func TestSetURLOverrides_ClearsPersistedEntryOnChange(t *testing.T) {
 }
 
 func TestExhaustionSignal_FiresOnFullLadderFailure(t *testing.T) {
-	s, obs := newTestMUR(t, "a", "b")
+	// seedPriorSuccess leaves lastSuccessDelayMs set so the cycle's own
+	// failures advance lastOutcomeAt past freshSince while a stale delay
+	// remains — the combination that previously let a fully-failing
+	// ladder report a winner and stay silent.
+	tests := []struct {
+		name             string
+		seedPriorSuccess bool
+	}{
+		{"no history", false},
+		{"prior success", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, obs := newTestMUR(t, "a", "b")
+			s.defaultURL = "http://probe.test/"
+			if tt.seedPriorSuccess {
+				recordSuccess(s, "a", 100)
+				recordSuccess(s, "b", 200)
+			}
+			obs["a"].On("DialContext").Return(nil, errors.New("dial denied"))
+			obs["b"].On("DialContext").Return(nil, errors.New("dial denied"))
+
+			sig := s.ExhaustionSignal()
+			s.runLadder("a")
+
+			select {
+			case _, ok := <-sig:
+				assert.True(t, ok, "exhaustion channel should deliver a value, not be closed")
+			case <-time.After(2 * time.Second):
+				require.FailNow(t, "exhaustion signal not delivered within timeout")
+			}
+		})
+	}
+}
+
+// Guards the opposite direction from the exhaustion tests: the winner gate
+// must not be so tight that a live member is missed, which would signal
+// exhaustion every cycle and drive a /config-new refetch each time.
+func TestRunLadder_StaysSilentWhenAMemberSucceeds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(srv.Close)
+
+	s, obs := newTestMUR(t, "dead", "live")
 	s.defaultURL = "http://probe.test/"
-	obs["a"].On("DialContext").Return(nil, errors.New("dial denied"))
-	obs["b"].On("DialContext").Return(nil, errors.New("dial denied"))
+	s.cfg.ladderTotalBudget = 10 * time.Second
+	recordSuccess(s, "dead", 100)
+	recordSuccess(s, "live", 200)
+
+	obs["dead"].On("DialContext").Return(nil, errors.New("dial denied"))
+	obs["live"].dial = func() (net.Conn, error) {
+		return net.Dial("tcp", srv.Listener.Addr().String())
+	}
 
 	sig := s.ExhaustionSignal()
-	s.runLadder("a")
+	s.runLadder("dead")
 
 	select {
-	case _, ok := <-sig:
-		assert.True(t, ok, "exhaustion channel should deliver a value, not be closed")
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "exhaustion signal not delivered within timeout")
+	case <-sig:
+		require.FailNow(t, "a cycle with a live member must not signal exhaustion")
+	default:
 	}
 }
 
