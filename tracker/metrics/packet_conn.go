@@ -16,6 +16,7 @@ type PacketConn struct {
 	tracker   *MetricsTracker
 	startTime time.Time
 	rxBytes   atomic.Int64
+	closed    atomic.Bool
 }
 
 // NewPacketConn creates a new PacketConn instance.
@@ -49,11 +50,13 @@ func (c *PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) er
 	return c.PacketConn.WritePacket(buffer, destination)
 }
 
-// Close overrides net.PacketConn's Close method to track connection duration.
+// Close mirrors Conn.Close: metrics once, then forward the close.
 func (c *PacketConn) Close() error {
-	duration := time.Since(c.startTime).Milliseconds()
-	c.tracker.Leave(duration, c.attrs)
-	c.tracker.recordGoodput(c.rxBytes.Load(), duration, c.attrs)
+	if !c.closed.Swap(true) {
+		duration := time.Since(c.startTime).Milliseconds()
+		c.tracker.Leave(duration, c.attrs)
+		c.tracker.recordGoodput(c.rxBytes.Load(), duration, c.attrs)
+	}
 	return c.PacketConn.Close()
 }
 
