@@ -1301,8 +1301,9 @@ func TestRunLadder_StaysSilentWhenAMemberSucceeds(t *testing.T) {
 	recordSuccess(s, "live", 200)
 
 	obs["dead"].On("DialContext").Return(nil, errors.New("dial denied"))
-	obs["live"].dial = func() (net.Conn, error) {
-		return net.Dial("tcp", srv.Listener.Addr().String())
+	obs["live"].dial = func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Listener.Addr().String())
 	}
 
 	sig := s.ExhaustionSignal()
