@@ -318,31 +318,11 @@ jobs:
             exit 1
           fi
 
-  fetch-datacap:
-    name: Fetch latest datacap nightly
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download and extract datacap packages
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash deploy/packer/download-datacap-nightly.sh /tmp
-
-      - name: Upload datacap binaries
-        uses: actions/upload-artifact@v5
-        with:
-          name: datacap-binaries
-          path: |
-            /tmp/datacap-amd64
-            /tmp/datacap-arm64
-
   # Build each provider in parallel
   build:
     name: Build ${{ matrix.builder }}
     runs-on: ubuntu-latest
-    needs: [prepare, prune, fetch-datacap]
+    needs: [prepare, prune]
     permissions:
       contents: read
     strategy:
@@ -365,12 +345,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Download datacap binaries
-        uses: actions/download-artifact@v5
-        with:
-          name: datacap-binaries
-          path: /tmp
 
       - name: Setup Packer
         uses: hashicorp/setup-packer@v3

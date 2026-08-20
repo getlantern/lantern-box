@@ -54,19 +54,6 @@ packer build \
   .
 ```
 
-### Datacap fallback
-
-CI downloads the newest immutable `datacap-nightly-<full-source-sha>` Debian packages from
-the public `getlantern/lantern-box` release feed, extracts their binaries, and bakes them into the
-image as a first-boot fallback. It does not compile lantern-cloud. The active
-version is selected and updated independently by lantern-cloud's cloud-init and
-SSH hotswap workers, so a datacap release does not trigger a Packer rebuild.
-
-For local builds, empty placeholders are created automatically so the build
-succeeds without datacap. To include it locally, run
-`bash deploy/packer/download-datacap-nightly.sh /tmp` or place pre-built binaries at
-`/tmp/datacap-amd64` and `/tmp/datacap-arm64` before `packer build`.
-
 ## Environment variables
 
 | Variable                      | Description                                                                |

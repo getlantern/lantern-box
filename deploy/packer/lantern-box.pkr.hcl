@@ -1076,45 +1076,6 @@ build {
     "source.qemu.lantern-box-gcore",
   ]
 
-  # Ensure datacap placeholder files exist so the file provisioner never fails.
-  # In CI, the real binaries come from the fetch-datacap nightly artifact.
-  # For local/OSS builds, these will be empty (and skipped at install time).
-  provisioner "shell-local" {
-    inline = [
-      "touch /tmp/datacap-amd64 /tmp/datacap-arm64",
-    ]
-  }
-
-  # Upload the datacap binary for this arch.
-  # OCI sources target arm64; Linode/Alicloud target amd64.
-  provisioner "file" {
-    only        = ["linode.lantern-box", "alicloud-ecs.lantern-box", "qemu.lantern-box-gcore"]
-    source      = "/tmp/datacap-amd64"
-    destination = "/tmp/datacap"
-  }
-
-  provisioner "file" {
-    except      = ["linode.lantern-box", "alicloud-ecs.lantern-box", "qemu.lantern-box-gcore"]
-    source      = "/tmp/datacap-arm64"
-    destination = "/tmp/datacap"
-  }
-
-  provisioner "shell" {
-    execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
-    inline = [
-      <<-EOF
-      if [ -s /tmp/datacap ]; then
-        install -o root -g root -m 755 /tmp/datacap /usr/local/bin/datacap
-        rm -f /tmp/datacap
-        echo "datacap installed to /usr/local/bin/datacap"
-      else
-        rm -f /tmp/datacap
-        echo "datacap binary not staged, skipping"
-      fi
-      EOF
-    ]
-  }
-
   # Upload OTel Collector config before the shell provisioner copies it into place.
   provisioner "file" {
     source      = "${path.root}/otelcol.yaml"
