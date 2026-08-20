@@ -186,12 +186,16 @@ jobs:
     steps:
       - name: Prune old Linode images
         if: contains(needs.prepare.outputs.matrix, 'linode')
+        # Explicit `shell: bash` for `-eo pipefail`: under the default shell a failed
+        # list curl let jq report success, and the step printed "Nothing to prune"
+        # instead of admitting it could not read the list.
+        shell: bash
         env:
           LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
         run: |
           KEEP=3
           echo "Fetching Linode custom images..."
-          images=$(curl -sS -f -H "Authorization: Bearer $LINODE_TOKEN" \
+          images=$(curl -sS -f --retry 3 --retry-connrefused -H "Authorization: Bearer $LINODE_TOKEN" \
             "https://api.linode.com/v4/images?page_size=500" \
             | jq -r '.data[] | select(.is_public == false and (.label | startswith("lantern-box-"))) | "\(.created)\t\(.id)\t\(.label)"' \
             | sort -r)
@@ -201,7 +205,10 @@ jobs:
             echo "Nothing to prune."
           else
             failures=0
-            echo "$images" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id label; do
+            # Process substitution, not a pipe into `while`: the piped loop ran in a
+            # subshell, so its `failures` increments were lost and delete failures
+            # never failed the step.
+            while IFS=$'\t' read -r created id label; do
               echo "Deleting $label ($id, created $created)..."
               http_code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $LINODE_TOKEN" \
                 "https://api.linode.com/v4/images/$id")
@@ -211,7 +218,7 @@ jobs:
                 echo "::error::Failed to delete Linode image $label ($id): HTTP $http_code"
                 failures=$((failures + 1))
               fi
-            done
+            done < <(echo "$images" | tail -n +$((KEEP + 1)))
             if [ "$failures" -gt 0 ]; then
               echo "::error::$failures image(s) failed to delete"
               exit 1
@@ -240,13 +247,13 @@ jobs:
             # Two passes, unioned by ID. The unfiltered list is the only place a
             # "shared" or "public" import shows up; the private pass is kept because
             # gcore's unfiltered default is not documented enough to bet prune on.
-            if ! priv=$(curl -sS -f -H "$AUTH" \
+            if ! priv=$(curl -sS -f --retry 3 --retry-connrefused -H "$AUTH" \
               "${API}/images/${GCORE_PROJECT_ID}/${region}?private=true"); then
               echo "::error::Failed to list gcore private images in region ${region}"
               failures=$((failures + 1))
               continue
             fi
-            if ! all=$(curl -sS -f -H "$AUTH" \
+            if ! all=$(curl -sS -f --retry 3 --retry-connrefused -H "$AUTH" \
               "${API}/images/${GCORE_PROJECT_ID}/${region}"); then
               echo "::error::Failed to list gcore images in region ${region}"
               failures=$((failures + 1))
@@ -323,6 +330,11 @@ jobs:
     name: Build ${{ matrix.builder }}
     runs-on: ubuntu-latest
     needs: [prepare, prune]
+    # Prune is housekeeping against provider quota, not a precondition: a transient
+    # list failure there once blocked every image build. Build regardless — if quota
+    # really is full, the provider rejects the build with its own, clearer error —
+    # while the failed prune still marks the run red.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     permissions:
       contents: read
     strategy:
@@ -355,7 +367,16 @@ jobs:
 
       - name: Init Packer plugins
         working-directory: deploy/packer
-        run: packer init .
+        # Retried: plugin downloads hit the GitHub release CDN and a transient fetch
+        # error here throws away the whole (long) build for nothing.
+        run: |
+          for attempt in 1 2 3; do
+            packer init . && exit 0
+            echo "::warning::packer init failed (attempt ${attempt}/3); retrying in 10s"
+            sleep 10
+          done
+          echo "::error::packer init failed after 3 attempts"
+          exit 1
 
       - name: Map builder to packer -only flag
         id: only
@@ -592,9 +613,11 @@ jobs:
       - name: Install QEMU deps and enable KVM (gcore)
         if: matrix.builder == 'gcore'
         run: |
-          sudo apt-get update
+          # Acquire::Retries covers the fetch-level flakes (mirror hiccups) that
+          # otherwise kill the gcore build before it starts.
+          sudo apt-get -o Acquire::Retries=3 update
           # xorriso builds the NoCloud cidata seed ISO and isn't preinstalled.
-          sudo apt-get install -y -q qemu-system-x86 qemu-utils xorriso
+          sudo apt-get -o Acquire::Retries=3 install -y -q qemu-system-x86 qemu-utils xorriso
           if [ ! -e /dev/kvm ]; then
             echo "::error::/dev/kvm not available on this runner — QEMU build requires KVM"
             exit 1
@@ -772,3 +795,56 @@ jobs:
         with:
           name: packer-manifest-${{ matrix.builder }}
           path: deploy/packer/manifest.json
+
+  # A red run in this repo is easy to miss — push-triggered failures only email the
+  # commit author, and getlantern/engineering#3838 documents 6 days of image builds
+  # failing with nobody noticing. This job makes the outcome durable: any failure
+  # opens (or comments on) a tracking issue, and the next green run closes it.
+  report:
+    name: Report result
+    runs-on: ubuntu-latest
+    needs: [prepare, prune, build]
+    if: ${{ !cancelled() }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Summarize and track failures in an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PREPARE: ${{ needs.prepare.result }}
+          PRUNE: ${{ needs.prune.result }}
+          BUILD: ${{ needs.build.result }}
+          TITLE: "Packer image builds are failing"
+        run: |
+          set -euo pipefail
+          {
+            echo "## Image build result"
+            echo "| job | result |"
+            echo "|---|---|"
+            echo "| prepare | $PREPARE |"
+            echo "| prune | $PRUNE |"
+            echo "| build | $BUILD |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          existing=$(gh issue list --repo "$REPO" --state open \
+            --search "in:title \"$TITLE\"" --json number,title \
+            --jq '[.[] | select(.title == env.TITLE)][0].number // empty')
+          if [ "$PREPARE" = "success" ] && [ "$PRUNE" = "success" ] && [ "$BUILD" = "success" ]; then
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --repo "$REPO" \
+                --comment "Image builds are green again: $RUN_URL"
+            fi
+            exit 0
+          fi
+          detail="[failed run]($RUN_URL) — prepare: \`$PREPARE\`, prune: \`$PRUNE\`, build: \`$BUILD\`. Per-builder detail is in the run's job list."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "Still failing: $detail"
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --body "$(printf '%s\n\n%s\n\n%s' \
+              "Automated report from build-images.yaml: $detail" \
+              "The fleet provisions VPS boxes from these images; a stale image surfaces only at provision time, so treat this as production-impacting (see getlantern/engineering#3838)." \
+              "This issue closes itself on the next green run.")"
+          fi
