@@ -98,7 +98,12 @@ otelcol_version="0.120.0"
 otelcol_deb="otelcol-contrib_${otelcol_version}_linux_${arch}.deb"
 otelcol_url="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${otelcol_version}/${otelcol_deb}"
 echo "    URL: ${otelcol_url}"
-curl -fsSL -o "/tmp/${otelcol_deb}" "${otelcol_url}"
+# Retried with a bounded connect timeout: from some provider regions the first
+# connection to github.com can hang for minutes and die with curl exit 28,
+# which threw away an otherwise-healthy image build (region me-riyadh-1, run
+# 32352757546). Same flags as the CA download below.
+curl -fsSL --retry 5 --connect-timeout 10 --max-time 300 \
+  -o "/tmp/${otelcol_deb}" "${otelcol_url}"
 apt-get "${APT_OPTS[@]}" install -y -q "/tmp/${otelcol_deb}"
 rm -f "/tmp/${otelcol_deb}"
 
@@ -184,9 +189,11 @@ echo "    lantern user present at $(id lantern)"
 
 echo "==> Installing Tailscale client (for Headscale VPN management)"
 # Add Tailscale apt repo — works on Ubuntu 24.04 (noble)
-curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | \
+curl -fsSL --retry 5 --connect-timeout 10 --max-time 60 \
+  https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | \
   tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | \
+curl -fsSL --retry 5 --connect-timeout 10 --max-time 60 \
+  https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | \
   tee /etc/apt/sources.list.d/tailscale.list
 apt-get "${APT_OPTS[@]}" update -q
 apt-get "${APT_OPTS[@]}" install -y -q tailscale
