@@ -54,9 +54,18 @@ packer build \
   .
 ```
 
-### Datacap (optional, closed-source)
+### Datacap fallback
 
-In CI, the `datacap` binary is built from `getlantern/lantern-cloud` and baked into the image. For local builds, empty placeholders are created automatically so the build succeeds without it. To include datacap locally, place the pre-built binaries at `/tmp/datacap-amd64` and `/tmp/datacap-arm64` before running `packer build`.
+CI downloads the newest immutable `datacap-nightly-<full-source-sha>` Debian packages from
+the public `getlantern/lantern-box` release feed, extracts their binaries, and bakes them into the
+image as a first-boot fallback. It does not compile lantern-cloud. The active
+version is selected and updated independently by lantern-cloud's cloud-init and
+SSH hotswap workers, so a datacap release does not trigger a Packer rebuild.
+
+For local builds, empty placeholders are created automatically so the build
+succeeds without datacap. To include it locally, run
+`bash deploy/packer/download-datacap-nightly.sh /tmp` or place pre-built binaries at
+`/tmp/datacap-amd64` and `/tmp/datacap-arm64` before `packer build`.
 
 ## Environment variables
 
@@ -186,9 +195,32 @@ provider's image store) gcore uses a **build → host → import** pipeline:
 3. `deploy/packer/gcore-publish.sh` imports that URL into each target region via
    `POST cloud/v1/downloadimage/{project}/{region}` (name `lantern-box-<version>`,
    `architecture=x86_64`, `os_type=linux`), polls each task to `FINISHED`, and checks
-   the created image's `visibility`. POSTs are spaced by `IMPORT_STAGGER_SECS`
-   (default 30) because gcore reaps a task not *started* within 10min of its own
-   `created_on` — submitting ~30 at once gave them one deadline it could not meet.
+   the created image's `visibility`.
+
+   **Imports run at most `MAX_INFLIGHT` (default 6) at a time, and that bound is the
+   point.** Gcore fails any task it has not *started* within 10min of that task's own
+   `created_on`, while its per-project scheduler runs only a handful of image imports
+   concurrently and each takes 8-16min (observed tail: 75min). Creating all ~30 imports
+   up front therefore guaranteed the tail of the queue was reaped before it ever ran:
+   in runs 32154320626 and 32158844992 *every* errored region came back with gcore's
+   `Task was not started within 10 minutes of creation. Marked as failed by scheduler
+   cleanup.` `IMPORT_STAGGER_SECS` (default 30) alone did not fix it, because a fixed
+   stagger still lets the queue grow without limit — it now just spaces the POSTs that
+   refill a freed slot.
+
+   A region is re-POSTed once (`IMPORT_ATTEMPTS`, default 2) if its import ERRORs or
+   outruns its polls; a retry reuses the already-hosted qcow2, so it costs one API call
+   and no re-upload. `POLL_ATTEMPTS` (default 360) is **per region per attempt**, not a
+   budget shared across regions, so one slow region cannot spend what the others still
+   need. On ERROR the whole gcore task body is dumped to the log rather than a field
+   this script picked in advance — that reaper message was invisible for two builds
+   precisely because only `state` was read.
+
+   The publish ends with a summary naming which regions received the image and which
+   did not, and fails the job when any region is missing. Landing in 27 of 29 regions
+   is a different event from landing nowhere, and the old all-or-nothing
+   `N region import(s) failed` hid the difference from whoever had to judge whether
+   production was affected.
 
 **Image visibility** is read-only in gcore's API: neither
 `POST cloud/v1/downloadimage/...` nor `PATCH cloud/v1/images/...` accepts the
@@ -236,26 +268,33 @@ window were ever caught; a per-run value is worthless once the job ends. Keep an
 replacement hex or alphanumeric: it is interpolated into the cloud-init YAML and
 into `shutdown_command`'s single-quoted shell string.
 
-**Imports run concurrently.** There is one staged object and one URL, and each region's
-importer fetches it independently, so the transfers were never serial — only the waiting
-was. `gcore-publish.sh` starts every region's import first, then polls all outstanding
-tasks together, one sleep per round rather than per region. Wall-clock is the slowest
-single region instead of the sum, which also shortens the window the qcow2 spends
-publicly readable. A region whose import is rejected is counted as a failure without
+**Imports run concurrently, but bounded.** There is one staged object and one URL, and
+each region's importer fetches it independently, so the transfers were never serial —
+only the waiting was. `gcore-publish.sh` keeps at most `MAX_INFLIGHT` imports
+outstanding, POSTing a region's import only once a slot frees, then polls every
+outstanding task together, one sleep per round rather than per region. The bound is not
+a throughput tuning knob: it exists because gcore reaps a task it has not started within
+10min of that task's `created_on` (see step 3 above). A region whose import is rejected,
+errors, or outruns its polls is retried once and otherwise recorded as missing, without
 holding up the others.
 
-The build job's timeout is budgeted in the `prepare` job (55min fixed + a 35min shared
-poll window + 3min per region, capped at 350) rather than in `timeout-minutes`, which
-cannot do arithmetic. Adding regions therefore needs no timeout edit and costs little
-wall-clock. The per-region term is not the poll window — it covers the sequential import
-POSTs and visibility checks plus the fact that every region pulls the same object from one
-bucket at once, so shared egress makes each import slower than a solo one.
+Slots behave as a sliding window rather than lockstep waves — a slow region holds one
+slot while the others keep cycling.
 
-With a long region list the binding constraint is **not** this timeout but `POLL_ATTEMPTS`
-(120 x 15s = 30min per task): if shared bucket egress pushes a single import past that,
-its poll gives up however long the job is allowed to run. That is the knob to raise
-first, and getting killed mid-import is worth avoiding since it leaves orphaned gcore
-tasks.
+The build job's timeout is budgeted in the `prepare` job rather than in
+`timeout-minutes`, which cannot do arithmetic. It is **derived from the publisher's own
+knobs**, so the two must be kept in step: 55min fixed for build/upload/teardown, plus a
+publish allowance of whichever is larger of one region's worst case
+(`IMPORT_ATTEMPTS x POLL_ATTEMPTS x POLL_INTERVAL_SECS`, 180min at the defaults) and the
+aggregate (one wave-equivalent per `MAX_INFLIGHT` regions at 35min each), plus 1min per
+region for the staggered POSTs and visibility checks, capped at 350. Adding regions
+therefore needs no timeout edit.
+
+Budgeting it this way rather than under-budgeting matters because a job killed mid-publish
+loses the summary naming which regions actually landed — the output an operator needs
+most — and leaves orphaned gcore tasks behind. If the cap is ever hit, split the region
+list across runs, or raise `MAX_INFLIGHT` if gcore will genuinely schedule more imports
+at once.
 
 Prune lists each region **twice** — `?private=true` plus unfiltered — and unions the
 results by image ID, because a `shared` or `public` image never appears in the

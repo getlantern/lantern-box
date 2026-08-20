@@ -44,6 +44,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       matrix: ${{ steps.matrix.outputs.matrix }}
       gcore_regions: ${{ steps.gcore.outputs.regions }}
+      gcore_prune_regions: ${{ steps.gcore.outputs.prune_regions }}
       gcore_timeout: ${{ steps.gcore.outputs.timeout }}
     steps:
       - name: Checkout (full history — needed to find the latest tag)
@@ -122,28 +123,59 @@ jobs:
           # in, since its provider fails outright where the image is missing. A dispatch
           # may narrow it for a scoped test; nothing else should.
           # 6 not added because luxembourg is a "special" region
-          default_regions="196,184,180,176,164,152,148,140,136,128,124,116,108,104,100,92,88,84,80,76,68,64,50,46,34,30,26,18,14"
+          #
+          # 18 and 68 are deliberately absent: lantern-cloud has ZERO routes with
+          # provider_region_id 18 or 68, so importing there buys nothing and each import
+          # occupies one of the few concurrent slots gcore grants the project (see
+          # MAX_INFLIGHT in deploy/packer/gcore-publish.sh). They are NOT excluded for
+          # being broken — both failed runs 32154320626/32158844992 reaped them with the
+          # same generic "not started within 10 minutes" scheduler message that also hit
+          # 30/64/76, and both regions do hold a healthy lantern-box image today. Add
+          # them back if we ever route there.
+          default_regions="196,184,180,176,164,152,148,140,136,128,124,116,108,104,100,92,88,84,80,76,64,50,46,34,30,26,14"
           regions="${INPUT_REGIONS:-$default_regions}"
           echo "regions=$regions" >> "$GITHUB_OUTPUT"
           echo "gcore regions: $regions"
+          # Prune covers a SUPERSET of the publish list: a region we stopped publishing to
+          # still holds images from when we did, and dropping it from both lists would
+          # strand those against the account's image quota with nothing left to collect
+          # them. Retired regions only ever shrink this list's work, since there is
+          # nothing new to find there.
+          retired_regions="18,68"
+          echo "prune_regions=${regions},${retired_regions}" >> "$GITHUB_OUTPUT"
+          echo "gcore prune regions: ${regions},${retired_regions}"
           # Budgeted here because GitHub expressions have no arithmetic, so
-          # timeout-minutes cannot scale with the region count. The poll window is
-          # SHARED, not per-region: 55min build/upload/teardown + 35min for
-          # POLL_ATTEMPTS(120) x POLL_INTERVAL_SECS(15) and visibility/delete polling
-          # + 3/region for the staggered POSTs and checks. Keep in step with
-          # gcore-publish.sh's poll defaults. The real ceiling on many regions is
-          # POLL_ATTEMPTS, not this timeout.
+          # timeout-minutes cannot scale with the region count. DERIVED from
+          # gcore-publish.sh's knobs, which must be kept in step with the values below —
+          # a job killed mid-publish loses the summary naming which regions actually
+          # landed, which is the output an operator needs most.
+          #
+          # Slots are a sliding window, not lockstep waves: a slow region holds one slot
+          # while the others keep cycling. So the publish needs whichever is larger of
+          #   - one region's own worst case: IMPORT_ATTEMPTS x POLL_ATTEMPTS x interval
+          #   - the aggregate: one wave-equivalent per MAX_INFLIGHT regions at 35min,
+          #     against observed import times of 8-16min typical and a 75min tail
+          # plus 1min/region for the staggered POSTs and visibility checks.
           count=$(echo "$regions" | tr ',' '\n' | grep -c '[^[:space:]]' || true)
           # Empty or 0 falls back to one region, never a nonsensical timeout.
           [ "${count:-0}" -gt 0 ] 2>/dev/null || count=1
-          timeout=$((55 + 35 + count * 3))
+          max_inflight=6
+          import_attempts=2
+          poll_attempts=360
+          poll_interval_secs=15
+          waves=$(( (count + max_inflight - 1) / max_inflight ))
+          per_region=$(( import_attempts * poll_attempts * poll_interval_secs / 60 ))
+          aggregate=$(( waves * 35 ))
+          publish=$aggregate
+          [ "$per_region" -gt "$publish" ] && publish=$per_region
+          timeout=$((55 + publish + count))
           # GitHub caps hosted-runner jobs at 360min.
           if [ "$timeout" -gt 350 ]; then
             timeout=350
-            echo "::warning::gcore build timeout capped at 350min for ${count} regions — raise POLL_ATTEMPTS or split the region list across runs rather than growing this further"
+            echo "::warning::gcore build timeout capped at 350min for ${count} regions — split the region list across runs, or raise MAX_INFLIGHT if gcore will actually schedule more imports at once, rather than growing this further"
           fi
           echo "timeout=$timeout" >> "$GITHUB_OUTPUT"
-          echo "gcore build timeout: ${timeout}min (${count} region(s))"
+          echo "gcore build timeout: ${timeout}min (${count} region(s), ${waves} wave(s) of ${max_inflight}; publish allowance ${publish}min = max(per-region ${per_region}, aggregate ${aggregate}))"
 
   # Prune old images before building (avoids provider quota limits)
   prune:
@@ -194,7 +226,7 @@ jobs:
         env:
           GCORE_API_KEY: ${{ secrets.GCORE_API_KEY }}
           GCORE_PROJECT_ID: ${{ secrets.GCORE_PROJECT_ID }}
-          GCORE_REGIONS: ${{ needs.prepare.outputs.gcore_regions }}
+          GCORE_REGIONS: ${{ needs.prepare.outputs.gcore_prune_regions }}
         run: |
           KEEP=3
           API="https://api.gcore.com/cloud/v1"
@@ -241,20 +273,42 @@ jobs:
             fi
             while IFS=$'\t' read -r created id name vis; do
               echo "Deleting ${name} (${id}, created ${created}, visibility ${vis}) in region ${region}..."
-              if ! http_code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$AUTH" \
+              # Body kept, not sent to /dev/null: an unexpected status is undiagnosable
+              # without gcore's reason, which is how a 409 read as a mystery failure.
+              if ! resp=$(curl -sS -w $'\n%{http_code}' -X DELETE -H "$AUTH" \
                 "${API}/images/${GCORE_PROJECT_ID}/${region}/${id}"); then
                 echo "::error::Failed to reach gcore to delete ${name} (${id}) in region ${region}"
                 failures=$((failures + 1))
                 continue
               fi
+              http_code="${resp##*$'\n'}"
+              body="${resp%$'\n'*}"
               if [ "$http_code" = "404" ]; then
                 echo "  Already gone (404), skipping."
               elif [ "$http_code" = "403" ]; then
                 # The unfiltered pass can surface another project's public image that
                 # matches the prefix. Not ours to delete, not a failure.
                 echo "  Not ours to delete (403), skipping."
+              elif [ "$http_code" = "409" ]; then
+                # Still referenced by a live volume, so gcore refuses — and it is right
+                # to. These are the images the running VPS boxes booted from; the whole
+                # point of keeping them is that deleting one is destructive. An image
+                # becomes prunable on its own once those boxes are replaced, so this is a
+                # normal steady state for the oldest kept version, not a fault. Failing
+                # the job here blocked every image build (run 32238646926) while the
+                # correct action was to leave the image alone.
+                # Plain text, not ::notice::: a workflow command is only parsed at the
+                # start of a line, and this is routine steady state that would otherwise
+                # annotate every run for every in-use image. Matches the 404/403 lines.
+                echo "  Still in use by a live volume (409), skipping — it will prune once those boxes are replaced."
               elif [ "$http_code" -ge 400 ]; then
+                # Body printed on its own indented lines rather than interpolated into
+                # the ::error::, which is a single line by definition: gcore's message
+                # could carry newlines, and any line of it starting with "::" would be
+                # read as another workflow command. The indent prefix makes that
+                # impossible.
                 echo "::error::Failed to delete gcore image ${name} (${id}) in region ${region}: HTTP ${http_code}"
+                printf '%s\n' "$body" | sed 's/^/    /'
                 failures=$((failures + 1))
               fi
             done < <(echo "$images" | tail -n +$((KEEP + 1)))
@@ -264,34 +318,17 @@ jobs:
             exit 1
           fi
 
-  build-datacap:
-    name: Build datacap binaries
+  fetch-datacap:
+    name: Fetch latest datacap nightly
     runs-on: ubuntu-latest
-    needs: prepare
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
-      - name: Checkout lantern-cloud
-        uses: actions/checkout@v6
-        with:
-          repository: getlantern/lantern-cloud
-          path: lantern-cloud
-          token: ${{ secrets.CI_PRIVATE_REPOS_GH_TOKEN }}
+      - uses: actions/checkout@v6
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: lantern-cloud/go.mod
-
-      - name: Install cross-compilers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y -q gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - name: Build datacap binaries
-        working-directory: lantern-cloud
-        run: |
-          CGO_ENABLED=1 go build -o /tmp/datacap-amd64 github.com/getlantern/lantern-cloud/cmd/datacap
-          GOARCH=arm64 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ CGO_ENABLED=1 go build -o /tmp/datacap-arm64 github.com/getlantern/lantern-cloud/cmd/datacap
+      - name: Download and extract datacap packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash deploy/packer/download-datacap-nightly.sh /tmp
 
       - name: Upload datacap binaries
         uses: actions/upload-artifact@v5
@@ -305,7 +342,7 @@ jobs:
   build:
     name: Build ${{ matrix.builder }}
     runs-on: ubuntu-latest
-    needs: [prepare, prune, build-datacap]
+    needs: [prepare, prune, fetch-datacap]
     permissions:
       contents: read
     strategy:
