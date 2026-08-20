@@ -804,10 +804,11 @@ type preCandidate struct {
 }
 
 // rankLocked builds the candidate set for selection. A non-zero freshSince
-// restricts to members with a recorded outcome at or after freshSince
-// and drops those without a fresh success (lastSuccessDelayMs==0); the
-// probe-cycle ranker uses this so the "is there a winner this cycle?"
-// check can't see stale outcomes. Caller must hold s.access.
+// restricts to members with a recorded outcome at or after freshSince that
+// have a recorded success from any cycle. A fresh failure still qualifies,
+// because recordProbeFailure preserves lastSuccessDelayMs, so a caller
+// asking "did anything succeed this cycle?" must gate on that itself.
+// Caller must hold s.access.
 func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []rankedCandidate {
 	clear(s.scratchPres)
 	pres := s.scratchPres[:0]
@@ -1056,11 +1057,23 @@ func (s *MutableAutoSelect) runLadder(target string) {
 	fullCtx, cancel := context.WithTimeout(s.ctx, s.cfg.ladderTotalBudget)
 	defer cancel()
 	cycleStart := time.Now()
-	s.internalProbe(fullCtx, nil)
+	// A probe failure advances lastOutcomeAt while leaving
+	// lastSuccessDelayMs intact, so the ranked set alone cannot tell a
+	// member that succeeded this cycle from one that only failed in it.
+	// Rank still orders the winner; this decides whether one exists. The
+	// map needs no lock of its own: probeAll serializes onSuccess, and
+	// internalProbe returns only after its workers finish.
+	succeeded := make(map[string]struct{})
+	s.internalProbe(fullCtx, func(res probeResult) {
+		succeeded[res.tag] = struct{}{}
+	})
 	var winner A.Outbound
 	s.access.Lock()
-	if ranked := s.rankLocked(time.Now(), cycleStart); len(ranked) > 0 {
-		winner = ranked[0].outbound
+	for _, c := range s.rankLocked(time.Now(), cycleStart) {
+		if _, ok := succeeded[c.tag]; ok {
+			winner = c.outbound
+			break
+		}
 	}
 	s.access.Unlock()
 	s.probeMu.Unlock()
