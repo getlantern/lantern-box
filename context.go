@@ -4,9 +4,16 @@ import (
 	"context"
 
 	"github.com/sagernet/sing-box/experimental/libbox"
+	"github.com/sagernet/sing-box/include"
 
 	"github.com/getlantern/lantern-box/protocol"
 )
+
+// Context returns a context with all sing-box and lantern-box registries.
+func Context(ctx context.Context) context.Context {
+	ctx = include.Context(ctx)
+	return protocol.RegisterProtocols(ctx)
+}
 
 type PlatformInterface interface {
 	LocalDNSTransport() libbox.LocalDNSTransport
