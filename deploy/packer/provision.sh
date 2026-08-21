@@ -22,14 +22,17 @@ if command -v cloud-init >/dev/null 2>&1; then
   fi
 fi
 
-# Stop unattended-upgrades so it doesn't race with our apt-get calls.
-# We mask it during provisioning but re-enable at the end of the script
-# so the final image still receives automatic security updates.
+# Stop unattended-upgrades so it doesn't race with our apt-get calls here;
+# it is purged from the image entirely further down.
 echo "==> Stopping unattended-upgrades"
 systemctl stop unattended-upgrades.service 2>/dev/null || true
 systemctl mask unattended-upgrades.service 2>/dev/null || true
 systemctl kill --signal=TERM apt-daily.service 2>/dev/null || true
 systemctl kill --signal=TERM apt-daily-upgrade.service 2>/dev/null || true
+# Mask the timers too, or the services can restart mid-provision and
+# re-acquire the dpkg lock; the masks stay in place in the final image.
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl mask apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 # Kill any lingering apt/unattended-upgrade processes (but not dpkg — killing
 # dpkg mid-transaction can corrupt the package database).
 killall apt apt-get unattended-upgrade 2>/dev/null || true
@@ -156,9 +159,16 @@ systemctl daemon-reload
 # silent "install failed" errors with no way to identify affected
 # hosts (we had 266/hour of those at peak).
 
-# Re-enable unattended-upgrades so the final image receives security updates.
+# Remove unattended-upgrades from the image entirely. These boxes are
+# ephemeral and centrally updated (see central-vps-updates.md note above), and
+# on first boot unattended-upgrades races cloud-init's lantern-box install and
+# the provision worker's SSH-phase apt-get calls (e.g. InstallDatacapRelease)
+# for the dpkg frontend lock — holding it past DPkg::Lock::Timeout fails the
+# provision outright. The apt-daily units and timers were masked in the
+# early "Stopping unattended-upgrades" block and stay masked in the image.
+echo "==> Removing unattended-upgrades"
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
-systemctl enable unattended-upgrades.service 2>/dev/null || true
+apt-get "${APT_OPTS[@]}" purge -y -q unattended-upgrades
 
 echo "==> Disabling SSH password authentication"
 # Stock cloud images drop /etc/ssh/sshd_config.d/50-cloud-init.conf with
@@ -247,6 +257,22 @@ if ! command -v otelcol-contrib >/dev/null 2>&1; then
   echo "otelcol-contrib not found on PATH" >&2
   exit 1
 fi
+# Fail closed on the unattended-upgrades removal: the purge and the early
+# masking use `|| true` (units differ across provider base images), so verify
+# the end state instead — the package must be gone from dpkg and every
+# apt-daily unit must be masked (or absent) so nothing can grab the dpkg lock
+# on provisioned boxes.
+if dpkg-query -W -f '${db:Status-Status}\n' unattended-upgrades 2>/dev/null | grep -qv '^not-installed$'; then
+  echo "unattended-upgrades still present in dpkg — purge above failed" >&2
+  exit 1
+fi
+for unit in apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer; do
+  state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  if [ -n "$state" ] && [ "$state" != "masked" ]; then
+    echo "$unit is '$state', expected masked" >&2
+    exit 1
+  fi
+done
 
 # Validate otelcol config at image-build time so malformed YAML, unknown
 # receivers/exporters, or missing pipeline references fail the packer
