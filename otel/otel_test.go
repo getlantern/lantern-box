@@ -14,6 +14,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 	sdkotel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	semconv "github.com/getlantern/semconv"
 )
 
@@ -162,6 +164,12 @@ func TestInitTelemetry(t *testing.T) {
 	require.NoError(t, err)
 	counter.Add(ctx, 1)
 
+	// A histogram too: proxy.session.goodput is one, and histograms were the
+	// last kind still exporting cumulative.
+	hist, err := sdkotel.Meter("test").Float64Histogram("test.histogram")
+	require.NoError(t, err)
+	hist.Record(ctx, 42)
+
 	// Shutdown flushes pending exports.
 	shutdownTracer()
 	shutdownMeter()
@@ -186,5 +194,40 @@ func TestInitTelemetry(t *testing.T) {
 			"collector logs should contain proxy.name attribute")
 		assert.Contains(c, output, "test.counter",
 			"collector logs should contain the metric name")
+		assert.Contains(c, output, "test.histogram",
+			"collector logs should contain the histogram name")
+		// The histogram must arrive as Delta. The ops collector aggregates
+		// resource attributes away on proxy.session.goodput, which silently
+		// corrupts rate() on a cumulative stream (its per-host series carry
+		// interleaved resets), and lantern-cloud reads the paired .count with
+		// timeAggregation=sum, which only matches delta. A name-only assertion
+		// would not catch a revert to cumulative.
+		assert.NotContains(c, output, "AggregationTemporality: Cumulative",
+			"every stream this binary exports must be delta")
 	}, 10*time.Second, 500*time.Millisecond)
+}
+
+// TestDeltaTemporalityCoversHistograms guards the exporter's temporality
+// selection directly, without needing a collector.
+//
+// InstrumentKindHistogram is the one that matters: it was cumulative while
+// counters were already delta, and it is the kind proxy.session.goodput uses.
+// Delta is required for the ops collector to strip route.id/instance.id/
+// host.name from that metric — aggregating an identifier away merges the
+// matching series, and merging cumulative streams interleaves their resets,
+// corrupting rate() with no error.
+func TestDeltaTemporalityCoversHistograms(t *testing.T) {
+	kinds := []sdkmetric.InstrumentKind{
+		sdkmetric.InstrumentKindCounter,
+		sdkmetric.InstrumentKindUpDownCounter,
+		sdkmetric.InstrumentKindHistogram,
+		sdkmetric.InstrumentKindGauge,
+		sdkmetric.InstrumentKindObservableCounter,
+		sdkmetric.InstrumentKindObservableUpDownCounter,
+		sdkmetric.InstrumentKindObservableGauge,
+	}
+	for _, k := range kinds {
+		assert.Equal(t, metricdata.DeltaTemporality, deltaTemporality(k),
+			"instrument kind %v must export delta", k)
+	}
 }
