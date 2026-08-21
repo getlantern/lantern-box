@@ -22,9 +22,8 @@ if command -v cloud-init >/dev/null 2>&1; then
   fi
 fi
 
-# Stop unattended-upgrades so it doesn't race with our apt-get calls.
-# We mask it during provisioning but re-enable at the end of the script
-# so the final image still receives automatic security updates.
+# Stop unattended-upgrades so it doesn't race with our apt-get calls here;
+# it is purged from the image entirely further down.
 echo "==> Stopping unattended-upgrades"
 systemctl stop unattended-upgrades.service 2>/dev/null || true
 systemctl mask unattended-upgrades.service 2>/dev/null || true
@@ -156,9 +155,18 @@ systemctl daemon-reload
 # silent "install failed" errors with no way to identify affected
 # hosts (we had 266/hour of those at peak).
 
-# Re-enable unattended-upgrades so the final image receives security updates.
+# Remove unattended-upgrades from the image entirely. These boxes are
+# ephemeral and centrally updated (see central-vps-updates.md note above), and
+# on first boot unattended-upgrades races cloud-init's lantern-box install and
+# the provision worker's SSH-phase apt-get calls (e.g. InstallDatacapRelease)
+# for the dpkg frontend lock — holding it past DPkg::Lock::Timeout fails the
+# provision outright. The apt-daily timers are masked too so apt-daily can't
+# grab the lock on its own schedule either.
+echo "==> Removing unattended-upgrades"
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
-systemctl enable unattended-upgrades.service 2>/dev/null || true
+apt-get "${APT_OPTS[@]}" purge -y -q unattended-upgrades 2>/dev/null || true
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl mask apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 
 echo "==> Disabling SSH password authentication"
 # Stock cloud images drop /etc/ssh/sshd_config.d/50-cloud-init.conf with
@@ -245,6 +253,10 @@ if ! command -v tailscale >/dev/null 2>&1; then
 fi
 if ! command -v otelcol-contrib >/dev/null 2>&1; then
   echo "otelcol-contrib not found on PATH" >&2
+  exit 1
+fi
+if command -v unattended-upgrade >/dev/null 2>&1; then
+  echo "unattended-upgrades still installed — purge above failed" >&2
   exit 1
 fi
 
