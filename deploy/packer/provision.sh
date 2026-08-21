@@ -257,10 +257,22 @@ if ! command -v otelcol-contrib >/dev/null 2>&1; then
   echo "otelcol-contrib not found on PATH" >&2
   exit 1
 fi
-if command -v unattended-upgrade >/dev/null 2>&1; then
-  echo "unattended-upgrades still installed — purge above failed" >&2
+# Fail closed on the unattended-upgrades removal: the purge and the early
+# masking use `|| true` (units differ across provider base images), so verify
+# the end state instead — the package must be gone from dpkg and every
+# apt-daily unit must be masked (or absent) so nothing can grab the dpkg lock
+# on provisioned boxes.
+if dpkg-query -W -f '${db:Status-Status}\n' unattended-upgrades 2>/dev/null | grep -qv '^not-installed$'; then
+  echo "unattended-upgrades still present in dpkg — purge above failed" >&2
   exit 1
 fi
+for unit in apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer; do
+  state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  if [ -n "$state" ] && [ "$state" != "masked" ]; then
+    echo "$unit is '$state', expected masked" >&2
+    exit 1
+  fi
+done
 
 # Validate otelcol config at image-build time so malformed YAML, unknown
 # receivers/exporters, or missing pipeline references fail the packer
