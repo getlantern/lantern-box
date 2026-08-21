@@ -298,9 +298,9 @@ func TestHydrateLocalHistory_DropsAgedUserFailures(t *testing.T) {
 		UpdatedAt: now.Add(-time.Minute),
 	}
 	h := hydrateLocalHistory(persisted, now, 5*time.Minute)
-	lastDelay, _, _, userFails := h.snapshot(now, 5*time.Minute)
+	lastDelay, _, _, userFailCount := h.snapshot(now, 5*time.Minute)
 	assert.Equal(t, uint32(120), lastDelay)
-	assert.Len(t, userFails, 1, "stale user-failure timestamp must be dropped on hydrate")
+	assert.Equal(t, uint32(1), userFailCount, "stale user-failure timestamp must be dropped on hydrate")
 }
 
 func TestBehaviorFor_Timeouts(t *testing.T) {
@@ -568,9 +568,7 @@ func (stallConn) SetReadDeadline(time.Time) error  { return nil }
 func (stallConn) SetWriteDeadline(time.Time) error { return nil }
 
 func TestDataPlaneStream_StallSuppressedUntilProven(t *testing.T) {
-	// A handshake-only conn that never delivers payload is "established
-	// but inactive" — the stall timer fires but onStall is suppressed
-	// because provedReadBytes hasn't been crossed.
+	// A handshake-only conn never becomes proven, so idle is not a stall.
 	var calls atomic.Uint32
 	const provedReadBytes = 100
 	d := newDataPlaneStream(stallConn{}, 10*time.Millisecond, provedReadBytes,
@@ -601,13 +599,14 @@ func TestDataPlaneStream_StallFiresAfterProven(t *testing.T) {
 	_, err = d.Write([]byte("ping"))
 	require.NoError(t, err, "Write should succeed on echoConn")
 
-	require.True(t, d.lastWasWrite.Load(), "Write should set the last-was-write gate")
+	_, wasWrite := unpackActivity(d.activity.Load())
+	require.True(t, wasWrite, "Write should set the last-was-write gate")
 	// Wait past the idle window.
 	require.Eventually(t, func() bool { return calls.Load() == 1 },
 		time.Second, 5*time.Millisecond, "proven stall should have fired by now")
 
 	d.fireStall()
-	assert.Equal(t, uint32(1), calls.Load(), "fired CAS should suppress duplicate fires")
+	assert.Equal(t, uint32(1), calls.Load(), "terminal activity state should suppress duplicate fires")
 }
 
 func TestDataPlaneStream_StallSuppressedOnReadOnlyIdle(t *testing.T) {
@@ -625,10 +624,80 @@ func TestDataPlaneStream_StallSuppressedOnReadOnlyIdle(t *testing.T) {
 	require.NoError(t, err, "Read should succeed on echoConn")
 
 	require.True(t, d.proven.Load(), "Read should have proven the conn")
-	require.False(t, d.lastWasWrite.Load(), "Read-only conn must not set the last-was-write gate")
+	_, wasWrite := unpackActivity(d.activity.Load())
+	require.False(t, wasWrite, "Read-only conn must not set the last-was-write gate")
 	time.Sleep(80 * time.Millisecond)
 	assert.Equal(t, uint32(0), calls.Load(),
 		"proven conn with read-only history must not fire stall")
+}
+
+func TestClaimStall_AbortsOnConcurrentActivity(t *testing.T) {
+	// fireStall samples activity, then commits; a Read that republishes
+	// activity in that gap must abort the stall so a live conn is not
+	// demoted.
+	d := newDataPlaneStream(echoConn{}, time.Hour, 0, func(adapter.UserFailureKind) {}, nil)
+
+	// Sample a stale write, then simulate a concurrent Read republishing
+	// fresh activity before the commit.
+	act := packActivity(idleForever, true)
+	d.activity.Store(act)
+	d.activity.Store(packActivity(sinceEpoch(), false))
+	assert.False(t, d.claimStall(act), "claim must abort when activity advanced since the sample")
+
+	// A successful claim marks the terminal state. Later activity must not
+	// overwrite it.
+	fresh := d.activity.Load()
+	assert.True(t, d.claimStall(fresh), "claim must succeed when activity is unchanged")
+	assert.False(t, d.publishActivity(false), "activity must not overwrite a terminal claim")
+	d.noteIO(1, nil, true)
+	assert.Equal(t, int64(activityTerminal), d.activity.Load(), "a claim marks the terminal state")
+	assert.False(t, d.proven.Load(), "terminal claims must suppress later Read-side proving")
+	assert.False(t, d.claimStall(activityTerminal), "the sentinel itself is not a claimable sample")
+}
+
+func TestPackActivity_RoundTrip(t *testing.T) {
+	// fireStall depends on one atomic snapshot preserving both fields.
+	cases := []struct {
+		nanos    int64
+		wasWrite bool
+	}{
+		{0, false},
+		{0, true},
+		{1, false}, // odd timestamp: low bit must not leak into wasWrite
+		{1, true},
+		{123456788, true},
+		{idleForever, false},
+		{idleForever, true},
+	}
+	for _, c := range cases {
+		gotNanos, gotWrite := unpackActivity(packActivity(c.nanos, c.wasWrite))
+		assert.Equal(t, c.wasWrite, gotWrite, "wasWrite must survive the round-trip")
+		assert.Equal(t, c.nanos&^1, gotNanos, "timestamp must survive minus its low bit")
+	}
+}
+
+func TestDataPlaneStream_StallAfterReadIdleThenWrite(t *testing.T) {
+	// Read-only idle must keep the timer alive for a later unanswered Write.
+	var calls atomic.Uint32
+	const provedReadBytes = 50
+	d := newDataPlaneStream(echoConn{}, 20*time.Millisecond, provedReadBytes,
+		func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	defer d.Close()
+
+	_, err := d.Read(make([]byte, provedReadBytes))
+	require.NoError(t, err, "Read should succeed on echoConn")
+	require.True(t, d.proven.Load(), "Read should have proven the conn")
+
+	// Let several read-only idle windows lapse; each must re-arm, not fire.
+	time.Sleep(70 * time.Millisecond)
+	require.Equal(t, uint32(0), calls.Load(), "read-only idle must not stall")
+
+	// A now-unanswered Write on the still-armed watchdog must stall.
+	_, err = d.Write([]byte("ping"))
+	require.NoError(t, err, "Write should succeed on echoConn")
+	require.Eventually(t, func() bool { return calls.Load() == 1 },
+		time.Second, 5*time.Millisecond,
+		"unanswered Write after a read-idle window must still stall")
 }
 
 func TestDataPlaneStream_CloseIsIdempotent(t *testing.T) {
@@ -640,8 +709,8 @@ func TestDataPlaneStream_CloseIsIdempotent(t *testing.T) {
 func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
 	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
-	d.proven.Store(true)       // simulate a proven conn so fireStall isn't gated on the proven check
-	d.lastWasWrite.Store(true) // ...nor on the write-without-read gate
+	d.proven.Store(true)                              // simulate a proven conn so fireStall isn't gated on the proven check
+	d.activity.Store(packActivity(idleForever, true)) // ...nor on the write-without-read or freshness gates
 	d.Close()
 	d.fireStall()
 	assert.Equal(t, uint32(0), calls.Load(), "no stall callbacks must fire after Close")
@@ -651,7 +720,7 @@ func TestDataPlanePacket_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
 	d := newDataPlanePacket(stallPacketConn{}, time.Hour, 0, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
 	d.proven.Store(true)
-	d.lastWasWrite.Store(true)
+	d.activity.Store(packActivity(idleForever, true))
 	d.Close()
 	d.fireStall()
 	assert.Equal(t, uint32(0), calls.Load(), "no stall callbacks must fire after Close")
@@ -755,6 +824,19 @@ func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	assert.False(t, exists)
 }
 
+// firstUserFailure reads the failure count and first-recorded kind under
+// h.mu. The stall/reset hooks kick a background runLadder that mutates
+// history concurrently, so these fields must not be read raw.
+func firstUserFailure(h *localHistory) (n int, kind adapter.UserFailureKind) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n = len(h.userFailures)
+	if n > 0 {
+		kind = h.userFailures[0].Kind
+	}
+	return
+}
+
 func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// A stall counts as one failure — same weight as a single dial
 	// error. The demote rule hits hard at three failures in window, not
@@ -768,8 +850,9 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, uint32(1), h.userFailureCount(time.Now(), s.hist.userFailureWindow),
 		"a single stall must contribute exactly one user-failure timestamp")
-	require.Len(t, h.userFailures, 1)
-	assert.Equal(t, adapter.UserFailureStall, h.userFailures[0].Kind,
+	n, kind := firstUserFailure(h)
+	require.Equal(t, 1, n, "a single stall must record exactly one failure")
+	assert.Equal(t, adapter.UserFailureStall, kind,
 		"the stall hook must record the failure as a stall")
 }
 
@@ -781,8 +864,9 @@ func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
 	require.True(t, ok)
-	require.Len(t, h.userFailures, 1)
-	assert.Equal(t, adapter.UserFailureReset, h.userFailures[0].Kind,
+	n, kind := firstUserFailure(h)
+	require.Equal(t, 1, n, "a single reset must record exactly one failure")
+	assert.Equal(t, adapter.UserFailureReset, kind,
 		"makeHooks must record the failure under the kind the watchdog reports")
 }
 
@@ -793,8 +877,9 @@ func TestRecordUserFailure_AttributesDialKind(t *testing.T) {
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
 	require.True(t, ok)
-	require.Len(t, h.userFailures, 1)
-	assert.Equal(t, adapter.UserFailureDial, h.userFailures[0].Kind,
+	n, kind := firstUserFailure(h)
+	require.Equal(t, 1, n, "a single dial error must record exactly one failure")
+	assert.Equal(t, adapter.UserFailureDial, kind,
 		"a dial-site failure must record the failure as a dial error")
 }
 
@@ -1106,7 +1191,7 @@ func TestDataPlaneStream_Stall_AttributesStallKind(t *testing.T) {
 	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func(k adapter.UserFailureKind) { got.Store(k) }, nil)
 	defer d.Close()
 	d.proven.Store(true)
-	d.lastWasWrite.Store(true)
+	d.activity.Store(packActivity(idleForever, true))
 	d.fireStall()
 
 	require.NotNil(t, got.Load(), "a stall must attribute a failure")
@@ -1200,9 +1285,9 @@ func TestDataPlaneStream_TimeoutDoesNotAttribute(t *testing.T) {
 }
 
 func TestDataPlaneStream_NoAttributeAfterClose(t *testing.T) {
-	// After our own Close, closeWatchdog has set stalled; a racing read that
-	// surfaces net.ErrClosed must short-circuit, not attribute a phantom
-	// failure.
+	// After our own Close, closeWatchdog has marked the watchdog
+	// terminal; a racing read that surfaces net.ErrClosed must not
+	// attribute a phantom failure.
 	var calls atomic.Uint32
 	c := &failingConn{err: net.ErrClosed}
 	d := newDataPlaneStream(c, time.Hour, 1, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
@@ -1216,7 +1301,7 @@ func TestDataPlaneStream_NoAttributeAfterClose(t *testing.T) {
 }
 
 func TestDataPlaneStream_FailureFiresOnce(t *testing.T) {
-	// Repeated errored reads attribute at most once per conn (the fired CAS).
+	// Repeated errored reads attribute at most once per conn.
 	var calls atomic.Uint32
 	c := &failingConn{err: connResetErr()}
 	d := newDataPlaneStream(c, time.Hour, 1, func(adapter.UserFailureKind) { calls.Add(1) }, nil)

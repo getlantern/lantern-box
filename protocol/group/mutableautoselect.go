@@ -828,13 +828,13 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 			haveData  bool
 		)
 		if h, ok := s.peekHistoryLocked(tag); ok {
-			lastDelay, lastAt, c, uf := h.snapshot(now, s.hist.userFailureWindow)
+			lastDelay, lastAt, c, ufCount := h.snapshot(now, s.hist.userFailureWindow)
 			if !freshSince.IsZero() && lastAt.Before(freshSince) {
 				continue
 			}
 			rawDelay = lastDelay
 			consec = c
-			userFails = uint32(len(uf))
+			userFails = ufCount
 			haveData = true
 		} else if freshSince.IsZero() && s.history != nil {
 			// Cold member (added without going through hydrate). Fall back

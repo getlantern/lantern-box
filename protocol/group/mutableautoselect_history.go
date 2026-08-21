@@ -126,17 +126,16 @@ func (h *localHistory) userFailureCount(now time.Time, window time.Duration) uin
 	return uint32(len(h.userFailures))
 }
 
-func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay uint32, lastAt time.Time, consec uint32, userFails []adapter.UserFailure) {
+// snapshot returns probe state plus the live user-failure count, pruning
+// stale failures in place.
+func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay uint32, lastAt time.Time, consec uint32, userFailCount uint32) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.userFailures = pruneUserFailures(h.userFailures, now, window)
 	lastDelay = h.lastSuccessDelayMs
 	lastAt = h.lastOutcomeAt
 	consec = h.consecutiveFailures
-	if len(h.userFailures) > 0 {
-		userFails = make([]adapter.UserFailure, len(h.userFailures))
-		copy(userFails, h.userFailures)
-	}
+	userFailCount = uint32(len(h.userFailures))
 	return
 }
 

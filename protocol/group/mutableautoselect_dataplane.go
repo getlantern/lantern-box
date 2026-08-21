@@ -32,19 +32,27 @@ func (s *MutableAutoSelect) makeHooks(outerTag string) (onFailure func(adapter.U
 // dataPlaneWatchdog is the no-traffic stall timer shared by the stream
 // and packet wrappers.
 //
-// provedReadBytes gates whether the stall is real: until the wrapped conn
-// has delivered that many cumulative non-empty Read bytes, an
-// idle-window expiry is treated as "established but never carried real
-// traffic" (e.g. a handshake-only or keepalive-only conn) and the
-// stall handler is suppressed.
+// provedReadBytes keeps handshake-only and keepalive-only conns from
+// counting as stalls: the watchdog starts only after that many cumulative
+// non-empty Read bytes have arrived.
 //
-// lastWasWrite separately distinguishes "tunnel is broken" from "user
-// stopped sending traffic" on an already-proven conn. The stall fires
-// only when the most recent non-empty IO was a Write — i.e. we sent
+// The write-vs-read classification distinguishes "tunnel is broken" from
+// "user stopped sending traffic" on an already-proven conn. The stall
+// fires only when the most recent non-empty IO was a Write — i.e. we sent
 // bytes and got nothing back for the idle window. A proven conn whose
 // last activity was a Read (response arrived, then silence) is treated
 // as user-idle, not broken: a healthy keep-alive going unused looks
 // identical to a broken tunnel without this gate.
+//
+// The classification, timestamp, and terminal state share one atomic word
+// so activity publication, stall claims, reset claims, and close claims
+// are serialized without taking timerMu on the IO path.
+//
+// The timer is lazy on two axes to keep its cost off the data path.
+// It is allocated only when the conn becomes proven. noteIO also avoids
+// timer resets on the IO path; it only stamps activity, and fireStall
+// re-arms when the stamp is still fresh. Steady traffic therefore costs
+// one timer op per idle window instead of one per packet.
 type dataPlaneWatchdog struct {
 	idle            time.Duration
 	onFailure       func(adapter.UserFailureKind)
@@ -52,19 +60,73 @@ type dataPlaneWatchdog struct {
 	provedReadBytes uint64
 	readBytes       atomic.Uint64
 	proven          atomic.Bool
-	lastWasWrite    atomic.Bool
-	stalled         atomic.Bool
-	fired           atomic.Bool
-	timer           *time.Timer
-	closeOnce       sync.Once
+	// activity is either activityTerminal or the last non-empty IO packed
+	// as monotonic nanoseconds since dataPlaneEpoch plus a write flag in
+	// bit 0.
+	activity atomic.Int64
+
+	timerMu   sync.Mutex
+	timer     *time.Timer // nil until proven; guarded by timerMu
+	closeOnce sync.Once
 }
+
+// packActivity stores wasWrite in bit 0. This drops 1 ns of timestamp
+// precision, which is irrelevant for idle-window comparisons.
+func packActivity(nanos int64, wasWrite bool) int64 {
+	v := nanos &^ 1
+	if wasWrite {
+		v |= 1
+	}
+	return v
+}
+
+func unpackActivity(v int64) (nanos int64, wasWrite bool) {
+	return v &^ 1, v&1 != 0
+}
+
+// dataPlaneEpoch anchors activity timestamps to a monotonic clock, so
+// wall-clock changes cannot delay or accelerate stall detection.
+var dataPlaneEpoch = time.Now()
+
+func sinceEpoch() int64 { return time.Since(dataPlaneEpoch).Nanoseconds() }
+
+// idleForever seeds activity as old read-side IO: old enough to exceed
+// any real idle window, but small enough to avoid subtraction overflow.
+const idleForever = -int64(24 * time.Hour)
+
+// activityTerminal is the reserved terminal activity value. Real IO stamps
+// are non-negative, so this marker cannot collide with activity.
+const activityTerminal = -1
 
 func (w *dataPlaneWatchdog) init(idle time.Duration, provedReadBytes uint64, onFailure func(adapter.UserFailureKind), onActivity func()) {
 	w.idle = idle
 	w.provedReadBytes = provedReadBytes
 	w.onFailure = onFailure
 	w.onActivity = onActivity
-	w.timer = time.AfterFunc(idle, w.fireStall)
+	// Direct fireStall calls in tests should evaluate the gates instead
+	// of treating the missing IO stamp as fresh activity.
+	w.activity.Store(idleForever)
+	// Timer is armed lazily on the proven transition; see armTimer.
+}
+
+// armTimer starts the stall timer on the transition to proven.
+func (w *dataPlaneWatchdog) armTimer() {
+	w.timerMu.Lock()
+	defer w.timerMu.Unlock()
+	if w.isTerminal() {
+		return
+	}
+	w.timer = time.AfterFunc(w.idle, w.fireStall)
+}
+
+// rearm reschedules the stall timer for d, unless the watchdog is terminal.
+func (w *dataPlaneWatchdog) rearm(d time.Duration) {
+	w.timerMu.Lock()
+	defer w.timerMu.Unlock()
+	if w.isTerminal() || w.timer == nil {
+		return
+	}
+	w.timer.Reset(d)
 }
 
 // isDataPlaneFailure reports whether err should demote the outbound.
@@ -81,12 +143,6 @@ func isDataPlaneFailure(err error) bool {
 }
 
 func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
-	// Short-circuit once stalled: a late noteIO must not re-arm the
-	// timer, fire onActivity, or attribute a failure after the conn is
-	// logically gone.
-	if w.stalled.Load() {
-		return
-	}
 	// Attribute mid-stream transport failures immediately.
 	if isDataPlaneFailure(err) {
 		w.fireResetFailure()
@@ -96,13 +152,11 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	if n <= 0 || err != nil {
 		return
 	}
-	// Publish the gate value before re-arming the timer so a fireStall
-	// racing the Reset reads the fresh classification, not the previous
-	// IO's value. Otherwise a Read landing just as the timer fires
-	// could leave lastWasWrite=true from an earlier Write and trip
-	// the gate it's supposed to suppress.
-	w.lastWasWrite.Store(!isRead)
-	w.timer.Reset(w.idle)
+	// Publish activity before callbacks/proving so a racing fireStall
+	// either observes the new activity or wins the terminal claim.
+	if !w.publishActivity(!isRead) || w.isTerminal() {
+		return
+	}
 	if w.onActivity != nil {
 		w.onActivity()
 	}
@@ -118,17 +172,25 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	}
 	total := w.readBytes.Add(uint64(n))
 	if total >= w.provedReadBytes {
-		w.proven.Store(true)
+		// Arm on the proven transition only: CAS so concurrent readers
+		// crossing the threshold together arm exactly one timer.
+		if w.proven.CompareAndSwap(false, true) {
+			w.armTimer()
+		}
 	}
 }
 
-// closeWatchdog sets stalled=true before Stop so any concurrent noteIO
-// short-circuits and any concurrent fireStall CAS-fails — late I/O can't
-// deliver a phantom onFailure after Close.
+// closeWatchdog marks the watchdog terminal before Stop so concurrent
+// noteIO/fireStall cannot report a failure after Close. The timer is nil
+// until proven.
 func (w *dataPlaneWatchdog) closeWatchdog() (firstClose bool) {
 	w.closeOnce.Do(func() {
-		w.stalled.Store(true)
-		w.timer.Stop()
+		w.claimTerminal()
+		w.timerMu.Lock()
+		if w.timer != nil {
+			w.timer.Stop()
+		}
+		w.timerMu.Unlock()
 		firstClose = true
 	})
 	return firstClose
@@ -136,18 +198,33 @@ func (w *dataPlaneWatchdog) closeWatchdog() (firstClose bool) {
 
 // fireStall is the idle-timer callback: it demotes a conn that went quiet
 // mid-stream. It fires only on a proven conn whose last non-empty IO was a
-// Write.
+// Write and whose idle window has genuinely elapsed.
+//
+// Since noteIO does not reset the timer, a callback can arrive while
+// activity is fresh; fireStall re-arms for the remaining window. It also
+// re-arms after read-only idle so later unanswered Writes remain watched.
 func (w *dataPlaneWatchdog) fireStall() {
 	if !w.proven.Load() {
 		return
 	}
-	if !w.lastWasWrite.Load() {
+	act := w.activity.Load()
+	if act == activityTerminal {
 		return
 	}
-	if !w.stalled.CompareAndSwap(false, true) {
+	lastNanos, lastWasWrite := unpackActivity(act)
+	elapsed := time.Duration(sinceEpoch() - lastNanos)
+	if remaining := w.idle - elapsed; remaining > 0 {
+		w.rearm(remaining)
 		return
 	}
-	if !w.fired.CompareAndSwap(false, true) {
+	if !lastWasWrite {
+		w.rearm(w.idle)
+		return
+	}
+	// Claim exactly the sampled activity. If IO won the race, re-arm; if
+	// this CAS wins, later IO cannot overwrite the terminal state.
+	if !w.claimStall(act) {
+		w.rearm(w.idle)
 		return
 	}
 	if w.onFailure != nil {
@@ -155,19 +232,53 @@ func (w *dataPlaneWatchdog) fireStall() {
 	}
 }
 
-// fireResetFailure demotes on a mid-stream transport error. Unlike fireStall it skips
-// the proven/lastWasWrite gates — an explicit reset is unambiguous even before a
-// conn is proven. Fire and attribution happens at most once.
-func (w *dataPlaneWatchdog) fireResetFailure() {
-	if !w.stalled.CompareAndSwap(false, true) {
-		return
+func (w *dataPlaneWatchdog) isTerminal() bool {
+	return w.activity.Load() == activityTerminal
+}
+
+// publishActivity records a non-empty Read/Write unless the watchdog is
+// terminal.
+func (w *dataPlaneWatchdog) publishActivity(wasWrite bool) bool {
+	for {
+		cur := w.activity.Load()
+		if cur == activityTerminal {
+			return false
+		}
+		// Stamp timestamp and write flag together so fireStall can't read a
+		// fresh flag against a stale timestamp and fire on a just-written conn.
+		next := packActivity(sinceEpoch(), wasWrite)
+		if w.activity.CompareAndSwap(cur, next) {
+			return true
+		}
 	}
-	if !w.fired.CompareAndSwap(false, true) {
+}
+
+// claimTerminal marks the watchdog terminal. The first close/reset/stall
+// path to claim the terminal sentinel owns the transition.
+func (w *dataPlaneWatchdog) claimTerminal() bool {
+	return w.activity.Swap(activityTerminal) != activityTerminal
+}
+
+// claimStall CASes the activity word to the terminal sentinel, succeeding
+// only if no IO republished activity since act was sampled.
+func (w *dataPlaneWatchdog) claimStall(act int64) bool {
+	if act == activityTerminal {
+		return false
+	}
+	return w.activity.CompareAndSwap(act, activityTerminal)
+}
+
+// fireResetFailure demotes on a mid-stream transport error. Unlike
+// fireStall, it skips the proven/lastWasWrite gates: an explicit reset is
+// unambiguous even before a conn is proven. Fire and attribution happens
+// at most once.
+func (w *dataPlaneWatchdog) fireResetFailure() {
+	if !w.claimTerminal() {
 		return
 	}
 	if w.onFailure != nil {
-		// run onFailure in a goroutine to avoid deadlocks: the callback may call back
-		// into the selector, which may hold locks that the data-plane IO path also needs.
+		// Avoid deadlocks: the callback may call back into the selector,
+		// which may hold locks that the data-plane IO path also needs.
 		go w.onFailure(adapter.UserFailureReset)
 	}
 }
