@@ -29,6 +29,10 @@ systemctl stop unattended-upgrades.service 2>/dev/null || true
 systemctl mask unattended-upgrades.service 2>/dev/null || true
 systemctl kill --signal=TERM apt-daily.service 2>/dev/null || true
 systemctl kill --signal=TERM apt-daily-upgrade.service 2>/dev/null || true
+# Mask the timers too, or the services can restart mid-provision and
+# re-acquire the dpkg lock; the masks stay in place in the final image.
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl mask apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 # Kill any lingering apt/unattended-upgrade processes (but not dpkg — killing
 # dpkg mid-transaction can corrupt the package database).
 killall apt apt-get unattended-upgrade 2>/dev/null || true
@@ -160,13 +164,11 @@ systemctl daemon-reload
 # on first boot unattended-upgrades races cloud-init's lantern-box install and
 # the provision worker's SSH-phase apt-get calls (e.g. InstallDatacapRelease)
 # for the dpkg frontend lock — holding it past DPkg::Lock::Timeout fails the
-# provision outright. The apt-daily timers are masked too so apt-daily can't
-# grab the lock on its own schedule either.
+# provision outright. The apt-daily units and timers were masked in the
+# early "Stopping unattended-upgrades" block and stay masked in the image.
 echo "==> Removing unattended-upgrades"
 systemctl unmask unattended-upgrades.service 2>/dev/null || true
-apt-get "${APT_OPTS[@]}" purge -y -q unattended-upgrades 2>/dev/null || true
-systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-systemctl mask apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+apt-get "${APT_OPTS[@]}" purge -y -q unattended-upgrades
 
 echo "==> Disabling SSH password authentication"
 # Stock cloud images drop /etc/ssh/sshd_config.d/50-cloud-init.conf with
