@@ -16,6 +16,7 @@ import (
 	sbAdapter "github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
@@ -46,14 +47,15 @@ func newTestMUR(t *testing.T, tags ...string) (*MutableAutoSelect, map[string]*m
 		urlOverrides: map[string]string{},
 		histories:    map[string]*localHistory{},
 		cfg: mutableAutoSelectConfig{
-			switchTolerance:   50 * time.Millisecond,
-			activeInterval:    time.Hour,
-			idleInterval:      4 * time.Hour,
-			idleThreshold:     10 * time.Minute,
-			ladderTotalBudget: 100 * time.Millisecond,
-			dataPlaneIdle:     time.Hour,
-			maxPersistedAge:   defaultMaxPersistedAge,
-			probeConcurrency:  defaultProbeConcurrency,
+			switchTolerance:    50 * time.Millisecond,
+			activeInterval:     time.Hour,
+			idleInterval:       4 * time.Hour,
+			idleThreshold:      10 * time.Minute,
+			ladderTotalBudget:  100 * time.Millisecond,
+			dataPlaneIdle:      time.Hour,
+			demoteOnlySelected: true,
+			maxPersistedAge:    defaultMaxPersistedAge,
+			probeConcurrency:   defaultProbeConcurrency,
 		},
 		hist:         defaultHistoryParams(),
 		history:      adapter.NewAutoSelectHistoryStorage(),
@@ -376,9 +378,21 @@ func TestRank_SwitchPenaltyOnlyAppliesToRealSeeded(t *testing.T) {
 		"unknown-mid must not be rescued — its 0ms self-delay is a sentinel, not a measurement")
 }
 
-// addUserFailureN appends n failures to tag's in-memory history.
-// Passes dedupe=0 so the helper can deterministically seed any count
-// without depending on the dedupe window.
+// userFailures copies a member's user-failure window under the history's
+// lock. Tests avoid direct localHistory reads because probe goroutines mutate
+// entries through locked methods.
+func userFailures(s *MutableAutoSelect, tag string) ([]adapter.UserFailure, bool) {
+	s.access.Lock()
+	h, ok := s.peekHistoryLocked(tag)
+	s.access.Unlock()
+	if !ok {
+		return nil, false
+	}
+	_, _, _, uf := h.snapshot(time.Now(), s.hist.userFailureWindow)
+	return uf, true
+}
+
+// addUserFailureN appends n failures to tag's history with dedupe disabled.
 func addUserFailureN(s *MutableAutoSelect, tag string, n int) {
 	s.access.Lock()
 	defer s.access.Unlock()
@@ -760,47 +774,44 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// error. The demote rule hits hard at three failures in window, not
 	// one. (Spec change from earlier "one-shot hard demote.")
 	s, _ := newTestMUR(t, "a")
-	onStall, _ := s.makeHooks("a")
+	s.stickyTag.tcp.Store("a")
+	onStall, _ := s.makeHooks("a", primaryRoute)
 	onStall(adapter.UserFailureStall)
-	s.access.Lock()
-	h, ok := s.peekHistoryLocked("a")
-	s.access.Unlock()
+	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
-	assert.Equal(t, uint32(1), h.userFailureCount(time.Now(), s.hist.userFailureWindow),
+	require.Len(t, uf, 1,
 		"a single stall must contribute exactly one user-failure timestamp")
-	require.Len(t, h.userFailures, 1)
-	assert.Equal(t, adapter.UserFailureStall, h.userFailures[0].Kind,
+	assert.Equal(t, adapter.UserFailureStall, uf[0].Kind,
 		"the stall hook must record the failure as a stall")
 }
 
 func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	onStall, _ := s.makeHooks("a")
+	s.stickyTag.tcp.Store("a")
+	onStall, _ := s.makeHooks("a", primaryRoute)
 	onStall(adapter.UserFailureReset)
-	s.access.Lock()
-	h, ok := s.peekHistoryLocked("a")
-	s.access.Unlock()
+	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
-	require.Len(t, h.userFailures, 1)
-	assert.Equal(t, adapter.UserFailureReset, h.userFailures[0].Kind,
+	require.Len(t, uf, 1)
+	assert.Equal(t, adapter.UserFailureReset, uf[0].Kind,
 		"makeHooks must record the failure under the kind the watchdog reports")
 }
 
 func TestRecordUserFailure_AttributesDialKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	require.True(t, s.recordUserFailure("a", adapter.UserFailureDial))
-	s.access.Lock()
-	h, ok := s.peekHistoryLocked("a")
-	s.access.Unlock()
+	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
-	require.Len(t, h.userFailures, 1)
-	assert.Equal(t, adapter.UserFailureDial, h.userFailures[0].Kind,
+	require.Len(t, uf, 1)
+	assert.Equal(t, adapter.UserFailureDial, uf[0].Kind,
 		"a dial-site failure must record the failure as a dial error")
 }
 
-func TestRecordUserFailure_DemotesTagInNextSelectFor(t *testing.T) {
+func TestRecordUserFailure_SoftDemotedStickyStillLosesOnDelay(t *testing.T) {
+	// Retention is not immunity: a soft-demoted sticky within its failure
+	// budget is still judged by the ordinary switchTolerance comparison.
 	s, _ := newTestMUR(t, "a", "b")
-	recordSuccess(s, "a", 50)
+	recordSuccess(s, "a", 200)
 	recordSuccess(s, "b", 100)
 	s.stickyTag.tcp.Store("a")
 
@@ -812,7 +823,76 @@ func TestRecordUserFailure_DemotesTagInNextSelectFor(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Tag(),
-		"soft-demoted a must lose to clean b on the next selectFor")
+		"a soft-demoted sticky beaten by the tolerance must still hand over")
+}
+
+func TestRecordUserFailure_SoftDemotedStickyKeptOverSlowerPeer(t *testing.T) {
+	// Regression guard: soft demotion must use hysteresis, not look like a
+	// departed sticky just because the tag is outside the clean pool.
+	s, _ := newTestMUR(t, "a", "b")
+	recordSuccess(s, "a", 50)
+	recordSuccess(s, "b", 100)
+	s.stickyTag.tcp.Store("a")
+
+	addUserFailureN(s, "a", int(s.hist.softFailLimit))
+
+	got, err := s.selectFor("tcp")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "a", got.Tag(),
+		"soft-demoted sticky must be kept over a strictly slower clean peer")
+}
+
+func TestRecordUserFailure_HardDemotedStickyDropsRegardlessOfDelay(t *testing.T) {
+	// A hard demote is evidence the member is broken, not evidence about
+	// latency, so no amount of measured speed advantage retains it.
+	s, _ := newTestMUR(t, "a", "b")
+	// Delays stay within switchPenaltyAltFactor of each other so the
+	// hard-demote limit is not doubled; see the boost case below.
+	recordSuccess(s, "a", 100)
+	recordSuccess(s, "b", 200)
+	s.stickyTag.tcp.Store("a")
+
+	addUserFailureN(s, "a", int(s.hist.consecutiveFailLimit))
+
+	got, err := s.selectFor("tcp")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "b", got.Tag(),
+		"hard-demoted sticky must be dropped even for a slower clean peer")
+}
+
+func TestRecordUserFailure_RetentionBoundedBySoftLimit(t *testing.T) {
+	// Speed-based soft-demote boosts must not extend sticky retention past
+	// softFailLimit.
+	s, _ := newTestMUR(t, "a", "b")
+	recordSuccess(s, "a", 10)
+	recordSuccess(s, "b", 900)
+	s.stickyTag.tcp.Store("a")
+
+	addUserFailureN(s, "a", int(s.hist.softFailLimit))
+	got, err := s.selectFor("tcp")
+	require.NoError(t, err)
+	require.Equal(t, "a", got.Tag(),
+		"retention must absorb the failure count that trips the soft demote")
+
+	addUserFailureN(s, "a", 1)
+	got, err = s.selectFor("tcp")
+	require.NoError(t, err)
+	assert.Equal(t, "b", got.Tag(),
+		"one failure past softFailLimit must release the sticky regardless of speed")
+}
+
+func TestApplyStickiness_DepartedStickyFallsToBest(t *testing.T) {
+	s, _ := newTestMUR(t, "b")
+	recordSuccess(s, "b", 100)
+	s.stickyTag.tcp.Store("gone")
+
+	got, err := s.selectFor("tcp")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "b", got.Tag(),
+		"a sticky that is no longer a candidate must fall through to the rank winner")
 }
 
 func TestSplitHealthyFor_PrefersCleanOverSoftOverHard(t *testing.T) {
@@ -823,15 +903,16 @@ func TestSplitHealthyFor_PrefersCleanOverSoftOverHard(t *testing.T) {
 
 	s := &MutableAutoSelect{}
 	// ranked must be demote-sorted (clean < soft < hard), as rankLocked returns it.
-	pool := s.splitHealthyForLocked([]rankedCandidate{mk("clean", demoteClean), mk("soft", demoteSoft), mk("hard", demoteHard)}, "tcp")
+	pool, forNetwork := s.splitHealthyForLocked([]rankedCandidate{mk("clean", demoteClean), mk("soft", demoteSoft), mk("hard", demoteHard)}, "tcp")
 	require.Len(t, pool, 1)
 	assert.Equal(t, "clean", pool[0].tag)
+	assert.Len(t, forNetwork, 3, "forNetwork keeps every tier so applyStickiness can find a demoted sticky")
 
-	pool = s.splitHealthyForLocked([]rankedCandidate{mk("soft", demoteSoft), mk("hard", demoteHard)}, "tcp")
+	pool, _ = s.splitHealthyForLocked([]rankedCandidate{mk("soft", demoteSoft), mk("hard", demoteHard)}, "tcp")
 	require.Len(t, pool, 1)
 	assert.Equal(t, "soft", pool[0].tag)
 
-	pool = s.splitHealthyForLocked([]rankedCandidate{mk("hard", demoteHard)}, "tcp")
+	pool, _ = s.splitHealthyForLocked([]rankedCandidate{mk("hard", demoteHard)}, "tcp")
 	assert.Len(t, pool, 1)
 }
 
@@ -843,11 +924,11 @@ func TestSplitHealthyFor_KeepsSoftWhenCleanIsOtherNetwork(t *testing.T) {
 		{outbound: bothSoft, tag: "both-soft", demote: demoteSoft, delayMs: 50},
 	}
 	s := &MutableAutoSelect{}
-	tcpPool := s.splitHealthyForLocked(ranked, "tcp")
+	tcpPool, _ := s.splitHealthyForLocked(ranked, "tcp")
 	require.Len(t, tcpPool, 1, "tcp pool should be clean-only")
 	assert.Equal(t, "tcp-only", tcpPool[0].tag)
 
-	udpPool := s.splitHealthyForLocked(ranked, "udp")
+	udpPool, _ := s.splitHealthyForLocked(ranked, "udp")
 	require.Len(t, udpPool, 1, "udp pool should fall through to soft when no clean udp candidate exists")
 	assert.Equal(t, "both-soft", udpPool[0].tag)
 }
@@ -1567,4 +1648,119 @@ func TestClose_RaceWithEmitExhaustionDoesNotPanic(t *testing.T) {
 		}()
 		wg.Wait()
 	}
+}
+
+func TestMakeHooks_IgnoresFailureFromUnselectedTag(t *testing.T) {
+	// Stale conns from a tag that is no longer selected should not keep that
+	// tag demoted after traffic has moved elsewhere.
+	s, _ := newTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("b")
+	s.stickyTag.udp.Store("b")
+
+	onStall, _ := s.makeHooks("a", primaryRoute)
+	onStall(adapter.UserFailureStall)
+
+	s.access.Lock()
+	_, ok := s.peekHistoryLocked("a")
+	s.access.Unlock()
+	assert.False(t, ok,
+		"a stall on a member that is no longer selected must not be recorded")
+}
+
+func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
+	// The gate spans both networks: a member carrying UDP is still
+	// selected even when TCP has moved elsewhere.
+	s, _ := newTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("b")
+	s.stickyTag.udp.Store("a")
+
+	onStall, _ := s.makeHooks("a", primaryRoute)
+	onStall(adapter.UserFailureStall)
+
+	uf, ok := userFailures(s, "a")
+	require.True(t, ok, "the udp selection must still be chargeable")
+	assert.Len(t, uf, 1)
+}
+
+func TestMakeHooks_UnselectedGateDisabledByConfig(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	s.cfg.demoteOnlySelected = false
+	s.stickyTag.tcp.Store("b")
+
+	onStall, _ := s.makeHooks("a", primaryRoute)
+	onStall(adapter.UserFailureStall)
+
+	uf, ok := userFailures(s, "a")
+	require.True(t, ok, "the gate must be defeatable for rollback")
+	assert.Len(t, uf, 1)
+}
+
+func TestMakeHooks_ChargesFallbackRouteEvenWhenUnselected(t *testing.T) {
+	// Fast-failover conns are fresh traffic and remain chargeable even though
+	// selectForExcluding does not make them sticky.
+	s, _ := newTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("a")
+
+	onStall, _ := s.makeHooks("b", fallbackRoute)
+	onStall(adapter.UserFailureReset)
+
+	uf, ok := userFailures(s, "b")
+	require.True(t, ok, "a fallback-route conn must stay chargeable")
+	require.Len(t, uf, 1)
+	assert.Equal(t, adapter.UserFailureReset, uf[0].Kind)
+}
+
+func TestDialContext_FastFailoverConnStaysChargeable(t *testing.T) {
+	// End-to-end fallback attribution: b's reset is charged to b even though
+	// a remains sticky.
+	s, obs := newTestMUR(t, "a", "b")
+	recordSuccess(s, "a", 10)
+	recordSuccess(s, "b", 20)
+	obs["a"].dial = func(context.Context) (net.Conn, error) {
+		return nil, errors.New("dial refused")
+	}
+	obs["b"].dial = func(context.Context) (net.Conn, error) {
+		return &failingConn{err: connResetErr(), failWrite: true}, nil
+	}
+
+	conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+	require.NoError(t, err, "fast failover should have produced b's conn")
+	require.Equal(t, "a", loadString(&s.stickyTag.tcp),
+		"fast failover must not move the sticky tag")
+
+	_, err = conn.Write([]byte("x"))
+	require.Error(t, err, "the fallback conn should fail the write")
+
+	require.Eventually(t, func() bool {
+		uf, _ := userFailures(s, "b")
+		return len(uf) == 1
+	}, time.Second, 5*time.Millisecond,
+		"a reset on the fallback conn must be charged to b")
+}
+
+func TestApplyStickiness_UnmeasuredStickyLosesToMeasuredPeer(t *testing.T) {
+	// Unknown delay is a sentinel, not a 0ms measurement; a measured clean
+	// peer should outrank an unmeasured soft-demoted sticky.
+	s, _ := newTestMUR(t, "a", "b")
+	recordSuccess(s, "b", 300)
+	s.stickyTag.tcp.Store("a")
+	addUserFailureN(s, "a", int(s.hist.softFailLimit))
+
+	got, err := s.selectFor("tcp")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "b", got.Tag(),
+		"an unmeasured, soft-demoted sticky must lose to a measured clean peer")
+}
+
+func TestChargeable_Policy(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("a")
+
+	assert.True(t, s.chargeable("a", primaryRoute), "the selection is chargeable")
+	assert.False(t, s.chargeable("b", primaryRoute), "an unselected primary conn is not")
+	assert.True(t, s.chargeable("b", fallbackRoute), "a fallback route is exempt from the gate")
+
+	s.cfg.demoteOnlySelected = false
+	assert.True(t, s.chargeable("b", primaryRoute), "the gate off makes everything chargeable")
 }

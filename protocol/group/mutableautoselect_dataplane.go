@@ -12,15 +12,14 @@ import (
 	"github.com/getlantern/lantern-box/adapter"
 )
 
-// makeHooks returns the (onFailure, onActivity) callback pair wired into
-// the data-plane wrappers. Callbacks re-look-up the member's history
-// at fire time so a Remove+Add cycle can't strand writes on a stale
-// entry. The failure callback short-circuits when recordUserFailure
-// reports a dedup/non-member, so a single broken outbound with N
-// orphan idle conns doesn't trigger N redundant full-fleet probe
-// sweeps.
-func (s *MutableAutoSelect) makeHooks(outerTag string) (onFailure func(adapter.UserFailureKind), onActivity func()) {
+// makeHooks returns callbacks wired into data-plane wrappers. Failure
+// handling re-checks membership at fire time, drops non-chargeable or
+// deduped events, and starts a ladder only for recorded failures.
+func (s *MutableAutoSelect) makeHooks(outerTag string, route routeKind) (onFailure func(adapter.UserFailureKind), onActivity func()) {
 	onFailure = func(kind adapter.UserFailureKind) {
+		if !s.chargeable(outerTag, route) {
+			return
+		}
 		if !s.recordUserFailure(outerTag, kind) {
 			return
 		}

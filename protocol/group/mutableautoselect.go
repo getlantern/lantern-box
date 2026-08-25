@@ -120,6 +120,7 @@ type mutableAutoSelectConfig struct {
 	ladderCooldown      time.Duration
 	dataPlaneIdle       time.Duration
 	dataPlaneProvedRead uint64
+	demoteOnlySelected  bool
 	maxPersistedAge     time.Duration
 	probeConcurrency    int
 }
@@ -134,6 +135,7 @@ func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) 
 		ladderCooldown:      time.Duration(o.LadderCooldownSeconds) * time.Second,
 		dataPlaneIdle:       time.Duration(o.DataPlaneIdleSeconds) * time.Second,
 		dataPlaneProvedRead: uint64(o.DataPlaneProvedReadBytes),
+		demoteOnlySelected:  o.DemoteOnlySelectedTag == nil || *o.DemoteOnlySelectedTag,
 		maxPersistedAge:     time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
 		probeConcurrency:    int(o.ProbeConcurrency),
 	}
@@ -476,7 +478,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	outerTag := o.Tag()
 	conn, err := o.DialContext(ctx, network, destination)
 	if err == nil {
-		return s.wrapStream(conn, o), nil
+		return s.wrapStream(conn, o, primaryRoute), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	// Attribute the failure to the outer (member) tag so rankLocked and
@@ -494,7 +496,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		conn, err = alt.DialContext(ctx, network, destination)
 		if err == nil {
 			go s.runLadder(outerTag)
-			return s.wrapStream(conn, alt), nil
+			return s.wrapStream(conn, alt, fallbackRoute), nil
 		}
 		s.logger.ErrorContext(ctx, err)
 		s.recordUserFailure(altTag, adapter.UserFailureDial)
@@ -523,7 +525,7 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	outerTag := o.Tag()
 	conn, err := o.ListenPacket(ctx, destination)
 	if err == nil {
-		return s.wrapPacket(conn, o), nil
+		return s.wrapPacket(conn, o, primaryRoute), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	s.recordUserFailure(outerTag, adapter.UserFailureDial)
@@ -534,7 +536,7 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		conn, err = alt.ListenPacket(ctx, destination)
 		if err == nil {
 			go s.runLadder(outerTag)
-			return s.wrapPacket(conn, alt), nil
+			return s.wrapPacket(conn, alt, fallbackRoute), nil
 		}
 		s.logger.ErrorContext(ctx, err)
 		s.recordUserFailure(altTag, adapter.UserFailureDial)
@@ -546,14 +548,31 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	return nil, err
 }
 
-func (s *MutableAutoSelect) wrapStream(conn net.Conn, o A.Outbound) net.Conn {
-	onStall, onActivity := s.makeHooks(o.Tag())
+// routeKind records whether a conn used the selected member or a
+// fast-failover alternate.
+type routeKind uint8
+
+const (
+	primaryRoute routeKind = iota
+	fallbackRoute
+)
+
+// chargeable reports whether a data-plane failure should count against tag.
+// Primary-route failures are counted only while tag is selected for TCP or
+// UDP; fallback-route failures are always counted as fresh failover traffic.
+func (s *MutableAutoSelect) chargeable(tag string, route routeKind) bool {
+	return !s.cfg.demoteOnlySelected || route == fallbackRoute ||
+		loadString(&s.stickyTag.tcp) == tag || loadString(&s.stickyTag.udp) == tag
+}
+
+func (s *MutableAutoSelect) wrapStream(conn net.Conn, o A.Outbound, route routeKind) net.Conn {
+	onStall, onActivity := s.makeHooks(o.Tag(), route)
 	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, onStall, onActivity)
 	return adapter.NewTaggedConn(wrapped, realTag(o))
 }
 
-func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, o A.Outbound) net.PacketConn {
-	onStall, onActivity := s.makeHooks(o.Tag())
+func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, o A.Outbound, route routeKind) net.PacketConn {
+	onStall, onActivity := s.makeHooks(o.Tag(), route)
 	wrapped := newDataPlanePacket(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, onStall, onActivity)
 	return adapter.NewTaggedPacketConn(wrapped, realTag(o))
 }
@@ -595,7 +614,7 @@ func (s *MutableAutoSelect) selectForExcluding(network, excludeTag string) (A.Ou
 			return c.tag == excludeTag
 		})
 	}
-	pool := s.splitHealthyForLocked(ranked, network)
+	pool, forNetwork := s.splitHealthyForLocked(ranked, network)
 	if len(pool) == 0 {
 		s.access.Unlock()
 		if excludeTag == "" {
@@ -607,7 +626,7 @@ func (s *MutableAutoSelect) selectForExcluding(network, excludeTag string) (A.Ou
 	}
 	var winner rankedCandidate
 	if excludeTag == "" {
-		winner = s.applyStickiness(network, slot, pool)
+		winner = s.applyStickiness(network, slot, pool, forNetwork)
 		prev := loadString(slot)
 		if prev != winner.tag {
 			slot.Store(winner.tag)
@@ -622,28 +641,53 @@ func (s *MutableAutoSelect) selectForExcluding(network, excludeTag string) (A.Ou
 	return winner.outbound, nil
 }
 
-// applyStickiness applies the spec's switch-tolerance hysteresis: keep
-// the sticky tag if it's in pool and the rank winner doesn't beat it by
-// at least switchTolerance. Caller must hold s.access.
-func (s *MutableAutoSelect) applyStickiness(network string, slot *atomic.Value, pool []rankedCandidate) rankedCandidate {
+// applyStickiness applies switch-tolerance hysteresis. It looks for the
+// sticky tag across every demotion tier, not just pool, so soft demotion
+// still goes through the normal comparison instead of looking like removal.
+//
+// Retention is capped at softFailLimit failures; beyond that, continuing
+// failures release the sticky even if it remains much faster.
+//
+// Caller must hold s.access.
+func (s *MutableAutoSelect) applyStickiness(network string, slot *atomic.Value, pool, forNetwork []rankedCandidate) rankedCandidate {
 	best := pool[0]
 	sticky := loadString(slot)
 	if sticky == "" || sticky == best.tag {
 		return best
 	}
-	for _, c := range pool {
-		if c.tag != sticky {
-			continue
-		}
-		tolMs := uint64(s.cfg.switchTolerance / time.Millisecond)
-		if uint64(best.delayMs)+tolMs <= uint64(c.delayMs) {
-			s.logger.Info(network, " switch: ", c.tag, "(", c.delayMs, "ms) -> ", best.tag, "(", best.delayMs, "ms)")
-			return best
-		}
+	idx := slices.IndexFunc(forNetwork, func(c rankedCandidate) bool {
+		return c.tag == sticky
+	})
+	if idx < 0 {
+		s.logSwitch(network, sticky, best, "not a candidate")
+		return best
+	}
+	c := forNetwork[idx]
+	switch {
+	case c.kind != best.kind:
+		// The tolerance comparison only means something between measurements
+		// of the same nature: kindUnknown carries delayMs 0 and
+		// kindSubstituted a synthetic constant, so comparing across kinds
+		// would let a never-probed sticky's 0ms retain it against a real
+		// measurement. rankLocked already sorts demote, then kind, then
+		// delay, so defer to that ordering.
+		s.logSwitch(network, sticky, best, "kind outranked")
+	case c.demote == demoteHard && best.demote < demoteHard:
+		s.logSwitch(network, sticky, best, "hard-demoted")
+	case c.demote > best.demote && c.userFails > s.hist.softFailLimit:
+		s.logSwitch(network, sticky, best, "failures past retention")
+	case uint64(best.delayMs)+uint64(s.cfg.switchTolerance/time.Millisecond) <= uint64(c.delayMs):
+		s.logSwitch(network, sticky, best, "beaten on delay")
+	default:
 		return c
 	}
-	s.logger.Info(network, " switch: ", sticky, " -> ", best.tag, " (sticky not in pool)")
 	return best
+}
+
+// logSwitch records which rule moved the group off sticky; a churn report is
+// only actionable if the logs say that.
+func (s *MutableAutoSelect) logSwitch(network, sticky string, best rankedCandidate, reason string) {
+	s.logger.Info(network, " switch: ", sticky, " -> ", best.tag, " (", reason, ")")
 }
 
 // clearStickyTagLocked drops the sticky tag for any network where it
@@ -749,23 +793,22 @@ const (
 )
 
 type rankedCandidate struct {
-	outbound A.Outbound
-	tag      string
-	delayMs  uint32
-	demote   demoteLevel
-	kind     candidateKind
+	outbound  A.Outbound
+	tag       string
+	delayMs   uint32
+	demote    demoteLevel
+	kind      candidateKind
+	userFails uint32
 }
 
-// splitHealthyForLocked restricts ranked to candidates supporting network,
-// then returns the cleanest non-empty subset: clean if any exist, else
-// soft-demoted, else the network-filtered slice (hard-demoted as last
-// resort). Per-network so a soft-only UDP candidate isn't drowned out
-// by a clean TCP-only peer.
+// splitHealthyForLocked filters ranked to network and returns the cleanest
+// non-empty tier as pool (clean, then soft, then hard). forNetwork contains
+// all filtered candidates so stickiness can evaluate a demoted tag outside
+// pool.
 //
-// ranked must be demote-sorted ascending (clean < soft < hard), as rankLocked returns it,
-// so each tier is contiguous. Requires access held: the result aliases s.scratchSplit
-// until the caller releases the lock.
-func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, network string) []rankedCandidate {
+// ranked must be sorted by demote level, as rankLocked returns it. Requires
+// s.access; both returned slices alias s.scratchSplit.
+func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, network string) (pool, forNetwork []rankedCandidate) {
 	clear(s.scratchSplit)
 	out := s.scratchSplit[:0]
 	var nClean, nSoft int
@@ -784,11 +827,11 @@ func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, netw
 	s.scratchSplit = out
 	switch {
 	case nClean > 0:
-		return out[:nClean]
+		return out[:nClean], out
 	case nSoft > 0:
-		return out[nClean : nClean+nSoft]
+		return out[nClean : nClean+nSoft], out
 	default:
-		return out
+		return out, out
 	}
 }
 
@@ -911,7 +954,7 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 		case soft:
 			level = demoteSoft
 		}
-		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, kind: p.kind, demote: level})
+		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, kind: p.kind, demote: level, userFails: p.userFails})
 	}
 	s.scratchRanked = out
 	sort.SliceStable(out, func(i, j int) bool {
