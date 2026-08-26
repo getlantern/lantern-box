@@ -7,6 +7,7 @@ const (
 	TypeOutline   = "outline"
 	TypeReflex    = "reflex"
 	TypeSamizdat  = "samizdat"
+	TypeTwiddle   = "twiddle"
 	TypeUnbounded = "unbounded"
 	TypeWATER     = "water"
 )

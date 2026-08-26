@@ -28,3 +28,16 @@ func TestSupportedProtocolsIncludesUnbounded(t *testing.T) {
 	t.Error(`protocol.SupportedProtocols() does not include "unbounded" — ` +
 		`add it to the supportedProtocols slice in protocol/register.go`)
 }
+
+// TestSupportedProtocolsIncludesTwiddle guards the same regression for twiddle:
+// registering with the sing-box registry but omitting the protocol from the
+// advertised slice leaves the client negotiator unaware it exists.
+func TestSupportedProtocolsIncludesTwiddle(t *testing.T) {
+	for _, p := range protocol.SupportedProtocols() {
+		if p == "twiddle" {
+			return
+		}
+	}
+	t.Error(`protocol.SupportedProtocols() does not include "twiddle" — ` +
+		`add it to the supportedProtocols slice in protocol/register.go`)
+}

@@ -1,4 +1,11 @@
-package reflex
+// Package masquerade implements the splitting egress: a connection that fails
+// to authenticate is forwarded verbatim to a real cover site, which answers it.
+//
+// For protocols that cannot complete a genuine handshake with an unauthenticated
+// peer -- reflex, and twiddle, whose TLS opening is synthesised -- this is not an
+// optional hardening. It is the only thing standing between an active prober and
+// a distinguishing reply.
+package masquerade
 
 import (
 	"context"
@@ -9,12 +16,11 @@ import (
 	"time"
 )
 
-// masqueradeDialTimeout is the timeout for dialing the upstream cover site.
-const masqueradeDialTimeout = 10 * time.Second
+// dialTimeout is the timeout for dialing the upstream cover site.
+const dialTimeout = 10 * time.Second
 
-// forwardToMasquerade transparently forwards conn to upstream (host:port),
-// prepending prefix bytes (which were already consumed from conn during the
-// silence probe) before the client's stream.
+// Blocks until both copy directions return. Returns the first non-EOF copy
+// error, or the dial/replay error, or nil on clean close.
 //
 // Blocks until both copy directions return. Returns the first non-EOF copy
 // error, or the dial/replay error, or nil on clean close.
@@ -22,12 +28,14 @@ const masqueradeDialTimeout = 10 * time.Second
 // To unblock the copy loops on context cancellation and when either
 // direction finishes, this function may close both the upstream connection
 // and conn. Callers should treat conn as possibly-closed after return.
-func forwardToMasquerade(ctx context.Context, conn net.Conn, upstream string, prefix []byte) error {
+// Forward transparently forwards conn to upstream (host:port), prepending any
+// prefix bytes already consumed from conn.
+func Forward(ctx context.Context, conn net.Conn, upstream string, prefix []byte) error {
 	if upstream == "" {
 		return fmt.Errorf("masquerade upstream not configured")
 	}
 
-	dctx, cancel := context.WithTimeout(ctx, masqueradeDialTimeout)
+	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 
 	var d net.Dialer
@@ -65,13 +73,11 @@ func forwardToMasquerade(ctx context.Context, conn net.Conn, upstream string, pr
 		_ = conn.Close()
 		errCh <- err
 	}()
-	return firstRealError(<-errCh, <-errCh)
+	return FirstRealError(<-errCh, <-errCh)
 }
 
-// firstRealError returns the first non-nil, non-EOF, non-closed-network error
-// from the two copy directions. EOF and use-of-closed-connection are expected
-// on clean shutdown.
-func firstRealError(errs ...error) error {
+// FirstRealError returns the first non-nil, non-EOF, non-closed-network error.
+func FirstRealError(errs ...error) error {
 	for _, err := range errs {
 		if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 			continue

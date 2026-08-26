@@ -1,4 +1,4 @@
-package reflex
+package masquerade
 
 import (
 	"context"
@@ -56,7 +56,7 @@ func TestForwardToMasquerade_ReplayPrefixAndForward(t *testing.T) {
 
 	forwardErrCh := make(chan error, 1)
 	go func() {
-		forwardErrCh <- forwardToMasquerade(context.Background(), serverSide, upstream, prefix)
+		forwardErrCh <- Forward(context.Background(), serverSide, upstream, prefix)
 	}()
 
 	// Client writes the rest of "X" + "HELLO" — total stream sent to upstream
@@ -79,7 +79,7 @@ func TestForwardToMasquerade_ReplayPrefixAndForward(t *testing.T) {
 	clientSide.Close()
 	select {
 	case err := <-forwardErrCh:
-		// EOF / closed-pipe is expected; firstRealError suppresses it to nil.
+		// EOF / closed-pipe is expected; FirstRealError suppresses it to nil.
 		if err != nil {
 			t.Logf("forward returned (acceptable on close): %v", err)
 		}
@@ -94,7 +94,7 @@ func TestForwardToMasquerade_DialFailure(t *testing.T) {
 	defer serverSide.Close()
 
 	// Port 1 on localhost should refuse connections quickly.
-	err := forwardToMasquerade(context.Background(), serverSide, "127.0.0.1:1", []byte{'X'})
+	err := Forward(context.Background(), serverSide, "127.0.0.1:1", []byte{'X'})
 	if err == nil {
 		t.Fatal("expected dial error, got nil")
 	}
@@ -105,24 +105,24 @@ func TestForwardToMasquerade_EmptyUpstream(t *testing.T) {
 	defer clientSide.Close()
 	defer serverSide.Close()
 
-	err := forwardToMasquerade(context.Background(), serverSide, "", []byte{'X'})
+	err := Forward(context.Background(), serverSide, "", []byte{'X'})
 	if err == nil {
 		t.Fatal("expected error for empty upstream, got nil")
 	}
 }
 
 func TestFirstRealError(t *testing.T) {
-	if err := firstRealError(nil, nil); err != nil {
+	if err := FirstRealError(nil, nil); err != nil {
 		t.Errorf("expected nil for all-nil, got %v", err)
 	}
-	if err := firstRealError(io.EOF, io.EOF); err != nil {
+	if err := FirstRealError(io.EOF, io.EOF); err != nil {
 		t.Errorf("expected nil for all-EOF, got %v", err)
 	}
 	real := io.ErrUnexpectedEOF
-	if err := firstRealError(io.EOF, real); err != real {
+	if err := FirstRealError(io.EOF, real); err != real {
 		t.Errorf("expected %v, got %v", real, err)
 	}
-	if err := firstRealError(real, io.EOF); err != real {
+	if err := FirstRealError(real, io.EOF); err != real {
 		t.Errorf("expected %v, got %v", real, err)
 	}
 }
