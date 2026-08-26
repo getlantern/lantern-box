@@ -1,6 +1,6 @@
 module github.com/getlantern/lantern-box
 
-go 1.26.2
+go 1.25
 
 // replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.18-lantern
 
@@ -29,7 +29,7 @@ require (
 	github.com/getlantern/lantern-water v0.0.0-20260520145825-958775d51395
 	github.com/getlantern/samizdat v0.0.3-0.20260819153658-ebc74116a064
 	github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb
-	github.com/getlantern/twiddle v0.0.0-20260826202959-3b9eac914d25
+	github.com/getlantern/twiddle v0.0.0-20260826224025-1f6cf44029c0
 	github.com/gobwas/ws v1.4.0
 	github.com/pion/transport/v4 v4.0.1
 	github.com/refraction-networking/water v0.7.1-alpha

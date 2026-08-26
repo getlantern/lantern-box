@@ -279,8 +279,8 @@ github.com/getlantern/sing-box-minimal v1.13.19-lantern h1:dwVCskH9N3Q5a2wVELdyG
 github.com/getlantern/sing-box-minimal v1.13.19-lantern/go.mod h1:4E8WvF7Vi60N1NtPw1CeG994J/yiJZZkty5dKKwG+V0=
 github.com/getlantern/telemetry v0.0.0-20250606052628-8960164ec1f5 h1:6ITBYqNkLbVZ1tQNXwmH8N80rZtvyW6IZa8L6EAhBQo=
 github.com/getlantern/telemetry v0.0.0-20250606052628-8960164ec1f5/go.mod h1:gx3dPUhZtQszPX5C+TshhxPXQHlY5t4gMnOOMA+viPA=
-github.com/getlantern/twiddle v0.0.0-20260826202959-3b9eac914d25 h1:ICm28T2LUfdWqDPlH93sB33P5tJfgtF6K6NZBZQuOn4=
-github.com/getlantern/twiddle v0.0.0-20260826202959-3b9eac914d25/go.mod h1:ij/mt/8nykKcXfGO2BhdtclOdRd+c6x65oasgMln9v8=
+github.com/getlantern/twiddle v0.0.0-20260826224025-1f6cf44029c0 h1:RV3BpVT/TRL54JYq4mlZ40qW8xITJi/+mbSXcuHQ7/w=
+github.com/getlantern/twiddle v0.0.0-20260826224025-1f6cf44029c0/go.mod h1:aU9c2/kcZhCxXCOZMN/Vulc+baDNHecqlvgLXOIeyOY=
 github.com/getlantern/water v0.7.1-alpha.0.20260309190745-bd547c14b4aa h1:goZee1cURbWPiqX1xyjfwLB/zByQ50hEwonnnyLmcJQ=
 github.com/getlantern/water v0.7.1-alpha.0.20260309190745-bd547c14b4aa/go.mod h1:Yo6Yk++Q9HRaCT+6/eYk3elNoNtjlJ3V5FufHY6ezto=
 github.com/getlantern/wazero v1.11.0-water.1 h1:mzUlaOoQKMDd16yL3mBIFrzg2nEK+gw7mdQgff1nOPQ=

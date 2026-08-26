@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -66,6 +67,7 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 			TicketKey: key,
 			MaxAge:    maxAge,
 			TicketLen: options.TicketLen,
+			PSKFirst:  options.PSKFirst,
 			Shaper:    tw.BrowsingShaper(true),
 		},
 		masqueradeUpstream: options.MasqueradeUpstream,
@@ -87,10 +89,14 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 func (i *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	peeked := &peekConn{Conn: conn}
 	tconn, err := tw.Server(peeked, i.cfg)
+	// Stop recording either way. On success the session continues reading through
+	// peekConn, and without this every byte of an authenticated connection would
+	// be buffered for the lifetime of the session.
+	peeked.stop()
 	if err != nil {
 		i.logger.DebugContext(ctx, "twiddle: unauthenticated connection from ", metadata.Source,
 			"; masquerading to ", i.masqueradeUpstream)
-		ferr := masquerade.Forward(ctx, conn, i.masqueradeUpstream, peeked.seen)
+		ferr := masquerade.Forward(ctx, conn, i.masqueradeUpstream, peeked.replay())
 		if ferr != nil {
 			i.logger.DebugContext(ctx, "twiddle: masquerade forward error: ", ferr)
 		}
@@ -131,21 +137,52 @@ func readDestination(r io.Reader) (string, error) {
 	return string(buf), nil
 }
 
-// peekConn records everything read from the connection so that a failed
-// authentication can be replayed to the cover site byte for byte. A prober must
-// see its own bytes arrive at a real server, not a truncated stream.
+// peekConn records what is read during authentication so a failed attempt can be
+// replayed to the cover site byte for byte. A prober must see its own bytes
+// arrive at a real server, not a truncated stream.
+//
+// Recording is bounded twice over. stop() ends it as soon as authentication
+// resolves -- otherwise an authenticated session would buffer its entire
+// lifetime's traffic -- and maxPeek caps what an unauthenticated peer can make
+// us hold before it resolves, since a prober controls how much it sends.
 type peekConn struct {
+	mu      sync.Mutex
+	stopped bool
+	seen    []byte
 	net.Conn
-	seen []byte
-	done bool
 }
+
+// maxPeek bounds the replay buffer. A ClientHello is ~2 KB; 64 KB leaves room
+// for a peer whose opening spans several records without letting one hold
+// unbounded memory.
+const maxPeek = 64 << 10
 
 func (c *peekConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	if n > 0 && !c.done {
-		c.seen = append(c.seen, b[:n]...)
+	if n > 0 {
+		c.mu.Lock()
+		if !c.stopped && len(c.seen) < maxPeek {
+			room := maxPeek - len(c.seen)
+			if room > n {
+				room = n
+			}
+			c.seen = append(c.seen, b[:room]...)
+		}
+		c.mu.Unlock()
 	}
 	return n, err
+}
+
+func (c *peekConn) stop() {
+	c.mu.Lock()
+	c.stopped = true
+	c.mu.Unlock()
+}
+
+func (c *peekConn) replay() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.seen
 }
 
 func (i *Inbound) Start(stage adapter.StartStage) error {

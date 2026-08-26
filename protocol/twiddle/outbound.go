@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -38,7 +39,14 @@ type Outbound struct {
 	server  string
 	port    uint16
 	timeout time.Duration
-	cfg     tw.ClientConfig
+
+	// mu guards cred, which rotates on every connection: the egress issues the
+	// next credential inside each flight. sing-box dials concurrently, so
+	// without this two dials could race and either lose a rotation or present
+	// the same single-use ticket twice.
+	mu   sync.Mutex
+	cred *tw.Credential
+	cfg  tw.ClientConfig
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogger, tag string, options option.TwiddleOutboundOptions) (adapter.Outbound, error) {
@@ -83,11 +91,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		server:  options.Server,
 		port:    options.ServerPort,
 		timeout: timeout,
+		cred:    cred,
 		cfg: tw.ClientConfig{
-			Pool:       pool,
-			CoverSNI:   options.CoverSNI,
-			Credential: cred,
-			Shaper:     tw.BrowsingShaper(false),
+			Pool:     pool,
+			CoverSNI: options.CoverSNI,
+			Shaper:   tw.BrowsingShaper(false),
 		},
 	}, nil
 }
@@ -104,7 +112,12 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	}
 	raw.SetDeadline(time.Now().Add(o.timeout))
 
-	conn, next, err := tw.Client(raw, o.cfg)
+	cfg := o.cfg
+	o.mu.Lock()
+	cfg.Credential = o.cred
+	o.mu.Unlock()
+
+	conn, next, err := tw.Client(raw, cfg)
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("twiddle: opening failed: %w", err)
@@ -112,10 +125,12 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	raw.SetDeadline(time.Time{})
 
 	// The egress issues the next credential inside its flight, exactly as
-	// NewSessionTicket does. Rotating here keeps every connection's ticket
-	// single-use, which is what TLS 1.3 expects of a real client.
+	// NewSessionTicket does. Rotating here keeps every ticket single-use, which
+	// is what TLS 1.3 expects of a real client.
 	if next != nil {
-		o.cfg.Credential = next
+		o.mu.Lock()
+		o.cred = next
+		o.mu.Unlock()
 	}
 
 	if err := writeDestination(conn, destination.String()); err != nil {
