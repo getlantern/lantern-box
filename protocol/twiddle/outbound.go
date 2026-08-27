@@ -40,14 +40,25 @@ type Outbound struct {
 	port    uint16
 	timeout time.Duration
 
-	// mu guards cred, which rotates on every connection: the egress issues the
-	// next credential inside each flight. sing-box dials concurrently, so
-	// without this two dials could race and either lose a rotation or present
-	// the same single-use ticket twice.
-	mu   sync.Mutex
-	cred *tw.Credential
-	cfg  tw.ClientConfig
+	// mu guards creds, the pool of credentials not yet spent. The egress issues
+	// a fresh one inside every flight, so a completed connection returns more
+	// than it took only in the sense that it replaces what it consumed.
+	//
+	// sing-box dials concurrently, which is why this is a pool and not a single
+	// slot: each dial claims a distinct credential when one is available, so
+	// sequential and moderately concurrent traffic never presents the same
+	// ticket twice. Under a burst wider than the pool, dials fall back to
+	// reusing the last credential rather than failing -- TLS 1.3 asks clients
+	// not to reuse tickets, but a dead connection is worse than a reused one,
+	// and the egress does not currently enforce single use. Eliminating reuse
+	// entirely would need the egress to issue several credentials per flight.
+	mu    sync.Mutex
+	creds []*tw.Credential
+	cfg   tw.ClientConfig
 }
+
+// maxCredPool bounds credential accumulation on a long-lived outbound.
+const maxCredPool = 32
 
 func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogger, tag string, options option.TwiddleOutboundOptions) (adapter.Outbound, error) {
 	ticket, err := base64.StdEncoding.DecodeString(options.Ticket)
@@ -91,7 +102,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		server:  options.Server,
 		port:    options.ServerPort,
 		timeout: timeout,
-		cred:    cred,
+		creds:   []*tw.Credential{cred},
 		cfg: tw.ClientConfig{
 			Pool:     pool,
 			CoverSNI: options.CoverSNI,
@@ -113,9 +124,7 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	raw.SetDeadline(time.Now().Add(o.timeout))
 
 	cfg := o.cfg
-	o.mu.Lock()
-	cfg.Credential = o.cred
-	o.mu.Unlock()
+	cfg.Credential = o.takeCredential()
 
 	conn, next, err := tw.Client(raw, cfg)
 	if err != nil {
@@ -125,12 +134,9 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	raw.SetDeadline(time.Time{})
 
 	// The egress issues the next credential inside its flight, exactly as
-	// NewSessionTicket does. Rotating here keeps every ticket single-use, which
-	// is what TLS 1.3 expects of a real client.
+	// NewSessionTicket does.
 	if next != nil {
-		o.mu.Lock()
-		o.cred = next
-		o.mu.Unlock()
+		o.putCredential(next)
 	}
 
 	if err := writeDestination(conn, destination.String()); err != nil {
@@ -138,6 +144,28 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, err
 	}
 	return conn, nil
+}
+
+// takeCredential claims a credential for one dial. The last one is reused
+// rather than removed, so a dial never fails for want of a credential.
+func (o *Outbound) takeCredential() *tw.Credential {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	last := len(o.creds) - 1
+	c := o.creds[last]
+	if last > 0 {
+		o.creds = o.creds[:last]
+	}
+	return c
+}
+
+func (o *Outbound) putCredential(c *tw.Credential) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.creds = append(o.creds, c)
+	if len(o.creds) > maxCredPool {
+		o.creds = o.creds[len(o.creds)-maxCredPool:]
+	}
 }
 
 func writeDestination(conn net.Conn, dest string) error {

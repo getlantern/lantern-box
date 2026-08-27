@@ -1,12 +1,15 @@
 package twiddle
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sagernet/sing-box/log"
@@ -189,34 +192,135 @@ func TestPeekConnReplayIsFaithful(t *testing.T) {
 	}
 }
 
-// TestConcurrentDialsDoNotRaceOnCredential covers the data race review found:
-// DialContext rotated o.cfg.Credential in place, and sing-box dials
-// concurrently. Run with -race.
-func TestConcurrentDialsDoNotRaceOnCredential(t *testing.T) {
-	_, ticket, psk := creds(t)
+// TestConcurrentDialsExerciseTheCredentialPath replaces an earlier version that
+// pointed at port 1. Review caught that the TCP dial fails before DialContext
+// ever reaches the credential code, so the test asserted nothing about the path
+// it named -- a vacuous test that would have passed with the pool removed.
+//
+// This one stands up a real twiddle egress, so every dial completes an opening
+// and actually claims and returns a credential. Run under -race.
+func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
+	key, err := tw.NewTicketKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := key.Issue(1, tw.DefaultTicketLen)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var served int64
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				tc, err := tw.Server(c, tw.ServerConfig{TicketKey: key})
+				if err != nil {
+					return
+				}
+				if _, err := readDestination(tc); err == nil {
+					atomic.AddInt64(&served, 1)
+				}
+			}(c)
+		}
+	}()
+
+	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port, _ := strconv.Atoi(portStr)
 	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleOutboundOptions{
-			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 1},
-			Ticket:        ticket, PSK: psk, CoverSNI: "www.example.com",
+			ServerOptions: boxoption.ServerOptions{Server: host, ServerPort: uint16(port)},
+			Ticket:        base64.StdEncoding.EncodeToString(cred.Ticket),
+			PSK:           hex.EncodeToString(cred.PSK[:]),
+			CoverSNI:      "www.example.com",
 		})
 	if err != nil {
 		t.Fatal(err)
 	}
 	o := ob.(*Outbound)
 
+	const n = 24
 	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
+	var ok int64
+	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// dials fail (port 1), but the credential read/rotate path still runs
-			o.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.com:443"))
-			o.mu.Lock()
-			_ = o.cred
-			o.mu.Unlock()
+			c, err := o.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.com:443"))
+			if err == nil {
+				atomic.AddInt64(&ok, 1)
+				c.Close()
+			}
 		}()
 	}
 	wg.Wait()
+
+	if ok == 0 {
+		t.Fatal("no dial completed — the credential path was never exercised")
+	}
+	o.mu.Lock()
+	pooled := len(o.creds)
+	o.mu.Unlock()
+	if pooled == 0 {
+		t.Error("credential pool is empty; a dial consumed the last credential")
+	}
+	t.Logf("%d/%d dials completed, %d openings served, %d credentials pooled",
+		ok, n, atomic.LoadInt64(&served), pooled)
+}
+
+// TestCredentialPoolHandsOutDistinctCredentials: sequential connections must
+// never present the same ticket twice, which is what the pool is for.
+func TestCredentialPoolHandsOutDistinctCredentials(t *testing.T) {
+	key, _ := tw.NewTicketKey()
+	c1, _ := key.Issue(1, tw.DefaultTicketLen)
+	c2, _ := key.Issue(1, tw.DefaultTicketLen)
+	o := &Outbound{creds: []*tw.Credential{c1, c2}}
+
+	a := o.takeCredential()
+	b := o.takeCredential()
+	if bytes.Equal(a.Ticket, b.Ticket) {
+		t.Error("two takes returned the same credential while the pool held two")
+	}
+	// the last credential is reused rather than removed, so a dial never starves
+	c := o.takeCredential()
+	if c == nil {
+		t.Fatal("takeCredential returned nil on an exhausted pool")
+	}
+	o.putCredential(c1)
+	o.mu.Lock()
+	got := len(o.creds)
+	o.mu.Unlock()
+	if got != 2 {
+		t.Errorf("pool has %d credentials after a put, want 2", got)
+	}
+}
+
+// TestCredentialPoolIsBounded guards against unbounded growth on a long-lived
+// outbound.
+func TestCredentialPoolIsBounded(t *testing.T) {
+	key, _ := tw.NewTicketKey()
+	seed, _ := key.Issue(1, tw.DefaultTicketLen)
+	o := &Outbound{creds: []*tw.Credential{seed}}
+	for i := 0; i < maxCredPool*3; i++ {
+		c, _ := key.Issue(1, tw.DefaultTicketLen)
+		o.putCredential(c)
+	}
+	o.mu.Lock()
+	got := len(o.creds)
+	o.mu.Unlock()
+	if got > maxCredPool {
+		t.Errorf("pool grew to %d, past the %d cap", got, maxCredPool)
+	}
 }
 
 // TestPSKFirstReachesServerConfig covers the dead option review found.
