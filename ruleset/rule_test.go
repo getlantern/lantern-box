@@ -131,6 +131,7 @@ func testStart(t *testing.T, ctx context.Context, mRuleSet *MutableRuleSet, rsTa
 	rule := mRuleSet.rules[0].(*ruleWrapper)
 	require.Equal(t, rule.name, rsTag, "rule name mismatch")
 	require.Contains(t, mRuleSet.filter.Domain, domain, "rule not loaded")
+	require.Contains(t, mRuleSet.filter.Domain, domain, "rule not loaded")
 }
 
 func testMatch(
