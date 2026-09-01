@@ -75,6 +75,9 @@ func TestNewConnectionEx_MalformedRequestLine(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("onClose was never called")
 	}
+
+	_, err := client.Read(make([]byte, 1))
+	require.Error(t, err)
 }
 
 func TestE2E(t *testing.T) {
