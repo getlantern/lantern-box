@@ -16,7 +16,7 @@ type mockOutbound struct {
 	typeName string
 	networks []string
 	// dial, when set, supersedes the mock expectation so each call gets
-	// its own conn; runProbe closes what it dials, so a shared one breaks
+	// its own conn; probe.Run closes what it dials, so a shared one breaks
 	// on the second probe. It receives the caller's context so a stub can
 	// honor the probe deadline the way a real outbound does.
 	dial func(context.Context) (net.Conn, error)
