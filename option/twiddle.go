@@ -54,11 +54,31 @@ type TwiddleOutboundOptions struct {
 	// are answered by another.
 	CoverSNI string `json:"cover_sni"`
 
-	// HelloPool overrides the built-in pool of harvested ClientHellos: one
-	// hex-encoded record per line. The built-in pool is a snapshot of one Chrome
-	// version and ages into a signal, so shipping a refreshed pool here is the
-	// intended path.
+	// HelloPool carries a pool of harvested ClientHellos inline: one hex-encoded
+	// record per line. This is the config-delivered tier -- it beats the pool
+	// compiled into the twiddle module, which is a snapshot of one Chrome version
+	// and ages into a positive signal, but it loses to HelloPoolDevicePath.
 	HelloPool string `json:"hello_pool,omitempty"`
+
+	// HelloPoolPath is a config-written pool file, in the same form as
+	// HelloPool. It ranks in the same tier and takes precedence within it, so a
+	// config fetcher may deliver hellos either way.
+	HelloPoolPath string `json:"hello_pool_path,omitempty"`
+
+	// HelloPoolDevicePath is a pool tapped from this device's OWN outbound TLS
+	// traffic, and it outranks both of the above.
+	//
+	// It is the only source that cannot go stale: by construction it holds what
+	// the browser installed on this device emits right now, with this device's
+	// Chrome version and field-trial state. Every other source is somebody
+	// else's snapshot -- the twiddle module's built-in pool already reproduces no
+	// Chrome that exists, having been captured before Chrome dropped
+	// server_padding (0x12e0) and added 0xca34.
+	//
+	// Whatever writes this file MUST pass each hello through twiddle.Sanitize
+	// first. A tapped hello names a site the user actually visited, and a
+	// resumption hello also carries that site's session ticket.
+	HelloPoolDevicePath string `json:"hello_pool_device_path,omitempty"`
 
 	ConnectTimeout string `json:"connect_timeout,omitempty"`
 }

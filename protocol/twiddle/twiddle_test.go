@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -123,16 +125,120 @@ func TestOutboundUsesTheEmbeddedPoolByDefault(t *testing.T) {
 	}
 }
 
-func TestOutboundRejectsACorruptPool(t *testing.T) {
+// A corrupt configured pool must DEGRADE to the built-in one, not fail the
+// outbound.
+//
+// This reverses the earlier contract deliberately. A pool arrives by config
+// push, so a bad one reaches every client at once; the two candidate failure
+// modes are "every client emits a stale fingerprint" and "every client has no
+// outbound at all". The first risks detection, probabilistically and
+// recoverably; the second is a certain outage. Both are fixed by pushing new
+// config, so the interim state is the whole of the difference, and staleness is
+// the better interim state.
+//
+// The compensating requirement is that the degradation be visible, which is
+// what poolOrigin and the logged Skipped errors are for.
+func TestOutboundDegradesToEmbeddedOnACorruptPool(t *testing.T) {
 	_, ticket, psk := creds(t)
-	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, PSK: psk, CoverSNI: "a.example",
 			HelloPool: "not hex at all",
 		})
-	if err == nil {
-		t.Fatal("outbound accepted a corrupt hello pool")
+	if err != nil {
+		t.Fatalf("a corrupt pool must not brick the outbound: %v", err)
+	}
+	o := ob.(*Outbound)
+	if o.poolOrigin != tw.OriginEmbedded {
+		t.Errorf("pool origin is %v, want embedded", o.poolOrigin)
+	}
+	if len(o.cfg.Pool) == 0 {
+		t.Error("degraded outbound has no hellos at all")
+	}
+}
+
+// The device tap outranks both config tiers, and an inline config pool outranks
+// the built-in one. This is the precedence the whole three-tier arrangement
+// exists for, so it is asserted here and not just in the twiddle module.
+func TestOutboundPoolPrecedence(t *testing.T) {
+	_, ticket, psk := creds(t)
+
+	// One real hello, rewritten so each tier is distinguishable by SNI.
+	poolFor := func(t *testing.T, name string) string {
+		t.Helper()
+		h, err := tw.ParseClientHello(tw.DefaultPool()[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h.SetSNI(name); err != nil {
+			t.Fatal(err)
+		}
+		return tw.FormatPool([][]byte{h.Marshal()})
+	}
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "pool.hex")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	devicePath := write(t, poolFor(t, "device.example"))
+	configPath := write(t, poolFor(t, "configfile.example"))
+	inline := poolFor(t, "inline.example")
+
+	for _, tc := range []struct {
+		name       string
+		opts       option.TwiddleOutboundOptions
+		wantOrigin tw.Origin
+		wantSNI    string
+	}{
+		{
+			name:       "device beats everything",
+			opts:       option.TwiddleOutboundOptions{HelloPoolDevicePath: devicePath, HelloPoolPath: configPath, HelloPool: inline},
+			wantOrigin: tw.OriginDevice, wantSNI: "device.example",
+		},
+		{
+			name:       "config file beats inline",
+			opts:       option.TwiddleOutboundOptions{HelloPoolPath: configPath, HelloPool: inline},
+			wantOrigin: tw.OriginConfig, wantSNI: "configfile.example",
+		},
+		{
+			name:       "inline beats embedded",
+			opts:       option.TwiddleOutboundOptions{HelloPool: inline},
+			wantOrigin: tw.OriginConfig, wantSNI: "inline.example",
+		},
+		{
+			name:       "nothing configured falls back",
+			opts:       option.TwiddleOutboundOptions{},
+			wantOrigin: tw.OriginEmbedded,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := tc.opts
+			o.ServerOptions = boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443}
+			o.Ticket, o.PSK, o.CoverSNI = ticket, psk, "www.microsoft.com"
+			ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t", o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := ob.(*Outbound)
+			if out.poolOrigin != tc.wantOrigin {
+				t.Errorf("origin = %v, want %v", out.poolOrigin, tc.wantOrigin)
+			}
+			if tc.wantSNI == "" {
+				return
+			}
+			h, err := tw.ParseClientHello(out.cfg.Pool[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h.SNI() != tc.wantSNI {
+				t.Errorf("loaded the wrong tier: SNI %q, want %q", h.SNI(), tc.wantSNI)
+			}
+		})
 	}
 }
 

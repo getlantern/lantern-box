@@ -55,6 +55,10 @@ type Outbound struct {
 	mu    sync.Mutex
 	creds []*tw.Credential
 	cfg   tw.ClientConfig
+
+	// poolOrigin records which tier the hellos came from, so a client that has
+	// quietly degraded to the built-in pool is diagnosable after the fact.
+	poolOrigin tw.Origin
 }
 
 // maxCredPool bounds credential accumulation on a long-lived outbound.
@@ -74,12 +78,24 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		return nil, err
 	}
 
-	pool := tw.DefaultPool()
-	if options.HelloPool != "" {
-		if pool, err = tw.ParsePool(options.HelloPool); err != nil {
-			return nil, err
-		}
+	// Hello sourcing is twiddle's policy, not ours: it owns the precedence
+	// (device tap, then config, then its built-in pool), the per-entry screening
+	// and the partitioning of a source that mixes browser builds. Reimplementing
+	// any of that here would let the two drift apart.
+	pool, err := tw.LoadPool(tw.Sources{
+		Device:       options.HelloPoolDevicePath,
+		Config:       options.HelloPoolPath,
+		ConfigInline: options.HelloPool,
+	})
+	if err != nil {
+		return nil, err
 	}
+	// A client that silently drops to the built-in pool still connects, so this
+	// has to be visible or a stale fingerprint ships unnoticed.
+	for _, skipped := range pool.Skipped {
+		lg.Warn("twiddle: ", skipped)
+	}
+	lg.Info("twiddle: ", len(pool.Hellos), " hellos from the ", pool.Origin, " pool")
 	if options.CoverSNI == "" {
 		return nil, fmt.Errorf("twiddle: cover_sni is required; it must agree with the egress's masquerade_upstream")
 	}
@@ -96,15 +112,16 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 	}
 
 	return &Outbound{
-		Adapter: outbound.NewAdapterWithDialerOptions(constant.TypeTwiddle, tag, []string{N.NetworkTCP}, options.DialerOptions),
-		logger:  lg,
-		dialer:  outboundDialer,
-		server:  options.Server,
-		port:    options.ServerPort,
-		timeout: timeout,
-		creds:   []*tw.Credential{cred},
+		Adapter:    outbound.NewAdapterWithDialerOptions(constant.TypeTwiddle, tag, []string{N.NetworkTCP}, options.DialerOptions),
+		logger:     lg,
+		dialer:     outboundDialer,
+		server:     options.Server,
+		port:       options.ServerPort,
+		timeout:    timeout,
+		creds:      []*tw.Credential{cred},
+		poolOrigin: pool.Origin,
 		cfg: tw.ClientConfig{
-			Pool:     pool,
+			Pool:     pool.Hellos,
 			CoverSNI: options.CoverSNI,
 			Shaper:   tw.BrowsingShaper(false),
 		},
