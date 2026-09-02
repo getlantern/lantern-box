@@ -5,6 +5,8 @@ package probe
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -18,29 +20,29 @@ import (
 	"github.com/sagernet/sing/common/ntp"
 )
 
-// Result is one attempt's outcome. Delay is meaningful only when Success: it
-// spans the handshake and the request, plus the dial for an outbound that does
-// not defer its handshake to first use.
-type Result struct {
-	Success bool
-	Delay   time.Duration
-}
+// ErrUnusableInput wraps a failure caused by Run's own arguments: an unusable
+// probeURL, or a non-positive timeout. It means the arguments cannot produce a
+// probe, not that the outbound or the target failed.
+var ErrUnusableInput = errors.New("unusable probe input")
 
-// Run dials out and completes an HTTP GET to probeURL over that one
-// connection, discarding the body. Success means the request completed,
-// whatever status it returned; when probeURL's handler confirms receipt, it
-// also means the handler was reached.
-//
-// timeout bounds the whole attempt: a non-positive timeout, or a probeURL that
-// is empty or unparsable, fails without dialing. The connection is closed
+// Run dials out, completes an HTTP GET to probeURL over that one connection,
+// discarding the body, and reports how long it took. A request that completes
+// is a success whatever status it returned; when probeURL's handler confirms
+// receipt, success also means the handler was reached. The connection is closed
 // before Run returns.
-func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Duration) Result {
-	if probeURL == "" || timeout <= 0 {
-		return Result{}
+//
+// The reported duration spans the handshake and the request, plus the dial for
+// an outbound that does not defer its handshake to first use.
+func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Duration) (time.Duration, error) {
+	if probeURL == "" {
+		return 0, fmt.Errorf("%w: empty probe URL", ErrUnusableInput)
+	}
+	if timeout <= 0 {
+		return 0, fmt.Errorf("%w: non-positive timeout %s", ErrUnusableInput, timeout)
 	}
 	linkURL, err := url.Parse(probeURL)
 	if err != nil {
-		return Result{}
+		return 0, fmt.Errorf("%w: %w", ErrUnusableInput, err)
 	}
 	hostname := linkURL.Hostname()
 	port := linkURL.Port()
@@ -52,6 +54,9 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 			port = "443"
 		}
 	}
+	if hostname == "" || port == "" {
+		return 0, fmt.Errorf("%w: no host or port in probe URL %q", ErrUnusableInput, probeURL)
+	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -59,7 +64,7 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	start := time.Now()
 	conn, err := out.DialContext(probeCtx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
 	if err != nil {
-		return Result{}
+		return 0, fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
 	if earlyConn, ok := common.Cast[N.EarlyConn](conn); ok && earlyConn.NeedHandshake() {
@@ -68,7 +73,7 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
 	if err != nil {
-		return Result{}
+		return 0, fmt.Errorf("new request: %w", err)
 	}
 	if tp := linkURL.Query().Get("tp"); tp != "" {
 		req.Header.Set("traceparent", tp)
@@ -91,10 +96,10 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
-		return Result{}
+		return 0, fmt.Errorf("do request: %w", err)
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	return Result{Success: true, Delay: time.Since(start)}
+	return time.Since(start), nil
 }

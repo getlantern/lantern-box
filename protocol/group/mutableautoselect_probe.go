@@ -26,13 +26,15 @@ func probeMember(
 	if beh.excludeFromPool {
 		return probeResult{tag: tag}
 	}
-	res := probe.Run(ctx, out, probeURL, beh.probeTimeout)
-	if !res.Success {
+	delay, err := probe.Run(ctx, out, probeURL, beh.probeTimeout)
+	if err != nil {
+		// Every failure is reported as a failed probe, an unusable probe
+		// URL included: separating those would change which members demote.
 		return probeResult{tag: tag}
 	}
 	// 1ms floor so a sub-millisecond probe isn't reported as 0; rank
 	// treats delay==0 as "no recent success" and would drop the winner.
-	delayMs := uint32(res.Delay / time.Millisecond)
+	delayMs := uint32(delay / time.Millisecond)
 	if delayMs == 0 {
 		delayMs = 1
 	}

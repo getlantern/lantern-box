@@ -66,11 +66,11 @@ func TestRun_SuccessMeasuresDelayAndClosesConn(t *testing.T) {
 	var conns []*trackedConn
 	out := &stubOutbound{dial: dialerFor(addr, &conns)}
 
-	res := Run(context.Background(), out, srv.URL, 5*time.Second)
+	delay, err := Run(context.Background(), out, srv.URL, 5*time.Second)
 
-	assert.True(t, res.Success)
-	assert.Positive(t, res.Delay)
-	assert.Less(t, res.Delay, 5*time.Second)
+	require.NoError(t, err)
+	assert.Positive(t, delay)
+	assert.Less(t, delay, 5*time.Second)
 	assert.Equal(t, addr, out.dest, "the URL's host and port are what gets dialed")
 	require.Len(t, conns, 1)
 	assert.True(t, conns[0].closed.Load(), "Run closes what it dials")
@@ -85,9 +85,9 @@ func TestRun_CompletedRequestSucceedsWhateverTheStatus(t *testing.T) {
 	var conns []*trackedConn
 	out := &stubOutbound{dial: dialerFor(strings.TrimPrefix(srv.URL, "http://"), &conns)}
 
-	res := Run(context.Background(), out, srv.URL, 5*time.Second)
+	_, err := Run(context.Background(), out, srv.URL, 5*time.Second)
 
-	assert.True(t, res.Success, "a 500 still proves the request completed")
+	assert.NoError(t, err, "a 500 still proves the request completed")
 }
 
 func TestRun_UnusableInputNeverDials(t *testing.T) {
@@ -98,6 +98,9 @@ func TestRun_UnusableInputNeverDials(t *testing.T) {
 	}{
 		{"empty URL", "", time.Second},
 		{"unparsable URL", "http://[::1", time.Second},
+		{"no scheme", "//probe.test/x", time.Second},
+		{"unsupported scheme", "ftp://probe.test/x", time.Second},
+		{"no host", "http:///x", time.Second},
 		{"zero timeout", "http://probe.test/", 0},
 		{"negative timeout", "http://probe.test/", -time.Second},
 	} {
@@ -106,23 +109,25 @@ func TestRun_UnusableInputNeverDials(t *testing.T) {
 				return nil, errors.New("must not dial")
 			}}
 
-			res := Run(context.Background(), out, tc.probeURL, tc.timeout)
+			_, err := Run(context.Background(), out, tc.probeURL, tc.timeout)
 
-			assert.False(t, res.Success)
+			assert.ErrorIs(t, err, ErrUnusableInput)
 			assert.Zero(t, out.dials.Load())
 		})
 	}
 }
 
-func TestRun_DialFailureIsAFailedProbe(t *testing.T) {
+func TestRun_DialFailureWrapsTheOutboundsError(t *testing.T) {
+	denied := errors.New("dial denied")
 	out := &stubOutbound{dial: func(context.Context) (net.Conn, error) {
-		return nil, errors.New("dial denied")
+		return nil, denied
 	}}
 
-	res := Run(context.Background(), out, "http://probe.test/", time.Second)
+	delay, err := Run(context.Background(), out, "http://probe.test/", time.Second)
 
-	assert.False(t, res.Success)
-	assert.Zero(t, res.Delay)
+	assert.ErrorIs(t, err, denied)
+	assert.NotErrorIs(t, err, ErrUnusableInput, "the dial happened; it failed")
+	assert.Zero(t, delay)
 }
 
 func TestRun_TimeoutBoundsTheAttempt(t *testing.T) {
@@ -136,10 +141,10 @@ func TestRun_TimeoutBoundsTheAttempt(t *testing.T) {
 
 	const timeout = 100 * time.Millisecond
 	start := time.Now()
-	res := Run(context.Background(), out, srv.URL, timeout)
+	_, err := Run(context.Background(), out, srv.URL, timeout)
 	elapsed := time.Since(start)
 
-	assert.False(t, res.Success, "a request that never completes is not a success")
+	assert.ErrorIs(t, err, context.DeadlineExceeded, "a request that never completes is not a success")
 	assert.Less(t, elapsed, 5*time.Second, "the per-probe timeout, not the caller's patience, ends it")
 	require.Len(t, conns, 1)
 	assert.True(t, conns[0].closed.Load())
@@ -152,9 +157,9 @@ func TestRun_CanceledContextIsAFailedProbe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	res := Run(ctx, out, "http://probe.test/", time.Second)
+	_, err := Run(ctx, out, "http://probe.test/", time.Second)
 
-	assert.False(t, res.Success)
+	assert.ErrorIs(t, err, context.Canceled)
 }
 
 func TestRun_ForwardsTraceparentFromQuery(t *testing.T) {
@@ -168,9 +173,9 @@ func TestRun_ForwardsTraceparentFromQuery(t *testing.T) {
 	var conns []*trackedConn
 	out := &stubOutbound{dial: dialerFor(strings.TrimPrefix(srv.URL, "http://"), &conns)}
 
-	res := Run(context.Background(), out, srv.URL+"?tp="+tp, 5*time.Second)
+	_, err := Run(context.Background(), out, srv.URL+"?tp="+tp, 5*time.Second)
 
-	require.True(t, res.Success)
+	require.NoError(t, err)
 	assert.Equal(t, tp, <-got)
 }
 
@@ -198,14 +203,14 @@ func TestRun_DelayExcludesTheDialWhenTheHandshakeIsDeferred(t *testing.T) {
 	}
 
 	deferred := &stubOutbound{dial: slowDial(func(c net.Conn) net.Conn { return earlyConn{c} })}
-	res := Run(context.Background(), deferred, srv.URL, 5*time.Second)
-	require.True(t, res.Success)
-	assert.Less(t, res.Delay, dialCost, "the timer restarts once a dial has only queued the handshake")
+	delay, err := Run(context.Background(), deferred, srv.URL, 5*time.Second)
+	require.NoError(t, err)
+	assert.Less(t, delay, dialCost, "the timer restarts once a dial has only queued the handshake")
 
 	eager := &stubOutbound{dial: slowDial(func(c net.Conn) net.Conn { return c })}
-	res = Run(context.Background(), eager, srv.URL, 5*time.Second)
-	require.True(t, res.Success)
-	assert.GreaterOrEqual(t, res.Delay, dialCost, "a conn that handshook while dialing is timed from before it")
+	delay, err = Run(context.Background(), eager, srv.URL, 5*time.Second)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, delay, dialCost, "a conn that handshook while dialing is timed from before it")
 }
 
 func TestRun_DerivesPortFromScheme(t *testing.T) {
