@@ -69,6 +69,7 @@ type MutableAutoSelect struct {
 	defaultURL   string
 	histories    map[string]*localHistory
 	cfg          mutableAutoSelectConfig
+	helloSink    *helloSink
 	hist         historyParams
 	history      adapter.AutoSelectHistoryStorage
 
@@ -122,6 +123,11 @@ type mutableAutoSelectConfig struct {
 	dataPlaneProvedRead uint64
 	maxPersistedAge     time.Duration
 	probeConcurrency    int
+	// devicePoolPath, when set, turns on the twiddle hello tap: ClientHellos
+	// written by apps on this device are harvested into a pool file that the
+	// twiddle outbound prefers over anything config delivers. Empty disables it
+	// entirely, at no cost.
+	devicePoolPath string
 }
 
 func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) (mutableAutoSelectConfig, historyParams) {
@@ -136,6 +142,7 @@ func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) 
 		dataPlaneProvedRead: uint64(o.DataPlaneProvedReadBytes),
 		maxPersistedAge:     time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
 		probeConcurrency:    int(o.ProbeConcurrency),
+		devicePoolPath:      o.HelloPoolDevicePath,
 	}
 	if cfg.switchTolerance == 0 {
 		cfg.switchTolerance = 200 * time.Millisecond
@@ -196,6 +203,7 @@ func NewMutableAutoSelect(ctx context.Context, _ A.Router, logger log.ContextLog
 		defaultURL:   options.URL,
 		histories:    make(map[string]*localHistory),
 		cfg:          cfg,
+		helloSink:    newDevicePoolSink(cfg.devicePoolPath),
 		hist:         hp,
 		history:      resolveHistoryStorage(ctx),
 		exhaustionCh: make(chan struct{}, 1),
@@ -281,6 +289,7 @@ func (s *MutableAutoSelect) PostStart() error {
 func (s *MutableAutoSelect) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancel()
+		s.helloSink.close()
 		// Close under s.access so emitExhaustion (which holds the same
 		// lock around its send) can't race a send into a closed channel.
 		s.access.Lock()
@@ -549,7 +558,9 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 func (s *MutableAutoSelect) wrapStream(conn net.Conn, o A.Outbound) net.Conn {
 	onStall, onActivity := s.makeHooks(o.Tag())
 	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, onStall, onActivity)
-	return adapter.NewTaggedConn(wrapped, realTag(o))
+	// The hello tap goes OUTSIDE the data-plane wrapper so it sees the app's
+	// bytes as written, and is a no-op when no device pool is configured.
+	return adapter.NewTaggedConn(newHelloTap(wrapped, s.helloSink), realTag(o))
 }
 
 func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, o A.Outbound) net.PacketConn {

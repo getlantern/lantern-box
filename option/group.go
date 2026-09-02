@@ -28,6 +28,18 @@ type MutableAutoSelectOutboundOptions struct {
 	URL          string            `json:"url,omitempty"`
 	URLOverrides map[string]string `json:"url_overrides,omitempty"`
 
+	// HelloPoolDevicePath turns on the twiddle hello tap and names the file it
+	// maintains. Empty disables it, at no cost.
+	//
+	// Every tunnelled dial passes through this group, so this is where the
+	// device's own browser ClientHellos can be observed whatever protocol
+	// carries them. They are sanitised before anything is written -- a tapped
+	// hello names a site the user actually visited -- and the twiddle outbound
+	// then PREFERS this file over any pool config delivers, because it is the
+	// only source that cannot go stale. Point the twiddle outbound's
+	// hello_pool_device_path at the same file.
+	HelloPoolDevicePath string `json:"hello_pool_device_path,omitempty"`
+
 	// SwitchToleranceMs is the delay improvement (in ms) a candidate must
 	// beat the current selection by before the group switches. Default 200.
 	SwitchToleranceMs uint32 `json:"switch_tolerance_ms,omitempty"`
