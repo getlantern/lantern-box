@@ -69,13 +69,25 @@ func (a *Inbound) Close() error {
 func (a *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = a.Tag()
 	metadata.InboundType = a.Type()
-	wsConn, err := a.newConnectionEx(ctx, conn)
+	wsConn, err := a.handshake(ctx, conn)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		a.logger.ErrorContext(ctx, exceptions.Cause(err, "process connection from ", metadata.Source))
 		return
 	}
 	a.httpInbound.NewConnectionEx(ctx, wsConn, metadata, onClose)
+}
+
+// handshake processes the connection and upgrades it to a WebSocket connection. It recovers from
+// panics in the request parser: the parser runs on attacker-controlled bytes, and sing-box handles
+// each inbound connection on a bare goroutine, so a panic there takes down the whole process.
+func (a *Inbound) handshake(ctx context.Context, conn net.Conn) (_ net.Conn, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic processing connection: %v", r)
+		}
+	}()
+	return a.newConnectionEx(ctx, conn)
 }
 
 // newConnectionEx processes the connection and upgrades it to a WebSocket connection.
