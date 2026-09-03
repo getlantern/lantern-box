@@ -48,6 +48,38 @@ func TestNewConnectionEx_HandshakeFailure(t *testing.T) {
 	require.Error(t, err)
 }
 
+// A request line whose path component contains only characters the parser strips (here "<") used
+// to leave findPath with an empty component and index out of range in the algeneva parser, killing
+// the whole process from a single unauthenticated connection.
+func TestNewConnectionEx_MalformedRequestLine(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+
+	go func() {
+		server.Write([]byte("GET < HTTP/1.1\r\n\r\n"))
+		server.Close()
+	}()
+
+	in := &Inbound{
+		Adapter: inbound.NewAdapter("algeneva", "test"),
+		logger:  log.StdLogger(),
+	}
+
+	onCloseCalled := make(chan struct{})
+	in.NewConnectionEx(context.Background(), client, adapter.InboundContext{}, func(err error) {
+		close(onCloseCalled)
+	})
+
+	select {
+	case <-onCloseCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onClose was never called")
+	}
+
+	_, err := client.Read(make([]byte, 1))
+	require.Error(t, err)
+}
+
 func TestE2E(t *testing.T) {
 	destination := metadata.ParseSocksaddr("google.com:80")
 	client, server := net.Pipe()

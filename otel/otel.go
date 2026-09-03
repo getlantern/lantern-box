@@ -36,7 +36,7 @@ func Enabled() bool {
 
 func InitGlobalMeterProvider(attrs ...attribute.KeyValue) (func(), error) {
 	exp, err := otlpmetrichttp.New(context.Background(),
-		otlpmetrichttp.WithTemporalitySelector(deltaForCounters),
+		otlpmetrichttp.WithTemporalitySelector(deltaTemporality),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("new meter provider: %w", err)
@@ -78,16 +78,24 @@ func InitGlobalTracerProvider(attrs ...attribute.KeyValue) (func(), error) {
 	}, nil
 }
 
-func deltaForCounters(kind sdkmetric.InstrumentKind) metricdata.Temporality {
-	switch kind {
-	case sdkmetric.InstrumentKindCounter,
-		sdkmetric.InstrumentKindUpDownCounter,
-		sdkmetric.InstrumentKindObservableCounter,
-		sdkmetric.InstrumentKindObservableUpDownCounter:
-		return metricdata.DeltaTemporality
-	default:
-		return metricdata.CumulativeTemporality
-	}
+// deltaTemporality exports every instrument kind with delta temporality,
+// including histograms.
+//
+// Delta is what lets the ops collector aggregate an attribute away. Stripping
+// a label from a cumulative stream merges independent monotonic series whose
+// resets are interleaved, which corrupts rate() silently rather than failing;
+// delta datapoints just sum. The ops collector relies on this to drop
+// route.id/instance.id/host.name from proxy.session.goodput, whose ~10.8k
+// distinct host.name values were driving the histogram to ~55M series (see
+// getlantern/engineering#3831).
+//
+// Temporality is chosen per instrument KIND at the exporter, so this covers
+// every histogram this binary emits, not just goodput. The other one is
+// sing.connection_duration, which the ops collector drops outright (no
+// readers), so goodput is the only histogram whose temporality is observable
+// downstream.
+func deltaTemporality(sdkmetric.InstrumentKind) metricdata.Temporality {
+	return metricdata.DeltaTemporality
 }
 
 // buildResource creates an OTEL resource with a default service name

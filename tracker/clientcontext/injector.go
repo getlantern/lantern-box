@@ -236,19 +236,17 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 		return fmt.Errorf("marshaling client info: %w", err)
 	}
 	dest := c.metadata.Destination
-	var addr *net.UDPAddr
-	if dest.IsIP() {
+	var addr net.Addr
+	switch {
+	case dest.IsIP():
 		addr = dest.UDPAddr()
-	} else if len(c.metadata.DestinationAddresses) > 0 {
-		// Use the already-resolved address from the routing pipeline. The
-		// destination was resolved earlier during DNS routing; re-resolving
-		// here is redundant and adds latency to every packet connection.
+	case len(c.metadata.DestinationAddresses) > 0:
 		addr = &net.UDPAddr{
 			IP:   c.metadata.DestinationAddresses[0].AsSlice(),
 			Port: int(dest.Port),
 		}
-	} else if addr, err = net.ResolveUDPAddr("udp", dest.String()); err != nil {
-		return fmt.Errorf("resolving destination %s: %w", dest, err)
+	default:
+		addr = dest
 	}
 	packet := append([]byte(packetPrefix), payload...)
 	_ = conn.SetDeadline(time.Now().Add(sendInfoTimeout))

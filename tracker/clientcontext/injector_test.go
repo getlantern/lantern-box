@@ -73,41 +73,39 @@ func TestSendInfoWithDomainAndResolvedAddresses(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestSendInfoWithDomainFallsBackToDNS(t *testing.T) {
-	serverAddr := startUDPSink(t)
-
-	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn.Close()
-
-	// With no DestinationAddresses, the domain falls back to DNS resolution.
-	// "localhost" resolves to 127.0.0.1, so this reaches the sink.
-	dest := M.Socksaddr{Fqdn: "localhost", Port: uint16(serverAddr.Port)}
-
-	wpc := &writePacketConn{
-		metadata: adapter.InboundContext{Destination: dest},
-		info:     &ClientInfo{DeviceID: "test-device", Platform: "test"},
-	}
-
-	err = wpc.sendInfo(conn)
-	assert.NoError(t, err)
+type recordingPacketConn struct {
+	writtenAddr net.Addr
 }
 
-func TestSendInfoWithUnresolvableDomainFails(t *testing.T) {
-	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn.Close()
+func (c *recordingPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n := copy(p, []byte("OK"))
+	return n, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, nil
+}
 
-	dest := M.Socksaddr{Fqdn: "this.domain.does.not.exist.invalid", Port: 12345}
+func (c *recordingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.writtenAddr = addr
+	return len(p), nil
+}
+
+func (c *recordingPacketConn) Close() error                       { return nil }
+func (c *recordingPacketConn) LocalAddr() net.Addr                { return &net.UDPAddr{} }
+func (c *recordingPacketConn) SetDeadline(_ time.Time) error      { return nil }
+func (c *recordingPacketConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (c *recordingPacketConn) SetWriteDeadline(_ time.Time) error { return nil }
+
+func TestSendInfoWithDomainPassesThrough(t *testing.T) {
+	conn := &recordingPacketConn{}
+
+	dest := M.Socksaddr{Fqdn: "example.com", Port: 443}
 
 	wpc := &writePacketConn{
 		metadata: adapter.InboundContext{Destination: dest},
 		info:     &ClientInfo{DeviceID: "test-device", Platform: "test"},
 	}
 
-	err = wpc.sendInfo(conn)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "resolving destination")
+	err := wpc.sendInfo(conn)
+	require.NoError(t, err)
+	assert.Equal(t, dest, conn.writtenAddr)
 }
 
 // stubConn records writes and fails reads so tests catch unexpected ack reads.

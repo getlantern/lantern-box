@@ -13,6 +13,7 @@ type Conn struct {
 	tracker   *MetricsTracker
 	startTime time.Time
 	rxBytes   atomic.Int64
+	closed    atomic.Bool
 }
 
 // NewConn creates a new Conn instance.
@@ -44,11 +45,14 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 	return
 }
 
-// Close overrides net.Conn's Close method to track connection duration.
+// Close records the session's metrics once, then forwards the close: sing-box
+// closes a routed conn up to 3x on non-graceful teardown.
 func (c *Conn) Close() error {
-	duration := time.Since(c.startTime).Milliseconds()
-	c.tracker.Leave(duration, c.attrs)
-	c.tracker.recordGoodput(c.rxBytes.Load(), duration, c.attrs)
+	if !c.closed.Swap(true) {
+		duration := time.Since(c.startTime).Milliseconds()
+		c.tracker.Leave(duration, c.attrs)
+		c.tracker.recordGoodput(c.rxBytes.Load(), duration, c.attrs)
+	}
 	return c.Conn.Close()
 }
 
