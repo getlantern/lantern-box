@@ -191,6 +191,35 @@ func TestReadInfoTimesOutShortWaitingClient(t *testing.T) {
 	require.Nil(t, info, "a short, waiting opening must be treated as ordinary traffic")
 }
 
+// A client on a server-first protocol (SMTP, IMAP, SSH) sends nothing until the
+// destination greets it. The classification read times out having consumed
+// nothing, which must leave the stream usable rather than poisoning it with the
+// timeout.
+func TestReadInfoTimesOutSilentWaitingClient(t *testing.T) {
+	prev := readInfoTimeout
+	readInfoTimeout = 50 * time.Millisecond
+	defer func() { readInfoTimeout = prev }()
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &readConn{Conn: server, reader: server, mgr: &Manager{}}
+	info, err := c.readInfo()
+	require.NoError(t, err, "a silent opening is a waiting peer, not a dead conn")
+	require.Nil(t, info)
+	require.NoError(t, c.readErr, "the classification timeout must not fail later reads")
+
+	// The peer speaks once the destination has greeted it.
+	const payload = "USER alice\r\n"
+	go func() { client.Write([]byte(payload)) }()
+
+	got := make([]byte, len(payload))
+	_, err = io.ReadFull(c, got)
+	require.NoError(t, err)
+	assert.Equal(t, payload, string(got))
+}
+
 // Ordinary traffic longer than the prefix keeps flowing untouched.
 func TestReadInfoPassesThroughNonClientInfo(t *testing.T) {
 	client, server := net.Pipe()

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -163,6 +165,12 @@ func (c *readConn) readInfo() (*ClientInfo, error) {
 	defer c.Conn.SetReadDeadline(time.Time{})
 	n, err := io.ReadAtLeast(c.Conn, buf[:], len(packetPrefix))
 	if n == 0 {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			// Nothing arrived within the classification window. The peer is
+			// still live and waiting for the server (a server-first protocol),
+			// so leave the stream untouched rather than failing it.
+			return nil, nil
+		}
 		// Preserve the original read error so callers can distinguish connection
 		// failure from decode failure.
 		c.readErr = err
