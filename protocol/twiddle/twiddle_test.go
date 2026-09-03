@@ -377,8 +377,14 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 	o.mu.Lock()
 	pooled := len(o.creds)
 	o.mu.Unlock()
-	if pooled == 0 {
-		t.Error("credential pool is empty; a dial consumed the last credential")
+	// > 1, not > 0: takeCredential deliberately never removes the final
+	// credential, so len(creds) can never reach zero and an "is it empty"
+	// assertion holds even if putCredential is never called at all. Growth
+	// past the single seeded credential is the thing worth asserting -- it can
+	// only happen if the egress's issued credential came back in the flight and
+	// was stored.
+	if pooled <= 1 {
+		t.Errorf("credential pool did not grow past the seeded credential (%d) after %d successful openings; rotation is not being stored", pooled, ok)
 	}
 	t.Logf("%d/%d dials completed, %d openings served, %d credentials pooled",
 		ok, n, atomic.LoadInt64(&served), pooled)
