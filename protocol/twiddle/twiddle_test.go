@@ -223,6 +223,32 @@ func TestInboundAcceptsAValidConfig(t *testing.T) {
 	}
 }
 
+func TestInboundAppliesDefaultTicketMaxAge(t *testing.T) {
+	keyHex, _, _ := creds(t)
+	ib, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleInboundOptions{
+			TicketKey: keyHex, MasqueradeUpstream: "www.cloudflare.com:443",
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ib.(*Inbound).cfg.MaxAge; got != tw.DefaultTicketMaxAge {
+		t.Fatalf("default ticket max age is %v, want %v", got, tw.DefaultTicketMaxAge)
+	}
+}
+
+func TestInboundRejectsMismatchedCoverHost(t *testing.T) {
+	keyHex, _, _ := creds(t)
+	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleInboundOptions{
+			TicketKey: keyHex, MasqueradeUpstream: "www.cloudflare.com:443",
+			CoverHost: "www.microsoft.com",
+		})
+	if err == nil {
+		t.Fatal("inbound accepted a cover_host that contradicts masquerade_upstream")
+	}
+}
+
 func TestInboundRejectsUnknownCover(t *testing.T) {
 	keyHex, _, _ := creds(t)
 	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
@@ -291,7 +317,7 @@ func TestOutboundRejectsUnknownCover(t *testing.T) {
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, PSK: psk, CoverSNI: "www.example.com",
-			HelloPool:     testPool(t),
+			HelloPool: testPool(t),
 		})
 	if err == nil {
 		t.Fatal("outbound accepted an unmeasured cover")
@@ -303,11 +329,24 @@ func TestOutboundRejectsCorruptPool(t *testing.T) {
 	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
-			Ticket:        ticket, PSK: psk, CoverSNI: "www.microsoft.com",
-			HelloPool:     "not hex at all",
+			Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
+			HelloPool: "not hex at all",
 		})
 	if err == nil {
 		t.Fatal("a corrupt pool must fail the outbound rather than emit the stale snapshot")
+	}
+}
+
+func TestOutboundRejectsCredentialForAnotherCover(t *testing.T) {
+	_, ticket, psk := creds(t)
+	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
+			Ticket:        ticket, PSK: psk, CoverSNI: "www.microsoft.com",
+			HelloPool: testPool(t),
+		})
+	if err == nil {
+		t.Fatal("outbound accepted a credential with the wrong ticket length for its cover")
 	}
 }
 
@@ -443,6 +482,150 @@ func TestPeekConnReplayIsFaithful(t *testing.T) {
 	n, _ := pc.Read(buf)
 	if got := pc.replay(); string(got) != string(want[:n]) {
 		t.Errorf("replay is %q, want %q", got, want[:n])
+	}
+}
+
+func TestAcceptStreamsReportsSessionError(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	serverSession, err := yamux.Server(serverConn, muxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSession, err := yamux.Client(clientConn, muxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go (&Inbound{}).acceptStreams(context.Background(), serverSession, adapter.InboundContext{}, func(err error) {
+		closed <- err
+	})
+	if err := clientSession.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-closed:
+		if err == nil {
+			t.Fatal("session failure was reported as a clean close")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("session close callback did not run")
+	}
+}
+
+func TestDialRetriesAfterRemoteGoAway(t *testing.T) {
+	cover, err := tw.CoverFor("www.cloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := tw.NewTicketKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := key.Issue(1, cover.TicketLen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	sessions := make(chan *yamux.Session, 2)
+	serverErr := make(chan error, 2)
+	replay := tw.NewReplayCache(8, time.Hour)
+	go func() {
+		for range 2 {
+			raw, err := listener.Accept()
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			go func() {
+				conn, err := tw.Server(raw, tw.ServerConfig{
+					TicketKey: key, Cover: cover, Replay: replay,
+				})
+				if err != nil {
+					serverErr <- err
+					return
+				}
+				session, err := yamux.Server(conn, muxConfig())
+				if err != nil {
+					serverErr <- err
+					return
+				}
+				sessions <- session
+			}()
+		}
+	}()
+
+	host, portString, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: host, ServerPort: uint16(port)},
+			Ticket:        base64.StdEncoding.EncodeToString(credential.Ticket),
+			PSK:           hex.EncodeToString(credential.PSK[:]),
+			CoverSNI:      cover.Host,
+			HelloPool:     testPool(t),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound := created.(*Outbound)
+	defer outbound.Close()
+
+	first, err := outbound.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstServerSession := <-sessions
+	defer firstServerSession.Close()
+	firstServerStream, err := firstServerSession.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDestination(firstServerStream); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	firstServerStream.Close()
+
+	if err := firstServerSession.GoAway(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outbound.sess.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := outbound.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.org:443"))
+	if err != nil {
+		t.Fatalf("dial did not replace the GO_AWAY session: %v", err)
+	}
+	defer second.Close()
+	secondServerSession := <-sessions
+	defer secondServerSession.Close()
+	secondServerStream, err := secondServerSession.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondServerStream.Close()
+	if got, err := readDestination(secondServerStream); err != nil {
+		t.Fatal(err)
+	} else if got != "example.org:443" {
+		t.Fatalf("retried destination is %q", got)
+	}
+
+	select {
+	case err := <-serverErr:
+		t.Fatal(err)
+	default:
 	}
 }
 

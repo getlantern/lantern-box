@@ -28,7 +28,8 @@ type TwiddleInboundOptions struct {
 	// CoverHost is the impersonated identity. Cipher, binder length, ticket
 	// length, ServerHello extension order and opening-flight sizes all come
 	// from the measured CoverProfile for this host. Empty means the host of
-	// MasqueradeUpstream. Unknown hosts are rejected.
+	// MasqueradeUpstream. When MasqueradeUpstream uses a DNS name, the two must
+	// match; an explicit cover is reserved for upstream IP addresses.
 	CoverHost string `json:"cover_host,omitempty"`
 }
 
@@ -64,9 +65,9 @@ type TwiddleOutboundOptions struct {
 	CoverSNI string `json:"cover_sni"`
 
 	// HelloPool carries a pool of harvested ClientHellos inline: one hex-encoded
-	// record per line. This is the config-delivered tier -- it beats the pool
-	// compiled into the twiddle module, which is a snapshot of one Chrome version
-	// and ages into a positive signal, but it loses to HelloPoolDevicePath.
+	// record per line. This is the config-delivered tier and loses to
+	// HelloPoolDevicePath. The stale pool compiled into twiddle is not used as a
+	// production fallback.
 	HelloPool string `json:"hello_pool,omitempty"`
 
 	// HelloPoolPath is a config-written pool file, in the same form as

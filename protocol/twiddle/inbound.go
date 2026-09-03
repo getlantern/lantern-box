@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,20 +54,22 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 		return nil, errors.New("twiddle: masquerade_upstream is required; without it an active prober gets a distinguishing reply")
 	}
 
+	masqueradeHost, _, err := net.SplitHostPort(options.MasqueradeUpstream)
+	if err != nil {
+		return nil, fmt.Errorf("twiddle: masquerade_upstream %q is not host:port: %w", options.MasqueradeUpstream, err)
+	}
 	coverHost := options.CoverHost
 	if coverHost == "" {
-		var herr error
-		coverHost, _, herr = net.SplitHostPort(options.MasqueradeUpstream)
-		if herr != nil {
-			return nil, fmt.Errorf("twiddle: masquerade_upstream %q is not host:port: %w", options.MasqueradeUpstream, herr)
-		}
+		coverHost = masqueradeHost
+	} else if net.ParseIP(masqueradeHost) == nil && !strings.EqualFold(coverHost, masqueradeHost) {
+		return nil, fmt.Errorf("twiddle: cover_host %q does not match masquerade_upstream host %q", coverHost, masqueradeHost)
 	}
 	cover, err := tw.CoverFor(coverHost)
 	if err != nil {
 		return nil, err
 	}
 
-	var maxAge time.Duration
+	maxAge := tw.DefaultTicketMaxAge
 	if options.TicketMaxAge != "" {
 		if maxAge, err = time.ParseDuration(options.TicketMaxAge); err != nil {
 			return nil, fmt.Errorf("twiddle: invalid ticket_max_age: %w", err)
@@ -132,14 +135,16 @@ func (i *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 
 func (i *Inbound) acceptStreams(ctx context.Context, sess *yamux.Session, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	defer sess.Close()
+	var acceptErr error
 	defer func() {
 		if onClose != nil {
-			onClose(nil)
+			onClose(acceptErr)
 		}
 	}()
 	for {
 		stream, err := sess.Accept()
 		if err != nil {
+			acceptErr = err
 			return
 		}
 		go i.routeStream(ctx, stream, metadata)

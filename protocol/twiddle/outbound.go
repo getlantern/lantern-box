@@ -86,6 +86,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 	if err != nil {
 		return nil, err
 	}
+	if len(cred.Ticket) != cover.TicketLen {
+		return nil, fmt.Errorf("twiddle: credential ticket length %d does not match cover %d", len(cred.Ticket), cover.TicketLen)
+	}
 
 	// Embedded fallback is disabled: a stale compiled-in snapshot is a
 	// fingerprint, and the right reaction is to fail this outbound so another
@@ -169,20 +172,28 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 // of its own. A twiddle connection per association would put a fresh opening on
 // the wire for every DNS lookup, which is the pattern muxing exists to remove.
 func (o *Outbound) dialTunnel(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	sess, err := o.ensureSession(ctx)
-	if err != nil {
-		return nil, err
+	var openErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		sess, err := o.ensureSession(ctx)
+		if err != nil {
+			return nil, err
+		}
+		stream, err := sess.Open()
+		if err != nil {
+			o.dropSession(sess)
+			openErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		if err := writeDestination(stream, destination.String()); err != nil {
+			stream.Close()
+			return nil, err
+		}
+		return stream, nil
 	}
-	stream, err := sess.Open()
-	if err != nil {
-		o.dropSession(sess)
-		return nil, fmt.Errorf("twiddle: open stream: %w", err)
-	}
-	if err := writeDestination(stream, destination.String()); err != nil {
-		stream.Close()
-		return nil, err
-	}
-	return stream, nil
+	return nil, fmt.Errorf("twiddle: open stream after replacing session: %w", openErr)
 }
 
 func (o *Outbound) ensureSession(ctx context.Context) (*yamux.Session, error) {
