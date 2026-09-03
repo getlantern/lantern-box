@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/yamux"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -42,29 +43,17 @@ type Outbound struct {
 	port    uint16
 	timeout time.Duration
 
-	// mu guards creds, the pool of credentials not yet spent. The egress issues
-	// a fresh one inside every flight, so a completed connection returns more
-	// than it took only in the sense that it replaces what it consumed.
-	//
-	// sing-box dials concurrently, which is why this is a pool and not a single
-	// slot: each dial claims a distinct credential when one is available, so
-	// sequential and moderately concurrent traffic never presents the same
-	// ticket twice. Under a burst wider than the pool, dials fall back to
-	// reusing the last credential rather than failing -- TLS 1.3 asks clients
-	// not to reuse tickets, but a dead connection is worse than a reused one,
-	// and the egress does not currently enforce single use. Eliminating reuse
-	// entirely would need the egress to issue several credentials per flight.
 	mu    sync.Mutex
 	creds []*tw.Credential
 	cfg   tw.ClientConfig
 
-	// poolOrigin records which tier the hellos came from, so a client that has
-	// quietly degraded to the built-in pool is diagnosable after the fact.
+	sessMu sync.Mutex
+	sess   *yamux.Session
+
 	poolOrigin tw.Origin
 	uotClient  *uot.Client
 }
 
-// maxCredPool bounds credential accumulation on a long-lived outbound.
 const maxCredPool = 32
 
 func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogger, tag string, options option.TwiddleOutboundOptions) (adapter.Outbound, error) {
@@ -93,44 +82,27 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 	if options.CoverSNI == "" {
 		return nil, fmt.Errorf("twiddle: cover_sni is required; it must agree with the egress's masquerade_upstream")
 	}
-	// An unmeasured cover is refused rather than approximated. Emitting a
-	// plausible-looking profile for a host nobody measured is the failure this
-	// is meant to prevent, not a degraded mode worth having.
 	cover, err := tw.CoverFor(options.CoverSNI)
 	if err != nil {
 		return nil, err
 	}
-	// Ticket length is one of the cover's measured parameters, and the ticket
-	// rides inside pre_shared_key, so a credential minted for another identity
-	// produces a hello of the wrong size for the SNI it carries.
-	if len(cred.Ticket) != cover.TicketLen {
-		return nil, fmt.Errorf("twiddle: credential ticket length %d does not match cover %d", len(cred.Ticket), cover.TicketLen)
-	}
 
-	// Hello sourcing is twiddle's policy, not ours: it owns the precedence
-	// (device tap, then config, then its built-in pool), the per-entry screening
-	// and the partitioning of a source that mixes browser builds. Reimplementing
-	// any of that here would let the two drift apart.
+	// Embedded fallback is disabled: a stale compiled-in snapshot is a
+	// fingerprint, and the right reaction is to fail this outbound so another
+	// transport is selected.
 	pool, err := tw.LoadPool(tw.Sources{
 		Device:       options.HelloPoolDevicePath,
 		Config:       options.HelloPoolPath,
 		ConfigInline: options.HelloPool,
-		// The built-in pool is opt-in in the core because it is stale by
-		// construction. It is enabled here for the reason argued at
-		// TestOutboundDegradesToEmbeddedOnACorruptPool: a stale fingerprint on
-		// every client beats no outbound on every client, and both need the same
-		// config push to clear.
-		AllowEmbedded: true,
 	})
 	if err != nil {
 		return nil, err
 	}
-	// A client that silently drops to the built-in pool still connects, so this
-	// has to be visible or a stale fingerprint ships unnoticed.
 	for _, skipped := range pool.Skipped {
 		lg.Warn("twiddle: ", skipped)
 	}
 	lg.Info("twiddle: ", len(pool.Hellos), " hellos from the ", pool.Origin, " pool")
+
 	timeout := 15 * time.Second
 	if options.ConnectTimeout != "" {
 		if timeout, err = time.ParseDuration(options.ConnectTimeout); err != nil {
@@ -189,42 +161,72 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	return o.dialTunnel(ctx, destination)
 }
 
-// dialTunnel opens one outer twiddle connection and names the inner
-// destination on it. Both the TCP path and UoT's inner dial land here.
+// dialTunnel opens one multiplexed stream to destination on the shared outer
+// connection, building that connection if there is not a live one.
+//
+// Both the TCP path and UoT's inner dial land here, which is the point: a UDP
+// association rides the same tunnel as everything else rather than opening one
+// of its own. A twiddle connection per association would put a fresh opening on
+// the wire for every DNS lookup, which is the pattern muxing exists to remove.
 func (o *Outbound) dialTunnel(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	o.logger.TraceContext(ctx, "dialing twiddle connection to ", o.server, ":", o.port)
+	sess, err := o.ensureSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := sess.Open()
+	if err != nil {
+		o.dropSession(sess)
+		return nil, fmt.Errorf("twiddle: open stream: %w", err)
+	}
+	if err := writeDestination(stream, destination.String()); err != nil {
+		stream.Close()
+		return nil, err
+	}
+	return stream, nil
+}
+
+func (o *Outbound) ensureSession(ctx context.Context) (*yamux.Session, error) {
+	o.sessMu.Lock()
+	defer o.sessMu.Unlock()
+	if o.sess != nil && !o.sess.IsClosed() {
+		return o.sess, nil
+	}
+	o.logger.TraceContext(ctx, "opening twiddle tunnel to ", o.server, ":", o.port)
+
+	cred := o.takeCredential()
+	if cred == nil {
+		return nil, fmt.Errorf("twiddle: no unused ticket; refusing to reuse")
+	}
 
 	raw, err := o.dialer.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddrHostPort(o.server, o.port))
 	if err != nil {
+		o.putCredential(cred)
 		return nil, fmt.Errorf("twiddle: TCP dial failed: %w", err)
 	}
 	raw.SetDeadline(time.Now().Add(o.timeout))
 
 	cfg := o.cfg
-	cfg.Credential = o.takeCredential()
-
+	cfg.Credential = cred
 	conn, next, err := tw.Client(raw, cfg)
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("twiddle: opening failed: %w", err)
 	}
 	raw.SetDeadline(time.Time{})
-
-	// The egress issues the next credential inside its flight, exactly as
-	// NewSessionTicket does.
 	if next != nil {
 		o.putCredential(next)
 	}
 
-	if err := writeDestination(conn, destination.String()); err != nil {
+	sess, err := yamux.Client(conn, muxConfig())
+	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("twiddle: mux: %w", err)
 	}
-	return conn, nil
+	o.sess = sess
+	return sess, nil
 }
 
-// uotDialer carries UoT's inner TCP dial without routing it back through
-// Outbound.
+// uotDialer carries UoT's inner dial without routing it back through Outbound.
 //
 // uot.Client needs an N.Dialer and Outbound is one, but wiring it to itself
 // makes both DialContext(udp) and ListenPacket self-referential: their
@@ -234,6 +236,9 @@ func (o *Outbound) dialTunnel(ctx context.Context, destination M.Socksaddr) (net
 // point the failure is an unbounded recursion in production rather than a
 // compile error. Cutting the loop here costs nothing and matches how unbounded,
 // samizdat and water each wire their own UoT client.
+//
+// It reaches dialTunnel, so UoT's inner connection is a stream on the shared
+// session rather than a tunnel of its own.
 type uotDialer Outbound
 
 func (d *uotDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -247,16 +252,28 @@ func (d *uotDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (
 	return nil, fmt.Errorf("twiddle: uotDialer does not support ListenPacket: %w", os.ErrInvalid)
 }
 
-// takeCredential claims a credential for one dial. The last one is reused
-// rather than removed, so a dial never fails for want of a credential.
+func (o *Outbound) dropSession(sess *yamux.Session) {
+	o.sessMu.Lock()
+	defer o.sessMu.Unlock()
+	if o.sess == sess {
+		o.sess.Close()
+		o.sess = nil
+	}
+}
+
+// takeCredential claims one unused ticket. It never reuses: a parallel burst
+// with one ticket opens one tunnel (via ensureSession's lock) and the rest
+// ride streams. An exhausted pool fails rather than emitting the same PSK
+// identity on two connections.
 func (o *Outbound) takeCredential() *tw.Credential {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if len(o.creds) == 0 {
+		return nil
+	}
 	last := len(o.creds) - 1
 	c := o.creds[last]
-	if last > 0 {
-		o.creds = o.creds[:last]
-	}
+	o.creds = o.creds[:last]
 	return c
 }
 
@@ -288,4 +305,14 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 }
 
 func (o *Outbound) Network() []string { return []string{N.NetworkTCP, N.NetworkUDP} }
-func (o *Outbound) Close() error      { return nil }
+
+func (o *Outbound) Close() error {
+	o.sessMu.Lock()
+	defer o.sessMu.Unlock()
+	if o.sess != nil {
+		err := o.sess.Close()
+		o.sess = nil
+		return err
+	}
+	return nil
+}

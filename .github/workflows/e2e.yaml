@@ -94,9 +94,7 @@ jobs:
           echo "reflex_cert_fp=$REFLEX_CERT_FP" >> "$GITHUB_OUTPUT"
 
           # Twiddle: the egress holds the ticket key, the client holds only the
-          # credential that key issued. The cover must be a measured identity:
-          # its profile is what fixes the ticket length, binder length, cipher
-          # and ServerHello extension order on both sides.
+          # credential that key issued. Cover must be a measured identity.
           go run github.com/getlantern/twiddle/cmd/twiddlecred \
             -client-id 1 -cover www.cloudflare.com > twiddle-creds.txt
           echo "twiddle_ticket_key=$(grep ^ticket_key= twiddle-creds.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
@@ -664,7 +662,9 @@ jobs:
           TWIDDLE_PSK: ${{ steps.creds.outputs.twiddle_psk }}
         run: |
           # cover_sni must agree with the egress's masquerade_upstream, or the
-          # SNI names one site while probes are answered by another.
+          # SNI names one site while probes are answered by another. hello_pool
+          # is required: the embedded snapshot is no longer a fallback.
+          go run github.com/getlantern/twiddle/cmd/twiddlecred -print-pool > /tmp/twiddle-hellos.hex
           cat > /tmp/twiddle-client.json << JSONEOF
           {
             "log": {"level": "debug"},
@@ -681,7 +681,8 @@ jobs:
               "server_port": 9005,
               "ticket": "${TWIDDLE_TICKET}",
               "psk": "${TWIDDLE_PSK}",
-              "cover_sni": "www.cloudflare.com"
+              "cover_sni": "www.cloudflare.com",
+              "hello_pool_path": "/tmp/twiddle-hellos.hex"
             }]
           }
           JSONEOF

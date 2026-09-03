@@ -27,9 +27,8 @@ type TwiddleInboundOptions struct {
 
 	// CoverHost is the impersonated identity. Cipher, binder length, ticket
 	// length, ServerHello extension order and opening-flight sizes all come
-	// from the measured CoverProfile for this host, so they cannot be set
-	// individually and drift apart. Empty means the host of MasqueradeUpstream.
-	// Unknown hosts are rejected.
+	// from the measured CoverProfile for this host. Empty means the host of
+	// MasqueradeUpstream. Unknown hosts are rejected.
 	CoverHost string `json:"cover_host,omitempty"`
 }
 
@@ -61,8 +60,7 @@ type TwiddleOutboundOptions struct {
 
 	// CoverSNI is the domain this egress masquerades as. It must be a measured
 	// cover identity (see twiddle.CoverFor) and should agree with the egress's
-	// masquerade_upstream, or the SNI names one site while probes are answered
-	// by another.
+	// masquerade_upstream.
 	CoverSNI string `json:"cover_sni"`
 
 	// HelloPool carries a pool of harvested ClientHellos inline: one hex-encoded

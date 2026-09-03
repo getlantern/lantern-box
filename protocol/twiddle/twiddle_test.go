@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/yamux"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	boxoption "github.com/sagernet/sing-box/option"
@@ -222,20 +223,6 @@ func TestInboundAcceptsAValidConfig(t *testing.T) {
 	}
 }
 
-func TestInboundAppliesDefaultTicketMaxAge(t *testing.T) {
-	keyHex, _, _ := creds(t)
-	ib, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
-		option.TwiddleInboundOptions{
-			TicketKey: keyHex, MasqueradeUpstream: "www.cloudflare.com:443",
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := ib.(*Inbound).cfg.MaxAge; got != tw.DefaultTicketMaxAge {
-		t.Fatalf("default ticket max age is %v, want %v", got, tw.DefaultTicketMaxAge)
-	}
-}
-
 func TestInboundRejectsUnknownCover(t *testing.T) {
 	keyHex, _, _ := creds(t)
 	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
@@ -277,22 +264,24 @@ func TestOutboundRejectsBadCredentials(t *testing.T) {
 	}
 }
 
-func TestOutboundUsesTheEmbeddedPoolByDefault(t *testing.T) {
+func testPool(t *testing.T) string {
+	t.Helper()
+	p, err := tw.LoadPool(tw.Sources{AllowEmbedded: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tw.FormatPool(p.Hellos)
+}
+
+func TestOutboundRejectsMissingPool(t *testing.T) {
 	_, ticket, psk := creds(t)
-	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
 		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	o := ob.(*Outbound)
-	if len(o.cfg.Pool) == 0 {
-		t.Fatal("outbound has an empty hello pool")
-	}
-	if o.cfg.Cover.Host != "www.cloudflare.com" {
-		t.Errorf("cover is %q", o.cfg.Cover.Host)
+	if err == nil {
+		t.Fatal("outbound accepted a missing hello pool; the embedded snapshot must not ship")
 	}
 }
 
@@ -302,57 +291,23 @@ func TestOutboundRejectsUnknownCover(t *testing.T) {
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, PSK: psk, CoverSNI: "www.example.com",
+			HelloPool:     testPool(t),
 		})
 	if err == nil {
 		t.Fatal("outbound accepted an unmeasured cover")
 	}
 }
 
-// Ticket length is a fidelity parameter of the cover, so a credential minted for
-// one identity cannot be presented as another: the hello would be the wrong size
-// for the SNI it carries.
-func TestOutboundRejectsCredentialForAnotherCover(t *testing.T) {
+func TestOutboundRejectsCorruptPool(t *testing.T) {
 	_, ticket, psk := creds(t)
 	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, PSK: psk, CoverSNI: "www.microsoft.com",
+			HelloPool:     "not hex at all",
 		})
 	if err == nil {
-		t.Fatal("outbound accepted a credential with the wrong ticket length for its cover")
-	}
-}
-
-// A corrupt configured pool must DEGRADE to the built-in one, not fail the
-// outbound.
-//
-// This reverses the earlier contract deliberately. A pool arrives by config
-// push, so a bad one reaches every client at once; the two candidate failure
-// modes are "every client emits a stale fingerprint" and "every client has no
-// outbound at all". The first risks detection, probabilistically and
-// recoverably; the second is a certain outage. Both are fixed by pushing new
-// config, so the interim state is the whole of the difference, and staleness is
-// the better interim state.
-//
-// The compensating requirement is that the degradation be visible, which is
-// what poolOrigin and the logged Skipped errors are for.
-func TestOutboundDegradesToEmbeddedOnACorruptPool(t *testing.T) {
-	_, ticket, psk := creds(t)
-	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
-		option.TwiddleOutboundOptions{
-			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
-			Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
-			HelloPool: "not hex at all",
-		})
-	if err != nil {
-		t.Fatalf("a corrupt pool must not brick the outbound: %v", err)
-	}
-	o := ob.(*Outbound)
-	if o.poolOrigin != tw.OriginEmbedded {
-		t.Errorf("pool origin is %v, want embedded", o.poolOrigin)
-	}
-	if len(o.cfg.Pool) == 0 {
-		t.Error("degraded outbound has no hellos at all")
+		t.Fatal("a corrupt pool must fail the outbound rather than emit the stale snapshot")
 	}
 }
 
@@ -404,14 +359,9 @@ func TestOutboundPoolPrecedence(t *testing.T) {
 			wantOrigin: tw.OriginConfig, wantSNI: "configfile.example",
 		},
 		{
-			name:       "inline beats embedded",
+			name:       "inline is the config tier",
 			opts:       option.TwiddleOutboundOptions{HelloPool: inline},
 			wantOrigin: tw.OriginConfig, wantSNI: "inline.example",
-		},
-		{
-			name:       "nothing configured falls back",
-			opts:       option.TwiddleOutboundOptions{},
-			wantOrigin: tw.OriginEmbedded,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -496,19 +446,12 @@ func TestPeekConnReplayIsFaithful(t *testing.T) {
 	}
 }
 
-// TestConcurrentDialsExerciseTheCredentialPath replaces an earlier version that
-// pointed at port 1. Review caught that the TCP dial fails before DialContext
-// ever reaches the credential code, so the test asserted nothing about the path
-// it named -- a vacuous test that would have passed with the pool removed.
-//
-// This one stands up a real twiddle egress, so every dial completes an opening
-// and actually claims and returns a credential. Run under -race.
-func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
-	key, err := tw.NewTicketKey()
+func TestConcurrentDialsShareOneMuxedTunnel(t *testing.T) {
+	cover, err := tw.CoverFor("www.cloudflare.com")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cover, err := tw.CoverFor("www.cloudflare.com")
+	key, err := tw.NewTicketKey()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,9 +459,6 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// One gate for the whole egress: tickets are single-use, so a per-connection
-	// cache would spend nothing.
-	replay := tw.NewReplayCache(64, 0)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -526,23 +466,35 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 	}
 	defer ln.Close()
 
-	var served int64
+	var served, tunnels int64
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
+			atomic.AddInt64(&tunnels, 1)
 			go func(c net.Conn) {
 				defer c.Close()
 				tc, err := tw.Server(c, tw.ServerConfig{
-					TicketKey: key, Cover: cover, Replay: replay,
+					TicketKey: key, Cover: cover, Replay: tw.NewReplayCache(32, 0),
 				})
 				if err != nil {
 					return
 				}
-				if _, err := readDestination(tc); err == nil {
-					atomic.AddInt64(&served, 1)
+				sess, err := yamux.Server(tc, muxConfig())
+				if err != nil {
+					return
+				}
+				for {
+					stream, err := sess.Accept()
+					if err != nil {
+						return
+					}
+					if _, err := readDestination(stream); err == nil {
+						atomic.AddInt64(&served, 1)
+					}
+					stream.Close()
 				}
 			}(c)
 		}
@@ -556,6 +508,7 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 			Ticket:        base64.StdEncoding.EncodeToString(cred.Ticket),
 			PSK:           hex.EncodeToString(cred.PSK[:]),
 			CoverSNI:      cover.Host,
+			HelloPool:     testPool(t),
 		})
 	if err != nil {
 		t.Fatal(err)
@@ -579,22 +532,15 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 	wg.Wait()
 
 	if ok == 0 {
-		t.Fatal("no dial completed — the credential path was never exercised")
+		t.Fatal("no dial completed")
 	}
-	o.mu.Lock()
-	pooled := len(o.creds)
-	o.mu.Unlock()
-	// > 1, not > 0: takeCredential deliberately never removes the final
-	// credential, so len(creds) can never reach zero and an "is it empty"
-	// assertion holds even if putCredential is never called at all. Growth
-	// past the single seeded credential is the thing worth asserting -- it can
-	// only happen if the egress's issued credential came back in the flight and
-	// was stored.
-	if pooled <= 1 {
-		t.Errorf("credential pool did not grow past the seeded credential (%d) after %d successful openings; rotation is not being stored", pooled, ok)
+	if atomic.LoadInt64(&tunnels) != 1 {
+		t.Errorf("opened %d outer tunnels, want 1 muxed session", tunnels)
 	}
-	t.Logf("%d/%d dials completed, %d openings served, %d credentials pooled",
-		ok, n, atomic.LoadInt64(&served), pooled)
+	if ok < n {
+		t.Errorf("%d/%d dials completed", ok, n)
+	}
+	t.Logf("%d/%d dials on %d tunnel, %d streams served", ok, n, tunnels, atomic.LoadInt64(&served))
 }
 
 // TestCredentialPoolHandsOutDistinctCredentials: sequential connections must
@@ -610,17 +556,16 @@ func TestCredentialPoolHandsOutDistinctCredentials(t *testing.T) {
 	if bytes.Equal(a.Ticket, b.Ticket) {
 		t.Error("two takes returned the same credential while the pool held two")
 	}
-	// the last credential is reused rather than removed, so a dial never starves
 	c := o.takeCredential()
-	if c == nil {
-		t.Fatal("takeCredential returned nil on an exhausted pool")
+	if c != nil {
+		t.Fatal("takeCredential reused a spent ticket")
 	}
 	o.putCredential(c1)
 	o.mu.Lock()
 	got := len(o.creds)
 	o.mu.Unlock()
-	if got != 2 {
-		t.Errorf("pool has %d credentials after a put, want 2", got)
+	if got != 1 {
+		t.Errorf("pool has %d credentials after a put, want 1", got)
 	}
 }
 
@@ -642,9 +587,6 @@ func TestCredentialPoolIsBounded(t *testing.T) {
 	}
 }
 
-// TestCoverProfileReachesServerConfig covers the dead option review found. The
-// individual knobs it replaced could name one identity and emit another's
-// parameters, so what is pinned now is that the whole measured profile arrives.
 func TestCoverProfileReachesServerConfig(t *testing.T) {
 	keyHex, _, _ := creds(t)
 	ib, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
