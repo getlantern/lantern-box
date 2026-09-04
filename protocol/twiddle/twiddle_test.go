@@ -533,7 +533,9 @@ func TestDialRetriesAfterRemoteGoAway(t *testing.T) {
 
 	sessions := make(chan *yamux.Session, 2)
 	serverErr := make(chan error, 2)
-	replay := tw.NewReplayCache(8, time.Hour)
+	// The horizon must be at least the server's MaxAge, which is unset here and
+	// so defaults to 24h; a shorter one is refused outright by tw.Server.
+	replay := tw.NewReplayCache(8, 0)
 	go func() {
 		for range 2 {
 			raw, err := listener.Accept()
