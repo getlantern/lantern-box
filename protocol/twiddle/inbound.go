@@ -51,7 +51,24 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 		return nil, errors.New("twiddle: masquerade_upstream is required; without it an active prober gets a distinguishing reply")
 	}
 
-	var maxAge time.Duration
+	// The cover identity is derived rather than configured field by field: the
+	// cipher, binder length, ticket length and ServerHello extension order are
+	// one measured profile, and a config that could set them individually could
+	// name microsoft while emitting cloudflare's binder.
+	coverHost := options.CoverHost
+	if coverHost == "" {
+		var herr error
+		coverHost, _, herr = net.SplitHostPort(options.MasqueradeUpstream)
+		if herr != nil {
+			return nil, fmt.Errorf("twiddle: masquerade_upstream %q is not host:port: %w", options.MasqueradeUpstream, herr)
+		}
+	}
+	cover, err := tw.CoverFor(coverHost)
+	if err != nil {
+		return nil, err
+	}
+
+	maxAge := tw.DefaultTicketMaxAge
 	if options.TicketMaxAge != "" {
 		if maxAge, err = time.ParseDuration(options.TicketMaxAge); err != nil {
 			return nil, fmt.Errorf("twiddle: invalid ticket_max_age: %w", err)
@@ -65,10 +82,13 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 		router:  router,
 		cfg: tw.ServerConfig{
 			TicketKey: key,
+			Cover:     cover,
 			MaxAge:    maxAge,
-			TicketLen: options.TicketLen,
-			PSKFirst:  options.PSKFirst,
-			Shaper:    tw.BrowsingShaper(true),
+			// One cache for the whole egress: a ticket is single-use, and a
+			// per-connection gate would spend nothing. Its horizon is maxAge
+			// because eviction is only sound where MaxAge refuses the ticket first.
+			Replay: tw.NewReplayCache(0, maxAge),
+			Shaper: tw.BrowsingShaper(true),
 		},
 		masqueradeUpstream: options.MasqueradeUpstream,
 	}

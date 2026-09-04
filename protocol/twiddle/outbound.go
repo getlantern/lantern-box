@@ -78,6 +78,23 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		return nil, err
 	}
 
+	if options.CoverSNI == "" {
+		return nil, fmt.Errorf("twiddle: cover_sni is required; it must agree with the egress's masquerade_upstream")
+	}
+	// An unmeasured cover is refused rather than approximated. Emitting a
+	// plausible-looking profile for a host nobody measured is the failure this
+	// is meant to prevent, not a degraded mode worth having.
+	cover, err := tw.CoverFor(options.CoverSNI)
+	if err != nil {
+		return nil, err
+	}
+	// Ticket length is one of the cover's measured parameters, and the ticket
+	// rides inside pre_shared_key, so a credential minted for another identity
+	// produces a hello of the wrong size for the SNI it carries.
+	if len(cred.Ticket) != cover.TicketLen {
+		return nil, fmt.Errorf("twiddle: credential ticket length %d does not match cover %d", len(cred.Ticket), cover.TicketLen)
+	}
+
 	// Hello sourcing is twiddle's policy, not ours: it owns the precedence
 	// (device tap, then config, then its built-in pool), the per-entry screening
 	// and the partitioning of a source that mixes browser builds. Reimplementing
@@ -86,6 +103,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		Device:       options.HelloPoolDevicePath,
 		Config:       options.HelloPoolPath,
 		ConfigInline: options.HelloPool,
+		// The built-in pool is opt-in in the core because it is stale by
+		// construction. It is enabled here for the reason argued at
+		// TestOutboundDegradesToEmbeddedOnACorruptPool: a stale fingerprint on
+		// every client beats no outbound on every client, and both need the same
+		// config push to clear.
+		AllowEmbedded: true,
 	})
 	if err != nil {
 		return nil, err
@@ -96,10 +119,6 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		lg.Warn("twiddle: ", skipped)
 	}
 	lg.Info("twiddle: ", len(pool.Hellos), " hellos from the ", pool.Origin, " pool")
-	if options.CoverSNI == "" {
-		return nil, fmt.Errorf("twiddle: cover_sni is required; it must agree with the egress's masquerade_upstream")
-	}
-
 	timeout := 15 * time.Second
 	if options.ConnectTimeout != "" {
 		if timeout, err = time.ParseDuration(options.ConnectTimeout); err != nil {
@@ -121,9 +140,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		creds:      []*tw.Credential{cred},
 		poolOrigin: pool.Origin,
 		cfg: tw.ClientConfig{
-			Pool:     pool.Hellos,
-			CoverSNI: options.CoverSNI,
-			Shaper:   tw.BrowsingShaper(false),
+			Pool:   pool.Hellos,
+			Cover:  cover,
+			Shaper: tw.BrowsingShaper(false),
 		},
 	}, nil
 }

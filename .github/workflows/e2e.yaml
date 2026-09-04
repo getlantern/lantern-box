@@ -94,10 +94,11 @@ jobs:
           echo "reflex_cert_fp=$REFLEX_CERT_FP" >> "$GITHUB_OUTPUT"
 
           # Twiddle: the egress holds the ticket key, the client holds only the
-          # credential that key issued. cover=www.example.com so the ticket
-          # length matches what that identity's real server would send.
+          # credential that key issued. The cover must be a measured identity:
+          # its profile is what fixes the ticket length, binder length, cipher
+          # and ServerHello extension order on both sides.
           go run github.com/getlantern/twiddle/cmd/twiddlecred \
-            -client-id 1 -cover www.example.com > twiddle-creds.txt
+            -client-id 1 -cover www.cloudflare.com > twiddle-creds.txt
           echo "twiddle_ticket_key=$(grep ^ticket_key= twiddle-creds.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
           echo "twiddle_ticket=$(grep ^ticket= twiddle-creds.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
           echo "twiddle_psk=$(grep ^psk= twiddle-creds.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
@@ -320,7 +321,7 @@ jobs:
               "listen": "::",
               "listen_port": 9005,
               "ticket_key": "${TWIDDLE_TICKET_KEY}",
-              "masquerade_upstream": "www.example.com:443",
+              "masquerade_upstream": "www.cloudflare.com:443",
               "ticket_max_age": "24h"
             }],
             "outbounds": [{
@@ -680,7 +681,7 @@ jobs:
               "server_port": 9005,
               "ticket": "${TWIDDLE_TICKET}",
               "psk": "${TWIDDLE_PSK}",
-              "cover_sni": "www.example.com"
+              "cover_sni": "www.cloudflare.com"
             }]
           }
           JSONEOF
@@ -736,8 +737,15 @@ jobs:
           # real TLS handshake back. If the egress answers with anything of its
           # own, an active prober has confirmed the transport.
           set +e
+          # The SNI is the cover's own: a prober testing whether this address is
+          # really the cover site asks for the cover site, and the answer has to
+          # be that site's real certificate. -verify_hostname is what makes that
+          # the assertion -- a chain that merely validates says only "some
+          # trusted site", which is not the claim being tested.
           OUT=$(echo | openssl s_client -connect "${DROPLET_IP}:9005" \
-                  -servername www.example.com -tls1_3 2>&1)
+                  -servername www.cloudflare.com \
+                  -verify_hostname www.cloudflare.com -verify_return_error \
+                  -tls1_3 2>&1)
           set -e
           if echo "$OUT" | grep -q "Verify return code: 0 (ok)"; then
             echo "Twiddle probe resistance PASSED (prober reached the cover site)"

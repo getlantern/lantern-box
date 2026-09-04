@@ -22,19 +22,15 @@ type TwiddleInboundOptions struct {
 	MasqueradeUpstream string `json:"masquerade_upstream"`
 
 	// TicketMaxAge bounds how long an issued ticket stays valid, as a Go
-	// duration. Empty disables the check.
+	// duration. Empty uses twiddle's default (24h). The check is never skipped.
 	TicketMaxAge string `json:"ticket_max_age,omitempty"`
 
-	// TicketLen is the ticket size this egress issues. It should match what the
-	// impersonated cover identity's real server issues, because the ticket
-	// travels inside pre_shared_key and so sets the client's ClientHello size:
-	// 176 bytes yields a 1711-byte hello, 230 yields 1761, 256 yields 1806.
-	TicketLen int `json:"ticket_len,omitempty"`
-
-	// PSKFirst places pre_shared_key before the other ServerHello extensions.
-	// Real servers differ but are each consistent -- google and cloudflare put it
-	// first, microsoft and amazon last -- so this should be stable per identity.
-	PSKFirst bool `json:"psk_first,omitempty"`
+	// CoverHost is the impersonated identity. Cipher, binder length, ticket
+	// length, ServerHello extension order and opening-flight sizes all come
+	// from the measured CoverProfile for this host, so they cannot be set
+	// individually and drift apart. Empty means the host of MasqueradeUpstream.
+	// Unknown hosts are rejected.
+	CoverHost string `json:"cover_host,omitempty"`
 }
 
 // TwiddleOutboundOptions configures the twiddle client.
@@ -49,9 +45,10 @@ type TwiddleOutboundOptions struct {
 	// PSK is the pre-shared key paired with Ticket, 32 bytes hex-encoded.
 	PSK string `json:"psk"`
 
-	// CoverSNI is the domain this egress masquerades as. It should agree with
-	// the egress's masquerade_upstream, or the SNI names one site while probes
-	// are answered by another.
+	// CoverSNI is the domain this egress masquerades as. It must be a measured
+	// cover identity (see twiddle.CoverFor) and should agree with the egress's
+	// masquerade_upstream, or the SNI names one site while probes are answered
+	// by another.
 	CoverSNI string `json:"cover_sni"`
 
 	// HelloPool carries a pool of harvested ClientHellos inline: one hex-encoded

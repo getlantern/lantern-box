@@ -64,15 +64,45 @@ func TestInboundAcceptsAValidConfig(t *testing.T) {
 	ib, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleInboundOptions{
 			TicketKey:          keyHex,
-			MasqueradeUpstream: "www.example.com:443",
+			MasqueradeUpstream: "www.microsoft.com:443",
 			TicketMaxAge:       "24h",
-			TicketLen:          256,
 		})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ib == nil {
 		t.Fatal("nil inbound")
+	}
+	if ib.(*Inbound).cfg.Cover.Host != "www.microsoft.com" {
+		t.Errorf("cover is %q", ib.(*Inbound).cfg.Cover.Host)
+	}
+	if ib.(*Inbound).cfg.Cover.BinderLen != 48 {
+		t.Errorf("microsoft binder %d, want 48", ib.(*Inbound).cfg.Cover.BinderLen)
+	}
+}
+
+func TestInboundAppliesDefaultTicketMaxAge(t *testing.T) {
+	keyHex, _, _ := creds(t)
+	ib, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleInboundOptions{
+			TicketKey: keyHex, MasqueradeUpstream: "www.cloudflare.com:443",
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ib.(*Inbound).cfg.MaxAge; got != tw.DefaultTicketMaxAge {
+		t.Fatalf("default ticket max age is %v, want %v", got, tw.DefaultTicketMaxAge)
+	}
+}
+
+func TestInboundRejectsUnknownCover(t *testing.T) {
+	keyHex, _, _ := creds(t)
+	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleInboundOptions{
+			TicketKey: keyHex, MasqueradeUpstream: "www.example.com:443",
+		})
+	if err == nil {
+		t.Fatal("inbound accepted an unmeasured cover")
 	}
 }
 
@@ -111,7 +141,7 @@ func TestOutboundUsesTheEmbeddedPoolByDefault(t *testing.T) {
 	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
-			Ticket:        ticket, PSK: psk, CoverSNI: "www.microsoft.com",
+			Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
 		})
 	if err != nil {
 		t.Fatal(err)
@@ -120,8 +150,35 @@ func TestOutboundUsesTheEmbeddedPoolByDefault(t *testing.T) {
 	if len(o.cfg.Pool) == 0 {
 		t.Fatal("outbound has an empty hello pool")
 	}
-	if o.cfg.CoverSNI != "www.microsoft.com" {
-		t.Errorf("cover SNI is %q", o.cfg.CoverSNI)
+	if o.cfg.Cover.Host != "www.cloudflare.com" {
+		t.Errorf("cover is %q", o.cfg.Cover.Host)
+	}
+}
+
+func TestOutboundRejectsUnknownCover(t *testing.T) {
+	_, ticket, psk := creds(t)
+	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
+			Ticket:        ticket, PSK: psk, CoverSNI: "www.example.com",
+		})
+	if err == nil {
+		t.Fatal("outbound accepted an unmeasured cover")
+	}
+}
+
+// Ticket length is a fidelity parameter of the cover, so a credential minted for
+// one identity cannot be presented as another: the hello would be the wrong size
+// for the SNI it carries.
+func TestOutboundRejectsCredentialForAnotherCover(t *testing.T) {
+	_, ticket, psk := creds(t)
+	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
+			Ticket:        ticket, PSK: psk, CoverSNI: "www.microsoft.com",
+		})
+	if err == nil {
+		t.Fatal("outbound accepted a credential with the wrong ticket length for its cover")
 	}
 }
 
@@ -143,7 +200,7 @@ func TestOutboundDegradesToEmbeddedOnACorruptPool(t *testing.T) {
 	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
-			Ticket:        ticket, PSK: psk, CoverSNI: "a.example",
+			Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
 			HelloPool: "not hex at all",
 		})
 	if err != nil {
@@ -219,7 +276,7 @@ func TestOutboundPoolPrecedence(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			o := tc.opts
 			o.ServerOptions = boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443}
-			o.Ticket, o.PSK, o.CoverSNI = ticket, psk, "www.microsoft.com"
+			o.Ticket, o.PSK, o.CoverSNI = ticket, psk, "www.cloudflare.com"
 			ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t", o)
 			if err != nil {
 				t.Fatal(err)
@@ -310,10 +367,17 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cred, err := key.Issue(1, tw.DefaultTicketLen)
+	cover, err := tw.CoverFor("www.cloudflare.com")
 	if err != nil {
 		t.Fatal(err)
 	}
+	cred, err := key.Issue(1, cover.TicketLen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One gate for the whole egress: tickets are single-use, so a per-connection
+	// cache would spend nothing.
+	replay := tw.NewReplayCache(64, 0)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -330,7 +394,9 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
-				tc, err := tw.Server(c, tw.ServerConfig{TicketKey: key})
+				tc, err := tw.Server(c, tw.ServerConfig{
+					TicketKey: key, Cover: cover, Replay: replay,
+				})
 				if err != nil {
 					return
 				}
@@ -348,7 +414,7 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 			ServerOptions: boxoption.ServerOptions{Server: host, ServerPort: uint16(port)},
 			Ticket:        base64.StdEncoding.EncodeToString(cred.Ticket),
 			PSK:           hex.EncodeToString(cred.PSK[:]),
-			CoverSNI:      "www.example.com",
+			CoverSNI:      cover.Host,
 		})
 	if err != nil {
 		t.Fatal(err)
@@ -435,19 +501,20 @@ func TestCredentialPoolIsBounded(t *testing.T) {
 	}
 }
 
-// TestPSKFirstReachesServerConfig covers the dead option review found.
-func TestPSKFirstReachesServerConfig(t *testing.T) {
+// TestCoverProfileReachesServerConfig covers the dead option review found. The
+// individual knobs it replaced could name one identity and emit another's
+// parameters, so what is pinned now is that the whole measured profile arrives.
+func TestCoverProfileReachesServerConfig(t *testing.T) {
 	keyHex, _, _ := creds(t)
-	for _, want := range []bool{false, true} {
-		ib, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
-			option.TwiddleInboundOptions{
-				TicketKey: keyHex, MasqueradeUpstream: "www.example.com:443", PSKFirst: want,
-			})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := ib.(*Inbound).cfg.PSKFirst; got != want {
-			t.Errorf("psk_first=%v did not reach ServerConfig (got %v)", want, got)
-		}
+	ib, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleInboundOptions{
+			TicketKey: keyHex, MasqueradeUpstream: "www.google.com:443",
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ib.(*Inbound).cfg.Cover
+	if !got.PSKFirst || got.TicketLen != 230 || got.BinderLen != 32 {
+		t.Errorf("google profile not applied: %+v", got)
 	}
 }
