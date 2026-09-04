@@ -540,7 +540,7 @@ func TestAcceptStreamsReportsARealFault(t *testing.T) {
 	}
 }
 
-// faultyConn fails every read with a error that is neither EOF nor a closed
+// faultyConn fails every read with an error that is neither EOF nor a closed
 // socket, so it exercises the branch acceptEndError must NOT swallow.
 type faultyConn struct {
 	net.Conn
