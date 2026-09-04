@@ -18,6 +18,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 
 	"github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/protocol/internal/masquerade"
 	"github.com/getlantern/lantern-box/option"
 )
 
@@ -138,7 +139,7 @@ func (i *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		}
 		if len(prefix) > 0 {
 			i.logger.DebugContext(ctx, "reflex: client spoke during silence window from ", metadata.Source, "; masquerading to ", i.masqueradeUpstream)
-			ferr := forwardToMasquerade(ctx, conn, i.masqueradeUpstream, prefix)
+			ferr := masquerade.Forward(ctx, conn, i.masqueradeUpstream, prefix)
 			if ferr != nil {
 				i.logger.DebugContext(ctx, "reflex: masquerade forward error: ", ferr)
 			}
