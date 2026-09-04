@@ -144,11 +144,26 @@ func (i *Inbound) acceptStreams(ctx context.Context, sess *yamux.Session, metada
 	for {
 		stream, err := sess.Accept()
 		if err != nil {
-			acceptErr = err
+			acceptErr = acceptEndError(err)
 			return
 		}
 		go i.routeStream(ctx, stream, metadata)
 	}
+}
+
+// acceptEndError maps the accept loop's exit to what onClose should report.
+//
+// Everything downstream reads a non-nil onClose as a fault -- mutableselector
+// records it on the span, and the autoselect health scoring demotes an outbound
+// on it -- so a peer that simply hung up has to arrive as nil, or ordinary
+// teardown is indistinguishable from a broken tunnel. yamux reports its own
+// clean shutdown as ErrSessionShutdown; the underlying conn reports the same
+// event as EOF or a closed socket, which FirstRealError already filters.
+func acceptEndError(err error) error {
+	if errors.Is(err, yamux.ErrSessionShutdown) {
+		return nil
+	}
+	return masquerade.FirstRealError(err)
 }
 
 func (i *Inbound) routeStream(ctx context.Context, stream net.Conn, metadata adapter.InboundContext) {

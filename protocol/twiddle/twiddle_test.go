@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -485,7 +486,10 @@ func TestPeekConnReplayIsFaithful(t *testing.T) {
 	}
 }
 
-func TestAcceptStreamsReportsSessionError(t *testing.T) {
+// A peer hanging up is not a fault. onClose feeds failure telemetry and the
+// autoselect health scoring, so reporting an ordinary teardown as an error
+// would demote a working outbound every time a client disconnects.
+func TestAcceptStreamsReportsACleanCloseAsClean(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	serverSession, err := yamux.Server(serverConn, muxConfig())
 	if err != nil {
@@ -504,13 +508,46 @@ func TestAcceptStreamsReportsSessionError(t *testing.T) {
 	}
 	select {
 	case err := <-closed:
-		if err == nil {
-			t.Fatal("session failure was reported as a clean close")
+		if err != nil {
+			t.Fatalf("ordinary teardown reported as a failure: %v", err)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("session close callback did not run")
 	}
 }
+
+// The other half of the same contract: a genuine transport fault still has to
+// reach onClose, or a broken tunnel looks exactly like a client going away.
+func TestAcceptStreamsReportsARealFault(t *testing.T) {
+	boom := errors.New("transport exploded")
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	serverSession, err := yamux.Server(&faultyConn{Conn: serverConn, readErr: boom}, muxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go (&Inbound{}).acceptStreams(context.Background(), serverSession, adapter.InboundContext{}, func(err error) {
+		closed <- err
+	})
+	select {
+	case err := <-closed:
+		if !errors.Is(err, boom) {
+			t.Fatalf("real fault reported as %v, want %v", err, boom)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("session close callback did not run")
+	}
+}
+
+// faultyConn fails every read with a error that is neither EOF nor a closed
+// socket, so it exercises the branch acceptEndError must NOT swallow.
+type faultyConn struct {
+	net.Conn
+	readErr error
+}
+
+func (c *faultyConn) Read([]byte) (int, error) { return 0, c.readErr }
 
 func TestDialRetriesAfterRemoteGoAway(t *testing.T) {
 	cover, err := tw.CoverFor("www.cloudflare.com")
