@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/hashicorp/yamux"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
@@ -52,17 +54,15 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 		return nil, errors.New("twiddle: masquerade_upstream is required; without it an active prober gets a distinguishing reply")
 	}
 
-	// The cover identity is derived rather than configured field by field: the
-	// cipher, binder length, ticket length and ServerHello extension order are
-	// one measured profile, and a config that could set them individually could
-	// name microsoft while emitting cloudflare's binder.
+	masqueradeHost, _, err := net.SplitHostPort(options.MasqueradeUpstream)
+	if err != nil {
+		return nil, fmt.Errorf("twiddle: masquerade_upstream %q is not host:port: %w", options.MasqueradeUpstream, err)
+	}
 	coverHost := options.CoverHost
 	if coverHost == "" {
-		var herr error
-		coverHost, _, herr = net.SplitHostPort(options.MasqueradeUpstream)
-		if herr != nil {
-			return nil, fmt.Errorf("twiddle: masquerade_upstream %q is not host:port: %w", options.MasqueradeUpstream, herr)
-		}
+		coverHost = masqueradeHost
+	} else if net.ParseIP(masqueradeHost) == nil && !strings.EqualFold(coverHost, masqueradeHost) {
+		return nil, fmt.Errorf("twiddle: cover_host %q does not match masquerade_upstream host %q", coverHost, masqueradeHost)
 	}
 	cover, err := tw.CoverFor(coverHost)
 	if err != nil {
@@ -85,11 +85,8 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 			TicketKey: key,
 			Cover:     cover,
 			MaxAge:    maxAge,
-			// One cache for the whole egress: a ticket is single-use, and a
-			// per-connection gate would spend nothing. Its horizon is maxAge
-			// because eviction is only sound where MaxAge refuses the ticket first.
-			Replay: tw.NewReplayCache(0, maxAge),
-			Shaper: tw.BrowsingShaper(true),
+			Replay:    tw.NewReplayCache(0, maxAge),
+			Shaper:    tw.BrowsingShaper(true),
 		},
 		masqueradeUpstream: options.MasqueradeUpstream,
 	}
@@ -128,18 +125,76 @@ func (i *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		return
 	}
 
-	dest, err := readDestination(tconn)
+	sess, err := yamux.Server(tconn, muxConfig())
 	if err != nil {
 		N.CloseOnHandshakeFailure(tconn, onClose, err)
 		return
 	}
-	destination := M.ParseSocksaddr(dest)
-	i.logger.TraceContext(ctx, "twiddle connection from ", metadata.Source, " to ", destination)
+	go i.acceptStreams(ctx, sess, metadata, onClose)
+}
 
-	metadata.Inbound = i.Tag()
-	metadata.InboundType = constant.TypeTwiddle
-	metadata.Destination = destination
-	i.router.RouteConnectionEx(ctx, tconn, metadata, onClose)
+func (i *Inbound) acceptStreams(ctx context.Context, sess *yamux.Session, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	defer sess.Close()
+	var acceptErr error
+	defer func() {
+		if onClose != nil {
+			onClose(acceptErr)
+		}
+	}()
+	for {
+		stream, err := sess.Accept()
+		if err != nil {
+			acceptErr = acceptEndError(err)
+			return
+		}
+		go i.routeStream(ctx, stream, metadata)
+	}
+}
+
+// acceptEndError maps the accept loop's exit to what onClose should report.
+//
+// Everything downstream reads a non-nil onClose as a fault -- mutableselector
+// records it on the span, and the autoselect health scoring demotes an outbound
+// on it -- so a peer that simply hung up has to arrive as nil, or ordinary
+// teardown is indistinguishable from a broken tunnel. yamux reports its own
+// clean shutdown as ErrSessionShutdown; the underlying conn reports the same
+// event as EOF or a closed socket, which FirstRealError already filters.
+func acceptEndError(err error) error {
+	if errors.Is(err, yamux.ErrSessionShutdown) {
+		return nil
+	}
+	return masquerade.FirstRealError(err)
+}
+
+// destinationReadTimeout bounds the stream prologue. A variable so tests can
+// shorten it.
+var destinationReadTimeout = 10 * time.Second
+
+func (i *Inbound) routeStream(ctx context.Context, stream net.Conn, metadata adapter.InboundContext) {
+	// A stream that opens and then says nothing would park this goroutine for
+	// as long as the peer cared to hold it. Mux is what makes that cheap to do
+	// at scale: one authenticated connection can open many streams, so the cost
+	// to the egress is per stream while the cost to the peer stays per
+	// connection. The deadline covers the prologue only and is cleared before
+	// the router takes over, which owns its own timeouts from there.
+	_ = stream.SetReadDeadline(time.Now().Add(destinationReadTimeout))
+	dest, err := readDestination(stream)
+	if err != nil {
+		stream.Close()
+		return
+	}
+	if err := stream.SetReadDeadline(time.Time{}); err != nil {
+		stream.Close()
+		return
+	}
+	destination := M.ParseSocksaddr(dest)
+	i.logger.TraceContext(ctx, "twiddle stream from ", metadata.Source, " to ", destination)
+
+	md := metadata
+	md.Inbound = i.Tag()
+	md.InboundType = constant.TypeTwiddle
+	md.Destination = destination
+	i.router.RouteConnectionEx(ctx, stream, md, nil)
 }
 
 func readDestination(r io.Reader) (string, error) {
