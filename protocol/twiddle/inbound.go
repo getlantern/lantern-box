@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
+	"github.com/sagernet/sing-box/common/uot"
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -32,7 +33,7 @@ type Inbound struct {
 	inbound.Adapter
 	ctx                context.Context
 	logger             log.ContextLogger
-	router             adapter.Router
+	router             adapter.ConnectionRouterEx
 	listener           *listener.Listener
 	cfg                tw.ServerConfig
 	masqueradeUpstream string
@@ -79,7 +80,7 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 		Adapter: inbound.NewAdapter(constant.TypeTwiddle, tag),
 		ctx:     ctx,
 		logger:  lg,
-		router:  router,
+		router:  uot.NewRouter(router, lg),
 		cfg: tw.ServerConfig{
 			TicketKey: key,
 			Cover:     cover,
