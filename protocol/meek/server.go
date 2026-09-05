@@ -179,7 +179,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	downstream, err := sess.serveRequest(hasSeq, seq, body, respCap, s.cfg.ResponseHoldoff)
 	if err != nil {
 		s.dropSession(sid)
-		if errors.Is(err, errUpstreamClosed) {
+		if errors.Is(err, errUpstreamBroken) {
+			// The upstream ended with a read failure, not an end of stream. This
+			// must not be a 410: the client maps 410 to io.EOF, so a truncated
+			// tunnel would reach the caller as a clean finish and the tail of the
+			// byte stream would vanish silently.
+			s.cfg.Logger.Debug("meek server: upstream failed; closing session", slog.String("sid", sid), slog.Any("error", err))
+			http.Error(w, "upstream failed", http.StatusBadGateway)
+		} else if errors.Is(err, errUpstreamClosed) {
 			// Clean end-of-stream: upstream closed with nothing left. 410 tells the
 			// client the session is gone so its Conn surfaces EOF instead of polling forever.
 			s.cfg.Logger.Debug("meek server: upstream closed; ending session", slog.String("sid", sid))
@@ -313,6 +320,11 @@ type session struct {
 	last         time.Time
 	readWakeCh   chan struct{}
 	upstreamDone chan struct{}
+	// upstreamErr is the non-EOF error that ended readPump, if any. It is what
+	// separates "upstream finished" from "upstream broke": both close
+	// upstreamDone, but only the first is an end of stream the client may
+	// report as io.EOF.
+	upstreamErr error
 	// drainCond wakes a readPump paused because pending is at cap, when
 	// takeLocked frees space or the session closes.
 	drainCond *sync.Cond
@@ -330,6 +342,12 @@ type session struct {
 // errUpstreamClosed signals that the upstream is closed with nothing left to
 // send, so ServeHTTP should drop the session and tell the client to tear down.
 var errUpstreamClosed = errors.New("meek: upstream closed")
+
+// errUpstreamBroken signals that the upstream ended with a read failure rather
+// than an end of stream. It must NOT become a 410: the client maps 410 to
+// io.EOF, which would report a truncated tunnel to the caller as a clean
+// finish. Anything else is surfaced as an error, which is the honest answer.
+var errUpstreamBroken = errors.New("meek: upstream failed")
 
 func newSession(id string, upstream net.Conn) *session {
 	s := &session{
@@ -358,8 +376,13 @@ func (s *session) serveRequest(hasSeq bool, seq uint64, body []byte, respCap int
 			}
 		}
 		resp := s.takeDownstream(respCap, holdoff)
-		if len(resp) == 0 && s.upstreamFinished() {
-			return nil, errUpstreamClosed
+		if len(resp) == 0 {
+			if done, upErr := s.upstreamFinished(); done {
+				if upErr != nil {
+					return nil, fmt.Errorf("%w: %w", errUpstreamBroken, upErr)
+				}
+				return nil, errUpstreamClosed
+			}
 		}
 		return resp, nil
 	}
@@ -375,8 +398,13 @@ func (s *session) serveRequest(hasSeq bool, seq uint64, body []byte, respCap int
 		}
 	}
 	resp := s.takeDownstream(respCap, holdoff)
-	if len(resp) == 0 && s.upstreamFinished() {
-		return nil, errUpstreamClosed
+	if len(resp) == 0 {
+		if done, upErr := s.upstreamFinished(); done {
+			if upErr != nil {
+				return nil, fmt.Errorf("%w: %w", errUpstreamBroken, upErr)
+			}
+			return nil, errUpstreamClosed
+		}
 	}
 	s.haveSeq = true
 	s.lastSeq = seq
@@ -388,15 +416,18 @@ func (s *session) serveRequest(hasSeq bool, seq uint64, body []byte, respCap int
 // downstream bytes have been drained — i.e. there is nothing left to ever send,
 // so the session should end and the client tear down (otherwise a read-only
 // client would poll forever on empty 200s, never seeing EOF).
-func (s *session) upstreamFinished() bool {
+func (s *session) upstreamFinished() (bool, error) {
 	select {
 	case <-s.upstreamDone:
 	default:
-		return false
+		return false, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.pending) == 0
+	if len(s.pending) > 0 {
+		return false, nil
+	}
+	return true, s.upstreamErr
 }
 
 func (s *session) lastSeen() time.Time {
@@ -448,6 +479,11 @@ func (s *session) readPump(cap int) {
 			s.signalWake()
 		}
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.mu.Lock()
+				s.upstreamErr = err
+				s.mu.Unlock()
+			}
 			return
 		}
 	}
