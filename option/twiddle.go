@@ -51,7 +51,8 @@ type TwiddleOutboundOptions struct {
 	// docs/full-handshake-carrier.md.
 	//
 	// Optional, and absence degrades rather than fails, because provisioning
-	// gained this field after clients were already deployed with the two above.
+	// gained this field after clients were already deployed with ticket and psk
+	// alone.
 	FullTicket string `json:"full_ticket,omitempty"`
 
 	// PSK is the pre-shared key paired with Ticket, 32 bytes hex-encoded. The
