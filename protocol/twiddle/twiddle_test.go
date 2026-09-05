@@ -927,3 +927,138 @@ func TestOutboundDisableFullHandshakeDropsTheContactMemory(t *testing.T) {
 		t.Error("disable_full_handshake left the contact memory in place")
 	}
 }
+
+// A GO_AWAY reaching one dial must not disturb the streams already running on
+// that tunnel.
+//
+// yamux's Close ends the session AND every stream on it, so retiring the cached
+// session has to stop short of closing it: GO_AWAY means "no new streams", not
+// "drop the ones in flight". Without that distinction a single late dial takes
+// down every unrelated connection the tunnel was carrying.
+func TestGoAwayLeavesLiveStreamsAlone(t *testing.T) {
+	cover, err := tw.CoverFor("www.cloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := tw.NewTicketKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := key.Issue(1, cover.TicketLen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	sessions := make(chan *yamux.Session, 2)
+	replay := tw.NewReplayCache(8, 0)
+	go func() {
+		for range 2 {
+			raw, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(raw net.Conn) {
+				conn, err := tw.Server(raw, tw.ServerConfig{
+					TicketKey: key, Cover: cover, Replay: replay,
+				})
+				if err != nil {
+					raw.Close()
+					return
+				}
+				session, err := yamux.Server(conn, muxConfig())
+				if err != nil {
+					conn.Close()
+					return
+				}
+				sessions <- session
+			}(raw)
+		}
+	}()
+
+	host, portString, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: host, ServerPort: uint16(port)},
+			Ticket:        base64.StdEncoding.EncodeToString(credential.Ticket),
+			PSK:           hex.EncodeToString(credential.PSK[:]),
+			CoverSNI:      cover.Host,
+			HelloPool:     testPool(t),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := created.(*Outbound)
+	defer out.Close()
+
+	// A stream that stays open for the whole test: this is the bystander.
+	first, err := out.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	firstSession := <-sessions
+	defer firstSession.Close()
+	firstStream, err := firstSession.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStream.Close()
+	if _, err := readDestination(firstStream); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := firstSession.GoAway(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := out.sess.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The dial that meets GO_AWAY. It must succeed on a replacement tunnel.
+	second, err := out.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.org:443"))
+	if err != nil {
+		t.Fatalf("dial did not replace the GO_AWAY session: %v", err)
+	}
+	defer second.Close()
+	secondSession := <-sessions
+	defer secondSession.Close()
+	secondStream, err := secondSession.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStream.Close()
+	if _, err := readDestination(secondStream); err != nil {
+		t.Fatal(err)
+	}
+
+	// The assertion this test exists for: the bystander still carries traffic.
+	want := []byte("the bystander is still connected")
+	if err := first.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Write(want); err != nil {
+		t.Fatalf("a live stream was torn down by an unrelated dial's GO_AWAY: %v", err)
+	}
+	if err := firstStream.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(firstStream, got); err != nil {
+		t.Fatalf("the egress side of a live stream did not survive the GO_AWAY: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("bystander carried %q, want %q", got, want)
+	}
+}

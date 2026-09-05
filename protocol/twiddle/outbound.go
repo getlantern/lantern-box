@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -180,7 +181,16 @@ func (o *Outbound) dialTunnel(ctx context.Context, destination M.Socksaddr) (net
 		}
 		stream, err := sess.Open()
 		if err != nil {
-			o.dropSession(sess)
+			// GO_AWAY means the egress will take no NEW streams. The ones
+			// already running on this tunnel are still live and still carrying
+			// user traffic, and yamux's Close takes down the session AND every
+			// stream on it -- so closing here would drop unrelated connections
+			// because an unrelated dial arrived late. The session is retired
+			// from the cache and left to drain instead; the peer closes the
+			// socket once it is done, which shuts the session down on its own.
+			// Any other Open failure means the session is already unusable, so
+			// there is nothing to drain and the socket should go back now.
+			o.retireSession(sess, !errors.Is(err, yamux.ErrRemoteGoAway))
 			openErr = err
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -263,12 +273,18 @@ func (d *uotDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (
 	return nil, fmt.Errorf("twiddle: uotDialer does not support ListenPacket: %w", os.ErrInvalid)
 }
 
-func (o *Outbound) dropSession(sess *yamux.Session) {
+// retireSession removes sess as the cached tunnel so the next dial builds a
+// fresh one. It closes sess only when closeIt is set -- see the GO_AWAY note in
+// dialTunnel for why that is not always wanted.
+func (o *Outbound) retireSession(sess *yamux.Session, closeIt bool) {
 	o.sessMu.Lock()
 	defer o.sessMu.Unlock()
-	if o.sess == sess {
-		o.sess.Close()
-		o.sess = nil
+	if o.sess != sess {
+		return
+	}
+	o.sess = nil
+	if closeIt {
+		sess.Close()
 	}
 }
 
