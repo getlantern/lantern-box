@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -48,8 +49,12 @@ const (
 	// bytes — see roundtrip / the server's seq handling.
 	defaultMaxPollRetries = 4
 	retryBaseBackoff      = 250 * time.Millisecond
-	headerSeq             = "X-Meek-Seq"
-	headerMaxBody         = "X-Meek-Max-Body"
+	// statusReasonCap bounds how much of a non-200 body is quoted back in the
+	// error. The server's reasons are a few words; anything longer is a peer
+	// being unhelpful, and is not worth carrying into a log line.
+	statusReasonCap = 256
+	headerSeq       = "X-Meek-Seq"
+	headerMaxBody   = "X-Meek-Max-Body"
 )
 
 // Config is the runtime configuration for a meek Conn.
@@ -428,6 +433,18 @@ func (c *Conn) roundtrip() error {
 		// Read surfaces a proper end-of-stream.
 		if resp.StatusCode == http.StatusGone {
 			return &permanentError{io.EOF}
+		}
+		// Carry the server's reason. Every non-200 path writes a short fixed
+		// string, and without it the two 502s -- a failed upstream read and a
+		// failed upstream write -- are indistinguishable to anyone reading a log,
+		// which is most of the value of separating them in the first place.
+		//
+		// Bounded and quoted: it is remote input, so it is capped at
+		// statusReasonCap bytes and rendered with %q rather than pasted into the
+		// message raw.
+		reason, _ := io.ReadAll(io.LimitReader(resp.Body, statusReasonCap))
+		if detail := strings.TrimSpace(string(reason)); detail != "" {
+			return &permanentError{fmt.Errorf("meek: status %d: %q", resp.StatusCode, detail)}
 		}
 		return &permanentError{fmt.Errorf("meek: status %d", resp.StatusCode)}
 	}

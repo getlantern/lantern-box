@@ -260,3 +260,51 @@ func TestBrokenUpstreamIsNotReportedAsCleanEOF(t *testing.T) {
 		t.Fatalf("got %v, want it to wrap both errUpstreamBroken and the read failure", err)
 	}
 }
+
+// The two 502 paths must be distinguishable to whoever reads the log.
+//
+// Separating a failed upstream READ from a failed upstream WRITE is only worth
+// anything if the difference survives to the caller. Both are 502, so without
+// the server's reason the distinction dies at the status line -- which is
+// exactly the position we were in when a CI failure said only "meek: status
+// 502" and could have been either.
+func TestClientCarriesTheServerReason(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+	}{
+		{"broken read", "upstream failed"},
+		{"failed write", "upstream write"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, tc.reason, http.StatusBadGateway)
+			}))
+			defer hs.Close()
+
+			conn, err := Dial(context.Background(), Config{
+				URL: hs.URL, InnerHost: "test", HTTPClient: hs.Client(),
+				PollInterval: 5 * time.Millisecond,
+			})
+			if err != nil {
+				// A 502 on the very first poll can fail the dial; that error must
+				// carry the reason too.
+				if !bytes.Contains([]byte(err.Error()), []byte(tc.reason)) {
+					t.Fatalf("dial error %q does not name the reason %q", err, tc.reason)
+				}
+				return
+			}
+			defer conn.Close()
+
+			buf := make([]byte, 1)
+			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_, err = conn.Read(buf)
+			if err == nil {
+				t.Fatal("a 502 was not surfaced as an error")
+			}
+			if !bytes.Contains([]byte(err.Error()), []byte(tc.reason)) {
+				t.Fatalf("error %q does not name the reason %q; the two 502 paths are indistinguishable", err, tc.reason)
+			}
+		})
+	}
+}
