@@ -1,0 +1,15 @@
+{
+	"log": {"disabled": true, "level": "trace", "output": "stdout"},
+	"inbounds": [
+		{
+			"type": "twiddle",
+			"tag": "twiddle-in",
+			"listen": "127.0.0.1",
+			"listen_port": 9005,
+			"ticket_key": "TICKET_KEY",
+			"masquerade_upstream": "www.cloudflare.com:443",
+			"ticket_max_age": "24h"
+		}
+	],
+	"outbounds": [{"type": "direct", "tag": "direct"}]
+}
