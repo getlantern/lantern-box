@@ -22,6 +22,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
@@ -59,6 +60,7 @@ type Outbound struct {
 	// poolOrigin records which tier the hellos came from, so a client that has
 	// quietly degraded to the built-in pool is diagnosable after the fact.
 	poolOrigin tw.Origin
+	uotClient  *uot.Client
 }
 
 // maxCredPool bounds credential accumulation on a long-lived outbound.
@@ -155,8 +157,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		contacts = tw.NewContactMemory(0, 0)
 	}
 
-	return &Outbound{
-		Adapter:    outbound.NewAdapterWithDialerOptions(constant.TypeTwiddle, tag, []string{N.NetworkTCP}, options.DialerOptions),
+	o := &Outbound{
+		Adapter:    outbound.NewAdapterWithDialerOptions(constant.TypeTwiddle, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
 		logger:     lg,
 		dialer:     outboundDialer,
 		server:     options.Server,
@@ -170,12 +172,18 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 			Shaper:   tw.BrowsingShaper(false),
 			Contacts: contacts,
 		},
-	}, nil
+	}
+	o.uotClient = &uot.Client{Dialer: o, Version: uot.Version}
+	return o, nil
 }
 
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	if network != N.NetworkTCP {
-		return nil, fmt.Errorf("twiddle: only TCP is supported")
+	switch N.NetworkName(network) {
+	case N.NetworkUDP:
+		return o.uotClient.DialContext(ctx, network, destination)
+	case N.NetworkTCP:
+	default:
+		return nil, fmt.Errorf("twiddle: unsupported network: %s", network)
 	}
 	o.logger.TraceContext(ctx, "dialing twiddle connection to ", o.server, ":", o.port)
 
@@ -245,8 +253,8 @@ func writeDestination(conn net.Conn, dest string) error {
 }
 
 func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	return nil, fmt.Errorf("twiddle: UDP not supported")
+	return o.uotClient.ListenPacket(ctx, destination)
 }
 
-func (o *Outbound) Network() []string { return []string{N.NetworkTCP} }
+func (o *Outbound) Network() []string { return []string{N.NetworkTCP, N.NetworkUDP} }
 func (o *Outbound) Close() error      { return nil }

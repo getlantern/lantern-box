@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,14 +14,139 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	boxoption "github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/stretchr/testify/require"
 
 	"github.com/getlantern/lantern-box/option"
 	tw "github.com/getlantern/twiddle"
 )
+
+type echoRouter struct {
+	adapter.Router
+	routed chan adapter.InboundContext
+}
+
+func (r *echoRouter) RouteConnectionEx(_ context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	r.routed <- metadata
+	_, err := io.Copy(conn, conn)
+	conn.Close()
+	onClose(err)
+}
+
+func (r *echoRouter) RoutePacketConnectionEx(_ context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	metadata.Network = N.NetworkUDP
+	r.routed <- metadata
+	defer conn.Close()
+	for {
+		packet := buf.NewPacket()
+		destination, err := conn.ReadPacket(packet)
+		if err == nil {
+			err = conn.WritePacket(packet, destination)
+		}
+		packet.Release()
+		if err != nil {
+			onClose(err)
+			return
+		}
+	}
+}
+
+func TestOutboundRoutesTCPAndUDP(t *testing.T) {
+	for _, mode := range []string{"tcp", "udp", "packet"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			key, ticket, psk := creds(t)
+			router := &echoRouter{routed: make(chan adapter.InboundContext, 1)}
+			logger := log.NewNOPFactory().Logger()
+			ib, err := NewInbound(ctx, router, logger, "in", option.TwiddleInboundOptions{
+				TicketKey: key, MasqueradeUpstream: "www.cloudflare.com:443",
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { ib.Close() })
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			t.Cleanup(func() { listener.Close() })
+			finished := make(chan struct{})
+			go func() {
+				defer close(finished)
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				conn.SetDeadline(time.Now().Add(10 * time.Second))
+				ib.(*Inbound).NewConnectionEx(ctx, conn, adapter.InboundContext{}, func(error) {})
+			}()
+			t.Cleanup(func() {
+				listener.Close()
+				select {
+				case <-finished:
+				case <-time.After(12 * time.Second):
+					t.Error("inbound did not close")
+				}
+			})
+			ob, err := NewOutbound(ctx, nil, logger, "out", option.TwiddleOutboundOptions{
+				ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: uint16(listener.Addr().(*net.TCPAddr).Port)},
+				Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
+			})
+			require.NoError(t, err)
+			out := ob.(*Outbound)
+			require.Contains(t, out.Network(), N.NetworkUDP)
+			destination := M.ParseSocksaddr("192.0.2.1:53")
+			payloads := [][]byte{[]byte("first datagram"), bytes.Repeat([]byte{0xab}, 4096)}
+			if mode == "packet" {
+				conn, err := out.ListenPacket(ctx, destination)
+				require.NoError(t, err)
+				defer conn.Close()
+				require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+				for i, target := range []M.Socksaddr{destination, M.ParseSocksaddr("[2001:db8::1]:5353"), M.ParseSocksaddr("192.0.2.2:443")} {
+					payload := payloads[i%len(payloads)]
+					_, err = conn.WriteTo(payload, target)
+					require.NoError(t, err)
+					response := make([]byte, 8192)
+					n, source, err := conn.ReadFrom(response)
+					require.NoError(t, err)
+					require.Equal(t, target.String(), source.String())
+					require.Equal(t, payload, response[:n])
+				}
+			} else {
+				conn, err := out.DialContext(ctx, mode, destination)
+				require.NoError(t, err)
+				defer conn.Close()
+				require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+				for _, payload := range payloads {
+					_, err = conn.Write(payload)
+					require.NoError(t, err)
+					response := make([]byte, 8192)
+					var n int
+					if mode == "tcp" {
+						n, err = io.ReadFull(conn, response[:len(payload)])
+					} else {
+						n, err = conn.Read(response)
+					}
+					require.NoError(t, err)
+					require.Equal(t, payload, response[:n])
+				}
+			}
+			select {
+			case metadata := <-router.routed:
+				require.Equal(t, destination, metadata.Destination)
+				if mode != "tcp" {
+					require.Equal(t, N.NetworkUDP, metadata.Network)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("connection never reached router")
+			}
+		})
+	}
+}
 
 func creds(t *testing.T) (keyHex, ticketB64, pskHex string) {
 	t.Helper()
