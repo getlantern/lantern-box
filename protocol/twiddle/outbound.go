@@ -50,6 +50,7 @@ type Outbound struct {
 
 	sessMu sync.Mutex
 	sess   *yamux.Session
+	closed bool
 
 	poolOrigin tw.Origin
 	uotClient  *uot.Client
@@ -91,9 +92,6 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		return nil, fmt.Errorf("twiddle: credential ticket length %d does not match cover %d", len(cred.Ticket), cover.TicketLen)
 	}
 
-	// Embedded fallback is disabled: a stale compiled-in snapshot is a
-	// fingerprint, and the right reaction is to fail this outbound so another
-	// transport is selected.
 	pool, err := tw.LoadPool(tw.Sources{
 		Device:       options.HelloPoolDevicePath,
 		Config:       options.HelloPoolPath,
@@ -215,6 +213,12 @@ func (o *Outbound) dialTunnel(ctx context.Context, destination M.Socksaddr) (net
 func (o *Outbound) ensureSession(ctx context.Context) (*yamux.Session, error) {
 	o.sessMu.Lock()
 	defer o.sessMu.Unlock()
+	// Close nils the session, so without this a dial arriving afterwards would
+	// read that as "no tunnel yet" and build a fresh one -- an outbound that
+	// quietly resurrects itself, holding a connection nothing will ever close.
+	if o.closed {
+		return nil, net.ErrClosed
+	}
 	if o.sess != nil && !o.sess.IsClosed() {
 		return o.sess, nil
 	}
@@ -342,6 +346,7 @@ func (o *Outbound) Network() []string { return []string{N.NetworkTCP, N.NetworkU
 func (o *Outbound) Close() error {
 	o.sessMu.Lock()
 	defer o.sessMu.Unlock()
+	o.closed = true
 	if o.sess != nil {
 		err := o.sess.Close()
 		o.sess = nil

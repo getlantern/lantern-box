@@ -806,13 +806,14 @@ func TestConcurrentDialsShareOneMuxedTunnel(t *testing.T) {
 	if ok == 0 {
 		t.Fatal("no dial completed")
 	}
-	if atomic.LoadInt64(&tunnels) != 1 {
-		t.Errorf("opened %d outer tunnels, want 1 muxed session", tunnels)
+	openedTunnels := atomic.LoadInt64(&tunnels)
+	if openedTunnels != 1 {
+		t.Errorf("opened %d outer tunnels, want 1 muxed session", openedTunnels)
 	}
 	if ok < n {
 		t.Errorf("%d/%d dials completed", ok, n)
 	}
-	t.Logf("%d/%d dials on %d tunnel, %d streams served", ok, n, tunnels, atomic.LoadInt64(&served))
+	t.Logf("%d/%d dials on %d tunnel, %d streams served", ok, n, openedTunnels, atomic.LoadInt64(&served))
 }
 
 // TestCredentialPoolHandsOutDistinctCredentials: sequential connections must
@@ -1157,5 +1158,62 @@ func TestSilentStreamIsDroppedNotHeld(t *testing.T) {
 	if elapsed > clientPatience/3 {
 		t.Fatalf("the egress held a silent stream for %v; the %v prologue deadline did not fire",
 			elapsed, destinationReadTimeout)
+	}
+}
+
+// A dial arriving after Close must not build a new tunnel.
+//
+// Close nils the cached session, which is exactly what ensureSession reads as
+// "no tunnel yet" -- so without a closed flag the outbound quietly resurrects
+// itself and holds a connection nothing will ever close.
+func TestDialAfterCloseDoesNotResurrectTheOutbound(t *testing.T) {
+	_, ticket, psk := creds(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	var accepted int64
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			atomic.AddInt64(&accepted, 1)
+			c.Close()
+		}
+	}()
+
+	host, portString, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: host, ServerPort: uint16(port)},
+			Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
+			HelloPool: testPool(t),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := created.(*Outbound)
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := out.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.com:443")); err == nil {
+		t.Fatal("a dial after Close built a new tunnel")
+	} else if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("dial after Close reported %v, want net.ErrClosed", err)
+	}
+	if n := atomic.LoadInt64(&accepted); n != 0 {
+		t.Errorf("a closed outbound opened %d connections", n)
 	}
 }
