@@ -166,9 +166,24 @@ func acceptEndError(err error) error {
 	return masquerade.FirstRealError(err)
 }
 
+// destinationReadTimeout bounds the stream prologue. A variable so tests can
+// shorten it.
+var destinationReadTimeout = 10 * time.Second
+
 func (i *Inbound) routeStream(ctx context.Context, stream net.Conn, metadata adapter.InboundContext) {
+	// A stream that opens and then says nothing would park this goroutine for
+	// as long as the peer cared to hold it. Mux is what makes that cheap to do
+	// at scale: one authenticated connection can open many streams, so the cost
+	// to the egress is per stream while the cost to the peer stays per
+	// connection. The deadline covers the prologue only and is cleared before
+	// the router takes over, which owns its own timeouts from there.
+	_ = stream.SetReadDeadline(time.Now().Add(destinationReadTimeout))
 	dest, err := readDestination(stream)
 	if err != nil {
+		stream.Close()
+		return
+	}
+	if err := stream.SetReadDeadline(time.Time{}); err != nil {
 		stream.Close()
 		return
 	}

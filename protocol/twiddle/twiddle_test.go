@@ -1085,3 +1085,59 @@ func TestGoAwayLeavesLiveStreamsAlone(t *testing.T) {
 		t.Fatalf("bystander carried %q, want %q", got, want)
 	}
 }
+
+// A stream that opens and never names a destination must be dropped rather than
+// held. Mux is what makes this worth bounding: the peer pays once for the
+// connection and the egress pays per stream, so an unbounded prologue is a
+// goroutine faucet for anyone holding a valid credential.
+func TestSilentStreamIsDroppedNotHeld(t *testing.T) {
+	prev := destinationReadTimeout
+	destinationReadTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { destinationReadTimeout = prev })
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	serverSession, err := yamux.Server(serverConn, muxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	clientSession, err := yamux.Client(clientConn, muxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+
+	ib := &Inbound{logger: log.NewNOPFactory().Logger()}
+	go ib.acceptStreams(context.Background(), serverSession, adapter.InboundContext{}, func(error) {})
+
+	stream, err := clientSession.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	// Say nothing. The egress must give up and close the stream on its own.
+	//
+	// The assertion is on ELAPSED TIME, not on the error: yamux returns its own
+	// timeout rather than os.ErrDeadlineExceeded, so an error-kind check passes
+	// whether the egress dropped the stream or the client's own deadline
+	// expired -- which is to say it would pass with no prologue deadline at all.
+	// Timing separates them: a dropped stream returns in about
+	// destinationReadTimeout, a held one only when the client gives up.
+	const clientPatience = 3 * time.Second
+	if err := stream.SetReadDeadline(time.Now().Add(clientPatience)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	start := time.Now()
+	_, err = stream.Read(buf)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a silent stream was answered rather than dropped")
+	}
+	if elapsed > clientPatience/3 {
+		t.Fatalf("the egress held a silent stream for %v; the %v prologue deadline did not fire",
+			elapsed, destinationReadTimeout)
+	}
+}
