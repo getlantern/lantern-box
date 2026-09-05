@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -180,4 +182,81 @@ func TestMeekRetryUploadNoDuplication(t *testing.T) {
 		t.Fatal("test ineffective: no responses were dropped")
 	}
 	t.Logf("upload intact (exactly %d bytes) across %d dropped+retried responses", size, atomic.LoadInt64(&ft.dropped))
+}
+
+// brokenUpstream serves some bytes and then fails the read, which is what an
+// RST or an I/O error on the origin looks like to the session's read pump.
+type brokenUpstream struct {
+	net.Conn
+	remaining int
+	failure   error
+}
+
+func (c *brokenUpstream) Read(b []byte) (int, error) {
+	if c.remaining <= 0 {
+		return 0, c.failure
+	}
+	n := len(b)
+	if n > c.remaining {
+		n = c.remaining
+	}
+	for i := range b[:n] {
+		b[i] = 0x5a
+	}
+	c.remaining -= n
+	return n, nil
+}
+
+func (c *brokenUpstream) Write(b []byte) (int, error) { return len(b), nil }
+func (c *brokenUpstream) Close() error                { return nil }
+
+// A truncated download must not reach the caller as a clean end of stream.
+//
+// readPump ends on any upstream read error, and closing upstreamDone is what
+// the session reads as "closed with nothing left" -- so before this was split
+// out, a failed read became a 410, which the client maps to io.EOF. The caller
+// could not tell a finished transfer from a broken one, and the tail of the
+// byte stream vanished silently. Everything else in this package is careful
+// about exactly that (see the over-cap check in client.go), so it should be
+// careful here too.
+func TestBrokenUpstreamIsNotReportedAsCleanEOF(t *testing.T) {
+	const served = 4096
+	failure := errors.New("upstream exploded")
+
+	sess := &session{
+		id:           "t",
+		upstream:     &brokenUpstream{remaining: served, failure: failure},
+		readWakeCh:   make(chan struct{}, 1),
+		upstreamDone: make(chan struct{}),
+	}
+	sess.drainCond = sync.NewCond(&sess.mu)
+	go sess.readPump(1 << 20)
+
+	// Drain what the upstream did deliver.
+	var got int
+	for got < served {
+		resp, err := sess.serveRequest(true, uint64(got), nil, 1024, 20*time.Millisecond)
+		if err != nil {
+			t.Fatalf("failed while bytes were still buffered, at %d/%d: %v", got, served, err)
+		}
+		if len(resp) == 0 {
+			continue
+		}
+		got += len(resp)
+	}
+
+	// The upstream is now finished, and it finished badly.
+	var err error
+	for i := 0; i < 50 && err == nil; i++ {
+		_, err = sess.serveRequest(true, uint64(served+i+1), nil, 1024, 20*time.Millisecond)
+	}
+	if err == nil {
+		t.Fatal("a broken upstream never ended the session")
+	}
+	if errors.Is(err, errUpstreamClosed) {
+		t.Fatal("a broken upstream reported a clean end of stream; the client would surface io.EOF and the caller would read a short, apparently complete stream")
+	}
+	if !errors.Is(err, errUpstreamBroken) || !errors.Is(err, failure) {
+		t.Fatalf("got %v, want it to wrap both errUpstreamBroken and the read failure", err)
+	}
 }
