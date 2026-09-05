@@ -300,15 +300,22 @@ func testPool(t *testing.T) string {
 	return tw.FormatPool(p.Hellos)
 }
 
-func TestOutboundRejectsMissingPool(t *testing.T) {
+func TestOutboundUsesTheEmbeddedPoolByDefault(t *testing.T) {
 	_, ticket, psk := creds(t)
-	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
 		})
-	if err == nil {
-		t.Fatal("outbound accepted a missing hello pool; the embedded snapshot must not ship")
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := ob.(*Outbound)
+	if len(o.cfg.Pool) == 0 {
+		t.Fatal("outbound has an empty hello pool")
+	}
+	if o.cfg.Cover.Host != "www.cloudflare.com" {
+		t.Errorf("cover is %q", o.cfg.Cover.Host)
 	}
 }
 
@@ -325,16 +332,35 @@ func TestOutboundRejectsUnknownCover(t *testing.T) {
 	}
 }
 
-func TestOutboundRejectsCorruptPool(t *testing.T) {
+// A corrupt configured pool must DEGRADE to the built-in one, not fail the
+// outbound.
+//
+// A pool arrives by config push, so a bad one reaches every client at once; the
+// two candidate failure modes are "every client emits a stale fingerprint" and
+// "every client has no outbound at all". The first risks detection,
+// probabilistically and recoverably; the second is a certain outage. Both are
+// fixed by pushing new config, so the interim state is the whole of the
+// difference, and staleness is the better interim state.
+//
+// The compensating requirement is that the degradation be visible, which is
+// what poolOrigin and the logged Skipped errors are for.
+func TestOutboundDegradesToEmbeddedOnACorruptPool(t *testing.T) {
 	_, ticket, psk := creds(t)
-	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
 			HelloPool: "not hex at all",
 		})
-	if err == nil {
-		t.Fatal("a corrupt pool must fail the outbound rather than emit the stale snapshot")
+	if err != nil {
+		t.Fatalf("a corrupt pool must not brick the outbound: %v", err)
+	}
+	o := ob.(*Outbound)
+	if o.poolOrigin != tw.OriginEmbedded {
+		t.Errorf("pool origin is %v, want embedded", o.poolOrigin)
+	}
+	if len(o.cfg.Pool) == 0 {
+		t.Error("degraded outbound has no hellos at all")
 	}
 }
 
@@ -859,8 +885,7 @@ func TestOutboundCarriesTheFullHandshakeCompanion(t *testing.T) {
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, FullTicket: fullTicket, PSK: psk,
-			CoverSNI:  "www.cloudflare.com",
-			HelloPool: testPool(t),
+			CoverSNI: "www.cloudflare.com",
 		})
 	if err != nil {
 		t.Fatal(err)
@@ -886,7 +911,6 @@ func TestOutboundWithoutAFullTicketIsResumptionOnly(t *testing.T) {
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
-			HelloPool: testPool(t),
 		})
 	if err != nil {
 		t.Fatalf("a config without full_ticket was rejected: %v", err)
@@ -918,7 +942,6 @@ func TestOutboundDisableFullHandshakeDropsTheContactMemory(t *testing.T) {
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, FullTicket: fullTicket, PSK: psk,
 			CoverSNI: "www.cloudflare.com", DisableFullHandshake: true,
-			HelloPool: testPool(t),
 		})
 	if err != nil {
 		t.Fatal(err)

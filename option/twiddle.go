@@ -65,9 +65,9 @@ type TwiddleOutboundOptions struct {
 	CoverSNI string `json:"cover_sni"`
 
 	// HelloPool carries a pool of harvested ClientHellos inline: one hex-encoded
-	// record per line. This is the config-delivered tier and loses to
-	// HelloPoolDevicePath. The stale pool compiled into twiddle is not used as a
-	// production fallback.
+	// record per line. This is the config-delivered tier -- it beats the pool
+	// compiled into the twiddle module, which is a snapshot of one Chrome version
+	// and ages into a positive signal, but it loses to HelloPoolDevicePath.
 	HelloPool string `json:"hello_pool,omitempty"`
 
 	// HelloPoolPath is a config-written pool file, in the same form as

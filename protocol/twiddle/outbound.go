@@ -98,6 +98,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		Device:       options.HelloPoolDevicePath,
 		Config:       options.HelloPoolPath,
 		ConfigInline: options.HelloPool,
+		// The built-in pool is opt-in in the core because it is stale by
+		// construction. It is enabled here for the reason argued at
+		// TestOutboundDegradesToEmbeddedOnACorruptPool: a stale fingerprint on
+		// every client beats no outbound on every client, and both need the same
+		// config push to clear.
+		AllowEmbedded: true,
 	})
 	if err != nil {
 		return nil, err
