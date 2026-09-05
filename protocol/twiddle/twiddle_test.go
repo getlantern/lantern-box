@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/yamux"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	boxoption "github.com/sagernet/sing-box/option"
@@ -48,11 +50,21 @@ func (r *echoRouter) RoutePacketConnection(ctx context.Context, conn N.PacketCon
 	return nil
 }
 
+// onClose is optional in the sing-box contract -- the real router funnels it
+// through N.CloseOnHandshakeFailure, which tolerates nil -- and routeStream
+// passes nil because a stream has no per-stream close bookkeeping to do. A test
+// double that calls it unconditionally turns that into a panic.
+func closeHandled(onClose N.CloseHandlerFunc, err error) {
+	if onClose != nil {
+		onClose(err)
+	}
+}
+
 func (r *echoRouter) RouteConnectionEx(_ context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	r.routed <- metadata
 	_, err := io.Copy(conn, conn)
 	conn.Close()
-	onClose(err)
+	closeHandled(onClose, err)
 }
 
 func (r *echoRouter) RoutePacketConnectionEx(_ context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -67,7 +79,7 @@ func (r *echoRouter) RoutePacketConnectionEx(_ context.Context, conn N.PacketCon
 		}
 		packet.Release()
 		if err != nil {
-			onClose(err)
+			closeHandled(onClose, err)
 			return
 		}
 	}
@@ -89,6 +101,13 @@ func TestOutboundRoutesTCPAndUDP(t *testing.T) {
 			require.NoError(t, err)
 			t.Cleanup(func() { listener.Close() })
 			finished := make(chan struct{})
+			// serving holds the tunnel open for the body of the test. Under
+			// muxing NewConnectionEx hands the session to a goroutine and
+			// returns at once, so a bare `defer conn.Close()` would tear the
+			// tunnel down before the client could open a stream on it -- and a
+			// deadline on conn would now bound the whole session rather than
+			// one connection.
+			serving := make(chan struct{})
 			go func() {
 				defer close(finished)
 				conn, err := listener.Accept()
@@ -96,10 +115,11 @@ func TestOutboundRoutesTCPAndUDP(t *testing.T) {
 					return
 				}
 				defer conn.Close()
-				conn.SetDeadline(time.Now().Add(10 * time.Second))
 				ib.(*Inbound).NewConnectionEx(ctx, conn, adapter.InboundContext{}, func(error) {})
+				<-serving
 			}()
 			t.Cleanup(func() {
+				close(serving)
 				listener.Close()
 				select {
 				case <-finished:
@@ -236,6 +256,18 @@ func TestInboundAppliesDefaultTicketMaxAge(t *testing.T) {
 	}
 }
 
+func TestInboundRejectsMismatchedCoverHost(t *testing.T) {
+	keyHex, _, _ := creds(t)
+	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleInboundOptions{
+			TicketKey: keyHex, MasqueradeUpstream: "www.cloudflare.com:443",
+			CoverHost: "www.microsoft.com",
+		})
+	if err == nil {
+		t.Fatal("inbound accepted a cover_host that contradicts masquerade_upstream")
+	}
+}
+
 func TestInboundRejectsUnknownCover(t *testing.T) {
 	keyHex, _, _ := creds(t)
 	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
@@ -277,6 +309,15 @@ func TestOutboundRejectsBadCredentials(t *testing.T) {
 	}
 }
 
+func testPool(t *testing.T) string {
+	t.Helper()
+	p, err := tw.LoadPool(tw.Sources{AllowEmbedded: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tw.FormatPool(p.Hellos)
+}
+
 func TestOutboundUsesTheEmbeddedPoolByDefault(t *testing.T) {
 	_, ticket, psk := creds(t)
 	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
@@ -302,37 +343,22 @@ func TestOutboundRejectsUnknownCover(t *testing.T) {
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, PSK: psk, CoverSNI: "www.example.com",
+			HelloPool: testPool(t),
 		})
 	if err == nil {
 		t.Fatal("outbound accepted an unmeasured cover")
 	}
 }
 
-// Ticket length is a fidelity parameter of the cover, so a credential minted for
-// one identity cannot be presented as another: the hello would be the wrong size
-// for the SNI it carries.
-func TestOutboundRejectsCredentialForAnotherCover(t *testing.T) {
-	_, ticket, psk := creds(t)
-	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
-		option.TwiddleOutboundOptions{
-			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
-			Ticket:        ticket, PSK: psk, CoverSNI: "www.microsoft.com",
-		})
-	if err == nil {
-		t.Fatal("outbound accepted a credential with the wrong ticket length for its cover")
-	}
-}
-
 // A corrupt configured pool must DEGRADE to the built-in one, not fail the
 // outbound.
 //
-// This reverses the earlier contract deliberately. A pool arrives by config
-// push, so a bad one reaches every client at once; the two candidate failure
-// modes are "every client emits a stale fingerprint" and "every client has no
-// outbound at all". The first risks detection, probabilistically and
-// recoverably; the second is a certain outage. Both are fixed by pushing new
-// config, so the interim state is the whole of the difference, and staleness is
-// the better interim state.
+// A pool arrives by config push, so a bad one reaches every client at once; the
+// two candidate failure modes are "every client emits a stale fingerprint" and
+// "every client has no outbound at all". The first risks detection,
+// probabilistically and recoverably; the second is a certain outage. Both are
+// fixed by pushing new config, so the interim state is the whole of the
+// difference, and staleness is the better interim state.
 //
 // The compensating requirement is that the degradation be visible, which is
 // what poolOrigin and the logged Skipped errors are for.
@@ -353,6 +379,19 @@ func TestOutboundDegradesToEmbeddedOnACorruptPool(t *testing.T) {
 	}
 	if len(o.cfg.Pool) == 0 {
 		t.Error("degraded outbound has no hellos at all")
+	}
+}
+
+func TestOutboundRejectsCredentialForAnotherCover(t *testing.T) {
+	_, ticket, psk := creds(t)
+	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
+			Ticket:        ticket, PSK: psk, CoverSNI: "www.microsoft.com",
+			HelloPool: testPool(t),
+		})
+	if err == nil {
+		t.Fatal("outbound accepted a credential with the wrong ticket length for its cover")
 	}
 }
 
@@ -404,14 +443,9 @@ func TestOutboundPoolPrecedence(t *testing.T) {
 			wantOrigin: tw.OriginConfig, wantSNI: "configfile.example",
 		},
 		{
-			name:       "inline beats embedded",
+			name:       "inline is the config tier",
 			opts:       option.TwiddleOutboundOptions{HelloPool: inline},
 			wantOrigin: tw.OriginConfig, wantSNI: "inline.example",
-		},
-		{
-			name:       "nothing configured falls back",
-			opts:       option.TwiddleOutboundOptions{},
-			wantOrigin: tw.OriginEmbedded,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -496,19 +530,200 @@ func TestPeekConnReplayIsFaithful(t *testing.T) {
 	}
 }
 
-// TestConcurrentDialsExerciseTheCredentialPath replaces an earlier version that
-// pointed at port 1. Review caught that the TCP dial fails before DialContext
-// ever reaches the credential code, so the test asserted nothing about the path
-// it named -- a vacuous test that would have passed with the pool removed.
-//
-// This one stands up a real twiddle egress, so every dial completes an opening
-// and actually claims and returns a credential. Run under -race.
-func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
+// A peer hanging up is not a fault. onClose feeds failure telemetry and the
+// autoselect health scoring, so reporting an ordinary teardown as an error
+// would demote a working outbound every time a client disconnects.
+func TestAcceptStreamsReportsACleanCloseAsClean(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	serverSession, err := yamux.Server(serverConn, muxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSession, err := yamux.Client(clientConn, muxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go (&Inbound{}).acceptStreams(context.Background(), serverSession, adapter.InboundContext{}, func(err error) {
+		closed <- err
+	})
+	if err := clientSession.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("ordinary teardown reported as a failure: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("session close callback did not run")
+	}
+}
+
+// The other half of the same contract: a genuine transport fault still has to
+// reach onClose, or a broken tunnel looks exactly like a client going away.
+func TestAcceptStreamsReportsARealFault(t *testing.T) {
+	boom := errors.New("transport exploded")
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	serverSession, err := yamux.Server(&faultyConn{Conn: serverConn, readErr: boom}, muxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go (&Inbound{}).acceptStreams(context.Background(), serverSession, adapter.InboundContext{}, func(err error) {
+		closed <- err
+	})
+	select {
+	case err := <-closed:
+		if !errors.Is(err, boom) {
+			t.Fatalf("real fault reported as %v, want %v", err, boom)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("session close callback did not run")
+	}
+}
+
+// faultyConn fails every read with an error that is neither EOF nor a closed
+// socket, so it exercises the branch acceptEndError must NOT swallow.
+type faultyConn struct {
+	net.Conn
+	readErr error
+}
+
+func (c *faultyConn) Read([]byte) (int, error) { return 0, c.readErr }
+
+func TestDialRetriesAfterRemoteGoAway(t *testing.T) {
+	cover, err := tw.CoverFor("www.cloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
 	key, err := tw.NewTicketKey()
 	if err != nil {
 		t.Fatal(err)
 	}
+	credential, err := key.Issue(1, cover.TicketLen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	sessions := make(chan *yamux.Session, 2)
+	serverErr := make(chan error, 2)
+	// The horizon must be at least the server's MaxAge, which is unset here and
+	// so defaults to 24h; a shorter one is refused outright by tw.Server.
+	replay := tw.NewReplayCache(8, 0)
+	go func() {
+		for range 2 {
+			raw, err := listener.Accept()
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			// raw is passed rather than captured: it is already per-iteration,
+			// but a parameter leaves nothing to re-derive. Closing is only on
+			// the failure paths -- on success the session owns the conn, and
+			// closing here would tear down the tunnel the test is about to use.
+			go func(raw net.Conn) {
+				conn, err := tw.Server(raw, tw.ServerConfig{
+					TicketKey: key, Cover: cover, Replay: replay,
+				})
+				if err != nil {
+					raw.Close()
+					serverErr <- err
+					return
+				}
+				session, err := yamux.Server(conn, muxConfig())
+				if err != nil {
+					conn.Close()
+					serverErr <- err
+					return
+				}
+				sessions <- session
+			}(raw)
+		}
+	}()
+
+	host, portString, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: host, ServerPort: uint16(port)},
+			Ticket:        base64.StdEncoding.EncodeToString(credential.Ticket),
+			PSK:           hex.EncodeToString(credential.PSK[:]),
+			CoverSNI:      cover.Host,
+			HelloPool:     testPool(t),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound := created.(*Outbound)
+	defer outbound.Close()
+
+	first, err := outbound.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstServerSession := <-sessions
+	defer firstServerSession.Close()
+	firstServerStream, err := firstServerSession.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDestination(firstServerStream); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	firstServerStream.Close()
+
+	if err := firstServerSession.GoAway(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outbound.sess.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := outbound.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.org:443"))
+	if err != nil {
+		t.Fatalf("dial did not replace the GO_AWAY session: %v", err)
+	}
+	defer second.Close()
+	secondServerSession := <-sessions
+	defer secondServerSession.Close()
+	secondServerStream, err := secondServerSession.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondServerStream.Close()
+	if got, err := readDestination(secondServerStream); err != nil {
+		t.Fatal(err)
+	} else if got != "example.org:443" {
+		t.Fatalf("retried destination is %q", got)
+	}
+
+	select {
+	case err := <-serverErr:
+		t.Fatal(err)
+	default:
+	}
+}
+
+func TestConcurrentDialsShareOneMuxedTunnel(t *testing.T) {
 	cover, err := tw.CoverFor("www.cloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := tw.NewTicketKey()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,9 +731,6 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// One gate for the whole egress: tickets are single-use, so a per-connection
-	// cache would spend nothing.
-	replay := tw.NewReplayCache(64, 0)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -526,23 +738,35 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 	}
 	defer ln.Close()
 
-	var served int64
+	var served, tunnels int64
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
+			atomic.AddInt64(&tunnels, 1)
 			go func(c net.Conn) {
 				defer c.Close()
 				tc, err := tw.Server(c, tw.ServerConfig{
-					TicketKey: key, Cover: cover, Replay: replay,
+					TicketKey: key, Cover: cover, Replay: tw.NewReplayCache(32, 0),
 				})
 				if err != nil {
 					return
 				}
-				if _, err := readDestination(tc); err == nil {
-					atomic.AddInt64(&served, 1)
+				sess, err := yamux.Server(tc, muxConfig())
+				if err != nil {
+					return
+				}
+				for {
+					stream, err := sess.Accept()
+					if err != nil {
+						return
+					}
+					if _, err := readDestination(stream); err == nil {
+						atomic.AddInt64(&served, 1)
+					}
+					stream.Close()
 				}
 			}(c)
 		}
@@ -556,6 +780,7 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 			Ticket:        base64.StdEncoding.EncodeToString(cred.Ticket),
 			PSK:           hex.EncodeToString(cred.PSK[:]),
 			CoverSNI:      cover.Host,
+			HelloPool:     testPool(t),
 		})
 	if err != nil {
 		t.Fatal(err)
@@ -579,22 +804,15 @@ func TestConcurrentDialsExerciseTheCredentialPath(t *testing.T) {
 	wg.Wait()
 
 	if ok == 0 {
-		t.Fatal("no dial completed — the credential path was never exercised")
+		t.Fatal("no dial completed")
 	}
-	o.mu.Lock()
-	pooled := len(o.creds)
-	o.mu.Unlock()
-	// > 1, not > 0: takeCredential deliberately never removes the final
-	// credential, so len(creds) can never reach zero and an "is it empty"
-	// assertion holds even if putCredential is never called at all. Growth
-	// past the single seeded credential is the thing worth asserting -- it can
-	// only happen if the egress's issued credential came back in the flight and
-	// was stored.
-	if pooled <= 1 {
-		t.Errorf("credential pool did not grow past the seeded credential (%d) after %d successful openings; rotation is not being stored", pooled, ok)
+	if atomic.LoadInt64(&tunnels) != 1 {
+		t.Errorf("opened %d outer tunnels, want 1 muxed session", tunnels)
 	}
-	t.Logf("%d/%d dials completed, %d openings served, %d credentials pooled",
-		ok, n, atomic.LoadInt64(&served), pooled)
+	if ok < n {
+		t.Errorf("%d/%d dials completed", ok, n)
+	}
+	t.Logf("%d/%d dials on %d tunnel, %d streams served", ok, n, tunnels, atomic.LoadInt64(&served))
 }
 
 // TestCredentialPoolHandsOutDistinctCredentials: sequential connections must
@@ -610,17 +828,16 @@ func TestCredentialPoolHandsOutDistinctCredentials(t *testing.T) {
 	if bytes.Equal(a.Ticket, b.Ticket) {
 		t.Error("two takes returned the same credential while the pool held two")
 	}
-	// the last credential is reused rather than removed, so a dial never starves
 	c := o.takeCredential()
-	if c == nil {
-		t.Fatal("takeCredential returned nil on an exhausted pool")
+	if c != nil {
+		t.Fatal("takeCredential reused a spent ticket")
 	}
 	o.putCredential(c1)
 	o.mu.Lock()
 	got := len(o.creds)
 	o.mu.Unlock()
-	if got != 2 {
-		t.Errorf("pool has %d credentials after a put, want 2", got)
+	if got != 1 {
+		t.Errorf("pool has %d credentials after a put, want 1", got)
 	}
 }
 
@@ -642,9 +859,6 @@ func TestCredentialPoolIsBounded(t *testing.T) {
 	}
 }
 
-// TestCoverProfileReachesServerConfig covers the dead option review found. The
-// individual knobs it replaced could name one identity and emit another's
-// parameters, so what is pinned now is that the whole measured profile arrives.
 func TestCoverProfileReachesServerConfig(t *testing.T) {
 	keyHex, _, _ := creds(t)
 	ib, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
@@ -752,5 +966,196 @@ func TestOutboundDisableFullHandshakeDropsTheContactMemory(t *testing.T) {
 	}
 	if o := ob.(*Outbound); o.cfg.Contacts != nil {
 		t.Error("disable_full_handshake left the contact memory in place")
+	}
+}
+
+// A GO_AWAY reaching one dial must not disturb the streams already running on
+// that tunnel.
+//
+// yamux's Close ends the session AND every stream on it, so retiring the cached
+// session has to stop short of closing it: GO_AWAY means "no new streams", not
+// "drop the ones in flight". Without that distinction a single late dial takes
+// down every unrelated connection the tunnel was carrying.
+func TestGoAwayLeavesLiveStreamsAlone(t *testing.T) {
+	cover, err := tw.CoverFor("www.cloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := tw.NewTicketKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := key.Issue(1, cover.TicketLen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	sessions := make(chan *yamux.Session, 2)
+	replay := tw.NewReplayCache(8, 0)
+	go func() {
+		for range 2 {
+			raw, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(raw net.Conn) {
+				conn, err := tw.Server(raw, tw.ServerConfig{
+					TicketKey: key, Cover: cover, Replay: replay,
+				})
+				if err != nil {
+					raw.Close()
+					return
+				}
+				session, err := yamux.Server(conn, muxConfig())
+				if err != nil {
+					conn.Close()
+					return
+				}
+				sessions <- session
+			}(raw)
+		}
+	}()
+
+	host, portString, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: host, ServerPort: uint16(port)},
+			Ticket:        base64.StdEncoding.EncodeToString(credential.Ticket),
+			PSK:           hex.EncodeToString(credential.PSK[:]),
+			CoverSNI:      cover.Host,
+			HelloPool:     testPool(t),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := created.(*Outbound)
+	defer out.Close()
+
+	// A stream that stays open for the whole test: this is the bystander.
+	first, err := out.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	firstSession := <-sessions
+	defer firstSession.Close()
+	firstStream, err := firstSession.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStream.Close()
+	if _, err := readDestination(firstStream); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := firstSession.GoAway(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := out.sess.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The dial that meets GO_AWAY. It must succeed on a replacement tunnel.
+	second, err := out.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.org:443"))
+	if err != nil {
+		t.Fatalf("dial did not replace the GO_AWAY session: %v", err)
+	}
+	defer second.Close()
+	secondSession := <-sessions
+	defer secondSession.Close()
+	secondStream, err := secondSession.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStream.Close()
+	if _, err := readDestination(secondStream); err != nil {
+		t.Fatal(err)
+	}
+
+	// The assertion this test exists for: the bystander still carries traffic.
+	want := []byte("the bystander is still connected")
+	if err := first.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Write(want); err != nil {
+		t.Fatalf("a live stream was torn down by an unrelated dial's GO_AWAY: %v", err)
+	}
+	if err := firstStream.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(firstStream, got); err != nil {
+		t.Fatalf("the egress side of a live stream did not survive the GO_AWAY: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("bystander carried %q, want %q", got, want)
+	}
+}
+
+// A stream that opens and never names a destination must be dropped rather than
+// held. Mux is what makes this worth bounding: the peer pays once for the
+// connection and the egress pays per stream, so an unbounded prologue is a
+// goroutine faucet for anyone holding a valid credential.
+func TestSilentStreamIsDroppedNotHeld(t *testing.T) {
+	prev := destinationReadTimeout
+	destinationReadTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { destinationReadTimeout = prev })
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	serverSession, err := yamux.Server(serverConn, muxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	clientSession, err := yamux.Client(clientConn, muxConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+
+	ib := &Inbound{logger: log.NewNOPFactory().Logger()}
+	go ib.acceptStreams(context.Background(), serverSession, adapter.InboundContext{}, func(error) {})
+
+	stream, err := clientSession.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	// Say nothing. The egress must give up and close the stream on its own.
+	//
+	// The assertion is on ELAPSED TIME, not on the error: yamux returns its own
+	// timeout rather than os.ErrDeadlineExceeded, so an error-kind check passes
+	// whether the egress dropped the stream or the client's own deadline
+	// expired -- which is to say it would pass with no prologue deadline at all.
+	// Timing separates them: a dropped stream returns in about
+	// destinationReadTimeout, a held one only when the client gives up.
+	const clientPatience = 3 * time.Second
+	if err := stream.SetReadDeadline(time.Now().Add(clientPatience)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	start := time.Now()
+	_, err = stream.Read(buf)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a silent stream was answered rather than dropped")
+	}
+	if elapsed > clientPatience/3 {
+		t.Fatalf("the egress held a silent stream for %v; the %v prologue deadline did not fire",
+			elapsed, destinationReadTimeout)
 	}
 }
