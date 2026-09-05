@@ -580,21 +580,27 @@ func TestDialRetriesAfterRemoteGoAway(t *testing.T) {
 				serverErr <- err
 				return
 			}
-			go func() {
+			// raw is passed rather than captured: it is already per-iteration,
+			// but a parameter leaves nothing to re-derive. Closing is only on
+			// the failure paths -- on success the session owns the conn, and
+			// closing here would tear down the tunnel the test is about to use.
+			go func(raw net.Conn) {
 				conn, err := tw.Server(raw, tw.ServerConfig{
 					TicketKey: key, Cover: cover, Replay: replay,
 				})
 				if err != nil {
+					raw.Close()
 					serverErr <- err
 					return
 				}
 				session, err := yamux.Server(conn, muxConfig())
 				if err != nil {
+					conn.Close()
 					serverErr <- err
 					return
 				}
 				sessions <- session
-			}()
+			}(raw)
 		}
 	}()
 
