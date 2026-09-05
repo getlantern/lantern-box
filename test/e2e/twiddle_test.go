@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,7 +67,8 @@ func TestTwiddleCarriesTCPAndUDPOverOneTunnel(t *testing.T) {
 	})
 	serverOpts.Inbounds[0].Options.(*lboption.TwiddleInboundOptions).ListenPort = serverPort
 	clientOpts.Inbounds[0].Options.(*option.HTTPMixedInboundOptions).ListenPort = clientPort
-	clientOpts.Outbounds[0].Options.(*lboption.TwiddleOutboundOptions).ServerPort = serverPort
+	relay := startCountingRelay(t, serverPort)
+	clientOpts.Outbounds[0].Options.(*lboption.TwiddleOutboundOptions).ServerPort = relay.port
 
 	serverBox, err := sbox.New(sbox.Options{Context: boxCtx, Options: serverOpts})
 	require.NoError(t, err)
@@ -87,16 +89,20 @@ func TestTwiddleCarriesTCPAndUDPOverOneTunnel(t *testing.T) {
 		}))
 		defer origin.Close()
 
+		var innerDials atomic.Int64
 		hc := &http.Client{
 			Timeout: 20 * time.Second,
 			Transport: &http.Transport{
+				// Without this the transport hands the second request its idle
+				// connection from the first, so no second stream is ever opened
+				// and the loop below proves nothing about reuse.
+				DisableKeepAlives: true,
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					innerDials.Add(1)
 					return client.DialContext(ctx, network, M.ParseSocksaddr(addr))
 				},
 			},
 		}
-		// Twice: the second request proves the tunnel is reusable, which under
-		// muxing means a second stream rather than a second twiddle opening.
 		for i := range 2 {
 			resp, err := hc.Get(origin.URL)
 			require.NoErrorf(t, err, "request %d", i+1)
@@ -105,6 +111,8 @@ func TestTwiddleCarriesTCPAndUDPOverOneTunnel(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, "through the tunnel", string(body))
 		}
+		require.EqualValues(t, 2, innerDials.Load(),
+			"each request must open its own inner connection, or the loop tests nothing")
 	})
 
 	t.Run("udp", func(t *testing.T) {
@@ -143,6 +151,12 @@ func TestTwiddleCarriesTCPAndUDPOverOneTunnel(t *testing.T) {
 			require.Equal(t, payload, buf[:n])
 		}
 	})
+
+	// Three inner connections have now crossed the relay -- two TCP and one UoT
+	// carrier for the UDP association -- and muxing means they shared a single
+	// outer twiddle connection. One opening on the wire, not three.
+	require.EqualValues(t, 1, relay.conns.Load(),
+		"TCP and UDP must share one outer twiddle tunnel; a fresh opening per destination is the fingerprint muxing exists to remove")
 }
 
 // twiddleOptions reads a config and substitutes the credentials generated for
@@ -159,4 +173,46 @@ func twiddleOptions(ctx context.Context, t *testing.T, path string, subs map[str
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(body))
 	require.NoError(t, err)
 	return opts
+}
+
+// countingRelay sits between the client box and the twiddle inbound and counts
+// the OUTER connections opened through it.
+//
+// Without it the muxing claim is unfalsifiable from out here: a regression that
+// opened a fresh twiddle tunnel per inner destination still serves every
+// request correctly, so the test would pass while the property it exists for
+// had been lost. Counting is what makes "one tunnel" an assertion rather than a
+// comment.
+type countingRelay struct {
+	port  uint16
+	conns atomic.Int64
+}
+
+func startCountingRelay(t *testing.T, upstreamPort uint16) *countingRelay {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
+
+	r := &countingRelay{port: uint16(ln.Addr().(*net.TCPAddr).Port)}
+	go func() {
+		for {
+			down, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			r.conns.Add(1)
+			go func() {
+				defer down.Close()
+				up, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", upstreamPort))
+				if err != nil {
+					return
+				}
+				defer up.Close()
+				go io.Copy(up, down)
+				io.Copy(down, up)
+			}()
+		}
+	}()
+	return r
 }
