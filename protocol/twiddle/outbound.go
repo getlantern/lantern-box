@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -173,7 +174,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 			Contacts: contacts,
 		},
 	}
-	o.uotClient = &uot.Client{Dialer: o, Version: uot.Version}
+	o.uotClient = &uot.Client{Dialer: (*uotDialer)(o), Version: uot.Version}
 	return o, nil
 }
 
@@ -185,6 +186,12 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	default:
 		return nil, fmt.Errorf("twiddle: unsupported network: %s", network)
 	}
+	return o.dialTunnel(ctx, destination)
+}
+
+// dialTunnel opens one outer twiddle connection and names the inner
+// destination on it. Both the TCP path and UoT's inner dial land here.
+func (o *Outbound) dialTunnel(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
 	o.logger.TraceContext(ctx, "dialing twiddle connection to ", o.server, ":", o.port)
 
 	raw, err := o.dialer.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddrHostPort(o.server, o.port))
@@ -214,6 +221,30 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, err
 	}
 	return conn, nil
+}
+
+// uotDialer carries UoT's inner TCP dial without routing it back through
+// Outbound.
+//
+// uot.Client needs an N.Dialer and Outbound is one, but wiring it to itself
+// makes both DialContext(udp) and ListenPacket self-referential: their
+// termination then rests on uot.Client never handing UDP back to DialContext
+// and never calling Dialer.ListenPacket at all. Both hold in sing v0.8.13 --
+// and both are upstream details that a dependency bump could change, at which
+// point the failure is an unbounded recursion in production rather than a
+// compile error. Cutting the loop here costs nothing and matches how unbounded,
+// samizdat and water each wire their own UoT client.
+type uotDialer Outbound
+
+func (d *uotDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if N.NetworkName(network) != N.NetworkTCP {
+		return nil, fmt.Errorf("twiddle: uot inner dial must be TCP, got %q: %w", network, os.ErrInvalid)
+	}
+	return (*Outbound)(d).dialTunnel(ctx, destination)
+}
+
+func (d *uotDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return nil, fmt.Errorf("twiddle: uotDialer does not support ListenPacket: %w", os.ErrInvalid)
 }
 
 // takeCredential claims a credential for one dial. The last one is reused

@@ -28,9 +28,24 @@ import (
 	tw "github.com/getlantern/twiddle"
 )
 
+// echoRouter embeds adapter.Router only to satisfy that interface's breadth;
+// every method reached in practice is defined below. The two non-Ex ones are
+// not decoration: uot.Router.RouteConnection forwards to the wrapped router's
+// RoutePacketConnection, so leaving them on the nil embed turns that path into
+// a nil-interface panic instead of an echo.
 type echoRouter struct {
 	adapter.Router
 	routed chan adapter.InboundContext
+}
+
+func (r *echoRouter) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
+	r.RouteConnectionEx(ctx, conn, metadata, func(error) {})
+	return nil
+}
+
+func (r *echoRouter) RoutePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) error {
+	r.RoutePacketConnectionEx(ctx, conn, metadata, func(error) {})
+	return nil
 }
 
 func (r *echoRouter) RouteConnectionEx(_ context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
