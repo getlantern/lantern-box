@@ -50,11 +50,21 @@ func (r *echoRouter) RoutePacketConnection(ctx context.Context, conn N.PacketCon
 	return nil
 }
 
+// onClose is optional in the sing-box contract -- the real router funnels it
+// through N.CloseOnHandshakeFailure, which tolerates nil -- and routeStream
+// passes nil because a stream has no per-stream close bookkeeping to do. A test
+// double that calls it unconditionally turns that into a panic.
+func closeHandled(onClose N.CloseHandlerFunc, err error) {
+	if onClose != nil {
+		onClose(err)
+	}
+}
+
 func (r *echoRouter) RouteConnectionEx(_ context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	r.routed <- metadata
 	_, err := io.Copy(conn, conn)
 	conn.Close()
-	onClose(err)
+	closeHandled(onClose, err)
 }
 
 func (r *echoRouter) RoutePacketConnectionEx(_ context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -69,7 +79,7 @@ func (r *echoRouter) RoutePacketConnectionEx(_ context.Context, conn N.PacketCon
 		}
 		packet.Release()
 		if err != nil {
-			onClose(err)
+			closeHandled(onClose, err)
 			return
 		}
 	}
@@ -91,6 +101,13 @@ func TestOutboundRoutesTCPAndUDP(t *testing.T) {
 			require.NoError(t, err)
 			t.Cleanup(func() { listener.Close() })
 			finished := make(chan struct{})
+			// serving holds the tunnel open for the body of the test. Under
+			// muxing NewConnectionEx hands the session to a goroutine and
+			// returns at once, so a bare `defer conn.Close()` would tear the
+			// tunnel down before the client could open a stream on it -- and a
+			// deadline on conn would now bound the whole session rather than
+			// one connection.
+			serving := make(chan struct{})
 			go func() {
 				defer close(finished)
 				conn, err := listener.Accept()
@@ -98,10 +115,11 @@ func TestOutboundRoutesTCPAndUDP(t *testing.T) {
 					return
 				}
 				defer conn.Close()
-				conn.SetDeadline(time.Now().Add(10 * time.Second))
 				ib.(*Inbound).NewConnectionEx(ctx, conn, adapter.InboundContext{}, func(error) {})
+				<-serving
 			}()
 			t.Cleanup(func() {
+				close(serving)
 				listener.Close()
 				select {
 				case <-finished:
