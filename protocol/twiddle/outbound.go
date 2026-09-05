@@ -51,6 +51,11 @@ type Outbound struct {
 	sessMu sync.Mutex
 	sess   *yamux.Session
 	closed bool
+	// draining holds sessions retired without closing, on the GO_AWAY path.
+	// They are unreferenced once o.sess moves on, so without this Close could
+	// not reach them and an outbound shutdown would leave tunnels open until
+	// each peer got round to closing its own.
+	draining map[*yamux.Session]struct{}
 
 	poolOrigin tw.Origin
 	uotClient  *uot.Client
@@ -295,7 +300,20 @@ func (o *Outbound) retireSession(sess *yamux.Session, closeIt bool) {
 	o.sess = nil
 	if closeIt {
 		sess.Close()
+		return
 	}
+	if o.draining == nil {
+		o.draining = make(map[*yamux.Session]struct{})
+	}
+	o.draining[sess] = struct{}{}
+	go func() {
+		// Drop it once the peer finishes with it, so a long-lived outbound does
+		// not accumulate a record per GO_AWAY.
+		<-sess.CloseChan()
+		o.sessMu.Lock()
+		delete(o.draining, sess)
+		o.sessMu.Unlock()
+	}()
 }
 
 // takeCredential claims one unused ticket. It never reuses: a parallel burst
@@ -347,10 +365,16 @@ func (o *Outbound) Close() error {
 	o.sessMu.Lock()
 	defer o.sessMu.Unlock()
 	o.closed = true
+	var err error
 	if o.sess != nil {
-		err := o.sess.Close()
+		err = o.sess.Close()
 		o.sess = nil
-		return err
 	}
-	return nil
+	// Sessions left to drain are still ours to tear down: shutdown is the point
+	// at which "let the peer finish" stops being the right trade.
+	for sess := range o.draining {
+		sess.Close()
+		delete(o.draining, sess)
+	}
+	return err
 }

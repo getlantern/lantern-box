@@ -1161,6 +1161,127 @@ func TestSilentStreamIsDroppedNotHeld(t *testing.T) {
 	}
 }
 
+// Close must tear down sessions left draining after a GO_AWAY, not just the
+// cached one. Retiring without closing is right while the process runs -- live
+// streams finish -- but at shutdown "let the peer finish" stops being the trade
+// we want, and a drained session is unreferenced so nothing else can reach it.
+func TestCloseTearsDownDrainingSessions(t *testing.T) {
+	cover, err := tw.CoverFor("www.cloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := tw.NewTicketKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := key.Issue(1, cover.TicketLen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	sessions := make(chan *yamux.Session, 2)
+	replay := tw.NewReplayCache(8, 0)
+	go func() {
+		for range 2 {
+			raw, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(raw net.Conn) {
+				conn, err := tw.Server(raw, tw.ServerConfig{
+					TicketKey: key, Cover: cover, Replay: replay,
+				})
+				if err != nil {
+					raw.Close()
+					return
+				}
+				session, err := yamux.Server(conn, muxConfig())
+				if err != nil {
+					conn.Close()
+					return
+				}
+				sessions <- session
+			}(raw)
+		}
+	}()
+
+	host, portString, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: host, ServerPort: uint16(port)},
+			Ticket:        base64.StdEncoding.EncodeToString(credential.Ticket),
+			PSK:           hex.EncodeToString(credential.PSK[:]),
+			CoverSNI:      cover.Host,
+			HelloPool:     testPool(t),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := created.(*Outbound)
+
+	first, err := out.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	firstSession := <-sessions
+	defer firstSession.Close()
+	firstStream, err := firstSession.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStream.Close()
+	if _, err := readDestination(firstStream); err != nil {
+		t.Fatal(err)
+	}
+
+	// GO_AWAY retires the client session without closing it, then a second dial
+	// replaces it -- so the first is now draining and unreferenced.
+	if err := firstSession.GoAway(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := out.sess.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	drained := out.sess
+	second, err := out.DialContext(context.Background(), "tcp", M.ParseSocksaddr("example.org:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	secondSession := <-sessions
+	defer secondSession.Close()
+
+	out.sessMu.Lock()
+	tracked := len(out.draining)
+	out.sessMu.Unlock()
+	if tracked != 1 {
+		t.Fatalf("%d draining sessions tracked, want 1", tracked)
+	}
+	if drained.IsClosed() {
+		t.Fatal("the drained session was closed before shutdown")
+	}
+
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !drained.IsClosed() {
+		t.Fatal("Close left a draining session open")
+	}
+}
+
 // A dial arriving after Close must not build a new tunnel.
 //
 // Close nils the cached session, which is exactly what ensureSession reads as
