@@ -518,3 +518,98 @@ func TestCoverProfileReachesServerConfig(t *testing.T) {
 		t.Errorf("google profile not applied: %+v", got)
 	}
 }
+
+// fullCreds returns a provisioned credential including the full-handshake
+// companion, as lantern-cloud will emit once it provisions full_ticket.
+func fullCreds(t *testing.T) (ticketB64, fullTicketB64, pskHex string) {
+	t.Helper()
+	k, err := tw.NewTicketKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := k.Issue(1, tw.DefaultTicketLen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.FullTicket) != tw.FullTicketLen {
+		t.Fatalf("issued credential has a %d-byte companion, want %d", len(c.FullTicket), tw.FullTicketLen)
+	}
+	return base64.StdEncoding.EncodeToString(c.Ticket),
+		base64.StdEncoding.EncodeToString(c.FullTicket),
+		hex.EncodeToString(c.PSK[:])
+}
+
+// full_ticket has to survive the config round trip into the credential. If it
+// silently did not, the client would be resumption-only and nothing would say
+// so -- the failure is invisible, because resumption-only still works.
+func TestOutboundCarriesTheFullHandshakeCompanion(t *testing.T) {
+	ticket, fullTicket, psk := fullCreds(t)
+	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
+			Ticket:        ticket, FullTicket: fullTicket, PSK: psk,
+			CoverSNI: "www.cloudflare.com",
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := ob.(*Outbound)
+	if len(o.creds) != 1 {
+		t.Fatalf("outbound holds %d credentials, want 1", len(o.creds))
+	}
+	if got := len(o.creds[0].FullTicket); got != tw.FullTicketLen {
+		t.Errorf("credential carries a %d-byte companion, want %d; the client would be resumption-only",
+			got, tw.FullTicketLen)
+	}
+	if o.cfg.Contacts == nil {
+		t.Error("no contact memory, so every opening would be a resumption")
+	}
+}
+
+// Provisioning gained full_ticket after clients were deployed with ticket and
+// psk alone, so its absence must degrade rather than fail.
+func TestOutboundWithoutAFullTicketIsResumptionOnly(t *testing.T) {
+	_, ticket, psk := creds(t)
+	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
+			Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
+		})
+	if err != nil {
+		t.Fatalf("a config without full_ticket was rejected: %v", err)
+	}
+	if o := ob.(*Outbound); o.creds[0].FullTicket != nil {
+		t.Error("a companion ticket appeared from nowhere")
+	}
+}
+
+func TestOutboundRejectsABadFullTicket(t *testing.T) {
+	_, ticket, psk := creds(t)
+	for _, bad := range []string{"not base64!!", base64.StdEncoding.EncodeToString([]byte("short"))} {
+		_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+			option.TwiddleOutboundOptions{
+				ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
+				Ticket:        ticket, FullTicket: bad, PSK: psk, CoverSNI: "www.cloudflare.com",
+			})
+		if err == nil {
+			t.Errorf("outbound accepted a bad full_ticket %q", bad)
+		}
+	}
+}
+
+// The kill switch has to actually reach the client config, or it is decoration.
+func TestOutboundDisableFullHandshakeDropsTheContactMemory(t *testing.T) {
+	ticket, fullTicket, psk := fullCreds(t)
+	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+		option.TwiddleOutboundOptions{
+			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
+			Ticket:        ticket, FullTicket: fullTicket, PSK: psk,
+			CoverSNI: "www.cloudflare.com", DisableFullHandshake: true,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := ob.(*Outbound); o.cfg.Contacts != nil {
+		t.Error("disable_full_handshake left the contact memory in place")
+	}
+}

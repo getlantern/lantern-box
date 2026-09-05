@@ -73,7 +73,16 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 	if err != nil {
 		return nil, fmt.Errorf("twiddle: bad psk: %w", err)
 	}
-	cred, err := tw.CredentialFromWire(ticket, psk)
+	// Optional: provisioning gained full_ticket after clients were already
+	// deployed with ticket and psk alone, and a nil companion degrades to
+	// resumption-only rather than failing.
+	var fullTicket []byte
+	if options.FullTicket != "" {
+		if fullTicket, err = base64.StdEncoding.DecodeString(options.FullTicket); err != nil {
+			return nil, fmt.Errorf("twiddle: bad full_ticket: %w", err)
+		}
+	}
+	cred, err := tw.CredentialFromWireFull(ticket, fullTicket, psk)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +139,22 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		return nil, err
 	}
 
+	// The contact memory decides the opening shape per connection: full on
+	// first contact with an egress, resumed afterwards, full again once a
+	// censor can no longer be assumed to remember. Nil disables it entirely and
+	// restores resumption-only behaviour.
+	//
+	// Safe to enable before anything else is ready. It degrades to resumption
+	// unless ALL THREE of a probed full profile, a pool hello whose ECH payload
+	// can carry the ticket, and a companion ticket are present -- and the cover
+	// table ships no full profile at all, so today it always degrades. That is
+	// deliberate: when per-egress probing and full_ticket provisioning land, the
+	// path activates without another lantern-box release.
+	var contacts *tw.ContactMemory
+	if !options.DisableFullHandshake {
+		contacts = tw.NewContactMemory(0, 0)
+	}
+
 	return &Outbound{
 		Adapter:    outbound.NewAdapterWithDialerOptions(constant.TypeTwiddle, tag, []string{N.NetworkTCP}, options.DialerOptions),
 		logger:     lg,
@@ -140,9 +165,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		creds:      []*tw.Credential{cred},
 		poolOrigin: pool.Origin,
 		cfg: tw.ClientConfig{
-			Pool:   pool.Hellos,
-			Cover:  cover,
-			Shaper: tw.BrowsingShaper(false),
+			Pool:     pool.Hellos,
+			Cover:    cover,
+			Shaper:   tw.BrowsingShaper(false),
+			Contacts: contacts,
 		},
 	}, nil
 }

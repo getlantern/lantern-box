@@ -42,7 +42,21 @@ type TwiddleOutboundOptions struct {
 	// one the egress issues in each connection's flight.
 	Ticket string `json:"ticket"`
 
-	// PSK is the pre-shared key paired with Ticket, 32 bytes hex-encoded.
+	// FullTicket is the full-handshake companion to Ticket, base64, minted over
+	// the same client and psk at the same instant.
+	//
+	// Without it this client is RESUMPTION-ONLY: every opening it emits carries
+	// pre_shared_key, and only about 4% of real browsing connections do, so it
+	// sits permanently in a rare bucket. See the twiddle module's
+	// docs/full-handshake-carrier.md.
+	//
+	// Optional, and absence degrades rather than fails, because provisioning
+	// gained this field after clients were already deployed with ticket and psk
+	// alone.
+	FullTicket string `json:"full_ticket,omitempty"`
+
+	// PSK is the pre-shared key paired with Ticket, 32 bytes hex-encoded. The
+	// same psk backs FullTicket.
 	PSK string `json:"psk"`
 
 	// CoverSNI is the domain this egress masquerades as. It must be a measured
@@ -76,6 +90,16 @@ type TwiddleOutboundOptions struct {
 	// first. A tapped hello names a site the user actually visited, and a
 	// resumption hello also carries that site's session ticket.
 	HelloPoolDevicePath string `json:"hello_pool_device_path,omitempty"`
+
+	// DisableFullHandshake turns off the full-handshake opening even when
+	// everything needed for it is present.
+	//
+	// It exists as a kill switch that costs no release. The opening shape is
+	// the most censor-visible thing this transport does, and if a full-handshake
+	// opening ever turns out to be the more detectable of the two in some
+	// region, the reaction should be a config push rather than a rebuild --
+	// the same reasoning that keeps the hello pool as data.
+	DisableFullHandshake bool `json:"disable_full_handshake,omitempty"`
 
 	ConnectTimeout string `json:"connect_timeout,omitempty"`
 }
