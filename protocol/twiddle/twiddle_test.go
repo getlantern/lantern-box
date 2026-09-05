@@ -853,7 +853,8 @@ func TestOutboundCarriesTheFullHandshakeCompanion(t *testing.T) {
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, FullTicket: fullTicket, PSK: psk,
-			CoverSNI: "www.cloudflare.com",
+			CoverSNI:  "www.cloudflare.com",
+			HelloPool: testPool(t),
 		})
 	if err != nil {
 		t.Fatal(err)
@@ -879,6 +880,7 @@ func TestOutboundWithoutAFullTicketIsResumptionOnly(t *testing.T) {
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, PSK: psk, CoverSNI: "www.cloudflare.com",
+			HelloPool: testPool(t),
 		})
 	if err != nil {
 		t.Fatalf("a config without full_ticket was rejected: %v", err)
@@ -910,6 +912,7 @@ func TestOutboundDisableFullHandshakeDropsTheContactMemory(t *testing.T) {
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, FullTicket: fullTicket, PSK: psk,
 			CoverSNI: "www.cloudflare.com", DisableFullHandshake: true,
+			HelloPool: testPool(t),
 		})
 	if err != nil {
 		t.Fatal(err)
