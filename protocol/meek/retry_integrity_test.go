@@ -74,6 +74,7 @@ func newMeekTestStack(t *testing.T, upstream string, dropEvery int64) (*Conn, *f
 // byte — a gap (lost-after-drain) or dup would fail the compare.
 func TestMeekRetryDownloadIntegrity(t *testing.T) {
 	const size = 2 << 20
+	const trigger = "go"
 	payload := make([]byte, size)
 	if _, err := rand.Read(payload); err != nil {
 		t.Fatal(err)
@@ -91,14 +92,20 @@ func TestMeekRetryDownloadIntegrity(t *testing.T) {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
-				go io.Copy(io.Discard, c) // drain the client's trigger byte(s)
+				_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+				// Consume the trigger before sending and closing. Racing Close
+				// against a background drain can leave unread input, causing a
+				// TCP reset that truncates the queued download on Linux.
+				if _, err := io.CopyN(io.Discard, c, int64(len(trigger))); err != nil {
+					return
+				}
 				_, _ = c.Write(payload)
 			}(c)
 		}
 	}()
 
 	conn, ft := newMeekTestStack(t, ln.Addr().String(), 4)
-	if _, err := conn.Write([]byte("go")); err != nil { // trigger upstream
+	if _, err := conn.Write([]byte(trigger)); err != nil { // trigger upstream
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))

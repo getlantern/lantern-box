@@ -29,7 +29,7 @@ require (
 	github.com/getlantern/lantern-water v0.0.0-20260520145825-958775d51395
 	github.com/getlantern/samizdat v0.0.3-0.20260819153658-ebc74116a064
 	github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb
-	github.com/getlantern/twiddle v0.0.0-20260905105024-c78665a55653
+	github.com/getlantern/twiddle v0.0.0-20260907083007-7261fa53edc2
 	github.com/gobwas/ws v1.4.0
 	github.com/hashicorp/yamux v0.1.2
 	github.com/pion/transport/v4 v4.0.1
