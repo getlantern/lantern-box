@@ -1,0 +1,23 @@
+{
+	"log": {"disabled": true, "level": "trace", "output": "stdout"},
+	"inbounds": [
+		{
+			"type": "mixed",
+			"tag": "mixed-in",
+			"listen": "127.0.0.1",
+			"listen_port": 1080
+		}
+	],
+	"outbounds": [
+		{
+			"type": "twiddle",
+			"tag": "twiddle-out",
+			"server": "127.0.0.1",
+			"server_port": 9005,
+			"ticket": "TICKET",
+			"psk": "PSK",
+			"cover_sni": "www.cloudflare.com",
+			"hello_pool": "HELLO_POOL"
+		}
+	]
+}

@@ -2,16 +2,28 @@ name: E2E Protocol Tests
 
 on:
   workflow_dispatch:
-  # Run on every PR — stacked PRs against feature branches (e.g. the Unbounded
-  # outbound stack) should still get live-machine coverage before they merge
-  # into main. The path filter keeps doc-only PRs from consuming droplets.
-  pull_request:
-    paths:
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
-      - 'Dockerfile'
-      - '.github/workflows/e2e.yaml'
+
+  # Nightly rather than per-PR.
+  #
+  # What this job uniquely tests is a REAL remote host: actual routing, actual
+  # MTU, a cover site reached over the actual internet. That is worth having for
+  # a transport whose whole job is surviving a network path, and it is not
+  # something an in-process test can stand in for.
+  #
+  # What it is not worth is gating every PR. It costs a droplet per run, needs
+  # DO_API_TOKEN, takes minutes, and fails on things that have nothing to do with
+  # the change under review -- a 422 from DigitalOcean's API cost two red boards
+  # on 2026-09-05, neither of them a code fault.
+  #
+  # Protocol coverage on PRs is test/e2e instead: in-process boxes talking to
+  # each other over loopback, which is what the droplet was standing in for in
+  # every assertion except the network path itself. Those run in `make test`.
+  #
+  # Trigger a run by hand (Actions > E2E Protocol Tests > Run workflow) whenever
+  # a change touches the wire: a new protocol, a transport's framing, or anything
+  # that would behave differently against a real peer.
+  schedule:
+    - cron: '0 7 * * *'
 
 env:
   DROPLET_NAME: "e2e-lantern-box-${{ github.run_id }}"
