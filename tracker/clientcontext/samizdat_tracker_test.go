@@ -149,11 +149,12 @@ func TestSamizdatClientContext(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Add Manager tracker on the server
+	// Register downstream trackers after Manager so they can read client info
+	// from the wrapped connection.
 	mgr := NewManager(MatchBounds{[]string{""}, []string{""}}, logger)
 	mTracker := &mockTracker{}
-	mgr.AppendTracker(mTracker)
 	serverBox.Router().AppendTracker(mgr)
+	serverBox.Router().AppendTracker(mTracker)
 
 	require.NoError(t, serverBox.Start())
 	defer serverBox.Close()

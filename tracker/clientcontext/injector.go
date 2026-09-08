@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -16,10 +15,8 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-// sendInfoTimeout bounds the client-info exchange. It runs on the connection's
-// critical path after the dial-layer timeouts no longer apply; without a
-// deadline, a server that stalls after the handshake (e.g. under DPI
-// throttling) holds the flow and its healthy-pool slot indefinitely.
+// sendInfoTimeout bounds the client-info frame write after dial-layer timeouts
+// no longer apply.
 var sendInfoTimeout = 10 * time.Second
 
 var (
@@ -152,29 +149,18 @@ func (c *writeConn) match(conn net.Conn) bool {
 	return c.outboundRule.match(outbound.Now())
 }
 
-// sendInfo marshals and sends client info as an HTTP POST, then waits for HTTP 200 OK.
+// sendInfo marshals and writes the client-info frame without waiting for a
+// reply.
 func (c *writeConn) sendInfo(conn net.Conn) error {
-	buf, err := json.Marshal(c.info)
+	payload, err := json.Marshal(c.info)
 	if err != nil {
 		return fmt.Errorf("marshaling client info: %w", err)
 	}
-	// Best effort: conns that don't support deadlines keep the old unbounded
-	// behavior rather than failing the exchange.
+	packet := append([]byte(packetPrefix), payload...)
 	_ = conn.SetDeadline(time.Now().Add(sendInfoTimeout))
 	defer conn.SetDeadline(time.Time{})
-
-	packet := append([]byte(packetPrefix), buf...)
 	if _, err = conn.Write(packet); err != nil {
 		return fmt.Errorf("writing client info: %w", err)
-	}
-
-	// wait for `OK` response
-	var resp [2]byte
-	if _, err := io.ReadFull(conn, resp[:]); err != nil {
-		return fmt.Errorf("reading response: %w", err)
-	}
-	if string(resp[:]) != "OK" {
-		return fmt.Errorf("invalid response: %q", resp[:])
 	}
 	return nil
 }
@@ -242,9 +228,10 @@ func (c *writePacketConn) match(conn net.PacketConn) bool {
 	return false
 }
 
-// sendInfo marshals and sends client info as a CLIENTINFO packet, then waits for OK.
+// sendInfo marshals and sends the client-info packet without waiting for a
+// reply.
 func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
-	buf, err := json.Marshal(c.info)
+	payload, err := json.Marshal(c.info)
 	if err != nil {
 		return fmt.Errorf("marshaling client info: %w", err)
 	}
@@ -261,26 +248,11 @@ func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
 	default:
 		addr = dest
 	}
-	// Best effort: conns that don't support deadlines keep the old unbounded
-	// behavior rather than failing the exchange.
+	packet := append([]byte(packetPrefix), payload...)
 	_ = conn.SetDeadline(time.Now().Add(sendInfoTimeout))
 	defer conn.SetDeadline(time.Time{})
-
-	packet := append([]byte(packetPrefix), buf...)
 	if _, err = conn.WriteTo(packet, addr); err != nil {
 		return fmt.Errorf("writing packet: %w", err)
-	}
-
-	// wait for `OK` response; the buffer must be able to hold a full datagram —
-	// wrapped conns return io.ErrShortBuffer instead of truncating, so a 2-byte
-	// buffer would reject any reply carrying transport overhead.
-	resp := make([]byte, 512)
-	n, _, err := conn.ReadFrom(resp)
-	if err != nil {
-		return fmt.Errorf("reading response: %w", err)
-	}
-	if n < 2 || string(resp[:2]) != "OK" {
-		return fmt.Errorf("invalid response: %q", resp[:n])
 	}
 	return nil
 }

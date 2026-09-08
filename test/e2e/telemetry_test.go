@@ -24,10 +24,8 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
-	"github.com/sagernet/sing/service"
 
 	box "github.com/getlantern/lantern-box"
-	"github.com/getlantern/lantern-box/adapter"
 	"github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/metrics"
@@ -103,10 +101,9 @@ func TestTelemetryE2E(t *testing.T) {
 		logger,
 	)
 	serverBox.Router().AppendTracker(mgr)
-	service.MustRegister[adapter.ClientContextManager](boxCtx, mgr)
 
 	metricsTracker := metrics.NewTracker(boxCtx)
-	mgr.AppendTracker(metricsTracker)
+	serverBox.Router().AppendTracker(metricsTracker)
 
 	require.NoError(t, serverBox.Start())
 	defer serverBox.Close()
