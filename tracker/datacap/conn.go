@@ -98,7 +98,9 @@ func NewConn(config ConnConfig) *Conn {
 func (c *Conn) Read(b []byte) (n int, err error) {
 	n, err = c.Conn.Read(b)
 	if n > 0 {
-		c.hasRead.Store(true)
+		if c.trafficCategory != "" {
+			c.hasRead.Store(true)
+		}
 		c.bytesReceived.Add(int64(n))
 
 		// Apply throttling after read (token bucket wait)
@@ -117,7 +119,9 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 func (c *Conn) Write(b []byte) (n int, err error) {
 	n, err = c.Conn.Write(b)
 	if n > 0 {
-		c.hasWritten.Store(true)
+		if c.trafficCategory != "" {
+			c.hasWritten.Store(true)
+		}
 		c.bytesSent.Add(int64(n))
 
 		// Apply throttling after write (token bucket wait)
@@ -189,7 +193,7 @@ func (c *Conn) sendReport() {
 		BytesUsed:   delta,
 	}
 
-	bidirectional := c.hasRead.Load() && c.hasWritten.Load() && !c.bidirectionalReported
+	bidirectional := c.trafficCategory != "" && c.hasRead.Load() && c.hasWritten.Load() && !c.bidirectionalReported
 	report.TrafficUsage = trafficReport(c.trafficCategory, delta, bidirectional)
 
 	timeout := c.client.httpClient.Timeout
