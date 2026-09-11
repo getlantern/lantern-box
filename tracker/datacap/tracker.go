@@ -16,6 +16,7 @@ import (
 var _ (adapter.ConnectionTracker) = (*DatacapTracker)(nil)
 
 type DatacapTracker struct {
+	classify         func(string) string
 	client           *Client
 	logger           log.ContextLogger
 	reportInterval   time.Duration
@@ -23,9 +24,12 @@ type DatacapTracker struct {
 }
 
 type Options struct {
-	URL            string `json:"url,omitempty"`
-	ReportInterval string `json:"report_interval,omitempty"`
-	HTTPTimeout    string `json:"http_timeout,omitempty"`
+	TrafficCategories bool     `json:"traffic_categories,omitempty"`
+	LanternHosts      []string `json:"lantern_hosts,omitempty"`
+	ProbeHosts        []string `json:"probe_hosts,omitempty"`
+	URL               string   `json:"url,omitempty"`
+	ReportInterval    string   `json:"report_interval,omitempty"`
+	HTTPTimeout       string   `json:"http_timeout,omitempty"`
 }
 
 func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTracker, error) {
@@ -50,7 +54,12 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 		}
 		httpTimeout = timeout
 	}
+	var classify func(string) string
+	if options.TrafficCategories {
+		classify = newTrafficClassifier(options.LanternHosts, options.ProbeHosts)
+	}
 	return &DatacapTracker{
+		classify:         classify,
 		client:           NewClient(options.URL, httpTimeout),
 		reportInterval:   reportInterval,
 		throttleRegistry: NewThrottleRegistry(),
@@ -69,13 +78,18 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 		t.logger.Debug("skipping datacap: client is pro ", info.DeviceID)
 		return conn
 	}
+	category := ""
+	if t.classify != nil {
+		category = t.classify(metadata.Destination.Fqdn)
+	}
 	return NewConn(ConnConfig{
-		Conn:           conn,
-		Client:         t.client,
-		Logger:         t.logger,
-		ClientInfo:     info,
-		ReportInterval: t.reportInterval,
-		Throttler:      t.throttleRegistry.GetOrCreate(info.DeviceID),
+		TrafficCategory: category,
+		Conn:            conn,
+		Client:          t.client,
+		Logger:          t.logger,
+		ClientInfo:      info,
+		ReportInterval:  t.reportInterval,
+		Throttler:       t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
 }
 func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
@@ -90,11 +104,12 @@ func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 		return conn
 	}
 	return NewPacketConn(PacketConnConfig{
-		Conn:           conn,
-		Client:         t.client,
-		Logger:         t.logger,
-		ClientInfo:     info,
-		ReportInterval: t.reportInterval,
-		Throttler:      t.throttleRegistry.GetOrCreate(info.DeviceID),
+		TrafficCategories: t.classify != nil,
+		Conn:              conn,
+		Client:            t.client,
+		Logger:            t.logger,
+		ClientInfo:        info,
+		ReportInterval:    t.reportInterval,
+		Throttler:         t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
 }

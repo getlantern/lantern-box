@@ -23,6 +23,10 @@ const (
 
 // Conn wraps a net.Conn and tracks data consumption for datacap reporting.
 type Conn struct {
+	trafficCategory       string
+	hasRead               atomic.Bool
+	hasWritten            atomic.Bool
+	bidirectionalReported bool // Guarded by reportMutex.
 	net.Conn
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -47,12 +51,13 @@ type Conn struct {
 
 // ConnConfig holds configuration for creating a datacap-tracked connection.
 type ConnConfig struct {
-	Conn           net.Conn
-	Client         *Client
-	Logger         log.ContextLogger
-	ClientInfo     clientcontext.ClientInfo
-	ReportInterval time.Duration
-	Throttler      *Throttler // Shared throttler from registry
+	TrafficCategory string
+	Conn            net.Conn
+	Client          *Client
+	Logger          log.ContextLogger
+	ClientInfo      clientcontext.ClientInfo
+	ReportInterval  time.Duration
+	Throttler       *Throttler // Shared throttler from registry
 }
 
 // NewConn creates a new datacap-tracked connection wrapper.
@@ -71,14 +76,15 @@ func NewConn(config ConnConfig) *Conn {
 	}
 
 	conn := &Conn{
-		Conn:         config.Conn,
-		ctx:          ctx,
-		cancel:       cancel,
-		client:       config.Client,
-		logger:       config.Logger,
-		clientInfo:   config.ClientInfo,
-		reportTicker: time.NewTicker(config.ReportInterval),
-		throttler:    throttler,
+		trafficCategory: config.TrafficCategory,
+		Conn:            config.Conn,
+		ctx:             ctx,
+		cancel:          cancel,
+		client:          config.Client,
+		logger:          config.Logger,
+		clientInfo:      config.ClientInfo,
+		reportTicker:    time.NewTicker(config.ReportInterval),
+		throttler:       throttler,
 	}
 
 	// Start periodic reporting goroutine
@@ -92,6 +98,7 @@ func NewConn(config ConnConfig) *Conn {
 func (c *Conn) Read(b []byte) (n int, err error) {
 	n, err = c.Conn.Read(b)
 	if n > 0 {
+		c.hasRead.Store(true)
 		c.bytesReceived.Add(int64(n))
 
 		// Apply throttling after read (token bucket wait)
@@ -110,6 +117,7 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 func (c *Conn) Write(b []byte) (n int, err error) {
 	n, err = c.Conn.Write(b)
 	if n > 0 {
+		c.hasWritten.Store(true)
 		c.bytesSent.Add(int64(n))
 
 		// Apply throttling after write (token bucket wait)
@@ -181,6 +189,9 @@ func (c *Conn) sendReport() {
 		BytesUsed:   delta,
 	}
 
+	bidirectional := c.hasRead.Load() && c.hasWritten.Load() && !c.bidirectionalReported
+	report.TrafficUsage = trafficReport(c.trafficCategory, delta, bidirectional)
+
 	timeout := c.client.httpClient.Timeout
 	if timeout == 0 {
 		timeout = 10 * time.Second
@@ -195,6 +206,9 @@ func (c *Conn) sendReport() {
 		c.bytesReceived.Add(received)
 		c.logger.Debug("failed to report datacap consumption (will retry): ", err)
 	} else {
+		if bidirectional {
+			c.bidirectionalReported = true
+		}
 		c.logger.Debug("reported datacap delta: ", delta, " bytes (sent: ", sent, ", received: ", received, ") for device ", c.clientInfo.DeviceID)
 		if status != nil {
 			c.updateThrottleState(status)

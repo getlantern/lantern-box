@@ -16,6 +16,7 @@ import (
 
 // PacketConn wraps a sing-box network.PacketConn and tracks data consumption for datacap reporting.
 type PacketConn struct {
+	trafficCategories bool
 	N.PacketConn
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -40,12 +41,13 @@ type PacketConn struct {
 
 // PacketConnConfig holds configuration for creating a datacap-tracked packet connection.
 type PacketConnConfig struct {
-	Conn           N.PacketConn
-	Client         *Client
-	Logger         log.ContextLogger
-	ClientInfo     clientcontext.ClientInfo
-	ReportInterval time.Duration
-	Throttler      *Throttler // Shared throttler from registry
+	TrafficCategories bool
+	Conn              N.PacketConn
+	Client            *Client
+	Logger            log.ContextLogger
+	ClientInfo        clientcontext.ClientInfo
+	ReportInterval    time.Duration
+	Throttler         *Throttler // Shared throttler from registry
 }
 
 // NewPacketConn creates a new datacap-tracked packet connection wrapper.
@@ -64,14 +66,15 @@ func NewPacketConn(config PacketConnConfig) *PacketConn {
 	}
 
 	conn := &PacketConn{
-		PacketConn:   config.Conn,
-		ctx:          ctx,
-		cancel:       cancel,
-		client:       config.Client,
-		logger:       config.Logger,
-		clientInfo:   config.ClientInfo,
-		reportTicker: time.NewTicker(config.ReportInterval),
-		throttler:    throttler,
+		trafficCategories: config.TrafficCategories,
+		PacketConn:        config.Conn,
+		ctx:               ctx,
+		cancel:            cancel,
+		client:            config.Client,
+		logger:            config.Logger,
+		clientInfo:        config.ClientInfo,
+		reportTicker:      time.NewTicker(config.ReportInterval),
+		throttler:         throttler,
 	}
 
 	// Start periodic reporting goroutine
@@ -178,6 +181,11 @@ func (c *PacketConn) sendReport() {
 		BytesUsed:   delta,
 	}
 
+	// A UDP association can carry several destinations; do not apply one
+	// connection-level hostname to all packets. No UDP connection count is inferred.
+	if c.trafficCategories {
+		report.TrafficUsage = trafficReport("unknown", delta, false)
+	}
 	timeout := c.client.httpClient.Timeout
 	if timeout == 0 {
 		timeout = 10 * time.Second

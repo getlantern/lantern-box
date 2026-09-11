@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	runtimeDebug "runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -95,8 +96,11 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		log.Info("Datacap enabled. Creating tracker...")
 		datacapTracker, err := datacap.NewDatacapTracker(
 			datacap.Options{
-				URL:            datacapURL,
-				ReportInterval: "10s",
+				URL:               datacapURL,
+				TrafficCategories: os.Getenv("LANTERN_TRAFFIC_CATEGORIES") == "1",
+				LanternHosts:      strings.Split(os.Getenv("LANTERN_TRAFFIC_SERVICE_HOSTS"), ","),
+				ProbeHosts:        strings.Split(os.Getenv("LANTERN_TRAFFIC_PROBE_HOSTS"), ","),
+				ReportInterval:    "10s",
 			},
 			log.StdLogger(),
 		)
