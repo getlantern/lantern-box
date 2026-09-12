@@ -77,10 +77,11 @@ type DataCapStatus struct {
 
 // DataCapReport represents the request body for POST /data-cap/ endpoint.
 type DataCapReport struct {
-	DeviceID    string `json:"deviceId"`
-	CountryCode string `json:"countryCode"`
-	Platform    string `json:"platform"`
-	BytesUsed   int64  `json:"bytesUsed"`
+	DeviceID     string        `json:"deviceId"`
+	CountryCode  string        `json:"countryCode"`
+	Platform     string        `json:"platform"`
+	BytesUsed    int64         `json:"bytesUsed"`
+	TrafficUsage *TrafficUsage `json:"trafficUsage,omitempty"`
 }
 
 func (c *Client) GetDataCapStatus(ctx context.Context, deviceID string) (*DataCapStatus, error) {
