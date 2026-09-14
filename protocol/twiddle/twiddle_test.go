@@ -268,15 +268,15 @@ func TestInboundRejectsMismatchedCoverHost(t *testing.T) {
 	}
 }
 
-func TestInboundRejectsUnknownCover(t *testing.T) {
+func TestInboundAcceptsUnlistedCover(t *testing.T) {
 	keyHex, _, _ := creds(t)
-	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+	ib, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleInboundOptions{
 			TicketKey: keyHex, MasqueradeUpstream: "www.example.com:443",
 		})
-	if err == nil {
-		t.Fatal("inbound accepted an unmeasured cover")
-	}
+	require.NoError(t, err)
+	t.Cleanup(func() { ib.Close() })
+	require.Equal(t, "www.example.com", ib.(*Inbound).cfg.Cover.Host)
 }
 
 func TestOutboundRequiresCoverSNI(t *testing.T) {
@@ -337,17 +337,17 @@ func TestOutboundUsesTheEmbeddedPoolByDefault(t *testing.T) {
 	}
 }
 
-func TestOutboundRejectsUnknownCover(t *testing.T) {
+func TestOutboundAcceptsUnlistedCover(t *testing.T) {
 	_, ticket, psk := creds(t)
-	_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
+	ob, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "t",
 		option.TwiddleOutboundOptions{
 			ServerOptions: boxoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
 			Ticket:        ticket, PSK: psk, CoverSNI: "www.example.com",
 			HelloPool: testPool(t),
 		})
-	if err == nil {
-		t.Fatal("outbound accepted an unmeasured cover")
-	}
+	require.NoError(t, err)
+	t.Cleanup(func() { ob.(*Outbound).Close() })
+	require.Equal(t, "www.example.com", ob.(*Outbound).cfg.Cover.Host)
 }
 
 // A corrupt configured pool must DEGRADE to the built-in one, not fail the
