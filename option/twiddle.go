@@ -27,7 +27,7 @@ type TwiddleInboundOptions struct {
 
 	// CoverHost is the impersonated identity. Cipher, binder length, ticket
 	// length, ServerHello extension order and opening-flight sizes all come
-	// from the measured CoverProfile for this host. Empty means the host of
+	// from the tuned or default CoverProfile for this DNS hostname. Empty means the host of
 	// MasqueradeUpstream. When MasqueradeUpstream uses a DNS name, the two must
 	// match; an explicit cover is reserved for upstream IP addresses.
 	CoverHost string `json:"cover_host,omitempty"`
@@ -59,8 +59,8 @@ type TwiddleOutboundOptions struct {
 	// same psk backs FullTicket.
 	PSK string `json:"psk"`
 
-	// CoverSNI is the domain this egress masquerades as. It must be a measured
-	// cover identity (see twiddle.CoverFor) and should agree with the egress's
+	// CoverSNI is the DNS hostname this egress masquerades as (see
+	// twiddle.CoverFor). It must agree with the egress's
 	// masquerade_upstream.
 	CoverSNI string `json:"cover_sni"`
 
