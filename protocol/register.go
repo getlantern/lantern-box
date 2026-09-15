@@ -21,6 +21,7 @@ import (
 	"github.com/getlantern/lantern-box/protocol/outline"
 	"github.com/getlantern/lantern-box/protocol/reflex"
 	"github.com/getlantern/lantern-box/protocol/samizdat"
+	"github.com/getlantern/lantern-box/protocol/testing"
 	"github.com/getlantern/lantern-box/protocol/twiddle"
 	"github.com/getlantern/lantern-box/protocol/unbounded"
 	"github.com/getlantern/lantern-box/protocol/water"
@@ -102,6 +103,7 @@ func registerOutbounds(registry *outbound.Registry) {
 	outline.RegisterOutbound(registry)
 	reflex.RegisterOutbound(registry)
 	samizdat.RegisterOutbound(registry)
+	testing.RegisterOutbound(registry)
 	twiddle.RegisterOutbound(registry)
 	unbounded.RegisterOutbound(registry)
 	water.RegisterOutbound(registry)
