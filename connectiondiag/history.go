@@ -50,20 +50,24 @@ type TCPStats struct {
 // Record describes a physical dial, not a logical stream or an authenticated handshake.
 // Observed I/O fields exclude raw-socket operations and TCP Fast Open initial payloads.
 type Record struct {
-	ID            uint64     `json:"id"`
-	Started       time.Time  `json:"started"`
-	Protocol      string     `json:"protocol"`
-	OutboundID    string     `json:"outbound_id"`
-	EndpointID    string     `json:"endpoint_id"`
-	Network       string     `json:"network"`
-	DialMS        int64      `json:"dial_ms"`
-	DialDone      bool       `json:"dial_done"`
-	Error         string     `json:"error,omitempty"`
-	ErrorStage    string     `json:"error_stage,omitempty"`
-	Closed        bool       `json:"closed"`
+	DialGroup  uint64    `json:"dial_group,omitempty"`
+	ID         uint64    `json:"id"`
+	Started    time.Time `json:"started"`
+	Protocol   string    `json:"protocol"`
+	OutboundID string    `json:"outbound_id"`
+	EndpointID string    `json:"endpoint_id"`
+	Network    string    `json:"network"`
+	DialMS     int64     `json:"dial_ms"`
+	DialDone   bool      `json:"dial_done"`
+	Error      string    `json:"error,omitempty"`
+	ErrorStage string    `json:"error_stage,omitempty"`
+	Closed     bool      `json:"closed"`
+	// FirstReadMS and observed byte counts exclude splice, raw I/O, and TFO initial payloads.
+	// Zero counts do not establish that no traffic flowed.
 	FirstReadMS   *int64     `json:"first_observed_read_ms,omitempty"`
 	ReadBytes     uint64     `json:"observed_read_bytes"`
 	WrittenBytes  uint64     `json:"observed_written_bytes"`
+	IOCoverage    string     `json:"io_coverage"`
 	TCP           *TCPStats  `json:"tcp,omitempty"`
 	TCPStatus     string     `json:"tcp_status"`
 	TCPObservedAt *time.Time `json:"tcp_observed_at,omitempty"`
@@ -93,6 +97,8 @@ var (
 
 // Enable starts in-memory collection; direct outbounds are included only when requested.
 func Enable(direct bool) {
+	history.Lock()
+	defer history.Unlock()
 	initKey.Do(func() {
 		history.key = [32]byte{}
 		if _, err := rand.Read(history.key[:]); err != nil {
@@ -101,6 +107,28 @@ func Enable(direct bool) {
 	})
 	includeDirect.Store(direct)
 	enabled.Store(true)
+}
+
+// Disable stops new collection and discards retained records without closing connections.
+// Completion hooks already in flight may finish but cannot reinsert discarded records.
+func Disable() {
+	history.Lock()
+	defer history.Unlock()
+	enabled.Store(false)
+	history.entries = [capacity]*entry{}
+	history.next = 0
+	history.total = 0
+}
+
+// OutboundID returns the process-local identifier used in snapshots, or empty when disabled.
+// Identifiers cannot be correlated across process restarts.
+func OutboundID(tag string) string {
+	history.Lock()
+	defer history.Unlock()
+	if !enabled.Load() {
+		return ""
+	}
+	return digest(tag)
 }
 
 func digest(value string) string {
@@ -142,14 +170,17 @@ func newEntry(label socketobserver.Label, network, endpoint string) *entry {
 	if !enabled.Load() || label.Protocol == "" || (label.Protocol == "direct" && !includeDirect.Load()) {
 		return nil
 	}
-	now := time.Now()
-	e := &entry{started: now, record: Record{Started: now.UTC(), Protocol: label.Protocol, OutboundID: digest(label.Tag), EndpointID: digest(endpoint), Network: network, TCPStatus: "not_connected"}}
 	history.Lock()
+	defer history.Unlock()
+	if !enabled.Load() || (label.Protocol == "direct" && !includeDirect.Load()) {
+		return nil
+	}
+	now := time.Now()
+	e := &entry{started: now, record: Record{DialGroup: label.DialGroup, IOCoverage: "partial", Started: now.UTC(), Protocol: label.Protocol, OutboundID: digest(label.Tag), EndpointID: digest(endpoint), Network: network, TCPStatus: "not_connected"}}
 	history.total++
 	e.record.ID = history.total
 	history.entries[history.next] = e
 	history.next = (history.next + 1) % capacity
-	history.Unlock()
 	return e
 }
 
@@ -182,16 +213,9 @@ func errorClass(err error) string {
 		return "closed"
 	case errors.Is(err, io.EOF):
 		return "eof"
-	case errors.Is(err, syscall.ECONNRESET):
-		return "reset"
-	case errors.Is(err, syscall.ECONNREFUSED):
-		return "refused"
-	case errors.Is(err, syscall.ENETUNREACH):
-		return "network_unreachable"
-	case errors.Is(err, syscall.EHOSTUNREACH):
-		return "host_unreachable"
-	case errors.Is(err, syscall.EPIPE):
-		return "broken_pipe"
+	}
+	if class := socketErrorClass(err); class != "" {
+		return class
 	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
@@ -324,6 +348,7 @@ func Snapshot() ([]byte, error) {
 		}
 	}
 	total := history.total
+	collecting := enabled.Load()
 	history.Unlock()
 	records := make([]Record, 0, len(entries))
 	for _, e := range entries {
@@ -350,6 +375,6 @@ func Snapshot() ([]byte, error) {
 		Total   uint64   `json:"total_dials"`
 		Evicted uint64   `json:"evicted"`
 		Records []Record `json:"records"`
-	}{1, enabled.Load(), total, total - uint64(len(entries)), records})
+	}{1, collecting, total, total - uint64(len(entries)), records})
 }
 func u64(v uint64) *uint64 { return &v }

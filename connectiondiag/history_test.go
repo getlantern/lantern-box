@@ -188,3 +188,43 @@ func TestVectorisedIOKeepsSocketStatistics(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDisableDiscardsInflightHistory(t *testing.T) {
+	resetHistory()
+	label := socketobserver.Label{Protocol: "tls", Tag: "private-route", DialGroup: 42}
+	done := Begin(label, "tcp", "private:443")
+	id := OutboundID(label.Tag)
+	data, err := Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		Enabled bool     `json:"enabled"`
+		Records []Record `json:"records"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.Records) != 1 || v.Records[0].OutboundID != id || v.Records[0].DialGroup != 42 || v.Records[0].IOCoverage != "partial" {
+		t.Fatalf("missing metadata: %s", data)
+	}
+	Disable()
+	done(nil, context.Canceled)
+	if Begin(label, "tcp", "private:443") != nil || OutboundID(label.Tag) != "" {
+		t.Fatal("disabled collector accepted new work")
+	}
+	data, err = Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.Enabled || len(v.Records) != 0 {
+		t.Fatalf("disabled history retained: %s", data)
+	}
+	Enable(false)
+	if OutboundID(label.Tag) != id {
+		t.Fatal("process-local correlation changed")
+	}
+}
