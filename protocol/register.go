@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/experimental/libbox"
 	"github.com/sagernet/sing/service"
 
+	"github.com/getlantern/lantern-box/connectiondiag"
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/protocol/algeneva"
 	"github.com/getlantern/lantern-box/protocol/amnezia"
@@ -66,6 +67,7 @@ func init() {
 // RegisterProtocols registers all lantern-box protocols to the given context's registries.
 // Note: this does not register sing-box built-in protocols.
 func RegisterProtocols(ctx context.Context) context.Context {
+	ctx = connectiondiag.Context(ctx)
 	if registry := service.FromContext[adapter.InboundRegistry](ctx); registry != nil {
 		if reg, ok := registry.(*inbound.Registry); ok {
 			registerInbounds(reg)
