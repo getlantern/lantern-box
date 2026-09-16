@@ -1170,14 +1170,14 @@ func TestReportFailure_RetriesAndReportsDelta(t *testing.T) {
 	require.NoError(t, err)
 
 	mockConn := newMockConn(make([]byte, 1000))
-	ctx := clientcontext.ContextWithClientInfo(context.Background(), clientcontext.ClientInfo{
+	staged := infoConn{Conn: mockConn, info: clientcontext.ClientInfo{
 		IsPro:       false,
 		DeviceID:    "device-retry-test",
 		Platform:    "test",
 		CountryCode: "US",
-	})
+	}}
 
-	routedConn := tracker.RoutedConnection(ctx, mockConn, adapter.InboundContext{}, nil, nil)
+	routedConn := tracker.RoutedConnection(context.Background(), staged, adapter.InboundContext{}, nil, nil)
 	conn, ok := routedConn.(*Conn)
 	require.True(t, ok)
 
