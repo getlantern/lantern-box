@@ -240,7 +240,20 @@ func (r Report) validate(sample SampleSpec) error {
 		return fmt.Errorf("%w: report has %d windows, want %d",
 			ErrInvalidContract, len(r.Windows), sample.WindowsPerExit)
 	}
+	seen := make(map[uint32]struct{}, len(r.Windows))
 	for _, window := range r.Windows {
+		if window.ExitIndex != 0 {
+			return fmt.Errorf("%w: report names exit %d, and a client is one exit",
+				ErrInvalidContract, window.ExitIndex)
+		}
+		if window.WindowIndex >= sample.WindowsPerExit {
+			return fmt.Errorf("%w: report names window %d, and the sample has %d",
+				ErrInvalidContract, window.WindowIndex, sample.WindowsPerExit)
+		}
+		if _, repeated := seen[window.WindowIndex]; repeated {
+			return fmt.Errorf("%w: report repeats window %d", ErrInvalidContract, window.WindowIndex)
+		}
+		seen[window.WindowIndex] = struct{}{}
 		if len(window.CandidateAttempts) != int(sample.AttemptsPerWindow) ||
 			len(window.ControlAttempts) != int(sample.AttemptsPerWindow) {
 			return fmt.Errorf("%w: report window %d has %d candidate and %d control attempts, want %d of each",

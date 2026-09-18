@@ -20,5 +20,7 @@ const (
 )
 
 const (
+	// TypeOutboundEval is the service type a stored configuration names, so
+	// changing the spelling orphans every configuration using the old one.
 	TypeOutboundEval = "outbound-eval"
 )

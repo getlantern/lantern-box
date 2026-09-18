@@ -160,6 +160,9 @@ func TestReportValidateRequiresTheWholeGrid(t *testing.T) {
 		"a control attempt short": func(r *Report) {
 			r.Windows[1].ControlAttempts = r.Windows[1].ControlAttempts[:1]
 		},
+		"a repeated window":        func(r *Report) { r.Windows[1].WindowIndex = 0 },
+		"a window out of range":    func(r *Report) { r.Windows[1].WindowIndex = 7 },
+		"a window of another exit": func(r *Report) { r.Windows[1].ExitIndex = 1 },
 		"reachable with a failure code": func(r *Report) {
 			r.Windows[0].CandidateAttempts[0].FailureCode = failureTimeout
 		},

@@ -3,6 +3,7 @@ package outboundeval
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
@@ -153,8 +154,10 @@ func (s *Service) attestWindow(
 		if errors.As(err, &status) && !status.retryable() {
 			return Attestation{}, err
 		}
+		// The context error leads so the window reports the deadline rather
+		// than the attestation failure that was about to be retried.
 		if attempt < attestAttempts && !sleepContext(ctx, s.retryDelay) {
-			return Attestation{}, err
+			return Attestation{}, fmt.Errorf("%w (%w)", ctx.Err(), err)
 		}
 	}
 	return Attestation{}, err

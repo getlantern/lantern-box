@@ -267,6 +267,35 @@ func TestRunWindowSeparatesADeadlineFromARejectedAttestation(t *testing.T) {
 	})
 }
 
+func TestRunWindowReportsADeadlineThatLandsBetweenAttestationAttempts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestService(t, testOptions())
+		s.retryDelay = 2 * time.Second
+		s.attest = func(context.Context, string, AttestationRequest) (Attestation, error) {
+			return Attestation{}, apiError{status: http.StatusBadGateway}
+		}
+		s.measure = func(context.Context, A.Outbound, string) Attempt {
+			t.Error("an unattested window must not measure")
+			return Attempt{}
+		}
+
+		assignment := validAssignment()
+		assignment.Sample.WindowDurationSeconds = 1
+
+		report := s.runAssignment(context.Background(), testCycle(), assignment)
+
+		require.NoError(t, report.validate(assignment.Sample))
+		for _, window := range report.Windows {
+			for _, attempts := range [][]Attempt{window.CandidateAttempts, window.ControlAttempts} {
+				for _, attempt := range attempts {
+					assert.Equal(t, failureWindowDeadline, attempt.FailureCode,
+						"a window that ran out mid-retry is not an attestation failure")
+				}
+			}
+		}
+	})
+}
+
 func TestRunWindowDoesNotSpendTheWindowOnItsSpacing(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newTestService(t, testOptions())

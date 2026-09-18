@@ -137,6 +137,8 @@ func (c *apiClient) post(ctx context.Context, endpoint, token string, request, r
 	}
 	defer httpResponse.Body.Close()
 	if httpResponse.StatusCode < http.StatusOK || httpResponse.StatusCode >= http.StatusMultipleChoices {
+		// Draining leaves the connection reusable for the retry.
+		_, _ = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, maxControlResponseBytes))
 		return apiError{status: httpResponse.StatusCode}
 	}
 	if response == nil {

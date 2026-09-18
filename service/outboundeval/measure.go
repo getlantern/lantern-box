@@ -14,8 +14,9 @@ import (
 // never retries: a retry would hide the failure the measurement exists to
 // observe.
 //
-// A response outside 2xx is reported unreachable with failureHTTPStatus, so a
-// block page counts against the arm that served it.
+// A response outside 2xx is reported unreachable with failureHTTPStatus even
+// when its body then fails, so a block page counts against the arm that served
+// it.
 func measureAttempt(
 	ctx context.Context,
 	out A.Outbound,
@@ -32,10 +33,11 @@ func measureAttempt(
 		ThroughputBytesPerSecond: result.ThroughputBytesPerSecond,
 	}
 	switch {
+	case result.HTTPStatus != 0 &&
+		(result.HTTPStatus < http.StatusOK || result.HTTPStatus >= http.StatusMultipleChoices):
+		attempt.FailureCode = failureHTTPStatus
 	case err != nil:
 		attempt.FailureCode = classifyFailure(err)
-	case result.HTTPStatus < http.StatusOK || result.HTTPStatus >= http.StatusMultipleChoices:
-		attempt.FailureCode = failureHTTPStatus
 	default:
 		attempt.Reachable = true
 	}

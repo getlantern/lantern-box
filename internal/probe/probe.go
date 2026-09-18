@@ -111,7 +111,8 @@ func Measure(ctx context.Context, out A.Outbound, probeURL string, timeout time.
 
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
 	if err != nil {
-		return result, fmt.Errorf("new request: %w", err)
+		result.Elapsed = time.Since(start)
+		return result, fmt.Errorf("%w: %w", ErrUnusableInput, err)
 	}
 	if tp := linkURL.Query().Get("tp"); tp != "" {
 		req.Header.Set("traceparent", tp)

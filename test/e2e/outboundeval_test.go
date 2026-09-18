@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,6 +29,7 @@ import (
 // controlAPI stands in for the evaluation control plane: it hands out one
 // assignment, attests every window, and captures the report.
 type controlAPI struct {
+	t           *testing.T
 	mu          sync.Mutex
 	tokens      []string
 	challenges  []string
@@ -62,20 +64,32 @@ func (c *controlAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.mu.Lock()
 		c.tokens = append(c.tokens, r.Header.Get("Authorization"))
 		c.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(c.assignment())
+		if err := json.NewEncoder(w).Encode(c.assignment()); err != nil {
+			c.t.Errorf("encode assignment: %v", err)
+		}
 	case strings.HasSuffix(r.URL.Path, "/attestations"):
 		var request outboundeval.AttestationRequest
-		_ = json.NewDecoder(r.Body).Decode(&request)
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			c.t.Errorf("decode attestation request: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		c.mu.Lock()
 		c.challenges = append(c.challenges, request.Challenge)
 		c.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(outboundeval.Attestation{
+		if err := json.NewEncoder(w).Encode(outboundeval.Attestation{
 			Token:      "attested-" + request.Challenge,
 			ServerTime: time.Now().UTC(),
-		})
+		}); err != nil {
+			c.t.Errorf("encode attestation: %v", err)
+		}
 	case strings.HasSuffix(r.URL.Path, "/reports"):
 		var report outboundeval.Report
-		_ = json.NewDecoder(r.Body).Decode(&report)
+		if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+			c.t.Errorf("decode report: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		c.mu.Lock()
 		c.reports = append(c.reports, report)
 		c.mu.Unlock()
@@ -92,7 +106,7 @@ func (c *controlAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // The measurement target does not resolve, so every attempt fails. That is the
 // point of the assertion: the grid still has to arrive complete.
 func TestOutboundEvalRunsInsideABox(t *testing.T) {
-	api := &controlAPI{reported: make(chan struct{})}
+	api := &controlAPI{t: t, reported: make(chan struct{})}
 	server := httptest.NewServer(api)
 	t.Cleanup(server.Close)
 
@@ -147,12 +161,13 @@ func TestOutboundEvalRunsInsideABox(t *testing.T) {
 	for _, window := range report.Windows {
 		assert.Len(t, window.CandidateAttempts, int(assignment.Sample.AttemptsPerWindow))
 		assert.Len(t, window.ControlAttempts, int(assignment.Sample.AttemptsPerWindow))
-		assert.Equal(t, "attested-challenge-"+string(rune('0'+window.WindowIndex)), window.AttestationToken)
+		assert.Equal(t, fmt.Sprintf("attested-challenge-%d", window.WindowIndex), window.AttestationToken)
 		for _, attempt := range append(window.CandidateAttempts, window.ControlAttempts...) {
 			assert.False(t, attempt.Reachable)
 			assert.NotEmpty(t, attempt.FailureCode)
 		}
 	}
+	require.GreaterOrEqual(t, len(api.challenges), 2)
 	assert.Equal(t, []string{"challenge-0", "challenge-1"}, api.challenges[:2])
 	assert.Equal(t, "Bearer e2e-token", api.tokens[0])
 }
@@ -198,7 +213,7 @@ func TestOutboundEvalRefusesAConfigWithoutItsArms(t *testing.T) {
 // TestOutboundEvalTokenRotatesThroughTheServiceManager exercises the path an
 // embedder uses to replace a credential without restarting the box.
 func TestOutboundEvalTokenRotatesThroughTheServiceManager(t *testing.T) {
-	api := &controlAPI{reported: make(chan struct{})}
+	api := &controlAPI{t: t, reported: make(chan struct{})}
 	server := httptest.NewServer(api)
 	t.Cleanup(server.Close)
 

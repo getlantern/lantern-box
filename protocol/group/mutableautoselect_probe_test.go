@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // A member that answered carried the request, so the reply going short does not
@@ -20,10 +19,21 @@ func TestProbeMember_ATruncatedBodyStillReachesTheMember(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", "4096")
 		_, _ = w.Write([]byte(strings.Repeat("x", 16)))
+		// Hand the short body to the client before taking the connection, so
+		// the probe reads a truncated body rather than nothing at all.
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
 		hijacker, ok := w.(http.Hijacker)
-		require.True(t, ok)
+		if !ok {
+			t.Errorf("the test server does not support hijacking")
+			return
+		}
 		conn, _, err := hijacker.Hijack()
-		require.NoError(t, err)
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
 		_ = conn.Close()
 	}))
 	t.Cleanup(srv.Close)

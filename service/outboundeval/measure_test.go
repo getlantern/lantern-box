@@ -51,6 +51,40 @@ func TestMeasureAttemptCountsANonSuccessStatusAgainstTheArm(t *testing.T) {
 	}
 }
 
+func TestMeasureAttemptReportsABlockPageThatCutsItsBodyShort(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "4096")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(strings.Repeat("x", 16)))
+		// Hand the short body to the client before taking the connection, so
+		// the measurement reads a truncated body rather than nothing at all.
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("the test server does not support hijacking")
+			return
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(server.Close)
+	out := &dialOutbound{tag: "candidate", address: server.Listener.Addr().String()}
+
+	attempt := measureAttempt(context.Background(), out, server.URL, time.Second, 0)
+
+	require.NoError(t, attempt.validate())
+	assert.False(t, attempt.Reachable)
+	assert.Equal(t, failureHTTPStatus, attempt.FailureCode,
+		"the status the target served outranks its body then failing")
+	assert.Equal(t, http.StatusForbidden, attempt.HTTPStatus)
+}
+
 func TestMeasureAttemptStopsAtTheByteCeiling(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(strings.Repeat("x", 64<<10)))
