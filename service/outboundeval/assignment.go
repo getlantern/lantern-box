@@ -154,8 +154,8 @@ func (s *Service) attestWindow(
 		if errors.As(err, &status) && !status.retryable() {
 			return Attestation{}, err
 		}
-		// The context error leads so the window reports the deadline rather
-		// than the attestation failure that was about to be retried.
+		// Carrying the context error keeps the window's report on the deadline
+		// rather than the attestation failure that was about to be retried.
 		if attempt < attestAttempts && !sleepContext(ctx, s.retryDelay) {
 			return Attestation{}, fmt.Errorf("%w (%w)", ctx.Err(), err)
 		}
