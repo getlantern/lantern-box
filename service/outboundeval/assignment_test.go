@@ -202,6 +202,71 @@ func TestRunAssignmentPadsWhenTheWindowRunsOutOfTime(t *testing.T) {
 	})
 }
 
+func TestRunWindowPadsWhenTheAssignmentEndsDuringTheSpacing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestService(t, testOptions())
+		attested := false
+		s.attest = func(context.Context, string, AttestationRequest) (Attestation, error) {
+			attested = true
+			return Attestation{Token: "attestation"}, nil
+		}
+		s.measure = func(context.Context, A.Outbound, string) Attempt {
+			t.Error("a window that never opened must not measure")
+			return Attempt{}
+		}
+
+		assignment := validAssignment()
+		assignment.Sample.FreshSessionDelayMS = 5_000
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		report := s.runAssignment(ctx, testCycle(), assignment)
+
+		require.NoError(t, report.validate(assignment.Sample))
+		assert.False(t, attested, "a window that never opened must not be attested")
+		for _, window := range report.Windows {
+			assert.Empty(t, window.AttestationToken)
+			for _, attempts := range [][]Attempt{window.CandidateAttempts, window.ControlAttempts} {
+				for _, attempt := range attempts {
+					assert.False(t, attempt.Reachable)
+					assert.Equal(t, failureWindowDeadline, attempt.FailureCode)
+				}
+			}
+		}
+	})
+}
+
+func TestRunWindowSeparatesADeadlineFromARejectedAttestation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestService(t, testOptions())
+		s.attest = func(ctx context.Context, _ string, _ AttestationRequest) (Attestation, error) {
+			<-ctx.Done()
+			return Attestation{}, ctx.Err()
+		}
+		s.measure = func(context.Context, A.Outbound, string) Attempt {
+			t.Error("an unattested window must not measure")
+			return Attempt{}
+		}
+
+		assignment := validAssignment()
+		assignment.Sample.WindowDurationSeconds = 1
+
+		report := s.runAssignment(context.Background(), testCycle(), assignment)
+
+		require.NoError(t, report.validate(assignment.Sample))
+		for _, window := range report.Windows {
+			assert.Empty(t, window.AttestationToken)
+			for _, attempts := range [][]Attempt{window.CandidateAttempts, window.ControlAttempts} {
+				for _, attempt := range attempts {
+					assert.False(t, attempt.Reachable)
+					assert.Equal(t, failureWindowDeadline, attempt.FailureCode,
+						"a deadline is not the server refusing the challenge")
+				}
+			}
+		}
+	})
+}
+
 func TestRunWindowDoesNotSpendTheWindowOnItsSpacing(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newTestService(t, testOptions())
