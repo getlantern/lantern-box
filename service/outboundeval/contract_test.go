@@ -22,9 +22,6 @@ func testBounds() bounds {
 	}
 }
 
-// validAssignment is the assignment the tests measure against. Its spacing is
-// far shorter than a server's, since the tests that run a grid outside a
-// synctest bubble wait it out for real.
 func validAssignment() Assignment {
 	return Assignment{
 		ID:             "assignment-1",
@@ -34,7 +31,8 @@ func validAssignment() Assignment {
 			WindowsPerExit:        2,
 			AttemptsPerWindow:     2,
 			WindowDurationSeconds: 45,
-			FreshSessionDelayMS:   10,
+			// The grid tests outside a synctest bubble wait this out for real.
+			FreshSessionDelayMS: 10,
 		},
 		Challenges: []WindowChallenge{
 			{WindowIndex: 0, Challenge: "challenge-0"},
