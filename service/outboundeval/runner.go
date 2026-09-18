@@ -1,0 +1,149 @@
+package outboundeval
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/getlantern/common/backoff"
+)
+
+// clientExitCount is how many vantage points a client offers. A client is one
+// device on one network, so a sample may never be spread across exits the way a
+// proxy-pool runner's can.
+const clientExitCount = 1
+
+// retryBaseWait is the default base wait before retrying a cycle a later
+// attempt may fix. The backoff jitters it and grows from there, up to the
+// configured maximum.
+const retryBaseWait = 30 * time.Second
+
+var (
+	errNoToken             = errors.New("idle until a token is supplied")
+	errOutboundUnavailable = errors.New("outbound under test is unavailable")
+)
+
+func (s *Service) run() {
+	defer close(s.done)
+	ticker := time.NewTicker(time.Duration(s.options.PollInterval))
+	defer ticker.Stop()
+	retries := backoff.NewExponentialBackoff(s.retryBase, time.Duration(s.options.MaxRetryBackoff))
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.wake:
+		case <-ticker.C:
+		}
+		var err error
+		for {
+			if err = s.runCycle(s.ctx); !retryableCycleError(err) {
+				break
+			}
+			s.logger.Debug("outbound evaluation will retry: ", err)
+			retries.WaitOn(s.ctx, s.wake)
+		}
+		if s.ctx.Err() != nil {
+			return
+		}
+		retries.Reset()
+		interval := time.Duration(s.options.PollInterval)
+		if err != nil {
+			interval = time.Duration(s.options.NoAssignmentInterval)
+			if errors.Is(err, ErrNoAssignment) || errors.Is(err, errNoToken) {
+				s.logger.Debug("outbound evaluation: ", err)
+			} else {
+				s.logger.Warn("outbound evaluation refused: ", err)
+			}
+		}
+		ticker.Reset(interval)
+	}
+}
+
+func (s *Service) runCycle(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	config := s.config.Load()
+	if config.Token == "" {
+		return errNoToken
+	}
+	candidate, found := s.outbounds.Outbound(config.OutboundTag)
+	if !found {
+		return fmt.Errorf("%w: %q", errOutboundUnavailable, config.OutboundTag)
+	}
+
+	assignment, err := s.api.acquire(ctx, s.options.AcquireURL, config.Token, AssignmentRequest{
+		CountryCode: config.CountryCode,
+		ExitCount:   clientExitCount,
+	})
+	if err != nil {
+		return err
+	}
+
+	if assignment.ServerTime.IsZero() {
+		return fmt.Errorf("%w: assignment carries no server time", ErrInvalidContract)
+	}
+	clock := newServerClock(assignment.ServerTime)
+	serverNow := clock.now()
+	if err := assignment.validate(serverNow, s.limits); err != nil {
+		return fmt.Errorf("validate assignment: %w", err)
+	}
+
+	// The grid is bounded by the assignment's own lifetime, measured against
+	// the server's clock so a skewed device does not measure past the expiry.
+	gridCtx, cancel := context.WithTimeout(ctx, assignment.ExpiresAt.Sub(serverNow))
+	defer cancel()
+	report := s.runAssignment(gridCtx, &cycle{candidate: candidate, control: s.control, clock: clock}, assignment)
+	if err := report.validate(assignment.Sample); err != nil {
+		return fmt.Errorf("validate report: %w", err)
+	}
+	return s.submitReport(ctx, report)
+}
+
+// submitReport delivers a finished report, retrying a refusal a later attempt
+// may clear. Resubmission is safe: the report carries the token and idempotency
+// key the server deduplicates on.
+func (s *Service) submitReport(ctx context.Context, report Report) error {
+	var err error
+	for attempt := 1; attempt <= submitAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err = s.api.submit(ctx, s.options.SubmitURL, report)
+		if !retryableCycleError(err) {
+			return err
+		}
+		if attempt < submitAttempts && !sleepContext(ctx, s.retryDelay) {
+			return ctx.Err()
+		}
+	}
+	return err
+}
+
+func retryableCycleError(err error) bool {
+	if err == nil || errors.Is(err, ErrNoAssignment) || errors.Is(err, errNoToken) ||
+		errors.Is(err, errOutboundUnavailable) || errors.Is(err, ErrInvalidContract) ||
+		errors.Is(err, context.Canceled) {
+		return false
+	}
+	var status apiError
+	if errors.As(err, &status) {
+		return status.retryable()
+	}
+	return true
+}
+
+// sleepContext reports false when ctx ended before the delay elapsed.
+func sleepContext(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(delay):
+		return true
+	}
+}

@@ -18,3 +18,7 @@ const (
 	TypeMutableURLTest    = "mutableurltest"
 	TypeMutableAutoSelect = "mutableautoselect"
 )
+
+const (
+	TypeOutboundEval = "outbound-eval"
+)
