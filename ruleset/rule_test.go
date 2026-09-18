@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
@@ -43,22 +44,28 @@ func TestMutableRuleSet(t *testing.T) {
 	}
 
 	m, _ := newMutableRuleSet(path, rsTag, "source", true)
-	reset := func() {
-		m.filter.Domain = []string{domain}
-		m.saveToFile()
-		m.Enable()
-	}
-
 	testStart(t, ctx, m, rsTag, domain)
+
+	const added = "google.com"
+	reloads := observeReloads(t, m, domain, added)
+
+	reset := func(t *testing.T) {
+		m.filterMu.Lock()
+		m.filter.Domain = []string{domain}
+		m.filterMu.Unlock()
+		require.NoError(t, m.saveToFile())
+		m.Enable()
+		awaitReload(t, reloads, func(rs reloadState) bool { return rs[domain] && !rs[added] })
+	}
 
 	matchTests := []struct {
 		name    string
-		alterFn func(*MutableRuleSet, chan struct{}) *adapter.InboundContext
+		alterFn func(*testing.T, *MutableRuleSet) *adapter.InboundContext
 		want    bool
 	}{
 		{
 			name: "disable",
-			alterFn: func(mrs *MutableRuleSet, _ chan struct{}) *adapter.InboundContext {
+			alterFn: func(_ *testing.T, mrs *MutableRuleSet) *adapter.InboundContext {
 				mrs.Disable()
 				return inboundCtx(domain)
 			},
@@ -66,7 +73,7 @@ func TestMutableRuleSet(t *testing.T) {
 		},
 		{
 			name: "re-enable",
-			alterFn: func(mrs *MutableRuleSet, _ chan struct{}) *adapter.InboundContext {
+			alterFn: func(_ *testing.T, mrs *MutableRuleSet) *adapter.InboundContext {
 				mrs.Disable()
 				mrs.Enable()
 				return inboundCtx(domain)
@@ -75,20 +82,20 @@ func TestMutableRuleSet(t *testing.T) {
 		},
 		{
 			name: "match added item",
-			alterFn: func(mrs *MutableRuleSet, reloaded chan struct{}) *adapter.InboundContext {
-				mrs.AddItem(TypeDomain, "google.com")
-				<-reloaded
-				return inboundCtx("google.com")
+			alterFn: func(t *testing.T, mrs *MutableRuleSet) *adapter.InboundContext {
+				require.NoError(t, mrs.AddItem(TypeDomain, added))
+				awaitReload(t, reloads, func(rs reloadState) bool { return rs[added] })
+				return inboundCtx(added)
 			},
 			want: true,
 		},
 		{
 			name: "should not match removed item",
-			alterFn: func(mrs *MutableRuleSet, reloaded chan struct{}) *adapter.InboundContext {
-				mrs.AddItem(TypeDomain, "google.com")
-				<-reloaded
-				mrs.RemoveItem(TypeDomain, domain)
-				<-reloaded
+			alterFn: func(t *testing.T, mrs *MutableRuleSet) *adapter.InboundContext {
+				require.NoError(t, mrs.AddItem(TypeDomain, added))
+				awaitReload(t, reloads, func(rs reloadState) bool { return rs[added] })
+				require.NoError(t, mrs.RemoveItem(TypeDomain, domain))
+				awaitReload(t, reloads, func(rs reloadState) bool { return !rs[domain] })
 				return inboundCtx(domain)
 			},
 			want: false,
@@ -96,14 +103,58 @@ func TestMutableRuleSet(t *testing.T) {
 	}
 	for _, tt := range matchTests {
 		t.Run(tt.name, func(t *testing.T) {
-			reset()
-			reloaded := make(chan struct{})
-			cb := m.ruleset.RegisterCallback(func(it adapter.RuleSet) {
-				reloaded <- struct{}{}
-			})
-			testMatch(t, instance, m, tt.alterFn, reloaded, inboundCtx(domain), tt.want)
-			m.ruleset.UnregisterCallback(cb)
+			reset(t)
+			testMatch(t, instance, m, tt.alterFn, inboundCtx(domain), tt.want)
 		})
+	}
+}
+
+// reloadState records, for one reload of the watched rule set, whether each domain of
+// interest matched.
+type reloadState map[string]bool
+
+// observeReloads registers a rule-set callback that evaluates the given domains against the
+// freshly reloaded rules and publishes the result. The evaluation happens on the reloading
+// goroutine, so it observes exactly the rules that reload installed and never races with
+// the next one.
+//
+// The rule file is picked up by a debounced watcher: writes within ~100ms of each other
+// collapse into one reload, writes further apart each get their own. A test that waits for
+// "a reload" after each write therefore cannot know which write the reload it saw reflects,
+// which is what made this test flake on slow CI runners. Waiting for the reload that shows
+// the expected state removes the ambiguity.
+func observeReloads(t *testing.T, mrs *MutableRuleSet, domains ...string) <-chan reloadState {
+	t.Helper()
+	reloads := make(chan reloadState, 64)
+	cb := mrs.ruleset.RegisterCallback(func(rs adapter.RuleSet) {
+		state := make(reloadState, len(domains))
+		for _, d := range domains {
+			state[d] = rs.Match(&adapter.InboundContext{Domain: d})
+		}
+		select {
+		case reloads <- state:
+		default:
+			t.Error("reload observations not consumed")
+		}
+	})
+	t.Cleanup(func() { mrs.ruleset.UnregisterCallback(cb) })
+	return reloads
+}
+
+// awaitReload consumes reload observations until one satisfies want. Every caller has just
+// written the rule file, so at least one reload is guaranteed to arrive.
+func awaitReload(t *testing.T, reloads <-chan reloadState, want func(reloadState) bool) {
+	t.Helper()
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case state := <-reloads:
+			if want(state) {
+				return
+			}
+		case <-timeout:
+			t.Fatal("rule set never reloaded into the expected state")
+		}
 	}
 }
 
@@ -137,8 +188,7 @@ func testMatch(
 	t *testing.T,
 	instance *sbox.Box,
 	mrs *MutableRuleSet,
-	alter func(*MutableRuleSet, chan struct{}) *adapter.InboundContext,
-	reloaded chan struct{},
+	alter func(*testing.T, *MutableRuleSet) *adapter.InboundContext,
 	inboundCtx *adapter.InboundContext,
 	matchAltered bool,
 ) {
@@ -150,7 +200,7 @@ func testMatch(
 	ruleOriginal := rules[0].String()
 	rsOriginal := mrs.ruleset.String()
 
-	alterInboundCtx := alter(mrs, reloaded)
+	alterInboundCtx := alter(t, mrs)
 	router = instance.Router()
 	rules = router.Rules()
 	require.Len(t, rules, 1, "rules not loaded")
