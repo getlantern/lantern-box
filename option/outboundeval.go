@@ -3,11 +3,11 @@ package option
 import "github.com/sagernet/sing/common/json/badoption"
 
 // OutboundEvalServiceOptions configures the outboundeval service. The three
-// endpoint URLs, CountryCode and OutboundTag are required; every other zero
-// value falls back to the default documented on the field.
+// endpoint URLs and OutboundTag are required; every other zero value falls
+// back to the default documented on the field.
 type OutboundEvalServiceOptions struct {
 	// AcquireURL, AttestURL and SubmitURL are the control API endpoints, each a
-	// complete URL. HTTPS is required unless the host is a loopback address.
+	// complete URL.
 	AcquireURL string `json:"acquire_url"`
 	AttestURL  string `json:"attest_url"`
 	SubmitURL  string `json:"submit_url"`
@@ -17,7 +17,8 @@ type OutboundEvalServiceOptions struct {
 	// embedder that mints tokens at runtime may leave it unset.
 	Token string `json:"token,omitempty"`
 
-	// CountryCode is the ISO-3166 alpha-2 market under evaluation.
+	// CountryCode is the market under evaluation, which the server expects as
+	// an ISO-3166 alpha-2 code.
 	CountryCode string `json:"country_code"`
 
 	// OutboundTag is the outbound measured as the candidate arm. It is resolved
@@ -44,6 +45,11 @@ type OutboundEvalServiceOptions struct {
 	// MaxRetryBackoff caps the backoff applied to retryable control
 	// API failures. Default 10m.
 	MaxRetryBackoff badoption.Duration `json:"max_retry_backoff,omitempty"`
+
+	// NTPServer is queried for the time an assignment's expiry and observations
+	// are judged against. Ignored when the box already runs a time service.
+	// Default time.apple.com:123.
+	NTPServer string `json:"ntp_server,omitempty"`
 
 	// RequestTimeout bounds each individual HTTP request the service makes.
 	// Default 30s.

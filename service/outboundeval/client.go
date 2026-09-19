@@ -14,8 +14,14 @@ import (
 
 	A "github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/common/ntp"
+
+	"github.com/getlantern/lantern-box/option"
 )
+
+// successStatus reports whether a status code is a 2xx.
+func successStatus(code int) bool {
+	return code >= http.StatusOK && code < http.StatusMultipleChoices
+}
 
 // ErrNoAssignment means the server has nothing for this runner to measure at
 // the moment. It is the steady state of a fleet with no evaluation running, not
@@ -47,10 +53,18 @@ func (e apiError) retryable() bool {
 // the measurement to.
 type apiClient struct {
 	http           *http.Client
+	acquireURL     string
+	attestURL      string
+	submitURL      string
 	requestTimeout time.Duration
 }
 
-func newAPIClient(ctx context.Context, out A.Outbound, requestTimeout time.Duration) *apiClient {
+func newAPIClient(
+	ctx context.Context,
+	out A.Outbound,
+	now func() time.Time,
+	options option.OutboundEvalServiceOptions,
+) *apiClient {
 	return &apiClient{
 		http: &http.Client{
 			Transport: &http.Transport{
@@ -58,15 +72,21 @@ func newAPIClient(ctx context.Context, out A.Outbound, requestTimeout time.Durat
 					return out.DialContext(ctx, network, M.ParseSocksaddr(address))
 				},
 				TLSClientConfig: &tls.Config{
-					Time:    ntp.TimeFuncFromContext(ctx),
+					Time:    now,
 					RootCAs: A.RootPoolFromContext(ctx),
 				},
+				// Cycles are minutes apart, so a connection idle for longer is
+				// not worth parking through the control outbound.
+				IdleConnTimeout: 90 * time.Second,
 			},
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		},
-		requestTimeout: requestTimeout,
+		acquireURL:     options.AcquireURL,
+		attestURL:      options.AttestURL,
+		submitURL:      options.SubmitURL,
+		requestTimeout: time.Duration(options.RequestTimeout),
 	}
 }
 
@@ -76,9 +96,9 @@ func (c *apiClient) close() {
 
 // acquire asks for one assignment, returning ErrNoAssignment when the server
 // has nothing to measure.
-func (c *apiClient) acquire(ctx context.Context, endpoint, token string, request AssignmentRequest) (Assignment, error) {
+func (c *apiClient) acquire(ctx context.Context, token string, request AssignmentRequest) (Assignment, error) {
 	var assignment Assignment
-	err := c.post(ctx, endpoint, token, request, &assignment)
+	err := c.post(ctx, c.acquireURL, token, request, &assignment)
 	var status apiError
 	if errors.As(err, &status) && status.status == http.StatusServiceUnavailable {
 		return Assignment{}, ErrNoAssignment
@@ -91,21 +111,18 @@ func (c *apiClient) acquire(ctx context.Context, endpoint, token string, request
 
 // attest exchanges one window's challenge for an attestation token. It carries
 // no bearer credential: the challenge is the authorization.
-func (c *apiClient) attest(ctx context.Context, endpoint string, request AttestationRequest) (Attestation, error) {
+func (c *apiClient) attest(ctx context.Context, request AttestationRequest) (Attestation, error) {
 	var attestation Attestation
-	if err := c.post(ctx, endpoint, "", request, &attestation); err != nil {
+	if err := c.post(ctx, c.attestURL, "", request, &attestation); err != nil {
 		return Attestation{}, fmt.Errorf("attest window: %w", err)
-	}
-	if err := boundedIdentifier("attestation token", attestation.Token, maxTokenBytes); err != nil {
-		return Attestation{}, err
 	}
 	return attestation, nil
 }
 
 // submit delivers one report, authorized by the report token it carries. A
 // conflict means the server already holds this report, which is success.
-func (c *apiClient) submit(ctx context.Context, endpoint string, report Report) error {
-	err := c.post(ctx, endpoint, "", report, nil)
+func (c *apiClient) submit(ctx context.Context, report Report) error {
+	err := c.post(ctx, c.submitURL, "", report, nil)
 	var status apiError
 	if errors.As(err, &status) && status.status == http.StatusConflict {
 		return nil
@@ -136,7 +153,7 @@ func (c *apiClient) post(ctx context.Context, endpoint, token string, request, r
 		return fmt.Errorf("post: %w", err)
 	}
 	defer httpResponse.Body.Close()
-	if httpResponse.StatusCode < http.StatusOK || httpResponse.StatusCode >= http.StatusMultipleChoices {
+	if !successStatus(httpResponse.StatusCode) {
 		// Draining leaves the connection reusable for the retry.
 		_, _ = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, maxControlResponseBytes))
 		return apiError{status: httpResponse.StatusCode}

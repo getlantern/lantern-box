@@ -1,91 +1,91 @@
 {
-  "assignment_id": "01JB8Q2P9K3V4W5X6Y7Z8A9B0C",
   "report_token": "5vJt0nQf3kZ2xH9cR1bW7yT4",
   "idempotency_key": "01JB8Q2P9K3V4W5X6Y7Z8A9B0C",
-  "observed_at": "2026-09-17T12:03:20Z",
   "windows": [
     {
       "exit_index": 0,
       "window_index": 0,
-      "attestation_token": "Yk3pQ1sZ9dRt6vWx2mB8nC4hJ7fL0gTa",
       "candidate_attempts": [
         {
           "reachable": true,
           "http_status": 200,
-          "time_to_headers_ms": 412,
-          "elapsed_ms": 883,
-          "bytes_read": 1048576,
-          "throughput_bytes_per_second": 2226150.4
+          "throughput_bytes_per_second": 2226150,
+          "latency_ms": 412.37,
+          "elapsed_milliseconds": 883,
+          "bytes_transferred": 1048576
         },
         {
           "reachable": true,
           "http_status": 200,
-          "time_to_headers_ms": 388,
-          "elapsed_ms": 795,
-          "bytes_read": 1048576,
-          "throughput_bytes_per_second": 2574506.1
+          "throughput_bytes_per_second": 2574506,
+          "latency_ms": 388,
+          "elapsed_milliseconds": 795,
+          "bytes_transferred": 1048576
         }
       ],
       "control_attempts": [
         {
           "reachable": false,
-          "time_to_headers_ms": 0,
-          "elapsed_ms": 10004,
-          "bytes_read": 0,
           "throughput_bytes_per_second": 0,
-          "failure_code": "timeout"
+          "failure_code": "timeout",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 10004,
+          "bytes_transferred": 0
         },
         {
           "reachable": false,
-          "time_to_headers_ms": 0,
-          "elapsed_ms": 61,
-          "bytes_read": 0,
           "throughput_bytes_per_second": 0,
-          "failure_code": "connection_reset"
+          "failure_code": "connection_reset",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 61,
+          "bytes_transferred": 0
         }
-      ]
+      ],
+      "exit_attestation_token": "Yk3pQ1sZ9dRt6vWx2mB8nC4hJ7fL0gTa",
+      "observed_at": "2026-09-17T12:03:20Z"
     },
     {
       "exit_index": 0,
       "window_index": 1,
-      "attestation_token": "Tb8mN2xW5qZ1cV7hK4jR9dY3gL6pS0fA",
       "candidate_attempts": [
         {
           "reachable": true,
           "http_status": 200,
-          "time_to_headers_ms": 455,
-          "elapsed_ms": 1021,
-          "bytes_read": 1048576,
-          "throughput_bytes_per_second": 1852337.9
+          "throughput_bytes_per_second": 1852337,
+          "latency_ms": 455,
+          "elapsed_milliseconds": 1021,
+          "bytes_transferred": 1048576
         },
         {
           "reachable": false,
           "http_status": 403,
-          "time_to_headers_ms": 302,
-          "elapsed_ms": 318,
-          "bytes_read": 512,
           "throughput_bytes_per_second": 32000,
-          "failure_code": "http_status"
+          "failure_code": "http_status",
+          "latency_ms": 302,
+          "elapsed_milliseconds": 318,
+          "bytes_transferred": 512
         }
       ],
       "control_attempts": [
         {
           "reachable": false,
-          "time_to_headers_ms": 0,
-          "elapsed_ms": 9998,
-          "bytes_read": 0,
           "throughput_bytes_per_second": 0,
-          "failure_code": "timeout"
+          "failure_code": "timeout",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 9998,
+          "bytes_transferred": 0
         },
         {
           "reachable": false,
-          "time_to_headers_ms": 0,
-          "elapsed_ms": 10001,
-          "bytes_read": 0,
           "throughput_bytes_per_second": 0,
-          "failure_code": "timeout"
+          "failure_code": "timeout",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 10001,
+          "bytes_transferred": 0
         }
-      ]
+      ],
+      "exit_attestation_token": "Tb8mN2xW5qZ1cV7hK4jR9dY3gL6pS0fA",
+      "observed_at": "2026-09-17T12:03:20Z"
     }
   ]
 }

@@ -2,7 +2,6 @@ package outboundeval
 
 import (
 	"context"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,7 +10,7 @@ import (
 
 	A "github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
-	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,20 +18,6 @@ import (
 	lbA "github.com/getlantern/lantern-box/adapter"
 	"github.com/getlantern/lantern-box/option"
 )
-
-// dialOutbound stands in for one arm, connecting to a fixed test address
-// whatever destination it is handed.
-type dialOutbound struct {
-	A.Outbound
-	tag     string
-	address string
-}
-
-func (o *dialOutbound) Tag() string { return o.tag }
-
-func (o *dialOutbound) DialContext(ctx context.Context, network string, _ M.Socksaddr) (net.Conn, error) {
-	return (&net.Dialer{}).DialContext(ctx, network, o.address)
-}
 
 type stubOutboundManager struct {
 	A.OutboundManager
@@ -52,7 +37,7 @@ func contextWithOutbounds(outbounds map[string]A.Outbound) context.Context {
 
 // wiredService is a service pointed at a stub control API, wired as Start would
 // wire it but without the cycle loop running.
-func wiredService(t *testing.T, handler http.HandlerFunc) (*Service, *httptest.Server) {
+func wiredService(t *testing.T, handler http.HandlerFunc) *Service {
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
@@ -62,20 +47,21 @@ func wiredService(t *testing.T, handler http.HandlerFunc) (*Service, *httptest.S
 	options.AttestURL = server.URL + "/attestations"
 	options.SubmitURL = server.URL + "/reports"
 
-	control := &dialOutbound{tag: "direct", address: server.Listener.Addr().String()}
-	candidate := &dialOutbound{tag: "candidate", address: server.Listener.Addr().String()}
+	control := &stubOutbound{tag: "direct", address: server.Listener.Addr().String()}
+	candidate := &stubOutbound{tag: "candidate", address: server.Listener.Addr().String()}
 	ctx := contextWithOutbounds(map[string]A.Outbound{"direct": control, "candidate": candidate})
 
 	created, err := NewService(ctx, log.NewNOPFactory().Logger(), "eval", options)
 	require.NoError(t, err)
 	s := created.(*Service)
 	s.retryDelay = time.Millisecond
+	s.timeService = liveTime{}
 	s.outbounds = service.FromContext[A.OutboundManager](ctx)
 	s.control = control
-	s.api = newAPIClient(ctx, control, time.Duration(s.options.RequestTimeout))
+	s.api = newAPIClient(ctx, control, time.Now, s.options)
 	s.attest = s.api.attest
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
-	return s, server
+	return s
 }
 
 func TestNewServiceAppliesDefaults(t *testing.T) {
@@ -97,20 +83,7 @@ func TestNewServiceRejectsUnusableOptions(t *testing.T) {
 		"no acquire url": func(o *option.OutboundEvalServiceOptions) { o.AcquireURL = "" },
 		"no attest url":  func(o *option.OutboundEvalServiceOptions) { o.AttestURL = "" },
 		"no submit url":  func(o *option.OutboundEvalServiceOptions) { o.SubmitURL = "" },
-		"plaintext to the world": func(o *option.OutboundEvalServiceOptions) {
-			o.AcquireURL = "http://control.example/assignments"
-		},
-		"unsupported scheme": func(o *option.OutboundEvalServiceOptions) {
-			o.SubmitURL = "ftp://control.example/reports"
-		},
-		"url with credentials": func(o *option.OutboundEvalServiceOptions) {
-			o.AttestURL = "https://user:pw@control.example/attestations"
-		},
-		"relative url":    func(o *option.OutboundEvalServiceOptions) { o.AcquireURL = "/assignments" },
-		"no country":      func(o *option.OutboundEvalServiceOptions) { o.CountryCode = "" },
-		"long country":    func(o *option.OutboundEvalServiceOptions) { o.CountryCode = "RUS" },
-		"numeric country": func(o *option.OutboundEvalServiceOptions) { o.CountryCode = "R1" },
-		"no outbound":     func(o *option.OutboundEvalServiceOptions) { o.OutboundTag = "" },
+		"no outbound":    func(o *option.OutboundEvalServiceOptions) { o.OutboundTag = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			options := testOptions()
@@ -121,11 +94,20 @@ func TestNewServiceRejectsUnusableOptions(t *testing.T) {
 	}
 }
 
-func TestNewServiceAcceptsAPlaintextLoopbackAPI(t *testing.T) {
-	options := testOptions()
-	options.AcquireURL = "http://localhost:8080/assignments"
-	_, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "eval", options)
-	assert.NoError(t, err)
+// A box that keeps its own clock is the one this service reads, rather than
+// starting a second time service beside it.
+func TestStartUsesTheBoxsTimeService(t *testing.T) {
+	pinned := time.Now().UTC().Add(4 * time.Hour)
+	ctx := service.ContextWith[ntp.TimeService](contextWithOutbounds(map[string]A.Outbound{
+		"direct": &stubOutbound{tag: "direct"}, "candidate": &stubOutbound{tag: "candidate"},
+	}), fixedTime{at: pinned})
+	created, err := NewService(ctx, log.NewNOPFactory().Logger(), "eval", testOptions())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, created.Close()) })
+
+	require.NoError(t, created.Start(A.StartStateStart))
+
+	assert.Equal(t, pinned, created.(*Service).timeService.TimeFunc()())
 }
 
 func TestStartRequiresBothArms(t *testing.T) {
@@ -155,7 +137,7 @@ func TestStartWithoutAnOutboundManager(t *testing.T) {
 
 func TestStartMeasuresNothingBeforeItsStage(t *testing.T) {
 	requests := 0
-	s, _ := wiredService(t, func(http.ResponseWriter, *http.Request) { requests++ })
+	s := wiredService(t, func(http.ResponseWriter, *http.Request) { requests++ })
 
 	for _, stage := range []A.StartStage{A.StartStateInitialize, A.StartStatePostStart, A.StartStateStarted} {
 		require.NoError(t, s.Start(stage))
@@ -201,20 +183,12 @@ func TestSetOutboundEvalConfigAcceptsNoCredentialYet(t *testing.T) {
 	assert.Empty(t, s.config.Load().Token)
 }
 
-func TestSetOutboundEvalConfigRejectsAnUnusableConfig(t *testing.T) {
+func TestSetOutboundEvalConfigRejectsAConfigWithoutAnOutbound(t *testing.T) {
 	s := newTestService(t, testOptions())
 	before := *s.config.Load()
 
-	for name, config := range map[string]lbA.OutboundEvalConfig{
-		"no country":   {Token: "t", OutboundTag: "candidate"},
-		"long country": {Token: "t", CountryCode: "RUS", OutboundTag: "candidate"},
-		"no outbound":  {Token: "t", CountryCode: "RU"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			assert.Error(t, s.SetOutboundEvalConfig(config))
-			assert.Equal(t, before, *s.config.Load())
-		})
-	}
+	assert.Error(t, s.SetOutboundEvalConfig(lbA.OutboundEvalConfig{Token: "t", CountryCode: "RU"}))
+	assert.Equal(t, before, *s.config.Load(), "a rejected configuration leaves the running one alone")
 }
 
 func TestSetOutboundEvalConfigWakesAWaitingCycle(t *testing.T) {

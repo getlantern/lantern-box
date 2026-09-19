@@ -74,7 +74,7 @@ func (s *Service) runCycle(ctx context.Context) error {
 		return fmt.Errorf("%w: %q", errOutboundUnavailable, config.OutboundTag)
 	}
 
-	assignment, err := s.api.acquire(ctx, s.options.AcquireURL, config.Token, AssignmentRequest{
+	assignment, err := s.api.acquire(ctx, config.Token, AssignmentRequest{
 		CountryCode: config.CountryCode,
 		ExitCount:   clientExitCount,
 	})
@@ -82,23 +82,14 @@ func (s *Service) runCycle(ctx context.Context) error {
 		return err
 	}
 
-	if assignment.ServerTime.IsZero() {
-		return fmt.Errorf("%w: assignment carries no server time", ErrInvalidContract)
-	}
-	clock := newServerClock(assignment.ServerTime)
-	serverNow := clock.now()
-	if err := assignment.validate(serverNow, s.limits); err != nil {
+	now := s.timeService.TimeFunc()().UTC()
+	if err := assignment.validate(now, s.limits); err != nil {
 		return fmt.Errorf("validate assignment: %w", err)
 	}
 
-	// The grid is bounded by the assignment's own lifetime, measured against
-	// the server's clock so a skewed device does not measure past the expiry.
-	gridCtx, cancel := context.WithTimeout(ctx, assignment.ExpiresAt.Sub(serverNow))
+	gridCtx, cancel := context.WithTimeout(ctx, assignment.ExpiresAt.Sub(now))
 	defer cancel()
-	report := s.runAssignment(gridCtx, &cycle{candidate: candidate, control: s.control, clock: clock}, assignment)
-	if err := report.validate(assignment.Sample); err != nil {
-		return fmt.Errorf("validate report: %w", err)
-	}
+	report := s.runAssignment(gridCtx, candidate, assignment)
 	return s.submitReport(ctx, report)
 }
 
@@ -111,7 +102,7 @@ func (s *Service) submitReport(ctx context.Context, report Report) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err = s.api.submit(ctx, s.options.SubmitURL, report)
+		err = s.api.submit(ctx, report)
 		if !retryableCycleError(err) {
 			return err
 		}

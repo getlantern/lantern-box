@@ -29,7 +29,6 @@ func TestClassifyFailure(t *testing.T) {
 		err  error
 		want string
 	}{
-		"no failure":       {err: nil, want: ""},
 		"refused dial":     {err: fmt.Errorf("%w: %w", probe.ErrDial, syscall.ECONNREFUSED), want: failureDial},
 		"unreachable dial": {err: fmt.Errorf("%w: %w", probe.ErrDial, syscall.EHOSTUNREACH), want: failureDial},
 		"cancelled":        {err: fmt.Errorf("%w: %w", probe.ErrRequest, context.Canceled), want: failureCanceled},
@@ -87,16 +86,4 @@ func TestClassifyFailureOnARealHandshakeAgainstAPlaintextPeer(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Equal(t, failureTLSHandshake, classifyFailure(fmt.Errorf("%w: %w", probe.ErrRequest, err)))
-}
-
-// Every code a measurement can carry has to satisfy the contract the report is
-// validated against.
-func TestFailureCodesAreReportable(t *testing.T) {
-	for _, code := range []string{
-		failureDial, failureTLSHandshake, failureTimeout, failureConnectionReset,
-		failureRead, failureInvalidResponse, failureHTTPStatus, failureCanceled,
-		failureAttestation, failureAttestationRejected, failureWindowDeadline,
-	} {
-		assert.NoError(t, Attempt{FailureCode: code}.validate(), code)
-	}
 }

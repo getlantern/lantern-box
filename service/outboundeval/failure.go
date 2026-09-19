@@ -40,8 +40,6 @@ const (
 // rejection during a request says more than "the request failed".
 func classifyFailure(err error) string {
 	switch {
-	case err == nil:
-		return ""
 	case errors.Is(err, context.Canceled):
 		return failureCanceled
 	case errors.Is(err, context.DeadlineExceeded):

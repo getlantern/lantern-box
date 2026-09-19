@@ -9,8 +9,8 @@ package outboundeval
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,8 +18,12 @@ import (
 
 	A "github.com/sagernet/sing-box/adapter"
 	boxService "github.com/sagernet/sing-box/adapter/service"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
+	O "github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
+	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/service"
 
 	lbA "github.com/getlantern/lantern-box/adapter"
@@ -75,6 +79,9 @@ type Service struct {
 	outbounds A.OutboundManager
 	control   A.Outbound
 	api       *apiClient
+	// timeService keeps the clock a report is judged and stamped against. Start
+	// resolves it before anything reads it.
+	timeService ntp.TimeService
 
 	// retryDelay is the gap between the bounded retries inside one cycle, and
 	// retryBase the base wait for a retried cycle; both are shortened in tests.
@@ -84,7 +91,7 @@ type Service struct {
 	// measure and attest are the network-facing steps, replaced in tests that
 	// exercise grid assembly without a network.
 	measure func(ctx context.Context, out A.Outbound, target string) Attempt
-	attest  func(ctx context.Context, endpoint string, request AttestationRequest) (Attestation, error)
+	attest  func(ctx context.Context, request AttestationRequest) (Attestation, error)
 }
 
 var (
@@ -128,10 +135,7 @@ func NewService(
 		CountryCode: strings.ToUpper(options.CountryCode),
 		OutboundTag: options.OutboundTag,
 	})
-	s.measure = func(ctx context.Context, out A.Outbound, target string) Attempt {
-		return measureAttempt(ctx, out, target,
-			time.Duration(options.RequestTimeout), options.MaxResponseBytes)
-	}
+	s.measure = s.measureOnce
 	return s, nil
 }
 
@@ -141,21 +145,46 @@ func (s *Service) Start(stage A.StartStage) error {
 	}
 	outbounds := service.FromContext[A.OutboundManager](s.ctx)
 	if outbounds == nil {
-		return fmt.Errorf("outbound evaluation: no outbound manager in context")
+		return errors.New("no outbound manager in context")
 	}
 	control, found := outbounds.Outbound(s.options.ControlOutboundTag)
 	if !found {
-		return fmt.Errorf("outbound evaluation: control outbound %q is not declared in this config",
+		return fmt.Errorf("control outbound %q is not declared in this config",
 			s.options.ControlOutboundTag)
 	}
 	candidateTag := s.config.Load().OutboundTag
 	if _, found := outbounds.Outbound(candidateTag); !found {
-		return fmt.Errorf("outbound evaluation: outbound under test %q is not declared in this config",
+		return fmt.Errorf("outbound under test %q is not declared in this config",
 			candidateTag)
+	}
+	if timeService := service.FromContext[ntp.TimeService](s.ctx); timeService != nil {
+		s.timeService = timeService
+	} else {
+		// Cloning the registry keeps this clock off the box's own, where
+		// autoselect and urltest would judge TLS validity against it.
+		s.ctx = service.ExtendContext(s.ctx)
+		server := M.ParseSocksaddr(s.options.NTPServer)
+		ntpDialer, err := dialer.New(s.ctx, O.DialerOptions{}, server.IsDomain())
+		if err != nil {
+			return fmt.Errorf("build ntp dialer: %w", err)
+		}
+		ntpService := ntp.NewService(ntp.Options{
+			Context: s.ctx,
+			Dialer:  ntpDialer,
+			Logger:  s.logger,
+			Server:  server,
+		})
+		if err := ntpService.Start(); err != nil {
+			return fmt.Errorf("start time service: %w", err)
+		}
+		// probe.Measure resolves its TLS clock from the context rather than
+		// from this service, so the measurement arms need it registered too.
+		service.MustRegister[ntp.TimeService](s.ctx, ntpService)
+		s.timeService = ntpService
 	}
 	s.outbounds = outbounds
 	s.control = control
-	s.api = newAPIClient(s.ctx, control, time.Duration(s.options.RequestTimeout))
+	s.api = newAPIClient(s.ctx, control, s.timeService.TimeFunc(), s.options)
 	s.attest = s.api.attest
 	s.started.Store(true)
 	go s.run()
@@ -182,12 +211,8 @@ func (s *Service) Close() error {
 // SetOutboundEvalConfig implements adapter.OutboundEvalConfigSetter. It rejects
 // a configuration it cannot act on, leaving the running one untouched.
 func (s *Service) SetOutboundEvalConfig(config lbA.OutboundEvalConfig) error {
-	if !validCountryCode(config.CountryCode) {
-		return fmt.Errorf("outbound evaluation: country code %q is not a two-letter code",
-			config.CountryCode)
-	}
 	if config.OutboundTag == "" {
-		return fmt.Errorf("outbound evaluation: outbound under test is required")
+		return errors.New("outbound evaluation: outbound under test is required")
 	}
 	config.CountryCode = strings.ToUpper(config.CountryCode)
 	s.config.Store(&config)
@@ -230,62 +255,17 @@ func withDefaults(options option.OutboundEvalServiceOptions) option.OutboundEval
 }
 
 func validateOptions(options option.OutboundEvalServiceOptions) error {
-	for _, endpoint := range []struct {
-		name  string
-		value string
-	}{
-		{name: "acquire_url", value: options.AcquireURL},
-		{name: "attest_url", value: options.AttestURL},
-		{name: "submit_url", value: options.SubmitURL},
-	} {
-		if err := validateEndpoint(endpoint.name, endpoint.value); err != nil {
-			return err
-		}
+	if options.AcquireURL == "" {
+		return errors.New("acquire_url is required")
 	}
-	if !validCountryCode(options.CountryCode) {
-		return fmt.Errorf("outbound evaluation: country_code %q is not a two-letter code",
-			options.CountryCode)
+	if options.AttestURL == "" {
+		return errors.New("attest_url is required")
+	}
+	if options.SubmitURL == "" {
+		return errors.New("submit_url is required")
 	}
 	if options.OutboundTag == "" {
-		return fmt.Errorf("outbound evaluation: outbound_tag is required")
+		return errors.New("outbound_tag is required")
 	}
 	return nil
-}
-
-// validateEndpoint requires HTTPS unless the endpoint is loopback, which is the
-// only case where a plaintext control API is a local test rather than a leak.
-func validateEndpoint(name, endpoint string) error {
-	if endpoint == "" {
-		return fmt.Errorf("outbound evaluation: %s is required", name)
-	}
-	parsed, err := parseBoundedURL(endpoint, maxURLBytes)
-	if err != nil {
-		return fmt.Errorf("outbound evaluation: %s %w", name, err)
-	}
-	if parsed.Scheme == "https" {
-		return nil
-	}
-	if parsed.Scheme != "http" {
-		return fmt.Errorf("outbound evaluation: %s must use http or https", name)
-	}
-	hostname := parsed.Hostname()
-	if strings.EqualFold(hostname, "localhost") {
-		return nil
-	}
-	if ip := net.ParseIP(hostname); ip != nil && ip.IsLoopback() {
-		return nil
-	}
-	return fmt.Errorf("outbound evaluation: %s must use https unless its host is loopback", name)
-}
-
-func validCountryCode(country string) bool {
-	if len(country) != 2 {
-		return false
-	}
-	for _, character := range strings.ToUpper(country) {
-		if character < 'A' || character > 'Z' {
-			return false
-		}
-	}
-	return true
 }

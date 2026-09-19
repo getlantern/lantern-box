@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -19,12 +20,57 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sagernet/sing/common/ntp"
+
 	box "github.com/getlantern/lantern-box"
 	lbA "github.com/getlantern/lantern-box/adapter"
 	"github.com/getlantern/lantern-box/constant"
 	lboption "github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/service/outboundeval"
 )
+
+// localTime stands in for the box's NTP service, so starting a box in a test
+// queries no time server.
+type localTime struct{}
+
+func (localTime) TimeFunc() func() time.Time { return time.Now }
+
+func evalBoxContext() context.Context {
+	ctx := box.BaseContext()
+	service.MustRegister[ntp.TimeService](ctx, localTime{})
+	return ctx
+}
+
+// bothArms are the outbounds a complete cycle needs: sing-box declares no
+// implicit direct outbound for a config that names any of its own.
+func bothArms() []option.Outbound {
+	return []option.Outbound{
+		{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}},
+		{Type: C.TypeDirect, Tag: "candidate", Options: &option.DirectOutboundOptions{}},
+	}
+}
+
+// evalBoxOptions is a box running nothing but the evaluation service, pointed
+// at a control API on baseURL.
+func evalBoxOptions(baseURL, token string, outbounds []option.Outbound) option.Options {
+	return option.Options{
+		Log:       &option.LogOptions{Disabled: true},
+		Outbounds: outbounds,
+		Services: []option.Service{{
+			Type: constant.TypeOutboundEval,
+			Tag:  "eval",
+			Options: &lboption.OutboundEvalServiceOptions{
+				AcquireURL:   baseURL + "/assignments",
+				AttestURL:    baseURL + "/attestations",
+				SubmitURL:    baseURL + "/reports",
+				Token:        token,
+				CountryCode:  "RU",
+				OutboundTag:  "candidate",
+				PollInterval: badoption.Duration(10 * time.Millisecond),
+			},
+		}},
+	}
+}
 
 // controlAPI stands in for the evaluation control plane: it hands out one
 // assignment, attests every window, and captures the report.
@@ -53,8 +99,7 @@ func (c *controlAPI) assignment() outboundeval.Assignment {
 			{WindowIndex: 0, Challenge: "challenge-0"},
 			{WindowIndex: 1, Challenge: "challenge-1"},
 		},
-		ExpiresAt:  now.Add(10 * time.Minute),
-		ServerTime: now,
+		ExpiresAt: now.Add(10 * time.Minute),
 	}
 }
 
@@ -78,8 +123,7 @@ func (c *controlAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.challenges = append(c.challenges, request.Challenge)
 		c.mu.Unlock()
 		if err := json.NewEncoder(w).Encode(outboundeval.Attestation{
-			Token:      "attested-" + request.Challenge,
-			ServerTime: time.Now().UTC(),
+			Token: "attested-" + request.Challenge,
 		}); err != nil {
 			c.t.Errorf("encode attestation: %v", err)
 		}
@@ -110,29 +154,11 @@ func TestOutboundEvalRunsInsideABox(t *testing.T) {
 	server := httptest.NewServer(api)
 	t.Cleanup(server.Close)
 
-	boxCtx := box.BaseContext()
-	options := option.Options{
-		Log: &option.LogOptions{Disabled: true},
-		Outbounds: []option.Outbound{
-			{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}},
-			{Type: C.TypeDirect, Tag: "candidate", Options: &option.DirectOutboundOptions{}},
-		},
-		Services: []option.Service{{
-			Type: constant.TypeOutboundEval,
-			Tag:  "eval",
-			Options: &lboption.OutboundEvalServiceOptions{
-				AcquireURL:   server.URL + "/assignments",
-				AttestURL:    server.URL + "/attestations",
-				SubmitURL:    server.URL + "/reports",
-				Token:        "e2e-token",
-				CountryCode:  "RU",
-				OutboundTag:  "candidate",
-				PollInterval: badoption.Duration(10 * time.Millisecond),
-			},
-		}},
-	}
-
-	instance, err := sbox.New(sbox.Options{Context: boxCtx, Options: options})
+	boxCtx := evalBoxContext()
+	instance, err := sbox.New(sbox.Options{
+		Context: boxCtx,
+		Options: evalBoxOptions(server.URL, "e2e-token", bothArms()),
+	})
 	require.NoError(t, err, "the service type must be registered by box.BaseContext")
 
 	select {
@@ -155,8 +181,8 @@ func TestOutboundEvalRunsInsideABox(t *testing.T) {
 	assignment := api.assignment()
 	require.NotEmpty(t, api.reports)
 	report := api.reports[0]
-	assert.Equal(t, assignment.ID, report.AssignmentID)
 	assert.Equal(t, assignment.ReportToken, report.ReportToken)
+	assert.Equal(t, assignment.ID, report.IdempotencyKey)
 	require.Len(t, report.Windows, int(assignment.Sample.WindowsPerExit))
 	for _, window := range report.Windows {
 		assert.Len(t, window.CandidateAttempts, int(assignment.Sample.AttemptsPerWindow))
@@ -175,36 +201,30 @@ func TestOutboundEvalRunsInsideABox(t *testing.T) {
 // TestOutboundEvalRefusesAConfigWithoutItsArms proves the service names the
 // outbound it could not find rather than measuring nothing in silence.
 func TestOutboundEvalRefusesAConfigWithoutItsArms(t *testing.T) {
-	for name, outbounds := range map[string][]option.Outbound{
+	for name, test := range map[string]struct {
+		outbounds []option.Outbound
+		missing   string
+	}{
 		"no control outbound": {
-			{Type: C.TypeDirect, Tag: "candidate", Options: &option.DirectOutboundOptions{}},
+			outbounds: []option.Outbound{
+				{Type: C.TypeDirect, Tag: "candidate", Options: &option.DirectOutboundOptions{}},
+			},
+			missing: `"direct"`,
 		},
 		"no outbound under test": {
-			{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}},
+			outbounds: []option.Outbound{
+				{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}},
+			},
+			missing: `"candidate"`,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			instance, err := sbox.New(sbox.Options{
-				Context: box.BaseContext(),
-				Options: option.Options{
-					Log:       &option.LogOptions{Disabled: true},
-					Outbounds: outbounds,
-					Services: []option.Service{{
-						Type: constant.TypeOutboundEval,
-						Tag:  "eval",
-						Options: &lboption.OutboundEvalServiceOptions{
-							AcquireURL:  "https://control.invalid/assignments",
-							AttestURL:   "https://control.invalid/attestations",
-							SubmitURL:   "https://control.invalid/reports",
-							Token:       "token",
-							CountryCode: "RU",
-							OutboundTag: "candidate",
-						},
-					}},
-				},
+				Context: evalBoxContext(),
+				Options: evalBoxOptions("https://control.invalid", "token", test.outbounds),
 			})
 			require.NoError(t, err)
-			assert.ErrorContains(t, instance.Start(), "outbound evaluation")
+			assert.ErrorContains(t, instance.Start(), test.missing)
 			_ = instance.Close()
 		})
 	}
@@ -217,29 +237,10 @@ func TestOutboundEvalTokenRotatesThroughTheServiceManager(t *testing.T) {
 	server := httptest.NewServer(api)
 	t.Cleanup(server.Close)
 
-	boxCtx := box.BaseContext()
+	boxCtx := evalBoxContext()
 	instance, err := sbox.New(sbox.Options{
 		Context: boxCtx,
-		Options: option.Options{
-			Log: &option.LogOptions{Disabled: true},
-			Outbounds: []option.Outbound{
-				{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}},
-				{Type: C.TypeDirect, Tag: "candidate", Options: &option.DirectOutboundOptions{}},
-			},
-			Services: []option.Service{{
-				Type: constant.TypeOutboundEval,
-				Tag:  "eval",
-				Options: &lboption.OutboundEvalServiceOptions{
-					AcquireURL:   server.URL + "/assignments",
-					AttestURL:    server.URL + "/attestations",
-					SubmitURL:    server.URL + "/reports",
-					Token:        "first-token",
-					CountryCode:  "RU",
-					OutboundTag:  "candidate",
-					PollInterval: badoption.Duration(10 * time.Millisecond),
-				},
-			}},
-		},
+		Options: evalBoxOptions(server.URL, "first-token", bothArms()),
 	})
 	require.NoError(t, err)
 	require.NoError(t, instance.Start())

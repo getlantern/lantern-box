@@ -18,11 +18,23 @@ import (
 	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/getlantern/lantern-box/option"
 )
 
 // testRetryBase is the retry backoff's base wait and its cap both, which holds
 // every retry to [800ms, 1s]: the cap applies to the wait once jittered.
 const testRetryBase = time.Second
+
+// fixedTime and liveTime stand in for the box's time service, which Start
+// resolves and these tests wire by hand.
+type fixedTime struct{ at time.Time }
+
+func (f fixedTime) TimeFunc() func() time.Time { return func() time.Time { return f.at } }
+
+type liveTime struct{}
+
+func (liveTime) TimeFunc() func() time.Time { return time.Now }
 
 // controlAPI answers the acquire, attest and submit endpoints.
 type controlAPI struct {
@@ -61,10 +73,7 @@ func (c *controlAPI) handler(t *testing.T) http.HandlerFunc {
 		case strings.HasSuffix(r.URL.Path, "/attestations"):
 			var request AttestationRequest
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-			require.NoError(t, json.NewEncoder(w).Encode(Attestation{
-				Token:      fmt.Sprintf("attestation-%d", request.WindowIndex),
-				ServerTime: time.Now().UTC(),
-			}))
+			require.NoError(t, json.NewEncoder(w).Encode(Attestation{Token: "attested-" + request.Challenge}))
 		case strings.HasSuffix(r.URL.Path, "/reports"):
 			var report Report
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&report))
@@ -91,7 +100,7 @@ func reachableMeasure(context.Context, A.Outbound, string) Attempt {
 
 func TestRunCycleMeasuresAndSubmitsACompleteGrid(t *testing.T) {
 	api := newControlAPI()
-	s, _ := wiredService(t, api.handler(t))
+	s := wiredService(t, api.handler(t))
 	s.measure = reachableMeasure
 
 	assert.NoError(t, s.runCycle(context.Background()))
@@ -99,16 +108,84 @@ func TestRunCycleMeasuresAndSubmitsACompleteGrid(t *testing.T) {
 	reports := api.reports()
 	require.Len(t, reports, 1)
 	assignment := serverAssignment()
-	require.NoError(t, reports[0].validate(assignment.Sample))
-	assert.Equal(t, assignment.ID, reports[0].AssignmentID)
+	requireCompleteGrid(t, reports[0], assignment.Sample)
 	assert.Equal(t, assignment.ReportToken, reports[0].ReportToken)
-	assert.NotEmpty(t, reports[0].IdempotencyKey)
+	assert.Equal(t, assignment.ID, reports[0].IdempotencyKey, "the assignment identifies the report through its key")
+}
+
+func TestRunCycleRefusesAnExpiryTheBoxsClockRejects(t *testing.T) {
+	api := newControlAPI()
+	s := wiredService(t, api.handler(t))
+	s.timeService = fixedTime{at: time.Now().Add(time.Hour)}
+	s.measure = reachableMeasure
+
+	assert.ErrorIs(t, s.runCycle(context.Background()), ErrInvalidContract)
+	assert.Empty(t, api.reports())
+}
+
+// A window longer than the whole grid takes still measures every attempt: the
+// window's duration is a budget, not a wait.
+func TestRunCycleAcceptsAWindowLongerThanItNeeds(t *testing.T) {
+	api := newControlAPI()
+	api.assignment = func() Assignment {
+		assignment := serverAssignment()
+		assignment.Sample.WindowDurationSeconds = 120
+		return assignment
+	}
+	s := wiredService(t, api.handler(t))
+	s.measure = reachableMeasure
+
+	require.NoError(t, s.runCycle(context.Background()))
+
+	reports := api.reports()
+	require.Len(t, reports, 1)
+	requireCompleteGrid(t, reports[0], api.assignment().Sample)
+	for _, window := range reports[0].Windows {
+		for _, attempts := range [][]Attempt{window.CandidateAttempts, window.ControlAttempts} {
+			for _, attempt := range attempts {
+				assert.True(t, attempt.Reachable)
+			}
+		}
+	}
+}
+
+// The expiry the server stated is the whole budget: a grid that cannot finish
+// inside it stops there, reporting its unmeasured windows rather than running
+// past the moment its report token dies.
+func TestRunCycleMeasuresOnlyUntilTheAssignmentExpires(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		assignment := validAssignment()
+		assignment.ExpiresAt = time.Now().Add(time.Second)
+		assignment.Sample.WindowsPerExit = defaultMaxWindows
+		assignment.Sample.FreshSessionDelayMS = maxFreshSessionDelayMS
+		assignment.Challenges = make([]WindowChallenge, defaultMaxWindows)
+		for i := range assignment.Challenges {
+			assignment.Challenges[i] = WindowChallenge{WindowIndex: uint32(i), Challenge: "challenge"}
+		}
+		api := newControlAPI()
+		api.assignment = func() Assignment { return assignment }
+		s := wireRunner(t, testOptions(), api.handler(t))
+
+		start := time.Now()
+		require.NoError(t, s.runCycle(context.Background()))
+		assert.Equal(t, time.Second, time.Since(start))
+
+		reports := api.reports()
+		require.Len(t, reports, 1)
+		requireCompleteGrid(t, reports[0], assignment.Sample)
+		last := reports[0].Windows[len(reports[0].Windows)-1]
+		for _, attempts := range [][]Attempt{last.CandidateAttempts, last.ControlAttempts} {
+			for _, attempt := range attempts {
+				assert.Equal(t, failureWindowDeadline, attempt.FailureCode)
+			}
+		}
+	})
 }
 
 func TestRunCycleResubmitsAFinishedReport(t *testing.T) {
 	api := newControlAPI()
 	api.refuseSubmits = 1
-	s, _ := wiredService(t, api.handler(t))
+	s := wiredService(t, api.handler(t))
 	s.measure = reachableMeasure
 
 	assert.NoError(t, s.runCycle(context.Background()))
@@ -122,7 +199,7 @@ func TestRunCycleResubmitsAFinishedReport(t *testing.T) {
 func TestRunCycleGivesUpOnAReportAfterBoundedAttempts(t *testing.T) {
 	api := newControlAPI()
 	api.submitStatus = http.StatusServiceUnavailable
-	s, _ := wiredService(t, api.handler(t))
+	s := wiredService(t, api.handler(t))
 	s.measure = reachableMeasure
 
 	assert.ErrorIs(t, s.runCycle(context.Background()), apiError{status: http.StatusServiceUnavailable})
@@ -142,27 +219,10 @@ func TestRunCycleErrors(t *testing.T) {
 		"server trouble":     {acquireStatus: http.StatusInternalServerError, want: apiError{status: http.StatusInternalServerError}},
 		"rate limited":       {acquireStatus: http.StatusTooManyRequests, want: apiError{status: http.StatusTooManyRequests}},
 		"submit refused":     {submitStatus: http.StatusBadRequest, want: apiError{status: http.StatusBadRequest}},
-		"missing server time": {
-			assignment: func() Assignment {
-				assignment := serverAssignment()
-				assignment.ServerTime = time.Time{}
-				return assignment
-			},
-			want: ErrInvalidContract,
-		},
 		"assignment beyond local bounds": {
 			assignment: func() Assignment {
 				assignment := serverAssignment()
 				assignment.Sample.WindowsPerExit = defaultMaxWindows + 1
-				return assignment
-			},
-			want: ErrInvalidContract,
-		},
-		"grid longer than the assignment lives": {
-			assignment: func() Assignment {
-				assignment := serverAssignment()
-				assignment.ExpiresAt = assignment.ServerTime.Add(time.Minute)
-				assignment.Sample.WindowDurationSeconds = 120
 				return assignment
 			},
 			want: ErrInvalidContract,
@@ -175,7 +235,7 @@ func TestRunCycleErrors(t *testing.T) {
 			if test.assignment != nil {
 				api.assignment = test.assignment
 			}
-			s, _ := wiredService(t, api.handler(t))
+			s := wiredService(t, api.handler(t))
 			s.measure = reachableMeasure
 
 			assert.ErrorIs(t, s.runCycle(context.Background()), test.want)
@@ -185,7 +245,7 @@ func TestRunCycleErrors(t *testing.T) {
 
 func TestRunCycleWaitsForACredential(t *testing.T) {
 	api := newControlAPI()
-	s, _ := wiredService(t, api.handler(t))
+	s := wiredService(t, api.handler(t))
 	s.measure = reachableMeasure
 	idle := *s.config.Load()
 	idle.Token = ""
@@ -197,7 +257,7 @@ func TestRunCycleWaitsForACredential(t *testing.T) {
 
 func TestRunCycleSkipsAnOutboundThatWentAway(t *testing.T) {
 	api := newControlAPI()
-	s, _ := wiredService(t, api.handler(t))
+	s := wiredService(t, api.handler(t))
 	s.measure = reachableMeasure
 	replaced := *s.config.Load()
 	replaced.OutboundTag = "replacement"
@@ -212,7 +272,7 @@ func TestRunCycleSkipsAnOutboundThatWentAway(t *testing.T) {
 func TestRunCycleStopsWhenClosing(t *testing.T) {
 	api := newControlAPI()
 	api.acquireStatus = http.StatusInternalServerError
-	s, _ := wiredService(t, api.handler(t))
+	s := wiredService(t, api.handler(t))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -258,24 +318,34 @@ func (h handlerTransport) RoundTrip(request *http.Request) (*http.Response, erro
 	return response.Result(), nil
 }
 
+// wireRunner is a service wired as Start would wire it, answering the control
+// API in the goroutine that called it, without the cycle loop running.
+func wireRunner(t *testing.T, options option.OutboundEvalServiceOptions, handler http.HandlerFunc) *Service {
+	t.Helper()
+	s := newTestService(t, options)
+	s.outbounds = &stubOutboundManager{outbounds: map[string]A.Outbound{
+		"candidate": &stubOutbound{tag: "candidate"},
+	}}
+	s.api = &apiClient{
+		http:           &http.Client{Transport: handlerTransport{handler: handler}},
+		acquireURL:     s.options.AcquireURL,
+		attestURL:      s.options.AttestURL,
+		submitURL:      s.options.SubmitURL,
+		requestTimeout: time.Duration(s.options.RequestTimeout),
+	}
+	s.attest = s.api.attest
+	s.measure = reachableMeasure
+	return s
+}
+
 func startTestRunner(t *testing.T, handler http.HandlerFunc) *Service {
 	t.Helper()
 	options := testOptions()
 	options.PollInterval = badoption.Duration(10 * time.Second)
 	options.NoAssignmentInterval = badoption.Duration(3 * time.Second)
 	options.MaxRetryBackoff = badoption.Duration(testRetryBase)
-	s := newTestService(t, options)
+	s := wireRunner(t, options, handler)
 	s.retryBase = testRetryBase
-	s.control = &stubOutbound{tag: "direct"}
-	s.outbounds = &stubOutboundManager{outbounds: map[string]A.Outbound{
-		"candidate": &stubOutbound{tag: "candidate"},
-	}}
-	s.api = &apiClient{
-		http:           &http.Client{Transport: handlerTransport{handler: handler}},
-		requestTimeout: time.Duration(s.options.RequestTimeout),
-	}
-	s.attest = s.api.attest
-	s.measure = reachableMeasure
 	s.started.Store(true)
 	go s.run()
 	return s
@@ -293,7 +363,7 @@ func TestRunPollingIntervals(t *testing.T) {
 		"invalid": {
 			assignment: func() Assignment {
 				assignment := serverAssignment()
-				assignment.ServerTime = time.Time{}
+				assignment.Sample.WindowsPerExit = defaultMaxWindows + 1
 				return assignment
 			},
 			wait: 3 * time.Second,

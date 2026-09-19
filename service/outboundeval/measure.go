@@ -2,13 +2,19 @@ package outboundeval
 
 import (
 	"context"
-	"net/http"
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
 
 	"github.com/getlantern/lantern-box/internal/probe"
 )
+
+// measureOnce fetches target once through out, under the limits this service
+// was configured with.
+func (s *Service) measureOnce(ctx context.Context, out A.Outbound, target string) Attempt {
+	return measureAttempt(ctx, out, target,
+		time.Duration(s.options.RequestTimeout), s.options.MaxResponseBytes)
+}
 
 // measureAttempt fetches target once through out and records what happened. It
 // never retries: a retry would hide the failure the measurement exists to
@@ -27,14 +33,13 @@ func measureAttempt(
 	result, err := probe.Measure(ctx, out, target, timeout, maxBytes)
 	attempt := Attempt{
 		HTTPStatus:               result.HTTPStatus,
-		TimeToHeadersMS:          result.TimeToHeaders.Milliseconds(),
+		TimeToHeadersMS:          float64(result.TimeToHeaders) / float64(time.Millisecond),
 		ElapsedMS:                result.Elapsed.Milliseconds(),
 		BytesRead:                result.BytesRead,
-		ThroughputBytesPerSecond: result.ThroughputBytesPerSecond,
+		ThroughputBytesPerSecond: int64(result.ThroughputBytesPerSecond),
 	}
 	switch {
-	case result.HTTPStatus != 0 &&
-		(result.HTTPStatus < http.StatusOK || result.HTTPStatus >= http.StatusMultipleChoices):
+	case result.HTTPStatus != 0 && !successStatus(result.HTTPStatus):
 		attempt.FailureCode = failureHTTPStatus
 	case err != nil:
 		attempt.FailureCode = classifyFailure(err)
@@ -42,13 +47,4 @@ func measureAttempt(
 		attempt.Reachable = true
 	}
 	return attempt
-}
-
-// failedAttempts fills one arm of a window that was never measured.
-func failedAttempts(count int, code string) []Attempt {
-	attempts := make([]Attempt, count)
-	for i := range attempts {
-		attempts[i] = Attempt{FailureCode: code}
-	}
-	return attempts
 }

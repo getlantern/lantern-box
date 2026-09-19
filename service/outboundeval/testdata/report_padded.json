@@ -1,49 +1,48 @@
 {
-  "assignment_id": "01JB8Q2P9K3V4W5X6Y7Z8A9B0C",
   "report_token": "5vJt0nQf3kZ2xH9cR1bW7yT4",
   "idempotency_key": "01JB8Q2P9K3V4W5X6Y7Z8A9B0C",
-  "observed_at": "2026-09-17T12:02:51Z",
   "windows": [
     {
       "exit_index": 0,
       "window_index": 0,
-      "attestation_token": "Yk3pQ1sZ9dRt6vWx2mB8nC4hJ7fL0gTa",
       "candidate_attempts": [
         {
           "reachable": true,
           "http_status": 200,
-          "time_to_headers_ms": 401,
-          "elapsed_ms": 860,
-          "bytes_read": 1048576,
-          "throughput_bytes_per_second": 2286021.3
+          "throughput_bytes_per_second": 2286021,
+          "latency_ms": 401,
+          "elapsed_milliseconds": 860,
+          "bytes_transferred": 1048576
         },
         {
           "reachable": true,
           "http_status": 200,
-          "time_to_headers_ms": 377,
-          "elapsed_ms": 812,
-          "bytes_read": 1048576,
-          "throughput_bytes_per_second": 2410529.7
+          "throughput_bytes_per_second": 2410529,
+          "latency_ms": 377,
+          "elapsed_milliseconds": 812,
+          "bytes_transferred": 1048576
         }
       ],
       "control_attempts": [
         {
           "reachable": false,
-          "time_to_headers_ms": 0,
-          "elapsed_ms": 10002,
-          "bytes_read": 0,
           "throughput_bytes_per_second": 0,
-          "failure_code": "timeout"
+          "failure_code": "timeout",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 10002,
+          "bytes_transferred": 0
         },
         {
           "reachable": false,
-          "time_to_headers_ms": 0,
-          "elapsed_ms": 10000,
-          "bytes_read": 0,
           "throughput_bytes_per_second": 0,
-          "failure_code": "timeout"
+          "failure_code": "timeout",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 10000,
+          "bytes_transferred": 0
         }
-      ]
+      ],
+      "exit_attestation_token": "Yk3pQ1sZ9dRt6vWx2mB8nC4hJ7fL0gTa",
+      "observed_at": "2026-09-17T12:02:51Z"
     },
     {
       "exit_index": 0,
@@ -51,39 +50,40 @@
       "candidate_attempts": [
         {
           "reachable": false,
-          "time_to_headers_ms": 0,
-          "elapsed_ms": 0,
-          "bytes_read": 0,
           "throughput_bytes_per_second": 0,
-          "failure_code": "attestation_failed"
+          "failure_code": "attestation_failed",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 0,
+          "bytes_transferred": 0
         },
         {
           "reachable": false,
-          "time_to_headers_ms": 0,
-          "elapsed_ms": 0,
-          "bytes_read": 0,
           "throughput_bytes_per_second": 0,
-          "failure_code": "attestation_failed"
+          "failure_code": "attestation_failed",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 0,
+          "bytes_transferred": 0
         }
       ],
       "control_attempts": [
         {
           "reachable": false,
-          "time_to_headers_ms": 0,
-          "elapsed_ms": 0,
-          "bytes_read": 0,
           "throughput_bytes_per_second": 0,
-          "failure_code": "attestation_failed"
+          "failure_code": "attestation_failed",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 0,
+          "bytes_transferred": 0
         },
         {
           "reachable": false,
-          "time_to_headers_ms": 0,
-          "elapsed_ms": 0,
-          "bytes_read": 0,
           "throughput_bytes_per_second": 0,
-          "failure_code": "attestation_failed"
+          "failure_code": "attestation_failed",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 0,
+          "bytes_transferred": 0
         }
-      ]
+      ],
+      "observed_at": "2026-09-17T12:02:51Z"
     }
   ]
 }
