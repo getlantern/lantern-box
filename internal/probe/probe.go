@@ -98,26 +98,17 @@ func Measure(ctx context.Context, out A.Outbound, probeURL string, timeout time.
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	start := time.Now()
-	conn, err := out.DialContext(probeCtx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
-	if err != nil {
-		result.Elapsed = time.Since(start)
-		return result, fmt.Errorf("%w: %w", ErrDial, err)
-	}
-	defer conn.Close()
-	if earlyConn, ok := common.Cast[N.EarlyConn](conn); ok && earlyConn.NeedHandshake() {
-		start = time.Now()
-	}
-
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
 	if err != nil {
-		result.Elapsed = time.Since(start)
 		return result, fmt.Errorf("%w: %w", ErrUnusableInput, err)
 	}
 	if tp := linkURL.Query().Get("tp"); tp != "" {
 		req.Header.Set("traceparent", tp)
 	}
-
+	// Built before the clock starts, so its setup is not charged to the
+	// measurement: the transport closure reads conn, which is dialed below and
+	// set before Do runs.
+	var conn net.Conn
 	client := http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -133,6 +124,17 @@ func Measure(ctx context.Context, out A.Outbound, probeURL string, timeout time.
 		},
 	}
 	defer client.CloseIdleConnections()
+
+	start := time.Now()
+	conn, err = out.DialContext(probeCtx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
+	if err != nil {
+		result.Elapsed = time.Since(start)
+		return result, fmt.Errorf("%w: %w", ErrDial, err)
+	}
+	defer conn.Close()
+	if earlyConn, ok := common.Cast[N.EarlyConn](conn); ok && earlyConn.NeedHandshake() {
+		start = time.Now()
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		result.Elapsed = time.Since(start)
