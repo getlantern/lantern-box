@@ -1,0 +1,89 @@
+{
+  "report_token": "5vJt0nQf3kZ2xH9cR1bW7yT4",
+  "idempotency_key": "01JB8Q2P9K3V4W5X6Y7Z8A9B0C",
+  "windows": [
+    {
+      "exit_index": 0,
+      "window_index": 0,
+      "candidate_attempts": [
+        {
+          "reachable": true,
+          "http_status": 200,
+          "throughput_bytes_per_second": 2286021,
+          "latency_ms": 401,
+          "elapsed_milliseconds": 860,
+          "bytes_transferred": 1048576
+        },
+        {
+          "reachable": true,
+          "http_status": 200,
+          "throughput_bytes_per_second": 2410529,
+          "latency_ms": 377,
+          "elapsed_milliseconds": 812,
+          "bytes_transferred": 1048576
+        }
+      ],
+      "control_attempts": [
+        {
+          "reachable": false,
+          "throughput_bytes_per_second": 0,
+          "failure_code": "timeout",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 10002,
+          "bytes_transferred": 0
+        },
+        {
+          "reachable": false,
+          "throughput_bytes_per_second": 0,
+          "failure_code": "timeout",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 10000,
+          "bytes_transferred": 0
+        }
+      ],
+      "exit_attestation_token": "Yk3pQ1sZ9dRt6vWx2mB8nC4hJ7fL0gTa",
+      "observed_at": "2026-09-17T12:02:51Z"
+    },
+    {
+      "exit_index": 0,
+      "window_index": 1,
+      "candidate_attempts": [
+        {
+          "reachable": false,
+          "throughput_bytes_per_second": 0,
+          "failure_code": "attestation_failed",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 0,
+          "bytes_transferred": 0
+        },
+        {
+          "reachable": false,
+          "throughput_bytes_per_second": 0,
+          "failure_code": "attestation_failed",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 0,
+          "bytes_transferred": 0
+        }
+      ],
+      "control_attempts": [
+        {
+          "reachable": false,
+          "throughput_bytes_per_second": 0,
+          "failure_code": "attestation_failed",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 0,
+          "bytes_transferred": 0
+        },
+        {
+          "reachable": false,
+          "throughput_bytes_per_second": 0,
+          "failure_code": "attestation_failed",
+          "latency_ms": 0,
+          "elapsed_milliseconds": 0,
+          "bytes_transferred": 0
+        }
+      ],
+      "observed_at": "2026-09-17T12:02:51Z"
+    }
+  ]
+}

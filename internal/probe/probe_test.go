@@ -119,7 +119,9 @@ func TestRun_UnusableInputNeverDials(t *testing.T) {
 
 func TestRun_DialFailureWrapsTheOutboundsError(t *testing.T) {
 	denied := errors.New("dial denied")
+	const spent = 20 * time.Millisecond
 	out := &stubOutbound{dial: func(context.Context) (net.Conn, error) {
+		time.Sleep(spent)
 		return nil, denied
 	}}
 
@@ -127,7 +129,9 @@ func TestRun_DialFailureWrapsTheOutboundsError(t *testing.T) {
 
 	assert.ErrorIs(t, err, denied)
 	assert.NotErrorIs(t, err, ErrUnusableInput, "the dial happened; it failed")
-	assert.Zero(t, delay)
+	// A slow failure and an instant one are different evidence, so the time
+	// spent failing is reported too.
+	assert.GreaterOrEqual(t, delay, spent)
 }
 
 func TestRun_TimeoutBoundsTheAttempt(t *testing.T) {

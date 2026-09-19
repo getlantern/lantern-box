@@ -1,0 +1,24 @@
+{
+  "assignment_id": "01JB8Q2P9K3V4W5X6Y7Z8A9B0C",
+  "report_token": "5vJt0nQf3kZ2xH9cR1bW7yT4",
+  "measurement_url": "https://measure.example/resource",
+  "expires_at": "2026-09-17T12:15:00Z",
+  "sample_spec": {
+    "windows_per_exit": 2,
+    "attempts_per_window": 2,
+    "window_duration_seconds": 45,
+    "fresh_session_delay_milliseconds": 250
+  },
+  "windows": [
+    {
+      "exit_index": 0,
+      "window_index": 0,
+      "exit_attestation_challenge": "1789257600.hQ2mS8vTzXc1pL0aBd4eFg"
+    },
+    {
+      "exit_index": 0,
+      "window_index": 1,
+      "exit_attestation_challenge": "1789257600.kR7nJ3wYuMb5qN9cVe2tHi"
+    }
+  ]
+}
