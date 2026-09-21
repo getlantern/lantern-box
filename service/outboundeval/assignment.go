@@ -39,8 +39,6 @@ func (s *Service) runWindow(
 ) (window WindowReport) {
 	sample := assignment.Sample
 	window = WindowReport{
-		ExitIndex:         challenge.ExitIndex,
-		WindowIndex:       challenge.WindowIndex,
 		CandidateAttempts: make([]Attempt, 0, sample.AttemptsPerWindow),
 		ControlAttempts:   make([]Attempt, 0, sample.AttemptsPerWindow),
 	}

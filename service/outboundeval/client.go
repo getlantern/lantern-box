@@ -119,15 +119,8 @@ func (c *apiClient) attest(ctx context.Context, request AttestationRequest) (Att
 	return attestation, nil
 }
 
-// submit delivers one report, authorized by the report token it carries. A
-// conflict means the server already holds this report, which is success.
-func (c *apiClient) submit(ctx context.Context, report Report) error {
-	err := c.post(ctx, c.submitURL, "", report, nil)
-	var status apiError
-	if errors.As(err, &status) && status.status == http.StatusConflict {
-		return nil
-	}
-	if err != nil {
+func (c *apiClient) submit(ctx context.Context, token string, report Report) error {
+	if err := c.post(ctx, c.submitURL, token, report, nil); err != nil {
 		return fmt.Errorf("submit report: %w", err)
 	}
 	return nil

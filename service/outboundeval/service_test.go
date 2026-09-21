@@ -68,14 +68,27 @@ func TestNewServiceAppliesDefaults(t *testing.T) {
 	s := newTestService(t, testOptions())
 
 	assert.Equal(t, defaultControlOutboundTag, s.options.ControlOutboundTag)
-	assert.Equal(t, defaultPollInterval, time.Duration(s.options.PollInterval))
-	assert.Equal(t, defaultNoAssignmentInterval, time.Duration(s.options.NoAssignmentInterval))
+	assert.Equal(t, 5*time.Minute, time.Duration(s.options.PollInterval))
+	assert.Equal(t, 5*time.Minute, time.Duration(s.options.NoAssignmentInterval))
 	assert.Equal(t, defaultMaxRetryBackoff, time.Duration(s.options.MaxRetryBackoff))
 	assert.Equal(t, defaultRequestTimeout, time.Duration(s.options.RequestTimeout))
 	assert.EqualValues(t, defaultMaxResponseBytes, s.options.MaxResponseBytes)
 	assert.EqualValues(t, defaultMaxAssignmentBytes, s.options.MaxAssignmentBytes)
 	assert.EqualValues(t, defaultMaxWindows, s.options.MaxWindows)
 	assert.EqualValues(t, defaultMaxAttemptsPerWindow, s.options.MaxAttemptsPerWindow)
+}
+
+func TestDefaultPollingLeavesRoomWithinRunnerActivityWindow(t *testing.T) {
+	s := newTestService(t, testOptions())
+	const assignmentLifetime = 15 * time.Minute
+	const activityWindow = 30 * time.Minute
+
+	for _, interval := range []time.Duration{
+		time.Duration(s.options.PollInterval),
+		time.Duration(s.options.NoAssignmentInterval),
+	} {
+		assert.Less(t, assignmentLifetime+interval, activityWindow)
+	}
 }
 
 func TestNewServiceRejectsUnusableOptions(t *testing.T) {

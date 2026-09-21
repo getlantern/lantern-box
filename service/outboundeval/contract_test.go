@@ -184,6 +184,9 @@ func TestFixturedReportsFillTheGrid(t *testing.T) {
 			var report Report
 			require.NoError(t, json.Unmarshal(raw, &report))
 			requireCompleteGrid(t, report, assignment.Sample)
+			for _, window := range report.Windows {
+				require.NotEmpty(t, window.AttestationToken)
+			}
 		})
 	}
 }

@@ -3,8 +3,6 @@
   "idempotency_key": "01JB8Q2P9K3V4W5X6Y7Z8A9B0C",
   "windows": [
     {
-      "exit_index": 0,
-      "window_index": 0,
       "candidate_attempts": [
         {
           "reachable": true,
@@ -45,13 +43,12 @@
       "observed_at": "2026-09-17T12:02:51Z"
     },
     {
-      "exit_index": 0,
-      "window_index": 1,
+      "exit_attestation_token": "Tb8mN2xW5qZ1cV7hK4jR9dY3gL6pS0fA",
       "candidate_attempts": [
         {
           "reachable": false,
           "throughput_bytes_per_second": 0,
-          "failure_code": "attestation_failed",
+          "failure_code": "window_deadline_exceeded",
           "latency_ms": 0,
           "elapsed_milliseconds": 0,
           "bytes_transferred": 0
@@ -59,7 +56,7 @@
         {
           "reachable": false,
           "throughput_bytes_per_second": 0,
-          "failure_code": "attestation_failed",
+          "failure_code": "window_deadline_exceeded",
           "latency_ms": 0,
           "elapsed_milliseconds": 0,
           "bytes_transferred": 0
@@ -69,7 +66,7 @@
         {
           "reachable": false,
           "throughput_bytes_per_second": 0,
-          "failure_code": "attestation_failed",
+          "failure_code": "window_deadline_exceeded",
           "latency_ms": 0,
           "elapsed_milliseconds": 0,
           "bytes_transferred": 0
@@ -77,7 +74,7 @@
         {
           "reachable": false,
           "throughput_bytes_per_second": 0,
-          "failure_code": "attestation_failed",
+          "failure_code": "window_deadline_exceeded",
           "latency_ms": 0,
           "elapsed_milliseconds": 0,
           "bytes_transferred": 0

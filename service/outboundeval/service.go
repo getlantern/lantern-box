@@ -34,8 +34,8 @@ import (
 // Defaults for every option left unset.
 const (
 	defaultControlOutboundTag   = "direct"
-	defaultPollInterval         = 30 * time.Minute
-	defaultNoAssignmentInterval = 15 * time.Minute
+	defaultPollInterval         = 5 * time.Minute
+	defaultNoAssignmentInterval = 5 * time.Minute
 	defaultMaxRetryBackoff      = 10 * time.Minute
 	defaultRequestTimeout       = 30 * time.Second
 	defaultMaxResponseBytes     = 1 << 20
@@ -70,6 +70,8 @@ type Service struct {
 	limits  bounds
 
 	config atomic.Pointer[lbA.OutboundEvalConfig]
+	// pendingAssignment is owned by the run loop and retained across acquisition retries.
+	pendingAssignment *pendingAssignment
 	// wake carries a configuration change to a cycle waiting to retry, so a
 	// fresh credential does not have to wait out a backoff.
 	wake      chan struct{}

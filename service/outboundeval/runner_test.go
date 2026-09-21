@@ -113,6 +113,105 @@ func TestRunCycleMeasuresAndSubmitsACompleteGrid(t *testing.T) {
 	assert.Equal(t, assignment.ID, reports[0].IdempotencyKey, "the assignment identifies the report through its key")
 }
 
+func TestRunCycleAcquisitionKeys(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		acquireStatus int
+		refuseSubmits int
+		wantErr       error
+		reuseKey      bool
+	}{
+		{name: "completed"},
+		{
+			name: "acquisition retry", acquireStatus: http.StatusBadGateway,
+			wantErr: apiError{status: http.StatusBadGateway}, reuseKey: true,
+		},
+		{
+			name: "rate limited", acquireStatus: http.StatusTooManyRequests,
+			wantErr: apiError{status: http.StatusTooManyRequests}, reuseKey: true,
+		},
+		{
+			name: "no assignment", acquireStatus: http.StatusServiceUnavailable,
+			wantErr: ErrNoAssignment,
+		},
+		{
+			name: "refused", acquireStatus: http.StatusUnauthorized,
+			wantErr: apiError{status: http.StatusUnauthorized},
+		},
+		{
+			name: "submission exhausted retries", refuseSubmits: submitAttempts,
+			wantErr: apiError{status: http.StatusServiceUnavailable},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := newControlAPI()
+			api.refuseSubmits = test.refuseSubmits
+			handler := api.handler(t)
+			var requests []AssignmentRequest
+			s := wireRunner(t, testOptions(), func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/assignments" {
+					var request AssignmentRequest
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+					requests = append(requests, request)
+					if len(requests) == 1 && test.acquireStatus != 0 {
+						w.WriteHeader(test.acquireStatus)
+						return
+					}
+				}
+				handler(w, r)
+			})
+
+			require.ErrorIs(t, s.runCycle(context.Background()), test.wantErr)
+			require.NoError(t, s.runCycle(context.Background()))
+
+			require.Len(t, requests, 2)
+			for _, request := range requests {
+				require.NotEmpty(t, request.IdempotencyKey)
+				assert.LessOrEqual(t, len(request.IdempotencyKey), 128)
+				assert.NotEqual(t, s.config.Load().Token, request.IdempotencyKey)
+			}
+			if test.reuseKey {
+				assert.Equal(t, requests[0], requests[1])
+			} else {
+				assert.NotEqual(t, requests[0].IdempotencyKey, requests[1].IdempotencyKey)
+			}
+		})
+	}
+}
+
+func TestRunCycleAcquisitionKeyTracksConfig(t *testing.T) {
+	for _, field := range []string{"token", "country", "unchanged"} {
+		t.Run(field, func(t *testing.T) {
+			var requests []AssignmentRequest
+			s := wireRunner(t, testOptions(), func(w http.ResponseWriter, r *http.Request) {
+				var request AssignmentRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+				requests = append(requests, request)
+				w.WriteHeader(http.StatusBadGateway)
+			})
+
+			require.Error(t, s.runCycle(context.Background()))
+			config := *s.config.Load()
+			switch field {
+			case "token":
+				config.Token = "rotated-token"
+			case "country":
+				config.CountryCode = "IR"
+			}
+			require.NoError(t, s.SetOutboundEvalConfig(config))
+			require.Error(t, s.runCycle(context.Background()))
+
+			require.Len(t, requests, 2)
+			if field == "unchanged" {
+				assert.Equal(t, requests[0], requests[1])
+			} else {
+				assert.NotEqual(t, requests[0].IdempotencyKey, requests[1].IdempotencyKey)
+			}
+			assert.Equal(t, config.CountryCode, requests[1].CountryCode)
+		})
+	}
+}
+
 func TestRunCycleRefusesAnExpiryTheBoxsClockRejects(t *testing.T) {
 	api := newControlAPI()
 	s := wiredService(t, api.handler(t))
@@ -149,9 +248,6 @@ func TestRunCycleAcceptsAWindowLongerThanItNeeds(t *testing.T) {
 	}
 }
 
-// The expiry the server stated is the whole budget: a grid that cannot finish
-// inside it stops there, reporting its unmeasured windows rather than running
-// past the moment its report token dies.
 func TestRunCycleMeasuresOnlyUntilTheAssignmentExpires(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		assignment := validAssignment()
@@ -167,18 +263,10 @@ func TestRunCycleMeasuresOnlyUntilTheAssignmentExpires(t *testing.T) {
 		s := wireRunner(t, testOptions(), api.handler(t))
 
 		start := time.Now()
-		require.NoError(t, s.runCycle(context.Background()))
+		require.ErrorIs(t, s.runCycle(context.Background()), errUnattestedReport)
 		assert.Equal(t, time.Second, time.Since(start))
 
-		reports := api.reports()
-		require.Len(t, reports, 1)
-		requireCompleteGrid(t, reports[0], assignment.Sample)
-		last := reports[0].Windows[len(reports[0].Windows)-1]
-		for _, attempts := range [][]Attempt{last.CandidateAttempts, last.ControlAttempts} {
-			for _, attempt := range attempts {
-				assert.Equal(t, failureWindowDeadline, attempt.FailureCode)
-			}
-		}
+		assert.Empty(t, api.reports())
 	})
 }
 
@@ -194,6 +282,82 @@ func TestRunCycleResubmitsAFinishedReport(t *testing.T) {
 	require.Len(t, reports, 2, "a measured grid must not be dropped on one refusal")
 	assert.Equal(t, reports[0].IdempotencyKey, reports[1].IdempotencyKey)
 	assert.Equal(t, reports[0].Windows, reports[1].Windows)
+}
+
+func TestRunCycleKeepsItsCredentialForSubmissionRetries(t *testing.T) {
+	api := newControlAPI()
+	api.refuseSubmits = 1
+	handler := api.handler(t)
+	var authorizations []string
+	s := wiredService(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/reports") {
+			authorizations = append(authorizations, r.Header.Get("Authorization"))
+		}
+		handler(w, r)
+	})
+	original := *s.config.Load()
+	s.measure = func(ctx context.Context, out A.Outbound, target string) Attempt {
+		updated := original
+		updated.Token = "rotated-token"
+		require.NoError(t, s.SetOutboundEvalConfig(updated))
+		return reachableMeasure(ctx, out, target)
+	}
+
+	require.NoError(t, s.runCycle(context.Background()))
+
+	assert.Equal(t, []string{"Bearer " + original.Token, "Bearer " + original.Token}, authorizations)
+	assert.Equal(t, "rotated-token", s.config.Load().Token)
+}
+
+func TestRunCycleDoesNotSubmitUnattestedWindows(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "attestation refused", err: apiError{status: http.StatusForbidden}},
+		{name: "attestation failed", err: errors.New("connection lost")},
+		{name: "empty attestation"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := newControlAPI()
+			s := wiredService(t, api.handler(t))
+			s.measure = reachableMeasure
+			s.attest = func(_ context.Context, request AttestationRequest) (Attestation, error) {
+				if request.Challenge == "challenge-0" {
+					return Attestation{Token: "attested-first-window"}, nil
+				}
+				return Attestation{}, test.err
+			}
+
+			require.ErrorIs(t, s.runCycle(context.Background()), errUnattestedReport)
+			assert.Empty(t, api.reports())
+		})
+	}
+}
+
+func TestRunCycleSubmitsAttestedDeadlineFailures(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		api := newControlAPI()
+		s := wireRunner(t, testOptions(), api.handler(t))
+		s.measure = func(ctx context.Context, _ A.Outbound, _ string) Attempt {
+			<-ctx.Done()
+			return Attempt{FailureCode: failureTimeout}
+		}
+
+		require.NoError(t, s.runCycle(context.Background()))
+
+		reports := api.reports()
+		require.Len(t, reports, 1)
+		requireCompleteGrid(t, reports[0], serverAssignment().Sample)
+		for _, window := range reports[0].Windows {
+			require.NotEmpty(t, window.AttestationToken)
+			for _, attempts := range [][]Attempt{window.CandidateAttempts, window.ControlAttempts} {
+				for _, attempt := range attempts {
+					assert.Equal(t, failureWindowDeadline, attempt.FailureCode)
+				}
+			}
+		}
+	})
 }
 
 func TestRunCycleGivesUpOnAReportAfterBoundedAttempts(t *testing.T) {
@@ -219,6 +383,7 @@ func TestRunCycleErrors(t *testing.T) {
 		"server trouble":     {acquireStatus: http.StatusInternalServerError, want: apiError{status: http.StatusInternalServerError}},
 		"rate limited":       {acquireStatus: http.StatusTooManyRequests, want: apiError{status: http.StatusTooManyRequests}},
 		"submit refused":     {submitStatus: http.StatusBadRequest, want: apiError{status: http.StatusBadRequest}},
+		"submit conflict":    {submitStatus: http.StatusConflict, want: apiError{status: http.StatusConflict}},
 		"assignment beyond local bounds": {
 			assignment: func() Assignment {
 				assignment := serverAssignment()
@@ -284,17 +449,18 @@ func TestRetryableCycleError(t *testing.T) {
 		err  error
 		want bool
 	}{
-		"success":          {},
-		"no assignment":    {err: ErrNoAssignment},
-		"no token":         {err: errNoToken},
-		"missing outbound": {err: errOutboundUnavailable},
-		"invalid contract": {err: ErrInvalidContract},
-		"canceled":         {err: context.Canceled},
-		"refused":          {err: apiError{status: http.StatusUnauthorized}},
-		"rate limited":     {err: apiError{status: http.StatusTooManyRequests}, want: true},
-		"unavailable":      {err: apiError{status: http.StatusServiceUnavailable}, want: true},
-		"request deadline": {err: context.DeadlineExceeded, want: true},
-		"transport error":  {err: errors.New("connection lost"), want: true},
+		"success":           {},
+		"no assignment":     {err: ErrNoAssignment},
+		"no token":          {err: errNoToken},
+		"missing outbound":  {err: errOutboundUnavailable},
+		"invalid contract":  {err: ErrInvalidContract},
+		"unattested report": {err: errUnattestedReport},
+		"canceled":          {err: context.Canceled},
+		"refused":           {err: apiError{status: http.StatusUnauthorized}},
+		"rate limited":      {err: apiError{status: http.StatusTooManyRequests}, want: true},
+		"unavailable":       {err: apiError{status: http.StatusServiceUnavailable}, want: true},
+		"request deadline":  {err: context.DeadlineExceeded, want: true},
+		"transport error":   {err: errors.New("connection lost"), want: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			assert.Equal(t, test.want, retryableCycleError(test.err))
@@ -419,8 +585,12 @@ func TestRunBackoffRetriesWithoutWaitingForTheTicker(t *testing.T) {
 		}
 		handler := api.handler(t)
 		var acquired, retriedAt atomic.Int64
+		var requests []AssignmentRequest
 		startTestRunner(t, func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/assignments" {
+				var request AssignmentRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+				requests = append(requests, request)
 				switch acquired.Add(1) {
 				case 1:
 					w.WriteHeader(http.StatusBadGateway)
@@ -452,6 +622,10 @@ func TestRunBackoffRetriesWithoutWaitingForTheTicker(t *testing.T) {
 		time.Sleep(time.Nanosecond)
 		synctest.Wait()
 		assert.EqualValues(t, 3, acquired.Load())
+		require.Len(t, requests, 3)
+		assert.NotEmpty(t, requests[0].IdempotencyKey)
+		assert.Equal(t, requests[0], requests[1])
+		assert.NotEqual(t, requests[1].IdempotencyKey, requests[2].IdempotencyKey)
 	})
 }
 

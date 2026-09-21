@@ -3,8 +3,6 @@
   "idempotency_key": "01JB8Q2P9K3V4W5X6Y7Z8A9B0C",
   "windows": [
     {
-      "exit_index": 0,
-      "window_index": 0,
       "candidate_attempts": [
         {
           "reachable": true,
@@ -45,8 +43,6 @@
       "observed_at": "2026-09-17T12:03:20Z"
     },
     {
-      "exit_index": 0,
-      "window_index": 1,
       "candidate_attempts": [
         {
           "reachable": true,

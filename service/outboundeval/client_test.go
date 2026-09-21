@@ -33,11 +33,11 @@ func TestAcquireCarriesTheBearerTokenAndRequest(t *testing.T) {
 	})
 
 	assignment, err := s.api.acquire(context.Background(), "token",
-		AssignmentRequest{CountryCode: "RU", ExitCount: clientExitCount})
+		AssignmentRequest{CountryCode: "RU", IdempotencyKey: "acquire-key", ExitCount: clientExitCount})
 
 	require.NoError(t, err)
 	assert.Equal(t, "Bearer token", authorization)
-	assert.Equal(t, AssignmentRequest{CountryCode: "RU", ExitCount: 1}, request)
+	assert.Equal(t, AssignmentRequest{CountryCode: "RU", IdempotencyKey: "acquire-key", ExitCount: 1}, request)
 	assert.Equal(t, "assignment-1", assignment.ID)
 	assert.Len(t, assignment.Challenges, 2)
 }
@@ -56,16 +56,52 @@ func TestAttestCarriesNoBearerCredential(t *testing.T) {
 	assert.Equal(t, "attestation", attestation.Token)
 }
 
-func TestSubmitTreatsAConflictAsAlreadyAccepted(t *testing.T) {
-	status := http.StatusConflict
-	s := wiredService(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(status)
+func TestSubmitCarriesTheBearerTokenAndReport(t *testing.T) {
+	report := Report{
+		ReportToken:    "report-token",
+		IdempotencyKey: "report-key",
+		Windows: []WindowReport{{
+			AttestationToken:  "attestation",
+			CandidateAttempts: []Attempt{{Reachable: true, HTTPStatus: http.StatusOK}},
+			ControlAttempts:   []Attempt{{FailureCode: failureTimeout}},
+			ObservedAt:        fixedNow,
+		}},
+	}
+	s := wiredService(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer runner-token", r.Header.Get("Authorization"))
+		var payload map[string]json.RawMessage
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		require.Len(t, payload, 3)
+		var windows []map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(payload["windows"], &windows))
+		require.Len(t, windows, 1)
+		require.Len(t, windows[0], 4)
+		for _, field := range []string{
+			"exit_attestation_token", "candidate_attempts", "control_attempts", "observed_at",
+		} {
+			assert.Contains(t, windows[0], field)
+		}
+		encoded, err := json.Marshal(payload)
+		require.NoError(t, err)
+		var received Report
+		require.NoError(t, json.Unmarshal(encoded, &received))
+		assert.Equal(t, report, received)
+		_, _ = w.Write([]byte(`{"accepted":true}`))
 	})
 
-	assert.NoError(t, s.api.submit(context.Background(), Report{}))
+	assert.NoError(t, s.api.submit(context.Background(), "runner-token", report))
+}
 
-	status = http.StatusInternalServerError
-	assert.Error(t, s.api.submit(context.Background(), Report{}))
+func TestSubmitReportsHTTPFailures(t *testing.T) {
+	for _, status := range []int{http.StatusConflict, http.StatusUnauthorized, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			s := wiredService(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			})
+
+			assert.ErrorIs(t, s.api.submit(context.Background(), "token", Report{}), apiError{status: status})
+		})
+	}
 }
 
 func TestAPIErrorRetryability(t *testing.T) {

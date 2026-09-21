@@ -20,7 +20,9 @@ const (
 // vantage points the runner offers, which is one for a client.
 type AssignmentRequest struct {
 	CountryCode string `json:"country_code"`
-	ExitCount   uint32 `json:"exit_count"`
+	// IdempotencyKey identifies one acquisition across retries.
+	IdempotencyKey string `json:"idempotency_key"`
+	ExitCount      uint32 `json:"exit_count"`
 }
 
 // Assignment is one bounded measurement the server hands out. It names the
@@ -80,12 +82,8 @@ type Report struct {
 
 // WindowReport is one window's paired arms.
 type WindowReport struct {
-	ExitIndex   uint32 `json:"exit_index"`
-	WindowIndex uint32 `json:"window_index"`
-	// AttestationToken is empty for a window that carries no attestation,
-	// which leaves it tied to its assignment but attributed to no country or
-	// ASN.
-	AttestationToken  string    `json:"exit_attestation_token,omitempty"`
+	// AttestationToken identifies the assignment's exit and window; it is empty if attestation failed.
+	AttestationToken  string    `json:"exit_attestation_token"`
 	CandidateAttempts []Attempt `json:"candidate_attempts"`
 	ControlAttempts   []Attempt `json:"control_attempts"`
 	ObservedAt        time.Time `json:"observed_at"`

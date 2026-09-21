@@ -2,6 +2,7 @@ package outboundeval
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"time"
@@ -22,7 +23,13 @@ const retryBaseWait = 30 * time.Second
 var (
 	errNoToken             = errors.New("idle until a token is supplied")
 	errOutboundUnavailable = errors.New("outbound under test is unavailable")
+	errUnattestedReport    = errors.New("report contains an unattested window")
 )
+
+type pendingAssignment struct {
+	token   string
+	request AssignmentRequest
+}
 
 func (s *Service) run() {
 	defer close(s.done)
@@ -67,17 +74,30 @@ func (s *Service) runCycle(ctx context.Context) error {
 	}
 	config := s.config.Load()
 	if config.Token == "" {
+		s.pendingAssignment = nil
 		return errNoToken
 	}
 	candidate, found := s.outbounds.Outbound(config.OutboundTag)
 	if !found {
+		s.pendingAssignment = nil
 		return fmt.Errorf("%w: %q", errOutboundUnavailable, config.OutboundTag)
 	}
 
-	assignment, err := s.api.acquire(ctx, config.Token, AssignmentRequest{
-		CountryCode: config.CountryCode,
-		ExitCount:   clientExitCount,
-	})
+	if s.pendingAssignment == nil || s.pendingAssignment.token != config.Token ||
+		s.pendingAssignment.request.CountryCode != config.CountryCode {
+		s.pendingAssignment = &pendingAssignment{
+			token: config.Token,
+			request: AssignmentRequest{
+				CountryCode:    config.CountryCode,
+				IdempotencyKey: rand.Text(),
+				ExitCount:      clientExitCount,
+			},
+		}
+	}
+	assignment, err := s.api.acquire(ctx, config.Token, s.pendingAssignment.request)
+	if !retryableCycleError(err) {
+		s.pendingAssignment = nil
+	}
 	if err != nil {
 		return err
 	}
@@ -90,19 +110,22 @@ func (s *Service) runCycle(ctx context.Context) error {
 	gridCtx, cancel := context.WithTimeout(ctx, assignment.ExpiresAt.Sub(now))
 	defer cancel()
 	report := s.runAssignment(gridCtx, candidate, assignment)
-	return s.submitReport(ctx, report)
+	return s.submitReport(ctx, config.Token, report)
 }
 
-// submitReport delivers a finished report, retrying a refusal a later attempt
-// may clear. Resubmission is safe: the report carries the token and idempotency
-// key the server deduplicates on.
-func (s *Service) submitReport(ctx context.Context, report Report) error {
+// submitReport refuses reports with unattested windows and retries transient submission failures.
+func (s *Service) submitReport(ctx context.Context, token string, report Report) error {
+	for i, window := range report.Windows {
+		if window.AttestationToken == "" {
+			return fmt.Errorf("%w: window %d", errUnattestedReport, i)
+		}
+	}
 	var err error
 	for attempt := 1; attempt <= submitAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err = s.api.submit(ctx, report)
+		err = s.api.submit(ctx, token, report)
 		if !retryableCycleError(err) {
 			return err
 		}
@@ -116,6 +139,7 @@ func (s *Service) submitReport(ctx context.Context, report Report) error {
 func retryableCycleError(err error) bool {
 	if err == nil || errors.Is(err, ErrNoAssignment) || errors.Is(err, errNoToken) ||
 		errors.Is(err, errOutboundUnavailable) || errors.Is(err, ErrInvalidContract) ||
+		errors.Is(err, errUnattestedReport) ||
 		errors.Is(err, context.Canceled) {
 		return false
 	}

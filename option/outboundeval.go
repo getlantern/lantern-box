@@ -12,7 +12,7 @@ type OutboundEvalServiceOptions struct {
 	AttestURL  string `json:"attest_url"`
 	SubmitURL  string `json:"submit_url"`
 
-	// Token is the bearer credential presented when acquiring an assignment.
+	// Token authenticates assignment acquisition and report submission.
 	// While it is empty the service idles without measuring anything, so an
 	// embedder that mints tokens at runtime may leave it unset.
 	Token string `json:"token,omitempty"`
@@ -35,11 +35,11 @@ type OutboundEvalServiceOptions struct {
 	ControlOutboundTag string `json:"control_outbound_tag,omitempty"`
 
 	// PollInterval is the wait before the first cycle and after a completed
-	// assignment. Configuration changes interrupt the wait. Default 30m.
+	// assignment. Configuration changes interrupt the wait. Default 5m.
 	PollInterval badoption.Duration `json:"poll_interval,omitempty"`
 
 	// NoAssignmentInterval is the wait after the server has nothing to measure,
-	// and after it refuses a request in a way a retry cannot fix. Default 15m.
+	// and after it refuses a request in a way a retry cannot fix. Default 5m.
 	NoAssignmentInterval badoption.Duration `json:"no_assignment_interval,omitempty"`
 
 	// MaxRetryBackoff caps the backoff applied to retryable control

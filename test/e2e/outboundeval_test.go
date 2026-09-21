@@ -184,10 +184,10 @@ func TestOutboundEvalRunsInsideABox(t *testing.T) {
 	assert.Equal(t, assignment.ReportToken, report.ReportToken)
 	assert.Equal(t, assignment.ID, report.IdempotencyKey)
 	require.Len(t, report.Windows, int(assignment.Sample.WindowsPerExit))
-	for _, window := range report.Windows {
+	for i, window := range report.Windows {
 		assert.Len(t, window.CandidateAttempts, int(assignment.Sample.AttemptsPerWindow))
 		assert.Len(t, window.ControlAttempts, int(assignment.Sample.AttemptsPerWindow))
-		assert.Equal(t, fmt.Sprintf("attested-challenge-%d", window.WindowIndex), window.AttestationToken)
+		assert.Equal(t, fmt.Sprintf("attested-challenge-%d", assignment.Challenges[i].WindowIndex), window.AttestationToken)
 		for _, attempt := range append(window.CandidateAttempts, window.ControlAttempts...) {
 			assert.False(t, attempt.Reachable)
 			assert.NotEmpty(t, attempt.FailureCode)
