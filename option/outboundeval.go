@@ -19,11 +19,11 @@ type OutboundEvalServiceOptions struct {
 
 	// CountryCode is the market under evaluation, which the server expects as
 	// an ISO-3166 alpha-2 code.
-	CountryCode string `json:"country_code"`
+	CountryCode string `json:"country_code,omitempty"`
 
 	// OutboundTag is the candidate when an assignment does not supply both outbounds.
 	// It is resolved again for each assignment.
-	OutboundTag string `json:"outbound_tag"`
+	OutboundTag string `json:"outbound_tag,omitempty"`
 
 	// ControlOutboundTag carries every control API call and is the measurement
 	// control when an assignment does not supply both outbounds.
