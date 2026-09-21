@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/sagernet/sing-box/option"
 )
 
 // ErrInvalidContract reports a control API message that does not satisfy the
@@ -25,19 +27,20 @@ type AssignmentRequest struct {
 	ExitCount      uint32 `json:"exit_count"`
 }
 
-// Assignment is one bounded measurement the server hands out. It names the
-// resource to fetch and the sample to take, and nothing about what is under
-// test, so a runner cannot attribute its own results.
+// Assignment is one bounded measurement issued by the server.
 type Assignment struct {
 	ID string `json:"assignment_id"`
 	// ReportToken authorizes exactly one report and is the only thing tying
 	// that report back to this assignment.
 	ReportToken string `json:"report_token"`
-	// MeasurementURL is fetched identically by both arms.
-	MeasurementURL string            `json:"measurement_url"`
-	Sample         SampleSpec        `json:"sample_spec"`
-	Challenges     []WindowChallenge `json:"windows"`
-	ExpiresAt      time.Time         `json:"expires_at"`
+	// MeasurementURL is fetched by both arms; empty selects https://www.wikipedia.org/.
+	MeasurementURL string `json:"measurement_url,omitempty"`
+	// Candidate and Control override the configured measurement pair only when both are non-nil.
+	Candidate  *option.Outbound  `json:"candidate_outbound,omitempty"`
+	Control    *option.Outbound  `json:"control_outbound,omitempty"`
+	Sample     SampleSpec        `json:"sample_spec"`
+	Challenges []WindowChallenge `json:"windows"`
+	ExpiresAt  time.Time         `json:"expires_at"`
 }
 
 // SampleSpec is the grid of measurements one assignment asks for. A report is

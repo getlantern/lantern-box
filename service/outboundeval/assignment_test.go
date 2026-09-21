@@ -2,6 +2,7 @@ package outboundeval
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"sync"
@@ -91,7 +92,7 @@ func TestRunAssignmentFillsTheGridAndAlternatesArms(t *testing.T) {
 		}
 
 		assignment := validAssignment()
-		report := s.runAssignment(context.Background(), testCandidate(), assignment)
+		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
 
 		requireCompleteGrid(t, report, assignment.Sample)
 		assert.Equal(t, assignment.ID, report.IdempotencyKey)
@@ -104,6 +105,49 @@ func TestRunAssignmentFillsTheGridAndAlternatesArms(t *testing.T) {
 			"direct", "candidate", "direct", "candidate",
 		}, calls.recorded())
 	})
+}
+
+func TestRunAssignmentMeasurementURL(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "omitted", body: `{}`, want: "https://www.wikipedia.org/"},
+		{name: "empty", body: `{"measurement_url":""}`, want: "https://www.wikipedia.org/"},
+		{name: "override", body: `{"measurement_url":"https://measure.example/resource"}`, want: "https://measure.example/resource"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var decoded Assignment
+				require.NoError(t, json.Unmarshal([]byte(test.body), &decoded))
+				assignment := validAssignment()
+				assignment.MeasurementURL = decoded.MeasurementURL
+				require.NoError(t, assignment.validate(fixedNow, testBounds()))
+				s := newTestService(t, testOptions())
+				s.attest = func(context.Context, AttestationRequest) (Attestation, error) {
+					return Attestation{Token: "attested"}, nil
+				}
+				calls := make(map[string]int)
+				s.measure = func(_ context.Context, out A.Outbound, target string) Attempt {
+					assert.Equal(t, test.want, target)
+					calls[out.Tag()]++
+					return Attempt{Reachable: true, HTTPStatus: http.StatusOK}
+				}
+
+				report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
+
+				requireCompleteGrid(t, report, assignment.Sample)
+				wantCalls := int(assignment.Sample.WindowsPerExit * assignment.Sample.AttemptsPerWindow)
+				assert.Equal(t, map[string]int{"candidate": wantCalls, "direct": wantCalls}, calls)
+				encoded, err := json.Marshal(decoded)
+				require.NoError(t, err)
+				if test.name != "override" {
+					assert.NotContains(t, string(encoded), "measurement_url")
+				}
+			})
+		})
+	}
 }
 
 func TestRunAssignmentPadsAnUnattestedWindow(t *testing.T) {
@@ -127,7 +171,7 @@ func TestRunAssignmentPadsAnUnattestedWindow(t *testing.T) {
 				}
 
 				assignment := validAssignment()
-				report := s.runAssignment(context.Background(), testCandidate(), assignment)
+				report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
 
 				requireCompleteGrid(t, report, assignment.Sample)
 				assert.Empty(t, report.Windows[1].AttestationToken)
@@ -202,7 +246,7 @@ func TestRunAssignmentPadsWhenTheWindowRunsOutOfTime(t *testing.T) {
 		assignment.Sample.AttemptsPerWindow = 4
 		assignment.Sample.WindowDurationSeconds = 1
 		assignment.Sample.FreshSessionDelayMS = 0
-		report := s.runAssignment(context.Background(), testCandidate(), assignment)
+		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
 
 		requireCompleteGrid(t, report, assignment.Sample)
 		assert.Equal(t, failureWindowDeadline,
@@ -228,7 +272,7 @@ func TestRunWindowPadsWhenTheAssignmentEndsDuringTheSpacing(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 
-		report := s.runAssignment(ctx, testCandidate(), assignment)
+		report := s.runAssignment(ctx, testCandidate(), s.control, assignment)
 
 		requireCompleteGrid(t, report, assignment.Sample)
 		assert.False(t, attested, "a window that never opened must not be attested")
@@ -259,7 +303,7 @@ func TestRunWindowSeparatesADeadlineFromARejectedAttestation(t *testing.T) {
 		assignment := validAssignment()
 		assignment.Sample.WindowDurationSeconds = 1
 
-		report := s.runAssignment(context.Background(), testCandidate(), assignment)
+		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
 
 		requireCompleteGrid(t, report, assignment.Sample)
 		for _, window := range report.Windows {
@@ -290,7 +334,7 @@ func TestRunWindowReportsADeadlineThatLandsBetweenAttestationAttempts(t *testing
 		assignment := validAssignment()
 		assignment.Sample.WindowDurationSeconds = 1
 
-		report := s.runAssignment(context.Background(), testCandidate(), assignment)
+		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
 
 		requireCompleteGrid(t, report, assignment.Sample)
 		for _, window := range report.Windows {
@@ -317,7 +361,7 @@ func TestRunWindowDoesNotSpendTheWindowOnItsSpacing(t *testing.T) {
 		assignment := validAssignment()
 		assignment.Sample.WindowDurationSeconds = 1
 		assignment.Sample.FreshSessionDelayMS = 1200
-		report := s.runAssignment(context.Background(), testCandidate(), assignment)
+		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
 
 		requireCompleteGrid(t, report, assignment.Sample)
 		for _, window := range report.Windows {
@@ -347,7 +391,7 @@ func TestRunWindowDoesNotBlameAnArmForTheWindowsOwnBudget(t *testing.T) {
 		assignment.Sample.AttemptsPerWindow = 1
 		assignment.Sample.WindowDurationSeconds = 1
 		assignment.Sample.FreshSessionDelayMS = 0
-		report := s.runAssignment(context.Background(), testCandidate(), assignment)
+		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
 
 		requireCompleteGrid(t, report, assignment.Sample)
 		for _, window := range report.Windows {
@@ -382,7 +426,7 @@ func TestRunWindowKeepsACompletedVerdictAtTheDeadline(t *testing.T) {
 		assignment.Sample.AttemptsPerWindow = 1
 		assignment.Sample.WindowDurationSeconds = 1
 		assignment.Sample.FreshSessionDelayMS = 0
-		report := s.runAssignment(context.Background(), testCandidate(), assignment)
+		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
 
 		requireCompleteGrid(t, report, assignment.Sample)
 		for _, window := range report.Windows {
@@ -406,7 +450,7 @@ func TestRunAssignmentStampsObservationOnTheBoxsClock(t *testing.T) {
 		}
 
 		assignment := validAssignment()
-		report := s.runAssignment(context.Background(), testCandidate(), assignment)
+		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
 
 		assert.Equal(t, corrected, report.Windows[0].ObservedAt)
 	})

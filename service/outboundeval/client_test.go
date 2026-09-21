@@ -4,9 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter/outbound"
+	O "github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/direct"
+	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -16,7 +21,7 @@ func TestAcquireReportsThatThereIsNothingToMeasure(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 
-	_, err := s.api.acquire(context.Background(), "token", AssignmentRequest{})
+	_, err := s.api.acquire("token", AssignmentRequest{})
 
 	assert.ErrorIs(t, err, ErrNoAssignment)
 }
@@ -32,7 +37,7 @@ func TestAcquireCarriesTheBearerTokenAndRequest(t *testing.T) {
 		require.NoError(t, json.NewEncoder(w).Encode(serverAssignment()))
 	})
 
-	assignment, err := s.api.acquire(context.Background(), "token",
+	assignment, err := s.api.acquire("token",
 		AssignmentRequest{CountryCode: "RU", IdempotencyKey: "acquire-key", ExitCount: clientExitCount})
 
 	require.NoError(t, err)
@@ -42,11 +47,64 @@ func TestAcquireCarriesTheBearerTokenAndRequest(t *testing.T) {
 	assert.Len(t, assignment.Challenges, 2)
 }
 
+func TestAcquireDecodesAssignmentResponse(t *testing.T) {
+	body, err := os.ReadFile("testdata/assignment.json")
+	require.NoError(t, err)
+	s := wiredService(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, err := w.Write(body)
+		assert.NoError(t, err)
+	})
+
+	assignment, err := s.api.acquire("token", AssignmentRequest{
+		CountryCode: "RU", IdempotencyKey: "acquire-key", ExitCount: 1,
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "01JB8Q2P9K3V4W5X6Y7Z8A9B0C", assignment.ID)
+	assert.Equal(t, "5vJt0nQf3kZ2xH9cR1bW7yT4", assignment.ReportToken)
+	assert.Empty(t, assignment.MeasurementURL)
+	assert.Equal(t, fixedNow.Add(15*time.Minute), assignment.ExpiresAt)
+	assert.Equal(t, SampleSpec{
+		WindowsPerExit: 2, AttemptsPerWindow: 2,
+		WindowDurationSeconds: 45, FreshSessionDelayMS: 250,
+	}, assignment.Sample)
+	assert.Equal(t, []WindowChallenge{
+		{WindowIndex: 0, Challenge: "1789257600.hQ2mS8vTzXc1pL0aBd4eFg"},
+		{WindowIndex: 1, Challenge: "1789257600.kR7nJ3wYuMb5qN9cVe2tHi"},
+	}, assignment.Challenges)
+}
+
+func TestAcquireDecodesOutboundOptions(t *testing.T) {
+	s := wiredService(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, err := w.Write([]byte(`{
+			"candidate_outbound":{"type":"direct","tag":"candidate","bind_interface":"candidate-interface"},
+			"control_outbound":{"type":"direct","tag":"control","bind_interface":"control-interface"}
+		}`))
+		assert.NoError(t, err)
+	})
+	registry := outbound.NewRegistry()
+	direct.RegisterOutbound(registry)
+	s.api.ctx = service.ContextWith[O.OutboundOptionsRegistry](s.ctx, registry)
+
+	assignment, err := s.api.acquire("token", AssignmentRequest{})
+
+	require.NoError(t, err)
+	require.NotNil(t, assignment.Candidate)
+	require.NotNil(t, assignment.Control)
+	assert.Equal(t, "direct", assignment.Candidate.Type)
+	assert.Equal(t, "candidate", assignment.Candidate.Tag)
+	require.IsType(t, &O.DirectOutboundOptions{}, assignment.Candidate.Options)
+	assert.Equal(t, "candidate-interface", assignment.Candidate.Options.(*O.DirectOutboundOptions).BindInterface)
+	require.IsType(t, &O.DirectOutboundOptions{}, assignment.Control.Options)
+	assert.Equal(t, "control-interface", assignment.Control.Options.(*O.DirectOutboundOptions).BindInterface)
+}
+
 func TestAttestCarriesNoBearerCredential(t *testing.T) {
 	var authorization string
 	s := wiredService(t, func(w http.ResponseWriter, r *http.Request) {
 		authorization = r.Header.Get("Authorization")
-		require.NoError(t, json.NewEncoder(w).Encode(Attestation{Token: "attestation"}))
+		_, err := w.Write([]byte(`{"attestation_token":"attestation","expires_at":"2026-09-17T12:15:00Z"}`))
+		assert.NoError(t, err)
 	})
 
 	attestation, err := s.api.attest(context.Background(), AttestationRequest{})
@@ -89,7 +147,7 @@ func TestSubmitCarriesTheBearerTokenAndReport(t *testing.T) {
 		_, _ = w.Write([]byte(`{"accepted":true}`))
 	})
 
-	assert.NoError(t, s.api.submit(context.Background(), "runner-token", report))
+	assert.NoError(t, s.api.submit("runner-token", report))
 }
 
 func TestSubmitReportsHTTPFailures(t *testing.T) {
@@ -99,7 +157,7 @@ func TestSubmitReportsHTTPFailures(t *testing.T) {
 				w.WriteHeader(status)
 			})
 
-			assert.ErrorIs(t, s.api.submit(context.Background(), "token", Report{}), apiError{status: status})
+			assert.ErrorIs(t, s.api.submit("token", Report{}), apiError{status: status})
 		})
 	}
 }

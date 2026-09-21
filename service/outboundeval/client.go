@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
 
 	"github.com/getlantern/lantern-box/option"
@@ -52,6 +52,7 @@ func (e apiError) retryable() bool {
 // outbound, including attestation, whose source address the server attributes
 // the measurement to.
 type apiClient struct {
+	ctx            context.Context
 	http           *http.Client
 	acquireURL     string
 	attestURL      string
@@ -66,6 +67,7 @@ func newAPIClient(
 	options option.OutboundEvalServiceOptions,
 ) *apiClient {
 	return &apiClient{
+		ctx: ctx,
 		http: &http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -96,9 +98,9 @@ func (c *apiClient) close() {
 
 // acquire asks for one assignment, returning ErrNoAssignment when the server
 // has nothing to measure.
-func (c *apiClient) acquire(ctx context.Context, token string, request AssignmentRequest) (Assignment, error) {
+func (c *apiClient) acquire(token string, request AssignmentRequest) (Assignment, error) {
 	var assignment Assignment
-	err := c.post(ctx, c.acquireURL, token, request, &assignment)
+	err := c.post(c.ctx, c.acquireURL, token, request, &assignment)
 	var status apiError
 	if errors.As(err, &status) && status.status == http.StatusServiceUnavailable {
 		return Assignment{}, ErrNoAssignment
@@ -119,8 +121,8 @@ func (c *apiClient) attest(ctx context.Context, request AttestationRequest) (Att
 	return attestation, nil
 }
 
-func (c *apiClient) submit(ctx context.Context, token string, report Report) error {
-	if err := c.post(ctx, c.submitURL, token, report, nil); err != nil {
+func (c *apiClient) submit(token string, report Report) error {
+	if err := c.post(c.ctx, c.submitURL, token, report, nil); err != nil {
 		return fmt.Errorf("submit report: %w", err)
 	}
 	return nil
@@ -155,7 +157,7 @@ func (c *apiClient) post(ctx context.Context, endpoint, token string, request, r
 		_, err = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, maxControlResponseBytes))
 		return err
 	}
-	if err := json.NewDecoder(io.LimitReader(httpResponse.Body, maxControlResponseBytes)).Decode(response); err != nil {
+	if err := json.NewDecoderContext(c.ctx, io.LimitReader(httpResponse.Body, maxControlResponseBytes)).Decode(response); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil

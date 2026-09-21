@@ -58,7 +58,7 @@ func wiredService(t *testing.T, handler http.HandlerFunc) *Service {
 	s.timeService = liveTime{}
 	s.outbounds = service.FromContext[A.OutboundManager](ctx)
 	s.control = control
-	s.api = newAPIClient(ctx, control, time.Now, s.options)
+	s.api = newAPIClient(s.ctx, control, time.Now, s.options)
 	s.attest = s.api.attest
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 	return s
@@ -139,13 +139,6 @@ func TestStartRequiresBothArms(t *testing.T) {
 			assert.Error(t, created.Start(A.StartStateStart))
 		})
 	}
-}
-
-func TestStartWithoutAnOutboundManager(t *testing.T) {
-	created, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "eval", testOptions())
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, created.Close()) })
-	assert.Error(t, created.Start(A.StartStateStart))
 }
 
 func TestStartMeasuresNothingBeforeItsStage(t *testing.T) {

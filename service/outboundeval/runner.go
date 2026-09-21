@@ -45,7 +45,7 @@ func (s *Service) run() {
 		}
 		var err error
 		for {
-			if err = s.runCycle(s.ctx); !retryableCycleError(err) {
+			if err = s.runCycle(); !retryableCycleError(err) {
 				break
 			}
 			s.logger.Debug("outbound evaluation will retry: ", err)
@@ -68,8 +68,8 @@ func (s *Service) run() {
 	}
 }
 
-func (s *Service) runCycle(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
+func (s *Service) runCycle() error {
+	if err := s.ctx.Err(); err != nil {
 		return err
 	}
 	config := s.config.Load()
@@ -77,12 +77,6 @@ func (s *Service) runCycle(ctx context.Context) error {
 		s.pendingAssignment = nil
 		return errNoToken
 	}
-	candidate, found := s.outbounds.Outbound(config.OutboundTag)
-	if !found {
-		s.pendingAssignment = nil
-		return fmt.Errorf("%w: %q", errOutboundUnavailable, config.OutboundTag)
-	}
-
 	if s.pendingAssignment == nil || s.pendingAssignment.token != config.Token ||
 		s.pendingAssignment.request.CountryCode != config.CountryCode {
 		s.pendingAssignment = &pendingAssignment{
@@ -94,7 +88,7 @@ func (s *Service) runCycle(ctx context.Context) error {
 			},
 		}
 	}
-	assignment, err := s.api.acquire(ctx, config.Token, s.pendingAssignment.request)
+	assignment, err := s.api.acquire(config.Token, s.pendingAssignment.request)
 	if !retryableCycleError(err) {
 		s.pendingAssignment = nil
 	}
@@ -107,14 +101,15 @@ func (s *Service) runCycle(ctx context.Context) error {
 		return fmt.Errorf("validate assignment: %w", err)
 	}
 
-	gridCtx, cancel := context.WithTimeout(ctx, assignment.ExpiresAt.Sub(now))
-	defer cancel()
-	report := s.runAssignment(gridCtx, candidate, assignment)
-	return s.submitReport(ctx, config.Token, report)
+	report, err := s.measureAssignment(config.OutboundTag, assignment)
+	if err != nil {
+		return err
+	}
+	return s.submitReport(config.Token, report)
 }
 
 // submitReport refuses reports with unattested windows and retries transient submission failures.
-func (s *Service) submitReport(ctx context.Context, token string, report Report) error {
+func (s *Service) submitReport(token string, report Report) error {
 	for i, window := range report.Windows {
 		if window.AttestationToken == "" {
 			return fmt.Errorf("%w: window %d", errUnattestedReport, i)
@@ -122,15 +117,15 @@ func (s *Service) submitReport(ctx context.Context, token string, report Report)
 	}
 	var err error
 	for attempt := 1; attempt <= submitAttempts; attempt++ {
-		if err := ctx.Err(); err != nil {
+		if err := s.ctx.Err(); err != nil {
 			return err
 		}
-		err = s.api.submit(ctx, token, report)
+		err = s.api.submit(token, report)
 		if !retryableCycleError(err) {
 			return err
 		}
-		if attempt < submitAttempts && !sleepContext(ctx, s.retryDelay) {
-			return ctx.Err()
+		if attempt < submitAttempts && !sleepContext(s.ctx, s.retryDelay) {
+			return s.ctx.Err()
 		}
 	}
 	return err

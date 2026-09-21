@@ -1,7 +1,6 @@
 {
   "assignment_id": "01JB8Q2P9K3V4W5X6Y7Z8A9B0C",
   "report_token": "5vJt0nQf3kZ2xH9cR1bW7yT4",
-  "measurement_url": "https://measure.example/resource",
   "expires_at": "2026-09-17T12:15:00Z",
   "sample_spec": {
     "windows_per_exit": 2,

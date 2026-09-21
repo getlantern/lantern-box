@@ -11,40 +11,45 @@ import (
 )
 
 const (
-	attestAttempts    = 3
-	submitAttempts    = 3
-	defaultRetryDelay = 2 * time.Second
+	attestAttempts        = 3
+	submitAttempts        = 3
+	defaultRetryDelay     = 2 * time.Second
+	defaultMeasurementURL = "https://www.wikipedia.org/"
 )
 
-// runAssignment measures everything the assignment asks for through candidate,
-// against the control arm. Its report always fills the grid: a window that
-// could not be measured is filled with failed attempts on both arms.
-func (s *Service) runAssignment(ctx context.Context, candidate A.Outbound, assignment Assignment) Report {
+// runAssignment pads unmeasured attempts on both arms to fill the assignment's grid.
+func (s *Service) runAssignment(ctx context.Context, candidate, control A.Outbound, assignment Assignment) Report {
 	report := Report{
 		ReportToken:    assignment.ReportToken,
 		IdempotencyKey: assignment.ID,
 		Windows:        make([]WindowReport, 0, len(assignment.Challenges)),
 	}
 	for _, challenge := range assignment.Challenges {
-		report.Windows = append(report.Windows, s.runWindow(ctx, candidate, assignment, challenge))
+		report.Windows = append(report.Windows, s.runWindow(ctx, candidate, control, assignment, challenge))
 	}
 	return report
 }
 
 func (s *Service) runWindow(
 	ctx context.Context,
-	candidate A.Outbound,
+	candidate, control A.Outbound,
 	assignment Assignment,
 	challenge WindowChallenge,
 ) (window WindowReport) {
 	sample := assignment.Sample
+	target := assignment.MeasurementURL
+	if target == "" {
+		target = defaultMeasurementURL
+	}
 	window = WindowReport{
 		CandidateAttempts: make([]Attempt, 0, sample.AttemptsPerWindow),
 		ControlAttempts:   make([]Attempt, 0, sample.AttemptsPerWindow),
 	}
 	// The result is named so every way out of the window carries the instant
 	// it stopped observing.
-	defer func() { window.ObservedAt = s.timeService.TimeFunc()().UTC() }()
+	defer func() {
+		window.ObservedAt = s.timeService.TimeFunc()().UTC()
+	}()
 	// The spacing between windows precedes the window, so it is not charged
 	// against the time the window has to measure in.
 	if !sleepContext(ctx, sample.freshSessionDelay()) {
@@ -68,7 +73,7 @@ func (s *Service) runWindow(
 			break
 		}
 		candidateAttempt, controlAttempt := s.measurePair(
-			windowCtx, candidate, assignment.MeasurementURL, candidateFirst)
+			windowCtx, candidate, control, target, candidateFirst)
 		// An interrupted pair is inconclusive for both arms.
 		if windowCtx.Err() != nil && (interrupted(candidateAttempt) || interrupted(controlAttempt)) {
 			candidateAttempt = Attempt{FailureCode: failureWindowDeadline}
@@ -88,15 +93,15 @@ func interrupted(attempt Attempt) bool {
 
 func (s *Service) measurePair(
 	ctx context.Context,
-	candidate A.Outbound,
+	candidate, control A.Outbound,
 	target string,
 	candidateFirst bool,
 ) (candidateAttempt, controlAttempt Attempt) {
 	if candidateFirst {
 		candidateAttempt = s.measure(ctx, candidate, target)
-		controlAttempt = s.measure(ctx, s.control, target)
+		controlAttempt = s.measure(ctx, control, target)
 	} else {
-		controlAttempt = s.measure(ctx, s.control, target)
+		controlAttempt = s.measure(ctx, control, target)
 		candidateAttempt = s.measure(ctx, candidate, target)
 	}
 	return candidateAttempt, controlAttempt

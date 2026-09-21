@@ -103,7 +103,7 @@ func TestRunCycleMeasuresAndSubmitsACompleteGrid(t *testing.T) {
 	s := wiredService(t, api.handler(t))
 	s.measure = reachableMeasure
 
-	assert.NoError(t, s.runCycle(context.Background()))
+	assert.NoError(t, s.runCycle())
 
 	reports := api.reports()
 	require.Len(t, reports, 1)
@@ -161,8 +161,8 @@ func TestRunCycleAcquisitionKeys(t *testing.T) {
 				handler(w, r)
 			})
 
-			require.ErrorIs(t, s.runCycle(context.Background()), test.wantErr)
-			require.NoError(t, s.runCycle(context.Background()))
+			require.ErrorIs(t, s.runCycle(), test.wantErr)
+			require.NoError(t, s.runCycle())
 
 			require.Len(t, requests, 2)
 			for _, request := range requests {
@@ -190,7 +190,7 @@ func TestRunCycleAcquisitionKeyTracksConfig(t *testing.T) {
 				w.WriteHeader(http.StatusBadGateway)
 			})
 
-			require.Error(t, s.runCycle(context.Background()))
+			require.Error(t, s.runCycle())
 			config := *s.config.Load()
 			switch field {
 			case "token":
@@ -199,7 +199,7 @@ func TestRunCycleAcquisitionKeyTracksConfig(t *testing.T) {
 				config.CountryCode = "IR"
 			}
 			require.NoError(t, s.SetOutboundEvalConfig(config))
-			require.Error(t, s.runCycle(context.Background()))
+			require.Error(t, s.runCycle())
 
 			require.Len(t, requests, 2)
 			if field == "unchanged" {
@@ -218,7 +218,7 @@ func TestRunCycleRefusesAnExpiryTheBoxsClockRejects(t *testing.T) {
 	s.timeService = fixedTime{at: time.Now().Add(time.Hour)}
 	s.measure = reachableMeasure
 
-	assert.ErrorIs(t, s.runCycle(context.Background()), ErrInvalidContract)
+	assert.ErrorIs(t, s.runCycle(), ErrInvalidContract)
 	assert.Empty(t, api.reports())
 }
 
@@ -234,7 +234,7 @@ func TestRunCycleAcceptsAWindowLongerThanItNeeds(t *testing.T) {
 	s := wiredService(t, api.handler(t))
 	s.measure = reachableMeasure
 
-	require.NoError(t, s.runCycle(context.Background()))
+	require.NoError(t, s.runCycle())
 
 	reports := api.reports()
 	require.Len(t, reports, 1)
@@ -263,7 +263,7 @@ func TestRunCycleMeasuresOnlyUntilTheAssignmentExpires(t *testing.T) {
 		s := wireRunner(t, testOptions(), api.handler(t))
 
 		start := time.Now()
-		require.ErrorIs(t, s.runCycle(context.Background()), errUnattestedReport)
+		require.ErrorIs(t, s.runCycle(), errUnattestedReport)
 		assert.Equal(t, time.Second, time.Since(start))
 
 		assert.Empty(t, api.reports())
@@ -276,7 +276,7 @@ func TestRunCycleResubmitsAFinishedReport(t *testing.T) {
 	s := wiredService(t, api.handler(t))
 	s.measure = reachableMeasure
 
-	assert.NoError(t, s.runCycle(context.Background()))
+	assert.NoError(t, s.runCycle())
 
 	reports := api.reports()
 	require.Len(t, reports, 2, "a measured grid must not be dropped on one refusal")
@@ -303,7 +303,7 @@ func TestRunCycleKeepsItsCredentialForSubmissionRetries(t *testing.T) {
 		return reachableMeasure(ctx, out, target)
 	}
 
-	require.NoError(t, s.runCycle(context.Background()))
+	require.NoError(t, s.runCycle())
 
 	assert.Equal(t, []string{"Bearer " + original.Token, "Bearer " + original.Token}, authorizations)
 	assert.Equal(t, "rotated-token", s.config.Load().Token)
@@ -329,7 +329,7 @@ func TestRunCycleDoesNotSubmitUnattestedWindows(t *testing.T) {
 				return Attestation{}, test.err
 			}
 
-			require.ErrorIs(t, s.runCycle(context.Background()), errUnattestedReport)
+			require.ErrorIs(t, s.runCycle(), errUnattestedReport)
 			assert.Empty(t, api.reports())
 		})
 	}
@@ -344,7 +344,7 @@ func TestRunCycleSubmitsAttestedDeadlineFailures(t *testing.T) {
 			return Attempt{FailureCode: failureTimeout}
 		}
 
-		require.NoError(t, s.runCycle(context.Background()))
+		require.NoError(t, s.runCycle())
 
 		reports := api.reports()
 		require.Len(t, reports, 1)
@@ -366,7 +366,7 @@ func TestRunCycleGivesUpOnAReportAfterBoundedAttempts(t *testing.T) {
 	s := wiredService(t, api.handler(t))
 	s.measure = reachableMeasure
 
-	assert.ErrorIs(t, s.runCycle(context.Background()), apiError{status: http.StatusServiceUnavailable})
+	assert.ErrorIs(t, s.runCycle(), apiError{status: http.StatusServiceUnavailable})
 	assert.Len(t, api.reports(), submitAttempts)
 }
 
@@ -403,7 +403,7 @@ func TestRunCycleErrors(t *testing.T) {
 			s := wiredService(t, api.handler(t))
 			s.measure = reachableMeasure
 
-			assert.ErrorIs(t, s.runCycle(context.Background()), test.want)
+			assert.ErrorIs(t, s.runCycle(), test.want)
 		})
 	}
 }
@@ -416,7 +416,7 @@ func TestRunCycleWaitsForACredential(t *testing.T) {
 	idle.Token = ""
 	require.NoError(t, s.SetOutboundEvalConfig(idle))
 
-	assert.ErrorIs(t, s.runCycle(context.Background()), errNoToken)
+	assert.ErrorIs(t, s.runCycle(), errNoToken)
 	assert.Empty(t, api.reports())
 }
 
@@ -428,7 +428,7 @@ func TestRunCycleSkipsAnOutboundThatWentAway(t *testing.T) {
 	replaced.OutboundTag = "replacement"
 	require.NoError(t, s.SetOutboundEvalConfig(replaced))
 
-	err := s.runCycle(context.Background())
+	err := s.runCycle()
 	assert.ErrorIs(t, err, errOutboundUnavailable)
 	assert.ErrorContains(t, err, "replacement")
 	assert.Empty(t, api.reports())
@@ -439,9 +439,46 @@ func TestRunCycleStopsWhenClosing(t *testing.T) {
 	api.acquireStatus = http.StatusInternalServerError
 	s := wiredService(t, api.handler(t))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	assert.ErrorIs(t, s.runCycle(ctx), context.Canceled)
+	s.cancel()
+	assert.ErrorIs(t, s.runCycle(), context.Canceled)
+}
+
+type cancellationTransport struct {
+	http.RoundTripper
+	path    string
+	started chan struct{}
+}
+
+func (t cancellationTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Path != t.path {
+		return t.RoundTripper.RoundTrip(request)
+	}
+	close(t.started)
+	<-request.Context().Done()
+	return nil, request.Context().Err()
+}
+
+func TestCloseCancelsCycleAPIRequests(t *testing.T) {
+	for _, path := range []string{"/assignments", "/reports"} {
+		t.Run(path, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				api := newControlAPI()
+				s := wireRunner(t, testOptions(), api.handler(t))
+				started := make(chan struct{})
+				s.api.http.Transport = cancellationTransport{
+					RoundTripper: s.api.http.Transport, path: path, started: started,
+				}
+				done := make(chan error, 1)
+				go func() { done <- s.runCycle() }()
+				<-started
+
+				require.NoError(t, s.Close())
+
+				require.ErrorIs(t, <-done, context.Canceled)
+				assert.Empty(t, api.reports())
+			})
+		})
+	}
 }
 
 func TestRetryableCycleError(t *testing.T) {
@@ -493,6 +530,7 @@ func wireRunner(t *testing.T, options option.OutboundEvalServiceOptions, handler
 		"candidate": &stubOutbound{tag: "candidate"},
 	}}
 	s.api = &apiClient{
+		ctx:            s.ctx,
 		http:           &http.Client{Transport: handlerTransport{handler: handler}},
 		acquireURL:     s.options.AcquireURL,
 		attestURL:      s.options.AttestURL,

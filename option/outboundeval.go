@@ -21,13 +21,13 @@ type OutboundEvalServiceOptions struct {
 	// an ISO-3166 alpha-2 code.
 	CountryCode string `json:"country_code"`
 
-	// OutboundTag is the outbound measured as the candidate arm. It is resolved
-	// again before every cycle, so an embedder may replace the outbound it names
-	// while the service runs.
+	// OutboundTag is the candidate when an assignment does not supply both outbounds.
+	// It is resolved again for each assignment.
 	OutboundTag string `json:"outbound_tag"`
 
-	// ControlOutboundTag is the outbound measured as the control arm and used for
-	// every control API call. Exit attestation is attributed to the address it
+	// ControlOutboundTag carries every control API call and is the measurement
+	// control when an assignment does not supply both outbounds.
+	// Exit attestation is attributed to the address it
 	// arrives from, so this outbound must egress on the physical interface.
 	// Default "direct", which the configuration has to declare: sing-box
 	// creates an implicit direct outbound only for a configuration that

@@ -1,10 +1,4 @@
-// Package outboundeval measures one outbound against the un-proxied path and
-// reports the pair to a control API.
-//
-// A cycle asks the control API for an assignment, proves which address it is
-// measuring from, fetches the assigned resource through both arms as many times
-// as the assignment asks for, and submits the result. An assignment names the
-// resource and the sample, and nothing about what is under test.
+// Package outboundeval measures paired outbounds and reports the results to a control API.
 package outboundeval
 
 import (
@@ -77,7 +71,13 @@ type Service struct {
 	wake      chan struct{}
 	started   atomic.Bool
 	closeOnce sync.Once
+	closeErr  error
 
+	// assignmentMu serializes outbound creation and removal with Close.
+	assignmentMu   sync.Mutex
+	assignmentTags []string
+
+	router    A.Router
 	outbounds A.OutboundManager
 	control   A.Outbound
 	api       *apiClient
@@ -114,6 +114,8 @@ func NewService(
 		return nil, err
 	}
 	runCtx, cancel := context.WithCancel(ctx)
+	outbounds := service.FromContext[A.OutboundManager](ctx)
+	router := service.FromContext[A.Router](ctx)
 	s := &Service{
 		Adapter: boxService.NewAdapter(constant.TypeOutboundEval, tag),
 		ctx:     runCtx,
@@ -122,6 +124,9 @@ func NewService(
 		logger:  logger,
 		options: options,
 		wake:    make(chan struct{}, 1),
+
+		router:    router,
+		outbounds: outbounds,
 
 		retryDelay: defaultRetryDelay,
 		retryBase:  retryBaseWait,
@@ -145,17 +150,13 @@ func (s *Service) Start(stage A.StartStage) error {
 	if stage != A.StartStateStart {
 		return nil
 	}
-	outbounds := service.FromContext[A.OutboundManager](s.ctx)
-	if outbounds == nil {
-		return errors.New("no outbound manager in context")
-	}
-	control, found := outbounds.Outbound(s.options.ControlOutboundTag)
+	control, found := s.outbounds.Outbound(s.options.ControlOutboundTag)
 	if !found {
 		return fmt.Errorf("control outbound %q is not declared in this config",
 			s.options.ControlOutboundTag)
 	}
 	candidateTag := s.config.Load().OutboundTag
-	if _, found := outbounds.Outbound(candidateTag); !found {
+	if _, found := s.outbounds.Outbound(candidateTag); !found {
 		return fmt.Errorf("outbound under test %q is not declared in this config",
 			candidateTag)
 	}
@@ -184,7 +185,6 @@ func (s *Service) Start(stage A.StartStage) error {
 		service.MustRegister[ntp.TimeService](s.ctx, ntpService)
 		s.timeService = ntpService
 	}
-	s.outbounds = outbounds
 	s.control = control
 	s.api = newAPIClient(s.ctx, control, s.timeService.TimeFunc(), s.options)
 	s.attest = s.api.attest
@@ -196,6 +196,7 @@ func (s *Service) Start(stage A.StartStage) error {
 func (s *Service) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancel()
+		s.closeErr = s.closeAssignmentOutbounds()
 		if s.started.Load() {
 			select {
 			case <-s.done:
@@ -207,7 +208,7 @@ func (s *Service) Close() error {
 			s.api.close()
 		}
 	})
-	return nil
+	return s.closeErr
 }
 
 // SetOutboundEvalConfig implements adapter.OutboundEvalConfigSetter. It rejects
