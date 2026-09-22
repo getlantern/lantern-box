@@ -155,9 +155,10 @@ const (
 	maxJunkLen = 64
 )
 
-// newJunk returns 8–64 random bytes with the QUIC long-header bit set. Servers
-// silently drop long-header packets shorter than 1200 bytes whose version they
-// don't support, and so never answer the junk.
+// newJunk returns 8–64 random bytes with the QUIC long-header bit set. quic-go
+// drops long-header packets under 1200 bytes with an unsupported version before
+// it considers version negotiation, and drops the ~1-in-2^32 all-zero-version
+// case as a Version Negotiation packet, so the server never answers the junk.
 func newJunk() ([]byte, error) {
 	n, err := rand.Int(rand.Reader, big.NewInt(maxJunkLen-minJunkLen+1))
 	if err != nil {

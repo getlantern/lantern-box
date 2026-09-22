@@ -78,6 +78,8 @@ func TestHysteria2XPreInitialJunk(t *testing.T) {
 				require.LessOrEqual(t, len(first[0]), 64)
 				require.NotZero(t, first[0][0]&0x80, "junk must carry the long-header bit")
 				require.True(t, isQUICv1Initial(first[1]), "the Initial must follow the junk")
+				require.Equal(t, 0, relay.serverDatagramsBeforeClient(2),
+					"the server must stay silent until the client's Initial; a reply to the junk is a recognizable datagram on the flow")
 			} else {
 				require.True(t, isQUICv1Initial(first[0]), "without junk the Initial comes first")
 			}
@@ -121,6 +123,9 @@ type recordingUDPRelay struct {
 	port uint16
 	mu   sync.Mutex
 	sent [][]byte
+	// order logs each datagram's direction as it crossed the relay: true for
+	// client-to-server.
+	order []bool
 }
 
 func startRecordingUDPRelay(t *testing.T, serverPort uint16) *recordingUDPRelay {
@@ -146,6 +151,7 @@ func startRecordingUDPRelay(t *testing.T, serverPort uint16) *recordingUDPRelay 
 			addrMu.Unlock()
 			r.mu.Lock()
 			r.sent = append(r.sent, append([]byte(nil), buf[:n]...))
+			r.order = append(r.order, true)
 			r.mu.Unlock()
 			_, _ = back.Write(buf[:n])
 		}
@@ -157,6 +163,9 @@ func startRecordingUDPRelay(t *testing.T, serverPort uint16) *recordingUDPRelay 
 			if err != nil {
 				return
 			}
+			r.mu.Lock()
+			r.order = append(r.order, false)
+			r.mu.Unlock()
 			addrMu.Lock()
 			addr := clientAddr
 			addrMu.Unlock()
@@ -172,4 +181,22 @@ func (r *recordingUDPRelay) firstDatagrams(n int) [][]byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.sent[:min(n, len(r.sent))]
+}
+
+// serverDatagramsBeforeClient counts server-to-client datagrams that crossed
+// the relay before the client's nth datagram.
+func (r *recordingUDPRelay) serverDatagramsBeforeClient(n int) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fromServer, fromClient := 0, 0
+	for _, c := range r.order {
+		if c {
+			if fromClient++; fromClient == n {
+				break
+			}
+		} else {
+			fromServer++
+		}
+	}
+	return fromServer
 }
