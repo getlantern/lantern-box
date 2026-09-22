@@ -27,8 +27,9 @@ func TestNewJunkShape(t *testing.T) {
 	}
 }
 
-// TestStockServerNeverAnswersJunk sends a few hundred junk datagrams straight
-// to a stock hysteria2 inbound and requires silence. Junk that answers would
+// TestStockServerNeverAnswersJunk first confirms a stock hysteria2 inbound
+// answers a full-size unknown-version packet, then sends it a few hundred junk
+// datagrams and requires silence. Junk that answers would
 // hand the censor a recognizable server datagram (for example a Version
 // Negotiation) on a flow meant to open with unparseable bytes. Random DCID
 // lengths make many of these datagrams parse as long headers, so this exercises
@@ -50,6 +51,25 @@ func TestStockServerNeverAnswersJunk(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, server.Start())
 	t.Cleanup(func() { server.Close() })
+
+	// Control: a full-size unknown-version packet must draw a Version
+	// Negotiation, or silence below proves nothing about the server listening.
+	control, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+	require.NoError(t, err)
+	pkt := make([]byte, 1300)
+	pkt[0] = 0xc0
+	copy(pkt[1:5], []byte{0x1a, 0x2a, 0x3a, 0x4a})
+	pkt[5] = 8  // DCID length
+	pkt[14] = 8 // SCID length
+	_, err = control.Write(pkt)
+	require.NoError(t, err)
+	require.NoError(t, control.SetReadDeadline(time.Now().Add(2*time.Second)))
+	vn := make([]byte, 2048)
+	n, err := control.Read(vn)
+	control.Close()
+	require.NoError(t, err, "control: server must answer a 1300-byte unknown-version packet")
+	require.GreaterOrEqual(t, n, 5)
+	require.Equal(t, []byte{0, 0, 0, 0}, vn[1:5], "control reply must be a Version Negotiation")
 
 	for flow := range 20 {
 		conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
