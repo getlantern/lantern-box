@@ -1,6 +1,6 @@
 # lantern-box
 
-Lantern Box is a censorship circumvention proxy and client platform that's built on [sing-box](https://github.com/SagerNet/sing-box) -- the universal proxy platform -- with extra protocols built for places where the internet comes with walls. It adds [Samizdat](https://github.com/getlantern/samizdat), [Reflex](https://github.com/getlantern/engineering/issues/3166), [WATER](https://arxiv.org/html/2312.00163v2), [Outline SDK smart dialer](https://github.com/Jigsaw-Code/outline-sdk/tree/main/x/smart), [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/), and [ALGeneva](https://www.usenix.org/system/files/sec22-harrity.pdf) to the sing-box ecosystem.
+Lantern Box is a censorship circumvention proxy and client platform that's built on [sing-box](https://github.com/SagerNet/sing-box) -- the universal proxy platform -- with extra protocols built for places where the internet comes with walls. It adds [Samizdat](https://github.com/getlantern/samizdat), [Reflex](https://github.com/getlantern/engineering/issues/3166), [WATER](https://arxiv.org/html/2312.00163v2), [Outline SDK smart dialer](https://github.com/Jigsaw-Code/outline-sdk/tree/main/x/smart), [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/), [ALGeneva](https://www.usenix.org/system/files/sec22-harrity.pdf), and Hysteria2X (hysteria2 with QUIC-censorship evasions) to the sing-box ecosystem.
 
 The goal is to be as useful as possible to the censorship circumvention community. Operators are encouraged to run servers and hand configs to users. We contribute changes upstream whenever we can.
 
@@ -80,6 +80,7 @@ Pick the protocol that fits your threat model.
 | **Outline SDK** | DNS/SNI blocking (smart dialer) | No | No |
 | **AmneziaWG** | WireGuard protocol fingerprinting | WireGuard keys | Yes |
 | **ALGeneva** | HTTP-level DPI (header inspection) | No | Yes |
+| **Hysteria2X** | QUIC Initial / SNI inspection (China's GFW) | Same as hysteria2 | Yes (stock hysteria2) |
 
 ---
 
@@ -602,6 +603,44 @@ The server doesn't need a strategy -- it just accepts connections and forwards t
 ```
 
 Point your browser's SOCKS5 proxy at `127.0.0.1:1080` and you're done.
+
+---
+
+### Hysteria2X
+
+The stock sing-box [hysteria2](https://sing-box.sagernet.org/configuration/outbound/hysteria2/) outbound, plus client-side evasions against QUIC censorship. It's a drop-in client for an **unmodified hysteria2 server**: keep the server's `"type": "hysteria2"` inbound as it is, and change only the client outbound's `type` to `hysteria2x`. It accepts every hysteria2 outbound option, plus these:
+
+| Option | Default | Effect |
+|---|---|---|
+| `pre_initial_junk` | `false` | Sends one random 8–64 byte datagram on each new UDP flow, including each port hop, before the QUIC Initial. |
+
+**Why `pre_initial_junk` works:** China's GFW decrypts QUIC Initials and blocks by SNI. It assumes the first datagram of a UDP flow is the Initial, and when it can't parse that datagram it stops inspecting the flow, so the real Initial goes through uninspected (GFW Report, [Exposing and Circumventing SNI-based QUIC Censorship of the Great Firewall of China](https://gfw.report/publications/usenixsecurity25/en/), USENIX Security 2025, §7). The server drops the junk without replying: it's a long-header packet under 1200 bytes with an unknown version, so quic-go discards it before version negotiation.
+
+**When to use it:** A censor that inspects QUIC by SNI, like China's since April 2024. It stacks with hysteria2's own ECH (`tls.ech`) and with quic-go's default SNI slicing. Leave salamander `obfs` off, because obfs already hides the Initial.
+
+The outbound is only registered in `with_quic` builds, the same as sing-box's hysteria2. A build without the tag doesn't advertise `hysteria2x`, so a Lantern server never assigns it a `hysteria2x` config.
+
+#### Client config
+
+```json
+{
+  "outbounds": [
+    {
+      "type": "hysteria2x",
+      "tag": "hy2x-out",
+      "server": "YOUR_SERVER_IP",
+      "server_port": 65535,
+      "password": "YOUR_PASSWORD",
+      "pre_initial_junk": true,
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "insecure": true
+      }
+    }
+  ]
+}
+```
 
 ---
 

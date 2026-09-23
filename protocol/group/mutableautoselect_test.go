@@ -315,6 +315,7 @@ func TestBehaviorFor_Timeouts(t *testing.T) {
 		{C.TypeHTTP, 2000 * time.Millisecond},
 		{C.TypeHysteria, 1500 * time.Millisecond},
 		{C.TypeHysteria2, 1500 * time.Millisecond},
+		{lConst.TypeHysteria2X, 1500 * time.Millisecond},
 		{lConst.TypeOutline, 10000 * time.Millisecond},
 		{lConst.TypeReflex, 3000 * time.Millisecond},
 		{lConst.TypeSamizdat, 3000 * time.Millisecond},

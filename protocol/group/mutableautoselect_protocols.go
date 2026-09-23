@@ -32,7 +32,7 @@ func behaviorFor(outboundType string) protocolBehavior {
 		return protocolBehavior{probeTimeout: 2000 * time.Millisecond}
 	case C.TypeHysteria:
 		return protocolBehavior{probeTimeout: 1500 * time.Millisecond}
-	case C.TypeHysteria2:
+	case C.TypeHysteria2, lConst.TypeHysteria2X:
 		return protocolBehavior{probeTimeout: 1500 * time.Millisecond}
 	case lConst.TypeOutline:
 		return protocolBehavior{probeTimeout: 10000 * time.Millisecond}
