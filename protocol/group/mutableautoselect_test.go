@@ -16,6 +16,8 @@ import (
 	sbAdapter "github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
@@ -1121,6 +1123,84 @@ type failingPacketConn struct {
 func (c *failingPacketConn) ReadFrom(p []byte) (int, net.Addr, error)  { return 0, nil, c.err }
 func (c *failingPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
 func (c *failingPacketConn) Close() error                              { return nil }
+
+// addressedPacketConn stands in for a per-packet-addressed outbound conn: it
+// records each WritePacket destination and, like shadowsocks, needs headroom
+// around the payload.
+type addressedPacketConn struct {
+	net.PacketConn
+	writeErr error
+	written  []metadata.Socksaddr
+}
+
+const addressedFrontHeadroom, addressedRearHeadroom = 32, 16
+
+func (c *addressedPacketConn) WritePacket(buffer *buf.Buffer, destination metadata.Socksaddr) error {
+	defer buffer.Release()
+	if buffer.Start() < addressedFrontHeadroom || buffer.FreeLen() < addressedRearHeadroom {
+		return errors.New("insufficient headroom")
+	}
+	c.written = append(c.written, destination)
+	return c.writeErr
+}
+
+func (c *addressedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.written = append(c.written, metadata.SocksaddrFromNet(addr))
+	return len(p), c.writeErr
+}
+
+func (c *addressedPacketConn) ReadPacket(*buf.Buffer) (metadata.Socksaddr, error) {
+	return metadata.Socksaddr{}, io.EOF
+}
+func (c *addressedPacketConn) FrontHeadroom() int { return addressedFrontHeadroom }
+func (c *addressedPacketConn) RearHeadroom() int  { return addressedRearHeadroom }
+func (c *addressedPacketConn) Close() error       { return nil }
+
+func newPayload(t *testing.T) *buf.Buffer {
+	t.Helper()
+	b := buf.New()
+	_, err := b.WriteString("ntp")
+	require.NoError(t, err)
+	return b
+}
+
+func TestListenPacket_WritePacketKeepsDomainDestination(t *testing.T) {
+	// A domain destination must reach the member outbound intact through the
+	// group's wrappers; sing's net.PacketConn adapter would strip it to an
+	// IP-only address, which per-packet-addressed outbounds reject.
+	s, obs := newTestMUR(t, "a")
+	recordSuccess(s, "a", 10)
+	inner := &addressedPacketConn{}
+	obs["a"].On("ListenPacket").Return(inner, nil)
+
+	conn, err := s.ListenPacket(context.Background(), metadata.Socksaddr{})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	dst := metadata.ParseSocksaddr("time.android.com:123")
+	require.NoError(t, bufio.NewPacketConn(conn).WritePacket(newPayload(t), dst),
+		"the write should reach the member with the headroom it needs")
+	require.Equal(t, []metadata.Socksaddr{dst}, inner.written,
+		"the member must receive the domain destination")
+}
+
+func TestDataPlanePacket_WritePacketReset_AttributesFailure(t *testing.T) {
+	// WritePacket shares noteIO with WriteTo, so a reset on it is charged.
+	var calls atomic.Uint32
+	inner := &addressedPacketConn{writeErr: connResetErr()}
+	d := newDataPlanePacket(inner, time.Hour, 4, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	defer d.Close()
+
+	b := buf.NewSize(128)
+	b.Resize(addressedFrontHeadroom, 0)
+	_, err := b.WriteString("ntp")
+	require.NoError(t, err)
+	require.Error(t, d.WritePacket(b, metadata.ParseSocksaddr("time.android.com:123")),
+		"WritePacket should have returned the reset error")
+
+	require.Eventually(t, func() bool { return calls.Load() == 1 },
+		time.Second, 5*time.Millisecond, "a reset on WritePacket must attribute a failure")
+}
 
 func connResetErr() error {
 	return &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
