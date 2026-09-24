@@ -9,6 +9,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+
 	"github.com/getlantern/lantern-box/adapter"
 )
 
@@ -214,6 +219,7 @@ func (d *dataPlaneStream) Upstream() any { return d.Conn }
 type dataPlanePacket struct {
 	net.PacketConn
 	dataPlaneWatchdog
+	writer N.PacketWriter
 }
 
 func newDataPlanePacket(
@@ -223,7 +229,7 @@ func newDataPlanePacket(
 	onFailure func(adapter.UserFailureKind),
 	onActivity func(),
 ) *dataPlanePacket {
-	d := &dataPlanePacket{PacketConn: c}
+	d := &dataPlanePacket{PacketConn: c, writer: bufio.NewPacketConn(c)}
 	d.init(idle, provedReadBytes, onFailure, onActivity)
 	return d
 }
@@ -240,6 +246,24 @@ func (d *dataPlanePacket) WriteTo(p []byte, addr net.Addr) (int, error) {
 	return n, err
 }
 
+// ReadPacket reads through ReadFrom, so the watchdog sees the read.
+func (d *dataPlanePacket) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	_, addr, err := buffer.ReadPacketFrom(d)
+	if err != nil {
+		return M.Socksaddr{}, err
+	}
+	return M.SocksaddrFromNet(addr).Unwrap(), nil
+}
+
+// WritePacket passes domain-name destinations through; bufio's
+// net.PacketConn adapter would strip them to IP-only.
+func (d *dataPlanePacket) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	n := buffer.Len()
+	err := d.writer.WritePacket(buffer, destination)
+	d.noteIO(n, err, false)
+	return err
+}
+
 func (d *dataPlanePacket) Close() error {
 	if !d.closeWatchdog() {
 		return nil
@@ -250,6 +274,6 @@ func (d *dataPlanePacket) Close() error {
 func (d *dataPlanePacket) Upstream() any { return d.PacketConn }
 
 var (
-	_ net.Conn       = (*dataPlaneStream)(nil)
-	_ net.PacketConn = (*dataPlanePacket)(nil)
+	_ net.Conn        = (*dataPlaneStream)(nil)
+	_ N.NetPacketConn = (*dataPlanePacket)(nil)
 )
