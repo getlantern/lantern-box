@@ -17,20 +17,55 @@ import (
 	"github.com/getlantern/lantern-box/adapter"
 )
 
+// Five seconds is a provisional margin below the default 10s DNS/NTP/STUN idle
+// timeout. Delayed resets after partial replies can also be excused.
+const defaultDataPlaneResetQuiet = 5 * time.Second
+
+type dataPlaneHooks struct {
+	onFailure func(adapter.UserFailureKind)
+	// onError runs on the IO goroutine, outside the watchdog's lock.
+	onError    func(err error, state dataPlaneIO, excused bool)
+	onActivity func()
+}
+
 // makeHooks returns callbacks wired into data-plane wrappers. Failure
 // handling re-checks membership at fire time, drops non-chargeable or
 // deduped events, and starts a ladder only for recorded failures.
-func (s *MutableAutoSelect) makeHooks(outerTag string, route routeKind) (onFailure func(adapter.UserFailureKind), onActivity func()) {
-	onFailure = func(kind adapter.UserFailureKind) {
-		if !s.chargeable(outerTag, route) {
-			return
-		}
-		if !s.recordUserFailure(outerTag, kind) {
-			return
-		}
-		go s.runLadder(outerTag)
+func (s *MutableAutoSelect) makeHooks(outerTag string, route routeKind) dataPlaneHooks {
+	return dataPlaneHooks{
+		onFailure: func(kind adapter.UserFailureKind) {
+			if !s.chargeable(outerTag, route) {
+				return
+			}
+			if !s.recordUserFailure(outerTag, kind) {
+				return
+			}
+			go s.runLadder(outerTag)
+		},
+		onError: func(err error, state dataPlaneIO, excused bool) {
+			decision := "candidate"
+			if excused {
+				decision = "excused"
+			}
+			last := "none"
+			if state.hasIO {
+				last = "read"
+				if state.lastWasWrite {
+					last = "write"
+				}
+			}
+			s.logger.Debug("data-plane error: tag=", outerTag, " decision=", decision,
+				" err=", err, " quiet=", state.quiet, " last=", last, " proven=", state.proven)
+		},
+		onActivity: s.bumpActive,
 	}
-	return onFailure, s.bumpActive
+}
+
+type dataPlaneIO struct {
+	hasIO        bool
+	lastWasWrite bool
+	quiet        time.Duration
+	proven       bool
 }
 
 // dataPlaneWatchdog is the no-traffic stall timer shared by the stream
@@ -42,32 +77,36 @@ func (s *MutableAutoSelect) makeHooks(outerTag string, route routeKind) (onFailu
 // traffic" (e.g. a handshake-only or keepalive-only conn) and the
 // stall handler is suppressed.
 //
-// lastWasWrite separately distinguishes "tunnel is broken" from "user
-// stopped sending traffic" on an already-proven conn. The stall fires
-// only when the most recent non-empty IO was a Write — i.e. we sent
-// bytes and got nothing back for the idle window. A proven conn whose
-// last activity was a Read (response arrived, then silence) is treated
-// as user-idle, not broken: a healthy keep-alive going unused looks
-// identical to a broken tunnel without this gate.
+// The direction of the last non-empty IO separately distinguishes "tunnel
+// is broken" from "user stopped sending traffic" on an already-proven conn.
+// The stall fires only when the most recent non-empty IO was a Write —
+// i.e. we sent bytes and got nothing back for the idle window. A proven
+// conn whose last activity was a Read (response arrived, then silence) is
+// treated as user-idle, not broken: a healthy keep-alive going unused
+// looks identical to a broken tunnel without this gate.
+//
+// endsQuietRead extends that rule to transport errors.
 type dataPlaneWatchdog struct {
 	idle            time.Duration
-	onFailure       func(adapter.UserFailureKind)
-	onActivity      func()
+	hooks           dataPlaneHooks
 	provedReadBytes uint64
+	born            time.Time
+	ioMu            sync.Mutex
+	lastIO          time.Time // guarded by ioMu
+	lastWasWrite    bool      // guarded by ioMu
 	readBytes       atomic.Uint64
 	proven          atomic.Bool
-	lastWasWrite    atomic.Bool
 	stalled         atomic.Bool
 	fired           atomic.Bool
 	timer           *time.Timer
 	closeOnce       sync.Once
 }
 
-func (w *dataPlaneWatchdog) init(idle time.Duration, provedReadBytes uint64, onFailure func(adapter.UserFailureKind), onActivity func()) {
+func (w *dataPlaneWatchdog) init(idle time.Duration, provedReadBytes uint64, hooks dataPlaneHooks) {
 	w.idle = idle
 	w.provedReadBytes = provedReadBytes
-	w.onFailure = onFailure
-	w.onActivity = onActivity
+	w.hooks = hooks
+	w.born = time.Now()
 	w.timer = time.AfterFunc(idle, w.fireStall)
 }
 
@@ -84,6 +123,11 @@ func isDataPlaneFailure(err error) bool {
 	return true
 }
 
+func endsQuietRead(isRead bool, n int, state dataPlaneIO) bool {
+	return isRead && n == 0 && state.hasIO && !state.lastWasWrite &&
+		state.quiet >= defaultDataPlaneResetQuiet
+}
+
 func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	// Short-circuit once stalled: a late noteIO must not re-arm the
 	// timer, fire onActivity, or attribute a failure after the conn is
@@ -91,24 +135,29 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	if w.stalled.Load() {
 		return
 	}
-	// Attribute mid-stream transport failures immediately.
 	if isDataPlaneFailure(err) {
-		w.fireResetFailure()
+		state := w.snapshotIO()
+		excused := endsQuietRead(isRead, n, state)
+		if !excused {
+			w.fireResetFailure()
+		}
+		if w.hooks.onError != nil {
+			w.hooks.onError(err, state, excused)
+		}
 		return
 	}
 	// Ignore empty I/O and benign terminal conditions.
 	if n <= 0 || err != nil {
 		return
 	}
-	// Publish the gate value before re-arming the timer so a fireStall
-	// racing the Reset reads the fresh classification, not the previous
-	// IO's value. Otherwise a Read landing just as the timer fires
-	// could leave lastWasWrite=true from an earlier Write and trip
-	// the gate it's supposed to suppress.
-	w.lastWasWrite.Store(!isRead)
+	// Publish the IO state before re-arming the stall timer.
+	w.ioMu.Lock()
+	w.lastIO = time.Now()
+	w.lastWasWrite = !isRead
+	w.ioMu.Unlock()
 	w.timer.Reset(w.idle)
-	if w.onActivity != nil {
-		w.onActivity()
+	if w.hooks.onActivity != nil {
+		w.hooks.onActivity()
 	}
 	if !isRead {
 		return
@@ -123,6 +172,22 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	total := w.readBytes.Add(uint64(n))
 	if total >= w.provedReadBytes {
 		w.proven.Store(true)
+	}
+}
+
+func (w *dataPlaneWatchdog) snapshotIO() dataPlaneIO {
+	w.ioMu.Lock()
+	defer w.ioMu.Unlock()
+	last := w.lastIO
+	hasIO := !last.IsZero()
+	if !hasIO {
+		last = w.born
+	}
+	return dataPlaneIO{
+		hasIO:        hasIO,
+		lastWasWrite: w.lastWasWrite,
+		quiet:        time.Since(last),
+		proven:       w.proven.Load(),
 	}
 }
 
@@ -145,7 +210,7 @@ func (w *dataPlaneWatchdog) fireStall() {
 	if !w.proven.Load() {
 		return
 	}
-	if !w.lastWasWrite.Load() {
+	if !w.snapshotIO().lastWasWrite {
 		return
 	}
 	if !w.stalled.CompareAndSwap(false, true) {
@@ -154,14 +219,12 @@ func (w *dataPlaneWatchdog) fireStall() {
 	if !w.fired.CompareAndSwap(false, true) {
 		return
 	}
-	if w.onFailure != nil {
-		w.onFailure(adapter.UserFailureStall)
+	if w.hooks.onFailure != nil {
+		w.hooks.onFailure(adapter.UserFailureStall)
 	}
 }
 
-// fireResetFailure demotes on a mid-stream transport error. Unlike fireStall it skips
-// the proven/lastWasWrite gates — an explicit reset is unambiguous even before a
-// conn is proven. Fire and attribution happens at most once.
+// fireResetFailure attributes a non-excused error once, even on an unproven conn.
 func (w *dataPlaneWatchdog) fireResetFailure() {
 	if !w.stalled.CompareAndSwap(false, true) {
 		return
@@ -169,10 +232,10 @@ func (w *dataPlaneWatchdog) fireResetFailure() {
 	if !w.fired.CompareAndSwap(false, true) {
 		return
 	}
-	if w.onFailure != nil {
+	if w.hooks.onFailure != nil {
 		// run onFailure in a goroutine to avoid deadlocks: the callback may call back
 		// into the selector, which may hold locks that the data-plane IO path also needs.
-		go w.onFailure(adapter.UserFailureReset)
+		go w.hooks.onFailure(adapter.UserFailureReset)
 	}
 }
 
@@ -183,9 +246,9 @@ type dataPlaneStream struct {
 	dataPlaneWatchdog
 }
 
-func newDataPlaneStream(c net.Conn, idle time.Duration, provedReadBytes uint64, onFailure func(adapter.UserFailureKind), onActivity func()) *dataPlaneStream {
+func newDataPlaneStream(c net.Conn, idle time.Duration, provedReadBytes uint64, hooks dataPlaneHooks) *dataPlaneStream {
 	d := &dataPlaneStream{Conn: c}
-	d.init(idle, provedReadBytes, onFailure, onActivity)
+	d.init(idle, provedReadBytes, hooks)
 	return d
 }
 
@@ -226,11 +289,10 @@ func newDataPlanePacket(
 	c net.PacketConn,
 	idle time.Duration,
 	provedReadBytes uint64,
-	onFailure func(adapter.UserFailureKind),
-	onActivity func(),
+	hooks dataPlaneHooks,
 ) *dataPlanePacket {
 	d := &dataPlanePacket{PacketConn: c, writer: bufio.NewPacketConn(c)}
-	d.init(idle, provedReadBytes, onFailure, onActivity)
+	d.init(idle, provedReadBytes, hooks)
 	return d
 }
 

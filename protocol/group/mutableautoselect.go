@@ -566,14 +566,14 @@ func (s *MutableAutoSelect) chargeable(tag string, route routeKind) bool {
 }
 
 func (s *MutableAutoSelect) wrapStream(conn net.Conn, o A.Outbound, route routeKind) net.Conn {
-	onStall, onActivity := s.makeHooks(o.Tag(), route)
-	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, onStall, onActivity)
+	hooks := s.makeHooks(o.Tag(), route)
+	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, hooks)
 	return adapter.NewTaggedConn(wrapped, realTag(o))
 }
 
 func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, o A.Outbound, route routeKind) net.PacketConn {
-	onStall, onActivity := s.makeHooks(o.Tag(), route)
-	wrapped := newDataPlanePacket(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, onStall, onActivity)
+	hooks := s.makeHooks(o.Tag(), route)
+	wrapped := newDataPlanePacket(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, hooks)
 	return adapter.NewTaggedPacketConn(wrapped, realTag(o))
 }
 
