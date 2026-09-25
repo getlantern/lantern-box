@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -35,7 +36,7 @@ func TestOutboundEvalCreatesAndRemovesAssignmentOutbounds(t *testing.T) {
 		Challenges: []outboundeval.WindowChallenge{{Challenge: "challenge"}},
 		ExpiresAt:  time.Now().Add(time.Minute),
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/assignments":
 			assert.NoError(t, json.NewEncoder(w).Encode(assignment))
@@ -65,6 +66,9 @@ func TestOutboundEvalCreatesAndRemovesAssignmentOutbounds(t *testing.T) {
 	assignment.MeasurementURL = server.URL + "/measure"
 	ctx := evalBoxContext()
 	options := evalBoxOptions(server.URL, "token", bothArms())
+	options.Certificate = &option.CertificateOptions{
+		Certificate: []string{string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}))},
+	}
 	options.Services[0].Options.(*lboption.OutboundEvalServiceOptions).PollInterval = badoption.Duration(time.Hour)
 	instance, err := sbox.New(sbox.Options{Context: ctx, Options: options})
 	require.NoError(t, err)

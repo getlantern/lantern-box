@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -258,14 +259,21 @@ func withDefaults(options option.OutboundEvalServiceOptions) option.OutboundEval
 }
 
 func validateOptions(options option.OutboundEvalServiceOptions) error {
-	if options.AcquireURL == "" {
-		return errors.New("acquire_url is required")
-	}
-	if options.AttestURL == "" {
-		return errors.New("attest_url is required")
-	}
-	if options.SubmitURL == "" {
-		return errors.New("submit_url is required")
+	for _, endpoint := range []struct {
+		name  string
+		value string
+	}{
+		{"acquire_url", options.AcquireURL},
+		{"attest_url", options.AttestURL},
+		{"submit_url", options.SubmitURL},
+	} {
+		if endpoint.value == "" {
+			return fmt.Errorf("%s is required", endpoint.name)
+		}
+		parsed, err := url.Parse(endpoint.value)
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
+			return fmt.Errorf("%s must be an absolute HTTPS URL with a hostname", endpoint.name)
+		}
 	}
 	if options.OutboundTag == "" {
 		return errors.New("outbound_tag is required")

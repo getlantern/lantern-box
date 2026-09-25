@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -151,13 +152,17 @@ func (c *controlAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // point of the assertion: the grid still has to arrive complete.
 func TestOutboundEvalRunsInsideABox(t *testing.T) {
 	api := &controlAPI{t: t, reported: make(chan struct{})}
-	server := httptest.NewServer(api)
+	server := httptest.NewTLSServer(api)
 	t.Cleanup(server.Close)
 
 	boxCtx := evalBoxContext()
+	options := evalBoxOptions(server.URL, "e2e-token", bothArms())
+	options.Certificate = &option.CertificateOptions{
+		Certificate: []string{string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}))},
+	}
 	instance, err := sbox.New(sbox.Options{
 		Context: boxCtx,
-		Options: evalBoxOptions(server.URL, "e2e-token", bothArms()),
+		Options: options,
 	})
 	require.NoError(t, err, "the service type must be registered by box.BaseContext")
 
@@ -234,13 +239,17 @@ func TestOutboundEvalRefusesAConfigWithoutItsArms(t *testing.T) {
 // embedder uses to replace a credential without restarting the box.
 func TestOutboundEvalTokenRotatesThroughTheServiceManager(t *testing.T) {
 	api := &controlAPI{t: t, reported: make(chan struct{})}
-	server := httptest.NewServer(api)
+	server := httptest.NewTLSServer(api)
 	t.Cleanup(server.Close)
 
 	boxCtx := evalBoxContext()
+	options := evalBoxOptions(server.URL, "first-token", bothArms())
+	options.Certificate = &option.CertificateOptions{
+		Certificate: []string{string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}))},
+	}
 	instance, err := sbox.New(sbox.Options{
 		Context: boxCtx,
-		Options: evalBoxOptions(server.URL, "first-token", bothArms()),
+		Options: options,
 	})
 	require.NoError(t, err)
 	require.NoError(t, instance.Start())

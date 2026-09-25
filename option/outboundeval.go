@@ -6,8 +6,7 @@ import "github.com/sagernet/sing/common/json/badoption"
 // endpoint URLs and OutboundTag are required; every other zero value falls
 // back to the default documented on the field.
 type OutboundEvalServiceOptions struct {
-	// AcquireURL, AttestURL and SubmitURL are the control API endpoints, each a
-	// complete URL.
+	// AcquireURL, AttestURL and SubmitURL must be absolute HTTPS URLs with a hostname.
 	AcquireURL string `json:"acquire_url"`
 	AttestURL  string `json:"attest_url"`
 	SubmitURL  string `json:"submit_url"`

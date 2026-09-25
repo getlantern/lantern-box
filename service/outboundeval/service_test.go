@@ -2,6 +2,7 @@ package outboundeval
 
 import (
 	"context"
+	"crypto/x509"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -39,7 +40,7 @@ func contextWithOutbounds(outbounds map[string]A.Outbound) context.Context {
 // wire it but without the cycle loop running.
 func wiredService(t *testing.T, handler http.HandlerFunc) *Service {
 	t.Helper()
-	server := httptest.NewServer(handler)
+	server := httptest.NewTLSServer(handler)
 	t.Cleanup(server.Close)
 
 	options := testOptions()
@@ -59,6 +60,9 @@ func wiredService(t *testing.T, handler http.HandlerFunc) *Service {
 	s.outbounds = service.FromContext[A.OutboundManager](ctx)
 	s.control = control
 	s.api = newAPIClient(s.ctx, control, time.Now, s.options)
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	s.api.http.Transport.(*http.Transport).TLSClientConfig.RootCAs = roots
 	s.attest = s.api.attest
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 	return s
@@ -104,6 +108,55 @@ func TestNewServiceRejectsUnusableOptions(t *testing.T) {
 			_, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "eval", options)
 			assert.Error(t, err)
 		})
+	}
+}
+
+func TestNewServiceValidatesControlURLs(t *testing.T) {
+	for _, endpoint := range []struct {
+		name string
+		set  func(*option.OutboundEvalServiceOptions, string)
+	}{
+		{"acquire_url", func(o *option.OutboundEvalServiceOptions, value string) { o.AcquireURL = value }},
+		{"attest_url", func(o *option.OutboundEvalServiceOptions, value string) { o.AttestURL = value }},
+		{"submit_url", func(o *option.OutboundEvalServiceOptions, value string) { o.SubmitURL = value }},
+	} {
+		for _, test := range []struct {
+			name  string
+			url   string
+			valid bool
+		}{
+			{"https", "https://control.example/api", true},
+			{"https with port", "https://control.example:8443/api", true},
+			{"https with IPv6", "https://[::1]:8443/api", true},
+			{"http", "http://control.example/api", false},
+			{"other scheme", "ftp://control.example/api", false},
+			{"relative", "/api", false},
+			{"scheme relative", "//control.example/api", false},
+			{"missing hostname", "https:///api", false},
+			{"port without hostname", "https://:443/api", false},
+			{"opaque", "https:control.example/api", false},
+			{"malformed", "https://control.example/%zz", false},
+		} {
+			for _, token := range []string{"", "token"} {
+				tokenState := "without token"
+				if token != "" {
+					tokenState = "with token"
+				}
+				t.Run(endpoint.name+"/"+test.name+"/"+tokenState, func(t *testing.T) {
+					options := testOptions()
+					options.Token = token
+					endpoint.set(&options, test.url)
+					created, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "eval", options)
+					if test.valid {
+						require.NoError(t, err)
+						require.NoError(t, created.Close())
+					} else {
+						require.EqualError(t, err, endpoint.name+" must be an absolute HTTPS URL with a hostname")
+						assert.Nil(t, created)
+					}
+				})
+			}
+		}
 	}
 }
 

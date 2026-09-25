@@ -40,9 +40,9 @@ func testCandidate() A.Outbound { return &stubOutbound{tag: "candidate"} }
 
 func testOptions() option.OutboundEvalServiceOptions {
 	return option.OutboundEvalServiceOptions{
-		AcquireURL:  "http://127.0.0.1:1/assignments",
-		AttestURL:   "http://127.0.0.1:1/attestations",
-		SubmitURL:   "http://127.0.0.1:1/reports",
+		AcquireURL:  "https://127.0.0.1:1/assignments",
+		AttestURL:   "https://127.0.0.1:1/attestations",
+		SubmitURL:   "https://127.0.0.1:1/reports",
 		Token:       "token",
 		CountryCode: "RU",
 		OutboundTag: "candidate",
