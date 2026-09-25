@@ -133,4 +133,4 @@ dockerhub:
     secret_name: DOCKER_PASSWORD
     full_description:
       from_file:
-        path: ./README.md
+        path: ./README.docker.md
