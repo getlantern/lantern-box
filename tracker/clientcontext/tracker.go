@@ -1,12 +1,12 @@
-// Package clientcontext provides [adapter.ConnectionTracker]s that sends and receives client
-// metadata after connection handshake between the client and server. The metadata is stored in the
-// context for other trackers to use.
+// Package clientcontext provides [adapter.ConnectionTracker] implementations
+// that exchange client metadata after the connection handshake. Manager exposes
+// decoded metadata on the wrapped connection for downstream trackers to read
+// with [InfoFromConn].
 //
 // Usage:
-// Create a [ClientContextInjector] on the client side to send client info to the server, and a
-// [Manager] on the server side to receive and store the info. Both trackers should be added to the
-// router using router.AppendTracker. Trackers added to the Manager with [Manager.AppendTracker] can
-// access the client info from the connection context using [ClientInfoFromContext].
+// Register [ClientContextInjector] on the client router and [Manager] on the
+// server router. Trackers registered after Manager can recover client info with
+// [InfoFromConn].
 package clientcontext
 
 import "slices"
@@ -35,7 +35,18 @@ import "slices"
 // This is why writeConn (client) doesn't send the client info until ConnHandshakeSuccess while
 // readConn (server) reads it immediately upon creation.
 
-const packetPrefix = "CLIENTINFO "
+const (
+	// legacyPacketPrefix marks a client-info frame from a client that waits for
+	// ackResponse.
+	legacyPacketPrefix = "CLIENTINFO "
+
+	// packetPrefix marks a client-info frame from a client that does not wait
+	// for a reply.
+	packetPrefix = "CLIENTINFO2 "
+
+	// ackResponse is sent only to legacyPacketPrefix clients.
+	ackResponse = "OK"
+)
 
 type GetClientInfoFn func() ClientInfo
 
