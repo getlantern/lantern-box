@@ -1,15 +1,16 @@
 package constant
 
 const (
-	TypeAmnezia   = "amnezia"
-	TypeALGeneva  = "algeneva"
-	TypeMeek      = "meek"
-	TypeOutline   = "outline"
-	TypeReflex    = "reflex"
-	TypeSamizdat  = "samizdat"
-	TypeTwiddle   = "twiddle"
-	TypeUnbounded = "unbounded"
-	TypeWATER     = "water"
+	TypeAmnezia    = "amnezia"
+	TypeALGeneva   = "algeneva"
+	TypeHysteria2X = "hysteria2x"
+	TypeMeek       = "meek"
+	TypeOutline    = "outline"
+	TypeReflex     = "reflex"
+	TypeSamizdat   = "samizdat"
+	TypeTwiddle    = "twiddle"
+	TypeUnbounded  = "unbounded"
+	TypeWATER      = "water"
 )
 
 const (

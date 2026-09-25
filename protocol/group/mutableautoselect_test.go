@@ -16,6 +16,8 @@ import (
 	sbAdapter "github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
@@ -315,6 +317,7 @@ func TestBehaviorFor_Timeouts(t *testing.T) {
 		{C.TypeHTTP, 2000 * time.Millisecond},
 		{C.TypeHysteria, 1500 * time.Millisecond},
 		{C.TypeHysteria2, 1500 * time.Millisecond},
+		{lConst.TypeHysteria2X, 1500 * time.Millisecond},
 		{lConst.TypeOutline, 10000 * time.Millisecond},
 		{lConst.TypeReflex, 3000 * time.Millisecond},
 		{lConst.TypeSamizdat, 3000 * time.Millisecond},
@@ -588,7 +591,7 @@ func TestDataPlaneStream_StallSuppressedUntilProven(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 100
 	d := newDataPlaneStream(stallConn{}, 10*time.Millisecond, provedReadBytes,
-		func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+		dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	defer d.Close()
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, uint32(0), calls.Load(),
@@ -602,7 +605,7 @@ func TestDataPlaneStream_StallFiresAfterProven(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 50
 	d := newDataPlaneStream(echoConn{}, 30*time.Millisecond, provedReadBytes,
-		func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+		dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	defer d.Close()
 
 	// Drive enough Read bytes to prove the conn.
@@ -615,7 +618,7 @@ func TestDataPlaneStream_StallFiresAfterProven(t *testing.T) {
 	_, err = d.Write([]byte("ping"))
 	require.NoError(t, err, "Write should succeed on echoConn")
 
-	require.True(t, d.lastWasWrite.Load(), "Write should set the last-was-write gate")
+	require.True(t, d.snapshotIO().lastWasWrite, "Write should set the last-was-write gate")
 	// Wait past the idle window.
 	require.Eventually(t, func() bool { return calls.Load() == 1 },
 		time.Second, 5*time.Millisecond, "proven stall should have fired by now")
@@ -632,30 +635,30 @@ func TestDataPlaneStream_StallSuppressedOnReadOnlyIdle(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 50
 	d := newDataPlaneStream(echoConn{}, 30*time.Millisecond, provedReadBytes,
-		func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+		dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	defer d.Close()
 
 	_, err := d.Read(make([]byte, provedReadBytes))
 	require.NoError(t, err, "Read should succeed on echoConn")
 
 	require.True(t, d.proven.Load(), "Read should have proven the conn")
-	require.False(t, d.lastWasWrite.Load(), "Read-only conn must not set the last-was-write gate")
+	require.False(t, d.snapshotIO().lastWasWrite, "Read-only conn must not set the last-was-write gate")
 	time.Sleep(80 * time.Millisecond)
 	assert.Equal(t, uint32(0), calls.Load(),
 		"proven conn with read-only history must not fire stall")
 }
 
 func TestDataPlaneStream_CloseIsIdempotent(t *testing.T) {
-	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func(adapter.UserFailureKind) {}, nil)
+	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{})
 	require.NoError(t, d.Close())
 	assert.NoError(t, d.Close(), "second Close should be a no-op")
 }
 
 func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
-	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
-	d.proven.Store(true)       // simulate a proven conn so fireStall isn't gated on the proven check
-	d.lastWasWrite.Store(true) // ...nor on the write-without-read gate
+	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d.proven.Store(true)    // simulate a proven conn so fireStall isn't gated on the proven check
+	d.noteIO(1, nil, false) // ...nor on the write-without-read gate
 	d.Close()
 	d.fireStall()
 	assert.Equal(t, uint32(0), calls.Load(), "no stall callbacks must fire after Close")
@@ -663,9 +666,9 @@ func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 
 func TestDataPlanePacket_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
-	d := newDataPlanePacket(stallPacketConn{}, time.Hour, 0, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	d := newDataPlanePacket(stallPacketConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	d.proven.Store(true)
-	d.lastWasWrite.Store(true)
+	d.noteIO(1, nil, false)
 	d.Close()
 	d.fireStall()
 	assert.Equal(t, uint32(0), calls.Load(), "no stall callbacks must fire after Close")
@@ -775,8 +778,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// one. (Spec change from earlier "one-shot hard demote.")
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	onStall, _ := s.makeHooks("a", primaryRoute)
-	onStall(adapter.UserFailureStall)
+	s.makeHooks("a", primaryRoute).onFailure(adapter.UserFailureStall)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1,
@@ -788,8 +790,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	onStall, _ := s.makeHooks("a", primaryRoute)
-	onStall(adapter.UserFailureReset)
+	s.makeHooks("a", primaryRoute).onFailure(adapter.UserFailureReset)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -1073,7 +1074,7 @@ func TestNextProbeInterval(t *testing.T) {
 
 func TestDataPlaneStream_OnActivityFiresOnNonEmptyIO(t *testing.T) {
 	var activity atomic.Uint32
-	d := newDataPlaneStream(echoConn{}, time.Hour, 0, func(adapter.UserFailureKind) {}, func() { activity.Add(1) })
+	d := newDataPlaneStream(echoConn{}, time.Hour, 0, dataPlaneHooks{onActivity: func() { activity.Add(1) }})
 	defer d.Close()
 	_, err := d.Write([]byte("hi"))
 	require.NoError(t, err, "Write should succeed on echoConn")
@@ -1121,6 +1122,84 @@ func (c *failingPacketConn) ReadFrom(p []byte) (int, net.Addr, error)  { return 
 func (c *failingPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
 func (c *failingPacketConn) Close() error                              { return nil }
 
+// addressedPacketConn stands in for a per-packet-addressed outbound conn: it
+// records each WritePacket destination and, like shadowsocks, needs headroom
+// around the payload.
+type addressedPacketConn struct {
+	net.PacketConn
+	writeErr error
+	written  []metadata.Socksaddr
+}
+
+const addressedFrontHeadroom, addressedRearHeadroom = 32, 16
+
+func (c *addressedPacketConn) WritePacket(buffer *buf.Buffer, destination metadata.Socksaddr) error {
+	defer buffer.Release()
+	if buffer.Start() < addressedFrontHeadroom || buffer.FreeLen() < addressedRearHeadroom {
+		return errors.New("insufficient headroom")
+	}
+	c.written = append(c.written, destination)
+	return c.writeErr
+}
+
+func (c *addressedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.written = append(c.written, metadata.SocksaddrFromNet(addr))
+	return len(p), c.writeErr
+}
+
+func (c *addressedPacketConn) ReadPacket(*buf.Buffer) (metadata.Socksaddr, error) {
+	return metadata.Socksaddr{}, io.EOF
+}
+func (c *addressedPacketConn) FrontHeadroom() int { return addressedFrontHeadroom }
+func (c *addressedPacketConn) RearHeadroom() int  { return addressedRearHeadroom }
+func (c *addressedPacketConn) Close() error       { return nil }
+
+func newPayload(t *testing.T) *buf.Buffer {
+	t.Helper()
+	b := buf.New()
+	_, err := b.WriteString("ntp")
+	require.NoError(t, err)
+	return b
+}
+
+func TestListenPacket_WritePacketKeepsDomainDestination(t *testing.T) {
+	// A domain destination must reach the member outbound intact through the
+	// group's wrappers; sing's net.PacketConn adapter would strip it to an
+	// IP-only address, which per-packet-addressed outbounds reject.
+	s, obs := newTestMUR(t, "a")
+	recordSuccess(s, "a", 10)
+	inner := &addressedPacketConn{}
+	obs["a"].On("ListenPacket").Return(inner, nil)
+
+	conn, err := s.ListenPacket(context.Background(), metadata.Socksaddr{})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	dst := metadata.ParseSocksaddr("time.android.com:123")
+	require.NoError(t, bufio.NewPacketConn(conn).WritePacket(newPayload(t), dst),
+		"the write should reach the member with the headroom it needs")
+	require.Equal(t, []metadata.Socksaddr{dst}, inner.written,
+		"the member must receive the domain destination")
+}
+
+func TestDataPlanePacket_WritePacketReset_AttributesFailure(t *testing.T) {
+	// WritePacket shares noteIO with WriteTo, so a reset on it is charged.
+	var calls atomic.Uint32
+	inner := &addressedPacketConn{writeErr: connResetErr()}
+	d := newDataPlanePacket(inner, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	defer d.Close()
+
+	b := buf.NewSize(128)
+	b.Resize(addressedFrontHeadroom, 0)
+	_, err := b.WriteString("ntp")
+	require.NoError(t, err)
+	require.Error(t, d.WritePacket(b, metadata.ParseSocksaddr("time.android.com:123")),
+		"WritePacket should have returned the reset error")
+
+	require.Eventually(t, func() bool { return calls.Load() == 1 },
+		time.Second, 5*time.Millisecond, "a reset on WritePacket must attribute a failure")
+}
+
 func connResetErr() error {
 	return &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
 }
@@ -1143,7 +1222,7 @@ func TestDataPlaneStream_MidStreamReset_ConnReset_AttributesFailure(t *testing.T
 	var calls atomic.Uint32
 	const provedReadBytes = 1 << 20 // never reached by the 16-byte read below
 	c := &failingConn{err: connResetErr(), firstN: 16}
-	d := newDataPlaneStream(c, time.Hour, provedReadBytes, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, provedReadBytes, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1166,7 +1245,7 @@ func TestDataPlaneStream_MidStreamReset_AttributesResetKind(t *testing.T) {
 	// mid-stream failure modes stay separable downstream.
 	var got atomic.Value // adapter.UserFailureKind
 	c := &failingConn{err: connResetErr(), firstN: 16}
-	d := newDataPlaneStream(c, time.Hour, 1<<20, func(k adapter.UserFailureKind) { got.Store(k) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 1<<20, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind) { got.Store(kind) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1184,10 +1263,10 @@ func TestDataPlaneStream_MidStreamReset_AttributesResetKind(t *testing.T) {
 func TestDataPlaneStream_Stall_AttributesStallKind(t *testing.T) {
 	// The idle-timeout path must report a stall, complementing the reset path.
 	var got atomic.Value // adapter.UserFailureKind
-	d := newDataPlaneStream(stallConn{}, time.Hour, 0, func(k adapter.UserFailureKind) { got.Store(k) }, nil)
+	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind) { got.Store(kind) }})
 	defer d.Close()
 	d.proven.Store(true)
-	d.lastWasWrite.Store(true)
+	d.noteIO(1, nil, false)
 	d.fireStall()
 
 	require.NotNil(t, got.Load(), "a stall must attribute a failure")
@@ -1200,7 +1279,7 @@ func TestDataPlaneStream_MidStreamReset_ErrClosed_AttributesFailure(t *testing.T
 	// inner outbound tore its own fd down — a broken tunnel, so demote.
 	var calls atomic.Uint32
 	c := &failingConn{err: net.ErrClosed, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1218,7 +1297,7 @@ func TestDataPlaneStream_MidStreamReset_WritePath_AttributesFailure(t *testing.T
 	// The failure path must fire on a reset Write too, not just Read.
 	var calls atomic.Uint32
 	c := &failingConn{err: connResetErr(), failWrite: true}
-	d := newDataPlaneStream(c, time.Hour, 4, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	defer d.Close()
 
 	_, err := d.Write([]byte("req"))
@@ -1233,7 +1312,7 @@ func TestDataPlanePacket_MidStreamReset_AttributesFailure(t *testing.T) {
 	// the same way as the stream path.
 	var calls atomic.Uint32
 	c := &failingPacketConn{err: connResetErr()}
-	d := newDataPlanePacket(c, time.Hour, 4, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	d := newDataPlanePacket(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	defer d.Close()
 
 	_, _, err := d.ReadFrom(make([]byte, 32))
@@ -1247,7 +1326,7 @@ func TestDataPlaneStream_EOFDoesNotAttribute(t *testing.T) {
 	// io.EOF is an ordinary stream end, not a tunnel failure.
 	var calls atomic.Uint32
 	c := &failingConn{err: io.EOF, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1266,7 +1345,7 @@ func TestDataPlaneStream_TimeoutDoesNotAttribute(t *testing.T) {
 	// double-count and usurp that role.
 	var calls atomic.Uint32
 	c := &failingConn{err: timeoutErr{}, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1286,7 +1365,7 @@ func TestDataPlaneStream_NoAttributeAfterClose(t *testing.T) {
 	// failure.
 	var calls atomic.Uint32
 	c := &failingConn{err: net.ErrClosed}
-	d := newDataPlaneStream(c, time.Hour, 1, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 1, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	require.True(t, d.closeWatchdog(), "first close")
 
 	_, err := d.Read(make([]byte, 8))
@@ -1300,7 +1379,7 @@ func TestDataPlaneStream_FailureFiresOnce(t *testing.T) {
 	// Repeated errored reads attribute at most once per conn (the fired CAS).
 	var calls atomic.Uint32
 	c := &failingConn{err: connResetErr()}
-	d := newDataPlaneStream(c, time.Hour, 1, func(adapter.UserFailureKind) { calls.Add(1) }, nil)
+	d := newDataPlaneStream(c, time.Hour, 1, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
 	defer d.Close()
 
 	for i := range 3 {
@@ -1657,8 +1736,7 @@ func TestMakeHooks_IgnoresFailureFromUnselectedTag(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("b")
 
-	onStall, _ := s.makeHooks("a", primaryRoute)
-	onStall(adapter.UserFailureStall)
+	s.makeHooks("a", primaryRoute).onFailure(adapter.UserFailureStall)
 
 	s.access.Lock()
 	_, ok := s.peekHistoryLocked("a")
@@ -1674,8 +1752,7 @@ func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("a")
 
-	onStall, _ := s.makeHooks("a", primaryRoute)
-	onStall(adapter.UserFailureStall)
+	s.makeHooks("a", primaryRoute).onFailure(adapter.UserFailureStall)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the udp selection must still be chargeable")
@@ -1687,8 +1764,7 @@ func TestMakeHooks_UnselectedGateDisabledByConfig(t *testing.T) {
 	s.cfg.demoteOnlySelected = false
 	s.stickyTag.tcp.Store("b")
 
-	onStall, _ := s.makeHooks("a", primaryRoute)
-	onStall(adapter.UserFailureStall)
+	s.makeHooks("a", primaryRoute).onFailure(adapter.UserFailureStall)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the gate must be defeatable for rollback")
@@ -1701,8 +1777,7 @@ func TestMakeHooks_ChargesFallbackRouteEvenWhenUnselected(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	s.stickyTag.tcp.Store("a")
 
-	onStall, _ := s.makeHooks("b", fallbackRoute)
-	onStall(adapter.UserFailureReset)
+	s.makeHooks("b", fallbackRoute).onFailure(adapter.UserFailureReset)
 
 	uf, ok := userFailures(s, "b")
 	require.True(t, ok, "a fallback-route conn must stay chargeable")
