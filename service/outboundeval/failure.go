@@ -27,8 +27,8 @@ const (
 
 // Failure codes reported for every attempt of a window that could not be
 // measured at all. They fill the window so the grid stays complete, and they
-// fill both arms, which keeps the window from reading as evidence against the
-// candidate.
+// fill both targets, which keeps the window from reading as evidence against
+// the candidate.
 const (
 	failureAttestation         = "attestation_failed"
 	failureAttestationRejected = "attestation_rejected"

@@ -74,12 +74,13 @@ type Service struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	// assignmentMu serializes outbound creation and removal with Close.
-	assignmentMu   sync.Mutex
-	assignmentTags []string
+	// assignmentMu serializes assignment target creation and removal with Close.
+	assignmentMu      sync.Mutex
+	assignmentTargets []createdTarget
 
 	router    A.Router
 	outbounds A.OutboundManager
+	endpoints A.EndpointManager
 	control   A.Outbound
 	api       *apiClient
 	// timeService keeps the clock a report is judged and stamped against. Start
@@ -116,6 +117,7 @@ func NewService(
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	outbounds := service.FromContext[A.OutboundManager](ctx)
+	endpoints := service.FromContext[A.EndpointManager](ctx)
 	router := service.FromContext[A.Router](ctx)
 	s := &Service{
 		Adapter: boxService.NewAdapter(constant.TypeOutboundEval, tag),
@@ -128,6 +130,7 @@ func NewService(
 
 		router:    router,
 		outbounds: outbounds,
+		endpoints: endpoints,
 
 		retryDelay: defaultRetryDelay,
 		retryBase:  retryBaseWait,
@@ -182,7 +185,7 @@ func (s *Service) Start(stage A.StartStage) error {
 			return fmt.Errorf("start time service: %w", err)
 		}
 		// probe.Measure resolves its TLS clock from the context rather than
-		// from this service, so the measurement arms need it registered too.
+		// from this service, so the eval targets need it registered too.
 		service.MustRegister[ntp.TimeService](s.ctx, ntpService)
 		s.timeService = ntpService
 	}

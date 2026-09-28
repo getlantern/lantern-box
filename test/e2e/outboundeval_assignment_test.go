@@ -12,6 +12,7 @@ import (
 	A "github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
+	sjson "github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
@@ -28,18 +29,27 @@ func TestOutboundEvalCreatesAndRemovesAssignmentOutbounds(t *testing.T) {
 	measured := make(chan struct{}, 2)
 	assignment := outboundeval.Assignment{
 		ID: "assignment", ReportToken: "report",
-		Candidate: &option.Outbound{Type: C.TypeDirect, Tag: "candidate", Options: &option.DirectOutboundOptions{}},
-		Control:   &option.Outbound{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}},
+		Candidate: &outboundeval.EvaluationTarget{Type: outboundeval.EvaluationTargetOutbound, Options: option.Outbound{
+			Type: C.TypeDirect, Tag: "candidate", Options: &option.DirectOutboundOptions{},
+		}},
+		Control: &outboundeval.EvaluationTarget{Type: outboundeval.EvaluationTargetOutbound, Options: option.Outbound{
+			Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{},
+		}},
 		Sample: outboundeval.SampleSpec{
 			WindowsPerExit: 1, AttemptsPerWindow: 1, WindowDurationSeconds: 5,
 		},
 		Challenges: []outboundeval.WindowChallenge{{Challenge: "challenge"}},
 		ExpiresAt:  time.Now().Add(time.Minute),
 	}
+	ctx := evalBoxContext()
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/assignments":
-			assert.NoError(t, json.NewEncoder(w).Encode(assignment))
+			// The standard library would drop the targets' sing-box options.
+			encoded, err := sjson.MarshalContext(ctx, assignment)
+			assert.NoError(t, err)
+			_, err = w.Write(encoded)
+			assert.NoError(t, err)
 		case "/attestations":
 			assert.Empty(t, r.Header.Get("Authorization"))
 			assert.NoError(t, json.NewEncoder(w).Encode(outboundeval.Attestation{Token: "attested"}))
@@ -64,8 +74,7 @@ func TestOutboundEvalCreatesAndRemovesAssignmentOutbounds(t *testing.T) {
 	}))
 	defer server.Close()
 	assignment.MeasurementURL = server.URL + "/measure"
-	ctx := evalBoxContext()
-	options := evalBoxOptions(server.URL, "token", bothArms())
+	options := evalBoxOptions(server.URL, "token", bothTargets())
 	options.Certificate = &option.CertificateOptions{
 		Certificate: []string{string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}))},
 	}

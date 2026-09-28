@@ -31,7 +31,7 @@ func TestMeasureAttemptRecordsAReachedTarget(t *testing.T) {
 	assert.GreaterOrEqual(t, attempt.ElapsedMS, int64(attempt.TimeToHeadersMS))
 }
 
-func TestMeasureAttemptCountsANonSuccessStatusAgainstTheArm(t *testing.T) {
+func TestMeasureAttemptCountsANonSuccessStatusAgainstTheEvalTarget(t *testing.T) {
 	for _, status := range []int{
 		http.StatusMovedPermanently, http.StatusForbidden,
 		http.StatusTooManyRequests, http.StatusBadGateway,

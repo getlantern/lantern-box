@@ -176,7 +176,7 @@ func TestStartUsesTheBoxsTimeService(t *testing.T) {
 	assert.Equal(t, pinned, created.(*Service).timeService.TimeFunc()())
 }
 
-func TestStartRequiresBothArms(t *testing.T) {
+func TestStartRequiresBothTargets(t *testing.T) {
 	candidate := &stubOutbound{tag: "candidate"}
 	direct := &stubOutbound{tag: "direct"}
 	for name, outbounds := range map[string]map[string]A.Outbound{

@@ -17,7 +17,8 @@ const (
 	defaultMeasurementURL = "https://www.wikipedia.org/"
 )
 
-// runAssignment pads unmeasured attempts on both arms to fill the assignment's grid.
+// runAssignment pads unmeasured attempts on both eval targets to fill the
+// assignment's grid.
 func (s *Service) runAssignment(ctx context.Context, candidate, control A.Outbound, assignment Assignment) Report {
 	report := Report{
 		ReportToken:    assignment.ReportToken,
@@ -65,8 +66,8 @@ func (s *Service) runWindow(
 	}
 	window.AttestationToken = attestation.Token
 
-	// Alternating which arm goes first keeps a systematic advantage from
-	// accruing to whichever arm always warms the path.
+	// Alternating which eval target goes first keeps a systematic advantage
+	// from accruing to whichever one always warms the path.
 	candidateFirst := challenge.WindowIndex%2 == 0
 	for range sample.AttemptsPerWindow {
 		if windowCtx.Err() != nil {
@@ -74,7 +75,7 @@ func (s *Service) runWindow(
 		}
 		candidateAttempt, controlAttempt := s.measurePair(
 			windowCtx, candidate, control, target, candidateFirst)
-		// An interrupted pair is inconclusive for both arms.
+		// An interrupted pair is inconclusive for both eval targets.
 		if windowCtx.Err() != nil && (interrupted(candidateAttempt) || interrupted(controlAttempt)) {
 			candidateAttempt = Attempt{FailureCode: failureWindowDeadline}
 			controlAttempt = Attempt{FailureCode: failureWindowDeadline}
@@ -131,8 +132,8 @@ func (s *Service) attestWindow(ctx context.Context, challenge WindowChallenge) (
 	return Attestation{}, err
 }
 
-// fillWindow pads both arms up to the sample's width so the grid stays
-// complete, and is a no-op for a window that ran every attempt.
+// fillWindow pads both eval targets up to the sample's width so the grid
+// stays complete, and is a no-op for a window that ran every attempt.
 func fillWindow(window WindowReport, sample SampleSpec, code string) WindowReport {
 	width := int(sample.AttemptsPerWindow)
 	failed := Attempt{FailureCode: code}

@@ -42,9 +42,9 @@ func evalBoxContext() context.Context {
 	return ctx
 }
 
-// bothArms are the outbounds a complete cycle needs: sing-box declares no
+// bothTargets are the outbounds a complete cycle needs: sing-box declares no
 // implicit direct outbound for a config that names any of its own.
-func bothArms() []option.Outbound {
+func bothTargets() []option.Outbound {
 	return []option.Outbound{
 		{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}},
 		{Type: C.TypeDirect, Tag: "candidate", Options: &option.DirectOutboundOptions{}},
@@ -156,7 +156,7 @@ func TestOutboundEvalRunsInsideABox(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	boxCtx := evalBoxContext()
-	options := evalBoxOptions(server.URL, "e2e-token", bothArms())
+	options := evalBoxOptions(server.URL, "e2e-token", bothTargets())
 	options.Certificate = &option.CertificateOptions{
 		Certificate: []string{string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}))},
 	}
@@ -203,9 +203,9 @@ func TestOutboundEvalRunsInsideABox(t *testing.T) {
 	assert.Equal(t, "Bearer e2e-token", api.tokens[0])
 }
 
-// TestOutboundEvalRefusesAConfigWithoutItsArms proves the service names the
+// TestOutboundEvalRefusesAConfigWithoutItsTargets proves the service names the
 // outbound it could not find rather than measuring nothing in silence.
-func TestOutboundEvalRefusesAConfigWithoutItsArms(t *testing.T) {
+func TestOutboundEvalRefusesAConfigWithoutItsTargets(t *testing.T) {
 	for name, test := range map[string]struct {
 		outbounds []option.Outbound
 		missing   string
@@ -243,7 +243,7 @@ func TestOutboundEvalTokenRotatesThroughTheServiceManager(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	boxCtx := evalBoxContext()
-	options := evalBoxOptions(server.URL, "first-token", bothArms())
+	options := evalBoxOptions(server.URL, "first-token", bothTargets())
 	options.Certificate = &option.CertificateOptions{
 		Certificate: []string{string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}))},
 	}

@@ -19,9 +19,9 @@ import (
 	"github.com/getlantern/lantern-box/option"
 )
 
-// stubOutbound stands in for one arm. Its DialContext connects to address
-// whatever destination it is handed, and a stub that is never dialed through
-// needs no address.
+// stubOutbound stands in for one eval target. Its DialContext connects to
+// address whatever destination it is handed, and a stub that is never dialed
+// through needs no address.
 type stubOutbound struct {
 	A.Outbound
 	tag     string
@@ -61,7 +61,7 @@ func newTestService(t *testing.T, options option.OutboundEvalServiceOptions) *Se
 	return s
 }
 
-// recorder captures which arm each measurement went through, in order.
+// recorder captures which eval target each measurement went through, in order.
 type recorder struct {
 	mu    sync.Mutex
 	calls []string
@@ -79,7 +79,7 @@ func (r *recorder) recorded() []string {
 	return append([]string(nil), r.calls...)
 }
 
-func TestRunAssignmentFillsTheGridAndAlternatesArms(t *testing.T) {
+func TestRunAssignmentFillsTheGridAndAlternatesTargets(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newTestService(t, testOptions())
 		calls := &recorder{}
@@ -372,14 +372,14 @@ func TestRunWindowDoesNotSpendTheWindowOnItsSpacing(t *testing.T) {
 	})
 }
 
-func TestRunWindowDoesNotBlameAnArmForTheWindowsOwnBudget(t *testing.T) {
+func TestRunWindowDoesNotBlameATargetForTheWindowsOwnBudget(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newTestService(t, testOptions())
 		s.attest = func(context.Context, AttestationRequest) (Attestation, error) {
 			return Attestation{Token: "attestation"}, nil
 		}
-		// Each arm takes most of the window, so the second one is always the one
-		// cut short.
+		// Each eval target takes most of the window, so the second one is always
+		// the one cut short.
 		s.measure = func(ctx context.Context, _ A.Outbound, _ string) Attempt {
 			if !sleepContext(ctx, 600*time.Millisecond) {
 				return Attempt{FailureCode: failureTimeout}
@@ -399,7 +399,7 @@ func TestRunWindowDoesNotBlameAnArmForTheWindowsOwnBudget(t *testing.T) {
 				for _, attempt := range attempts {
 					assert.False(t, attempt.Reachable)
 					assert.Equal(t, failureWindowDeadline, attempt.FailureCode,
-						"neither arm is credited with the window running out of time")
+						"neither eval target is credited with the window running out of time")
 				}
 			}
 		}
@@ -412,8 +412,8 @@ func TestRunWindowKeepsACompletedVerdictAtTheDeadline(t *testing.T) {
 		s.attest = func(context.Context, AttestationRequest) (Attestation, error) {
 			return Attestation{Token: "attestation"}, nil
 		}
-		// The seam ignores the window context, so both arms reach a verdict of
-		// their own even though the window ends during the pair.
+		// The seam ignores the window context, so both eval targets reach a
+		// verdict of their own even though the window ends during the pair.
 		s.measure = func(_ context.Context, out A.Outbound, _ string) Attempt {
 			time.Sleep(600 * time.Millisecond)
 			if out.Tag() == "candidate" {

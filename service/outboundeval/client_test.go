@@ -8,10 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sagernet/sing-box/adapter/outbound"
 	O "github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/direct"
-	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -74,29 +71,48 @@ func TestAcquireDecodesAssignmentResponse(t *testing.T) {
 	}, assignment.Challenges)
 }
 
-func TestAcquireDecodesOutboundOptions(t *testing.T) {
+func TestAcquireDecodesTheTargets(t *testing.T) {
 	s := wiredService(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, err := w.Write([]byte(`{
-			"candidate_outbound":{"type":"direct","tag":"candidate","bind_interface":"candidate-interface"},
-			"control_outbound":{"type":"direct","tag":"control","bind_interface":"control-interface"}
+			"candidate_target":{"type":"outbound","options":{"type":"dual","tag":"candidate","server":"a"}},
+			"control_target":{"type":"endpoint","options":{"type":"dual","tag":"control","peer":"b"}}
 		}`))
 		assert.NoError(t, err)
 	})
-	registry := outbound.NewRegistry()
-	direct.RegisterOutbound(registry)
-	s.api.ctx = service.ContextWith[O.OutboundOptionsRegistry](s.ctx, registry)
+	s.api.ctx = targetContext(s.ctx)
 
 	assignment, err := s.api.acquire("token", AssignmentRequest{})
 
 	require.NoError(t, err)
-	require.NotNil(t, assignment.Candidate)
-	require.NotNil(t, assignment.Control)
-	assert.Equal(t, "direct", assignment.Candidate.Type)
-	assert.Equal(t, "candidate", assignment.Candidate.Tag)
-	require.IsType(t, &O.DirectOutboundOptions{}, assignment.Candidate.Options)
-	assert.Equal(t, "candidate-interface", assignment.Candidate.Options.(*O.DirectOutboundOptions).BindInterface)
-	require.IsType(t, &O.DirectOutboundOptions{}, assignment.Control.Options)
-	assert.Equal(t, "control-interface", assignment.Control.Options.(*O.DirectOutboundOptions).BindInterface)
+	assert.Equal(t, &EvaluationTarget{Type: EvaluationTargetOutbound, Options: O.Outbound{
+		Type: "dual", Tag: "candidate", Options: &dualOutboundOptions{Server: "a"},
+	}}, assignment.Candidate)
+	assert.Equal(t, &EvaluationTarget{Type: EvaluationTargetEndpoint, Options: O.Endpoint{
+		Type: "dual", Tag: "control", Options: &dualEndpointOptions{Peer: "b"},
+	}}, assignment.Control)
+}
+
+// The cycle does not retry a contract fault, so the sentinel has to survive the
+// decoder and the request's own wrapping.
+func TestAcquireRefusesATargetItCannotDecode(t *testing.T) {
+	for name, body := range map[string]string{
+		"unknown type": `{"candidate_target":{"type":"inbound","options":{"type":"dual"}}}`,
+		"numeric type": `{"candidate_target":{"type":123,"options":{"type":"dual"}}}`,
+		"array":        `{"candidate_target":[]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := wiredService(t, func(w http.ResponseWriter, _ *http.Request) {
+				_, err := w.Write([]byte(body))
+				assert.NoError(t, err)
+			})
+			s.api.ctx = targetContext(s.ctx)
+
+			_, err := s.api.acquire("token", AssignmentRequest{})
+
+			require.ErrorIs(t, err, ErrInvalidContract)
+			assert.False(t, retryableCycleError(err))
+		})
+	}
 }
 
 func TestAttestCarriesNoBearerCredential(t *testing.T) {

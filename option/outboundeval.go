@@ -59,11 +59,11 @@ type OutboundEvalServiceOptions struct {
 	MaxResponseBytes int64 `json:"max_response_bytes,omitempty"`
 
 	// MaxAssignmentBytes caps the response bodies one assignment may read at
-	// worst, over every window and both arms; protocol overhead and transport
+	// worst, over every window and both targets; protocol overhead and transport
 	// read-ahead are outside it, so it bounds rather than accounts for network
-	// use. The candidate arm is proxied, so this is the user's data the service
-	// spends, and an assignment whose grid could exceed it is refused rather
-	// than measured. Default 32 MiB.
+	// use. The candidate target is proxied, so this is the user's data the
+	// service spends, and an assignment whose grid could exceed it is refused
+	// rather than measured. Default 32 MiB.
 	MaxAssignmentBytes int64 `json:"max_assignment_bytes,omitempty"`
 
 	// MaxWindows and MaxAttemptsPerWindow bound the sample an assignment may ask

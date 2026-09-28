@@ -89,15 +89,71 @@ func (m *assignmentTestManager) Remove(tag string) error {
 	return errors.Join(out.(*managedTestOutbound).Close(), m.removeErr)
 }
 
+type managedTestEndpoint struct {
+	managedTestOutbound
+}
+
+func (*managedTestEndpoint) Start(A.StartStage) error { return nil }
+
+type assignmentTestEndpoints struct {
+	A.EndpointManager
+	mu        sync.Mutex
+	endpoints map[string]*managedTestEndpoint
+	created   []*managedTestEndpoint
+	options   []any
+}
+
+func (m *assignmentTestEndpoints) Create(_ context.Context, _ A.Router, _ log.ContextLogger, tag, _ string, options any) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	endpoint := &managedTestEndpoint{managedTestOutbound{
+		stubOutbound: stubOutbound{tag: tag}, closed: make(chan struct{}),
+	}}
+	m.endpoints[tag] = endpoint
+	m.created = append(m.created, endpoint)
+	m.options = append(m.options, options)
+	return nil
+}
+
+func (m *assignmentTestEndpoints) Get(tag string) (A.Endpoint, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	endpoint, found := m.endpoints[tag]
+	return endpoint, found
+}
+
+func (m *assignmentTestEndpoints) Remove(tag string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	endpoint, exists := m.endpoints[tag]
+	if !exists {
+		return errors.New("endpoint already removed")
+	}
+	delete(m.endpoints, tag)
+	return endpoint.Close()
+}
+
+func outboundTarget(tag string) *EvaluationTarget {
+	return &EvaluationTarget{Type: EvaluationTargetOutbound, Options: O.Outbound{
+		Type: "direct", Tag: tag, Options: &O.DirectOutboundOptions{},
+	}}
+}
+
+func targetOptions(target *EvaluationTarget) any {
+	switch options := target.Options.(type) {
+	case O.Outbound:
+		return options.Options
+	case O.Endpoint:
+		return options.Options
+	}
+	return nil
+}
+
 func assignmentWithOutbounds() Assignment {
 	assignment := serverAssignment()
 	assignment.Sample.FreshSessionDelayMS = 0
-	assignment.Candidate = &O.Outbound{
-		Type: "direct", Tag: "candidate", Options: &O.DirectOutboundOptions{},
-	}
-	assignment.Control = &O.Outbound{
-		Type: "direct", Tag: "direct", Options: &O.DirectOutboundOptions{},
-	}
+	assignment.Candidate = outboundTarget("candidate")
+	assignment.Control = outboundTarget("direct")
 	return assignment
 }
 
@@ -114,7 +170,7 @@ func serviceWithAssignmentManager(t *testing.T) (*Service, *assignmentTestManage
 	return s, manager
 }
 
-func TestAssignmentOutboundsRequireBothArms(t *testing.T) {
+func TestAssignmentOutboundsRequireBothTargets(t *testing.T) {
 	for _, test := range []struct {
 		name               string
 		candidate, control bool
@@ -150,7 +206,7 @@ func TestAssignmentOutboundsRequireBothArms(t *testing.T) {
 			candidate, control := configuredCandidate, configuredControl
 			if test.candidate && test.control {
 				require.Len(t, manager.created, 2)
-				assert.Equal(t, []any{assignment.Candidate.Options, assignment.Control.Options}, manager.options)
+				assert.Equal(t, []any{targetOptions(assignment.Candidate), targetOptions(assignment.Control)}, manager.options)
 				candidate, control = manager.created[0], manager.created[1]
 				assertOutboundsClosed(t, manager.created)
 				for _, out := range manager.created {
@@ -170,6 +226,39 @@ func TestAssignmentOutboundsRequireBothArms(t *testing.T) {
 			assert.Same(t, configuredControl, currentControl)
 		})
 	}
+}
+
+func TestAssignmentTargetsUseTheManagerOfTheirKind(t *testing.T) {
+	s, manager := serviceWithAssignmentManager(t)
+	endpoints := &assignmentTestEndpoints{endpoints: map[string]*managedTestEndpoint{}}
+	s.endpoints = endpoints
+	assignment := assignmentWithOutbounds()
+	assignment.Control = &EvaluationTarget{Type: EvaluationTargetEndpoint, Options: O.Endpoint{
+		Type: "wireguard", Tag: "control", Options: &O.WireGuardEndpointOptions{},
+	}}
+	var measured []A.Outbound
+	s.measure = func(_ context.Context, out A.Outbound, _ string) Attempt {
+		measured = append(measured, out)
+		return Attempt{Reachable: true}
+	}
+
+	report, err := s.measureAssignment("candidate", assignment)
+
+	require.NoError(t, err)
+	requireCompleteGrid(t, report, assignment.Sample)
+	require.Len(t, manager.created, 1)
+	require.Len(t, endpoints.created, 1)
+	assert.Equal(t, []any{targetOptions(assignment.Candidate)}, manager.options)
+	assert.Equal(t, []any{targetOptions(assignment.Control)}, endpoints.options)
+	candidate, control := A.Outbound(manager.created[0]), A.Outbound(endpoints.created[0])
+	assert.Equal(t, []A.Outbound{
+		candidate, control, candidate, control,
+		control, candidate, control, candidate,
+	}, measured)
+	assertOutboundsClosed(t, manager.created)
+	assert.EqualValues(t, 1, endpoints.created[0].closes.Load())
+	assert.Empty(t, endpoints.endpoints)
+	assert.Len(t, manager.outbounds, 2)
 }
 
 func TestAssignmentOutboundsCleanUpCreationFailure(t *testing.T) {

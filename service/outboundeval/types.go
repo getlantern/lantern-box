@@ -1,11 +1,15 @@
 package outboundeval
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json"
+
+	lbO "github.com/getlantern/lantern-box/option"
 )
 
 // ErrInvalidContract reports a control API message that does not satisfy the
@@ -33,14 +37,95 @@ type Assignment struct {
 	// ReportToken authorizes exactly one report and is the only thing tying
 	// that report back to this assignment.
 	ReportToken string `json:"report_token"`
-	// MeasurementURL is fetched by both arms; empty selects https://www.wikipedia.org/.
+	// MeasurementURL is fetched by both eval targets; empty selects https://www.wikipedia.org/.
 	MeasurementURL string `json:"measurement_url,omitempty"`
 	// Candidate and Control override the configured measurement pair only when both are non-nil.
-	Candidate  *option.Outbound  `json:"candidate_outbound,omitempty"`
-	Control    *option.Outbound  `json:"control_outbound,omitempty"`
+	Candidate  *EvaluationTarget `json:"candidate_target,omitempty"`
+	Control    *EvaluationTarget `json:"control_target,omitempty"`
 	Sample     SampleSpec        `json:"sample_spec"`
 	Challenges []WindowChallenge `json:"windows"`
 	ExpiresAt  time.Time         `json:"expires_at"`
+}
+
+// Eval target types specify which kind of option an eval target carries,
+// [option.Outbound] or [option.Endpoint].
+const (
+	EvaluationTargetOutbound = "outbound"
+	EvaluationTargetEndpoint = "endpoint"
+)
+
+// EvaluationTarget configures an outbound or endpoint for an assignment.
+//
+// An EvaluationTarget encodes and decodes only through sing's context JSON;
+// the standard library cannot produce or consume the typed sing-box options
+// it carries.
+type EvaluationTarget struct {
+	Type string
+	// Options is an option.Outbound for EvaluationTargetOutbound or an
+	// option.Endpoint for EvaluationTargetEndpoint.
+	Options any
+}
+
+type evaluationTargetJSON struct {
+	Type    string          `json:"type"`
+	Options json.RawMessage `json:"options"`
+}
+
+// MarshalJSONContext fails for a Type it does not know or Options that do not
+// match it.
+func (t *EvaluationTarget) MarshalJSONContext(ctx context.Context) ([]byte, error) {
+	var (
+		options []byte
+		err     error
+	)
+	switch t.Type {
+	case EvaluationTargetOutbound:
+		outbound, ok := t.Options.(option.Outbound)
+		if !ok {
+			return nil, fmt.Errorf("outbound target holds %T", t.Options)
+		}
+		options, err = outbound.MarshalJSONContext(ctx)
+	case EvaluationTargetEndpoint:
+		endpoint, ok := t.Options.(option.Endpoint)
+		if !ok {
+			return nil, fmt.Errorf("endpoint target holds %T", t.Options)
+		}
+		options, err = endpoint.MarshalJSONContext(ctx)
+	default:
+		return nil, fmt.Errorf("unknown target type %q", t.Type)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(evaluationTargetJSON{Type: t.Type, Options: options})
+}
+
+// UnmarshalJSONContext returns ErrInvalidContract for malformed or unsupported
+// eval targets.
+func (t *EvaluationTarget) UnmarshalJSONContext(ctx context.Context, content []byte) error {
+	var wire evaluationTargetJSON
+	if err := json.Unmarshal(content, &wire); err != nil {
+		return fmt.Errorf("%w: evaluation target: %w", ErrInvalidContract, err)
+	}
+	switch wire.Type {
+	case EvaluationTargetOutbound:
+		var outbound option.Outbound
+		if err := outbound.UnmarshalJSONContext(ctx, wire.Options); err != nil {
+			return fmt.Errorf("%w: outbound target: %w", ErrInvalidContract, err)
+		}
+		t.Options = outbound
+	case EvaluationTargetEndpoint:
+		var endpoint option.Endpoint
+		if err := endpoint.UnmarshalJSONContext(ctx, wire.Options); err != nil {
+			return fmt.Errorf("%w: endpoint target: %w", ErrInvalidContract, err)
+		}
+		t.Options = endpoint
+	default:
+		return fmt.Errorf("%w: target type %q is neither %q nor %q",
+			ErrInvalidContract, wire.Type, EvaluationTargetOutbound, EvaluationTargetEndpoint)
+	}
+	t.Type = wire.Type
+	return nil
 }
 
 // SampleSpec is the grid of measurements one assignment asks for. A report is
@@ -83,7 +168,7 @@ type Report struct {
 	Windows        []WindowReport `json:"windows"`
 }
 
-// WindowReport is one window's paired arms.
+// WindowReport is one window's attempts through both eval targets.
 type WindowReport struct {
 	// AttestationToken identifies the assignment's exit and window; it is empty if attestation failed.
 	AttestationToken  string    `json:"exit_attestation_token"`
@@ -92,7 +177,7 @@ type WindowReport struct {
 	ObservedAt        time.Time `json:"observed_at"`
 }
 
-// Attempt is one fetch of the measurement URL through one arm.
+// Attempt is one fetch of the measurement URL through one eval target.
 type Attempt struct {
 	Reachable  bool `json:"reachable"`
 	HTTPStatus int  `json:"http_status,omitempty"`
@@ -133,6 +218,39 @@ func (a Assignment) validate(now time.Time, limits bounds) error {
 		return fmt.Errorf("%w: assignment has %d challenges, want %d",
 			ErrInvalidContract, len(a.Challenges), want)
 	}
+	for _, target := range []*EvaluationTarget{a.Candidate, a.Control} {
+		if err := target.validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validate refuses an endpoint eval target that would listen on the device or
+// bring up a system interface, or whose type it cannot check for either: an
+// eval target is only ever dialed through.
+func (t *EvaluationTarget) validate() error {
+	if t == nil || t.Type != EvaluationTargetEndpoint {
+		return nil
+	}
+	endpoint, _ := t.Options.(option.Endpoint)
+	var wireguard *option.WireGuardEndpointOptions
+	switch options := endpoint.Options.(type) {
+	case *option.WireGuardEndpointOptions:
+		wireguard = options
+	case *lbO.AmneziaEndpointOptions:
+		wireguard = &options.WireGuardEndpointOptions
+	default:
+		return fmt.Errorf("%w: endpoint type %q is not an accepted eval target",
+			ErrInvalidContract, endpoint.Type)
+	}
+	switch {
+	case wireguard.ListenPort != 0:
+		return fmt.Errorf("%w: endpoint eval target listens on port %d",
+			ErrInvalidContract, wireguard.ListenPort)
+	case wireguard.System:
+		return fmt.Errorf("%w: endpoint eval target brings up a system interface", ErrInvalidContract)
+	}
 	return nil
 }
 
@@ -154,8 +272,8 @@ func (s SampleSpec) validate(limits bounds) error {
 	return nil
 }
 
-// maxBytes is the most the whole grid can transfer, both arms included, when
-// every fetch reads its full allowance.
+// maxBytes is the most the whole grid can transfer, both eval targets
+// included, when every fetch reads its full allowance.
 func (s SampleSpec) maxBytes(perResponse int64) int64 {
 	return int64(s.WindowsPerExit) * int64(s.AttemptsPerWindow) * 2 * perResponse
 }

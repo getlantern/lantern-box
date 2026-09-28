@@ -21,8 +21,8 @@ func (s *Service) measureOnce(ctx context.Context, out A.Outbound, target string
 // observe.
 //
 // A response outside 2xx is reported unreachable with failureHTTPStatus even
-// when its body then fails, so a block page counts against the arm that served
-// it.
+// when its body then fails, so a block page counts against the eval target
+// that served it.
 func measureAttempt(
 	ctx context.Context,
 	out A.Outbound,
