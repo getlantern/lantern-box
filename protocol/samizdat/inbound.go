@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -14,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/uot"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/route/rule"
 	M "github.com/sagernet/sing/common/metadata"
 
 	"github.com/getlantern/lantern-box/constant"
@@ -178,15 +180,25 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	// perspective — and would break the close-pairs-with-accept assumption
 	// the abuse aggregator relies on.
 	source := metadata.Source.String()
+	// Written by the routing callback and read by the deferred close, which
+	// can run without the callback having fired when shutdown times out.
+	var rejected atomic.Bool
 	if notify := peerconn.Acquire(); notify != nil {
 		notify(peerconn.Event{State: +1, Source: source, Destination: destination})
-		defer notify(peerconn.Event{State: -1, Source: source})
+		defer func() {
+			evt := peerconn.Event{State: -1, Source: source}
+			if rejected.Load() {
+				evt.Destination, evt.Rejected = destination, true
+			}
+			notify(evt)
+		}()
 	}
 
 	i.logger.InfoContext(ctx, "inbound connection to ", destination)
 	done := make(chan struct{})
 	i.router.RouteConnectionEx(ctx, conn, metadata, func(err error) {
 		if err != nil {
+			rejected.Store(rule.IsRejected(err))
 			i.logger.ErrorContext(ctx, err)
 		}
 		close(done)
