@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -32,7 +33,7 @@ type callbackRecorder struct {
 
 func newCallbackRecorder(t *testing.T) *callbackRecorder {
 	rec := &callbackRecorder{}
-	rec.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	rec.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec.mu.Lock()
 		rec.queries = append(rec.queries, r.URL.Query())
 		rec.headers = append(rec.headers, r.Header.Clone())
@@ -199,8 +200,8 @@ func TestServe_CancelledProbeIsNotReported(t *testing.T) {
 	rec := newCallbackRecorder(t)
 	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
 		ReportStalled: true,
-		StallTimeout:  badoption.Duration(time.Minute),
-		MaxWait:       badoption.Duration(time.Minute),
+		StallTimeout:  badoption.Duration(maxMaxWait),
+		MaxWait:       badoption.Duration(maxMaxWait),
 	}, scriptedState(sendState{acked: 100, unacked: 4000}))
 	server, client := tcpPair(t)
 
@@ -220,6 +221,71 @@ func TestServe_CancelledProbeIsNotReported(t *testing.T) {
 		t.Fatal("serve ignored cancellation")
 	}
 	assert.Empty(t, rec.calls(), "a probe cut short by the proxy says nothing about the route")
+}
+
+// blockingConn is a non-TCP conn whose Write blocks until its write deadline
+// passes, like a stream whose peer has stopped reading.
+type blockingConn struct {
+	net.Conn
+	mu       sync.Mutex
+	deadline time.Time
+	changed  chan struct{}
+}
+
+func newBlockingConn(c net.Conn) *blockingConn {
+	return &blockingConn{Conn: c, changed: make(chan struct{}, 1)}
+}
+
+func (c *blockingConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	select {
+	case c.changed <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (c *blockingConn) Write(b []byte) (int, error) {
+	for {
+		c.mu.Lock()
+		d := c.deadline
+		c.mu.Unlock()
+		if !d.IsZero() && !time.Now().Before(d) {
+			return 0, os.ErrDeadlineExceeded
+		}
+		select {
+		case <-c.changed:
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestServe_CancelledNonTCPProbeIsAborted(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
+		ReportStalled: true,
+		MaxWait:       badoption.Duration(maxMaxWait),
+	}, nil)
+	server, client := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() { errc <- r.serve(ctx, newBlockingConn(server)) }()
+	req, err := http.NewRequest(http.MethodGet, probeTarget, nil)
+	require.NoError(t, err)
+	require.NoError(t, req.Write(client))
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a blocked non-TCP write ignored cancellation")
+	}
+	assert.Empty(t, rec.calls())
 }
 
 func TestServe_MaxWaitBoundsSlowProgress(t *testing.T) {
@@ -372,6 +438,8 @@ func TestNewConfig(t *testing.T) {
 		{},
 		{CallbackURL: "api.example.test/v1/bandit/callback"},
 		{CallbackURL: "ftp://api.example.test/x"},
+		{CallbackURL: "http://api.example.test/v1/bandit/callback"},
+		{CallbackURL: "https://api.example.test/x", MaxWait: badoption.Duration(maxMaxWait + time.Second)},
 		{CallbackURL: "https://api.example.test/x", BodySize: bodyPoolSize + 1},
 	} {
 		_, err := newConfig(bad)

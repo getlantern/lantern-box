@@ -74,6 +74,11 @@ func (r *responder) serve(ctx context.Context, conn net.Conn) error {
 
 	res := r.respond(ctx, conn)
 	conn.Close()
+	// Shutdown closes inbound conns, which surfaces as write or socket errors;
+	// those say nothing about the route.
+	if ctx.Err() != nil {
+		res.verdict = verdictAborted
+	}
 	r.logger.DebugContext(ctx, "bandit probe ", res.verdict, " drain=", res.drain, " acked=", res.acked,
 		" retrans=", res.state.retrans, " rtt=", res.state.rtt)
 	if res.verdict == verdictAborted || (res.verdict == verdictStalled && !r.cfg.reportStalled) {
@@ -103,10 +108,22 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	conn.SetWriteDeadline(writeDeadline)
 	tc, isTCP := common.Cast[*net.TCPConn](conn)
 	if !isTCP {
-		if _, err := conn.Write(payload); err != nil {
-			return result{verdict: verdictStalled, drain: r.now().Sub(start)}
+		written := make(chan error, 1)
+		go func() {
+			_, err := conn.Write(payload)
+			written <- err
+		}()
+		select {
+		case err := <-written:
+			if err != nil {
+				return result{verdict: verdictStalled, drain: r.now().Sub(start)}
+			}
+			return result{verdict: verdictUnknown, drain: r.now().Sub(start)}
+		case <-ctx.Done():
+			conn.SetWriteDeadline(time.Now())
+			<-written
+			return result{verdict: verdictAborted, drain: r.now().Sub(start)}
 		}
-		return result{verdict: verdictUnknown, drain: r.now().Sub(start)}
 	}
 
 	// The write runs alongside the poll because a body larger than the free send

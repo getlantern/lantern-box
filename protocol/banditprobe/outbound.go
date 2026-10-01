@@ -32,6 +32,7 @@ const (
 	defaultBodySize     = 64 * 1024
 	defaultStallTimeout = 2500 * time.Millisecond
 	defaultMaxWait      = 10 * time.Second
+	maxMaxWait          = 15 * time.Second
 	requestReadTimeout  = 10 * time.Second
 	maxRequestBytes     = 8 << 10
 	callbackTimeout     = 10 * time.Second
@@ -78,8 +79,8 @@ func newConfig(options option.BanditProbeOutboundOptions) (config, error) {
 		return config{}, errors.New("banditprobe: callback_url is required")
 	}
 	u, err := url.Parse(options.CallbackURL)
-	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
-		return config{}, fmt.Errorf("banditprobe: invalid callback_url %q", options.CallbackURL)
+	if err != nil || u.Host == "" || u.Scheme != "https" {
+		return config{}, fmt.Errorf("banditprobe: callback_url must be an https URL, got %q", options.CallbackURL)
 	}
 	cfg := config{
 		callbackURL:   u,
@@ -99,6 +100,9 @@ func newConfig(options option.BanditProbeOutboundOptions) (config, error) {
 	}
 	if cfg.maxWait <= 0 {
 		cfg.maxWait = defaultMaxWait
+	}
+	if cfg.maxWait > maxMaxWait {
+		return config{}, fmt.Errorf("banditprobe: max_wait %s exceeds %s", cfg.maxWait, maxMaxWait)
 	}
 	return cfg, nil
 }

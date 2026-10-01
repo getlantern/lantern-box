@@ -9,8 +9,8 @@ import "github.com/sagernet/sing/common/json/badoption"
 // defaults noted on each field.
 type BanditProbeOutboundOptions struct {
 	// CallbackURL is where the proxy sends the callback once it has a verdict,
-	// e.g. "https://api.iantem.io/v1/bandit/callback". The client request's
-	// query parameters are carried over onto it.
+	// e.g. "https://api.iantem.io/v1/bandit/callback". It must be https: the
+	// callback carries the probe token and device ID across the open internet.
 	CallbackURL string `json:"callback_url"`
 
 	// BodySize is the number of random bytes sent back to the client. It has to
@@ -21,8 +21,9 @@ type BanditProbeOutboundOptions struct {
 	// still unacknowledged, before the probe is judged stalled (default: 2.5s).
 	StallTimeout badoption.Duration `json:"stall_timeout,omitempty"`
 
-	// MaxWait bounds the whole verdict so the callback always reaches the API
-	// before its reaper expires the probe (default: 10s).
+	// MaxWait bounds the verdict (default: 10s, at most 15s). The callback has to
+	// reach the API before its reaper expires the probe, so this must leave room
+	// for the callback inside that window.
 	MaxWait badoption.Duration `json:"max_wait,omitempty"`
 
 	// ReportStalled sends the callback with verdict=stalled instead of dropping
