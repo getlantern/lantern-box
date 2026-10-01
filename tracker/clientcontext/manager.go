@@ -185,6 +185,7 @@ func (c *readConn) ClientInfo() (ClientInfo, bool) {
 // sending anything fails its later reads and is not reported as an error.
 func (c *readConn) readInfo() (ClientInfo, error) {
 	_ = c.Conn.SetReadDeadline(time.Now().Add(readInfoTimeout))
+	defer c.Conn.SetReadDeadline(time.Time{})
 	head, err := readHead(c.Conn, nil)
 	if errors.Is(err, os.ErrDeadlineExceeded) && len(head) > 0 {
 		// A partial marker means the client is mid-frame, not waiting for the
@@ -193,7 +194,6 @@ func (c *readConn) readInfo() (ClientInfo, error) {
 		_ = c.Conn.SetReadDeadline(time.Now().Add(readInfoTimeout))
 		head, err = readHead(c.Conn, head)
 	}
-	_ = c.Conn.SetReadDeadline(time.Time{})
 	if errors.Is(err, os.ErrDeadlineExceeded) {
 		// Classification finishes on the first Read instead, so a frame delayed
 		// past the deadline is still kept from the destination, though too late
@@ -205,6 +205,9 @@ func (c *readConn) readInfo() (ClientInfo, error) {
 		c.readErr = err
 		return ClientInfo{}, nil
 	}
+	// Decoding a frame gets its own window, so a client that stalls mid-frame
+	// cannot block routing.
+	_ = c.Conn.SetReadDeadline(time.Now().Add(readInfoTimeout))
 	return c.consumeHead(head)
 }
 
@@ -231,6 +234,8 @@ func (c *readConn) consumeHead(head []byte) (ClientInfo, error) {
 	c.reader = io.MultiReader(dec.Buffered(), reader)
 	if ack {
 		if _, err := c.Write([]byte(ackResponse)); err != nil {
+			// The legacy sender waits for the ack before sending its traffic.
+			c.readErr = err
 			return ClientInfo{}, fmt.Errorf("writing %s response: %w", ackResponse, err)
 		}
 	}

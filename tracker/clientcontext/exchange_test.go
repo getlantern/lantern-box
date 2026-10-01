@@ -359,6 +359,17 @@ func TestFrameConnConcurrent(t *testing.T) {
 	}
 }
 
+// Probe conns share one payload, so the first write must not use its spare
+// capacity.
+func TestFrameConnSharedPayload(t *testing.T) {
+	payload := make([]byte, len(testPayload), len(testPayload)+16)
+	copy(payload, testPayload)
+	inner := &recordingConn{}
+	_, err := newFrameConn(inner, inner, payload).Write([]byte("data"))
+	require.NoError(t, err)
+	assert.Equal(t, make([]byte, 16), payload[len(payload):cap(payload)])
+}
+
 // A first write that times out before the whole frame is out keeps the rest
 // for the next write, since the router ignores a timed-out handshake kick and
 // keeps relaying.

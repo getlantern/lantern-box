@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -116,7 +117,9 @@ func (c *frameConn) Write(b []byte) (int, error) {
 	frame := c.frame
 	// One inner write, so the handshake carries the frame and b together. The
 	// router's handshake kick writes nil, which sends the frame alone.
-	n, err := c.Conn.Write(append(frame, b...))
+	// Clip so append never writes into a frame's spare capacity, which for
+	// probes is the shared probePayload.
+	n, err := c.Conn.Write(append(slices.Clip(frame), b...))
 	if n < len(frame) {
 		// Keep the unsent part for the next write: the router ignores a timed-out
 		// handshake kick and keeps relaying.

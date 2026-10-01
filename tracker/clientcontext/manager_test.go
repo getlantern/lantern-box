@@ -37,8 +37,9 @@ type scriptedRead struct {
 // writes. It ignores deadlines, so tests can place a read timeout exactly.
 type scriptedConn struct {
 	net.Conn
-	reads   []scriptedRead
-	written bytes.Buffer
+	reads    []scriptedRead
+	written  bytes.Buffer
+	writeErr error
 }
 
 func (c *scriptedConn) Read(p []byte) (int, error) {
@@ -55,7 +56,13 @@ func (c *scriptedConn) Read(p []byte) (int, error) {
 	return n, r.err
 }
 
-func (c *scriptedConn) Write(p []byte) (int, error)     { return c.written.Write(p) }
+func (c *scriptedConn) Write(p []byte) (int, error) {
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	return c.written.Write(p)
+}
+
 func (c *scriptedConn) SetReadDeadline(time.Time) error { return nil }
 
 func newScriptedReadConn(reads ...scriptedRead) (*readConn, *scriptedConn) {
@@ -133,6 +140,33 @@ func TestReadInfoErrors(t *testing.T) {
 		require.Error(t, err)
 		require.Zero(t, info)
 		_, err = conn.Read(make([]byte, 8))
+		require.Error(t, err, "later reads must return the failure")
+	})
+
+	// A legacy sender waits for the ack before sending its traffic.
+	t.Run("ack failed", func(t *testing.T) {
+		conn, scripted := newScriptedReadConn(scriptedRead{data: legacyClientInfoPrefix + testInfoJSON + testRequest})
+		scripted.writeErr = io.ErrClosedPipe
+
+		_, err := conn.readInfo()
+		require.ErrorIs(t, err, io.ErrClosedPipe)
+		_, err = conn.Read(make([]byte, 8))
+		require.Error(t, err, "later reads must return the failure")
+	})
+
+	// Decoding is bounded too, so a client that stalls mid-frame cannot block
+	// routing.
+	t.Run("stalled frame", func(t *testing.T) {
+		setReadInfoTimeout(t, 50*time.Millisecond)
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		go client.Write([]byte(clientInfoPrefix + `{"DeviceID":`))
+
+		c := &readConn{Conn: server, reader: server}
+		_, err := readInfoWithin(t, c)
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+		_, err = c.Read(make([]byte, 8))
 		require.Error(t, err, "later reads must return the failure")
 	})
 
