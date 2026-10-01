@@ -93,6 +93,11 @@ func newConfig(options option.BanditProbeOutboundOptions) (config, error) {
 	if err != nil || u.Host == "" || u.Scheme != "https" {
 		return config{}, fmt.Errorf("banditprobe: callback_url must be an https URL, got %q", options.CallbackURL)
 	}
+	// Probe requests are matched against this path, so it must be one a
+	// request can carry.
+	if u.Path == "" || u.Path == "/" {
+		return config{}, fmt.Errorf("banditprobe: callback_url must include the callback path, got %q", options.CallbackURL)
+	}
 	cfg := config{
 		callbackURL:   u,
 		bodySize:      options.BodySize,

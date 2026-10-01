@@ -565,6 +565,8 @@ func TestNewConfig(t *testing.T) {
 		{CallbackURL: "api.example.test/v1/bandit/callback"},
 		{CallbackURL: "ftp://api.example.test/x"},
 		{CallbackURL: "http://api.example.test/v1/bandit/callback"},
+		{CallbackURL: "https://api.example.test"},
+		{CallbackURL: "https://api.example.test/"},
 		{CallbackURL: "https://api.example.test/x", MaxWait: badoption.Duration(maxMaxWait + time.Second)},
 		{CallbackURL: "https://api.example.test/x", BodySize: bodyPoolSize + 1},
 	} {
