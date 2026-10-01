@@ -17,6 +17,7 @@ import (
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/protocol/algeneva"
 	"github.com/getlantern/lantern-box/protocol/amnezia"
+	"github.com/getlantern/lantern-box/protocol/banditprobe"
 	"github.com/getlantern/lantern-box/protocol/group"
 	"github.com/getlantern/lantern-box/protocol/hysteria2x"
 	"github.com/getlantern/lantern-box/protocol/meek"
@@ -111,6 +112,7 @@ func registerOutbounds(registry *outbound.Registry) {
 	water.RegisterOutbound(registry)
 
 	// utility outbounds
+	banditprobe.RegisterOutbound(registry)
 	group.RegisterFallback(registry)
 	group.RegisterMutableSelector(registry)
 	group.RegisterMutableURLTest(registry)

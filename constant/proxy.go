@@ -14,6 +14,7 @@ const (
 )
 
 const (
+	TypeBanditProbe       = "banditprobe"
 	TypeFallback          = "fallback"
 	TypeMutableSelector   = "mutableselector"
 	TypeMutableURLTest    = "mutableurltest"
