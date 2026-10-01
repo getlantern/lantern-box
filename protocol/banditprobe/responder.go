@@ -192,7 +192,9 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 			return result{verdict: verdictDelivered, drain: r.now().Sub(start), acked: st.acked, state: st}
 		}
 		now := r.now()
-		if st.acked != lastAcked {
+		// With nothing outstanding the flow isn't frozen, even if a wrapper is
+		// still holding Write open after the bytes reached the socket.
+		if st.acked != lastAcked || st.unacked == 0 {
 			lastAcked, lastProgress = st.acked, now
 		}
 		if now.Sub(lastProgress) >= r.cfg.stallTimeout || !now.Before(deadline) {

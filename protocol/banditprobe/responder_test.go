@@ -359,6 +359,39 @@ func TestServe_CompletedWriteWithoutSocketStateIsUnknown(t *testing.T) {
 	assert.Equal(t, "unknown", calls[0].Get("verdict"))
 }
 
+// throttledTCPConn hands bytes to the socket at once and then holds Write
+// open, the way a post-write rate limiter does.
+type throttledTCPConn struct {
+	*net.TCPConn
+	hold time.Duration
+}
+
+func (c *throttledTCPConn) Write(b []byte) (int, error) {
+	n, err := c.TCPConn.Write(b)
+	time.Sleep(c.hold)
+	return n, err
+}
+
+func (c *throttledTCPConn) Upstream() any { return c.TCPConn }
+
+func TestServe_PostWriteThrottleIsNotAStall(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{ReportStalled: true}, scriptedState(
+		sendState{acked: 4100, unacked: 0},
+	))
+	server, client := tcpPair(t)
+	conn := &throttledTCPConn{TCPConn: server, hold: 3 * time.Duration(r.cfg.stallTimeout)}
+
+	errc := make(chan error, 1)
+	go func() { errc <- r.serve(context.Background(), conn) }()
+	_, body := probe(t, client, probeTarget)
+	assert.Len(t, body, testBodySize)
+	require.NoError(t, <-errc)
+	calls := rec.calls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, "delivered", calls[0].Get("verdict"), "an acknowledged body must not stall while Write is held open")
+}
+
 func TestServe_MaxWaitBoundsSlowProgress(t *testing.T) {
 	rec := newCallbackRecorder(t)
 	var mu sync.Mutex
