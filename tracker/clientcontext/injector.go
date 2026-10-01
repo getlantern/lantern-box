@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/service"
 
 	isync "github.com/getlantern/lantern-box/internal/sync"
@@ -62,7 +63,7 @@ func (i *Injector) Install(ctx context.Context) error {
 	}
 	// A second wrapper would send client info twice, and the server forwards
 	// the second copy to the destination.
-	if _, installed := registry.(*outboundRegistry); installed {
+	if _, installed := common.Cast[*outboundRegistry](registry); installed {
 		return errors.New("clientcontext: injector already installed")
 	}
 	service.MustRegister[adapter.OutboundRegistry](ctx, &outboundRegistry{

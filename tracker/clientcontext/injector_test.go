@@ -52,6 +52,14 @@ func TestTags(t *testing.T) {
 	assert.False(t, injector.shouldInject("c"))
 }
 
+// upstreamRegistry stands in for a registry wrapper installed after an
+// Injector.
+type upstreamRegistry struct {
+	adapter.OutboundRegistry
+}
+
+func (r upstreamRegistry) Upstream() any { return r.OutboundRegistry }
+
 func TestInstall(t *testing.T) {
 	injector := newTestInjector()
 	assert.Error(t, injector.Install(context.Background()), "no outbound registry")
@@ -60,6 +68,9 @@ func TestInstall(t *testing.T) {
 	require.NoError(t, injector.Install(ctx))
 	assert.Error(t, injector.Install(ctx), "already installed")
 	assert.Error(t, NewInjector(injector.getInfo).Install(ctx), "already installed by another injector")
+	installed := service.FromContext[adapter.OutboundRegistry](ctx)
+	service.MustRegister[adapter.OutboundRegistry](ctx, upstreamRegistry{installed})
+	assert.Error(t, newTestInjector().Install(ctx), "already installed beneath another wrapper")
 
 	// Protocols registered after Install still reach the wrapped registry.
 	ctx = include.Context(context.Background())
