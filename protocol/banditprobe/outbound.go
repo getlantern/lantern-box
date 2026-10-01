@@ -65,13 +65,24 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		logger:     lg,
 		pool:       pool,
 		readState:  readSendState,
-		httpClient: &http.Client{Timeout: callbackTimeout},
+		httpClient: newCallbackClient(),
 		now:        time.Now,
 	}
 	return &Outbound{
 		Adapter:   outbound.NewAdapter(constant.TypeBanditProbe, tag, []string{N.NetworkTCP}, nil),
 		responder: r,
 	}, nil
+}
+
+// newCallbackClient never follows redirects: a redirect could move the token,
+// device ID and verdict off the validated https callback_url.
+func newCallbackClient() *http.Client {
+	return &http.Client{
+		Timeout: callbackTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 func newConfig(options option.BanditProbeOutboundOptions) (config, error) {

@@ -402,6 +402,28 @@ func TestServe_RejectsOversizedRequest(t *testing.T) {
 	assert.Empty(t, rec.calls())
 }
 
+func TestSendCallback_DoesNotFollowRedirects(t *testing.T) {
+	var redirected bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirected = true
+	}))
+	t.Cleanup(target.Close)
+	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.RequestURI(), http.StatusFound)
+	}))
+	t.Cleanup(api.Close)
+
+	cfg, err := newConfig(option.BanditProbeOutboundOptions{CallbackURL: api.URL + "/v1/bandit/callback"})
+	require.NoError(t, err)
+	client := newCallbackClient()
+	client.Transport = api.Client().Transport
+	r := &responder{cfg: cfg, httpClient: client, now: time.Now}
+
+	err = r.sendCallback(context.Background(), url.Values{"token": {"tok-1"}}, "", result{verdict: verdictDelivered})
+	assert.Error(t, err, "a 3xx must fail the callback")
+	assert.False(t, redirected, "the callback must not follow a redirect")
+}
+
 func TestServe_RejectsUnexpectedRequests(t *testing.T) {
 	tests := []struct {
 		name   string
