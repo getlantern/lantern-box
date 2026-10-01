@@ -288,6 +288,77 @@ func TestServe_CancelledNonTCPProbeIsAborted(t *testing.T) {
 	assert.Empty(t, rec.calls())
 }
 
+// TestServe_InconsistentSnapshotIsNotDelivered covers acks landing between the
+// two socket-state syscalls: acked then lags unacked, and a target built from
+// both would be reached while the tail is still outstanding.
+func TestServe_InconsistentSnapshotIsNotDelivered(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{ReportStalled: true}, scriptedState(
+		sendState{acked: 0, unacked: 0},
+		sendState{acked: 100, unacked: 500},
+		sendState{acked: 600, unacked: 400},
+	))
+	server, client := tcpPair(t)
+
+	_, _, err := runProbe(t, r, server, client, probeTarget)
+	require.NoError(t, err)
+	calls := rec.calls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, "stalled", calls[0].Get("verdict"))
+}
+
+// blockingTCPConn exposes a real *net.TCPConn through Upstream, as inbound
+// wrappers do, while its own Write blocks until its write deadline.
+type blockingTCPConn struct {
+	*blockingConn
+	tcp *net.TCPConn
+}
+
+func (c *blockingTCPConn) Upstream() any { return c.tcp }
+
+func TestServe_FailedWriteWithoutSocketStateIsStalled(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
+		ReportStalled: true,
+		MaxWait:       badoption.Duration(300 * time.Millisecond),
+	}, func(*net.TCPConn) (sendState, error) {
+		return sendState{}, errors.New("tcp send state unavailable")
+	})
+	server, client := tcpPair(t)
+	conn := &blockingTCPConn{blockingConn: newBlockingConn(server), tcp: server}
+
+	errc := make(chan error, 1)
+	go func() { errc <- r.serve(context.Background(), conn) }()
+	req, err := http.NewRequest(http.MethodGet, probeTarget, nil)
+	require.NoError(t, err)
+	require.NoError(t, req.Write(client))
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return")
+	}
+	calls := rec.calls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, "stalled", calls[0].Get("verdict"), "a write that never completed must not be reported as unknown")
+}
+
+func TestServe_CompletedWriteWithoutSocketStateIsUnknown(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{}, func(*net.TCPConn) (sendState, error) {
+		return sendState{}, errors.New("tcp send state unavailable")
+	})
+	server, client := tcpPair(t)
+
+	resp, body, err := runProbe(t, r, server, client, probeTarget)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Len(t, body, testBodySize)
+	calls := rec.calls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, "unknown", calls[0].Get("verdict"))
+}
+
 func TestServe_MaxWaitBoundsSlowProgress(t *testing.T) {
 	rec := newCallbackRecorder(t)
 	var mu sync.Mutex

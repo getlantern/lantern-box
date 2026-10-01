@@ -152,11 +152,21 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 
 	st, err := r.readState(tc)
 	if err != nil {
-		abortWrite()
-		return result{verdict: verdictUnknown, drain: r.now().Sub(start)}
+		// Without socket state only the write result is known, and unknown is
+		// reported as a success, so it requires the whole response to have been
+		// written.
+		select {
+		case err := <-written:
+			if err != nil {
+				return result{verdict: verdictStalled, drain: r.now().Sub(start)}
+			}
+			return result{verdict: verdictUnknown, drain: r.now().Sub(start)}
+		case <-ctx.Done():
+			abortWrite()
+			return result{verdict: verdictAborted, drain: r.now().Sub(start)}
+		}
 	}
 	lastAcked, lastProgress := st.acked, r.now()
-	var target uint64
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
@@ -172,13 +182,13 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 					return stalled(st)
 				}
 				st = next
-				// Delivered means the peer has acknowledged every byte written so
-				// far, including anything the conn already had in flight.
-				target = st.acked + uint64(st.unacked)
 			default:
 			}
 		}
-		if writeDone && st.acked >= target {
+		// Delivered means nothing written is still unacknowledged. acked and
+		// unacked come from separate syscalls, so a target summed from them can
+		// fall short of the response's end; unacked alone cannot.
+		if writeDone && st.unacked == 0 {
 			return result{verdict: verdictDelivered, drain: r.now().Sub(start), acked: st.acked, state: st}
 		}
 		now := r.now()
