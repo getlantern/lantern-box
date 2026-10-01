@@ -11,6 +11,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/libbox"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/service"
 
 	"github.com/getlantern/lantern-box/constant"
@@ -73,7 +74,8 @@ func RegisterProtocols(ctx context.Context) context.Context {
 		}
 	}
 	if registry := service.FromContext[adapter.OutboundRegistry](ctx); registry != nil {
-		if reg, ok := registry.(*outbound.Registry); ok {
+		// Cast sees through wrappers such as clientcontext's Injector.
+		if reg, ok := common.Cast[*outbound.Registry](registry); ok {
 			registerOutbounds(reg)
 		}
 	}

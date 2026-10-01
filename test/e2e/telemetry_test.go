@@ -24,10 +24,8 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
-	"github.com/sagernet/sing/service"
 
 	box "github.com/getlantern/lantern-box"
-	"github.com/getlantern/lantern-box/adapter"
 	"github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/metrics"
@@ -103,10 +101,9 @@ func TestTelemetryE2E(t *testing.T) {
 		logger,
 	)
 	serverBox.Router().AppendTracker(mgr)
-	service.MustRegister[adapter.ClientContextManager](boxCtx, mgr)
 
 	metricsTracker := metrics.NewTracker(boxCtx)
-	mgr.AppendTracker(metricsTracker)
+	serverBox.Router().AppendTracker(metricsTracker)
 
 	require.NoError(t, serverBox.Start())
 	defer serverBox.Close()
@@ -119,14 +116,15 @@ func TestTelemetryE2E(t *testing.T) {
 		CountryCode: "US",
 		Version:     "1.0.0",
 	}
-	injector := clientcontext.NewClientContextInjector(
+	clientCtx := box.BaseContext()
+	injector := clientcontext.NewInjector(
 		func() clientcontext.ClientInfo { return cInfo },
-		clientcontext.MatchBounds{Inbound: []string{"any"}, Outbound: []string{"any"}},
+		"http-out", "socks-out",
 	)
+	require.NoError(t, injector.Install(clientCtx))
 
-	clientBox, err := sbox.New(sbox.Options{Context: boxCtx, Options: clientOpts})
+	clientBox, err := sbox.New(sbox.Options{Context: clientCtx, Options: clientOpts})
 	require.NoError(t, err)
-	clientBox.Router().AppendTracker(injector)
 	require.NoError(t, clientBox.Start())
 	defer clientBox.Close()
 
