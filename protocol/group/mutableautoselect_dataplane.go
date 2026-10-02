@@ -21,6 +21,8 @@ import (
 // timeout. Delayed resets after partial replies can also be excused.
 const defaultDataPlaneResetQuiet = 5 * time.Second
 
+const defaultFirstResponseTimeout = 10 * time.Second
+
 type dataPlaneHooks struct {
 	onFailure func(adapter.UserFailureKind)
 	// onError runs on the IO goroutine, outside the watchdog's lock.
@@ -28,10 +30,10 @@ type dataPlaneHooks struct {
 	onActivity func()
 }
 
-// makeHooks returns callbacks wired into data-plane wrappers. Failure
-// handling re-checks membership at fire time, drops non-chargeable or
-// deduped events, and starts a ladder only for recorded failures.
-func (s *MutableAutoSelect) makeHooks(outerTag string, route routeKind) dataPlaneHooks {
+// makeHooks records chargeable failures and starts recovery. Only primary TCP
+// resets and unanswered writes trigger selection confirmation.
+func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind) dataPlaneHooks {
+	confirms := network == N.NetworkTCP && route == primaryRoute
 	return dataPlaneHooks{
 		onFailure: func(kind adapter.UserFailureKind) {
 			if !s.chargeable(outerTag, route) {
@@ -41,6 +43,9 @@ func (s *MutableAutoSelect) makeHooks(outerTag string, route routeKind) dataPlan
 				return
 			}
 			go s.runLadder(outerTag)
+			if confirms && (kind == adapter.UserFailureReset || kind == adapter.UserFailureNoResponse) {
+				go s.confirmSelectedFailure(outerTag, "")
+			}
 		},
 		onError: func(err error, state dataPlaneIO, excused bool) {
 			decision := "candidate"
@@ -68,38 +73,30 @@ type dataPlaneIO struct {
 	proven       bool
 }
 
-// dataPlaneWatchdog is the no-traffic stall timer shared by the stream
-// and packet wrappers.
+// dataPlaneWatchdog detects unanswered writes and mid-stream stalls.
+// Idle expiry counts only after provedReadBytes have arrived and the last
+// non-empty IO was a write, so unused keep-alive connections are not charged.
 //
-// provedReadBytes gates whether the stall is real: until the wrapped conn
-// has delivered that many cumulative non-empty Read bytes, an
-// idle-window expiry is treated as "established but never carried real
-// traffic" (e.g. a handshake-only or keepalive-only conn) and the
-// stall handler is suppressed.
-//
-// The direction of the last non-empty IO separately distinguishes "tunnel
-// is broken" from "user stopped sending traffic" on an already-proven conn.
-// The stall fires only when the most recent non-empty IO was a Write —
-// i.e. we sent bytes and got nothing back for the idle window. A proven
-// conn whose last activity was a Read (response arrived, then silence) is
-// treated as user-idle, not broken: a healthy keep-alive going unused
-// looks identical to a broken tunnel without this gate.
-//
-// endsQuietRead extends that rule to transport errors.
+// A non-zero firstResponseTimeout starts after the first non-empty write,
+// independently of provedReadBytes. Read bytes or a non-timeout read error
+// (including EOF) disarm it. Set firstResponseTimeout before the first IO.
 type dataPlaneWatchdog struct {
-	idle            time.Duration
-	hooks           dataPlaneHooks
-	provedReadBytes uint64
-	born            time.Time
-	ioMu            sync.Mutex
-	lastIO          time.Time // guarded by ioMu
-	lastWasWrite    bool      // guarded by ioMu
-	readBytes       atomic.Uint64
-	proven          atomic.Bool
-	stalled         atomic.Bool
-	fired           atomic.Bool
-	timer           *time.Timer
-	closeOnce       sync.Once
+	idle                 time.Duration
+	firstResponseTimeout time.Duration
+	hooks                dataPlaneHooks
+	provedReadBytes      uint64
+	born                 time.Time
+	ioMu                 sync.Mutex
+	lastIO               time.Time   // guarded by ioMu
+	lastWasWrite         bool        // guarded by ioMu
+	firstResponseTimer   *time.Timer // guarded by ioMu
+	readBytes            atomic.Uint64
+	responded            atomic.Bool
+	proven               atomic.Bool
+	stalled              atomic.Bool
+	fired                atomic.Bool
+	timer                *time.Timer
+	closeOnce            sync.Once
 }
 
 func (w *dataPlaneWatchdog) init(idle time.Duration, provedReadBytes uint64, hooks dataPlaneHooks) {
@@ -116,11 +113,12 @@ func isDataPlaneFailure(err error) bool {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
 		return false
 	}
+	return !isTimeout(err)
+}
+
+func isTimeout(err error) bool {
 	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
-		return false
-	}
-	return true
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func endsQuietRead(isRead bool, n int, state dataPlaneIO) bool {
@@ -134,6 +132,14 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	// logically gone.
 	if w.stalled.Load() {
 		return
+	}
+	if w.needsResponseTracking() {
+		switch {
+		case isRead && (n > 0 || (err != nil && !isTimeout(err))):
+			w.markResponded()
+		case !isRead && n > 0:
+			w.startFirstResponseTimer()
+		}
 	}
 	if isDataPlaneFailure(err) {
 		state := w.snapshotIO()
@@ -198,9 +204,51 @@ func (w *dataPlaneWatchdog) closeWatchdog() (firstClose bool) {
 	w.closeOnce.Do(func() {
 		w.stalled.Store(true)
 		w.timer.Stop()
+		w.stopFirstResponseTimer()
 		firstClose = true
 	})
 	return firstClose
+}
+
+func (w *dataPlaneWatchdog) needsResponseTracking() bool {
+	return w.firstResponseTimeout > 0 && !w.responded.Load()
+}
+
+func (w *dataPlaneWatchdog) startFirstResponseTimer() {
+	w.ioMu.Lock()
+	defer w.ioMu.Unlock()
+	if w.firstResponseTimer != nil || w.responded.Load() || w.stalled.Load() {
+		return
+	}
+	w.firstResponseTimer = time.AfterFunc(w.firstResponseTimeout, w.fireNoResponse)
+}
+
+func (w *dataPlaneWatchdog) markResponded() {
+	w.responded.Store(true)
+	w.stopFirstResponseTimer()
+}
+
+func (w *dataPlaneWatchdog) stopFirstResponseTimer() {
+	w.ioMu.Lock()
+	defer w.ioMu.Unlock()
+	if w.firstResponseTimer != nil {
+		w.firstResponseTimer.Stop()
+	}
+}
+
+func (w *dataPlaneWatchdog) fireNoResponse() {
+	if w.responded.Load() {
+		return
+	}
+	if !w.stalled.CompareAndSwap(false, true) {
+		return
+	}
+	if !w.fired.CompareAndSwap(false, true) {
+		return
+	}
+	if w.hooks.onFailure != nil {
+		w.hooks.onFailure(adapter.UserFailureNoResponse)
+	}
 }
 
 // fireStall is the idle-timer callback: it demotes a conn that went quiet
@@ -239,8 +287,7 @@ func (w *dataPlaneWatchdog) fireResetFailure() {
 	}
 }
 
-// dataPlaneStream detects tunnels that handshake successfully but
-// stop carrying data after they have started carrying it.
+// dataPlaneStream monitors stream IO for transport failures and unanswered writes.
 type dataPlaneStream struct {
 	net.Conn
 	dataPlaneWatchdog
