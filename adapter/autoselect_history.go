@@ -20,6 +20,9 @@ const (
 	// than going quiet.
 	UserFailureReset   UserFailureKind = "reset"
 	UserFailureUnknown UserFailureKind = "unknown"
+	// UserFailureNoResponse is a dialed connection that sent data but had no
+	// response observed before the first-response timeout.
+	UserFailureNoResponse UserFailureKind = "no_response"
 )
 
 // UserFailure stores when a user-traffic failure happened and what kind it was.
@@ -30,7 +33,7 @@ type UserFailure struct {
 
 func normalizeUserFailureKind(kind UserFailureKind) UserFailureKind {
 	switch kind {
-	case UserFailureDial, UserFailureStall, UserFailureReset:
+	case UserFailureDial, UserFailureStall, UserFailureReset, UserFailureNoResponse:
 		return kind
 	default:
 		return UserFailureUnknown
