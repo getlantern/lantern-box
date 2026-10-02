@@ -127,43 +127,49 @@ func TestDialContext_UDPFailureDoesNotSwitch(t *testing.T) {
 
 func TestTrySwitchAfterConfirmedFailure(t *testing.T) {
 	tests := []struct {
-		name     string
-		setup    func(s *MutableAutoSelect)
-		switched bool
+		name  string
+		setup func(s *MutableAutoSelect)
+		want  string
 	}{
-		{"validated fallback", func(*MutableAutoSelect) {}, true},
-		{"current selection changed", func(s *MutableAutoSelect) { s.stickyTag.tcp.Store("c") }, false},
+		{"validated fallback", func(*MutableAutoSelect) {}, "b"},
+		{"current selection changed", func(s *MutableAutoSelect) { s.stickyTag.tcp.Store("c") }, ""},
+		{"newer probe passed", func(s *MutableAutoSelect) { s.recordProbeOutcome("a", true, 10) }, ""},
 		{"fallback failed its last probe", func(s *MutableAutoSelect) {
 			s.recordProbeOutcome("b", false, 0)
-		}, false},
+		}, "c"},
 		{"fallback never probed", func(s *MutableAutoSelect) {
 			s.access.Lock()
 			delete(s.histories, "b")
 			s.access.Unlock()
-		}, false},
+		}, "c"},
+		{"no validated member", func(s *MutableAutoSelect) {
+			s.recordProbeOutcome("b", false, 0)
+			s.recordProbeOutcome("c", false, 0)
+		}, ""},
 		{"rate limited", func(s *MutableAutoSelect) {
 			s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = time.Now(), "c"
-		}, false},
+		}, ""},
 		{"rate limit expired", func(s *MutableAutoSelect) {
 			s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = time.Now().Add(-confirmedFailureSwitchCooldown), "c"
-		}, true},
+		}, "b"},
 		{"replacement fails again", func(s *MutableAutoSelect) {
 			s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = time.Now(), "a"
-		}, true},
+		}, "b"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				s, _ := newConfirmationTestMUR(t, "a", "b", "c")
+				s.recordProbeOutcome("a", false, 0)
 				tt.setup(s)
 				before := loadString(&s.stickyTag.tcp)
 				s.trySwitchAfterConfirmedFailure("a", "b")
 
 				h, _ := s.peekHistoryLocked("a")
-				if tt.switched {
-					assert.Equal(t, "b", loadString(&s.stickyTag.tcp))
+				if tt.want != "" {
+					assert.Equal(t, tt.want, loadString(&s.stickyTag.tcp))
 					assert.True(t, h.hasRecoveryGate())
-					assert.Equal(t, "b", s.lastConfirmedFailureSwitch.selectedTag)
+					assert.Equal(t, tt.want, s.lastConfirmedFailureSwitch.selectedTag)
 				} else {
 					assert.Equal(t, before, loadString(&s.stickyTag.tcp))
 					assert.False(t, h.hasRecoveryGate())
@@ -433,6 +439,7 @@ func TestTrySwitchAfterConfirmedFailure_ChoosesValidatedAlternate(t *testing.T) 
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				s, _ := newConfirmationTestMUR(t, "a", "b", "c")
+				s.recordProbeOutcome("a", false, 0)
 				tt.setup(s)
 				s.trySwitchAfterConfirmedFailure("a", "")
 				assert.Equal(t, tt.want, loadString(&s.stickyTag.tcp))

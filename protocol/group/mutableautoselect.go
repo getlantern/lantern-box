@@ -1144,8 +1144,9 @@ func (s *MutableAutoSelect) confirmSelectedFailure(failedTag, replacementTag str
 	}
 }
 
-// trySwitchAfterConfirmedFailure gates failedTag only if it is still selected
-// and a switch to an eligible replacement succeeds.
+// trySwitchAfterConfirmedFailure gates failedTag only if it is still selected,
+// its latest probe still failed, and a switch to an eligible replacement
+// succeeds. An ineligible replacementTag falls back to another eligible member.
 func (s *MutableAutoSelect) trySwitchAfterConfirmedFailure(failedTag, replacementTag string) {
 	s.access.Lock()
 	defer s.access.Unlock()
@@ -1156,11 +1157,19 @@ func (s *MutableAutoSelect) trySwitchAfterConfirmedFailure(failedTag, replacemen
 	if _, member := s.members.Load(failedTag); !member {
 		return
 	}
+	h, ok := s.peekHistoryLocked(failedTag)
+	if !ok {
+		return
+	}
 	now := time.Now()
-	if replacementTag == "" {
-		replacementTag = s.findProbedReplacementLocked(now, N.NetworkTCP, failedTag)
+	// A concurrent ladder probe may have recorded a newer success.
+	if _, _, consec, _, _ := h.snapshot(now, s.hist.userFailureWindow); consec == 0 {
+		return
 	}
 	if replacementTag == "" || !s.eligibleReplacementLocked(now, replacementTag) {
+		replacementTag = s.findProbedReplacementLocked(now, N.NetworkTCP, failedTag)
+	}
+	if replacementTag == "" {
 		return
 	}
 	last := s.lastConfirmedFailureSwitch
@@ -1169,7 +1178,7 @@ func (s *MutableAutoSelect) trySwitchAfterConfirmedFailure(failedTag, replacemen
 		return
 	}
 	slot.Store(replacementTag)
-	s.historyForLocked(failedTag).startRecoveryGate(now)
+	h.startRecoveryGate(now)
 	s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = now, replacementTag
 	s.logger.Info("tcp switch: ", failedTag, " -> ", replacementTag, " (failed confirmation)")
 }

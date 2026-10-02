@@ -223,9 +223,15 @@ func (w *dataPlaneWatchdog) startFirstResponseTimer() {
 	w.firstResponseTimer = time.AfterFunc(w.firstResponseTimeout, w.fireNoResponse)
 }
 
+// markResponded and fireNoResponse decide under ioMu, so a reply recorded
+// before the timeout decision is never charged.
 func (w *dataPlaneWatchdog) markResponded() {
+	w.ioMu.Lock()
+	defer w.ioMu.Unlock()
 	w.responded.Store(true)
-	w.stopFirstResponseTimer()
+	if w.firstResponseTimer != nil {
+		w.firstResponseTimer.Stop()
+	}
 }
 
 func (w *dataPlaneWatchdog) stopFirstResponseTimer() {
@@ -237,10 +243,10 @@ func (w *dataPlaneWatchdog) stopFirstResponseTimer() {
 }
 
 func (w *dataPlaneWatchdog) fireNoResponse() {
-	if w.responded.Load() {
-		return
-	}
-	if !w.stalled.CompareAndSwap(false, true) {
+	w.ioMu.Lock()
+	charge := !w.responded.Load() && w.stalled.CompareAndSwap(false, true)
+	w.ioMu.Unlock()
+	if !charge {
 		return
 	}
 	if !w.fired.CompareAndSwap(false, true) {
