@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -27,9 +28,10 @@ func probeMember(
 		return probeResult{tag: tag}
 	}
 	delay, err := probe.Run(ctx, out, probeURL, beh.probeTimeout)
-	if err != nil {
-		// Every failure is reported as a failed probe, an unusable probe
-		// URL included: separating those would change which members demote.
+	// Every failure but a truncated body is reported as a failed probe, an
+	// unusable probe URL included: separating those would change which members
+	// demote.
+	if err != nil && !errors.Is(err, probe.ErrResponseBody) {
 		return probeResult{tag: tag}
 	}
 	// 1ms floor so a sub-millisecond probe isn't reported as 0; rank
