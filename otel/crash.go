@@ -124,7 +124,6 @@ func crashAttributes(crashLog string) []otellog.KeyValue {
 		key   attribute.Key
 		value string
 	}{
-		{semconv.ExceptionTypeKey, c.kind},
 		{semconv.ExceptionMessageKey, c.message},
 		{semconv.CodeFunctionNameKey, c.function},
 		{semconv.CodeFilePathKey, c.file},
@@ -155,10 +154,9 @@ type crashSummary struct {
 	line     int    // line within file
 }
 
-var (
-	hexRun   = regexp.MustCompile(`0x[0-9a-fA-F]+`)
-	digitRun = regexp.MustCompile(`[0-9]+`)
-)
+// numberRun matches hex literals before plain digit runs, so an address
+// normalises to "0x?" rather than having its digits rewritten as well.
+var numberRun = regexp.MustCompile(`0x[0-9a-fA-F]+|[0-9]+`)
 
 // signature identifies a crash independent of the values involved, so
 // "slice bounds out of range [:172] with capacity 128" and "[:257] with
@@ -171,7 +169,12 @@ func (c crashSummary) signature() string {
 	if c.message != "" {
 		sig += ": " + c.message
 	}
-	sig = digitRun.ReplaceAllString(hexRun.ReplaceAllString(sig, "0x?"), "N")
+	sig = numberRun.ReplaceAllStringFunc(sig, func(n string) string {
+		if strings.HasPrefix(n, "0x") {
+			return "0x?"
+		}
+		return "N"
+	})
 	if c.function != "" {
 		sig += " @ " + c.function
 	}

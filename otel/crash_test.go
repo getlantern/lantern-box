@@ -134,6 +134,9 @@ func TestCrashSignatureIgnoresValues(t *testing.T) {
 	a := crashSummary{kind: "panic", message: "runtime error: slice bounds out of range [:172] with capacity 128", function: "f"}
 	b := crashSummary{kind: "panic", message: "runtime error: slice bounds out of range [:257] with capacity 256", function: "f"}
 	assert.Equal(t, a.signature(), b.signature())
+
+	addr := crashSummary{kind: "panic", message: "bad pointer 0x4a1b2c in span 12", function: "f"}
+	assert.Equal(t, "panic: bad pointer 0x? in span N @ f", addr.signature())
 }
 
 func TestCrashAttributes(t *testing.T) {
@@ -143,7 +146,6 @@ func TestCrashAttributes(t *testing.T) {
 		got[kv.Key] = kv.Value
 	}
 	assert.Equal(t, "runtime_panic", got[string(semconv.CrashTypeKey)].AsString())
-	assert.Equal(t, "panic", got[string(semconv.ExceptionTypeKey)].AsString())
 	assert.Equal(t, "runtime error: slice bounds out of range [:172] with capacity 128",
 		got[string(semconv.ExceptionMessageKey)].AsString())
 	assert.Equal(t, "github.com/sagernet/sing-vmess/vless.(*VisionConn).filterTLS",
