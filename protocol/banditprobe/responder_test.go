@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/stretchr/testify/assert"
@@ -572,5 +573,76 @@ func TestNewConfig(t *testing.T) {
 	} {
 		_, err := newConfig(bad)
 		assert.Error(t, err, "%+v", bad)
+	}
+}
+
+// debugLogger formats every message the way a box logging at debug does;
+// the NOP logger the other tests use never formats its arguments.
+func debugLogger() log.ContextLogger {
+	factory := log.NewDefaultFactory(context.Background(), log.Formatter{}, io.Discard, "", nil, false)
+	factory.SetLevel(log.LevelDebug)
+	return factory.Logger()
+}
+
+func TestServe_DebugLoggingFormatsEveryVerdict(t *testing.T) {
+	tests := []struct {
+		name      string
+		opts      option.BanditProbeOutboundOptions
+		readState func(*net.TCPConn) (sendState, error)
+		pipe      bool
+		want      string
+	}{
+		{"delivered", option.BanditProbeOutboundOptions{}, scriptedState(
+			sendState{acked: 4100, unacked: 0, retrans: 1, rtt: 42 * time.Millisecond},
+		), false, "delivered"},
+		{"stalled", option.BanditProbeOutboundOptions{ReportStalled: true}, scriptedState(
+			sendState{acked: 100, unacked: 4000},
+			sendState{acked: 1500, unacked: 2600, retrans: 7},
+		), false, "stalled"},
+		{"unknown", option.BanditProbeOutboundOptions{}, nil, true, "unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := newCallbackRecorder(t)
+			r := newTestResponder(t, rec, tt.opts, tt.readState)
+			r.logger = debugLogger()
+			var server, client net.Conn
+			if tt.pipe {
+				server, client = net.Pipe()
+				t.Cleanup(func() { client.Close(); server.Close() })
+			} else {
+				server, client = tcpPair(t)
+			}
+
+			_, _, err := runProbe(t, r, server, client, probeTarget)
+			require.NoError(t, err)
+			calls := rec.calls()
+			require.Len(t, calls, 1)
+			assert.Equal(t, tt.want, calls[0].Get("verdict"))
+		})
+	}
+}
+
+// panicConn panics on the first call serve makes, standing in for any bug in
+// the probe path.
+type panicConn struct{ net.Conn }
+
+func (panicConn) SetReadDeadline(time.Time) error { panic("boom") }
+
+func TestNewConnectionEx_RecoversFromPanic(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{}, nil)
+	o := &Outbound{responder: r}
+	server, client := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	closed := make(chan error, 1)
+	o.NewConnectionEx(context.Background(), panicConn{server}, adapter.InboundContext{}, func(err error) { closed <- err })
+	select {
+	case err := <-closed:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "panic answering probe")
+	case <-time.After(5 * time.Second):
+		t.Fatal("onClose was not called after the panic")
 	}
 }

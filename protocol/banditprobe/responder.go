@@ -79,7 +79,9 @@ func (r *responder) serve(ctx context.Context, conn net.Conn) error {
 	if ctx.Err() != nil {
 		res.verdict = verdictAborted
 	}
-	r.logger.DebugContext(ctx, "bandit probe ", res.verdict, " drain=", res.drain, " acked=", res.acked,
+	// sing's formatter panics on types it doesn't know, a named string type
+	// included, so the verdict is logged as a plain string.
+	r.logger.DebugContext(ctx, "bandit probe ", string(res.verdict), " drain=", res.drain, " acked=", res.acked,
 		" retrans=", res.state.retrans, " rtt=", res.state.rtt)
 	if res.verdict == verdictAborted || (res.verdict == verdictStalled && !r.cfg.reportStalled) {
 		return nil
