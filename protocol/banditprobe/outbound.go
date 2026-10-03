@@ -133,10 +133,19 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 
 func (o *Outbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	go func() {
-		err := o.responder.serve(ctx, conn)
-		conn.Close()
-		if onClose != nil {
-			onClose(err)
-		}
+		var err error
+		// A probe is a side channel: a panic while answering one must not take
+		// down the proxy and every user on it.
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("banditprobe: panic answering probe: %v", p)
+				o.responder.logger.ErrorContext(ctx, err)
+			}
+			conn.Close()
+			if onClose != nil {
+				onClose(err)
+			}
+		}()
+		err = o.responder.serve(ctx, conn)
 	}()
 }
