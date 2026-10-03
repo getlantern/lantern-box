@@ -110,7 +110,7 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	conn.SetWriteDeadline(writeDeadline)
 	tc, isTCP := common.Cast[*net.TCPConn](conn)
 	if !isTCP {
-		written := writeAsync(conn, payload)
+		written := r.writeAsync(ctx, conn, payload)
 		select {
 		case err := <-written:
 			if errors.Is(err, errWritePanic) {
@@ -133,17 +133,23 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	// Deadlines also go on the raw socket so a wrapper that ignores them cannot
 	// leave the write blocked forever.
 	tc.SetWriteDeadline(writeDeadline)
-	written := writeAsync(conn, payload)
+	written := r.writeAsync(ctx, conn, payload)
 	writeDone := false
-	abortWrite := func() {
-		if !writeDone {
-			conn.SetWriteDeadline(time.Now())
-			tc.SetWriteDeadline(time.Now())
-			<-written
+	// abortWrite unblocks an outstanding write and returns its result.
+	abortWrite := func() error {
+		if writeDone {
+			return nil
 		}
+		conn.SetWriteDeadline(time.Now())
+		tc.SetWriteDeadline(time.Now())
+		return <-written
 	}
 	stalled := func(st sendState) result {
-		abortWrite()
+		// The write can panic after the loop last checked it; that is still a
+		// bug here, not a stalled route.
+		if errors.Is(abortWrite(), errWritePanic) {
+			return result{verdict: verdictAborted, drain: r.now().Sub(start), acked: st.acked, state: st}
+		}
 		return result{verdict: verdictStalled, drain: r.now().Sub(start), acked: st.acked, state: st}
 	}
 
@@ -237,14 +243,16 @@ var errWritePanic = errors.New("banditprobe: panic writing probe response")
 
 // writeAsync writes payload on its own goroutine and delivers the result on
 // the returned channel. recover only covers the goroutine it runs in, so a
-// panic in a wrapper's Write is caught here and delivered as errWritePanic
-// rather than taking down the proxy.
-func writeAsync(conn net.Conn, payload []byte) <-chan error {
+// panic in a wrapper's Write is caught here, logged, and delivered as
+// errWritePanic rather than taking down the proxy.
+func (r *responder) writeAsync(ctx context.Context, conn net.Conn, payload []byte) <-chan error {
 	written := make(chan error, 1)
 	go func() {
 		defer func() {
 			if p := recover(); p != nil {
-				written <- fmt.Errorf("%w: %v", errWritePanic, p)
+				err := fmt.Errorf("%w: %v", errWritePanic, p)
+				r.logger.ErrorContext(ctx, err)
+				written <- err
 			}
 		}()
 		_, err := conn.Write(payload)

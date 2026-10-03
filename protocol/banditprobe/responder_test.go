@@ -2,6 +2,7 @@ package banditprobe
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -675,6 +676,8 @@ func TestServe_PanickingWriteIsAbortedNotReported(t *testing.T) {
 			rec := newCallbackRecorder(t)
 			r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{ReportStalled: true},
 				scriptedState(sendState{acked: 0, unacked: 4096}))
+			logs := &syncBuffer{}
+			r.logger = errorLogger(logs)
 			server, client := tt.pair(t)
 
 			errc := make(chan error, 1)
@@ -689,6 +692,76 @@ func TestServe_PanickingWriteIsAbortedNotReported(t *testing.T) {
 				t.Fatal("serve did not return after the write panicked")
 			}
 			assert.Empty(t, rec.calls(), "a panicking write is our bug, not a stall, so nothing is reported")
+			assert.Contains(t, logs.String(), "panic writing probe response", "the recovered panic is logged at error level")
 		})
 	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the logger's goroutines.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// errorLogger logs only errors, into w, as a box above debug level does.
+func errorLogger(w io.Writer) log.ContextLogger {
+	factory := log.NewDefaultFactory(context.Background(), log.Formatter{}, w, "", nil, false)
+	factory.SetLevel(log.LevelError)
+	return factory.Logger()
+}
+
+// latePanicConn blocks in Write until the responder aborts it by setting a
+// past write deadline, then panics: a panic that lands after the poll loop
+// last checked the write.
+type latePanicConn struct {
+	net.Conn
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *latePanicConn) SetWriteDeadline(t time.Time) error {
+	if !t.After(time.Now()) {
+		c.once.Do(func() { close(c.release) })
+	}
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *latePanicConn) Write([]byte) (int, error) {
+	<-c.release
+	panic("late boom")
+}
+
+func (c *latePanicConn) Upstream() any { return c.Conn }
+
+func TestServe_WritePanicDuringStallIsAborted(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{ReportStalled: true},
+		scriptedState(sendState{acked: 0, unacked: 4096}))
+	server, client := tcpPair(t)
+	conn := &latePanicConn{Conn: server, release: make(chan struct{})}
+
+	errc := make(chan error, 1)
+	go func() { errc <- r.serve(context.Background(), conn) }()
+	req, err := http.NewRequest(http.MethodGet, probeTarget, nil)
+	require.NoError(t, err)
+	require.NoError(t, req.Write(client))
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return")
+	}
+	assert.Empty(t, rec.calls(), "a write that panics while the stall is being called is aborted, not reported as stalled")
 }
