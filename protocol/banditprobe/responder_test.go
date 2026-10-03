@@ -646,3 +646,49 @@ func TestNewConnectionEx_RecoversFromPanic(t *testing.T) {
 		t.Fatal("onClose was not called after the panic")
 	}
 }
+
+// writePanicConn panics in Write, standing in for a buggy protocol wrapper. It
+// exposes the wrapped conn as its upstream, as sing's wrappers do, so a TCP
+// conn underneath is still found.
+type writePanicConn struct{ net.Conn }
+
+func (writePanicConn) Write([]byte) (int, error) { panic("boom") }
+func (c writePanicConn) Upstream() any           { return c.Conn }
+
+func TestServe_PanickingWriteIsAbortedNotReported(t *testing.T) {
+	tests := []struct {
+		name string
+		pair func(t *testing.T) (net.Conn, net.Conn)
+	}{
+		{"non-TCP", func(t *testing.T) (net.Conn, net.Conn) {
+			server, client := net.Pipe()
+			t.Cleanup(func() { client.Close(); server.Close() })
+			return server, client
+		}},
+		{"TCP", func(t *testing.T) (net.Conn, net.Conn) {
+			server, client := tcpPair(t)
+			return server, client
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := newCallbackRecorder(t)
+			r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{ReportStalled: true},
+				scriptedState(sendState{acked: 0, unacked: 4096}))
+			server, client := tt.pair(t)
+
+			errc := make(chan error, 1)
+			go func() { errc <- r.serve(context.Background(), writePanicConn{server}) }()
+			req, err := http.NewRequest(http.MethodGet, probeTarget, nil)
+			require.NoError(t, err)
+			require.NoError(t, req.Write(client))
+			select {
+			case err := <-errc:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("serve did not return after the write panicked")
+			}
+			assert.Empty(t, rec.calls(), "a panicking write is our bug, not a stall, so nothing is reported")
+		})
+	}
+}

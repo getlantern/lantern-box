@@ -110,13 +110,12 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	conn.SetWriteDeadline(writeDeadline)
 	tc, isTCP := common.Cast[*net.TCPConn](conn)
 	if !isTCP {
-		written := make(chan error, 1)
-		go func() {
-			_, err := conn.Write(payload)
-			written <- err
-		}()
+		written := writeAsync(conn, payload)
 		select {
 		case err := <-written:
+			if errors.Is(err, errWritePanic) {
+				return result{verdict: verdictAborted, drain: r.now().Sub(start)}
+			}
 			if err != nil {
 				return result{verdict: verdictStalled, drain: r.now().Sub(start)}
 			}
@@ -134,11 +133,7 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	// Deadlines also go on the raw socket so a wrapper that ignores them cannot
 	// leave the write blocked forever.
 	tc.SetWriteDeadline(writeDeadline)
-	written := make(chan error, 1)
-	go func() {
-		_, err := conn.Write(payload)
-		written <- err
-	}()
+	written := writeAsync(conn, payload)
 	writeDone := false
 	abortWrite := func() {
 		if !writeDone {
@@ -159,6 +154,9 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 		// written.
 		select {
 		case err := <-written:
+			if errors.Is(err, errWritePanic) {
+				return result{verdict: verdictAborted, drain: r.now().Sub(start)}
+			}
 			if err != nil {
 				return result{verdict: verdictStalled, drain: r.now().Sub(start)}
 			}
@@ -175,6 +173,9 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 		if !writeDone {
 			select {
 			case err := <-written:
+				if errors.Is(err, errWritePanic) {
+					return result{verdict: verdictAborted, drain: r.now().Sub(start), acked: st.acked, state: st}
+				}
 				if err != nil {
 					return result{verdict: verdictStalled, drain: r.now().Sub(start), acked: st.acked, state: st}
 				}
@@ -228,6 +229,29 @@ func (r *responder) body() []byte {
 // reservedParams are set only by the proxy; a client copy is discarded so it
 // cannot pre-empt or contradict the proxy's own observation.
 var reservedParams = []string{"verdict", "drain_ms", "acked", "retrans", "rtt_ms"}
+
+// errWritePanic marks a probe response write that panicked. It is a bug on
+// this side rather than a sign the route stalled, so it ends the probe as
+// aborted and is never reported.
+var errWritePanic = errors.New("banditprobe: panic writing probe response")
+
+// writeAsync writes payload on its own goroutine and delivers the result on
+// the returned channel. recover only covers the goroutine it runs in, so a
+// panic in a wrapper's Write is caught here and delivered as errWritePanic
+// rather than taking down the proxy.
+func writeAsync(conn net.Conn, payload []byte) <-chan error {
+	written := make(chan error, 1)
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				written <- fmt.Errorf("%w: %v", errWritePanic, p)
+			}
+		}()
+		_, err := conn.Write(payload)
+		written <- err
+	}()
+	return written
+}
 
 // sendCallback forwards the client's callback to the API with the verdict
 // attached. Client parameters other than the reserved and configured ones are
