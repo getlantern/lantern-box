@@ -28,7 +28,7 @@ require (
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260520145825-958775d51395
 	github.com/getlantern/samizdat v0.0.3-0.20260819153658-ebc74116a064
-	github.com/getlantern/semconv v0.0.0-20261003132151-c7f53312c748
+	github.com/getlantern/semconv v0.0.0-20261003143130-94b11ff9bfeb
 	github.com/getlantern/twiddle v0.0.0-20260914204124-f698a0d67d2f
 	github.com/gobwas/ws v1.4.0
 	github.com/hashicorp/yamux v0.1.2
