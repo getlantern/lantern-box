@@ -18,6 +18,8 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
+
+	lAdapter "github.com/getlantern/lantern-box/adapter"
 )
 
 // ErrUnusableInput wraps a failure caused by Run's own arguments: an unusable
@@ -58,7 +60,7 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 		return 0, fmt.Errorf("%w: no host or port in probe URL %q", ErrUnusableInput, probeURL)
 	}
 
-	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	probeCtx, cancel := context.WithTimeout(lAdapter.ContextWithProbe(ctx), timeout)
 	defer cancel()
 
 	start := time.Now()

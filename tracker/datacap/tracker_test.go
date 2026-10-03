@@ -2,6 +2,7 @@ package datacap
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,102 +11,112 @@ import (
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/common/bufio"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// Scenario 1: NewDatacapTracker returns error if URL is empty
-func TestNewDatacapTracker_MissingURL_ReturnsError(t *testing.T) {
+// infoConn stages ClientInfo on a connection for InfoFromConn in tests.
+type infoConn struct {
+	net.Conn
+	info clientcontext.ClientInfo
+}
+
+func (c infoConn) ClientInfo() (clientcontext.ClientInfo, bool) { return c.info, true }
+
+// infoPacketConn stages ClientInfo on a packet connection for InfoFromConn in
+// tests.
+type infoPacketConn struct {
+	N.PacketConn
+	info clientcontext.ClientInfo
+}
+
+func (c infoPacketConn) ClientInfo() (clientcontext.ClientInfo, bool) { return c.info, true }
+
+func TestNewMissingURL(t *testing.T) {
 	_, err := NewDatacapTracker(Options{URL: ""}, log.NewNOPFactory().Logger())
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "url not defined")
 }
 
-// Scenario 2: Datacap URL is present & Client is Pro
-func TestRoutedConnection_ProClient_SkipsTracking(t *testing.T) {
-	tracker, err := NewDatacapTracker(Options{URL: "http://example.com"}, log.NewNOPFactory().Logger())
-	require.NoError(t, err)
+// Data-cap enforcement applies only to identified free users, so every other
+// connection is returned unchanged.
+func TestSkip(t *testing.T) {
+	tests := []struct {
+		name string
+		info *clientcontext.ClientInfo
+	}{
+		// Not from a clientcontext-aware client.
+		{name: "no info"},
+		// Usage and throttling are keyed by device ID, so info without one would
+		// pool every such client under a single empty ID.
+		{name: "no device ID", info: &clientcontext.ClientInfo{Platform: "test", CountryCode: "US"}},
+		// A device ID is set so the skip can only come from IsPro.
+		{name: "pro", info: &clientcontext.ClientInfo{DeviceID: "device-pro", IsPro: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tracker, err := NewDatacapTracker(Options{URL: "http://example.com"}, log.NewNOPFactory().Logger())
+			require.NoError(t, err)
 
-	mockConn := newMockConn(nil)
-	ctx := service.ContextWithPtr(context.Background(), &clientcontext.ClientInfo{
-		IsPro: true,
-	})
+			udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer udpConn.Close()
+			var conn net.Conn = newMockConn(nil)
+			var packetConn N.PacketConn = bufio.NewPacketConn(udpConn)
+			if tt.info != nil {
+				conn = infoConn{Conn: conn, info: *tt.info}
+				packetConn = infoPacketConn{PacketConn: packetConn, info: *tt.info}
+			}
 
-	routedConn := tracker.RoutedConnection(ctx, mockConn, adapter.InboundContext{}, nil, nil)
-	// Should return original connection (skipped)
-	assert.Equal(t, mockConn, routedConn)
+			assert.Equal(t, conn, tracker.RoutedConnection(context.Background(), conn, adapter.InboundContext{}, nil, nil))
+			assert.Equal(t, packetConn, tracker.RoutedPacketConnection(context.Background(), packetConn, adapter.InboundContext{}, nil, nil))
+		})
+	}
 }
 
-// Scenario 3: Datacap URL present & Free Client & Throttling Disabled
-func TestRoutedConnection_FreeUser_ThrottlingDisabled(t *testing.T) {
-	// Mock server returning Throttle: false (throttling disabled)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"throttle":false, "capLimit": 1000}`))
-	}))
-	defer server.Close()
+// A free user is throttled only once the datacap server reports the cap is
+// exhausted.
+func TestThrottle(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+		want     bool
+	}{
+		{name: "under cap", response: `{"throttle":false, "capLimit": 1000}`},
+		{name: "exhausted", response: `{"throttle":true, "remainingBytes": 0, "capLimit": 1000}`, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(tt.response))
+			}))
+			defer server.Close()
 
-	tracker, err := NewDatacapTracker(Options{URL: server.URL, ReportInterval: "100ms"}, log.NewNOPFactory().Logger())
-	require.NoError(t, err)
+			tracker, err := NewDatacapTracker(Options{URL: server.URL, ReportInterval: "100ms"}, log.NewNOPFactory().Logger())
+			require.NoError(t, err)
 
-	mockConn := newMockConn(make([]byte, 1024))
-	ctx := clientcontext.ContextWithClientInfo(context.Background(), clientcontext.ClientInfo{
-		IsPro:       false,
-		DeviceID:    "device-free-no-throttle",
-		Platform:    "test",
-		CountryCode: "US",
-	})
+			staged := infoConn{Conn: newMockConn(make([]byte, 1024)), info: clientcontext.ClientInfo{
+				DeviceID:    "device-" + tt.name,
+				Platform:    "test",
+				CountryCode: "US",
+			}}
+			conn, ok := tracker.RoutedConnection(context.Background(), staged, adapter.InboundContext{}, nil, nil).(*Conn)
+			require.True(t, ok, "a free user's connection must be tracked")
+			defer conn.Close()
 
-	routedConn := tracker.RoutedConnection(ctx, mockConn, adapter.InboundContext{}, nil, nil)
-	assert.NotEqual(t, mockConn, routedConn)
+			_, _ = conn.Read(make([]byte, 10))
+			time.Sleep(200 * time.Millisecond)
 
-	conn, ok := routedConn.(*Conn)
-	require.True(t, ok, "routedConn should be *Conn")
-
-	_, _ = conn.Read(make([]byte, 10))
-	time.Sleep(200 * time.Millisecond)
-
-	// Throttling should be DISABLED
-	assert.False(t, conn.throttler.IsEnabled(), "Throttler should be disabled")
-	conn.Close()
-}
-
-// Scenario 4: Datacap URL present & Free Client & Data Exhausted (Throttle: true)
-func TestRoutedConnection_FreeUserWithCap_EnablesThrottling(t *testing.T) {
-	// Mock server returning Throttle: true (data exhausted, remainingBytes <= 0)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"throttle":true, "remainingBytes": 0, "capLimit": 1000}`))
-	}))
-	defer server.Close()
-
-	tracker, err := NewDatacapTracker(Options{URL: server.URL, ReportInterval: "100ms"}, log.NewNOPFactory().Logger())
-	require.NoError(t, err)
-
-	mockConn := newMockConn(make([]byte, 1024))
-	ctx := clientcontext.ContextWithClientInfo(context.Background(), clientcontext.ClientInfo{
-		IsPro:       false,
-		DeviceID:    "device-free-capped",
-		Platform:    "test",
-		CountryCode: "US",
-	})
-
-	routedConn := tracker.RoutedConnection(ctx, mockConn, adapter.InboundContext{}, nil, nil)
-	assert.NotEqual(t, mockConn, routedConn)
-
-	conn, ok := routedConn.(*Conn)
-	require.True(t, ok, "routedConn should be *Conn")
-
-	_, _ = conn.Read(make([]byte, 10))
-	time.Sleep(200 * time.Millisecond)
-
-	// Throttler should be enabled when Throttle=true (data exhausted)
-	assert.True(t, conn.throttler.IsEnabled(), "Throttler should be enabled for capped user")
-
-	// Verify rates: Write (Download) should be throttled, Read (Upload) should allow more
-	assert.Equal(t, int64(lowTierSpeedBytesPerSec), conn.throttler.GetWriteRate(), "Write rate (Download) should be throttled to low tier")
-	assert.Equal(t, int64(defaultUploadSpeedBytesPerSec), conn.throttler.GetReadRate(), "Read rate (Upload) should be default upload speed")
-
-	conn.Close()
+			require.Equal(t, tt.want, conn.throttler.IsEnabled())
+			if tt.want {
+				// Downloads (writes) drop to the low tier; uploads (reads) keep the
+				// default upload speed.
+				assert.Equal(t, int64(lowTierSpeedBytesPerSec), conn.throttler.GetWriteRate())
+				assert.Equal(t, int64(defaultUploadSpeedBytesPerSec), conn.throttler.GetReadRate())
+			}
+		})
+	}
 }

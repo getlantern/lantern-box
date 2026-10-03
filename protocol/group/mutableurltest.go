@@ -770,7 +770,7 @@ func urlTestGET(ctx context.Context, link string, detour N.Dialer) (uint16, erro
 	}
 
 	start := time.Now()
-	instance, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
+	instance, err := detour.DialContext(adapter.ContextWithProbe(ctx), "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
 	if err != nil {
 		return 0, err
 	}

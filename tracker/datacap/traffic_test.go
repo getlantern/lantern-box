@@ -49,8 +49,8 @@ func TestTrafficReportsBidirectionalOnceAndOmitsDestinations(t *testing.T) {
 	defer srv.Close()
 	tracker, err := NewDatacapTracker(Options{URL: srv.URL, TrafficCategories: true, ReportInterval: "1h"}, noopLogger)
 	require.NoError(t, err)
-	ctx := clientcontext.ContextWithClientInfo(context.Background(), clientcontext.ClientInfo{DeviceID: "device", CountryCode: "IR", Platform: "android"})
-	conn := tracker.RoutedConnection(ctx, newMockConn([]byte("read")), adapter.InboundContext{Destination: M.ParseSocksaddr("news.example:443")}, nil, nil).(*Conn)
+	staged := infoConn{Conn: newMockConn([]byte("read")), info: clientcontext.ClientInfo{DeviceID: "device", CountryCode: "IR", Platform: "android"}}
+	conn := tracker.RoutedConnection(context.Background(), staged, adapter.InboundContext{Destination: M.ParseSocksaddr("news.example:443")}, nil, nil).(*Conn)
 	defer conn.Close()
 	_, err = conn.Read(make([]byte, 4))
 	require.NoError(t, err)

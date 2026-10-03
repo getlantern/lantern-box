@@ -2,289 +2,73 @@ package clientcontext
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net"
-	"sync"
-	"time"
-
-	lAdapter "github.com/getlantern/lantern-box/adapter"
+	"errors"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/protocol/group"
-	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/service"
+
+	isync "github.com/getlantern/lantern-box/internal/sync"
 )
 
-// sendInfoTimeout bounds the client-info exchange. It runs on the connection's
-// critical path after the dial-layer timeouts no longer apply; without a
-// deadline, a server that stalls after the handshake (e.g. under DPI
-// throttling) holds the flow and its healthy-pool slot indefinitely.
-var sendInfoTimeout = 10 * time.Second
-
-var (
-	_ (adapter.ConnectionTracker)    = (*ClientContextInjector)(nil)
-	_ (N.ConnHandshakeSuccess)       = (*writeConn)(nil)
-	_ (N.PacketConnHandshakeSuccess) = (*writePacketConn)(nil)
-)
-
-// ClientContextInjector is a connection tracker that sends client info to a ClientContext Manager.
-type ClientContextInjector struct {
+// Injector sends [ClientInfo] to the server on connections dialed through
+// outbounds enabled for injection. Dials marked with
+// [github.com/getlantern/lantern-box/adapter.ContextWithProbe] exchange the
+// zero ClientInfo and are not attributed to a client. It is safe for
+// concurrent use.
+type Injector struct {
 	getInfo      GetClientInfoFn
-	matchBounds  MatchBounds
-	inboundRule  *boundsRule
-	outboundRule *boundsRule
-	ruleMu       sync.RWMutex
+	outboundTags isync.TypedMap[string, struct{}]
 }
 
-// NewClientContextInjector creates a tracker for injecting client info.
-func NewClientContextInjector(fn GetClientInfoFn, bounds MatchBounds) *ClientContextInjector {
-	return &ClientContextInjector{
-		matchBounds:  bounds,
-		inboundRule:  newBoundsRule(bounds.Inbound),
-		outboundRule: newBoundsRule(bounds.Outbound),
-		getInfo:      fn,
+// NewInjector returns an Injector that sends getInfo() on dials through
+// outbounds whose tag is in outboundTags. Their peers must support the
+// client-info exchange.
+func NewInjector(getInfo GetClientInfoFn, outboundTags ...string) *Injector {
+	i := &Injector{getInfo: getInfo}
+	i.AddOutboundTags(outboundTags...)
+	return i
+}
+
+// AddOutboundTags enables injection for the given outbound tags. Their
+// peers must support the client-info exchange. It applies from the next
+// dial; open connections are unaffected.
+func (i *Injector) AddOutboundTags(tags ...string) {
+	for _, tag := range tags {
+		i.outboundTags.Store(tag, struct{}{})
 	}
 }
 
-// RoutedConnection wraps the connection for writing client info.
-func (t *ClientContextInjector) RoutedConnection(
-	ctx context.Context,
-	conn net.Conn,
-	metadata adapter.InboundContext,
-	matchedRule adapter.Rule,
-	matchOutbound adapter.Outbound,
-) net.Conn {
-	_, isGroup := matchOutbound.(adapter.OutboundGroup)
-	if !isGroup && !t.preMatch(metadata.Inbound, matchOutbound.Tag()) {
-		return conn
-	}
-	info := t.getInfo()
-	t.ruleMu.RLock()
-	rule := *t.outboundRule
-	t.ruleMu.RUnlock()
-	return newWriteConn(conn, &info, rule, matchOutbound)
-}
-
-// RoutedPacketConnection wraps the packet connection for writing client info.
-func (t *ClientContextInjector) RoutedPacketConnection(
-	ctx context.Context,
-	conn N.PacketConn,
-	metadata adapter.InboundContext,
-	matchedRule adapter.Rule,
-	matchOutbound adapter.Outbound,
-) N.PacketConn {
-	_, isGroup := matchOutbound.(adapter.OutboundGroup)
-	if !isGroup && !t.preMatch(metadata.Inbound, matchOutbound.Tag()) {
-		return conn
-	}
-	info := t.getInfo()
-	t.ruleMu.RLock()
-	rule := *t.outboundRule
-	t.ruleMu.RUnlock()
-	return newWritePacketConn(conn, metadata, &info, rule, matchOutbound)
-}
-
-func (t *ClientContextInjector) preMatch(inbound, outbound string) bool {
-	t.ruleMu.RLock()
-	defer t.ruleMu.RUnlock()
-	return t.inboundRule.match(inbound) && t.outboundRule.match(outbound)
-}
-
-func (t *ClientContextInjector) SetBounds(bounds MatchBounds) {
-	t.ruleMu.Lock()
-	t.matchBounds = bounds
-	t.inboundRule = newBoundsRule(bounds.Inbound)
-	t.outboundRule = newBoundsRule(bounds.Outbound)
-	t.ruleMu.Unlock()
-}
-
-func (t *ClientContextInjector) MatchBounds() MatchBounds {
-	t.ruleMu.RLock()
-	defer t.ruleMu.RUnlock()
-	return t.matchBounds.clone()
-}
-
-// writeConn sends client info after handshake.
-type writeConn struct {
-	net.Conn
-	info          *ClientInfo
-	outboundRule  boundsRule
-	matchOutbound adapter.Outbound
-}
-
-func newWriteConn(
-	conn net.Conn,
-	info *ClientInfo,
-	outboundRule boundsRule,
-	matchOutbound adapter.Outbound,
-) net.Conn {
-	return &writeConn{
-		Conn:          conn,
-		info:          info,
-		outboundRule:  outboundRule,
-		matchOutbound: matchOutbound,
+// RemoveOutboundTags disables injection for the given outbound tags.
+// It applies from the next dial; connections already open are unaffected.
+func (i *Injector) RemoveOutboundTags(tags ...string) {
+	for _, tag := range tags {
+		i.outboundTags.Delete(tag)
 	}
 }
 
-// ConnHandshakeSuccess sends client info upon successful handshake with the server.
-func (c *writeConn) ConnHandshakeSuccess(conn net.Conn) error {
-	if !c.match(conn) {
-		return nil
+func (i *Injector) shouldInject(tag string) bool {
+	_, ok := i.outboundTags.Load(tag)
+	return ok
+}
+
+// Install replaces the outbound registry in ctx with one whose outbounds send
+// client info through i. It must be called after the registries are added to
+// ctx (e.g. by box.Context) and before box.New. It returns an error if ctx has
+// no outbound registry or already has an Injector installed.
+func (i *Injector) Install(ctx context.Context) error {
+	registry := service.FromContext[adapter.OutboundRegistry](ctx)
+	if registry == nil {
+		return errors.New("clientcontext: no outbound registry in context")
 	}
-	if err := c.sendInfo(conn); err != nil {
-		return fmt.Errorf("sending client info: %w", err)
+	// A second wrapper would send client info twice, and the server forwards
+	// the second copy to the destination.
+	if _, installed := common.Cast[*outboundRegistry](registry); installed {
+		return errors.New("clientcontext: injector already installed")
 	}
+	service.MustRegister[adapter.OutboundRegistry](ctx, &outboundRegistry{
+		OutboundRegistry: registry,
+		injector:         i,
+	})
 	return nil
-}
-
-func (c *writeConn) match(conn net.Conn) bool {
-	outbound, isGroup := c.matchOutbound.(adapter.OutboundGroup)
-	if !isGroup {
-		return true // caught by pre-match
-	}
-	// we need to check if the outbound used by the group matches as it may contain outbounds
-	// that don't
-
-	if tconn, ok := conn.(*lAdapter.TaggedConn); ok {
-		return c.outboundRule.match(tconn.Tag())
-	}
-	return c.outboundRule.match(outbound.Now())
-}
-
-// sendInfo marshals and sends client info as an HTTP POST, then waits for HTTP 200 OK.
-func (c *writeConn) sendInfo(conn net.Conn) error {
-	buf, err := json.Marshal(c.info)
-	if err != nil {
-		return fmt.Errorf("marshaling client info: %w", err)
-	}
-	// Best effort: conns that don't support deadlines keep the old unbounded
-	// behavior rather than failing the exchange.
-	_ = conn.SetDeadline(time.Now().Add(sendInfoTimeout))
-	defer conn.SetDeadline(time.Time{})
-
-	packet := append([]byte(packetPrefix), buf...)
-	if _, err = conn.Write(packet); err != nil {
-		return fmt.Errorf("writing client info: %w", err)
-	}
-
-	// wait for `OK` response
-	var resp [2]byte
-	if _, err := io.ReadFull(conn, resp[:]); err != nil {
-		return fmt.Errorf("reading response: %w", err)
-	}
-	if string(resp[:]) != "OK" {
-		return fmt.Errorf("invalid response: %q", resp[:])
-	}
-	return nil
-}
-
-func (c *writeConn) Upstream() any {
-	return c.Conn
-}
-
-type writePacketConn struct {
-	N.PacketConn
-	metadata      adapter.InboundContext
-	info          *ClientInfo
-	outboundRule  boundsRule
-	matchOutbound adapter.Outbound
-}
-
-func newWritePacketConn(
-	conn N.PacketConn,
-	metadata adapter.InboundContext,
-	info *ClientInfo,
-	outboundRule boundsRule,
-	matchOutbound adapter.Outbound,
-) N.PacketConn {
-	return &writePacketConn{
-		PacketConn:    conn,
-		metadata:      metadata,
-		info:          info,
-		outboundRule:  outboundRule,
-		matchOutbound: matchOutbound,
-	}
-}
-
-// PacketConnHandshakeSuccess sends client info upon successful handshake.
-func (c *writePacketConn) PacketConnHandshakeSuccess(conn net.PacketConn) error {
-	if !c.match(conn) {
-		return nil
-	}
-	if err := c.sendInfo(conn); err != nil {
-		return fmt.Errorf("sending client info: %w", err)
-	}
-	return nil
-}
-
-func (c *writePacketConn) match(conn net.PacketConn) bool {
-	outbound, isGroup := c.matchOutbound.(adapter.OutboundGroup)
-	if !isGroup {
-		return true // caught by pre-match
-	}
-	// we need to check if the outbound used by the group matches as it may contain outbounds
-	// that don't
-
-	// fast path: conn is already tagged
-	if tconn, ok := conn.(*lAdapter.TaggedPacketConn); ok {
-		return c.outboundRule.match(tconn.Tag())
-	}
-
-	switch outbound.(type) {
-	case *group.Selector:
-		return c.outboundRule.match(outbound.Now())
-	case *group.URLTest:
-		// edge case: we cannot determine which outbound was actually used. urltest.Now will return
-		// the tag for the selected TCP outbound if it's not nil and the selected UDP outbound can
-		// be different.
-	}
-	return false
-}
-
-// sendInfo marshals and sends client info as a CLIENTINFO packet, then waits for OK.
-func (c *writePacketConn) sendInfo(conn net.PacketConn) error {
-	buf, err := json.Marshal(c.info)
-	if err != nil {
-		return fmt.Errorf("marshaling client info: %w", err)
-	}
-	dest := c.metadata.Destination
-	var addr net.Addr
-	switch {
-	case dest.IsIP():
-		addr = dest.UDPAddr()
-	case len(c.metadata.DestinationAddresses) > 0:
-		addr = &net.UDPAddr{
-			IP:   c.metadata.DestinationAddresses[0].AsSlice(),
-			Port: int(dest.Port),
-		}
-	default:
-		addr = dest
-	}
-	// Best effort: conns that don't support deadlines keep the old unbounded
-	// behavior rather than failing the exchange.
-	_ = conn.SetDeadline(time.Now().Add(sendInfoTimeout))
-	defer conn.SetDeadline(time.Time{})
-
-	packet := append([]byte(packetPrefix), buf...)
-	if _, err = conn.WriteTo(packet, addr); err != nil {
-		return fmt.Errorf("writing packet: %w", err)
-	}
-
-	// wait for `OK` response; the buffer must be able to hold a full datagram —
-	// wrapped conns return io.ErrShortBuffer instead of truncating, so a 2-byte
-	// buffer would reject any reply carrying transport overhead.
-	resp := make([]byte, 512)
-	n, _, err := conn.ReadFrom(resp)
-	if err != nil {
-		return fmt.Errorf("reading response: %w", err)
-	}
-	if n < 2 || string(resp[:2]) != "OK" {
-		return fmt.Errorf("invalid response: %q", resp[:n])
-	}
-	return nil
-}
-
-func (c *writePacketConn) Upstream() any {
-	return c.PacketConn
 }

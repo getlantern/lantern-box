@@ -1,235 +1,81 @@
 package clientcontext
 
 import (
-	"net"
-	"net/netip"
+	"context"
+	"encoding/json"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	box "github.com/getlantern/lantern-box"
+	lAdapter "github.com/getlantern/lantern-box/adapter"
+	lconstant "github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/protocol"
 )
 
-// startUDPEchoOK starts a UDP server that expects a CLIENTINFO packet and responds "OK".
-func startUDPEchoOK(t *testing.T) *net.UDPAddr {
-	t.Helper()
-	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { conn.Close() })
-
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, addr, err := conn.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			_ = n
-			conn.WriteTo([]byte("OK"), addr)
-		}
-	}()
-
-	return conn.LocalAddr().(*net.UDPAddr)
-}
-
-func TestSendInfoWithIPDestination(t *testing.T) {
-	serverAddr := startUDPEchoOK(t)
-
-	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn.Close()
-
-	dest := M.SocksaddrFrom(netip.MustParseAddr(serverAddr.IP.String()), uint16(serverAddr.Port))
-
-	wpc := &writePacketConn{
-		metadata: adapter.InboundContext{Destination: dest},
-		info:     &ClientInfo{DeviceID: "test-device", Platform: "test"},
+func TestEncodePayload(t *testing.T) {
+	info := ClientInfo{DeviceID: "test-device", Platform: "test", IsPro: true, CountryCode: "US", Version: "1.0"}
+	tests := []struct {
+		name string
+		ctx  context.Context
+		want ClientInfo
+	}{
+		{name: "client info", ctx: context.Background(), want: info},
+		// A probe carries no device info.
+		{name: "probe", ctx: lAdapter.ContextWithProbe(context.Background())},
 	}
-
-	err = wpc.sendInfo(conn)
-	assert.NoError(t, err)
-}
-
-func TestSendInfoWithDomainAndResolvedAddresses(t *testing.T) {
-	serverAddr := startUDPEchoOK(t)
-
-	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn.Close()
-
-	// Simulate fakeip: destination is a domain, but DestinationAddresses has the resolved IP.
-	dest := M.Socksaddr{Fqdn: "example.com", Port: uint16(serverAddr.Port)}
-
-	wpc := &writePacketConn{
-		metadata: adapter.InboundContext{
-			Destination:          dest,
-			DestinationAddresses: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
-		},
-		info: &ClientInfo{DeviceID: "test-device", Platform: "test"},
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := NewInjector(func() ClientInfo { return info }).encodePayload(tt.ctx)
+			require.True(t, strings.HasPrefix(string(payload), clientInfoPrefix))
+			var got ClientInfo
+			require.NoError(t, json.Unmarshal(payload[len(clientInfoPrefix):], &got))
+			assert.Equal(t, tt.want, got)
+		})
 	}
-
-	err = wpc.sendInfo(conn)
-	assert.NoError(t, err)
 }
 
-type recordingPacketConn struct {
-	writtenAddr net.Addr
+func TestTags(t *testing.T) {
+	injector := newTestInjector("a")
+	assert.True(t, injector.shouldInject("a"))
+	assert.False(t, injector.shouldInject("b"))
+
+	injector.AddOutboundTags("b", "c")
+	injector.RemoveOutboundTags("a", "c")
+	assert.False(t, injector.shouldInject("a"))
+	assert.True(t, injector.shouldInject("b"))
+	assert.False(t, injector.shouldInject("c"))
 }
 
-func (c *recordingPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	n := copy(p, []byte("OK"))
-	return n, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, nil
+// upstreamRegistry stands in for a registry wrapper installed after an
+// Injector.
+type upstreamRegistry struct {
+	adapter.OutboundRegistry
 }
 
-func (c *recordingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	c.writtenAddr = addr
-	return len(p), nil
-}
+func (r upstreamRegistry) Upstream() any { return r.OutboundRegistry }
 
-func (c *recordingPacketConn) Close() error                       { return nil }
-func (c *recordingPacketConn) LocalAddr() net.Addr                { return &net.UDPAddr{} }
-func (c *recordingPacketConn) SetDeadline(_ time.Time) error      { return nil }
-func (c *recordingPacketConn) SetReadDeadline(_ time.Time) error  { return nil }
-func (c *recordingPacketConn) SetWriteDeadline(_ time.Time) error { return nil }
+func TestInstall(t *testing.T) {
+	injector := newTestInjector()
+	assert.Error(t, injector.Install(context.Background()), "no outbound registry")
 
-func TestSendInfoWithDomainPassesThrough(t *testing.T) {
-	conn := &recordingPacketConn{}
+	ctx := box.BaseContext()
+	require.NoError(t, injector.Install(ctx))
+	assert.Error(t, injector.Install(ctx), "already installed")
+	assert.Error(t, NewInjector(injector.getInfo).Install(ctx), "already installed by another injector")
+	installed := service.FromContext[adapter.OutboundRegistry](ctx)
+	service.MustRegister[adapter.OutboundRegistry](ctx, upstreamRegistry{installed})
+	assert.Error(t, newTestInjector().Install(ctx), "already installed beneath another wrapper")
 
-	dest := M.Socksaddr{Fqdn: "example.com", Port: 443}
-
-	wpc := &writePacketConn{
-		metadata: adapter.InboundContext{Destination: dest},
-		info:     &ClientInfo{DeviceID: "test-device", Platform: "test"},
-	}
-
-	err := wpc.sendInfo(conn)
-	require.NoError(t, err)
-	assert.Equal(t, dest, conn.writtenAddr)
-}
-
-func setSendInfoTimeout(t *testing.T, d time.Duration) {
-	t.Helper()
-	old := sendInfoTimeout
-	sendInfoTimeout = d
-	t.Cleanup(func() { sendInfoTimeout = old })
-}
-
-func TestStreamSendInfoReadsSplitOK(t *testing.T) {
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-
-	go func() {
-		buf := make([]byte, 4096)
-		server.Read(buf)
-		// "OK" delivered across two reads; sendInfo must not treat a short
-		// read as an invalid response.
-		server.Write([]byte("O"))
-		server.Write([]byte("K"))
-	}()
-
-	wc := &writeConn{info: &ClientInfo{DeviceID: "test-device", Platform: "test"}}
-	assert.NoError(t, wc.sendInfo(client))
-}
-
-func TestStreamSendInfoTimesOutWithoutResponse(t *testing.T) {
-	setSendInfoTimeout(t, 100*time.Millisecond)
-
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-
-	go func() {
-		buf := make([]byte, 4096)
-		server.Read(buf)
-		// never respond
-	}()
-
-	wc := &writeConn{info: &ClientInfo{DeviceID: "test-device", Platform: "test"}}
-	start := time.Now()
-	err := wc.sendInfo(client)
-	assert.Error(t, err)
-	assert.Less(t, time.Since(start), 5*time.Second)
-}
-
-func TestStreamSendInfoClearsDeadlineAfterSuccess(t *testing.T) {
-	setSendInfoTimeout(t, 100*time.Millisecond)
-
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-
-	go func() {
-		buf := make([]byte, 4096)
-		server.Read(buf)
-		server.Write([]byte("OK"))
-	}()
-
-	wc := &writeConn{info: &ClientInfo{DeviceID: "test-device", Platform: "test"}}
-	require.NoError(t, wc.sendInfo(client))
-
-	// The conn is piped for the connection's lifetime after sendInfo; a
-	// leftover deadline would kill reads that outlast the timeout.
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		server.Write([]byte("data"))
-	}()
-	buf := make([]byte, 4)
-	_, err := client.Read(buf)
-	assert.NoError(t, err)
-}
-
-func TestPacketSendInfoAcceptsOversizedResponse(t *testing.T) {
-	server, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { server.Close() })
-
-	go func() {
-		buf := make([]byte, 4096)
-		_, addr, err := server.ReadFrom(buf)
-		if err != nil {
-			return
-		}
-		server.WriteTo([]byte("OK with trailing transport overhead"), addr)
-	}()
-
-	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn.Close()
-
-	serverAddr := server.LocalAddr().(*net.UDPAddr)
-	dest := M.SocksaddrFrom(netip.MustParseAddr(serverAddr.IP.String()), uint16(serverAddr.Port))
-
-	wpc := &writePacketConn{
-		metadata: adapter.InboundContext{Destination: dest},
-		info:     &ClientInfo{DeviceID: "test-device", Platform: "test"},
-	}
-	assert.NoError(t, wpc.sendInfo(conn))
-}
-
-func TestPacketSendInfoTimesOutWithoutResponse(t *testing.T) {
-	setSendInfoTimeout(t, 100*time.Millisecond)
-
-	// Server reads but never responds.
-	server, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { server.Close() })
-
-	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn.Close()
-
-	serverAddr := server.LocalAddr().(*net.UDPAddr)
-	dest := M.SocksaddrFrom(netip.MustParseAddr(serverAddr.IP.String()), uint16(serverAddr.Port))
-
-	wpc := &writePacketConn{
-		metadata: adapter.InboundContext{Destination: dest},
-		info:     &ClientInfo{DeviceID: "test-device", Platform: "test"},
-	}
-	start := time.Now()
-	err = wpc.sendInfo(conn)
-	assert.Error(t, err)
-	assert.Less(t, time.Since(start), 5*time.Second)
+	// Protocols registered after Install still reach the wrapped registry.
+	ctx = include.Context(context.Background())
+	require.NoError(t, NewInjector(injector.getInfo).Install(ctx))
+	protocol.RegisterProtocols(ctx)
+	_, ok := service.FromContext[adapter.OutboundRegistry](ctx).CreateOptions(lconstant.TypeSamizdat)
+	assert.True(t, ok)
 }
