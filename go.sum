@@ -273,8 +273,8 @@ github.com/getlantern/quic-go-unbounded-fork v0.59.0-unbounded h1:1vTizA6U8YdyvZ
 github.com/getlantern/quic-go-unbounded-fork v0.59.0-unbounded/go.mod h1:upnsH4Ju1YkqpLXC305eW3yDZ4NfnNbmQRCMWS58IKU=
 github.com/getlantern/samizdat v0.0.3-0.20260819153658-ebc74116a064 h1:NhCyQAWGEWjok/jg4gRD6fzCZvyOQy/4dVSFYhzU5xk=
 github.com/getlantern/samizdat v0.0.3-0.20260819153658-ebc74116a064/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
-github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb h1:c5YM7b3a4r2J8Eh89KkI6M/iTFe6Bi+b8AJlfkKdFq4=
-github.com/getlantern/semconv v0.0.0-20260327040646-21845dda05cb/go.mod h1:GkPT5P9JoOTIRXRmFWxYgu1hhXgTFFTNc2hoG7WQc3g=
+github.com/getlantern/semconv v0.0.0-20261003131535-3156e30b80ef h1:/Ko5fUC288kF2EKUjQ7cpOs7LtqHzUYE9WyIKSRH1UA=
+github.com/getlantern/semconv v0.0.0-20261003131535-3156e30b80ef/go.mod h1:GkPT5P9JoOTIRXRmFWxYgu1hhXgTFFTNc2hoG7WQc3g=
 github.com/getlantern/sing-box-minimal v1.13.19-lantern h1:dwVCskH9N3Q5a2wVELdyGDOHKvqWK0D9/rCM/VcaDF0=
 github.com/getlantern/sing-box-minimal v1.13.19-lantern/go.mod h1:4E8WvF7Vi60N1NtPw1CeG994J/yiJZZkty5dKKwG+V0=
 github.com/getlantern/telemetry v0.0.0-20250606052628-8960164ec1f5 h1:6ITBYqNkLbVZ1tQNXwmH8N80rZtvyW6IZa8L6EAhBQo=
