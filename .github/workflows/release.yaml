@@ -18,6 +18,13 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0 # Mandatory to use the extract version from tag
+      - name: Check Docker Hub description size
+        run: |
+          bytes=$(wc -c < README.docker.md)
+          if [ "$bytes" -gt 25000 ]; then
+            echo "::error file=README.docker.md::Docker Hub description is $bytes bytes; the limit is 25000."
+            exit 1
+          fi
       - uses: actions/setup-go@v6
         with:
           go-version-file: "go.mod"
