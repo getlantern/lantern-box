@@ -304,3 +304,61 @@ func TestLastResortProbe_WatchdogFailsOverrunningProbe(t *testing.T) {
 	kick()
 	require.Eventually(t, func() bool { return dials.Load() == 2 }, 2*time.Second, 10*time.Millisecond)
 }
+
+func TestSelectForExcluding_NoFastFailoverToLastResortWhileRegularHealthy(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(s *MutableAutoSelect)
+		wantErr bool
+	}{
+		{
+			name: "failed member is still clean",
+			setup: func(s *MutableAutoSelect) {
+				recordSuccess(s, "a", 100)
+				addUserFailureN(s, "a", 1)
+			},
+			wantErr: true,
+		},
+		{
+			name: "failed member is soft-demoted",
+			setup: func(s *MutableAutoSelect) {
+				recordSuccess(s, "a", 100)
+				addUserFailureN(s, "a", int(s.hist.softFailLimit))
+			},
+			wantErr: true,
+		},
+		{
+			name: "failed member is hard-demoted",
+			setup: func(s *MutableAutoSelect) {
+				recordSuccess(s, "a", 100)
+				addUserFailureN(s, "a", int(s.hist.consecutiveFailLimit))
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _ := newLastResortMUR(t)
+			recordSuccess(s, "ub", 4000)
+			tt.setup(s)
+			got, err := s.selectForExcluding("tcp", "a")
+			if tt.wantErr {
+				require.Error(t, err, "one failed dial on a healthy regular member must not route through the last resort")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "ub", got.Tag())
+		})
+	}
+}
+
+func TestSelectForExcluding_PrefersAnotherRegularMemberOverLastResort(t *testing.T) {
+	s, obs := newTestMUR(t, "a", "b", "ub")
+	obs["ub"].typeName = lConst.TypeUnbounded
+	recordSuccess(s, "a", 100)
+	recordSuccess(s, "b", 300)
+	recordSuccess(s, "ub", 50)
+	got, err := s.selectForExcluding("tcp", "a")
+	require.NoError(t, err)
+	assert.Equal(t, "b", got.Tag())
+}

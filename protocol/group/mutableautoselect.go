@@ -613,12 +613,21 @@ func (s *MutableAutoSelect) selectForExcluding(network, excludeTag string) (A.Ou
 	}
 	s.access.Lock()
 	ranked := s.rankLocked(time.Now(), time.Time{})
+	// A regular member still clean or soft-demoted, the excluded one
+	// included, means the network isn't down to its last resort: one failed
+	// dial shouldn't send a request through it.
+	regularHealthy := slices.ContainsFunc(ranked, func(c rankedCandidate) bool {
+		return c.demote < demoteLastResort && slices.Contains(c.outbound.Network(), network)
+	})
 	if excludeTag != "" {
 		ranked = slices.DeleteFunc(ranked, func(c rankedCandidate) bool {
 			return c.tag == excludeTag
 		})
 	}
 	pool, forNetwork := s.splitHealthyForLocked(ranked, network)
+	if len(pool) > 0 && pool[0].demote == demoteLastResort && regularHealthy {
+		pool = nil
+	}
 	if len(pool) == 0 {
 		s.access.Unlock()
 		if excludeTag == "" {
