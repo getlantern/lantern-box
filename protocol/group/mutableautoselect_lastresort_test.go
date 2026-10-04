@@ -432,3 +432,32 @@ func TestRecordLastResortOutcome_DroppedAfterClose(t *testing.T) {
 	s.access.Unlock()
 	assert.False(t, ok, "an outcome landing after Close is not member evidence")
 }
+
+func TestRank_HardRegularOutranksHardLastResort(t *testing.T) {
+	s, _ := newLastResortMUR(t)
+	recordSuccess(s, "a", 900)
+	recordSuccess(s, "ub", 50)
+	addUserFailureN(s, "a", int(s.hist.consecutiveFailLimit))
+	addUserFailureN(s, "ub", int(s.hist.consecutiveFailLimit))
+
+	got, err := s.selectFor("tcp")
+	require.NoError(t, err)
+	assert.Equal(t, "a", got.Tag(), "when everything is hard-demoted, a regular member beats a faster last resort")
+}
+
+func TestSelectFor_LeavesHardStickyLastResortForHardRegular(t *testing.T) {
+	s, _ := newLastResortMUR(t)
+	recordSuccess(s, "a", 100)
+	recordSuccess(s, "ub", 100)
+	addUserFailureN(s, "a", int(s.hist.consecutiveFailLimit))
+	got, err := s.selectFor("tcp")
+	require.NoError(t, err)
+	require.Equal(t, "ub", got.Tag())
+
+	// The sticky last resort fails too; both are now hard, with equal delays
+	// that the tolerance rule alone would keep sticky.
+	addUserFailureN(s, "ub", int(s.hist.consecutiveFailLimit))
+	got, err = s.selectFor("tcp")
+	require.NoError(t, err)
+	assert.Equal(t, "a", got.Tag())
+}

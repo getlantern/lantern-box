@@ -684,7 +684,7 @@ func (s *MutableAutoSelect) applyStickiness(network string, slot *atomic.Value, 
 		s.logSwitch(network, sticky, best, "kind outranked")
 	case c.demote == demoteHard && best.demote < demoteHard:
 		s.logSwitch(network, sticky, best, "hard-demoted")
-	case c.demote == demoteLastResort && best.demote < demoteLastResort:
+	case c.lastResort && !best.lastResort && best.demote <= c.demote:
 		s.logSwitch(network, sticky, best, "last resort no longer needed")
 	case c.demote > best.demote && c.userFails > s.hist.softFailLimit:
 		s.logSwitch(network, sticky, best, "failures past retention")
@@ -987,6 +987,11 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 		a, b := out[i], out[j]
 		if a.demote != b.demote {
 			return a.demote < b.demote
+		}
+		// Within a tier (in practice demoteHard, the only one both share), a
+		// regular member outranks a last resort whatever their delays.
+		if a.lastResort != b.lastResort {
+			return !a.lastResort
 		}
 		if a.kind != b.kind {
 			return a.kind < b.kind
