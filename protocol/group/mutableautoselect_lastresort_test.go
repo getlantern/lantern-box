@@ -338,16 +338,21 @@ func TestSelectForExcluding_NoFastFailoverToLastResortWhileRegularHealthy(t *tes
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, _ := newLastResortMUR(t)
-			recordSuccess(s, "ub", 4000)
-			tt.setup(s)
-			got, err := s.selectForExcluding("tcp", "a")
-			if tt.wantErr {
-				require.Error(t, err, "one failed dial on a healthy regular member must not route through the last resort")
-				return
+			for _, ubHard := range []bool{false, true} {
+				s, _ := newLastResortMUR(t)
+				recordSuccess(s, "ub", 4000)
+				if ubHard {
+					addUserFailureN(s, "ub", int(s.hist.consecutiveFailLimit))
+				}
+				tt.setup(s)
+				got, err := s.selectForExcluding("tcp", "a")
+				if tt.wantErr {
+					require.Errorf(t, err, "one failed dial on a healthy regular member must not route through the last resort (ub hard=%v)", ubHard)
+					continue
+				}
+				require.NoError(t, err)
+				assert.Equal(t, "ub", got.Tag())
 			}
-			require.NoError(t, err)
-			assert.Equal(t, "ub", got.Tag())
 		})
 	}
 }
