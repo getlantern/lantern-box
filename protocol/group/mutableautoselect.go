@@ -961,7 +961,9 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 		// can't trigger off a synthetic delay. bestAlt for those is
 		// irrelevant — demoted gates the boost on selfMs>0.
 		var selfMs, bestAlt uint32
-		if p.kind == kindRealSeeded {
+		// A last resort isn't rescued by the switch-penalty boost: the normal
+		// hard threshold always applies to it.
+		if p.kind == kindRealSeeded && !p.lastResort {
 			selfMs = p.delayMs
 			bestAlt = min1
 			if p.delayMs == min1 {
@@ -1084,7 +1086,7 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 				// the dial actually returns: freeing it would let each later
 				// cycle stack another stuck dial on a stalled peer.
 				if s.ctx.Err() == nil {
-					s.recordProbeOutcome(tag, false, 0)
+					s.recordLastResortOutcome(tag, probeURL, false, 0)
 				}
 				<-done
 				s.clearLastResortInFlight(tag)
@@ -1095,11 +1097,26 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 			// first and have its outcome overwritten by this older one.
 			// Group shutdown is not member evidence.
 			if s.ctx.Err() == nil {
-				s.recordProbeOutcome(res.tag, res.success, res.delayMs)
+				s.recordLastResortOutcome(tag, probeURL, res.success, res.delayMs)
 			}
 			s.clearLastResortInFlight(tag)
 		}()
 	}
+}
+
+// recordLastResortOutcome records a last-resort probe's outcome unless the
+// member's probe URL changed while it ran. A new URL (a new bandit callback
+// token) invalidates the member's history, and an outcome for the old one
+// would read as current.
+func (s *MutableAutoSelect) recordLastResortOutcome(tag, probeURL string, success bool, delayMs uint32) {
+	s.mutateHistoryIf(tag, func() bool { return s.probeURLForLocked(tag) == probeURL }, func(h *localHistory, now time.Time) bool {
+		if success {
+			h.recordProbeSuccess(delayMs, now)
+		} else {
+			h.recordProbeFailure(now)
+		}
+		return true
+	})
 }
 
 func (s *MutableAutoSelect) clearLastResortInFlight(tag string) {
@@ -1122,9 +1139,18 @@ var lastResortProbeBound = func(beh protocolBehavior) time.Duration {
 // goroutine. fn is passed the timestamp used for both the entry and the
 // persisted snapshot. Returns true only if fn ran and reported a change.
 func (s *MutableAutoSelect) mutateHistory(tag string, fn func(*localHistory, time.Time) bool) bool {
+	return s.mutateHistoryIf(tag, nil, fn)
+}
+
+// mutateHistoryIf is mutateHistory gated on guard, which runs under s.access
+// before any history entry is created; a nil guard always passes.
+func (s *MutableAutoSelect) mutateHistoryIf(tag string, guard func() bool, fn func(*localHistory, time.Time) bool) bool {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if _, member := s.members.Load(tag); !member {
+		return false
+	}
+	if guard != nil && !guard() {
 		return false
 	}
 	h := s.historyForLocked(tag)

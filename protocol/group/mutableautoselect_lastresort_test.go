@@ -367,3 +367,50 @@ func TestSelectForExcluding_PrefersAnotherRegularMemberOverLastResort(t *testing
 	require.NoError(t, err)
 	assert.Equal(t, "b", got.Tag())
 }
+
+func TestRank_LastResortGetsNoSwitchPenaltyBoost(t *testing.T) {
+	// The boost would double the hard limit for a member much faster than
+	// its best alternative; a last resort must be held to the normal limit.
+	s, _ := newLastResortMUR(t)
+	recordSuccess(s, "ub", 100)
+	recordSuccess(s, "a", 990)
+	addUserFailureN(s, "ub", int(s.hist.consecutiveFailLimit))
+
+	s.access.Lock()
+	ranked := s.rankLocked(time.Now(), time.Time{})
+	s.access.Unlock()
+	for _, c := range ranked {
+		if c.tag == "ub" {
+			assert.Equal(t, demoteHard, c.demote)
+		}
+	}
+}
+
+func TestLastResortProbe_DiscardsOutcomeForReplacedURL(t *testing.T) {
+	s, obs := newLastResortMUR(t)
+	s.urlOverrides = map[string]string{"ub": "http://probe.test/old-token"}
+	release := make(chan struct{})
+	obs["ub"].dial = func(context.Context) (net.Conn, error) {
+		<-release
+		return nil, errors.New("dial failed")
+	}
+
+	s.access.Lock()
+	s.kickLastResortProbesLocked(time.Now(), nil, true)
+	s.access.Unlock()
+
+	// A config update hands the member a new callback URL while the old
+	// probe is still running.
+	s.SetURLOverrides(map[string]string{"ub": "http://probe.test/new-token"})
+	close(release)
+
+	require.Eventually(t, func() bool {
+		s.access.Lock()
+		defer s.access.Unlock()
+		return !s.lastResortInFlight["ub"]
+	}, 2*time.Second, 10*time.Millisecond)
+	s.access.Lock()
+	_, ok := s.peekHistoryLocked("ub")
+	s.access.Unlock()
+	assert.False(t, ok, "an outcome for the replaced URL must not land in the new URL's history")
+}
