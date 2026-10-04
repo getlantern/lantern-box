@@ -290,6 +290,190 @@ func TestServe_CancelledNonTCPProbeIsAborted(t *testing.T) {
 	assert.Empty(t, rec.calls())
 }
 
+// deadlineIgnoringConn is a non-TCP conn whose Write ignores write deadlines
+// and blocks until the conn is closed, like samizdat's HTTP/2 stream conn
+// while the peer withholds flow-control credit. With ignoreClose set, Close
+// doesn't unblock it either.
+type deadlineIgnoringConn struct {
+	net.Conn
+	ignoreClose bool
+	closed      chan struct{}
+	closeOnce   sync.Once
+	release     chan struct{}
+}
+
+func newDeadlineIgnoringConn(t *testing.T, c net.Conn, ignoreClose bool) *deadlineIgnoringConn {
+	dc := &deadlineIgnoringConn{Conn: c, ignoreClose: ignoreClose, closed: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(dc.release) })
+	return dc
+}
+
+func (c *deadlineIgnoringConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *deadlineIgnoringConn) Write([]byte) (int, error) {
+	if c.ignoreClose {
+		<-c.release
+		return 0, net.ErrClosed
+	}
+	select {
+	case <-c.closed:
+	case <-c.release:
+	}
+	return 0, net.ErrClosed
+}
+
+func (c *deadlineIgnoringConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func serveBlocked(t *testing.T, r *responder, ctx context.Context, conn net.Conn, client net.Conn) <-chan error {
+	t.Helper()
+	errc := make(chan error, 1)
+	go func() { errc <- r.serve(ctx, conn) }()
+	req, err := http.NewRequest(http.MethodGet, probeTarget, nil)
+	require.NoError(t, err)
+	require.NoError(t, req.Write(client))
+	return errc
+}
+
+func TestServe_NonTCPWriteIgnoringDeadlineIsStalledAtMaxWait(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		ignoreClose bool
+	}{
+		{"unblocked by close", false},
+		{"not even unblocked by close", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := newCallbackRecorder(t)
+			maxWait := 300 * time.Millisecond
+			r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
+				ReportStalled: true,
+				MaxWait:       badoption.Duration(maxWait),
+			}, nil)
+			server, client := net.Pipe()
+			t.Cleanup(func() { client.Close(); server.Close() })
+
+			start := time.Now()
+			errc := serveBlocked(t, r, context.Background(), newDeadlineIgnoringConn(t, server, tt.ignoreClose), client)
+			select {
+			case err := <-errc:
+				require.NoError(t, err)
+			case <-time.After(maxWait + writeAbortGrace + 3*time.Second):
+				t.Fatal("a write that ignores its deadline held the probe past max_wait")
+			}
+			assert.GreaterOrEqual(t, time.Since(start), maxWait)
+			calls := rec.calls()
+			require.Len(t, calls, 1)
+			assert.Equal(t, "stalled", calls[0].Get("verdict"))
+		})
+	}
+}
+
+// lateWriteConn completes Write successfully, but only once the probe's
+// write deadline has passed, ignoring the deadline itself.
+type lateWriteConn struct {
+	net.Conn
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (c *lateWriteConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.deadline.IsZero() {
+		c.deadline = t
+	}
+	return nil
+}
+
+func (c *lateWriteConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	d := c.deadline
+	c.mu.Unlock()
+	time.Sleep(time.Until(d))
+	return len(b), nil
+}
+
+func TestServe_NonTCPWriteFinishingAtMaxWaitIsStalled(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		rec := newCallbackRecorder(t)
+		r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
+			ReportStalled: true,
+			MaxWait:       badoption.Duration(100 * time.Millisecond),
+		}, nil)
+		server, client := net.Pipe()
+		t.Cleanup(func() { client.Close(); server.Close() })
+
+		errc := serveBlocked(t, r, context.Background(), &lateWriteConn{Conn: server}, client)
+		select {
+		case err := <-errc:
+			require.NoError(t, err)
+		case <-time.After(writeAbortGrace + 3*time.Second):
+			t.Fatal("serve did not return")
+		}
+		calls := rec.calls()
+		require.Len(t, calls, 1)
+		assert.Equal(t, "stalled", calls[0].Get("verdict"), "a write that only returned at max_wait was not delivered in time")
+	}
+}
+
+// TestAwaitWrite_ClassifiesByCompletionTime covers a write result that is
+// already buffered when max_wait has passed, so select can take either the
+// result or the timer. The verdict must follow when the write returned, not
+// which case select picked or when the result was read.
+func TestAwaitWrite_ClassifiesByCompletionTime(t *testing.T) {
+	r := newTestResponder(t, newCallbackRecorder(t), option.BanditProbeOutboundOptions{}, nil)
+	for _, tt := range []struct {
+		name   string
+		offset time.Duration // completion time relative to the deadline
+		err    error
+		want   verdict
+	}{
+		{"returned before max_wait", -time.Millisecond, nil, verdictUnknown},
+		{"returned at max_wait", 0, nil, verdictStalled},
+		{"returned after max_wait", time.Millisecond, nil, verdictStalled},
+		{"failed before max_wait", -time.Millisecond, os.ErrDeadlineExceeded, verdictStalled},
+		{"panicked", -time.Millisecond, errWritePanic, verdictAborted},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Repeat so both select cases are exercised.
+			for i := 0; i < 50; i++ {
+				server, client := net.Pipe()
+				deadline := time.Now().Add(-time.Millisecond)
+				written := make(chan writeResult, 1)
+				written <- writeResult{err: tt.err, done: deadline.Add(tt.offset)}
+				res := r.awaitWrite(context.Background(), server, written, time.Now(), deadline, nil)
+				client.Close()
+				require.Equal(t, tt.want, res.verdict)
+			}
+		})
+	}
+}
+
+func TestServe_CancelledProbeWithDeadlineIgnoringWriteIsAborted(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
+		ReportStalled: true,
+		MaxWait:       badoption.Duration(maxMaxWait),
+	}, nil)
+	server, client := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := serveBlocked(t, r, ctx, newDeadlineIgnoringConn(t, server, true), client)
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(writeAbortGrace + 3*time.Second):
+		t.Fatal("cancellation waited on a write that ignores deadlines and close")
+	}
+	assert.Empty(t, rec.calls())
+}
+
 // TestServe_InconsistentSnapshotIsNotDelivered covers acks landing between the
 // two socket-state syscalls: acked then lags unacked, and a target built from
 // both would be reached while the tail is still outstanding.
