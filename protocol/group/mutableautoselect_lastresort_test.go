@@ -221,10 +221,12 @@ func TestRunLadder_LastResortWithLatestSuccessIsNotExhausted(t *testing.T) {
 	tests := []struct {
 		name           string
 		latestFailed   bool
+		successAge     time.Duration
 		wantExhaustion bool
 	}{
-		{"latest last-resort probe succeeded", false, false},
-		{"latest last-resort probe failed", true, true},
+		{"latest last-resort probe succeeded", false, 0, false},
+		{"latest last-resort probe failed", true, 0, true},
+		{"latest success is stale", false, lastResortSuccessFreshness + time.Minute, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -237,7 +239,13 @@ func TestRunLadder_LastResortWithLatestSuccessIsNotExhausted(t *testing.T) {
 				<-ctx.Done()
 				return nil, ctx.Err()
 			}
-			recordSuccess(s, "ub", 4000)
+			if tt.successAge > 0 {
+				s.access.Lock()
+				s.historyForLocked("ub").recordProbeSuccess(4000, time.Now().Add(-tt.successAge))
+				s.access.Unlock()
+			} else {
+				recordSuccess(s, "ub", 4000)
+			}
 			if tt.latestFailed {
 				s.recordProbeOutcome("ub", false, 0)
 			}
@@ -413,4 +421,14 @@ func TestLastResortProbe_DiscardsOutcomeForReplacedURL(t *testing.T) {
 	_, ok := s.peekHistoryLocked("ub")
 	s.access.Unlock()
 	assert.False(t, ok, "an outcome for the replaced URL must not land in the new URL's history")
+}
+
+func TestRecordLastResortOutcome_DroppedAfterClose(t *testing.T) {
+	s, _ := newLastResortMUR(t)
+	s.cancel()
+	s.recordLastResortOutcome("ub", s.probeURLForLocked("ub"), true, 100)
+	s.access.Lock()
+	_, ok := s.peekHistoryLocked("ub")
+	s.access.Unlock()
+	assert.False(t, ok, "an outcome landing after Close is not member evidence")
 }

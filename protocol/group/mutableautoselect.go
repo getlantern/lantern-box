@@ -1109,7 +1109,10 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 // token) invalidates the member's history, and an outcome for the old one
 // would read as current.
 func (s *MutableAutoSelect) recordLastResortOutcome(tag, probeURL string, success bool, delayMs uint32) {
-	s.mutateHistoryIf(tag, func() bool { return s.probeURLForLocked(tag) == probeURL }, func(h *localHistory, now time.Time) bool {
+	// Rechecked under s.access so a concurrent Close can't slip between the
+	// caller's shutdown check and the write.
+	guard := func() bool { return s.ctx.Err() == nil && s.probeURLForLocked(tag) == probeURL }
+	s.mutateHistoryIf(tag, guard, func(h *localHistory, now time.Time) bool {
 		if success {
 			h.recordProbeSuccess(delayMs, now)
 		} else {
@@ -1124,6 +1127,10 @@ func (s *MutableAutoSelect) clearLastResortInFlight(tag string) {
 	delete(s.lastResortInFlight, tag)
 	s.access.Unlock()
 }
+
+// lastResortSuccessFreshness bounds how old a last resort's latest successful
+// probe may be for the ladder to treat it as a winner.
+const lastResortSuccessFreshness = 5 * time.Minute
 
 // lastResortProbeBound is how long a last-resort probe may run before it is
 // counted as failed even if the outbound hasn't returned. A variable so tests
@@ -1251,15 +1258,18 @@ func (s *MutableAutoSelect) runLadder(target string) {
 	}
 	if winner == nil {
 		// lastResort members are probed asynchronously and can't report
-		// inside the ladder budget. One whose latest probe succeeded can
-		// still carry traffic, so the group isn't exhausted.
+		// inside the ladder budget. One whose latest probe succeeded within
+		// lastResortSuccessFreshness can still carry traffic, so the group
+		// isn't exhausted. An older success doesn't count: a later failure
+		// doesn't rerun the ladder, so trusting it could suppress the
+		// exhaustion signal for good.
 		now := time.Now()
 		for _, c := range s.rankLocked(now, time.Time{}) {
 			if c.demote != demoteLastResort {
 				continue
 			}
 			if h, ok := s.peekHistoryLocked(c.tag); ok {
-				if delay, _, consec, _ := h.snapshot(now, s.hist.userFailureWindow); delay > 0 && consec == 0 {
+				if delay, at, consec, _ := h.snapshot(now, s.hist.userFailureWindow); delay > 0 && consec == 0 && now.Sub(at) <= lastResortSuccessFreshness {
 					winner = c.outbound
 					break
 				}
