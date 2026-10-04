@@ -1062,8 +1062,23 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 		}
 		s.lastResortInFlight[tag] = true
 		probeURL := s.probeURLForLocked(tag)
+		bound := lastResortProbeBound(beh)
 		go func() {
-			res := probeMember(s.ctx, o, probeURL, beh)
+			done := make(chan probeResult, 1)
+			go func() { done <- probeMember(s.ctx, o, probeURL, beh) }()
+			watchdog := time.NewTimer(bound)
+			defer watchdog.Stop()
+			var res probeResult
+			select {
+			case res = <-done:
+			case <-watchdog.C:
+				// The outbound ignored the probe deadline (broflake's SOCKS
+				// handshake reads without one). Count a failed probe and free
+				// the slot so later probes still run; the stuck dial returns
+				// into the buffered channel whenever it does.
+				res = probeResult{tag: tag}
+			case <-s.ctx.Done():
+			}
 			s.access.Lock()
 			delete(s.lastResortInFlight, tag)
 			s.access.Unlock()
@@ -1074,6 +1089,13 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 			s.recordProbeOutcome(res.tag, res.success, res.delayMs)
 		}()
 	}
+}
+
+// lastResortProbeBound is how long a last-resort probe may run before it is
+// counted as failed even if the outbound hasn't returned. A variable so tests
+// can shorten it.
+var lastResortProbeBound = func(beh protocolBehavior) time.Duration {
+	return beh.probeTimeout + 5*time.Second
 }
 
 // mutateHistory applies fn to tag's history under s.access and persists

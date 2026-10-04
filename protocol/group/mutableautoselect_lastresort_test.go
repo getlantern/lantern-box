@@ -254,3 +254,48 @@ func TestRunLadder_LastResortWithLatestSuccessIsNotExhausted(t *testing.T) {
 		})
 	}
 }
+
+// TestLastResortProbe_WatchdogFreesSlotWhenDialIgnoresDeadline covers an
+// outbound whose dial ignores its context (broflake's SOCKS handshake reads
+// without a deadline): the probe must still be recorded as failed and the
+// in-flight slot freed so later probes run.
+func TestLastResortProbe_WatchdogFreesSlotWhenDialIgnoresDeadline(t *testing.T) {
+	orig := lastResortProbeBound
+	lastResortProbeBound = func(protocolBehavior) time.Duration { return 50 * time.Millisecond }
+	t.Cleanup(func() { lastResortProbeBound = orig })
+
+	s, obs := newLastResortMUR(t)
+	s.defaultURL = "http://probe.test/"
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	var dials atomic.Int32
+	obs["ub"].dial = func(context.Context) (net.Conn, error) {
+		dials.Add(1)
+		<-stuck
+		return nil, errors.New("released")
+	}
+
+	s.access.Lock()
+	s.kickLastResortProbesLocked(time.Now(), nil, true)
+	s.access.Unlock()
+
+	require.Eventually(t, func() bool {
+		s.access.Lock()
+		defer s.access.Unlock()
+		if s.lastResortInFlight["ub"] {
+			return false
+		}
+		h, ok := s.peekHistoryLocked("ub")
+		if !ok {
+			return false
+		}
+		_, _, consec, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
+		return consec == 1
+	}, 2*time.Second, 10*time.Millisecond, "a dial that ignores its deadline must still end the probe as a failure")
+
+	s.access.Lock()
+	s.kickLastResortProbesLocked(time.Now(), nil, true)
+	s.access.Unlock()
+	require.Eventually(t, func() bool { return dials.Load() == 2 }, 2*time.Second, 10*time.Millisecond,
+		"the freed slot must let the next probe start")
+}
