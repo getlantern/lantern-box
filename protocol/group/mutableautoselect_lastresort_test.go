@@ -255,11 +255,11 @@ func TestRunLadder_LastResortWithLatestSuccessIsNotExhausted(t *testing.T) {
 	}
 }
 
-// TestLastResortProbe_WatchdogFreesSlotWhenDialIgnoresDeadline covers an
-// outbound whose dial ignores its context (broflake's SOCKS handshake reads
-// without a deadline): the probe must still be recorded as failed and the
-// in-flight slot freed so later probes run.
-func TestLastResortProbe_WatchdogFreesSlotWhenDialIgnoresDeadline(t *testing.T) {
+// TestLastResortProbe_WatchdogFailsOverrunningProbe covers an outbound
+// whose dial overruns its deadline: the probe is recorded as failed at the
+// watchdog, but the slot stays taken until the dial returns, so a stalled
+// peer can't accumulate stuck dials across cycles.
+func TestLastResortProbe_WatchdogFailsOverrunningProbe(t *testing.T) {
 	orig := lastResortProbeBound
 	lastResortProbeBound = func(protocolBehavior) time.Duration { return 50 * time.Millisecond }
 	t.Cleanup(func() { lastResortProbeBound = orig })
@@ -267,35 +267,40 @@ func TestLastResortProbe_WatchdogFreesSlotWhenDialIgnoresDeadline(t *testing.T) 
 	s, obs := newLastResortMUR(t)
 	s.defaultURL = "http://probe.test/"
 	stuck := make(chan struct{})
-	t.Cleanup(func() { close(stuck) })
 	var dials atomic.Int32
 	obs["ub"].dial = func(context.Context) (net.Conn, error) {
 		dials.Add(1)
 		<-stuck
 		return nil, errors.New("released")
 	}
+	kick := func() {
+		s.access.Lock()
+		s.kickLastResortProbesLocked(time.Now(), nil, true)
+		s.access.Unlock()
+	}
 
-	s.access.Lock()
-	s.kickLastResortProbesLocked(time.Now(), nil, true)
-	s.access.Unlock()
-
+	kick()
 	require.Eventually(t, func() bool {
 		s.access.Lock()
 		defer s.access.Unlock()
-		if s.lastResortInFlight["ub"] {
-			return false
-		}
 		h, ok := s.peekHistoryLocked("ub")
 		if !ok {
 			return false
 		}
 		_, _, consec, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
 		return consec == 1
-	}, 2*time.Second, 10*time.Millisecond, "a dial that ignores its deadline must still end the probe as a failure")
+	}, 2*time.Second, 10*time.Millisecond, "an overrunning probe must be recorded as failed at the watchdog")
 
-	s.access.Lock()
-	s.kickLastResortProbesLocked(time.Now(), nil, true)
-	s.access.Unlock()
-	require.Eventually(t, func() bool { return dials.Load() == 2 }, 2*time.Second, 10*time.Millisecond,
-		"the freed slot must let the next probe start")
+	kick()
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int32(1), dials.Load(), "no second dial while the first is still stuck")
+
+	close(stuck)
+	require.Eventually(t, func() bool {
+		s.access.Lock()
+		defer s.access.Unlock()
+		return !s.lastResortInFlight["ub"]
+	}, 2*time.Second, 10*time.Millisecond, "the slot frees once the stuck dial returns")
+	kick()
+	require.Eventually(t, func() bool { return dials.Load() == 2 }, 2*time.Second, 10*time.Millisecond)
 }

@@ -1072,16 +1072,19 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 			select {
 			case res = <-done:
 			case <-watchdog.C:
-				// The outbound ignored the probe deadline (broflake's SOCKS
-				// handshake reads without one). Count a failed probe and free
-				// the slot so later probes still run; the stuck dial returns
-				// into the buffered channel whenever it does.
-				res = probeResult{tag: tag}
+				// The outbound overran the probe deadline. Count the probe
+				// as failed now so ranking sees it, but keep the slot until
+				// the dial actually returns: freeing it would let each later
+				// cycle stack another stuck dial on a stalled peer.
+				if s.ctx.Err() == nil {
+					s.recordProbeOutcome(tag, false, 0)
+				}
+				<-done
+				s.clearLastResortInFlight(tag)
+				return
 			case <-s.ctx.Done():
 			}
-			s.access.Lock()
-			delete(s.lastResortInFlight, tag)
-			s.access.Unlock()
+			s.clearLastResortInFlight(tag)
 			// Group shutdown is not member evidence.
 			if s.ctx.Err() != nil {
 				return
@@ -1089,6 +1092,12 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 			s.recordProbeOutcome(res.tag, res.success, res.delayMs)
 		}()
 	}
+}
+
+func (s *MutableAutoSelect) clearLastResortInFlight(tag string) {
+	s.access.Lock()
+	delete(s.lastResortInFlight, tag)
+	s.access.Unlock()
 }
 
 // lastResortProbeBound is how long a last-resort probe may run before it is
