@@ -1091,12 +1091,13 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 				return
 			case <-s.ctx.Done():
 			}
-			s.clearLastResortInFlight(tag)
+			// Record before freeing the slot, so a newer probe can't finish
+			// first and have its outcome overwritten by this older one.
 			// Group shutdown is not member evidence.
-			if s.ctx.Err() != nil {
-				return
+			if s.ctx.Err() == nil {
+				s.recordProbeOutcome(res.tag, res.success, res.delayMs)
 			}
-			s.recordProbeOutcome(res.tag, res.success, res.delayMs)
+			s.clearLastResortInFlight(tag)
 		}()
 	}
 }
