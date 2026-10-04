@@ -1012,9 +1012,17 @@ func (s *MutableAutoSelect) runProbeCycle(ctx context.Context) {
 }
 
 // runExternalProbe runs a fire-and-forget, freshness-filtered probe for tags,
-// or all members when tags is nil. It drops if another external probe or
-// internal cycle is running and does not rank after refreshing history.
+// or all members when tags is nil. Its probe wave drops if another external
+// probe or internal cycle is running (last-resort probes start regardless),
+// and it does not rank after refreshing history.
 func (s *MutableAutoSelect) runExternalProbe(tags []string) {
+	// Last-resort probes run on their own goroutines and need only s.access,
+	// so start them before the probe-wave locks: a wave already in flight
+	// must not hold back the probe that reports a fresh callback URL.
+	s.access.Lock()
+	s.kickLastResortProbesLocked(time.Now(), tags, false)
+	s.access.Unlock()
+
 	if !s.externalProbeMu.TryLock() {
 		return
 	}
@@ -1025,9 +1033,7 @@ func (s *MutableAutoSelect) runExternalProbe(tags []string) {
 	defer s.probeMu.Unlock()
 
 	s.access.Lock()
-	now := time.Now()
-	jobs := s.collectProbeJobsLocked(now, tags, false)
-	s.kickLastResortProbesLocked(now, tags, false)
+	jobs := s.collectProbeJobsLocked(time.Now(), tags, false)
 	s.access.Unlock()
 
 	s.probeAll(s.ctx, jobs, nil)
@@ -1094,7 +1100,7 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 					s.recordLastResortOutcome(tag, probeURL, false, 0)
 				}
 				<-done
-				s.clearLastResortInFlight(tag)
+				s.finishLastResortProbe(tag, probeURL)
 				return
 			case <-s.ctx.Done():
 			}
@@ -1104,7 +1110,7 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 			if s.ctx.Err() == nil {
 				s.recordLastResortOutcome(tag, probeURL, res.success, res.delayMs)
 			}
-			s.clearLastResortInFlight(tag)
+			s.finishLastResortProbe(tag, probeURL)
 		}()
 	}
 }
@@ -1127,10 +1133,17 @@ func (s *MutableAutoSelect) recordLastResortOutcome(tag, probeURL string, succes
 	})
 }
 
-func (s *MutableAutoSelect) clearLastResortInFlight(tag string) {
+// finishLastResortProbe frees tag's probe slot. If the member's probe URL
+// changed while the probe ran (a config update brought a new bandit callback
+// URL), it starts a probe of the new URL at once rather than leaving it for
+// the next background cycle.
+func (s *MutableAutoSelect) finishLastResortProbe(tag, probeURL string) {
 	s.access.Lock()
+	defer s.access.Unlock()
 	delete(s.lastResortInFlight, tag)
-	s.access.Unlock()
+	if s.ctx.Err() == nil && s.probeURLForLocked(tag) != probeURL {
+		s.kickLastResortProbesLocked(time.Now(), []string{tag}, true)
+	}
 }
 
 // lastResortSuccessFreshness bounds how old a last resort's latest successful

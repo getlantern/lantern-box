@@ -398,9 +398,16 @@ func TestLastResortProbe_DiscardsOutcomeForReplacedURL(t *testing.T) {
 	s, obs := newLastResortMUR(t)
 	s.urlOverrides = map[string]string{"ub": "http://probe.test/old-token"}
 	release := make(chan struct{})
-	obs["ub"].dial = func(context.Context) (net.Conn, error) {
-		<-release
-		return nil, errors.New("dial failed")
+	var dials atomic.Int32
+	obs["ub"].dial = func(ctx context.Context) (net.Conn, error) {
+		if dials.Add(1) == 1 {
+			<-release
+			return nil, errors.New("dial failed")
+		}
+		// The re-probe of the new URL stays pending, so any history entry
+		// could only have come from the old probe.
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 
 	s.access.Lock()
@@ -412,11 +419,8 @@ func TestLastResortProbe_DiscardsOutcomeForReplacedURL(t *testing.T) {
 	s.SetURLOverrides(map[string]string{"ub": "http://probe.test/new-token"})
 	close(release)
 
-	require.Eventually(t, func() bool {
-		s.access.Lock()
-		defer s.access.Unlock()
-		return !s.lastResortInFlight["ub"]
-	}, 2*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return dials.Load() == 2 }, 2*time.Second, 10*time.Millisecond,
+		"the old probe has finished once the new URL's probe starts")
 	s.access.Lock()
 	_, ok := s.peekHistoryLocked("ub")
 	s.access.Unlock()
@@ -460,4 +464,61 @@ func TestSelectFor_LeavesHardStickyLastResortForHardRegular(t *testing.T) {
 	got, err = s.selectFor("tcp")
 	require.NoError(t, err)
 	assert.Equal(t, "a", got.Tag())
+}
+
+// TestCheckOutbounds_KicksLastResortWhileAWaveIsRunning covers a config
+// update landing while a probe wave holds probeMu: the external probe is
+// dropped, but the last-resort probe that reports the new callback URL must
+// still start.
+func TestCheckOutbounds_KicksLastResortWhileAWaveIsRunning(t *testing.T) {
+	s, obs := newLastResortMUR(t)
+	s.defaultURL = "http://probe.test/"
+	dialed := make(chan struct{}, 1)
+	obs["ub"].dial = func(ctx context.Context) (net.Conn, error) {
+		select {
+		case dialed <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	s.runExternalProbe(nil)
+
+	select {
+	case <-dialed:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "a busy probe wave held back the last-resort probe")
+	}
+}
+
+// TestLastResortProbe_ReprobesWhenURLReplacedMidProbe covers a config update
+// that replaces the callback URL while the old probe is still running: once
+// the old probe finishes, the new URL is probed at once.
+func TestLastResortProbe_ReprobesWhenURLReplacedMidProbe(t *testing.T) {
+	s, obs := newLastResortMUR(t)
+	s.urlOverrides = map[string]string{"ub": "http://probe.test/old-token"}
+	release := make(chan struct{})
+	var dials atomic.Int32
+	obs["ub"].dial = func(ctx context.Context) (net.Conn, error) {
+		if dials.Add(1) == 1 {
+			<-release
+			return nil, errors.New("old probe done")
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	s.access.Lock()
+	s.kickLastResortProbesLocked(time.Now(), nil, true)
+	s.access.Unlock()
+	require.Eventually(t, func() bool { return dials.Load() == 1 }, 2*time.Second, 10*time.Millisecond)
+
+	s.SetURLOverrides(map[string]string{"ub": "http://probe.test/new-token"})
+	close(release)
+
+	require.Eventually(t, func() bool { return dials.Load() == 2 }, 2*time.Second, 10*time.Millisecond,
+		"the new callback URL must be probed as soon as the stale probe finishes")
 }
