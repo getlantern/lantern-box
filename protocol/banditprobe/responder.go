@@ -242,6 +242,12 @@ func (r *responder) awaitWrite(ctx context.Context, conn net.Conn, written <-cha
 	defer timer.Stop()
 	select {
 	case err := <-written:
+		// A write and the timer can be ready together, and select picks
+		// either; a write that only returned at max_wait wasn't delivered in
+		// time.
+		if !time.Now().Before(writeDeadline) {
+			return verdictFor(err, verdictStalled)
+		}
 		return verdictFor(err, verdictUnknown)
 	case <-ctx.Done():
 		abort()

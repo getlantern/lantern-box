@@ -371,6 +371,54 @@ func TestServe_NonTCPWriteIgnoringDeadlineIsStalledAtMaxWait(t *testing.T) {
 	}
 }
 
+// lateWriteConn completes Write successfully, but only once the probe's
+// write deadline has passed, ignoring the deadline itself.
+type lateWriteConn struct {
+	net.Conn
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (c *lateWriteConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.deadline.IsZero() {
+		c.deadline = t
+	}
+	return nil
+}
+
+func (c *lateWriteConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	d := c.deadline
+	c.mu.Unlock()
+	time.Sleep(time.Until(d))
+	return len(b), nil
+}
+
+func TestServe_NonTCPWriteFinishingAtMaxWaitIsStalled(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		rec := newCallbackRecorder(t)
+		r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
+			ReportStalled: true,
+			MaxWait:       badoption.Duration(100 * time.Millisecond),
+		}, nil)
+		server, client := net.Pipe()
+		t.Cleanup(func() { client.Close(); server.Close() })
+
+		errc := serveBlocked(t, r, context.Background(), &lateWriteConn{Conn: server}, client)
+		select {
+		case err := <-errc:
+			require.NoError(t, err)
+		case <-time.After(writeAbortGrace + 3*time.Second):
+			t.Fatal("serve did not return")
+		}
+		calls := rec.calls()
+		require.Len(t, calls, 1)
+		assert.Equal(t, "stalled", calls[0].Get("verdict"), "a write that only returned at max_wait was not delivered in time")
+	}
+}
+
 func TestServe_CancelledProbeWithDeadlineIgnoringWriteIsAborted(t *testing.T) {
 	rec := newCallbackRecorder(t)
 	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
