@@ -290,6 +290,109 @@ func TestServe_CancelledNonTCPProbeIsAborted(t *testing.T) {
 	assert.Empty(t, rec.calls())
 }
 
+// deadlineIgnoringConn is a non-TCP conn whose Write ignores write deadlines
+// and blocks until the conn is closed, like samizdat's HTTP/2 stream conn
+// while the peer withholds flow-control credit. With ignoreClose set, Close
+// doesn't unblock it either.
+type deadlineIgnoringConn struct {
+	net.Conn
+	ignoreClose bool
+	closed      chan struct{}
+	closeOnce   sync.Once
+	release     chan struct{}
+}
+
+func newDeadlineIgnoringConn(t *testing.T, c net.Conn, ignoreClose bool) *deadlineIgnoringConn {
+	dc := &deadlineIgnoringConn{Conn: c, ignoreClose: ignoreClose, closed: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(dc.release) })
+	return dc
+}
+
+func (c *deadlineIgnoringConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *deadlineIgnoringConn) Write([]byte) (int, error) {
+	if c.ignoreClose {
+		<-c.release
+		return 0, net.ErrClosed
+	}
+	select {
+	case <-c.closed:
+	case <-c.release:
+	}
+	return 0, net.ErrClosed
+}
+
+func (c *deadlineIgnoringConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func serveBlocked(t *testing.T, r *responder, ctx context.Context, conn net.Conn, client net.Conn) <-chan error {
+	t.Helper()
+	errc := make(chan error, 1)
+	go func() { errc <- r.serve(ctx, conn) }()
+	req, err := http.NewRequest(http.MethodGet, probeTarget, nil)
+	require.NoError(t, err)
+	require.NoError(t, req.Write(client))
+	return errc
+}
+
+func TestServe_NonTCPWriteIgnoringDeadlineIsStalledAtMaxWait(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		ignoreClose bool
+	}{
+		{"unblocked by close", false},
+		{"not even unblocked by close", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := newCallbackRecorder(t)
+			maxWait := 300 * time.Millisecond
+			r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
+				ReportStalled: true,
+				MaxWait:       badoption.Duration(maxWait),
+			}, nil)
+			server, client := net.Pipe()
+			t.Cleanup(func() { client.Close(); server.Close() })
+
+			start := time.Now()
+			errc := serveBlocked(t, r, context.Background(), newDeadlineIgnoringConn(t, server, tt.ignoreClose), client)
+			select {
+			case err := <-errc:
+				require.NoError(t, err)
+			case <-time.After(maxWait + writeAbortGrace + 3*time.Second):
+				t.Fatal("a write that ignores its deadline held the probe past max_wait")
+			}
+			assert.GreaterOrEqual(t, time.Since(start), maxWait)
+			calls := rec.calls()
+			require.Len(t, calls, 1)
+			assert.Equal(t, "stalled", calls[0].Get("verdict"))
+		})
+	}
+}
+
+func TestServe_CancelledProbeWithDeadlineIgnoringWriteIsAborted(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
+		ReportStalled: true,
+		MaxWait:       badoption.Duration(maxMaxWait),
+	}, nil)
+	server, client := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := serveBlocked(t, r, ctx, newDeadlineIgnoringConn(t, server, true), client)
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(writeAbortGrace + 3*time.Second):
+		t.Fatal("cancellation waited on a write that ignores deadlines and close")
+	}
+	assert.Empty(t, rec.calls())
+}
+
 // TestServe_InconsistentSnapshotIsNotDelivered covers acks landing between the
 // two socket-state syscalls: acked then lags unacked, and a target built from
 // both would be reached while the tail is still outstanding.

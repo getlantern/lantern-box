@@ -110,21 +110,7 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	conn.SetWriteDeadline(writeDeadline)
 	tc, isTCP := common.Cast[*net.TCPConn](conn)
 	if !isTCP {
-		written := r.writeAsync(ctx, conn, payload)
-		select {
-		case err := <-written:
-			if errors.Is(err, errWritePanic) {
-				return result{verdict: verdictAborted, drain: r.now().Sub(start)}
-			}
-			if err != nil {
-				return result{verdict: verdictStalled, drain: r.now().Sub(start)}
-			}
-			return result{verdict: verdictUnknown, drain: r.now().Sub(start)}
-		case <-ctx.Done():
-			conn.SetWriteDeadline(time.Now())
-			<-written
-			return result{verdict: verdictAborted, drain: r.now().Sub(start)}
-		}
+		return r.awaitWrite(ctx, conn, r.writeAsync(ctx, conn, payload), start, writeDeadline, nil)
 	}
 
 	// The write runs alongside the poll because a body larger than the free send
@@ -155,22 +141,8 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 
 	st, err := r.readState(tc)
 	if err != nil {
-		// Without socket state only the write result is known, and unknown is
-		// reported as a success, so it requires the whole response to have been
-		// written.
-		select {
-		case err := <-written:
-			if errors.Is(err, errWritePanic) {
-				return result{verdict: verdictAborted, drain: r.now().Sub(start)}
-			}
-			if err != nil {
-				return result{verdict: verdictStalled, drain: r.now().Sub(start)}
-			}
-			return result{verdict: verdictUnknown, drain: r.now().Sub(start)}
-		case <-ctx.Done():
-			abortWrite()
-			return result{verdict: verdictAborted, drain: r.now().Sub(start)}
-		}
+		// Without socket state only the write result is known.
+		return r.awaitWrite(ctx, conn, written, start, writeDeadline, tc)
 	}
 	lastAcked, lastProgress := st.acked, r.now()
 	ticker := time.NewTicker(pollInterval)
@@ -222,6 +194,72 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 		st = next
 	}
 }
+
+// awaitWrite decides a probe from the write result alone, for a conn whose
+// socket state can't be read. unknown is reported as a success, so it requires
+// the whole response to have been written by max_wait; anything less is a
+// stall. raw, when set, is the kernel socket under conn and gets the same
+// deadline.
+//
+// The deadline is enforced here rather than left to the conn because some
+// wrappers ignore SetWriteDeadline (samizdat's HTTP/2 stream conn is a no-op),
+// and their Write blocks for as long as the peer withholds flow-control
+// credit. Past max_wait the conn is closed to unblock such a write, and if even
+// that doesn't return it within writeAbortGrace the probe is called stalled
+// without it.
+func (r *responder) awaitWrite(ctx context.Context, conn net.Conn, written <-chan error, start, writeDeadline time.Time, raw *net.TCPConn) result {
+	setDeadline := func(t time.Time) {
+		conn.SetWriteDeadline(t)
+		if raw != nil {
+			raw.SetWriteDeadline(t)
+		}
+	}
+	verdictFor := func(err error, ifWritten verdict) result {
+		switch {
+		case errors.Is(err, errWritePanic):
+			return result{verdict: verdictAborted, drain: r.now().Sub(start)}
+		case err != nil:
+			return result{verdict: verdictStalled, drain: r.now().Sub(start)}
+		default:
+			return result{verdict: ifWritten, drain: r.now().Sub(start)}
+		}
+	}
+	// abort unblocks the write and waits up to writeAbortGrace for it,
+	// reporting whether it returned and with what.
+	abort := func() (bool, error) {
+		setDeadline(time.Now())
+		conn.Close()
+		grace := time.NewTimer(writeAbortGrace)
+		defer grace.Stop()
+		select {
+		case err := <-written:
+			return true, err
+		case <-grace.C:
+			return false, nil
+		}
+	}
+	timer := time.NewTimer(time.Until(writeDeadline))
+	defer timer.Stop()
+	select {
+	case err := <-written:
+		return verdictFor(err, verdictUnknown)
+	case <-ctx.Done():
+		abort()
+		return result{verdict: verdictAborted, drain: r.now().Sub(start)}
+	case <-timer.C:
+	}
+	returned, err := abort()
+	if !returned {
+		return result{verdict: verdictStalled, drain: r.now().Sub(start)}
+	}
+	// The write can have finished just as max_wait passed; it was not
+	// delivered in time either way.
+	return verdictFor(err, verdictStalled)
+}
+
+// writeAbortGrace bounds how long a probe waits for a write to return after
+// its conn was closed at max_wait.
+const writeAbortGrace = time.Second
 
 const pollInterval = 50 * time.Millisecond
 
