@@ -128,7 +128,7 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 		}
 		conn.SetWriteDeadline(time.Now())
 		tc.SetWriteDeadline(time.Now())
-		return <-written
+		return (<-written).err
 	}
 	stalled := func(st sendState) result {
 		// The write can panic after the loop last checked it; that is still a
@@ -150,7 +150,8 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	for {
 		if !writeDone {
 			select {
-			case err := <-written:
+			case res := <-written:
+				err := res.err
 				if errors.Is(err, errWritePanic) {
 					return result{verdict: verdictAborted, drain: r.now().Sub(start), acked: st.acked, state: st}
 				}
@@ -207,60 +208,55 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 // credit. Past max_wait the conn is closed to unblock such a write, and if even
 // that doesn't return it within writeAbortGrace the probe is called stalled
 // without it.
-func (r *responder) awaitWrite(ctx context.Context, conn net.Conn, written <-chan error, start, writeDeadline time.Time, raw *net.TCPConn) result {
+func (r *responder) awaitWrite(ctx context.Context, conn net.Conn, written <-chan writeResult, start, writeDeadline time.Time, raw *net.TCPConn) result {
 	setDeadline := func(t time.Time) {
 		conn.SetWriteDeadline(t)
 		if raw != nil {
 			raw.SetWriteDeadline(t)
 		}
 	}
-	verdictFor := func(err error, ifWritten verdict) result {
+	// verdictFor classifies a write that returned by when it returned, not
+	// when this goroutine got to see it: the result and the timer can be ready
+	// together, and select picks either.
+	verdictFor := func(res writeResult) result {
 		switch {
-		case errors.Is(err, errWritePanic):
+		case errors.Is(res.err, errWritePanic):
 			return result{verdict: verdictAborted, drain: r.now().Sub(start)}
-		case err != nil:
+		case res.err != nil, !res.done.Before(writeDeadline):
 			return result{verdict: verdictStalled, drain: r.now().Sub(start)}
 		default:
-			return result{verdict: ifWritten, drain: r.now().Sub(start)}
+			return result{verdict: verdictUnknown, drain: r.now().Sub(start)}
 		}
 	}
 	// abort unblocks the write and waits up to writeAbortGrace for it,
 	// reporting whether it returned and with what.
-	abort := func() (bool, error) {
+	abort := func() (writeResult, bool) {
 		setDeadline(time.Now())
 		conn.Close()
 		grace := time.NewTimer(writeAbortGrace)
 		defer grace.Stop()
 		select {
-		case err := <-written:
-			return true, err
+		case res := <-written:
+			return res, true
 		case <-grace.C:
-			return false, nil
+			return writeResult{}, false
 		}
 	}
 	timer := time.NewTimer(time.Until(writeDeadline))
 	defer timer.Stop()
 	select {
-	case err := <-written:
-		// A write and the timer can be ready together, and select picks
-		// either; a write that only returned at max_wait wasn't delivered in
-		// time.
-		if !time.Now().Before(writeDeadline) {
-			return verdictFor(err, verdictStalled)
-		}
-		return verdictFor(err, verdictUnknown)
+	case res := <-written:
+		return verdictFor(res)
 	case <-ctx.Done():
 		abort()
 		return result{verdict: verdictAborted, drain: r.now().Sub(start)}
 	case <-timer.C:
 	}
-	returned, err := abort()
+	res, returned := abort()
 	if !returned {
 		return result{verdict: verdictStalled, drain: r.now().Sub(start)}
 	}
-	// The write can have finished just as max_wait passed; it was not
-	// delivered in time either way.
-	return verdictFor(err, verdictStalled)
+	return verdictFor(res)
 }
 
 // writeAbortGrace bounds how long a probe waits for a write to return after
@@ -285,22 +281,28 @@ var reservedParams = []string{"verdict", "drain_ms", "acked", "retrans", "rtt_ms
 // aborted and is never reported.
 var errWritePanic = errors.New("banditprobe: panic writing probe response")
 
+// writeResult is how a probe response write ended and when it returned.
+type writeResult struct {
+	err  error
+	done time.Time
+}
+
 // writeAsync writes payload on its own goroutine and delivers the result on
 // the returned channel. recover only covers the goroutine it runs in, so a
 // panic in a wrapper's Write is caught here, logged, and delivered as
 // errWritePanic rather than taking down the proxy.
-func (r *responder) writeAsync(ctx context.Context, conn net.Conn, payload []byte) <-chan error {
-	written := make(chan error, 1)
+func (r *responder) writeAsync(ctx context.Context, conn net.Conn, payload []byte) <-chan writeResult {
+	written := make(chan writeResult, 1)
 	go func() {
 		defer func() {
 			if p := recover(); p != nil {
 				err := fmt.Errorf("%w: %v", errWritePanic, p)
 				r.logger.ErrorContext(ctx, err)
-				written <- err
+				written <- writeResult{err: err, done: time.Now()}
 			}
 		}()
 		_, err := conn.Write(payload)
-		written <- err
+		written <- writeResult{err: err, done: time.Now()}
 	}()
 	return written
 }

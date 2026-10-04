@@ -419,6 +419,39 @@ func TestServe_NonTCPWriteFinishingAtMaxWaitIsStalled(t *testing.T) {
 	}
 }
 
+// TestAwaitWrite_ClassifiesByCompletionTime covers a write result that is
+// already buffered when max_wait has passed, so select can take either the
+// result or the timer. The verdict must follow when the write returned, not
+// which case select picked or when the result was read.
+func TestAwaitWrite_ClassifiesByCompletionTime(t *testing.T) {
+	r := newTestResponder(t, newCallbackRecorder(t), option.BanditProbeOutboundOptions{}, nil)
+	for _, tt := range []struct {
+		name   string
+		offset time.Duration // completion time relative to the deadline
+		err    error
+		want   verdict
+	}{
+		{"returned before max_wait", -time.Millisecond, nil, verdictUnknown},
+		{"returned at max_wait", 0, nil, verdictStalled},
+		{"returned after max_wait", time.Millisecond, nil, verdictStalled},
+		{"failed before max_wait", -time.Millisecond, os.ErrDeadlineExceeded, verdictStalled},
+		{"panicked", -time.Millisecond, errWritePanic, verdictAborted},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Repeat so both select cases are exercised.
+			for i := 0; i < 50; i++ {
+				server, client := net.Pipe()
+				deadline := time.Now().Add(-time.Millisecond)
+				written := make(chan writeResult, 1)
+				written <- writeResult{err: tt.err, done: deadline.Add(tt.offset)}
+				res := r.awaitWrite(context.Background(), server, written, time.Now(), deadline, nil)
+				client.Close()
+				require.Equal(t, tt.want, res.verdict)
+			}
+		})
+	}
+}
+
 func TestServe_CancelledProbeWithDeadlineIgnoringWriteIsAborted(t *testing.T) {
 	rec := newCallbackRecorder(t)
 	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
