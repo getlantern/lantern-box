@@ -20,6 +20,8 @@ import (
 	"github.com/sagernet/sing/common/ntp"
 )
 
+const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.8037.97 Safari/537.36"
+
 // ErrUnusableInput wraps a failure caused by Run's own arguments: an unusable
 // probeURL, or a non-positive timeout. It means the arguments cannot produce a
 // probe, not that the outbound or the target failed.
@@ -102,6 +104,7 @@ func Measure(ctx context.Context, out A.Outbound, probeURL string, timeout time.
 	if err != nil {
 		return result, fmt.Errorf("%w: %w", ErrUnusableInput, err)
 	}
+	req.Header.Set("User-Agent", userAgent)
 	if tp := linkURL.Query().Get("tp"); tp != "" {
 		req.Header.Set("traceparent", tp)
 	}
