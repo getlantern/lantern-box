@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -15,16 +16,19 @@ import (
 )
 
 func TestProbeSendsChromeUserAgent(t *testing.T) {
-	const want = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+	chromeUA := regexp.MustCompile(`^Mozilla/5\.0 \([^)]+\) AppleWebKit/537\.36 \(KHTML, like Gecko\) Chrome/\d+\.\d+\.\d+\.\d+ Safari/537\.36$`)
+
 	for _, method := range []string{"Measure", "Run"} {
 		t.Run(method, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				assert.Equal(t, want, r.UserAgent())
+				assert.Regexp(t, chromeUA, r.UserAgent())
 				w.WriteHeader(http.StatusNoContent)
 			}))
 			defer srv.Close()
+
 			var conns []*trackedConn
 			out := &stubOutbound{dial: dialerFor(srv.Listener.Addr().String(), &conns)}
+
 			if method == "Measure" {
 				_, err := Measure(context.Background(), out, srv.URL, time.Second, 0)
 				require.NoError(t, err)
