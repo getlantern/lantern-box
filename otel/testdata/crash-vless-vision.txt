@@ -1,0 +1,26 @@
+panic: runtime error: slice bounds out of range [:172] with capacity 128
+
+goroutine 4827929 [running]:
+github.com/sagernet/sing-vmess/vless.(*VisionConn).filterTLS(0xc000107140, {0xc0109e8ec0?, 0x1, 0x2000?})
+	github.com/sagernet/sing-vmess@v0.2.8-0.20250909125414-3aed155119a1/vless/vision.go:259 +0x6db
+github.com/sagernet/sing-vmess/vless.(*VisionConn).Read(0xc000107140, {0xc00e9f9b80, 0x20, 0x40})
+	github.com/sagernet/sing-vmess@v0.2.8-0.20250909125414-3aed155119a1/vless/vision.go:175 +0xba5
+github.com/sagernet/sing/common/buf.(*Buffer).ReadOnceFrom(0xc012d23380, {0x725dd4b7d7a8?, 0xc0140718c0?})
+	github.com/sagernet/sing@v0.8.13/common/buf/buffer.go:139 +0x63
+github.com/sagernet/sing/common/bufio/deadline.(*reader).pipeRead(0xc0131256d0, 0xc0129f6ea0?)
+	github.com/sagernet/sing@v0.8.13/common/bufio/deadline/reader.go:86 +0x56
+created by github.com/sagernet/sing/common/bufio/deadline.(*reader).Read in goroutine 4827835
+	github.com/sagernet/sing@v0.8.13/common/bufio/deadline/reader.go:62 +0x1a7
+
+goroutine 1 [chan receive, 356 minutes]:
+main.run({0x7fff642e5cf4, 0x1c}, {0x7fff642e5d1f, 0x15})
+	github.com/getlantern/lantern-box/cmd/cmd_run.go:159 +0x388
+main.init.func5(0x40ccf60, {0x27c925b?, 0x4?, 0x27c925f?})
+	github.com/getlantern/lantern-box/cmd/cmd_run.go:50 +0xea
+github.com/spf13/cobra.(*Command).execute(0x40ccf60, {0xc0000a35c0, 0x6, 0x6})
+	github.com/spf13/cobra@v1.10.2/command.go:1015 +0xb02
+github.com/spf13/cobra.(*Command).ExecuteC(0x40cd240)
+	github.com/spf13/cobra@v1.10.2/command.go:1148 +0x465
+github.com/spf13/cobra.(*Command).Execute(...)
+	github.com/spf13/cobra@v1.10.2/command.go:1071
+main.main()

@@ -2,8 +2,10 @@ package banditprobe
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/stretchr/testify/assert"
@@ -284,6 +287,190 @@ func TestServe_CancelledNonTCPProbeIsAborted(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("a blocked non-TCP write ignored cancellation")
+	}
+	assert.Empty(t, rec.calls())
+}
+
+// deadlineIgnoringConn is a non-TCP conn whose Write ignores write deadlines
+// and blocks until the conn is closed, like samizdat's HTTP/2 stream conn
+// while the peer withholds flow-control credit. With ignoreClose set, Close
+// doesn't unblock it either.
+type deadlineIgnoringConn struct {
+	net.Conn
+	ignoreClose bool
+	closed      chan struct{}
+	closeOnce   sync.Once
+	release     chan struct{}
+}
+
+func newDeadlineIgnoringConn(t *testing.T, c net.Conn, ignoreClose bool) *deadlineIgnoringConn {
+	dc := &deadlineIgnoringConn{Conn: c, ignoreClose: ignoreClose, closed: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(dc.release) })
+	return dc
+}
+
+func (c *deadlineIgnoringConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *deadlineIgnoringConn) Write([]byte) (int, error) {
+	if c.ignoreClose {
+		<-c.release
+		return 0, net.ErrClosed
+	}
+	select {
+	case <-c.closed:
+	case <-c.release:
+	}
+	return 0, net.ErrClosed
+}
+
+func (c *deadlineIgnoringConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func serveBlocked(t *testing.T, r *responder, ctx context.Context, conn net.Conn, client net.Conn) <-chan error {
+	t.Helper()
+	errc := make(chan error, 1)
+	go func() { errc <- r.serve(ctx, conn) }()
+	req, err := http.NewRequest(http.MethodGet, probeTarget, nil)
+	require.NoError(t, err)
+	require.NoError(t, req.Write(client))
+	return errc
+}
+
+func TestServe_NonTCPWriteIgnoringDeadlineIsStalledAtMaxWait(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		ignoreClose bool
+	}{
+		{"unblocked by close", false},
+		{"not even unblocked by close", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := newCallbackRecorder(t)
+			maxWait := 300 * time.Millisecond
+			r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
+				ReportStalled: true,
+				MaxWait:       badoption.Duration(maxWait),
+			}, nil)
+			server, client := net.Pipe()
+			t.Cleanup(func() { client.Close(); server.Close() })
+
+			start := time.Now()
+			errc := serveBlocked(t, r, context.Background(), newDeadlineIgnoringConn(t, server, tt.ignoreClose), client)
+			select {
+			case err := <-errc:
+				require.NoError(t, err)
+			case <-time.After(maxWait + writeAbortGrace + 3*time.Second):
+				t.Fatal("a write that ignores its deadline held the probe past max_wait")
+			}
+			assert.GreaterOrEqual(t, time.Since(start), maxWait)
+			calls := rec.calls()
+			require.Len(t, calls, 1)
+			assert.Equal(t, "stalled", calls[0].Get("verdict"))
+		})
+	}
+}
+
+// lateWriteConn completes Write successfully, but only once the probe's
+// write deadline has passed, ignoring the deadline itself.
+type lateWriteConn struct {
+	net.Conn
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (c *lateWriteConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.deadline.IsZero() {
+		c.deadline = t
+	}
+	return nil
+}
+
+func (c *lateWriteConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	d := c.deadline
+	c.mu.Unlock()
+	time.Sleep(time.Until(d))
+	return len(b), nil
+}
+
+func TestServe_NonTCPWriteFinishingAtMaxWaitIsStalled(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		rec := newCallbackRecorder(t)
+		r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
+			ReportStalled: true,
+			MaxWait:       badoption.Duration(100 * time.Millisecond),
+		}, nil)
+		server, client := net.Pipe()
+		t.Cleanup(func() { client.Close(); server.Close() })
+
+		errc := serveBlocked(t, r, context.Background(), &lateWriteConn{Conn: server}, client)
+		select {
+		case err := <-errc:
+			require.NoError(t, err)
+		case <-time.After(writeAbortGrace + 3*time.Second):
+			t.Fatal("serve did not return")
+		}
+		calls := rec.calls()
+		require.Len(t, calls, 1)
+		assert.Equal(t, "stalled", calls[0].Get("verdict"), "a write that only returned at max_wait was not delivered in time")
+	}
+}
+
+// TestAwaitWrite_ClassifiesByCompletionTime covers a write result that is
+// already buffered when max_wait has passed, so select can take either the
+// result or the timer. The verdict must follow when the write returned, not
+// which case select picked or when the result was read.
+func TestAwaitWrite_ClassifiesByCompletionTime(t *testing.T) {
+	r := newTestResponder(t, newCallbackRecorder(t), option.BanditProbeOutboundOptions{}, nil)
+	for _, tt := range []struct {
+		name   string
+		offset time.Duration // completion time relative to the deadline
+		err    error
+		want   verdict
+	}{
+		{"returned before max_wait", -time.Millisecond, nil, verdictUnknown},
+		{"returned at max_wait", 0, nil, verdictStalled},
+		{"returned after max_wait", time.Millisecond, nil, verdictStalled},
+		{"failed before max_wait", -time.Millisecond, os.ErrDeadlineExceeded, verdictStalled},
+		{"panicked", -time.Millisecond, errWritePanic, verdictAborted},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Repeat so both select cases are exercised.
+			for i := 0; i < 50; i++ {
+				server, client := net.Pipe()
+				deadline := time.Now().Add(-time.Millisecond)
+				written := make(chan writeResult, 1)
+				written <- writeResult{err: tt.err, done: deadline.Add(tt.offset)}
+				res := r.awaitWrite(context.Background(), server, written, time.Now(), deadline, nil)
+				client.Close()
+				require.Equal(t, tt.want, res.verdict)
+			}
+		})
+	}
+}
+
+func TestServe_CancelledProbeWithDeadlineIgnoringWriteIsAborted(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{
+		ReportStalled: true,
+		MaxWait:       badoption.Duration(maxMaxWait),
+	}, nil)
+	server, client := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := serveBlocked(t, r, ctx, newDeadlineIgnoringConn(t, server, true), client)
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(writeAbortGrace + 3*time.Second):
+		t.Fatal("cancellation waited on a write that ignores deadlines and close")
 	}
 	assert.Empty(t, rec.calls())
 }
@@ -573,4 +760,248 @@ func TestNewConfig(t *testing.T) {
 		_, err := newConfig(bad)
 		assert.Error(t, err, "%+v", bad)
 	}
+}
+
+// debugLogger formats every message the way a box logging at debug does;
+// the NOP logger the other tests use never formats its arguments.
+func debugLogger() log.ContextLogger {
+	factory := log.NewDefaultFactory(context.Background(), log.Formatter{}, io.Discard, "", nil, false)
+	factory.SetLevel(log.LevelDebug)
+	return factory.Logger()
+}
+
+func TestServe_DebugLoggingFormatsEveryVerdict(t *testing.T) {
+	tests := []struct {
+		name      string
+		opts      option.BanditProbeOutboundOptions
+		readState func(*net.TCPConn) (sendState, error)
+		pipe      bool
+		want      string
+	}{
+		{"delivered", option.BanditProbeOutboundOptions{}, scriptedState(
+			sendState{acked: 4100, unacked: 0, retrans: 1, rtt: 42 * time.Millisecond},
+		), false, "delivered"},
+		{"stalled", option.BanditProbeOutboundOptions{ReportStalled: true}, scriptedState(
+			sendState{acked: 100, unacked: 4000},
+			sendState{acked: 1500, unacked: 2600, retrans: 7},
+		), false, "stalled"},
+		{"unknown", option.BanditProbeOutboundOptions{}, nil, true, "unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := newCallbackRecorder(t)
+			r := newTestResponder(t, rec, tt.opts, tt.readState)
+			r.logger = debugLogger()
+			var server, client net.Conn
+			if tt.pipe {
+				server, client = net.Pipe()
+				t.Cleanup(func() { client.Close(); server.Close() })
+			} else {
+				server, client = tcpPair(t)
+			}
+
+			_, _, err := runProbe(t, r, server, client, probeTarget)
+			require.NoError(t, err)
+			calls := rec.calls()
+			require.Len(t, calls, 1)
+			assert.Equal(t, tt.want, calls[0].Get("verdict"))
+		})
+	}
+}
+
+// panicConn panics on the first call serve makes, standing in for any bug in
+// the probe path.
+type panicConn struct{ net.Conn }
+
+func (panicConn) SetReadDeadline(time.Time) error { panic("boom") }
+
+func TestNewConnectionEx_RecoversFromPanic(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{}, nil)
+	o := &Outbound{responder: r}
+	server, client := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	closed := make(chan error, 1)
+	o.NewConnectionEx(context.Background(), panicConn{server}, adapter.InboundContext{}, func(err error) { closed <- err })
+	select {
+	case err := <-closed:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "panic answering probe")
+	case <-time.After(5 * time.Second):
+		t.Fatal("onClose was not called after the panic")
+	}
+}
+
+// writePanicConn panics in Write, standing in for a buggy protocol wrapper. It
+// exposes the wrapped conn as its upstream, as sing's wrappers do, so a TCP
+// conn underneath is still found.
+type writePanicConn struct{ net.Conn }
+
+func (writePanicConn) Write([]byte) (int, error) { panic("boom") }
+func (c writePanicConn) Upstream() any           { return c.Conn }
+
+func TestServe_PanickingWriteIsAbortedNotReported(t *testing.T) {
+	tests := []struct {
+		name string
+		pair func(t *testing.T) (net.Conn, net.Conn)
+	}{
+		{"non-TCP", func(t *testing.T) (net.Conn, net.Conn) {
+			server, client := net.Pipe()
+			t.Cleanup(func() { client.Close(); server.Close() })
+			return server, client
+		}},
+		{"TCP", func(t *testing.T) (net.Conn, net.Conn) {
+			server, client := tcpPair(t)
+			return server, client
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := newCallbackRecorder(t)
+			r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{ReportStalled: true},
+				scriptedState(sendState{acked: 0, unacked: 4096}))
+			logs := &syncBuffer{}
+			r.logger = errorLogger(logs)
+			server, client := tt.pair(t)
+
+			errc := make(chan error, 1)
+			go func() { errc <- r.serve(context.Background(), writePanicConn{server}) }()
+			req, err := http.NewRequest(http.MethodGet, probeTarget, nil)
+			require.NoError(t, err)
+			require.NoError(t, req.Write(client))
+			select {
+			case err := <-errc:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("serve did not return after the write panicked")
+			}
+			assert.Empty(t, rec.calls(), "a panicking write is our bug, not a stall, so nothing is reported")
+			assert.Contains(t, logs.String(), "panic writing probe response", "the recovered panic is logged at error level")
+		})
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the logger's goroutines.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// errorLogger logs only errors, into w, as a box above debug level does.
+func errorLogger(w io.Writer) log.ContextLogger {
+	factory := log.NewDefaultFactory(context.Background(), log.Formatter{}, w, "", nil, false)
+	factory.SetLevel(log.LevelError)
+	return factory.Logger()
+}
+
+// latePanicConn blocks in Write until the responder aborts it by setting a
+// past write deadline, then panics: a panic that lands after the poll loop
+// last checked the write.
+type latePanicConn struct {
+	net.Conn
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *latePanicConn) SetWriteDeadline(t time.Time) error {
+	if !t.After(time.Now()) {
+		c.once.Do(func() { close(c.release) })
+	}
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *latePanicConn) Write([]byte) (int, error) {
+	<-c.release
+	panic("late boom")
+}
+
+func (c *latePanicConn) Upstream() any { return c.Conn }
+
+func TestServe_WritePanicDuringStallIsAborted(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{ReportStalled: true},
+		scriptedState(sendState{acked: 0, unacked: 4096}))
+	server, client := tcpPair(t)
+	conn := &latePanicConn{Conn: server, release: make(chan struct{})}
+
+	errc := make(chan error, 1)
+	go func() { errc <- r.serve(context.Background(), conn) }()
+	req, err := http.NewRequest(http.MethodGet, probeTarget, nil)
+	require.NoError(t, err)
+	require.NoError(t, req.Write(client))
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return")
+	}
+	assert.Empty(t, rec.calls(), "a write that panics while the stall is being called is aborted, not reported as stalled")
+}
+
+// ss2022MaxChunk is the largest payload the shadowsocks 2022 inbound frames as
+// one chunk.
+const ss2022MaxChunk = 64*1024 - 1
+
+// chunkLimitedConn panics on a Write larger than limit, the way the
+// shadowsocks 2022 inbound does on a chunk past its maximum.
+type chunkLimitedConn struct {
+	net.Conn
+	limit int
+}
+
+func (c *chunkLimitedConn) Write(b []byte) (int, error) {
+	if len(b) > c.limit {
+		panic(fmt.Sprintf("buffer overflow: write of %d past chunk limit %d", len(b), c.limit))
+	}
+	return c.Conn.Write(b)
+}
+
+func TestServe_ResponseFitsChunkLimitedInbound(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{BodySize: defaultBodySize}, nil)
+	server, client := tcpPair(t)
+	conn := &chunkLimitedConn{Conn: server, limit: ss2022MaxChunk}
+
+	resp, body, err := runProbe(t, r, conn, client, probeTarget)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Len(t, body, defaultBodySize)
+	calls := rec.calls()
+	require.Len(t, calls, 1, "a probe through a chunk-limited inbound must be reported")
+	assert.Equal(t, "unknown", calls[0].Get("verdict"))
+}
+
+// shortWriteConn accepts at most limit bytes per Write and reports a short
+// count with no error.
+type shortWriteConn struct {
+	net.Conn
+	limit int
+}
+
+func (c *shortWriteConn) Write(b []byte) (int, error) {
+	return c.Conn.Write(b[:min(len(b), c.limit)])
+}
+
+func TestServe_ShortWritesStillSendTheWholeResponse(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{BodySize: defaultBodySize}, nil)
+	server, client := tcpPair(t)
+
+	resp, body, err := runProbe(t, r, &shortWriteConn{Conn: server, limit: 1000}, client, probeTarget)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Len(t, body, defaultBodySize, "a short write must not drop the rest of a chunk")
 }

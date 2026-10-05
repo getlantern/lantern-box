@@ -37,6 +37,11 @@ const (
 	maxRequestBytes     = 8 << 10
 	callbackTimeout     = 10 * time.Second
 	bodyPoolSize        = 1 << 20
+	// maxWriteChunk bounds each Write of the probe response; see writeAsync.
+	// It sits well under the smallest per-Write frame limit we know of
+	// (shadowsocks 2022: 64 KiB - 1, less its framing overhead), and at the
+	// size of a TLS record, so no inbound has to split it.
+	maxWriteChunk = 16 * 1024
 )
 
 func RegisterOutbound(registry *outbound.Registry) {
@@ -133,10 +138,19 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 
 func (o *Outbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	go func() {
-		err := o.responder.serve(ctx, conn)
-		conn.Close()
-		if onClose != nil {
-			onClose(err)
-		}
+		var err error
+		// A probe is a side channel: a panic while answering one must not take
+		// down the proxy and every user on it.
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("banditprobe: panic answering probe: %v", p)
+				o.responder.logger.ErrorContext(ctx, err)
+			}
+			conn.Close()
+			if onClose != nil {
+				onClose(err)
+			}
+		}()
+		err = o.responder.serve(ctx, conn)
 	}()
 }

@@ -38,18 +38,20 @@ type MutableAutoSelectOutboundOptions struct {
 	ConsecutiveFailureLimit uint32 `json:"consecutive_failure_limit,omitempty"`
 
 	// SoftDemoteLimit soft-demotes a member once user-traffic failures
-	// within UserFailureWindowSeconds reach this count. A soft-demoted
-	// member loses to every clean peer but still beats hard-demoted
-	// peers. Set lower for a fleet with few alternatives; higher for a
-	// large pool where one transient stall shouldn't be enough to push
-	// the active member behind every clean alternative. Default 2.
+	// within UserFailureWindowSeconds reach this count. Among eligible
+	// members, soft-demoted peers rank below clean peers and above
+	// hard-demoted peers. Set lower for a fleet with few alternatives;
+	// higher for a large pool where one transient stall shouldn't be
+	// enough to push the active member behind every clean alternative.
+	// Default 2.
 	SoftDemoteLimit uint32 `json:"soft_demote_limit,omitempty"`
 
 	// UserFailureWindowSeconds is the sliding-window length used to
-	// count user-traffic failures (dial errors and data-plane stalls)
-	// for the demote rule. Failures older than this age out of the
-	// window so a transient failure self-recovers without depending on
-	// traffic being routed through the member. Default 300 (5 min).
+	// count user-traffic failures (dial errors, resets, unanswered
+	// writes, and stalls) for the demote rule. Failures older than
+	// this age out of the window so a transient failure self-recovers
+	// without depending on traffic being routed through the member.
+	// Default 300 (5 min).
 	UserFailureWindowSeconds uint32 `json:"user_failure_window_seconds,omitempty"`
 
 	// MaxPersistedAgeSeconds caps the age of persisted TagHistory
@@ -92,14 +94,10 @@ type MutableAutoSelectOutboundOptions struct {
 
 	// DataPlaneProvedReadBytes is the cumulative Read-bytes threshold a
 	// single wrapped conn must cross before the data-plane stall timer
-	// is allowed to fire. Before a conn is proven, it is treated as
-	// "established but inactive" — a brand-new conn, a handshake-only
-	// conn, or a keepalive-only conn isn't evidence of stalling and
-	// other failure paths (dial errors, probe failures) catch the
-	// actually-broken cases. Default 4096.
+	// is allowed to fire. Default 4096.
 	DataPlaneProvedReadBytes uint32 `json:"data_plane_proved_read_bytes,omitempty"`
 
-	// DemoteOnlySelectedTag restricts data-plane stall and reset
+	// DemoteOnlySelectedTag restricts data-plane stall, reset, and no-response
 	// attribution to the tag currently selected for TCP or UDP. Default
 	// true; set false to count failures from every wrapped conn.
 	DemoteOnlySelectedTag *bool `json:"demote_only_selected_tag,omitempty"`
