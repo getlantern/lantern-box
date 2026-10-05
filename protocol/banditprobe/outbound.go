@@ -37,6 +37,8 @@ const (
 	maxRequestBytes     = 8 << 10
 	callbackTimeout     = 10 * time.Second
 	bodyPoolSize        = 1 << 20
+	// maxWriteChunk bounds each Write of the probe response; see writeAsync.
+	maxWriteChunk = 16 * 1024
 )
 
 func RegisterOutbound(registry *outbound.Registry) {

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -948,4 +949,33 @@ func TestServe_WritePanicDuringStallIsAborted(t *testing.T) {
 		t.Fatal("serve did not return")
 	}
 	assert.Empty(t, rec.calls(), "a write that panics while the stall is being called is aborted, not reported as stalled")
+}
+
+// chunkLimitedConn panics on a Write larger than limit, the way the
+// shadowsocks 2022 inbound does on a chunk past its maximum.
+type chunkLimitedConn struct {
+	net.Conn
+	limit int
+}
+
+func (c *chunkLimitedConn) Write(b []byte) (int, error) {
+	if len(b) > c.limit {
+		panic(fmt.Sprintf("buffer overflow: write of %d past chunk limit %d", len(b), c.limit))
+	}
+	return c.Conn.Write(b)
+}
+
+func TestServe_ResponseFitsChunkLimitedInbound(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{BodySize: defaultBodySize}, nil)
+	server, client := tcpPair(t)
+	conn := &chunkLimitedConn{Conn: server, limit: 65535}
+
+	resp, body, err := runProbe(t, r, conn, client, probeTarget)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Len(t, body, defaultBodySize)
+	calls := rec.calls()
+	require.Len(t, calls, 1, "a probe through a chunk-limited inbound must be reported")
+	assert.Equal(t, "unknown", calls[0].Get("verdict"))
 }
