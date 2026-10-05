@@ -20,14 +20,19 @@ import (
 	box "github.com/getlantern/lantern-box"
 )
 
-const probeAPIHost = "api.iantem.io"
+// probeAPIHost is what the probe rule matches. The probe never leaves the
+// server box: the rule hands it to the responder.
+const probeAPIHost = "api.probe.invalid"
 
 // probeServer is a lantern-cloud launch config with the banditprobe outbound
-// and the probe route rule pcfg.injectBanditProbe adds.
-func probeServer(inbound string) string {
+// and the probe route rule pcfg.injectBanditProbe adds. Callbacks go to
+// callbackURL, which the test points at a closed loopback port: the responder
+// matches probes only by the callback path, and a refused callback is logged,
+// not failed.
+func probeServer(inbound, callbackURL string) string {
 	return `{"log":{"level":"warn"},"inbounds":[` + inbound + `],
 	"outbounds":[{"type":"direct","tag":"direct"},
-	{"type":"banditprobe","tag":"bandit-probe","callback_url":"https://` + probeAPIHost + `/v1/bandit/callback","stall_timeout":"6s","report_stalled":true}],
+	{"type":"banditprobe","tag":"bandit-probe","callback_url":"` + callbackURL + `","stall_timeout":"6s","report_stalled":true}],
 	"route":{"rules":[{"domain":["` + probeAPIHost + `"],"port":[80],"action":"route","outbound":"bandit-probe"}]}}`
 }
 
@@ -36,7 +41,8 @@ func probeServer(inbound string) string {
 func probeThrough(t *testing.T, serverInbound, clientOutbound string) {
 	ctx := box.BaseContext()
 	serverPort, clientPort := freePort(t), freePort(t)
-	srv := fmt.Sprintf(probeServer(serverInbound), serverPort)
+	callbackURL := fmt.Sprintf("https://127.0.0.1:%d/v1/bandit/callback", freePort(t))
+	srv := fmt.Sprintf(probeServer(serverInbound, callbackURL), serverPort)
 	cli := fmt.Sprintf(`{"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],"outbounds":[`+clientOutbound+`]}`, clientPort, serverPort)
 
 	so, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(srv))
