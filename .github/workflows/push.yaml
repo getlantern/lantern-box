@@ -24,6 +24,9 @@ jobs:
   docker_push:
     name: docker push
     needs: [go]
+    # A manual run must not publish :latest from a feature branch (branch
+    # images come from push_branch.yaml): only main or a release tag.
+    if: ${{ github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: "read"

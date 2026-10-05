@@ -38,6 +38,12 @@ jobs:
           if [ -z "$latest" ]; then
             next="v0.0.1"
           else
+            # The tag name ends up on gh's command line, so accept only a
+            # plain vMAJOR.MINOR.PATCH.
+            if [[ ! "$latest" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Latest tag is not plain semver: $latest" >&2
+              exit 1
+            fi
             # Strip 'v' prefix, split into parts, bump patch
             version="${latest#v}"
             major=$(echo "$version" | cut -d. -f1)
@@ -50,15 +56,18 @@ jobs:
           echo "Bumping $latest → $next"
 
       - name: Create and push tag
+        env:
+          RELEASE_REF: ${{ steps.tag.outputs.next }}
         run: |
-          git tag "${{ steps.tag.outputs.next }}"
-          git push origin "${{ steps.tag.outputs.next }}"
+          git tag "$RELEASE_REF"
+          git push origin "$RELEASE_REF"
 
       - name: Trigger release workflow
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ steps.tag.outputs.next }}
         run: |
-          gh workflow run release.yaml --ref "${{ steps.tag.outputs.next }}"
+          gh workflow run release.yaml --ref "$RELEASE_REF"
           # The versioned sing-box image that lantern-cloud pins triangle
           # backends to. A GITHUB_TOKEN tag push doesn't trigger push.yaml.
-          gh workflow run push.yaml --ref "${{ steps.tag.outputs.next }}"
+          gh workflow run push.yaml --ref "$RELEASE_REF"
