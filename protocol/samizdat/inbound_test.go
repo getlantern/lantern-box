@@ -2,7 +2,10 @@ package samizdat
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,8 +13,11 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/route/rule"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/getlantern/lantern-box/tracker/peerconn"
 )
 
 // mockRouter implements adapter.ConnectionRouterEx with controllable callback behavior.
@@ -207,4 +213,58 @@ func TestHandleConnection_SetsMetadata(t *testing.T) {
 	assert.Equal(t, "samizdat", captured.InboundType)
 	assert.Equal(t, "93.184.216.34", captured.Destination.Addr.String())
 	assert.Equal(t, uint16(443), captured.Destination.Port)
+}
+
+// The close event carries the destination only when a reject rule refused it,
+// so a consumer can tally refusals without confusing them with dial failures
+// or connections that simply ended.
+func TestHandleConnection_CloseEventMarksRejections(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		routeErr error
+		rejected bool
+	}{
+		{"routed", nil, false},
+		{"dial failure", errors.New("dial tcp: connection refused"), false},
+		{"reject rule", &rule.RejectedError{Cause: errors.New("reset")}, true},
+		{"wrapped reject", fmt.Errorf("route: %w", &rule.RejectedError{}), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu     sync.Mutex
+				events []peerconn.Event
+			)
+			peerconn.SetListener(func(evt peerconn.Event) {
+				mu.Lock()
+				defer mu.Unlock()
+				events = append(events, evt)
+			})
+			t.Cleanup(func() { peerconn.SetListener(nil) })
+
+			ib := &Inbound{
+				logger: log.NewNOPFactory().Logger(),
+				router: &mockRouter{onRoute: func(_ context.Context, _ net.Conn, _ adapter.InboundContext, onClose N.CloseHandlerFunc) {
+					onClose(tc.routeErr)
+				}},
+			}
+			ib.handleConnection(context.Background(), dummyConn(t), "blocked.example:443")
+
+			mu.Lock()
+			defer mu.Unlock()
+			if !assert.Len(t, events, 2) {
+				return
+			}
+			assert.Equal(t, +1, events[0].State)
+			assert.Equal(t, "blocked.example:443", events[0].Destination)
+			assert.False(t, events[0].Rejected)
+			closeEvt := events[1]
+			assert.Equal(t, -1, closeEvt.State)
+			assert.Equal(t, tc.rejected, closeEvt.Rejected)
+			if tc.rejected {
+				assert.Equal(t, "blocked.example:443", closeEvt.Destination)
+			} else {
+				assert.Empty(t, closeEvt.Destination)
+			}
+		})
+	}
 }

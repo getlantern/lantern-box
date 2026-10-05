@@ -103,6 +103,10 @@ type MutableAutoSelect struct {
 	// also makes them drop during an internal cycle.
 	externalProbeMu sync.Mutex
 
+	// lastResortInFlight holds the lastResort members with a probe running,
+	// so each has at most one at a time. Guarded by access.
+	lastResortInFlight map[string]bool
+
 	// Unix-nano of the most recent non-empty data-plane Read/Write; 0
 	// means no traffic observed yet. Drives the adaptive probe cadence.
 	lastActive atomic.Int64
@@ -610,8 +614,14 @@ func (s *MutableAutoSelect) selectForExcluding(network, excludeTag string) (A.Ou
 	s.access.Lock()
 	ranked := s.rankLocked(time.Now(), time.Time{})
 	if excludeTag != "" {
+		// A regular member still clean or soft-demoted, the excluded one
+		// included, means the network isn't down to its last resort: one
+		// failed dial shouldn't send a request through it, in any tier.
+		regularHealthy := slices.ContainsFunc(ranked, func(c rankedCandidate) bool {
+			return c.demote < demoteLastResort && slices.Contains(c.outbound.Network(), network)
+		})
 		ranked = slices.DeleteFunc(ranked, func(c rankedCandidate) bool {
-			return c.tag == excludeTag
+			return c.tag == excludeTag || (regularHealthy && c.lastResort)
 		})
 	}
 	pool, forNetwork := s.splitHealthyForLocked(ranked, network)
@@ -674,6 +684,8 @@ func (s *MutableAutoSelect) applyStickiness(network string, slot *atomic.Value, 
 		s.logSwitch(network, sticky, best, "kind outranked")
 	case c.demote == demoteHard && best.demote < demoteHard:
 		s.logSwitch(network, sticky, best, "hard-demoted")
+	case c.lastResort && !best.lastResort && best.demote <= c.demote:
+		s.logSwitch(network, sticky, best, "last resort no longer needed")
 	case c.demote > best.demote && c.userFails > s.hist.softFailLimit:
 		s.logSwitch(network, sticky, best, "failures past retention")
 	case uint64(best.delayMs)+uint64(s.cfg.switchTolerance/time.Millisecond) <= uint64(c.delayMs):
@@ -737,8 +749,10 @@ func (s *MutableAutoSelect) peekHistoryLocked(tag string) (*localHistory, bool) 
 }
 
 // collectProbeJobsLocked builds jobs for tags, or all members when tags is nil.
-// excludeFromPool members are skipped. With force=false, members with outcomes
-// newer than probeFreshnessWindow are skipped. Caller must hold s.access.
+// excludeFromPool and lastResort members are skipped; lastResort members are
+// probed by kickLastResortProbesLocked instead. With force=false, members with
+// outcomes newer than probeFreshnessWindow are skipped. Caller must hold
+// s.access.
 func (s *MutableAutoSelect) collectProbeJobsLocked(now time.Time, tags []string, force bool) []probeJob {
 	if tags == nil {
 		tags = s.tags
@@ -750,7 +764,7 @@ func (s *MutableAutoSelect) collectProbeJobsLocked(now time.Time, tags []string,
 			continue
 		}
 		beh := behaviorFor(o.Type())
-		if beh.excludeFromPool {
+		if beh.excludeFromPool || beh.lastResort {
 			continue
 		}
 		if !force {
@@ -782,36 +796,38 @@ const (
 
 // demoteLevel ranks how cautious selection should be about a candidate.
 // Ordering is load-bearing: rankLocked sorts on the integer value, so
-// demoteClean must compare < demoteSoft < demoteHard for the tiers to
-// land in the right order.
+// demoteClean must compare < demoteSoft < demoteLastResort < demoteHard for
+// the tiers to land in the right order.
 type demoteLevel uint8
 
 const (
-	demoteClean demoteLevel = iota
-	demoteSoft              // window_count(userFailures) >= 1, hard threshold not reached
-	demoteHard              // consecutive_failures or windowed user-failures at limit
+	demoteClean      demoteLevel = iota
+	demoteSoft                   // window_count(userFailures) >= 1, hard threshold not reached
+	demoteLastResort             // a lastResort member that isn't hard-demoted
+	demoteHard                   // consecutive_failures or windowed user-failures at limit
 )
 
 type rankedCandidate struct {
-	outbound  A.Outbound
-	tag       string
-	delayMs   uint32
-	demote    demoteLevel
-	kind      candidateKind
-	userFails uint32
+	outbound   A.Outbound
+	tag        string
+	delayMs    uint32
+	demote     demoteLevel
+	kind       candidateKind
+	userFails  uint32
+	lastResort bool
 }
 
 // splitHealthyForLocked filters ranked to network and returns the cleanest
-// non-empty tier as pool (clean, then soft, then hard). forNetwork contains
-// all filtered candidates so stickiness can evaluate a demoted tag outside
-// pool.
+// non-empty tier as pool (clean, then soft, then last resort, then hard).
+// forNetwork contains all filtered candidates so stickiness can evaluate a
+// demoted tag outside pool.
 //
 // ranked must be sorted by demote level, as rankLocked returns it. Requires
 // s.access; both returned slices alias s.scratchSplit.
 func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, network string) (pool, forNetwork []rankedCandidate) {
 	clear(s.scratchSplit)
 	out := s.scratchSplit[:0]
-	var nClean, nSoft int
+	var nClean, nSoft, nLast int
 	for _, c := range ranked {
 		if !slices.Contains(c.outbound.Network(), network) {
 			continue
@@ -822,6 +838,8 @@ func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, netw
 			nClean++
 		case demoteSoft:
 			nSoft++
+		case demoteLastResort:
+			nLast++
 		}
 	}
 	s.scratchSplit = out
@@ -830,6 +848,8 @@ func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, netw
 		return out[:nClean], out
 	case nSoft > 0:
 		return out[nClean : nClean+nSoft], out
+	case nLast > 0:
+		return out[nClean+nSoft : nClean+nSoft+nLast], out
 	default:
 		return out, out
 	}
@@ -838,12 +858,13 @@ func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, netw
 // preCandidate holds a member's pre-demotion state while rankLocked assembles
 // the candidate set.
 type preCandidate struct {
-	o         A.Outbound
-	tag       string
-	delayMs   uint32
-	kind      candidateKind
-	consec    uint32
-	userFails uint32
+	o          A.Outbound
+	tag        string
+	delayMs    uint32
+	kind       candidateKind
+	consec     uint32
+	userFails  uint32
+	lastResort bool
 }
 
 // rankLocked builds the candidate set for selection. A non-zero freshSince
@@ -908,7 +929,7 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 		default:
 			delay, kind = rawDelay, kindRealSeeded
 		}
-		pres = append(pres, preCandidate{o: o, tag: tag, delayMs: delay, kind: kind, consec: consec, userFails: userFails})
+		pres = append(pres, preCandidate{o: o, tag: tag, delayMs: delay, kind: kind, consec: consec, userFails: userFails, lastResort: beh.lastResort})
 	}
 	s.scratchPres = pres
 
@@ -917,10 +938,11 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 	// the rule can soften when the only fallback is much slower. Only
 	// kindRealSeeded delays participate — substituted/unknown values are
 	// synthetic, so basing a "switching is costly" decision on them
-	// would be meaningless.
+	// would be meaningless. lastResort members don't participate either: they
+	// are not an alternative a regular member competes with.
 	var min1, min2 uint32
 	for _, p := range pres {
-		if p.kind != kindRealSeeded || p.delayMs == 0 {
+		if p.kind != kindRealSeeded || p.delayMs == 0 || p.lastResort {
 			continue
 		}
 		switch {
@@ -939,7 +961,9 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 		// can't trigger off a synthetic delay. bestAlt for those is
 		// irrelevant — demoted gates the boost on selfMs>0.
 		var selfMs, bestAlt uint32
-		if p.kind == kindRealSeeded {
+		// A last resort isn't rescued by the switch-penalty boost: the normal
+		// hard threshold always applies to it.
+		if p.kind == kindRealSeeded && !p.lastResort {
 			selfMs = p.delayMs
 			bestAlt = min1
 			if p.delayMs == min1 {
@@ -951,16 +975,23 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 		switch {
 		case hard:
 			level = demoteHard
+		case p.lastResort:
+			level = demoteLastResort
 		case soft:
 			level = demoteSoft
 		}
-		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, kind: p.kind, demote: level, userFails: p.userFails})
+		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, kind: p.kind, demote: level, userFails: p.userFails, lastResort: p.lastResort})
 	}
 	s.scratchRanked = out
 	sort.SliceStable(out, func(i, j int) bool {
 		a, b := out[i], out[j]
 		if a.demote != b.demote {
 			return a.demote < b.demote
+		}
+		// Within a tier (in practice demoteHard, the only one both share), a
+		// regular member outranks a last resort whatever their delays.
+		if a.lastResort != b.lastResort {
+			return !a.lastResort
 		}
 		if a.kind != b.kind {
 			return a.kind < b.kind
@@ -981,9 +1012,17 @@ func (s *MutableAutoSelect) runProbeCycle(ctx context.Context) {
 }
 
 // runExternalProbe runs a fire-and-forget, freshness-filtered probe for tags,
-// or all members when tags is nil. It drops if another external probe or
-// internal cycle is running and does not rank after refreshing history.
+// or all members when tags is nil. Its probe wave drops if another external
+// probe or internal cycle is running (last-resort probes start regardless),
+// and it does not rank after refreshing history.
 func (s *MutableAutoSelect) runExternalProbe(tags []string) {
+	// Last-resort probes run on their own goroutines and need only s.access,
+	// so start them before the probe-wave locks: a wave already in flight
+	// must not hold back the probe that reports a fresh callback URL.
+	s.access.Lock()
+	s.kickLastResortProbesLocked(time.Now(), tags, false)
+	s.access.Unlock()
+
 	if !s.externalProbeMu.TryLock() {
 		return
 	}
@@ -1005,9 +1044,117 @@ func (s *MutableAutoSelect) runExternalProbe(tags []string) {
 // it bypasses freshness filtering; callers rank separately when needed.
 func (s *MutableAutoSelect) internalProbe(ctx context.Context, onSuccess func(probeResult)) {
 	s.access.Lock()
-	jobs := s.collectProbeJobsLocked(time.Now(), nil, true)
+	now := time.Now()
+	jobs := s.collectProbeJobsLocked(now, nil, true)
+	s.kickLastResortProbesLocked(now, nil, true)
 	s.access.Unlock()
 	s.probeAll(ctx, jobs, onSuccess)
+}
+
+// kickLastResortProbesLocked starts a probe for each lastResort member in
+// tags (all members when nil) that has none running. Each runs on its own
+// goroutine under the group's lifetime with the member's long probeTimeout,
+// so neither a probe wave nor URLTest waits for it; its outcome lands in
+// history like any other. With force=false, members with an outcome newer
+// than probeFreshnessWindow are skipped. Caller must hold s.access.
+func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []string, force bool) {
+	if tags == nil {
+		tags = s.tags
+	}
+	for _, tag := range tags {
+		o, ok := s.members.Load(tag)
+		if !ok {
+			continue
+		}
+		beh := behaviorFor(o.Type())
+		if !beh.lastResort || s.lastResortInFlight[tag] {
+			continue
+		}
+		if !force {
+			if h, ok := s.peekHistoryLocked(tag); ok {
+				if at := h.outcomeAt(); !at.IsZero() && now.Sub(at) < probeFreshnessWindow {
+					continue
+				}
+			}
+		}
+		if s.lastResortInFlight == nil {
+			s.lastResortInFlight = make(map[string]bool)
+		}
+		s.lastResortInFlight[tag] = true
+		probeURL := s.probeURLForLocked(tag)
+		bound := lastResortProbeBound(beh)
+		go func() {
+			done := make(chan probeResult, 1)
+			go func() { done <- probeMember(s.ctx, o, probeURL, beh) }()
+			watchdog := time.NewTimer(bound)
+			defer watchdog.Stop()
+			var res probeResult
+			select {
+			case res = <-done:
+			case <-watchdog.C:
+				// The outbound overran the probe deadline. Count the probe
+				// as failed now so ranking sees it, but keep the slot until
+				// the dial actually returns: freeing it would let each later
+				// cycle stack another stuck dial on a stalled peer.
+				if s.ctx.Err() == nil {
+					s.recordLastResortOutcome(tag, probeURL, false, 0)
+				}
+				<-done
+				s.finishLastResortProbe(tag, probeURL)
+				return
+			case <-s.ctx.Done():
+			}
+			// Record before freeing the slot, so a newer probe can't finish
+			// first and have its outcome overwritten by this older one.
+			// Group shutdown is not member evidence.
+			if s.ctx.Err() == nil {
+				s.recordLastResortOutcome(tag, probeURL, res.success, res.delayMs)
+			}
+			s.finishLastResortProbe(tag, probeURL)
+		}()
+	}
+}
+
+// recordLastResortOutcome records a last-resort probe's outcome unless the
+// member's probe URL changed while it ran. A new URL (a new bandit callback
+// token) invalidates the member's history, and an outcome for the old one
+// would read as current.
+func (s *MutableAutoSelect) recordLastResortOutcome(tag, probeURL string, success bool, delayMs uint32) {
+	// Rechecked under s.access so a concurrent Close can't slip between the
+	// caller's shutdown check and the write.
+	guard := func() bool { return s.ctx.Err() == nil && s.probeURLForLocked(tag) == probeURL }
+	s.mutateHistoryIf(tag, guard, func(h *localHistory, now time.Time) bool {
+		if success {
+			h.recordProbeSuccess(delayMs, now)
+		} else {
+			h.recordProbeFailure(now)
+		}
+		return true
+	})
+}
+
+// finishLastResortProbe frees tag's probe slot. If the member's probe URL
+// changed while the probe ran (a config update brought a new bandit callback
+// URL), it starts a probe of the new URL at once rather than leaving it for
+// the next background cycle.
+func (s *MutableAutoSelect) finishLastResortProbe(tag, probeURL string) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	delete(s.lastResortInFlight, tag)
+	if s.ctx.Err() == nil && s.probeURLForLocked(tag) != probeURL {
+		s.kickLastResortProbesLocked(time.Now(), []string{tag}, true)
+	}
+}
+
+// lastResortSuccessFreshness bounds how old a last resort's latest successful
+// probe may be for the ladder to treat it as a winner.
+const lastResortSuccessFreshness = 5 * time.Minute
+
+// lastResortProbeBound is how long a last-resort probe may run before it is
+// counted as failed even if the outbound hasn't returned. A variable so tests
+// can shorten it.
+var lastResortProbeBound = func(beh protocolBehavior) time.Duration {
+	return beh.probeTimeout + 5*time.Second
 }
 
 // mutateHistory applies fn to tag's history under s.access and persists
@@ -1017,9 +1164,18 @@ func (s *MutableAutoSelect) internalProbe(ctx context.Context, onSuccess func(pr
 // goroutine. fn is passed the timestamp used for both the entry and the
 // persisted snapshot. Returns true only if fn ran and reported a change.
 func (s *MutableAutoSelect) mutateHistory(tag string, fn func(*localHistory, time.Time) bool) bool {
+	return s.mutateHistoryIf(tag, nil, fn)
+}
+
+// mutateHistoryIf is mutateHistory gated on guard, which runs under s.access
+// before any history entry is created; a nil guard always passes.
+func (s *MutableAutoSelect) mutateHistoryIf(tag string, guard func() bool, fn func(*localHistory, time.Time) bool) bool {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if _, member := s.members.Load(tag); !member {
+		return false
+	}
+	if guard != nil && !guard() {
 		return false
 	}
 	h := s.historyForLocked(tag)
@@ -1116,6 +1272,26 @@ func (s *MutableAutoSelect) runLadder(target string) {
 		if _, ok := succeeded[c.tag]; ok {
 			winner = c.outbound
 			break
+		}
+	}
+	if winner == nil {
+		// lastResort members are probed asynchronously and can't report
+		// inside the ladder budget. One whose latest probe succeeded within
+		// lastResortSuccessFreshness can still carry traffic, so the group
+		// isn't exhausted. An older success doesn't count: a later failure
+		// doesn't rerun the ladder, so trusting it could suppress the
+		// exhaustion signal for good.
+		now := time.Now()
+		for _, c := range s.rankLocked(now, time.Time{}) {
+			if c.demote != demoteLastResort {
+				continue
+			}
+			if h, ok := s.peekHistoryLocked(c.tag); ok {
+				if delay, at, consec, _ := h.snapshot(now, s.hist.userFailureWindow); delay > 0 && consec == 0 && now.Sub(at) <= lastResortSuccessFreshness {
+					winner = c.outbound
+					break
+				}
+			}
 		}
 	}
 	s.access.Unlock()

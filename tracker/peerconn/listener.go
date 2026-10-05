@@ -25,9 +25,15 @@ import "sync"
 //	State        +1 on accept, -1 on close
 //	Source       remote peer's "ip:port" string (empty if unavailable)
 //	Destination  the host:port the remote peer requested through the
-//	             inbound (only meaningful on +1; close events leave it
-//	             empty since the abuse aggregator already pairs each
-//	             close with the prior accept by source identity)
+//	             inbound. Always set on +1. Close events leave it empty,
+//	             since the abuse aggregator already pairs each close with
+//	             the prior accept by source identity, except when Rejected
+//	             is set.
+//	Rejected     on -1 only: the router refused the destination by a
+//	             reject rule (the peer's allowlist or an abuse block), as
+//	             opposed to the connection failing or ending normally.
+//	             Destination is repeated so a consumer can tally refusals
+//	             without keeping per-connection state.
 //
 // Destination carries the load-bearing abuse-detection signal: source
 // IP alone is insufficient (mobile clients change IPs, NAT pools
@@ -42,6 +48,7 @@ type Event struct {
 	State       int
 	Source      string
 	Destination string
+	Rejected    bool
 }
 
 // Listener receives connection lifecycle notifications from lantern-box

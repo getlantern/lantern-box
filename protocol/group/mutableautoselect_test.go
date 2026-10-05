@@ -337,11 +337,16 @@ func TestBehaviorFor_Timeouts(t *testing.T) {
 	}
 }
 
-func TestBehaviorFor_PeerNetworkProtocolsAreExcluded(t *testing.T) {
-	for _, typeName := range []string{C.TypeTor, lConst.TypeUnbounded} {
-		assert.Truef(t, behaviorFor(typeName).excludeFromPool,
-			"%s should be excluded from candidate pool", typeName)
-	}
+func TestBehaviorFor_TorIsExcluded(t *testing.T) {
+	assert.True(t, behaviorFor(C.TypeTor).excludeFromPool)
+	assert.False(t, behaviorFor(C.TypeTor).lastResort)
+}
+
+func TestBehaviorFor_UnboundedIsLastResort(t *testing.T) {
+	beh := behaviorFor(lConst.TypeUnbounded)
+	assert.True(t, beh.lastResort)
+	assert.False(t, beh.excludeFromPool, "unbounded must stay a candidate so it can carry traffic when nothing else works")
+	assert.Equal(t, 60*time.Second, beh.probeTimeout)
 }
 
 func TestRank_SwitchPenaltyOnlyAppliesToRealSeeded(t *testing.T) {

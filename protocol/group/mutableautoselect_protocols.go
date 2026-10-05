@@ -12,10 +12,16 @@ import (
 // candidate.
 type protocolBehavior struct {
 	probeTimeout time.Duration
-	// excludeFromPool: peer/network protocols (tor, unbounded) run
-	// alongside the group with their own connection managers and never
-	// belong in the candidate pool.
+	// excludeFromPool: protocols that run alongside the group with their
+	// own connection manager (tor) and never belong in the candidate pool.
 	excludeFromPool bool
+	// lastResort: protocols that are only worth carrying traffic when no
+	// other member is healthy (unbounded: a WebRTC hop through a volunteer
+	// peer, slow to establish and capacity-limited). They are probed
+	// asynchronously with probeTimeout, so a slow handshake never holds up
+	// a probe wave, and rank in their own tier below every clean or
+	// soft-demoted member.
+	lastResort bool
 	// substituteDelay, when non-zero, replaces the measured probe delay
 	// for ranking. Set for protocols whose handshake jitter makes RTT
 	// meaningless (samizdat).
@@ -55,7 +61,9 @@ func behaviorFor(outboundType string) protocolBehavior {
 	case C.TypeTUIC:
 		return protocolBehavior{probeTimeout: 1500 * time.Millisecond}
 	case lConst.TypeUnbounded:
-		return protocolBehavior{excludeFromPool: true}
+		// Signaling, ICE/NAT traversal and the egress handshake routinely
+		// take tens of seconds.
+		return protocolBehavior{probeTimeout: 60 * time.Second, lastResort: true}
 	case C.TypeVLESS:
 		return protocolBehavior{probeTimeout: 2000 * time.Millisecond}
 	case C.TypeVMess:

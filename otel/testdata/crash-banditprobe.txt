@@ -1,0 +1,28 @@
+panic: unknown value
+
+goroutine 2637 [running]:
+github.com/sagernet/sing/common/format.ToString({0xc0005680a0?, 0xa, 0xc000d18a00?})
+	github.com/sagernet/sing@v0.8.13/common/format/fmt.go:61 +0x18de
+github.com/sagernet/sing-box/log.(*observableLogger).Log(0xc000151260, {0x2c23b90, 0xc000d18a00}, 0x5b?, {0xc0005680a0, 0xa, 0xa})
+	github.com/sagernet/sing-box@v1.13.19/log/observable.go:131 +0xf8
+github.com/sagernet/sing-box/log.(*observableLogger).DebugContext(0xadf5e?, {0x2c23b90?, 0xc000d18a00?}, {0xc0005680a0?, 0xc000d21200?, 0xe377ba?})
+	github.com/sagernet/sing-box@v1.13.19/log/observable.go:178 +0x30
+github.com/getlantern/lantern-box/protocol/banditprobe.(*responder).serve(0xc0002c04d0, {0x2c23b90, 0xc000d18a00}, {0x2c37d18, 0xc000d21200})
+	github.com/getlantern/lantern-box/protocol/banditprobe/responder.go:82 +0x684
+github.com/getlantern/lantern-box/protocol/banditprobe.(*Outbound).NewConnectionEx.func1()
+	github.com/getlantern/lantern-box/protocol/banditprobe/outbound.go:136 +0x3e
+created by github.com/getlantern/lantern-box/protocol/banditprobe.(*Outbound).NewConnectionEx in goroutine 2625
+	github.com/getlantern/lantern-box/protocol/banditprobe/outbound.go:135 +0xe5
+
+goroutine 1 [chan receive, 8 minutes]:
+main.run({0x7ffc2b569ccb, 0x1c}, {0x7ffc2b569cf6, 0x15})
+	github.com/getlantern/lantern-box/cmd/cmd_run.go:159 +0x388
+main.init.func5(0x40cbf40, {0x27c827b?, 0x4?, 0x27c827f?})
+	github.com/getlantern/lantern-box/cmd/cmd_run.go:50 +0xea
+github.com/spf13/cobra.(*Command).execute(0x40cbf40, {0xc0000aafc0, 0x6, 0x6})
+	github.com/spf13/cobra@v1.10.2/command.go:1015 +0xb02
+github.com/spf13/cobra.(*Command).ExecuteC(0x40cc220)
+	github.com/spf13/cobra@v1.10.2/command.go:1148 +0x465
+github.com/spf13/cobra.(*Command).Execute(...)
+	github.com/spf13/cobra@v1.10.2/command.go:1071
+main.main()
