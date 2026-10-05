@@ -59,3 +59,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh workflow run release.yaml --ref "${{ steps.tag.outputs.next }}"
+          # The versioned sing-box image that lantern-cloud pins triangle
+          # backends to. A GITHUB_TOKEN tag push doesn't trigger push.yaml.
+          gh workflow run push.yaml --ref "${{ steps.tag.outputs.next }}"
