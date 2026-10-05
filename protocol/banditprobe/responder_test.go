@@ -951,6 +951,10 @@ func TestServe_WritePanicDuringStallIsAborted(t *testing.T) {
 	assert.Empty(t, rec.calls(), "a write that panics while the stall is being called is aborted, not reported as stalled")
 }
 
+// ss2022MaxChunk is the largest payload the shadowsocks 2022 inbound frames as
+// one chunk.
+const ss2022MaxChunk = 64*1024 - 1
+
 // chunkLimitedConn panics on a Write larger than limit, the way the
 // shadowsocks 2022 inbound does on a chunk past its maximum.
 type chunkLimitedConn struct {
@@ -969,7 +973,7 @@ func TestServe_ResponseFitsChunkLimitedInbound(t *testing.T) {
 	rec := newCallbackRecorder(t)
 	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{BodySize: defaultBodySize}, nil)
 	server, client := tcpPair(t)
-	conn := &chunkLimitedConn{Conn: server, limit: 65535}
+	conn := &chunkLimitedConn{Conn: server, limit: ss2022MaxChunk}
 
 	resp, body, err := runProbe(t, r, conn, client, probeTarget)
 	require.NoError(t, err)
@@ -978,4 +982,26 @@ func TestServe_ResponseFitsChunkLimitedInbound(t *testing.T) {
 	calls := rec.calls()
 	require.Len(t, calls, 1, "a probe through a chunk-limited inbound must be reported")
 	assert.Equal(t, "unknown", calls[0].Get("verdict"))
+}
+
+// shortWriteConn accepts at most limit bytes per Write and reports a short
+// count with no error.
+type shortWriteConn struct {
+	net.Conn
+	limit int
+}
+
+func (c *shortWriteConn) Write(b []byte) (int, error) {
+	return c.Conn.Write(b[:min(len(b), c.limit)])
+}
+
+func TestServe_ShortWritesStillSendTheWholeResponse(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{BodySize: defaultBodySize}, nil)
+	server, client := tcpPair(t)
+
+	resp, body, err := runProbe(t, r, &shortWriteConn{Conn: server, limit: 1000}, client, probeTarget)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Len(t, body, defaultBodySize, "a short write must not drop the rest of a chunk")
 }
