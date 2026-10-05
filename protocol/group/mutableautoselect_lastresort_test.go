@@ -185,7 +185,7 @@ func TestInternalProbe_DoesNotWaitForLastResort(t *testing.T) {
 		if !ok {
 			return false
 		}
-		delay, _, consec, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
+		delay, _, consec, _, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
 		return delay > 0 && consec == 0
 	}, 5*time.Second, 10*time.Millisecond, "last-resort probe outcome was not recorded")
 	assert.Equal(t, int32(1), dials.Load(), "a last-resort member has at most one probe in flight")
@@ -295,7 +295,7 @@ func TestLastResortProbe_WatchdogFailsOverrunningProbe(t *testing.T) {
 		if !ok {
 			return false
 		}
-		_, _, consec, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
+		_, _, consec, _, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
 		return consec == 1
 	}, 2*time.Second, 10*time.Millisecond, "an overrunning probe must be recorded as failed at the watchdog")
 

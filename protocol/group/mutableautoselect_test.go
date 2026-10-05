@@ -183,10 +183,10 @@ func TestLocalHistory_ConsecutiveFailuresResetOnSuccess(t *testing.T) {
 	now := time.Now()
 	h.recordProbeFailure(now)
 	h.recordProbeFailure(now.Add(time.Second))
-	_, _, consec, _ := h.snapshot(now, time.Hour)
+	_, _, consec, _, _ := h.snapshot(now, time.Hour)
 	assert.Equal(t, uint32(2), consec, "two failures should accumulate")
 	h.recordProbeSuccess(100, now.Add(2*time.Second))
-	_, _, consec, _ = h.snapshot(now, time.Hour)
+	_, _, consec, _, _ = h.snapshot(now, time.Hour)
 	assert.Equal(t, uint32(0), consec, "success should reset consecutive failures")
 }
 
@@ -198,7 +198,7 @@ func TestLocalHistory_FailureDoesNotClearLastSuccessDelay(t *testing.T) {
 	now := time.Now()
 	h.recordProbeSuccess(150, now)
 	h.recordProbeFailure(now.Add(time.Second))
-	lastDelay, _, consec, _ := h.snapshot(now, time.Hour)
+	lastDelay, _, consec, _, _ := h.snapshot(now, time.Hour)
 	assert.Equal(t, uint32(150), lastDelay, "lastSuccessDelay must survive a subsequent failure")
 	assert.Equal(t, uint32(1), consec, "consecutive failures bump")
 }
@@ -302,7 +302,7 @@ func TestHydrateLocalHistory_DropsAgedUserFailures(t *testing.T) {
 		UpdatedAt: now.Add(-time.Minute),
 	}
 	h := hydrateLocalHistory(persisted, now, 5*time.Minute)
-	lastDelay, _, _, userFails := h.snapshot(now, 5*time.Minute)
+	lastDelay, _, _, userFails, _ := h.snapshot(now, 5*time.Minute)
 	assert.Equal(t, uint32(120), lastDelay)
 	assert.Len(t, userFails, 1, "stale user-failure timestamp must be dropped on hydrate")
 }
@@ -396,7 +396,7 @@ func userFailures(s *MutableAutoSelect, tag string) ([]adapter.UserFailure, bool
 	if !ok {
 		return nil, false
 	}
-	_, _, _, uf := h.snapshot(time.Now(), s.hist.userFailureWindow)
+	_, _, _, uf, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
 	return uf, true
 }
 
@@ -783,7 +783,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// one. (Spec change from earlier "one-shot hard demote.")
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", primaryRoute).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureStall)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1,
@@ -795,7 +795,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", primaryRoute).onFailure(adapter.UserFailureReset)
+	s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureReset)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -1741,7 +1741,7 @@ func TestMakeHooks_IgnoresFailureFromUnselectedTag(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("b")
 
-	s.makeHooks("a", primaryRoute).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureStall)
 
 	s.access.Lock()
 	_, ok := s.peekHistoryLocked("a")
@@ -1757,7 +1757,7 @@ func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("a")
 
-	s.makeHooks("a", primaryRoute).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureStall)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the udp selection must still be chargeable")
@@ -1769,7 +1769,7 @@ func TestMakeHooks_UnselectedGateDisabledByConfig(t *testing.T) {
 	s.cfg.demoteOnlySelected = false
 	s.stickyTag.tcp.Store("b")
 
-	s.makeHooks("a", primaryRoute).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureStall)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the gate must be defeatable for rollback")
@@ -1782,7 +1782,7 @@ func TestMakeHooks_ChargesFallbackRouteEvenWhenUnselected(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	s.stickyTag.tcp.Store("a")
 
-	s.makeHooks("b", fallbackRoute).onFailure(adapter.UserFailureReset)
+	s.makeHooks("b", "tcp", fallbackRoute).onFailure(adapter.UserFailureReset)
 
 	uf, ok := userFailures(s, "b")
 	require.True(t, ok, "a fallback-route conn must stay chargeable")

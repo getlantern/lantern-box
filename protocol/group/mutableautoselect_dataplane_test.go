@@ -3,7 +3,9 @@ package group
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -267,4 +269,114 @@ func TestListenPacket_QuietReadExcused(t *testing.T) {
 		uf, _ := userFailures(s, "a")
 		assert.Empty(t, uf)
 	})
+}
+
+func TestDataPlane_NoResponse(t *testing.T) {
+	const timeout = 10 * time.Second
+	tests := []struct {
+		name     string
+		disabled bool
+		run      func(w *dataPlaneWatchdog)
+		charged  bool
+	}{
+		{"unanswered write at timeout", false, func(w *dataPlaneWatchdog) {
+			w.noteIO(8, nil, false)
+			time.Sleep(timeout)
+		}, true},
+		{"unanswered write before timeout", false, func(w *dataPlaneWatchdog) {
+			w.noteIO(8, nil, false)
+			time.Sleep(timeout - time.Nanosecond)
+		}, false},
+		{"reply disarms", false, func(w *dataPlaneWatchdog) {
+			w.noteIO(8, nil, false)
+			w.noteIO(2, nil, true)
+			time.Sleep(2 * timeout)
+		}, false},
+		{"EOF counts as a reply", false, func(w *dataPlaneWatchdog) {
+			w.noteIO(8, nil, false)
+			w.noteIO(0, io.EOF, true)
+			time.Sleep(2 * timeout)
+		}, false},
+		{"read deadline does not charge early", false, func(w *dataPlaneWatchdog) {
+			w.noteIO(8, nil, false)
+			w.noteIO(0, os.ErrDeadlineExceeded, true)
+			time.Sleep(timeout - time.Nanosecond)
+		}, false},
+		{"read deadline is not a reply", false, func(w *dataPlaneWatchdog) {
+			w.noteIO(8, nil, false)
+			w.noteIO(0, os.ErrDeadlineExceeded, true)
+			time.Sleep(timeout)
+		}, true},
+		{"read deadline before any write stays armed", false, func(w *dataPlaneWatchdog) {
+			w.noteIO(0, os.ErrDeadlineExceeded, true)
+			w.noteIO(8, nil, false)
+			time.Sleep(timeout)
+		}, true},
+		{"close disarms", false, func(w *dataPlaneWatchdog) {
+			w.noteIO(8, nil, false)
+			w.closeWatchdog()
+			time.Sleep(2 * timeout)
+		}, false},
+		{"disabled", true, func(w *dataPlaneWatchdog) {
+			w.noteIO(8, nil, false)
+			w.noteIO(0, os.ErrDeadlineExceeded, true)
+			time.Sleep(2 * timeout)
+		}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var failures []adapter.UserFailureKind
+				var w dataPlaneWatchdog
+				w.init(time.Hour, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
+					onFailure: func(kind adapter.UserFailureKind) { failures = append(failures, kind) },
+				})
+				if !tt.disabled {
+					w.firstResponseTimeout = timeout
+				}
+				defer w.closeWatchdog()
+				tt.run(&w)
+				synctest.Wait()
+				if tt.charged {
+					assert.Equal(t, []adapter.UserFailureKind{adapter.UserFailureNoResponse}, failures)
+				} else {
+					assert.Empty(t, failures)
+				}
+			})
+		})
+	}
+}
+
+func TestDialContext_NoResponseChargedOnTCPOnly(t *testing.T) {
+	for _, network := range []string{"tcp", "udp"} {
+		t.Run(network, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, obs := newTestMUR(t, "a")
+				recordSuccess(s, "a", 10)
+				s.cfg.dataPlaneFirstResponseTimeout = defaultFirstResponseTimeout
+				s.cfg.ladderCooldown = time.Hour
+				s.lastLadderAt.Store(time.Now().UnixNano())
+				obs["a"].dial = func(context.Context) (net.Conn, error) {
+					return blackholeConn(), nil
+				}
+				conn, err := s.DialContext(context.Background(), network, metadata.Socksaddr{})
+				require.NoError(t, err)
+				defer conn.Close()
+
+				_, err = conn.Write([]byte("CLIENTINFO2 {}"))
+				require.NoError(t, err)
+				go io.ReadFull(conn, make([]byte, 2))
+				time.Sleep(defaultFirstResponseTimeout)
+				synctest.Wait()
+
+				uf, _ := userFailures(s, "a")
+				if network == "tcp" {
+					require.Len(t, uf, 1)
+					assert.Equal(t, adapter.UserFailureNoResponse, uf[0].Kind)
+				} else {
+					assert.Empty(t, uf)
+				}
+			})
+		})
+	}
 }
