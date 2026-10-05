@@ -79,7 +79,9 @@ func (r *responder) serve(ctx context.Context, conn net.Conn) error {
 	if ctx.Err() != nil {
 		res.verdict = verdictAborted
 	}
-	r.logger.DebugContext(ctx, "bandit probe ", res.verdict, " drain=", res.drain, " acked=", res.acked,
+	// sing's formatter panics on types it doesn't know, a named string type
+	// included, so the verdict is logged as a plain string.
+	r.logger.DebugContext(ctx, "bandit probe ", string(res.verdict), " drain=", res.drain, " acked=", res.acked,
 		" retrans=", res.state.retrans, " rtt=", res.state.rtt)
 	if res.verdict == verdictAborted || (res.verdict == verdictStalled && !r.cfg.reportStalled) {
 		return nil
@@ -108,22 +110,7 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	conn.SetWriteDeadline(writeDeadline)
 	tc, isTCP := common.Cast[*net.TCPConn](conn)
 	if !isTCP {
-		written := make(chan error, 1)
-		go func() {
-			_, err := conn.Write(payload)
-			written <- err
-		}()
-		select {
-		case err := <-written:
-			if err != nil {
-				return result{verdict: verdictStalled, drain: r.now().Sub(start)}
-			}
-			return result{verdict: verdictUnknown, drain: r.now().Sub(start)}
-		case <-ctx.Done():
-			conn.SetWriteDeadline(time.Now())
-			<-written
-			return result{verdict: verdictAborted, drain: r.now().Sub(start)}
-		}
+		return r.awaitWrite(ctx, conn, r.writeAsync(ctx, conn, payload), start, writeDeadline, nil)
 	}
 
 	// The write runs alongside the poll because a body larger than the free send
@@ -132,39 +119,30 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	// Deadlines also go on the raw socket so a wrapper that ignores them cannot
 	// leave the write blocked forever.
 	tc.SetWriteDeadline(writeDeadline)
-	written := make(chan error, 1)
-	go func() {
-		_, err := conn.Write(payload)
-		written <- err
-	}()
+	written := r.writeAsync(ctx, conn, payload)
 	writeDone := false
-	abortWrite := func() {
-		if !writeDone {
-			conn.SetWriteDeadline(time.Now())
-			tc.SetWriteDeadline(time.Now())
-			<-written
+	// abortWrite unblocks an outstanding write and returns its result.
+	abortWrite := func() error {
+		if writeDone {
+			return nil
 		}
+		conn.SetWriteDeadline(time.Now())
+		tc.SetWriteDeadline(time.Now())
+		return (<-written).err
 	}
 	stalled := func(st sendState) result {
-		abortWrite()
+		// The write can panic after the loop last checked it; that is still a
+		// bug here, not a stalled route.
+		if errors.Is(abortWrite(), errWritePanic) {
+			return result{verdict: verdictAborted, drain: r.now().Sub(start), acked: st.acked, state: st}
+		}
 		return result{verdict: verdictStalled, drain: r.now().Sub(start), acked: st.acked, state: st}
 	}
 
 	st, err := r.readState(tc)
 	if err != nil {
-		// Without socket state only the write result is known, and unknown is
-		// reported as a success, so it requires the whole response to have been
-		// written.
-		select {
-		case err := <-written:
-			if err != nil {
-				return result{verdict: verdictStalled, drain: r.now().Sub(start)}
-			}
-			return result{verdict: verdictUnknown, drain: r.now().Sub(start)}
-		case <-ctx.Done():
-			abortWrite()
-			return result{verdict: verdictAborted, drain: r.now().Sub(start)}
-		}
+		// Without socket state only the write result is known.
+		return r.awaitWrite(ctx, conn, written, start, writeDeadline, tc)
 	}
 	lastAcked, lastProgress := st.acked, r.now()
 	ticker := time.NewTicker(pollInterval)
@@ -172,7 +150,11 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	for {
 		if !writeDone {
 			select {
-			case err := <-written:
+			case res := <-written:
+				err := res.err
+				if errors.Is(err, errWritePanic) {
+					return result{verdict: verdictAborted, drain: r.now().Sub(start), acked: st.acked, state: st}
+				}
 				if err != nil {
 					return result{verdict: verdictStalled, drain: r.now().Sub(start), acked: st.acked, state: st}
 				}
@@ -214,6 +196,73 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	}
 }
 
+// awaitWrite decides a probe from the write result alone, for a conn whose
+// socket state can't be read. unknown is reported as a success, so it requires
+// the whole response to have been written by max_wait; anything less is a
+// stall. raw, when set, is the kernel socket under conn and gets the same
+// deadline.
+//
+// The deadline is enforced here rather than left to the conn because some
+// wrappers ignore SetWriteDeadline (samizdat's HTTP/2 stream conn is a no-op),
+// and their Write blocks for as long as the peer withholds flow-control
+// credit. Past max_wait the conn is closed to unblock such a write, and if even
+// that doesn't return it within writeAbortGrace the probe is called stalled
+// without it.
+func (r *responder) awaitWrite(ctx context.Context, conn net.Conn, written <-chan writeResult, start, writeDeadline time.Time, raw *net.TCPConn) result {
+	setDeadline := func(t time.Time) {
+		conn.SetWriteDeadline(t)
+		if raw != nil {
+			raw.SetWriteDeadline(t)
+		}
+	}
+	// verdictFor classifies a write that returned by when it returned, not
+	// when this goroutine got to see it: the result and the timer can be ready
+	// together, and select picks either.
+	verdictFor := func(res writeResult) result {
+		switch {
+		case errors.Is(res.err, errWritePanic):
+			return result{verdict: verdictAborted, drain: r.now().Sub(start)}
+		case res.err != nil, !res.done.Before(writeDeadline):
+			return result{verdict: verdictStalled, drain: r.now().Sub(start)}
+		default:
+			return result{verdict: verdictUnknown, drain: r.now().Sub(start)}
+		}
+	}
+	// abort unblocks the write and waits up to writeAbortGrace for it,
+	// reporting whether it returned and with what.
+	abort := func() (writeResult, bool) {
+		setDeadline(time.Now())
+		conn.Close()
+		grace := time.NewTimer(writeAbortGrace)
+		defer grace.Stop()
+		select {
+		case res := <-written:
+			return res, true
+		case <-grace.C:
+			return writeResult{}, false
+		}
+	}
+	timer := time.NewTimer(time.Until(writeDeadline))
+	defer timer.Stop()
+	select {
+	case res := <-written:
+		return verdictFor(res)
+	case <-ctx.Done():
+		abort()
+		return result{verdict: verdictAborted, drain: r.now().Sub(start)}
+	case <-timer.C:
+	}
+	res, returned := abort()
+	if !returned {
+		return result{verdict: verdictStalled, drain: r.now().Sub(start)}
+	}
+	return verdictFor(res)
+}
+
+// writeAbortGrace bounds how long a probe waits for a write to return after
+// its conn was closed at max_wait.
+const writeAbortGrace = time.Second
+
 const pollInterval = 50 * time.Millisecond
 
 // body returns bodySize random bytes from a random offset in the pool, so the
@@ -226,6 +275,37 @@ func (r *responder) body() []byte {
 // reservedParams are set only by the proxy; a client copy is discarded so it
 // cannot pre-empt or contradict the proxy's own observation.
 var reservedParams = []string{"verdict", "drain_ms", "acked", "retrans", "rtt_ms"}
+
+// errWritePanic marks a probe response write that panicked. It is a bug on
+// this side rather than a sign the route stalled, so it ends the probe as
+// aborted and is never reported.
+var errWritePanic = errors.New("banditprobe: panic writing probe response")
+
+// writeResult is how a probe response write ended and when it returned.
+type writeResult struct {
+	err  error
+	done time.Time
+}
+
+// writeAsync writes payload on its own goroutine and delivers the result on
+// the returned channel. recover only covers the goroutine it runs in, so a
+// panic in a wrapper's Write is caught here, logged, and delivered as
+// errWritePanic rather than taking down the proxy.
+func (r *responder) writeAsync(ctx context.Context, conn net.Conn, payload []byte) <-chan writeResult {
+	written := make(chan writeResult, 1)
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				err := fmt.Errorf("%w: %v", errWritePanic, p)
+				r.logger.ErrorContext(ctx, err)
+				written <- writeResult{err: err, done: time.Now()}
+			}
+		}()
+		_, err := conn.Write(payload)
+		written <- writeResult{err: err, done: time.Now()}
+	}()
+	return written
+}
 
 // sendCallback forwards the client's callback to the API with the verdict
 // attached. Client parameters other than the reserved and configured ones are
