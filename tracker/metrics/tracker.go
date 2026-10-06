@@ -94,11 +94,7 @@ func trackIOLoop(ctx context.Context, reportC <-chan report) {
 // device_id's connection to the proxy, to be correlated with the
 // client's API proxy assignment to assess connectivity success rate
 // and time-to-connect differences across connections.
-func emitDeviceConnectedSpan(ctx context.Context) {
-	info, ok := clientcontext.ClientInfoFromContext(ctx)
-	if !ok {
-		return
-	}
+func emitDeviceConnectedSpan(ctx context.Context, info clientcontext.ClientInfo) {
 	tracer := otel.Tracer("lantern-box")
 	_, span := tracer.Start(ctx, "device_id.connected")
 	span.SetAttributes(
@@ -112,23 +108,33 @@ func emitDeviceConnectedSpan(ctx context.Context) {
 }
 
 func (t *MetricsTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
-	emitDeviceConnectedSpan(ctx)
-	attrs := metadataToAttributes(metadata)
-	if info, ok := clientcontext.ClientInfoFromContext(ctx); ok {
-		attrs.client = &info
+	attrs, ok := connected(ctx, conn, metadata)
+	if !ok {
+		return conn
 	}
-	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return NewConn(conn, attrs, t)
 }
 
 func (t *MetricsTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
-	emitDeviceConnectedSpan(ctx)
-	attrs := metadataToAttributes(metadata)
-	if info, ok := clientcontext.ClientInfoFromContext(ctx); ok {
-		attrs.client = &info
+	attrs, ok := connected(ctx, conn, metadata)
+	if !ok {
+		return conn
 	}
-	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return NewPacketConn(conn, attrs, t)
+}
+
+// connected records a new connection from an identified client and returns its
+// attributes. It reports false, recording nothing, if conn has no client info.
+func connected(ctx context.Context, conn any, metadata adapter.InboundContext) (*attributes, bool) {
+	info, ok := clientcontext.InfoFromConn(conn)
+	if !ok {
+		return nil, false
+	}
+	attrs := metadataToAttributes(metadata)
+	attrs.client = &info
+	emitDeviceConnectedSpan(ctx, info)
+	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
+	return attrs, true
 }
 
 func (t *MetricsTracker) Leave(duration int64, attrs *attributes) {
