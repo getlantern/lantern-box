@@ -108,7 +108,7 @@ func TestProxyIOCarriesASNAndISP(t *testing.T) {
 		defer client.Close()
 		defer server.Close()
 
-		tracked := tracker.RoutedConnection(ctx, server, adapter.InboundContext{}, nil, nil)
+		tracked := tracker.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
 		// Let the workers resolve the client before any bytes are counted.
 		synctest.Wait()
 
@@ -156,7 +156,7 @@ func TestProxyIOWithoutISPLookupHasNoASN(t *testing.T) {
 		defer client.Close()
 		defer server.Close()
 
-		tracked := tracker.RoutedConnection(ctx, server, adapter.InboundContext{}, nil, nil)
+		tracked := tracker.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
 		go func() {
 			buf := make([]byte, 16)
 			_, _ = tracked.Read(buf)
