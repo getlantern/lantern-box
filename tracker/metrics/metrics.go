@@ -43,8 +43,14 @@ var goodputBucketBoundaries = []float64{
 type countryLookupRequest struct {
 	ip      net.IP
 	country *atomic.Value
-	asn     *atomic.Value
-	isp     *atomic.Value
+	network *atomic.Pointer[clientNetwork]
+}
+
+// clientNetwork is the client's ASN and ISP, published together so a reader
+// never sees one without the other.
+type clientNetwork struct {
+	asn string
+	isp string
 }
 
 type metricsManager struct {
@@ -145,8 +151,7 @@ func countryLookupWorker(ch <-chan countryLookupRequest, lookup geo.CountryLooku
 	for req := range ch {
 		req.country.Store(lookup.CountryCode(req.ip))
 		if !noISP {
-			req.asn.Store(ispLookup.ASN(req.ip))
-			req.isp.Store(ispLookup.ISP(req.ip))
+			req.network.Store(&clientNetwork{asn: ispLookup.ASN(req.ip), isp: ispLookup.ISP(req.ip)})
 		}
 	}
 }

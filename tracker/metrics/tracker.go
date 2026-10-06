@@ -77,11 +77,13 @@ func trackIOLoop(ctx context.Context, reportC <-chan report) {
 			}
 			// Left off when unknown, so a proxy without the ISP database
 			// emits exactly the series it did before.
-			if asn := r.attrs.asn.Load().(string); asn != "" {
-				attrs = append(attrs, semconv.ClientAsnKey.String(asn))
-			}
-			if isp := r.attrs.isp.Load().(string); isp != "" {
-				attrs = append(attrs, semconv.ClientISPKey.String(isp))
+			if n := r.attrs.network.Load(); n != nil {
+				if n.asn != "" {
+					attrs = append(attrs, semconv.ClientAsnKey.String(n.asn))
+				}
+				if n.isp != "" {
+					attrs = append(attrs, semconv.ClientISPKey.String(n.isp))
+				}
 			}
 			metrics.ProxyIO.Add(context.Background(), int64(r.n), metric.WithAttributes(attrs...))
 		}
@@ -185,9 +187,8 @@ func (t *MetricsTracker) recordGoodput(rxBytes, durationMs int64, attrs *attribu
 
 type attributes struct {
 	attrs   []attribute.KeyValue
-	country atomic.Value // string
-	asn     atomic.Value // string, proxy.io only
-	isp     atomic.Value // string, proxy.io only
+	country atomic.Value                  // string
+	network atomic.Pointer[clientNetwork] // proxy.io only; nil until looked up
 	client  *clientcontext.ClientInfo
 }
 
@@ -215,15 +216,12 @@ func metadataToAttributes(metadata adapter.InboundContext) *attributes {
 		},
 	}
 	attrs.country.Store(ccNa)
-	attrs.asn.Store("")
-	attrs.isp.Store("")
 	if metrics.countryLookupC != nil {
 		select {
 		case metrics.countryLookupC <- countryLookupRequest{
 			ip:      metadata.Source.IPAddr().IP,
 			country: &attrs.country,
-			asn:     &attrs.asn,
-			isp:     &attrs.isp,
+			network: &attrs.network,
 		}:
 		default:
 		}
