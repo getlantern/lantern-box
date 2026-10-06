@@ -108,6 +108,17 @@ func preRun(cmd *cobra.Command, args []string) {
 	geoCityURL, _ := cmd.Flags().GetString("geo-city-url")
 	cityDatabaseName, _ := cmd.Flags().GetString("city-database-name")
 	if geoCityURL != "" && cityDatabaseName != "" {
+		// The same database http-proxy uses, so both binaries report the same
+		// client.asn and client.isp values.
+		geoISPURL, _ := cmd.Flags().GetString("geo-isp-url")
+		ispDatabaseName, _ := cmd.Flags().GetString("isp-database-name")
+		if geoISPURL != "" && ispDatabaseName != "" {
+			metrics.SetISPLookup(geo.FromWeb(
+				geoISPURL, ispDatabaseName,
+				24*time.Hour, ispDatabaseName,
+				geo.ISP,
+			))
+		}
 		geolookup := geo.FromWeb(
 			geoCityURL, cityDatabaseName,
 			24*time.Hour, cityDatabaseName,

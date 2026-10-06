@@ -43,6 +43,14 @@ var goodputBucketBoundaries = []float64{
 type countryLookupRequest struct {
 	ip      net.IP
 	country *atomic.Value
+	network *atomic.Pointer[clientNetwork]
+}
+
+// clientNetwork is the client's ASN and ISP, published together so a reader
+// never sees one without the other.
+type clientNetwork struct {
+	asn string
+	isp string
 }
 
 type metricsManager struct {
@@ -61,6 +69,10 @@ type metricsManager struct {
 
 	countryLookup  geo.CountryLookup
 	countryLookupC chan countryLookupRequest
+
+	// ispLookup resolves the client's ASN and ISP for proxy.io only. It is a
+	// NoLookup unless SetISPLookup installs one before SetupMetricsManager.
+	ispLookup geo.ISPLookup
 }
 
 var metrics = &metricsManager{
@@ -69,6 +81,20 @@ var metrics = &metricsManager{
 	duration:       &noop.Int64Histogram{},
 	sessionGoodput: &noop.Float64Histogram{},
 	countryLookup:  geo.NoLookup{},
+	ispLookup:      geo.NoLookup{},
+}
+
+// SetISPLookup makes proxy.io carry client.asn and client.isp, resolved by
+// lookup alongside the country. It must be called before SetupMetricsManager,
+// which starts the workers that use it.
+//
+// Only proxy.io gets them: every distinct ASN multiplies a series, and the
+// connection, duration and goodput metrics (the goodput histogram has a
+// series per bucket) don't need the split.
+func SetISPLookup(lookup geo.ISPLookup) {
+	if lookup != nil {
+		metrics.ispLookup = lookup
+	}
 }
 
 func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
@@ -113,15 +139,19 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 	if _, ok := countryLookup.(geo.NoLookup); !ok {
 		metrics.countryLookupC = make(chan countryLookupRequest, 256)
 		for range countryLookupWorkers {
-			go countryLookupWorker(metrics.countryLookupC, metrics.countryLookup)
+			go countryLookupWorker(metrics.countryLookupC, metrics.countryLookup, metrics.ispLookup)
 		}
 	}
 
 	metrics.meter = meter
 }
 
-func countryLookupWorker(ch <-chan countryLookupRequest, lookup geo.CountryLookup) {
+func countryLookupWorker(ch <-chan countryLookupRequest, lookup geo.CountryLookup, ispLookup geo.ISPLookup) {
+	_, noISP := ispLookup.(geo.NoLookup)
 	for req := range ch {
 		req.country.Store(lookup.CountryCode(req.ip))
+		if !noISP {
+			req.network.Store(&clientNetwork{asn: ispLookup.ASN(req.ip), isp: ispLookup.ISP(req.ip)})
+		}
 	}
 }
