@@ -405,9 +405,8 @@ func (s *MutableAutoSelect) Remove(tags ...string) (n int, err error) {
 	return
 }
 
-// SetURLOverrides replaces the per-member callback URL map. Members whose
-// override changed (including removals) get their history dropped so the
-// next probe cycle re-tests against the new URL.
+// SetURLOverrides replaces per-member callback URL overrides.
+// Changed or removed overrides keep history and mark probe results stale.
 func (s *MutableAutoSelect) SetURLOverrides(overrides map[string]string) {
 	s.access.Lock()
 	defer s.access.Unlock()
@@ -415,21 +414,25 @@ func (s *MutableAutoSelect) SetURLOverrides(overrides map[string]string) {
 	s.urlOverrides = maps.Clone(overrides)
 	for tag, v := range s.urlOverrides {
 		if old[tag] != v {
-			s.invalidateHistoryLocked(tag)
+			s.markProbeStaleLocked(tag)
 		}
 	}
 	for tag := range old {
 		if _, kept := s.urlOverrides[tag]; !kept {
-			s.invalidateHistoryLocked(tag)
+			s.markProbeStaleLocked(tag)
 		}
 	}
 }
 
 // Caller must hold s.access.
-func (s *MutableAutoSelect) invalidateHistoryLocked(tag string) {
-	delete(s.histories, tag)
+func (s *MutableAutoSelect) markProbeStaleLocked(tag string) {
+	h, ok := s.peekHistoryLocked(tag)
+	if !ok {
+		return
+	}
+	h.clearOutcomeAt()
 	if s.history != nil {
-		s.history.Delete(tag)
+		s.history.Store(tag, h.toTagHistory(time.Now(), s.hist))
 	}
 }
 
@@ -1166,8 +1169,8 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 
 // recordLastResortOutcome records a last-resort probe's outcome unless the
 // member's probe URL changed while it ran. A new URL (a new bandit callback
-// token) invalidates the member's history, and an outcome for the old one
-// would read as current.
+// token) marks the member's probe outcome stale, and an outcome for the old
+// one would read as current.
 func (s *MutableAutoSelect) recordLastResortOutcome(tag, probeURL string, success bool, delayMs uint32) {
 	// Rechecked under s.access so a concurrent Close can't slip between the
 	// caller's shutdown check and the write.

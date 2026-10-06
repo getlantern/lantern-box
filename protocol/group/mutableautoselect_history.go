@@ -75,6 +75,12 @@ func (h *localHistory) outcomeAt() time.Time {
 	return h.lastOutcomeAt
 }
 
+func (h *localHistory) clearOutcomeAt() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lastOutcomeAt = time.Time{}
+}
+
 // recordProbeSuccess updates the probe scalars on a successful probe.
 // delayMs has already been clamped to ≥1 ms by the caller so the
 // "no measurement" sentinel (0) stays unambiguous.
