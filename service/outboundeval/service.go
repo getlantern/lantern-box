@@ -21,7 +21,6 @@ import (
 	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/service"
 
-	lbA "github.com/getlantern/lantern-box/adapter"
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
 )
@@ -64,15 +63,11 @@ type Service struct {
 	options option.OutboundEvalServiceOptions
 	limits  bounds
 
-	config atomic.Pointer[lbA.OutboundEvalConfig]
 	// pendingAssignment is owned by the run loop and retained across acquisition retries.
-	pendingAssignment *pendingAssignment
-	// wake carries a configuration change to a cycle waiting to retry, so a
-	// fresh credential does not have to wait out a backoff.
-	wake      chan struct{}
-	started   atomic.Bool
-	closeOnce sync.Once
-	closeErr  error
+	pendingAssignment *AssignmentRequest
+	started           atomic.Bool
+	closeOnce         sync.Once
+	closeErr          error
 
 	// assignmentMu serializes assignment target creation and removal with Close.
 	assignmentMu      sync.Mutex
@@ -98,10 +93,7 @@ type Service struct {
 	attest  func(ctx context.Context, request AttestationRequest) (Attestation, error)
 }
 
-var (
-	_ A.Service                    = (*Service)(nil)
-	_ lbA.OutboundEvalConfigSetter = (*Service)(nil)
-)
+var _ A.Service = (*Service)(nil)
 
 // NewService builds the runner from its options, resolving no outbound and
 // making no request until Start reaches A.StartStateStart.
@@ -112,6 +104,7 @@ func NewService(
 	options option.OutboundEvalServiceOptions,
 ) (A.Service, error) {
 	options = withDefaults(options)
+	options.CountryCode = strings.ToUpper(options.CountryCode)
 	if err := validateOptions(options); err != nil {
 		return nil, err
 	}
@@ -126,7 +119,6 @@ func NewService(
 		done:    make(chan struct{}),
 		logger:  logger,
 		options: options,
-		wake:    make(chan struct{}, 1),
 
 		router:    router,
 		outbounds: outbounds,
@@ -141,11 +133,6 @@ func NewService(
 		responseBytes:     options.MaxResponseBytes,
 		assignmentBytes:   options.MaxAssignmentBytes,
 	}
-	s.config.Store(&lbA.OutboundEvalConfig{
-		Token:       options.Token,
-		CountryCode: strings.ToUpper(options.CountryCode),
-		OutboundTag: options.OutboundTag,
-	})
 	s.measure = s.measureOnce
 	return s, nil
 }
@@ -159,7 +146,7 @@ func (s *Service) Start(stage A.StartStage) error {
 		return fmt.Errorf("control outbound %q is not declared in this config",
 			s.options.ControlOutboundTag)
 	}
-	candidateTag := s.config.Load().OutboundTag
+	candidateTag := s.options.OutboundTag
 	if _, found := s.outbounds.Outbound(candidateTag); !found {
 		return fmt.Errorf("outbound under test %q is not declared in this config",
 			candidateTag)
@@ -215,21 +202,6 @@ func (s *Service) Close() error {
 	return s.closeErr
 }
 
-// SetOutboundEvalConfig implements adapter.OutboundEvalConfigSetter. It rejects
-// a configuration it cannot act on, leaving the running one untouched.
-func (s *Service) SetOutboundEvalConfig(config lbA.OutboundEvalConfig) error {
-	if config.OutboundTag == "" {
-		return errors.New("outbound evaluation: outbound under test is required")
-	}
-	config.CountryCode = strings.ToUpper(config.CountryCode)
-	s.config.Store(&config)
-	select {
-	case s.wake <- struct{}{}:
-	default:
-	}
-	return nil
-}
-
 func withDefaults(options option.OutboundEvalServiceOptions) option.OutboundEvalServiceOptions {
 	if options.ControlOutboundTag == "" {
 		options.ControlOutboundTag = defaultControlOutboundTag
@@ -280,6 +252,9 @@ func validateOptions(options option.OutboundEvalServiceOptions) error {
 	}
 	if options.OutboundTag == "" {
 		return errors.New("outbound_tag is required")
+	}
+	if options.Token == "" {
+		return errors.New("token is required")
 	}
 	return nil
 }

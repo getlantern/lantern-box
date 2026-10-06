@@ -21,15 +21,9 @@ const clientExitCount = 1
 const retryBaseWait = 30 * time.Second
 
 var (
-	errNoToken             = errors.New("idle until a token is supplied")
 	errOutboundUnavailable = errors.New("outbound under test is unavailable")
 	errUnattestedReport    = errors.New("report contains an unattested window")
 )
-
-type pendingAssignment struct {
-	token   string
-	request AssignmentRequest
-}
 
 func (s *Service) run() {
 	defer close(s.done)
@@ -40,7 +34,6 @@ func (s *Service) run() {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-s.wake:
 		case <-ticker.C:
 		}
 		var err error
@@ -49,7 +42,7 @@ func (s *Service) run() {
 				break
 			}
 			s.logger.Debug("outbound evaluation will retry: ", err)
-			retries.WaitOn(s.ctx, s.wake)
+			retries.Wait(s.ctx)
 		}
 		if s.ctx.Err() != nil {
 			return
@@ -58,7 +51,7 @@ func (s *Service) run() {
 		interval := time.Duration(s.options.PollInterval)
 		if err != nil {
 			interval = time.Duration(s.options.NoAssignmentInterval)
-			if errors.Is(err, ErrNoAssignment) || errors.Is(err, errNoToken) {
+			if errors.Is(err, ErrNoAssignment) {
 				s.logger.Debug("outbound evaluation: ", err)
 			} else {
 				s.logger.Warn("outbound evaluation refused: ", err)
@@ -72,23 +65,14 @@ func (s *Service) runCycle() error {
 	if err := s.ctx.Err(); err != nil {
 		return err
 	}
-	config := s.config.Load()
-	if config.Token == "" {
-		s.pendingAssignment = nil
-		return errNoToken
-	}
-	if s.pendingAssignment == nil || s.pendingAssignment.token != config.Token ||
-		s.pendingAssignment.request.CountryCode != config.CountryCode {
-		s.pendingAssignment = &pendingAssignment{
-			token: config.Token,
-			request: AssignmentRequest{
-				CountryCode:    config.CountryCode,
-				IdempotencyKey: rand.Text(),
-				ExitCount:      clientExitCount,
-			},
+	if s.pendingAssignment == nil {
+		s.pendingAssignment = &AssignmentRequest{
+			CountryCode:    s.options.CountryCode,
+			IdempotencyKey: rand.Text(),
+			ExitCount:      clientExitCount,
 		}
 	}
-	assignment, err := s.api.acquire(config.Token, s.pendingAssignment.request)
+	assignment, err := s.api.acquire(s.options.Token, *s.pendingAssignment)
 	if !retryableCycleError(err) {
 		s.pendingAssignment = nil
 	}
@@ -101,15 +85,15 @@ func (s *Service) runCycle() error {
 		return fmt.Errorf("validate assignment: %w", err)
 	}
 
-	report, err := s.measureAssignment(config.OutboundTag, assignment)
+	report, err := s.measureAssignment(s.options.OutboundTag, assignment)
 	if err != nil {
 		return err
 	}
-	return s.submitReport(config.Token, report)
+	return s.submitReport(report)
 }
 
 // submitReport refuses reports with unattested windows and retries transient submission failures.
-func (s *Service) submitReport(token string, report Report) error {
+func (s *Service) submitReport(report Report) error {
 	for i, window := range report.Windows {
 		if window.AttestationToken == "" {
 			return fmt.Errorf("%w: window %d", errUnattestedReport, i)
@@ -120,7 +104,7 @@ func (s *Service) submitReport(token string, report Report) error {
 		if err := s.ctx.Err(); err != nil {
 			return err
 		}
-		err = s.api.submit(token, report)
+		err = s.api.submit(s.options.Token, report)
 		if !retryableCycleError(err) {
 			return err
 		}
@@ -132,7 +116,7 @@ func (s *Service) submitReport(token string, report Report) error {
 }
 
 func retryableCycleError(err error) bool {
-	if err == nil || errors.Is(err, ErrNoAssignment) || errors.Is(err, errNoToken) ||
+	if err == nil || errors.Is(err, ErrNoAssignment) ||
 		errors.Is(err, errOutboundUnavailable) || errors.Is(err, ErrInvalidContract) ||
 		errors.Is(err, errUnattestedReport) ||
 		errors.Is(err, context.Canceled) {

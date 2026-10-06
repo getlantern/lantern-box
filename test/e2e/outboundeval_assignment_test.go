@@ -18,13 +18,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	lbA "github.com/getlantern/lantern-box/adapter"
 	lboption "github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/service/outboundeval"
 )
 
 func TestOutboundEvalCreatesAndRemovesAssignmentOutbounds(t *testing.T) {
 	var manager A.OutboundManager
+	started := make(chan struct{})
 	reported := make(chan outboundeval.Report, 1)
 	measured := make(chan struct{}, 2)
 	assignment := outboundeval.Assignment{
@@ -45,6 +45,11 @@ func TestOutboundEvalCreatesAndRemovesAssignmentOutbounds(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/assignments":
+			select {
+			case <-started:
+			case <-r.Context().Done():
+				return
+			}
 			// The standard library would drop the targets' sing-box options.
 			encoded, err := sjson.MarshalContext(ctx, assignment)
 			assert.NoError(t, err)
@@ -78,21 +83,17 @@ func TestOutboundEvalCreatesAndRemovesAssignmentOutbounds(t *testing.T) {
 	options.Certificate = &option.CertificateOptions{
 		Certificate: []string{string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}))},
 	}
-	options.Services[0].Options.(*lboption.OutboundEvalServiceOptions).PollInterval = badoption.Duration(time.Hour)
+	options.Services[0].Options.(*lboption.OutboundEvalServiceOptions).PollInterval = badoption.Duration(time.Second)
 	instance, err := sbox.New(sbox.Options{Context: ctx, Options: options})
 	require.NoError(t, err)
-	require.NoError(t, instance.Start())
-	defer func() { require.NoError(t, instance.Close()) }()
 	manager = service.FromContext[A.OutboundManager](ctx)
 	configuredCandidate, found := manager.Outbound("candidate")
 	require.True(t, found)
 	configuredControl, found := manager.Outbound("direct")
 	require.True(t, found)
-	evaluation, found := service.FromContext[A.ServiceManager](ctx).Get("eval")
-	require.True(t, found)
-	require.NoError(t, evaluation.(lbA.OutboundEvalConfigSetter).SetOutboundEvalConfig(lbA.OutboundEvalConfig{
-		Token: "token", CountryCode: "RU", OutboundTag: "candidate",
-	}))
+	require.NoError(t, instance.Start())
+	close(started)
+	defer func() { require.NoError(t, instance.Close()) }()
 
 	select {
 	case report := <-reported:

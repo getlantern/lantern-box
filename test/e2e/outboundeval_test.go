@@ -13,7 +13,6 @@ import (
 	"time"
 
 	sbox "github.com/sagernet/sing-box"
-	A "github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -24,7 +23,6 @@ import (
 	"github.com/sagernet/sing/common/ntp"
 
 	box "github.com/getlantern/lantern-box"
-	lbA "github.com/getlantern/lantern-box/adapter"
 	"github.com/getlantern/lantern-box/constant"
 	lboption "github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/service/outboundeval"
@@ -233,47 +231,4 @@ func TestOutboundEvalRefusesAConfigWithoutItsTargets(t *testing.T) {
 			_ = instance.Close()
 		})
 	}
-}
-
-// TestOutboundEvalTokenRotatesThroughTheServiceManager exercises the path an
-// embedder uses to replace a credential without restarting the box.
-func TestOutboundEvalTokenRotatesThroughTheServiceManager(t *testing.T) {
-	api := &controlAPI{t: t, reported: make(chan struct{})}
-	server := httptest.NewTLSServer(api)
-	t.Cleanup(server.Close)
-
-	boxCtx := evalBoxContext()
-	options := evalBoxOptions(server.URL, "first-token", bothTargets())
-	options.Certificate = &option.CertificateOptions{
-		Certificate: []string{string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}))},
-	}
-	instance, err := sbox.New(sbox.Options{
-		Context: boxCtx,
-		Options: options,
-	})
-	require.NoError(t, err)
-	require.NoError(t, instance.Start())
-	t.Cleanup(func() { require.NoError(t, instance.Close()) })
-
-	// An embedder reaches the service the same way: the box exposes no service
-	// accessor, but the context it was built with carries the manager.
-	evaluation, found := service.FromContext[A.ServiceManager](boxCtx).Get("eval")
-	require.True(t, found)
-	setter, ok := evaluation.(lbA.OutboundEvalConfigSetter)
-	require.True(t, ok, "the service must be reachable as an OutboundEvalConfigSetter")
-
-	require.NoError(t, setter.SetOutboundEvalConfig(lbA.OutboundEvalConfig{
-		Token: "second-token", CountryCode: "RU", OutboundTag: "candidate",
-	}))
-
-	require.Eventually(t, func() bool {
-		api.mu.Lock()
-		defer api.mu.Unlock()
-		for _, token := range api.tokens {
-			if token == "Bearer second-token" {
-				return true
-			}
-		}
-		return false
-	}, 30*time.Second, 20*time.Millisecond)
 }

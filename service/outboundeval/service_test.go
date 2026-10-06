@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"testing/synctest"
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
@@ -16,7 +15,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	lbA "github.com/getlantern/lantern-box/adapter"
 	"github.com/getlantern/lantern-box/option"
 )
 
@@ -147,12 +145,15 @@ func TestNewServiceValidatesControlURLs(t *testing.T) {
 					options.Token = token
 					endpoint.set(&options, test.url)
 					created, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "eval", options)
-					if test.valid {
-						require.NoError(t, err)
-						require.NoError(t, created.Close())
-					} else {
+					if !test.valid {
 						require.EqualError(t, err, endpoint.name+" must be an absolute HTTPS URL with a hostname")
 						assert.Nil(t, created)
+					} else if token == "" {
+						require.EqualError(t, err, "token is required")
+						assert.Nil(t, created)
+					} else {
+						require.NoError(t, err)
+						require.NoError(t, created.Close())
 					}
 				})
 			}
@@ -218,68 +219,5 @@ func TestCloseIsIdempotentAndPromptWithoutAStart(t *testing.T) {
 	case <-done:
 	case <-time.After(closeGracePeriod):
 		t.Fatal("Close blocked on a cycle that never ran")
-	}
-}
-
-func TestSetOutboundEvalConfigReplacesTheRunningConfig(t *testing.T) {
-	s := newTestService(t, testOptions())
-
-	require.NoError(t, s.SetOutboundEvalConfig(lbA.OutboundEvalConfig{
-		Token: "rotated", CountryCode: "ir", OutboundTag: "replacement",
-	}))
-
-	assert.Equal(t, lbA.OutboundEvalConfig{
-		Token: "rotated", CountryCode: "IR", OutboundTag: "replacement",
-	}, *s.config.Load())
-}
-
-func TestSetOutboundEvalConfigAcceptsNoCredentialYet(t *testing.T) {
-	s := newTestService(t, testOptions())
-
-	require.NoError(t, s.SetOutboundEvalConfig(lbA.OutboundEvalConfig{
-		CountryCode: "RU", OutboundTag: "candidate",
-	}))
-	assert.Empty(t, s.config.Load().Token)
-}
-
-func TestSetOutboundEvalConfigRejectsAConfigWithoutAnOutbound(t *testing.T) {
-	s := newTestService(t, testOptions())
-	before := *s.config.Load()
-
-	assert.Error(t, s.SetOutboundEvalConfig(lbA.OutboundEvalConfig{Token: "t", CountryCode: "RU"}))
-	assert.Equal(t, before, *s.config.Load(), "a rejected configuration leaves the running one alone")
-}
-
-func TestSetOutboundEvalConfigWakesAWaitingCycle(t *testing.T) {
-	for _, backoff := range []bool{false, true} {
-		name := "polling"
-		if backoff {
-			name = "backoff"
-		}
-		t.Run(name, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				var tokens []string
-				s := startTestRunner(t, func(w http.ResponseWriter, r *http.Request) {
-					tokens = append(tokens, r.Header.Get("Authorization"))
-					w.WriteHeader(http.StatusBadGateway)
-				})
-				if backoff {
-					s.wake <- struct{}{}
-				}
-				synctest.Wait()
-				before := len(tokens)
-				if backoff {
-					require.Equal(t, 1, before)
-				} else {
-					require.Zero(t, before)
-				}
-				require.NoError(t, s.SetOutboundEvalConfig(lbA.OutboundEvalConfig{
-					Token: "rotated", CountryCode: "RU", OutboundTag: "candidate",
-				}))
-				synctest.Wait()
-				require.Len(t, tokens, before+1)
-				assert.Equal(t, "Bearer rotated", tokens[before])
-			})
-		})
 	}
 }

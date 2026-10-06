@@ -168,46 +168,13 @@ func TestRunCycleAcquisitionKeys(t *testing.T) {
 			for _, request := range requests {
 				require.NotEmpty(t, request.IdempotencyKey)
 				assert.LessOrEqual(t, len(request.IdempotencyKey), 128)
-				assert.NotEqual(t, s.config.Load().Token, request.IdempotencyKey)
+				assert.NotEqual(t, s.options.Token, request.IdempotencyKey)
 			}
 			if test.reuseKey {
 				assert.Equal(t, requests[0], requests[1])
 			} else {
 				assert.NotEqual(t, requests[0].IdempotencyKey, requests[1].IdempotencyKey)
 			}
-		})
-	}
-}
-
-func TestRunCycleAcquisitionKeyTracksConfig(t *testing.T) {
-	for _, field := range []string{"token", "country", "unchanged"} {
-		t.Run(field, func(t *testing.T) {
-			var requests []AssignmentRequest
-			s := wireRunner(t, testOptions(), func(w http.ResponseWriter, r *http.Request) {
-				var request AssignmentRequest
-				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-				requests = append(requests, request)
-				w.WriteHeader(http.StatusBadGateway)
-			})
-
-			require.Error(t, s.runCycle())
-			config := *s.config.Load()
-			switch field {
-			case "token":
-				config.Token = "rotated-token"
-			case "country":
-				config.CountryCode = "IR"
-			}
-			require.NoError(t, s.SetOutboundEvalConfig(config))
-			require.Error(t, s.runCycle())
-
-			require.Len(t, requests, 2)
-			if field == "unchanged" {
-				assert.Equal(t, requests[0], requests[1])
-			} else {
-				assert.NotEqual(t, requests[0].IdempotencyKey, requests[1].IdempotencyKey)
-			}
-			assert.Equal(t, config.CountryCode, requests[1].CountryCode)
 		})
 	}
 }
@@ -295,18 +262,11 @@ func TestRunCycleKeepsItsCredentialForSubmissionRetries(t *testing.T) {
 		}
 		handler(w, r)
 	})
-	original := *s.config.Load()
-	s.measure = func(ctx context.Context, out A.Outbound, target string) Attempt {
-		updated := original
-		updated.Token = "rotated-token"
-		require.NoError(t, s.SetOutboundEvalConfig(updated))
-		return reachableMeasure(ctx, out, target)
-	}
+	s.measure = reachableMeasure
 
 	require.NoError(t, s.runCycle())
 
-	assert.Equal(t, []string{"Bearer " + original.Token, "Bearer " + original.Token}, authorizations)
-	assert.Equal(t, "rotated-token", s.config.Load().Token)
+	assert.Equal(t, []string{"Bearer " + s.options.Token, "Bearer " + s.options.Token}, authorizations)
 }
 
 func TestRunCycleDoesNotSubmitUnattestedWindows(t *testing.T) {
@@ -408,29 +368,15 @@ func TestRunCycleErrors(t *testing.T) {
 	}
 }
 
-func TestRunCycleWaitsForACredential(t *testing.T) {
-	api := newControlAPI()
-	s := wiredService(t, api.handler(t))
-	s.measure = reachableMeasure
-	idle := *s.config.Load()
-	idle.Token = ""
-	require.NoError(t, s.SetOutboundEvalConfig(idle))
-
-	assert.ErrorIs(t, s.runCycle(), errNoToken)
-	assert.Empty(t, api.reports())
-}
-
 func TestRunCycleSkipsAnOutboundThatWentAway(t *testing.T) {
 	api := newControlAPI()
 	s := wiredService(t, api.handler(t))
 	s.measure = reachableMeasure
-	replaced := *s.config.Load()
-	replaced.OutboundTag = "replacement"
-	require.NoError(t, s.SetOutboundEvalConfig(replaced))
+	delete(s.outbounds.(*stubOutboundManager).outbounds, "candidate")
 
 	err := s.runCycle()
 	assert.ErrorIs(t, err, errOutboundUnavailable)
-	assert.ErrorContains(t, err, "replacement")
+	assert.ErrorContains(t, err, "candidate")
 	assert.Empty(t, api.reports())
 }
 
@@ -488,7 +434,6 @@ func TestRetryableCycleError(t *testing.T) {
 	}{
 		"success":           {},
 		"no assignment":     {err: ErrNoAssignment},
-		"no token":          {err: errNoToken},
 		"missing outbound":  {err: errOutboundUnavailable},
 		"invalid contract":  {err: ErrInvalidContract},
 		"unattested report": {err: errUnattestedReport},
@@ -703,7 +648,7 @@ func TestRunStopsWhileWaiting(t *testing.T) {
 					w.WriteHeader(http.StatusBadGateway)
 				})
 				if retrying {
-					s.wake <- struct{}{}
+					time.Sleep(10 * time.Second)
 				}
 				synctest.Wait()
 				if retrying {

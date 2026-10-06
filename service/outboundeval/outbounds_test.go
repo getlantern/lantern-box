@@ -307,7 +307,7 @@ func TestAssignmentOutboundsCleanUpAfterAttestationFailure(t *testing.T) {
 	report, err := s.measureAssignment("candidate", assignmentWithOutbounds())
 
 	require.NoError(t, err)
-	require.ErrorIs(t, s.submitReport("token", report), errUnattestedReport)
+	require.ErrorIs(t, s.submitReport(report), errUnattestedReport)
 	require.Len(t, manager.created, 2)
 	assertOutboundsClosed(t, manager.created)
 	assert.Len(t, manager.outbounds, 2)

@@ -3,7 +3,7 @@ package option
 import "github.com/sagernet/sing/common/json/badoption"
 
 // OutboundEvalServiceOptions configures the outboundeval service. The three
-// endpoint URLs and OutboundTag are required; every other zero value falls
+// endpoint URLs, Token, and OutboundTag are required; every other zero value falls
 // back to the default documented on the field.
 type OutboundEvalServiceOptions struct {
 	// AcquireURL, AttestURL and SubmitURL must be absolute HTTPS URLs with a hostname.
@@ -11,10 +11,8 @@ type OutboundEvalServiceOptions struct {
 	AttestURL  string `json:"attest_url"`
 	SubmitURL  string `json:"submit_url"`
 
-	// Token authenticates assignment acquisition and report submission.
-	// While it is empty the service idles without measuring anything, so an
-	// embedder that mints tokens at runtime may leave it unset.
-	Token string `json:"token,omitempty"`
+	// Token is required to authenticate assignment acquisition and report submission.
+	Token string `json:"token"`
 
 	// CountryCode is the market under evaluation, which the server expects as
 	// an ISO-3166 alpha-2 code.
@@ -34,7 +32,7 @@ type OutboundEvalServiceOptions struct {
 	ControlOutboundTag string `json:"control_outbound_tag,omitempty"`
 
 	// PollInterval is the wait before the first cycle and after a completed
-	// assignment. Configuration changes interrupt the wait. Default 5m.
+	// assignment. Default 5m.
 	PollInterval badoption.Duration `json:"poll_interval,omitempty"`
 
 	// NoAssignmentInterval is the wait after the server has nothing to measure,
