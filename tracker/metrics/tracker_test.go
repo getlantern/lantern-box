@@ -238,9 +238,18 @@ func TestUntracked(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
-	assert.Equal(t, server, tracker.RoutedConnection(context.Background(), server, adapter.InboundContext{}, nil, nil))
+	// A connection without client info is only wrapped to count its bytes in
+	// the unidentified metrics: it still carries no client info and wraps the
+	// original connection.
+	routed := tracker.RoutedConnection(context.Background(), server, adapter.InboundContext{}, nil, nil)
+	assert.IsType(t, &unidentifiedConn{}, routed)
+	assert.Equal(t, server, routed.(interface{ Upstream() any }).Upstream())
+	_, ok := clientcontext.InfoFromConn(routed)
+	assert.False(t, ok)
 	packetConn := fakePacketConn{}
-	assert.Equal(t, packetConn, tracker.RoutedPacketConnection(context.Background(), packetConn, adapter.InboundContext{}, nil, nil))
+	routedPacket := tracker.RoutedPacketConnection(context.Background(), packetConn, adapter.InboundContext{}, nil, nil)
+	assert.IsType(t, &unidentifiedPacketConn{}, routedPacket)
+	assert.Equal(t, packetConn, routedPacket.(interface{ Upstream() any }).Upstream())
 	assert.Empty(t, exporter.GetSpans(), "no span should be emitted without client info")
 }
 

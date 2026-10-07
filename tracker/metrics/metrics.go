@@ -60,6 +60,11 @@ type metricsManager struct {
 	duration       metric.Int64Histogram
 	sessionGoodput metric.Float64Histogram
 
+	// unidentifiedConns and unidentifiedIO count connections without client
+	// info, and their bytes (see unidentified.go).
+	unidentifiedConns metric.Int64Counter
+	unidentifiedIO    metric.Int64Counter
+
 	// track is the proxy's experiment track (from proxy-info). It is also an
 	// OTEL resource attribute (keyed "proxy.track"), but the metrics pipeline
 	// does not expose resource attrs as queryable labels, so it's re-emitted as
@@ -80,8 +85,12 @@ var metrics = &metricsManager{
 	conns:          &noop.Int64UpDownCounter{},
 	duration:       &noop.Int64Histogram{},
 	sessionGoodput: &noop.Float64Histogram{},
-	countryLookup:  geo.NoLookup{},
-	ispLookup:      geo.NoLookup{},
+
+	unidentifiedConns: &noop.Int64Counter{},
+	unidentifiedIO:    &noop.Int64Counter{},
+
+	countryLookup: geo.NoLookup{},
+	ispLookup:     geo.NoLookup{},
 }
 
 // SetISPLookup makes proxy.io carry client.asn and client.isp, resolved by
@@ -131,6 +140,16 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 		metric.WithExplicitBucketBoundaries(goodputBucketBoundaries...))
 	if err == nil {
 		metrics.sessionGoodput = goodput
+	}
+
+	if c, err := meter.Int64Counter("proxy.unidentified.connections",
+		metric.WithDescription("Connections relayed without client info, which proxy.io and datacap do not see")); err == nil {
+		metrics.unidentifiedConns = c
+	}
+	if c, err := meter.Int64Counter("proxy.unidentified.io",
+		metric.WithUnit("bytes"),
+		metric.WithDescription("Bytes of connections relayed without client info, which proxy.io does not count")); err == nil {
+		metrics.unidentifiedIO = c
 	}
 
 	if countryLookup != nil {
