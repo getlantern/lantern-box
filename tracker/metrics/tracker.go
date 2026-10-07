@@ -110,7 +110,7 @@ func emitDeviceConnectedSpan(ctx context.Context, info clientcontext.ClientInfo)
 func (t *MetricsTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	attrs, ok := connected(ctx, conn, metadata)
 	if !ok {
-		return conn
+		return newUnidentifiedConn(conn, metadata)
 	}
 	return NewConn(conn, attrs, t)
 }
@@ -118,7 +118,7 @@ func (t *MetricsTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 func (t *MetricsTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
 	attrs, ok := connected(ctx, conn, metadata)
 	if !ok {
-		return conn
+		return newUnidentifiedPacketConn(conn, metadata)
 	}
 	return NewPacketConn(conn, attrs, t)
 }
