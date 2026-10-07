@@ -599,6 +599,26 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 	}
 }
 
+func TestSetURLOverrides_MarksPersistedOnlyEntryStale(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	now := time.Now()
+	s.history.Store("a", &adapter.TagHistory{LastSuccessDelayMs: 100, LastOutcomeAt: now, UpdatedAt: now})
+
+	s.SetURLOverrides(map[string]string{"a": "https://override.example/a?token=2"})
+
+	persisted := s.history.Load("a")
+	require.NotNil(t, persisted)
+	assert.True(t, persisted.LastOutcomeAt.IsZero())
+	assert.Equal(t, uint32(100), persisted.LastSuccessDelayMs)
+	assert.Equal(t, now, persisted.UpdatedAt, "the entry keeps its original age")
+
+	s.access.Lock()
+	s.hydrateHistoryLocked("a")
+	jobs := s.collectProbeJobsLocked(time.Now(), nil, false)
+	s.access.Unlock()
+	require.Len(t, jobs, 1, "a hydrated entry is due for a probe of the new URL")
+}
+
 func TestSetURLOverrides_KeepsSelectionOffFailedMember(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	s.urlOverrides = map[string]string{"a": "https://override.example/a?token=1", "b": "https://override.example/b?token=1"}

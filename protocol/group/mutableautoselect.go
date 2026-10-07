@@ -424,15 +424,23 @@ func (s *MutableAutoSelect) SetURLOverrides(overrides map[string]string) {
 	}
 }
 
-// Caller must hold s.access.
+// markProbeStaleLocked also clears a persisted-only entry, which Start or Add
+// would otherwise hydrate as a fresh outcome. Caller must hold s.access.
 func (s *MutableAutoSelect) markProbeStaleLocked(tag string) {
-	h, ok := s.peekHistoryLocked(tag)
-	if !ok {
+	if h, ok := s.peekHistoryLocked(tag); ok {
+		h.clearOutcomeAt()
+		if s.history != nil {
+			s.history.Store(tag, h.toTagHistory(time.Now(), s.hist))
+		}
 		return
 	}
-	h.clearOutcomeAt()
-	if s.history != nil {
-		s.history.Store(tag, h.toTagHistory(time.Now(), s.hist))
+	if s.history == nil {
+		return
+	}
+	// UpdatedAt is kept so the entry still ages out on its original schedule.
+	if snap := s.history.Load(tag); snap != nil && !snap.LastOutcomeAt.IsZero() {
+		snap.LastOutcomeAt = time.Time{}
+		s.history.Store(tag, snap)
 	}
 }
 
