@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"io"
 	"net"
 
 	semconv "github.com/getlantern/semconv"
@@ -53,44 +54,75 @@ func newUnidentifiedIO(metadata adapter.InboundContext) unidentifiedIO {
 	return unidentifiedIO{rx: withDirection(rx), tx: withDirection(tx)}
 }
 
-func (u unidentifiedIO) add(n int, opt metric.AddOption) {
+func (u unidentifiedIO) add(n int64, opt metric.AddOption) {
 	if n > 0 {
-		metrics.unidentifiedIO.Add(context.Background(), int64(n), opt)
+		metrics.unidentifiedIO.Add(context.Background(), n, opt)
 	}
 }
 
+func (u unidentifiedIO) countRx(n int64) { u.add(n, u.rx) }
+func (u unidentifiedIO) countTx(n int64) { u.add(n, u.tx) }
+
 // unidentifiedConn counts the bytes of a connection without client info.
+//
+// It is a sing read/write counter: sing's copy loop unwraps it to the
+// connection beneath (keeping that connection's ReadWaiter, vectorised and
+// splice paths) and reports the bytes it moves through the count functions.
+// Read and Write count only when something reads or writes the wrapper itself,
+// so a byte is counted on one path or the other, never both.
 type unidentifiedConn struct {
 	net.Conn
 	io unidentifiedIO
 }
 
+// newUnidentifiedConn wraps conn, keeping half-close exactly as conn has it:
+// sing-box's connection manager half-closes a destination only if it is itself
+// an N.WriteCloser, so the wrapper must be one precisely when conn is.
 func newUnidentifiedConn(conn net.Conn, metadata adapter.InboundContext) net.Conn {
-	return &unidentifiedConn{Conn: conn, io: newUnidentifiedIO(metadata)}
+	c := &unidentifiedConn{Conn: conn, io: newUnidentifiedIO(metadata)}
+	if wc, ok := conn.(N.WriteCloser); ok {
+		return &unidentifiedDuplexConn{unidentifiedConn: c, closeWriter: wc}
+	}
+	return c
 }
 
 func (c *unidentifiedConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	c.io.add(n, c.io.rx)
+	c.io.countRx(int64(n))
 	return n, err
 }
 
 func (c *unidentifiedConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
-	c.io.add(n, c.io.tx)
+	c.io.countTx(int64(n))
 	return n, err
 }
 
-// Upstream exposes the wrapped connection. There is deliberately no CloseWrite:
-// half-close resolves through Upstream (N.CloseWrite, common.Cast) exactly as
-// it would for the unwrapped connection, so a wrapper never claims a half-close
-// the connection beneath it cannot perform.
+func (c *unidentifiedConn) UnwrapReader() (io.Reader, []N.CountFunc) {
+	return c.Conn, []N.CountFunc{c.io.countRx}
+}
+
+func (c *unidentifiedConn) UnwrapWriter() (io.Writer, []N.CountFunc) {
+	return c.Conn, []N.CountFunc{c.io.countTx}
+}
+
 func (c *unidentifiedConn) Upstream() any {
 	return c.Conn
 }
 
+// unidentifiedDuplexConn is an unidentifiedConn over a connection that can
+// half-close.
+type unidentifiedDuplexConn struct {
+	*unidentifiedConn
+	closeWriter N.WriteCloser
+}
+
+func (c *unidentifiedDuplexConn) CloseWrite() error {
+	return c.closeWriter.CloseWrite()
+}
+
 // unidentifiedPacketConn counts the bytes of a packet connection without
-// client info.
+// client info. Like unidentifiedConn, it is a sing packet read/write counter.
 type unidentifiedPacketConn struct {
 	N.PacketConn
 	io unidentifiedIO
@@ -103,14 +135,22 @@ func newUnidentifiedPacketConn(conn N.PacketConn, metadata adapter.InboundContex
 func (c *unidentifiedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	dest, err := c.PacketConn.ReadPacket(buffer)
 	if err == nil {
-		c.io.add(buffer.Len(), c.io.rx)
+		c.io.countRx(int64(buffer.Len()))
 	}
 	return dest, err
 }
 
 func (c *unidentifiedPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	c.io.add(buffer.Len(), c.io.tx)
+	c.io.countTx(int64(buffer.Len()))
 	return c.PacketConn.WritePacket(buffer, destination)
+}
+
+func (c *unidentifiedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc) {
+	return c.PacketConn, []N.CountFunc{c.io.countRx}
+}
+
+func (c *unidentifiedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc) {
+	return c.PacketConn, []N.CountFunc{c.io.countTx}
 }
 
 func (c *unidentifiedPacketConn) Upstream() any {

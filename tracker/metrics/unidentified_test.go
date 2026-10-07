@@ -6,12 +6,12 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"testing/synctest"
 
 	sdkotel "go.opentelemetry.io/otel"
 
 	"github.com/getlantern/geo"
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing/common"
 	N "github.com/sagernet/sing/common/network"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -98,23 +98,30 @@ func TestUnidentifiedConnectionIsCounted(t *testing.T) {
 // An identified connection is counted in proxy.io as before and never in the
 // unidentified metrics.
 func TestIdentifiedConnectionIsNotCountedAsUnidentified(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	sdkotel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
-	SetupMetricsManager(geo.NoLookup{}, "")
-	tracker := NewTracker(context.Background())
-	defer tracker.Close()
+	// The bubble keeps the tracker's report goroutine from outliving the test,
+	// which would race the next test's SetupMetricsManager over the package's
+	// instruments.
+	synctest.Test(t, func(t *testing.T) {
+		reader := sdkmetric.NewManualReader()
+		sdkotel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+		SetupMetricsManager(geo.NoLookup{}, "")
+		tracker := NewTracker(context.Background())
+		defer tracker.Close()
 
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-	routed := tracker.RoutedConnection(context.Background(), infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
-	exchange(t, client, routed, []byte("request"), []byte("response"))
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		routed := tracker.RoutedConnection(context.Background(), infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
+		exchange(t, client, routed, []byte("request"), []byte("response"))
+		synctest.Wait()
 
-	var rm metricdata.ResourceMetrics
-	require.NoError(t, reader.Collect(context.Background(), &rm))
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, reader.Collect(context.Background(), &rm))
 
-	assert.False(t, hasMetric(rm, "proxy.unidentified.connections"))
-	assert.False(t, hasMetric(rm, "proxy.unidentified.io"))
+		assert.True(t, hasMetric(rm, "proxy.io"), "an identified connection is counted in proxy.io")
+		assert.False(t, hasMetric(rm, "proxy.unidentified.connections"))
+		assert.False(t, hasMetric(rm, "proxy.unidentified.io"))
+	})
 }
 
 // halfCloser records CloseWrite calls on the connection beneath a wrapper.
@@ -128,9 +135,9 @@ func (c *halfCloser) CloseWrite() error {
 	return nil
 }
 
-// Wrapping must not change half-close: a connection that supports it is still
-// reached through the wrapper, and one that does not is not presented as if it
-// did, which would turn a full close at EOF into a no-op half-close.
+// Wrapping must not change half-close as sing-box's connection manager sees
+// it: it half-closes a destination only when the conn itself is an
+// N.WriteCloser, so the wrapper must be one exactly when the wrapped conn is.
 func TestUnidentifiedConnKeepsHalfCloseOfTheWrappedConn(t *testing.T) {
 	tracker := NewTracker(context.Background())
 	defer tracker.Close()
@@ -138,11 +145,54 @@ func TestUnidentifiedConnKeepsHalfCloseOfTheWrappedConn(t *testing.T) {
 	defer server.Close()
 
 	plain := tracker.RoutedConnection(context.Background(), server, adapter.InboundContext{}, nil, nil)
-	_, ok := common.Cast[N.WriteCloser](plain)
+	_, ok := plain.(N.WriteCloser)
 	assert.False(t, ok, "a conn without half-close must not gain one")
 
 	hc := &halfCloser{Conn: server}
 	wrapped := tracker.RoutedConnection(context.Background(), hc, adapter.InboundContext{}, nil, nil)
-	require.NoError(t, N.CloseWrite(wrapped))
+	wc, ok := wrapped.(N.WriteCloser)
+	require.True(t, ok, "a conn with half-close must keep it")
+	require.NoError(t, wc.CloseWrite())
 	assert.Equal(t, 1, hc.closedWrite)
+}
+
+// sing's copy loop unwraps counters to the connection beneath, keeping its
+// fast paths, and counts the bytes it moves through the returned functions.
+func TestUnidentifiedConnUnwrapsForSingCopy(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	sdkotel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	SetupMetricsManager(geo.NoLookup{}, "")
+	tracker := NewTracker(context.Background())
+	defer tracker.Close()
+	_, server := net.Pipe()
+	defer server.Close()
+	hc := &halfCloser{Conn: server}
+
+	routed := tracker.RoutedConnection(context.Background(), hc, adapter.InboundContext{}, nil, nil)
+	r, rxFuncs := N.UnwrapCountReader(routed, nil)
+	w, txFuncs := N.UnwrapCountWriter(routed, nil)
+	assert.Same(t, hc, r)
+	assert.Same(t, hc, w)
+	for _, f := range rxFuncs {
+		f(100)
+	}
+	for _, f := range txFuncs {
+		f(250)
+	}
+
+	packet := tracker.RoutedPacketConnection(context.Background(), fakePacketConn{}, adapter.InboundContext{}, nil, nil)
+	pr, prFuncs := N.UnwrapCountPacketReader(packet, nil)
+	pw, pwFuncs := N.UnwrapCountPacketWriter(packet, nil)
+	assert.Equal(t, fakePacketConn{}, pr)
+	assert.Equal(t, fakePacketConn{}, pw)
+	for _, f := range prFuncs {
+		f(7)
+	}
+	for _, f := range pwFuncs {
+		f(3)
+	}
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	assert.Equal(t, map[string]int64{"receive": 107, "transmit": 253}, sumByDirection(rm, "proxy.unidentified.io"))
 }
