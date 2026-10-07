@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/getlantern/geo"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common/buf"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -195,4 +198,31 @@ func TestUnidentifiedConnUnwrapsForSingCopy(t *testing.T) {
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(context.Background(), &rm))
 	assert.Equal(t, map[string]int64{"receive": 107, "transmit": 253}, sumByDirection(rm, "proxy.unidentified.io"))
+}
+
+// rejectingPacketConn fails every write, releasing the buffer as a writer may.
+type rejectingPacketConn struct{ N.PacketConn }
+
+func (rejectingPacketConn) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
+	buffer.Release()
+	return errors.New("rejected")
+}
+
+// A packet the writer rejects was not relayed, so it is not counted.
+func TestUnidentifiedPacketConnCountsOnlyWrittenPackets(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	sdkotel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	SetupMetricsManager(geo.NoLookup{}, "")
+	tracker := NewTracker(context.Background())
+	defer tracker.Close()
+
+	packet := tracker.RoutedPacketConnection(context.Background(), rejectingPacketConn{}, adapter.InboundContext{}, nil, nil)
+	buffer := buf.New()
+	_, err := buffer.Write([]byte("payload"))
+	require.NoError(t, err)
+	require.Error(t, packet.WritePacket(buffer, M.Socksaddr{}))
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	assert.Zero(t, sumByDirection(rm, "proxy.unidentified.io")["transmit"])
 }

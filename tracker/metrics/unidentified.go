@@ -140,9 +140,15 @@ func (c *unidentifiedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, er
 	return dest, err
 }
 
+// WritePacket counts a packet only once it is written. Its length is read
+// first because the writer may release the buffer.
 func (c *unidentifiedPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	c.io.countTx(int64(buffer.Len()))
-	return c.PacketConn.WritePacket(buffer, destination)
+	n := buffer.Len()
+	if err := c.PacketConn.WritePacket(buffer, destination); err != nil {
+		return err
+	}
+	c.io.countTx(int64(n))
+	return nil
 }
 
 func (c *unidentifiedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc) {
