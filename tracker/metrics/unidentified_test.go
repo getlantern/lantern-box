@@ -11,6 +11,8 @@ import (
 
 	"github.com/getlantern/geo"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common"
+	N "github.com/sagernet/sing/common/network"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
@@ -113,4 +115,34 @@ func TestIdentifiedConnectionIsNotCountedAsUnidentified(t *testing.T) {
 
 	assert.False(t, hasMetric(rm, "proxy.unidentified.connections"))
 	assert.False(t, hasMetric(rm, "proxy.unidentified.io"))
+}
+
+// halfCloser records CloseWrite calls on the connection beneath a wrapper.
+type halfCloser struct {
+	net.Conn
+	closedWrite int
+}
+
+func (c *halfCloser) CloseWrite() error {
+	c.closedWrite++
+	return nil
+}
+
+// Wrapping must not change half-close: a connection that supports it is still
+// reached through the wrapper, and one that does not is not presented as if it
+// did, which would turn a full close at EOF into a no-op half-close.
+func TestUnidentifiedConnKeepsHalfCloseOfTheWrappedConn(t *testing.T) {
+	tracker := NewTracker(context.Background())
+	defer tracker.Close()
+	_, server := net.Pipe()
+	defer server.Close()
+
+	plain := tracker.RoutedConnection(context.Background(), server, adapter.InboundContext{}, nil, nil)
+	_, ok := common.Cast[N.WriteCloser](plain)
+	assert.False(t, ok, "a conn without half-close must not gain one")
+
+	hc := &halfCloser{Conn: server}
+	wrapped := tracker.RoutedConnection(context.Background(), hc, adapter.InboundContext{}, nil, nil)
+	require.NoError(t, N.CloseWrite(wrapped))
+	assert.Equal(t, 1, hc.closedWrite)
 }

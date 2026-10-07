@@ -81,14 +81,10 @@ func (c *unidentifiedConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// CloseWrite forwards half-close, as Conn does.
-func (c *unidentifiedConn) CloseWrite() error {
-	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
-	}
-	return nil
-}
-
+// Upstream exposes the wrapped connection. There is deliberately no CloseWrite:
+// half-close resolves through Upstream (N.CloseWrite, common.Cast) exactly as
+// it would for the unwrapped connection, so a wrapper never claims a half-close
+// the connection beneath it cannot perform.
 func (c *unidentifiedConn) Upstream() any {
 	return c.Conn
 }
