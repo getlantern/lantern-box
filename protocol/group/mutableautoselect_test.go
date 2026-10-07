@@ -554,18 +554,92 @@ func TestAdd_DoesNotDuplicateAlreadyListedTag(t *testing.T) {
 	assert.Equal(t, []string{"a"}, s.All())
 }
 
-func TestSetURLOverrides_RemovingOverrideInvalidatesHistory(t *testing.T) {
+func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
+	tests := []struct {
+		name      string
+		overrides map[string]string
+	}{
+		{"changed", map[string]string{"a": "https://override.example/a?token=2", "b": "https://override.example/b"}},
+		{"removed", map[string]string{"b": "https://override.example/b"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _ := newTestMUR(t, "a", "b")
+			s.urlOverrides = map[string]string{"a": "https://override.example/a?token=1", "b": "https://override.example/b"}
+			recordSuccess(s, "a", 100)
+			recordSuccess(s, "b", 200)
+			s.hist.userFailureDedupeWindow = 0
+			for range s.hist.consecutiveFailLimit {
+				s.recordUserFailure("a", adapter.UserFailureNoResponse)
+			}
+			s.access.Lock()
+			s.historyForLocked("a").startRecoveryGate(time.Now())
+			s.access.Unlock()
+
+			s.SetURLOverrides(tt.overrides)
+
+			h, ok := s.peekHistoryLocked("a")
+			require.True(t, ok, "a changed override keeps the member's history")
+			delay, at, _, uf, gated := h.snapshot(time.Now(), s.hist.userFailureWindow)
+			assert.Equal(t, uint32(100), delay)
+			assert.True(t, at.IsZero(), "the probe outcome is marked stale")
+			assert.Len(t, uf, int(s.hist.consecutiveFailLimit))
+			assert.True(t, gated)
+			persisted := s.history.Load("a")
+			require.NotNil(t, persisted)
+			assert.True(t, persisted.HardDemoted)
+			assert.True(t, persisted.LastOutcomeAt.IsZero())
+
+			s.access.Lock()
+			jobs := s.collectProbeJobsLocked(time.Now(), nil, false)
+			s.access.Unlock()
+			require.Len(t, jobs, 1, "only the changed member is due for a freshness-filtered probe")
+			assert.Equal(t, "a", jobs[0].outbound.Tag())
+		})
+	}
+}
+
+func TestSetURLOverrides_MarksPersistedOnlyEntryStale(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	now := time.Now()
+	s.history.Store("a", &adapter.TagHistory{LastSuccessDelayMs: 100, LastOutcomeAt: now, UpdatedAt: now})
+
+	s.SetURLOverrides(map[string]string{"a": "https://override.example/a?token=2"})
+
+	persisted := s.history.Load("a")
+	require.NotNil(t, persisted)
+	assert.True(t, persisted.LastOutcomeAt.IsZero())
+	assert.Equal(t, uint32(100), persisted.LastSuccessDelayMs)
+	assert.Equal(t, now, persisted.UpdatedAt, "the entry keeps its original age")
+
+	s.access.Lock()
+	s.hydrateHistoryLocked("a")
+	jobs := s.collectProbeJobsLocked(time.Now(), nil, false)
+	s.access.Unlock()
+	require.Len(t, jobs, 1, "a hydrated entry is due for a probe of the new URL")
+}
+
+func TestSetURLOverrides_KeepsSelectionOffFailedMember(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
-	s.urlOverrides = map[string]string{"a": "https://override.example/a"}
+	s.urlOverrides = map[string]string{"a": "https://override.example/a?token=1", "b": "https://override.example/b?token=1"}
 	recordSuccess(s, "a", 100)
 	recordSuccess(s, "b", 200)
+	s.hist.userFailureDedupeWindow = 0
+	for range s.hist.consecutiveFailLimit {
+		s.recordUserFailure("a", adapter.UserFailureNoResponse)
+	}
+	o, err := s.selectFor("tcp")
+	require.NoError(t, err)
+	require.Equal(t, "b", o.Tag())
 
-	s.SetURLOverrides(map[string]string{})
+	s.SetURLOverrides(map[string]string{"a": "https://override.example/a?token=2", "b": "https://override.example/b?token=2"})
+	// The refresh's re-probe passes even though a's user traffic fails.
+	s.recordProbeOutcome("a", true, 10)
+	s.recordProbeOutcome("b", true, 500)
 
-	_, aPresent := s.histories["a"]
-	assert.False(t, aPresent, "history for 'a' should be cleared when its override is removed")
-	_, bPresent := s.histories["b"]
-	assert.True(t, bPresent, "history for 'b' should be preserved (no override change)")
+	o, err = s.selectFor("tcp")
+	require.NoError(t, err)
+	assert.Equal(t, "b", o.Tag(), "a config refresh must not restore a hard-demoted member")
 }
 
 func TestRank_ExcludesEntriesBeforeCycleStart(t *testing.T) {
@@ -1407,14 +1481,6 @@ func (echoConn) RemoteAddr() net.Addr             { return nil }
 func (echoConn) SetDeadline(time.Time) error      { return nil }
 func (echoConn) SetReadDeadline(time.Time) error  { return nil }
 func (echoConn) SetWriteDeadline(time.Time) error { return nil }
-
-func TestSetURLOverrides_ClearsPersistedEntryOnChange(t *testing.T) {
-	s, _ := newTestMUR(t, "a")
-	s.recordProbeOutcome("a", true, 100)
-	require.NotNil(t, s.history.Load("a"))
-	s.SetURLOverrides(map[string]string{"a": "https://override.example/a"})
-	assert.Nil(t, s.history.Load("a"))
-}
 
 func TestExhaustionSignal_FiresOnFullLadderFailure(t *testing.T) {
 	// seedPriorSuccess leaves lastSuccessDelayMs set so the cycle's own
