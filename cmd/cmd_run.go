@@ -16,10 +16,8 @@ import (
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
-	"github.com/sagernet/sing/service"
 	"github.com/spf13/cobra"
 
-	"github.com/getlantern/lantern-box/adapter"
 	lbotel "github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
@@ -31,6 +29,8 @@ func init() {
 	runCmd.Flags().String("config", "config.json", "Configuration file path")
 	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz", "URL for downloading GeoLite2-City database")
 	runCmd.Flags().String("city-database-name", "GeoLite2-City.mmdb", "Filename for storing GeoLite2-City database")
+	runCmd.Flags().String("geo-isp-url", "https://lanterngeo.lantern.io/GeoIP2-ISP.mmdb.tar.gz", "URL for downloading the GeoIP2-ISP database that tags proxy.io with client.asn and client.isp; empty disables the tags")
+	runCmd.Flags().String("isp-database-name", "GeoIP2-ISP.mmdb", "Filename for storing the GeoIP2-ISP database")
 	runCmd.Flags().String("datacap-url", "", "Datacap server URL")
 	runCmd.Flags().String("proxy-info", "", "Path to proxy info INI file")
 }
@@ -83,12 +83,13 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		Inbound:  []string{""},
 		Outbound: []string{""},
 	}, log.StdLogger())
+	// Register Manager before trackers that call clientcontext.InfoFromConn,
+	// because it wraps the connection they inspect.
 	instance.Router().AppendTracker(clientCtxMgr)
-	service.MustRegister[adapter.ClientContextManager](ctx, clientCtxMgr)
 
 	if lbotel.Enabled() {
 		metricsTracker := metrics.NewTracker(ctx)
-		clientCtxMgr.AppendTracker(metricsTracker)
+		instance.Router().AppendTracker(metricsTracker)
 		log.Info("Metric Tracking Enabled")
 	}
 
@@ -108,7 +109,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 			cancel()
 			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
 		}
-		clientCtxMgr.AppendTracker(datacapTracker)
+		instance.Router().AppendTracker(datacapTracker)
 	}
 
 	osSignals := make(chan os.Signal, 1)

@@ -18,6 +18,8 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
+
+	lAdapter "github.com/getlantern/lantern-box/adapter"
 )
 
 // use Chrome's user agent to avoid being blocked by some servers, and to make
@@ -99,7 +101,7 @@ func Measure(ctx context.Context, out A.Outbound, probeURL string, timeout time.
 		return result, fmt.Errorf("%w: no host or port in probe URL %q", ErrUnusableInput, probeURL)
 	}
 
-	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	probeCtx, cancel := context.WithTimeout(lAdapter.ContextWithProbe(ctx), timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)

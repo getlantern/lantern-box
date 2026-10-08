@@ -1,5 +1,3 @@
-//go:build goexperiment.synctest
-
 package metrics
 
 import (
@@ -14,6 +12,7 @@ import (
 
 	"github.com/getlantern/geo"
 	"github.com/sagernet/sing-box/adapter"
+	N "github.com/sagernet/sing/common/network"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -25,8 +24,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// infoConn stages a ClientInfo on a connection so clientcontext.InfoFromConn
+// resolves it, standing in for a Manager-wrapped conn.
+type infoConn struct {
+	net.Conn
+	info clientcontext.ClientInfo
+}
+
+func (c infoConn) ClientInfo() (clientcontext.ClientInfo, bool) { return c.info, true }
+
+// infoPacketConn is the packet-conn counterpart of infoConn.
+type infoPacketConn struct {
+	N.PacketConn
+	info clientcontext.ClientInfo
+}
+
+func (c infoPacketConn) ClientInfo() (clientcontext.ClientInfo, bool) { return c.info, true }
+
+// testInfo is the client info staged on connections that tests expect tracked.
+var testInfo = clientcontext.ClientInfo{DeviceID: "test-device", Platform: "linux"}
+
 func TestTracker(t *testing.T) {
-	synctest.Run(func() {
+	synctest.Test(t, func(t *testing.T) {
 		reader := metric.NewManualReader()
 		provider := metric.NewMeterProvider(metric.WithReader(reader))
 		sdkotel.SetMeterProvider(provider)
@@ -41,7 +60,7 @@ func TestTracker(t *testing.T) {
 		defer client.Close()
 		defer server.Close()
 
-		serverTracked := metricsTracker.RoutedConnection(ctx, server, adapter.InboundContext{}, nil, nil)
+		serverTracked := metricsTracker.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
 
 		clientSentMessage := []byte("A client sent a short request...")
 		serverReceive := 0
@@ -85,7 +104,7 @@ func TestTracker(t *testing.T) {
 }
 
 func TestTrackerWithClientInfo(t *testing.T) {
-	synctest.Run(func() {
+	synctest.Test(t, func(t *testing.T) {
 		reader := metric.NewManualReader()
 		provider := metric.NewMeterProvider(metric.WithReader(reader))
 		sdkotel.SetMeterProvider(provider)
@@ -98,10 +117,7 @@ func TestTrackerWithClientInfo(t *testing.T) {
 			IsPro:    true,
 			Version:  "7.0",
 		}
-		ctx := clientcontext.ContextWithClientInfo(
-			context.Background(), info,
-		)
-		tracker := NewTracker(ctx)
+		tracker := NewTracker(context.Background())
 		defer tracker.Close()
 
 		client, server := net.Pipe()
@@ -109,7 +125,7 @@ func TestTrackerWithClientInfo(t *testing.T) {
 		defer server.Close()
 
 		tracked := tracker.RoutedConnection(
-			ctx, server, adapter.InboundContext{}, nil, nil,
+			context.Background(), infoConn{Conn: server, info: info}, adapter.InboundContext{}, nil, nil,
 		)
 
 		// Exchange some bytes so proxy.io fires.
@@ -125,7 +141,7 @@ func TestTrackerWithClientInfo(t *testing.T) {
 		synctest.Wait()
 
 		var rm metricdata.ResourceMetrics
-		reader.Collect(ctx, &rm)
+		reader.Collect(context.Background(), &rm)
 
 		// All metrics carry low-cardinality client attrs.
 		for _, name := range []string{
@@ -171,17 +187,14 @@ func TestDeviceConnectedSpan(t *testing.T) {
 		sdkotel.SetTracerProvider(prevTP)
 	})
 
-	ctx := clientcontext.ContextWithClientInfo(
-		context.Background(),
-		clientcontext.ClientInfo{
-			DeviceID:    "test-device-123",
-			Platform:    "android",
-			IsPro:       true,
-			CountryCode: "CA",
-			Version:     "10.0",
-		},
-	)
-	emitDeviceConnectedSpan(ctx)
+	info := clientcontext.ClientInfo{
+		DeviceID:    "test-device-123",
+		Platform:    "android",
+		IsPro:       true,
+		CountryCode: "CA",
+		Version:     "10.0",
+	}
+	emitDeviceConnectedSpan(context.Background(), info)
 
 	spans := exporter.GetSpans()
 	var deviceSpan *tracetest.SpanStub
@@ -205,7 +218,9 @@ func TestDeviceConnectedSpan(t *testing.T) {
 	assert.Equal(t, "10.0", attrs["client.version"])
 }
 
-func TestDeviceConnectedSpanNoClientInfo(t *testing.T) {
+// Connections without client info are not tracked, so neither metrics nor the
+// device span are recorded for them.
+func TestUntracked(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithSyncer(exporter),
@@ -217,9 +232,25 @@ func TestDeviceConnectedSpanNoClientInfo(t *testing.T) {
 		sdkotel.SetTracerProvider(prevTP)
 	})
 
-	emitDeviceConnectedSpan(context.Background())
-	assert.Empty(t, exporter.GetSpans(),
-		"no span should be emitted without client info")
+	tracker := NewTracker(context.Background())
+	defer tracker.Close()
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	// A connection without client info is only wrapped to count its bytes in
+	// the unidentified metrics: it still carries no client info and wraps the
+	// original connection.
+	routed := tracker.RoutedConnection(context.Background(), server, adapter.InboundContext{}, nil, nil)
+	assert.IsType(t, &unidentifiedConn{}, routed)
+	assert.Equal(t, server, routed.(interface{ Upstream() any }).Upstream())
+	_, ok := clientcontext.InfoFromConn(routed)
+	assert.False(t, ok)
+	packetConn := fakePacketConn{}
+	routedPacket := tracker.RoutedPacketConnection(context.Background(), packetConn, adapter.InboundContext{}, nil, nil)
+	assert.IsType(t, &unidentifiedPacketConn{}, routedPacket)
+	assert.Equal(t, packetConn, routedPacket.(interface{ Upstream() any }).Upstream())
+	assert.Empty(t, exporter.GetSpans(), "no span should be emitted without client info")
 }
 
 // TestSessionGoodput verifies the per-session download goodput histogram is
@@ -228,7 +259,7 @@ func TestDeviceConnectedSpanNoClientInfo(t *testing.T) {
 // attributes it filters/groups by: network.io.direction='receive', the bare
 // "track" key (NOT the "proxy.track" resource attr), and geo.country.iso_code.
 func TestSessionGoodput(t *testing.T) {
-	synctest.Run(func() {
+	synctest.Test(t, func(t *testing.T) {
 		reader := metric.NewManualReader()
 		provider := metric.NewMeterProvider(metric.WithReader(reader))
 		sdkotel.SetMeterProvider(provider)
@@ -242,7 +273,7 @@ func TestSessionGoodput(t *testing.T) {
 		client, server := net.Pipe()
 		defer client.Close()
 		defer server.Close()
-		serverTracked := mt.RoutedConnection(ctx, server, adapter.InboundContext{}, nil, nil)
+		serverTracked := mt.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
 
 		const n = 1_100_000
 		done := make(chan int, 1)
@@ -298,7 +329,7 @@ func TestSessionGoodput(t *testing.T) {
 // nothing, which is what blinded the evaluator's goodput axis for the sing-box
 // protocol fleet.
 func TestSessionGoodputSmallSession(t *testing.T) {
-	synctest.Run(func() {
+	synctest.Test(t, func(t *testing.T) {
 		reader := metric.NewManualReader()
 		provider := metric.NewMeterProvider(metric.WithReader(reader))
 		sdkotel.SetMeterProvider(provider)
@@ -312,7 +343,7 @@ func TestSessionGoodputSmallSession(t *testing.T) {
 		client, server := net.Pipe()
 		defer client.Close()
 		defer server.Close()
-		serverTracked := mt.RoutedConnection(ctx, server, adapter.InboundContext{}, nil, nil)
+		serverTracked := mt.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
 
 		const n = 20_000 // well under the removed 1 MB floor
 		done := make(chan int, 1)
@@ -352,7 +383,7 @@ func TestSessionGoodputSmallSession(t *testing.T) {
 // TestSessionGoodputZeroBytes verifies the rxBytes > 0 guard: a session that
 // received no bytes records nothing even though it was open for a while.
 func TestSessionGoodputZeroBytes(t *testing.T) {
-	synctest.Run(func() {
+	synctest.Test(t, func(t *testing.T) {
 		reader := metric.NewManualReader()
 		provider := metric.NewMeterProvider(metric.WithReader(reader))
 		sdkotel.SetMeterProvider(provider)
@@ -366,7 +397,7 @@ func TestSessionGoodputZeroBytes(t *testing.T) {
 		client, server := net.Pipe()
 		defer client.Close()
 		defer server.Close()
-		serverTracked := mt.RoutedConnection(ctx, server, adapter.InboundContext{}, nil, nil)
+		serverTracked := mt.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
 
 		// No bytes received; only elapse time so the duration is non-zero.
 		time.Sleep(time.Second)

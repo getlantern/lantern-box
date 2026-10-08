@@ -68,14 +68,8 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 }
 
 func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
-	info, ok := clientcontext.ClientInfoFromContext(ctx)
+	info, ok := t.capped(conn)
 	if !ok {
-		// conn is not from a clientcontext-aware client (e.g., not radiance)
-		t.logger.Debug("skipping datacap: no client info in context")
-		return conn
-	}
-	if info.IsPro {
-		t.logger.Debug("skipping datacap: client is pro ", info.DeviceID)
 		return conn
 	}
 	category := ""
@@ -92,15 +86,10 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 		Throttler:       t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
 }
+
 func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
-	info, ok := clientcontext.ClientInfoFromContext(ctx)
+	info, ok := t.capped(conn)
 	if !ok {
-		// conn is not from a clientcontext-aware client (e.g., not radiance)
-		t.logger.Debug("skipping datacap: no client info in context")
-		return conn
-	}
-	if info.IsPro {
-		t.logger.Debug("skipping datacap: client is pro ", info.DeviceID)
 		return conn
 	}
 	return NewPacketConn(PacketConnConfig{
@@ -112,4 +101,22 @@ func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 		ReportInterval:    t.reportInterval,
 		Throttler:         t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
+}
+
+// capped returns the client info of conn if its usage counts against a data
+// cap: it comes from an identified free user.
+func (t *DatacapTracker) capped(conn any) (clientcontext.ClientInfo, bool) {
+	info, ok := clientcontext.InfoFromConn(conn)
+	switch {
+	case !ok:
+		// conn is not from a clientcontext-aware client (e.g., not radiance)
+		t.logger.Debug("skipping datacap: no client info on conn")
+	case info.DeviceID == "":
+		t.logger.Debug("skipping datacap: client info has no device ID")
+	case info.IsPro:
+		t.logger.Debug("skipping datacap: client is pro ", info.DeviceID)
+	default:
+		return info, true
+	}
+	return clientcontext.ClientInfo{}, false
 }

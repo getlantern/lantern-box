@@ -1,6 +1,6 @@
 module github.com/getlantern/lantern-box
 
-go 1.26.0
+go 1.26.2
 
 // replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.18-lantern
 

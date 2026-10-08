@@ -16,6 +16,8 @@ const (
 	defaultDataPlaneIdle            = 60 * time.Second
 	defaultDataPlaneProvedReadBytes = 4096
 	defaultMaxPersistedAge          = 15 * time.Minute
+	// Recovery requires a successful probe after this duration, not just elapsed time.
+	recoveryGateMinDuration = 5 * time.Minute
 	// switchPenaltyAltFactor is the ratio at which the best alternative
 	// is considered "much slower" than the candidate under evaluation.
 	// When best_alt_delay > self_delay * this factor, the demote rule
@@ -60,6 +62,8 @@ type localHistory struct {
 	lastOutcomeAt       time.Time
 	consecutiveFailures uint32
 	userFailures        []adapter.UserFailure
+	// In-memory only; zero means no recovery gate.
+	recoveryGateStartedAt time.Time
 }
 
 func newLocalHistory() *localHistory { return &localHistory{} }
@@ -71,6 +75,12 @@ func (h *localHistory) outcomeAt() time.Time {
 	return h.lastOutcomeAt
 }
 
+func (h *localHistory) clearOutcomeAt() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lastOutcomeAt = time.Time{}
+}
+
 // recordProbeSuccess updates the probe scalars on a successful probe.
 // delayMs has already been clamped to ≥1 ms by the caller so the
 // "no measurement" sentinel (0) stays unambiguous.
@@ -80,6 +90,9 @@ func (h *localHistory) recordProbeSuccess(delayMs uint32, now time.Time) {
 	h.lastSuccessDelayMs = delayMs
 	h.lastOutcomeAt = now
 	h.consecutiveFailures = 0
+	if !h.recoveryGateStartedAt.IsZero() && now.Sub(h.recoveryGateStartedAt) >= recoveryGateMinDuration {
+		h.recoveryGateStartedAt = time.Time{}
+	}
 }
 
 // recordProbeFailure increments the consecutive-failure counter and
@@ -90,6 +103,12 @@ func (h *localHistory) recordProbeFailure(now time.Time) {
 	defer h.mu.Unlock()
 	h.consecutiveFailures++
 	h.lastOutcomeAt = now
+}
+
+func (h *localHistory) startRecoveryGate(now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.recoveryGateStartedAt = now
 }
 
 // addUserFailure appends the failure and prunes entries older than window
@@ -126,13 +145,14 @@ func (h *localHistory) userFailureCount(now time.Time, window time.Duration) uin
 	return uint32(len(h.userFailures))
 }
 
-func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay uint32, lastAt time.Time, consec uint32, userFails []adapter.UserFailure) {
+func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay uint32, lastAt time.Time, consec uint32, userFails []adapter.UserFailure, gated bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.userFailures = pruneUserFailures(h.userFailures, now, window)
 	lastDelay = h.lastSuccessDelayMs
 	lastAt = h.lastOutcomeAt
 	consec = h.consecutiveFailures
+	gated = !h.recoveryGateStartedAt.IsZero()
 	if len(h.userFailures) > 0 {
 		userFails = make([]adapter.UserFailure, len(h.userFailures))
 		copy(userFails, h.userFailures)

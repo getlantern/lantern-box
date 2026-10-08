@@ -37,6 +37,11 @@ const (
 	maxRequestBytes     = 8 << 10
 	callbackTimeout     = 10 * time.Second
 	bodyPoolSize        = 1 << 20
+	// maxWriteChunk bounds each Write of the probe response; see writeAsync.
+	// It sits well under the smallest per-Write frame limit we know of
+	// (shadowsocks 2022: 64 KiB - 1, less its framing overhead), and at the
+	// size of a TLS record, so no inbound has to split it.
+	maxWriteChunk = 16 * 1024
 )
 
 func RegisterOutbound(registry *outbound.Registry) {

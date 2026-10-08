@@ -301,7 +301,18 @@ func (r *responder) writeAsync(ctx context.Context, conn net.Conn, payload []byt
 				written <- writeResult{err: err, done: time.Now()}
 			}
 		}()
-		_, err := conn.Write(payload)
+		var err error
+		// Some inbounds frame each Write as a single protocol chunk and panic
+		// instead of splitting one larger than their maximum (shadowsocks 2022
+		// caps a chunk at 64 KiB - 1, less than the header plus the body).
+		for len(payload) > 0 && err == nil {
+			var n int
+			n, err = conn.Write(payload[:min(len(payload), maxWriteChunk)])
+			if n == 0 && err == nil {
+				err = io.ErrShortWrite
+			}
+			payload = payload[n:]
+		}
 		written <- writeResult{err: err, done: time.Now()}
 	}()
 	return written

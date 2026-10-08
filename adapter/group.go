@@ -56,6 +56,12 @@ func (c *TaggedConn) Tag() string {
 	return c.outboundTag
 }
 
+// Upstream exposes the wrapped conn to common.Cast, so lookups such as the
+// router's pending-handshake check see through the tag.
+func (c *TaggedConn) Upstream() any {
+	return c.Conn
+}
+
 // TaggedPacketConn is a net.PacketConn tagged with the outbound tag used to create it.
 //
 // It implements N.NetPacketConn so packets written to a domain-name destination

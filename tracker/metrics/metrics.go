@@ -43,6 +43,14 @@ var goodputBucketBoundaries = []float64{
 type countryLookupRequest struct {
 	ip      net.IP
 	country *atomic.Value
+	network *atomic.Pointer[clientNetwork]
+}
+
+// clientNetwork is the client's ASN and ISP, published together so a reader
+// never sees one without the other.
+type clientNetwork struct {
+	asn string
+	isp string
 }
 
 type metricsManager struct {
@@ -51,6 +59,11 @@ type metricsManager struct {
 	conns          metric.Int64UpDownCounter
 	duration       metric.Int64Histogram
 	sessionGoodput metric.Float64Histogram
+
+	// unidentifiedConns and unidentifiedIO count connections without client
+	// info, and their bytes (see unidentified.go).
+	unidentifiedConns metric.Int64Counter
+	unidentifiedIO    metric.Int64Counter
 
 	// track is the proxy's experiment track (from proxy-info). It is also an
 	// OTEL resource attribute (keyed "proxy.track"), but the metrics pipeline
@@ -61,6 +74,10 @@ type metricsManager struct {
 
 	countryLookup  geo.CountryLookup
 	countryLookupC chan countryLookupRequest
+
+	// ispLookup resolves the client's ASN and ISP for proxy.io only. It is a
+	// NoLookup unless SetISPLookup installs one before SetupMetricsManager.
+	ispLookup geo.ISPLookup
 }
 
 var metrics = &metricsManager{
@@ -68,7 +85,25 @@ var metrics = &metricsManager{
 	conns:          &noop.Int64UpDownCounter{},
 	duration:       &noop.Int64Histogram{},
 	sessionGoodput: &noop.Float64Histogram{},
-	countryLookup:  geo.NoLookup{},
+
+	unidentifiedConns: &noop.Int64Counter{},
+	unidentifiedIO:    &noop.Int64Counter{},
+
+	countryLookup: geo.NoLookup{},
+	ispLookup:     geo.NoLookup{},
+}
+
+// SetISPLookup makes proxy.io carry client.asn and client.isp, resolved by
+// lookup alongside the country. It must be called before SetupMetricsManager,
+// which starts the workers that use it.
+//
+// Only proxy.io gets them: every distinct ASN multiplies a series, and the
+// connection, duration and goodput metrics (the goodput histogram has a
+// series per bucket) don't need the split.
+func SetISPLookup(lookup geo.ISPLookup) {
+	if lookup != nil {
+		metrics.ispLookup = lookup
+	}
 }
 
 func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
@@ -107,21 +142,35 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 		metrics.sessionGoodput = goodput
 	}
 
+	if c, err := meter.Int64Counter("proxy.unidentified.connections",
+		metric.WithDescription("Connections relayed without client info, which proxy.io and datacap do not see")); err == nil {
+		metrics.unidentifiedConns = c
+	}
+	if c, err := meter.Int64Counter("proxy.unidentified.io",
+		metric.WithUnit("bytes"),
+		metric.WithDescription("Bytes of connections relayed without client info, which proxy.io does not count")); err == nil {
+		metrics.unidentifiedIO = c
+	}
+
 	if countryLookup != nil {
 		metrics.countryLookup = countryLookup
 	}
 	if _, ok := countryLookup.(geo.NoLookup); !ok {
 		metrics.countryLookupC = make(chan countryLookupRequest, 256)
 		for range countryLookupWorkers {
-			go countryLookupWorker(metrics.countryLookupC, metrics.countryLookup)
+			go countryLookupWorker(metrics.countryLookupC, metrics.countryLookup, metrics.ispLookup)
 		}
 	}
 
 	metrics.meter = meter
 }
 
-func countryLookupWorker(ch <-chan countryLookupRequest, lookup geo.CountryLookup) {
+func countryLookupWorker(ch <-chan countryLookupRequest, lookup geo.CountryLookup, ispLookup geo.ISPLookup) {
+	_, noISP := ispLookup.(geo.NoLookup)
 	for req := range ch {
 		req.country.Store(lookup.CountryCode(req.ip))
+		if !noISP {
+			req.network.Store(&clientNetwork{asn: ispLookup.ASN(req.ip), isp: ispLookup.ISP(req.ip)})
+		}
 	}
 }

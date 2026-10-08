@@ -53,6 +53,10 @@ const defaultProbeConcurrency = 6
 // Internal probes always force a fresh probe.
 const probeFreshnessWindow = 30 * time.Second
 
+// confirmedFailureSwitchCooldown limits switches after confirmed failures,
+// except when the member selected by the last such switch also fails confirmation.
+const confirmedFailureSwitchCooldown = time.Minute
+
 // MutableAutoSelect is the client-side server-selection group.
 type MutableAutoSelect struct {
 	outbound.Adapter
@@ -88,9 +92,8 @@ type MutableAutoSelect struct {
 		udp atomic.Value // string; "" when unset
 	}
 
-	// probeMu serializes all probeAll runs so outcomes can't interleave and
-	// the worker bound is global. Fire-and-forget callers TryLock; callers
-	// that need a deterministic result Lock.
+	// probeMu serializes batch probes. Targeted failure confirmations run
+	// independently. Fire-and-forget batches TryLock; other batches Lock.
 	probeMu   sync.Mutex
 	laddering atomic.Bool
 	// Unix-nano of the most recent runLadder completion. Read by the
@@ -98,6 +101,15 @@ type MutableAutoSelect struct {
 	// stalls or dial errors arrive in quick succession.
 	lastLadderAt atomic.Int64
 	exhaustionCh chan struct{}
+
+	// pendingFailureConfirmations holds tags with a targeted confirmation
+	// probe in flight.
+	pendingFailureConfirmations isync.TypedMap[string, struct{}]
+	// Guarded by access.
+	lastConfirmedFailureSwitch struct {
+		at          time.Time
+		selectedTag string
+	}
 
 	// externalProbeMu drops overlapping Add / CheckOutbounds probes; probeMu
 	// also makes them drop during an internal cycle.
@@ -116,32 +128,34 @@ type MutableAutoSelect struct {
 }
 
 type mutableAutoSelectConfig struct {
-	switchTolerance     time.Duration
-	activeInterval      time.Duration
-	idleInterval        time.Duration
-	idleThreshold       time.Duration
-	ladderTotalBudget   time.Duration
-	ladderCooldown      time.Duration
-	dataPlaneIdle       time.Duration
-	dataPlaneProvedRead uint64
-	demoteOnlySelected  bool
-	maxPersistedAge     time.Duration
-	probeConcurrency    int
+	switchTolerance               time.Duration
+	activeInterval                time.Duration
+	idleInterval                  time.Duration
+	idleThreshold                 time.Duration
+	ladderTotalBudget             time.Duration
+	ladderCooldown                time.Duration
+	dataPlaneIdle                 time.Duration
+	dataPlaneFirstResponseTimeout time.Duration
+	dataPlaneProvedRead           uint64
+	demoteOnlySelected            bool
+	maxPersistedAge               time.Duration
+	probeConcurrency              int
 }
 
 func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) (mutableAutoSelectConfig, historyParams) {
 	cfg := mutableAutoSelectConfig{
-		switchTolerance:     time.Duration(o.SwitchToleranceMs) * time.Millisecond,
-		activeInterval:      time.Duration(o.BackgroundIntervalSeconds) * time.Second,
-		idleInterval:        time.Duration(o.IdleIntervalSeconds) * time.Second,
-		idleThreshold:       time.Duration(o.IdleThresholdSeconds) * time.Second,
-		ladderTotalBudget:   time.Duration(o.LadderTotalBudgetSeconds) * time.Second,
-		ladderCooldown:      time.Duration(o.LadderCooldownSeconds) * time.Second,
-		dataPlaneIdle:       time.Duration(o.DataPlaneIdleSeconds) * time.Second,
-		dataPlaneProvedRead: uint64(o.DataPlaneProvedReadBytes),
-		demoteOnlySelected:  o.DemoteOnlySelectedTag == nil || *o.DemoteOnlySelectedTag,
-		maxPersistedAge:     time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
-		probeConcurrency:    int(o.ProbeConcurrency),
+		switchTolerance:               time.Duration(o.SwitchToleranceMs) * time.Millisecond,
+		activeInterval:                time.Duration(o.BackgroundIntervalSeconds) * time.Second,
+		idleInterval:                  time.Duration(o.IdleIntervalSeconds) * time.Second,
+		idleThreshold:                 time.Duration(o.IdleThresholdSeconds) * time.Second,
+		ladderTotalBudget:             time.Duration(o.LadderTotalBudgetSeconds) * time.Second,
+		ladderCooldown:                time.Duration(o.LadderCooldownSeconds) * time.Second,
+		dataPlaneIdle:                 time.Duration(o.DataPlaneIdleSeconds) * time.Second,
+		dataPlaneFirstResponseTimeout: defaultFirstResponseTimeout,
+		dataPlaneProvedRead:           uint64(o.DataPlaneProvedReadBytes),
+		demoteOnlySelected:            o.DemoteOnlySelectedTag == nil || *o.DemoteOnlySelectedTag,
+		maxPersistedAge:               time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
+		probeConcurrency:              int(o.ProbeConcurrency),
 	}
 	if cfg.switchTolerance == 0 {
 		cfg.switchTolerance = 200 * time.Millisecond
@@ -391,9 +405,8 @@ func (s *MutableAutoSelect) Remove(tags ...string) (n int, err error) {
 	return
 }
 
-// SetURLOverrides replaces the per-member callback URL map. Members whose
-// override changed (including removals) get their history dropped so the
-// next probe cycle re-tests against the new URL.
+// SetURLOverrides replaces per-member callback URL overrides.
+// Changed or removed overrides keep history and mark probe results stale.
 func (s *MutableAutoSelect) SetURLOverrides(overrides map[string]string) {
 	s.access.Lock()
 	defer s.access.Unlock()
@@ -401,21 +414,33 @@ func (s *MutableAutoSelect) SetURLOverrides(overrides map[string]string) {
 	s.urlOverrides = maps.Clone(overrides)
 	for tag, v := range s.urlOverrides {
 		if old[tag] != v {
-			s.invalidateHistoryLocked(tag)
+			s.markProbeStaleLocked(tag)
 		}
 	}
 	for tag := range old {
 		if _, kept := s.urlOverrides[tag]; !kept {
-			s.invalidateHistoryLocked(tag)
+			s.markProbeStaleLocked(tag)
 		}
 	}
 }
 
-// Caller must hold s.access.
-func (s *MutableAutoSelect) invalidateHistoryLocked(tag string) {
-	delete(s.histories, tag)
-	if s.history != nil {
-		s.history.Delete(tag)
+// markProbeStaleLocked also clears a persisted-only entry, which Start or Add
+// would otherwise hydrate as a fresh outcome. Caller must hold s.access.
+func (s *MutableAutoSelect) markProbeStaleLocked(tag string) {
+	if h, ok := s.peekHistoryLocked(tag); ok {
+		h.clearOutcomeAt()
+		if s.history != nil {
+			s.history.Store(tag, h.toTagHistory(time.Now(), s.hist))
+		}
+		return
+	}
+	if s.history == nil {
+		return
+	}
+	// UpdatedAt is kept so the entry still ages out on its original schedule.
+	if snap := s.history.Load(tag); snap != nil && !snap.LastOutcomeAt.IsZero() {
+		snap.LastOutcomeAt = time.Time{}
+		s.history.Store(tag, snap)
 	}
 }
 
@@ -482,7 +507,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	outerTag := o.Tag()
 	conn, err := o.DialContext(ctx, network, destination)
 	if err == nil {
-		return s.wrapStream(conn, o, primaryRoute), nil
+		return s.wrapStream(conn, network, o, primaryRoute), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	// Attribute the failure to the outer (member) tag so rankLocked and
@@ -496,15 +521,18 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	// history fresh enough to pick a working peer without re-probing.
 	alt, altErr := s.selectForExcluding(network, outerTag)
 	if altErr == nil {
-		altTag := alt.Tag()
+		replacementTag := alt.Tag()
 		conn, err = alt.DialContext(ctx, network, destination)
 		if err == nil {
 			go s.runLadder(outerTag)
-			return s.wrapStream(conn, alt, fallbackRoute), nil
+			if network == N.NetworkTCP {
+				go s.confirmSelectedFailure(outerTag, replacementTag)
+			}
+			return s.wrapStream(conn, network, alt, fallbackRoute), nil
 		}
 		s.logger.ErrorContext(ctx, err)
-		s.recordUserFailure(altTag, adapter.UserFailureDial)
-		outerTag = altTag
+		s.recordUserFailure(replacementTag, adapter.UserFailureDial)
+		outerTag = replacementTag
 	}
 
 	go s.runLadder(outerTag)
@@ -536,15 +564,15 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 
 	alt, altErr := s.selectForExcluding("udp", outerTag)
 	if altErr == nil {
-		altTag := alt.Tag()
+		replacementTag := alt.Tag()
 		conn, err = alt.ListenPacket(ctx, destination)
 		if err == nil {
 			go s.runLadder(outerTag)
 			return s.wrapPacket(conn, alt, fallbackRoute), nil
 		}
 		s.logger.ErrorContext(ctx, err)
-		s.recordUserFailure(altTag, adapter.UserFailureDial)
-		outerTag = altTag
+		s.recordUserFailure(replacementTag, adapter.UserFailureDial)
+		outerTag = replacementTag
 	}
 
 	go s.runLadder(outerTag)
@@ -569,14 +597,20 @@ func (s *MutableAutoSelect) chargeable(tag string, route routeKind) bool {
 		loadString(&s.stickyTag.tcp) == tag || loadString(&s.stickyTag.udp) == tag
 }
 
-func (s *MutableAutoSelect) wrapStream(conn net.Conn, o A.Outbound, route routeKind) net.Conn {
-	hooks := s.makeHooks(o.Tag(), route)
+// wrapStream enables no-response detection for TCP only: on UDP a lost
+// datagram or a destination that never replies looks the same as a dead
+// member.
+func (s *MutableAutoSelect) wrapStream(conn net.Conn, network string, o A.Outbound, route routeKind) net.Conn {
+	hooks := s.makeHooks(o.Tag(), N.NetworkName(network), route)
 	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, hooks)
+	if N.NetworkName(network) == N.NetworkTCP {
+		wrapped.firstResponseTimeout = s.cfg.dataPlaneFirstResponseTimeout
+	}
 	return adapter.NewTaggedConn(wrapped, realTag(o))
 }
 
 func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, o A.Outbound, route routeKind) net.PacketConn {
-	hooks := s.makeHooks(o.Tag(), route)
+	hooks := s.makeHooks(o.Tag(), N.NetworkUDP, route)
 	wrapped := newDataPlanePacket(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, hooks)
 	return adapter.NewTaggedPacketConn(wrapped, realTag(o))
 }
@@ -636,7 +670,7 @@ func (s *MutableAutoSelect) selectForExcluding(network, excludeTag string) (A.Ou
 	}
 	var winner rankedCandidate
 	if excludeTag == "" {
-		winner = s.applyStickiness(network, slot, pool, forNetwork)
+		winner = s.applyStickiness(network, slot, pool[0], forNetwork)
 		prev := loadString(slot)
 		if prev != winner.tag {
 			slot.Store(winner.tag)
@@ -651,16 +685,21 @@ func (s *MutableAutoSelect) selectForExcluding(network, excludeTag string) (A.Ou
 	return winner.outbound, nil
 }
 
-// applyStickiness applies switch-tolerance hysteresis. It looks for the
-// sticky tag across every demotion tier, not just pool, so soft demotion
-// still goes through the normal comparison instead of looking like removal.
+// applyStickiness applies switch-tolerance hysteresis between the sticky tag
+// and best, the pool's preferred candidate. It looks for the sticky tag
+// across every demotion tier, not just the pool, so soft demotion still goes
+// through the normal comparison instead of looking like removal.
 //
 // Retention is capped at softFailLimit failures; beyond that, continuing
 // failures release the sticky even if it remains much faster.
 //
 // Caller must hold s.access.
-func (s *MutableAutoSelect) applyStickiness(network string, slot *atomic.Value, pool, forNetwork []rankedCandidate) rankedCandidate {
-	best := pool[0]
+func (s *MutableAutoSelect) applyStickiness(
+	network string,
+	slot *atomic.Value,
+	best rankedCandidate,
+	forNetwork []rankedCandidate,
+) rankedCandidate {
 	sticky := loadString(slot)
 	if sticky == "" || sticky == best.tag {
 		return best
@@ -808,31 +847,49 @@ const (
 )
 
 type rankedCandidate struct {
-	outbound   A.Outbound
-	tag        string
-	delayMs    uint32
-	demote     demoteLevel
-	kind       candidateKind
-	userFails  uint32
-	lastResort bool
+	outbound        A.Outbound
+	tag             string
+	delayMs         uint32
+	demote          demoteLevel
+	kind            candidateKind
+	userFails       uint32
+	lastResort      bool
+	hasRecoveryGate bool
 }
 
-// splitHealthyForLocked filters ranked to network and returns the cleanest
-// non-empty tier as pool (clean, then soft, then last resort, then hard).
-// forNetwork contains all filtered candidates so stickiness can evaluate a
-// demoted tag outside pool.
+// splitHealthyForLocked filters ranked to network and prefers ungated members
+// before choosing the cleanest non-empty tier (clean, soft, last resort, hard).
+// Gated members remain eligible only when no ungated member is available, or
+// when every ungated member is hard-demoted and a gated one is not, so the gate
+// never forces selection onto a member already known to be failing.
+// forNetwork retains every eligible tier for stickiness.
 //
 // ranked must be sorted by demote level, as rankLocked returns it. Requires
 // s.access; both returned slices alias s.scratchSplit.
 func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, network string) (pool, forNetwork []rankedCandidate) {
 	clear(s.scratchSplit)
 	out := s.scratchSplit[:0]
-	var nClean, nSoft, nLast int
 	for _, c := range ranked {
 		if !slices.Contains(c.outbound.Network(), network) {
 			continue
 		}
 		out = append(out, c)
+	}
+	var ungated, ungatedUsable, gatedUsable bool
+	for _, c := range out {
+		usable := c.demote < demoteHard
+		if c.hasRecoveryGate {
+			gatedUsable = gatedUsable || usable
+		} else {
+			ungated = true
+			ungatedUsable = ungatedUsable || usable
+		}
+	}
+	if ungatedUsable || (ungated && !gatedUsable) {
+		out = slices.DeleteFunc(out, func(c rankedCandidate) bool { return c.hasRecoveryGate })
+	}
+	var nClean, nSoft, nLast int
+	for _, c := range out {
 		switch c.demote {
 		case demoteClean:
 			nClean++
@@ -858,13 +915,14 @@ func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, netw
 // preCandidate holds a member's pre-demotion state while rankLocked assembles
 // the candidate set.
 type preCandidate struct {
-	o          A.Outbound
-	tag        string
-	delayMs    uint32
-	kind       candidateKind
-	consec     uint32
-	userFails  uint32
-	lastResort bool
+	o               A.Outbound
+	tag             string
+	delayMs         uint32
+	kind            candidateKind
+	consec          uint32
+	userFails       uint32
+	lastResort      bool
+	hasRecoveryGate bool
 }
 
 // rankLocked builds the candidate set for selection. A non-zero freshSince
@@ -886,19 +944,21 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 			continue
 		}
 		var (
-			rawDelay  uint32
-			consec    uint32
-			userFails uint32
-			haveData  bool
+			rawDelay        uint32
+			consec          uint32
+			userFails       uint32
+			hasRecoveryGate bool
+			haveData        bool
 		)
 		if h, ok := s.peekHistoryLocked(tag); ok {
-			lastDelay, lastAt, c, uf := h.snapshot(now, s.hist.userFailureWindow)
+			lastDelay, lastAt, c, uf, gated := h.snapshot(now, s.hist.userFailureWindow)
 			if !freshSince.IsZero() && lastAt.Before(freshSince) {
 				continue
 			}
 			rawDelay = lastDelay
 			consec = c
 			userFails = uint32(len(uf))
+			hasRecoveryGate = gated
 			haveData = true
 		} else if freshSince.IsZero() && s.history != nil {
 			// Cold member (added without going through hydrate). Fall back
@@ -929,7 +989,7 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 		default:
 			delay, kind = rawDelay, kindRealSeeded
 		}
-		pres = append(pres, preCandidate{o: o, tag: tag, delayMs: delay, kind: kind, consec: consec, userFails: userFails, lastResort: beh.lastResort})
+		pres = append(pres, preCandidate{o: o, tag: tag, delayMs: delay, kind: kind, consec: consec, userFails: userFails, lastResort: beh.lastResort, hasRecoveryGate: hasRecoveryGate})
 	}
 	s.scratchPres = pres
 
@@ -980,7 +1040,7 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 		case soft:
 			level = demoteSoft
 		}
-		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, kind: p.kind, demote: level, userFails: p.userFails, lastResort: p.lastResort})
+		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, kind: p.kind, demote: level, userFails: p.userFails, lastResort: p.lastResort, hasRecoveryGate: p.hasRecoveryGate})
 	}
 	s.scratchRanked = out
 	sort.SliceStable(out, func(i, j int) bool {
@@ -1117,8 +1177,8 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 
 // recordLastResortOutcome records a last-resort probe's outcome unless the
 // member's probe URL changed while it ran. A new URL (a new bandit callback
-// token) invalidates the member's history, and an outcome for the old one
-// would read as current.
+// token) marks the member's probe outcome stale, and an outcome for the old
+// one would read as current.
 func (s *MutableAutoSelect) recordLastResortOutcome(tag, probeURL string, success bool, delayMs uint32) {
 	// Rechecked under s.access so a concurrent Close can't slip between the
 	// caller's shutdown check and the write.
@@ -1218,6 +1278,108 @@ func (s *MutableAutoSelect) recordProbeOutcome(tag string, success bool, delayMs
 	})
 }
 
+// confirmSelectedFailure coalesces probes of the selected TCP member after a
+// user failure. A failed probe attempts a switch to replacementTag, or another
+// eligible member if empty. Cancellation leaves selection unchanged.
+func (s *MutableAutoSelect) confirmSelectedFailure(failedTag, replacementTag string) {
+	if loadString(&s.stickyTag.tcp) != failedTag {
+		return
+	}
+	if _, inFlight := s.pendingFailureConfirmations.LoadOrStore(failedTag, struct{}{}); inFlight {
+		return
+	}
+	defer s.pendingFailureConfirmations.Delete(failedTag)
+
+	o, member := s.members.Load(failedTag)
+	if !member {
+		return
+	}
+	beh := behaviorFor(o.Type())
+	s.access.Lock()
+	probeURL := s.probeURLForLocked(failedTag)
+	s.access.Unlock()
+	if beh.excludeFromPool || probeURL == "" {
+		return
+	}
+	res := probeMember(s.ctx, o, probeURL, beh)
+	if s.ctx.Err() != nil {
+		return
+	}
+	s.recordProbeOutcome(failedTag, res.success, res.delayMs)
+	if !res.success {
+		s.trySwitchAfterConfirmedFailure(failedTag, replacementTag)
+	}
+}
+
+// trySwitchAfterConfirmedFailure gates failedTag only if it is still selected,
+// its latest probe still failed, and a switch to an eligible replacement
+// succeeds. An ineligible replacementTag falls back to another eligible member.
+func (s *MutableAutoSelect) trySwitchAfterConfirmedFailure(failedTag, replacementTag string) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	slot := &s.stickyTag.tcp
+	if loadString(slot) != failedTag {
+		return
+	}
+	if _, member := s.members.Load(failedTag); !member {
+		return
+	}
+	h, ok := s.peekHistoryLocked(failedTag)
+	if !ok {
+		return
+	}
+	now := time.Now()
+	// A concurrent ladder probe may have recorded a newer success.
+	if _, _, consec, _, _ := h.snapshot(now, s.hist.userFailureWindow); consec == 0 {
+		return
+	}
+	if replacementTag == "" || !s.eligibleReplacementLocked(now, replacementTag) {
+		replacementTag = s.findProbedReplacementLocked(now, N.NetworkTCP, failedTag)
+	}
+	if replacementTag == "" {
+		return
+	}
+	last := s.lastConfirmedFailureSwitch
+	if !last.at.IsZero() && now.Sub(last.at) < confirmedFailureSwitchCooldown && last.selectedTag != failedTag {
+		s.logger.Info("tcp switch deferred: ", failedTag, " -> ", replacementTag, " (confirmed-failure switch cooldown)")
+		return
+	}
+	slot.Store(replacementTag)
+	h.startRecoveryGate(now)
+	s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = now, replacementTag
+	s.logger.Info("tcp switch: ", failedTag, " -> ", replacementTag, " (failed confirmation)")
+}
+
+// eligibleReplacementLocked requires membership, no recovery gate, and a
+// passing latest probe, regardless of age. Caller must hold s.access.
+func (s *MutableAutoSelect) eligibleReplacementLocked(now time.Time, tag string) bool {
+	if _, member := s.members.Load(tag); !member {
+		return false
+	}
+	h, ok := s.peekHistoryLocked(tag)
+	if !ok {
+		return false
+	}
+	delay, _, consec, _, gated := h.snapshot(now, s.hist.userFailureWindow)
+	return delay > 0 && consec == 0 && !gated
+}
+
+// findProbedReplacementLocked returns the highest-ranked member whose latest
+// probe passed and that has no recovery gate, in network's healthiest tier
+// after excluding excludeTag, or "" if there is none. Caller must hold s.access.
+func (s *MutableAutoSelect) findProbedReplacementLocked(now time.Time, network, excludeTag string) string {
+	ranked := slices.DeleteFunc(s.rankLocked(now, time.Time{}), func(c rankedCandidate) bool {
+		return c.tag == excludeTag
+	})
+	pool, _ := s.splitHealthyForLocked(ranked, network)
+	for _, c := range pool {
+		if s.eligibleReplacementLocked(now, c.tag) {
+			return c.tag
+		}
+	}
+	return ""
+}
+
 // runLadder is invoked on any dial/listen error (after the dial-site
 // fast-failover step has already had its shot) and on data-plane stall
 // callbacks. It does not retry the failing member: the dial caller
@@ -1287,7 +1449,7 @@ func (s *MutableAutoSelect) runLadder(target string) {
 				continue
 			}
 			if h, ok := s.peekHistoryLocked(c.tag); ok {
-				if delay, at, consec, _ := h.snapshot(now, s.hist.userFailureWindow); delay > 0 && consec == 0 && now.Sub(at) <= lastResortSuccessFreshness {
+				if delay, at, consec, _, _ := h.snapshot(now, s.hist.userFailureWindow); delay > 0 && consec == 0 && now.Sub(at) <= lastResortSuccessFreshness {
 					winner = c.outbound
 					break
 				}
