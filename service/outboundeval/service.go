@@ -37,6 +37,7 @@ const (
 	defaultMaxAssignmentBytes   = 32 << 20
 	defaultMaxWindows           = 8
 	defaultMaxAttemptsPerWindow = 8
+	defaultNTPServer            = "pool.ntp.org:123"
 )
 
 // closeGracePeriod is how long Close waits for the cycle to unwind. It stays
@@ -233,6 +234,9 @@ func withDefaults(options option.OutboundEvalServiceOptions) option.OutboundEval
 	}
 	if options.MaxAttemptsPerWindow == 0 {
 		options.MaxAttemptsPerWindow = defaultMaxAttemptsPerWindow
+	}
+	if options.NTPServer == "" {
+		options.NTPServer = defaultNTPServer
 	}
 	return options
 }

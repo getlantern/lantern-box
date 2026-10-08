@@ -45,7 +45,7 @@ type OutboundEvalServiceOptions struct {
 
 	// NTPServer is queried for the time an assignment's expiry and observations
 	// are judged against. Ignored when the box already runs a time service.
-	// Default time.apple.com:123.
+	// Default pool.ntp.org:123.
 	NTPServer string `json:"ntp_server,omitempty"`
 
 	// RequestTimeout bounds each individual HTTP request the service makes.
