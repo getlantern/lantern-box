@@ -98,13 +98,30 @@ func TestNewServiceRejectsUnusableOptions(t *testing.T) {
 		"no acquire url": func(o *option.OutboundEvalServiceOptions) { o.AcquireURL = "" },
 		"no attest url":  func(o *option.OutboundEvalServiceOptions) { o.AttestURL = "" },
 		"no submit url":  func(o *option.OutboundEvalServiceOptions) { o.SubmitURL = "" },
-		"no outbound":    func(o *option.OutboundEvalServiceOptions) { o.OutboundTag = "" },
+		"no token":       func(o *option.OutboundEvalServiceOptions) { o.Token = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			options := testOptions()
 			mutate(&options)
 			_, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "eval", options)
 			assert.Error(t, err)
+		})
+	}
+}
+
+func TestNewServiceDefaultsOutboundTag(t *testing.T) {
+	for _, tag := range []string{"", "candidate"} {
+		t.Run("tag="+tag, func(t *testing.T) {
+			options := testOptions()
+			options.OutboundTag = tag
+			options.ControlOutboundTag = "custom-control"
+			s := newTestService(t, options)
+			want := tag
+			if want == "" {
+				want = "direct"
+			}
+			assert.Equal(t, want, s.options.OutboundTag)
+			assert.Equal(t, "custom-control", s.options.ControlOutboundTag)
 		})
 	}
 }

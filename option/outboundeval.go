@@ -3,7 +3,7 @@ package option
 import "github.com/sagernet/sing/common/json/badoption"
 
 // OutboundEvalServiceOptions configures the outboundeval service. The three
-// endpoint URLs, Token, and OutboundTag are required; every other zero value falls
+// endpoint URLs and Token are required; every other zero value falls
 // back to the default documented on the field.
 type OutboundEvalServiceOptions struct {
 	// AcquireURL, AttestURL and SubmitURL must be absolute HTTPS URLs with a hostname.
@@ -19,7 +19,7 @@ type OutboundEvalServiceOptions struct {
 	CountryCode string `json:"country_code,omitempty"`
 
 	// OutboundTag is the candidate when an assignment does not supply both outbounds.
-	// It is resolved again for each assignment.
+	// It is resolved again for each assignment. Default "direct", which must exist at startup.
 	OutboundTag string `json:"outbound_tag,omitempty"`
 
 	// ControlOutboundTag carries every control API call and is the measurement

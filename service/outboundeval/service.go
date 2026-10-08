@@ -27,6 +27,7 @@ import (
 
 // Defaults for every option left unset.
 const (
+	defaultOutboundTag          = "direct"
 	defaultControlOutboundTag   = "direct"
 	defaultPollInterval         = 5 * time.Minute
 	defaultNoAssignmentInterval = 5 * time.Minute
@@ -203,6 +204,9 @@ func (s *Service) Close() error {
 }
 
 func withDefaults(options option.OutboundEvalServiceOptions) option.OutboundEvalServiceOptions {
+	if options.OutboundTag == "" {
+		options.OutboundTag = defaultOutboundTag
+	}
 	if options.ControlOutboundTag == "" {
 		options.ControlOutboundTag = defaultControlOutboundTag
 	}
@@ -249,9 +253,6 @@ func validateOptions(options option.OutboundEvalServiceOptions) error {
 		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
 			return fmt.Errorf("%s must be an absolute HTTPS URL with a hostname", endpoint.name)
 		}
-	}
-	if options.OutboundTag == "" {
-		return errors.New("outbound_tag is required")
 	}
 	if options.Token == "" {
 		return errors.New("token is required")
