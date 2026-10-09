@@ -951,7 +951,10 @@ source "alicloud-ecs" "lantern-box" {
   }
   io_optimized                  = true
   internet_charge_type          = "PayByTraffic"
-  internet_max_bandwidth_out    = 5
+  # 0 so the VPC instance is created without a public IP: the build reaches it
+  # through the EIP that associate_public_ip_address allocates (at Alicloud's
+  # default bandwidth), and an instance that already has one cannot take an EIP.
+  internet_max_bandwidth_out    = 0
   # Disable Alibaba's "security enhancement" (China-specific Aegis/CloudMonitor agent).
   # We run our own monitoring and don't want the extra agent on proxy servers.
   security_enhancement_strategy = "Deactive"
