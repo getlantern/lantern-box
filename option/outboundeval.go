@@ -18,26 +18,29 @@ type OutboundEvalServiceOptions struct {
 	// an ISO-3166 alpha-2 code.
 	CountryCode string `json:"country_code,omitempty"`
 
-	// OutboundTag is the candidate when an assignment does not supply both outbounds.
-	// It is resolved again for each assignment. Default "direct", which must exist at startup.
-	OutboundTag string `json:"outbound_tag,omitempty"`
-
-	// ControlOutboundTag carries every control API call and is the measurement
-	// control when an assignment does not supply both outbounds.
-	// Exit attestation is attributed to the address it
-	// arrives from, so this outbound must egress on the physical interface.
+	// ControlOutboundTag carries every control API call. Exit attestation is
+	// attributed to the address it arrives from, so this outbound must egress
+	// on the physical interface.
 	// Default "direct", which the configuration has to declare: sing-box
 	// creates an implicit direct outbound only for a configuration that
 	// declares no outbounds at all.
 	ControlOutboundTag string `json:"control_outbound_tag,omitempty"`
 
-	// PollInterval is the wait before the first cycle and after a completed
-	// assignment. Default 5m.
+	// PollInterval is the wait before the first assignment request, and the
+	// spacing between a request whose assignment completed and the next one.
+	// A cycle that outlasts it is followed by the next request at once.
+	// Default 5m.
 	PollInterval badoption.Duration `json:"poll_interval,omitempty"`
 
-	// NoAssignmentInterval is the wait after the server has nothing to measure,
-	// and after it refuses a request in a way a retry cannot fix. Default 5m.
+	// NoAssignmentInterval spaces the next assignment request from one the
+	// server had nothing for, or whose cycle failed in a way a retry cannot fix.
+	// Default 5m.
 	NoAssignmentInterval badoption.Duration `json:"no_assignment_interval,omitempty"`
+
+	// MinFreshSessionDelay is the least wait before each window, applied when
+	// an assignment asks for less, so consecutive windows sample different
+	// network moments. Default 30s.
+	MinFreshSessionDelay badoption.Duration `json:"min_fresh_session_delay,omitempty"`
 
 	// MaxRetryBackoff caps the backoff applied to retryable control
 	// API failures. Default 10m.
@@ -49,7 +52,7 @@ type OutboundEvalServiceOptions struct {
 	NTPServer string `json:"ntp_server,omitempty"`
 
 	// RequestTimeout bounds each individual HTTP request the service makes.
-	// Default 30s.
+	// Default 15s.
 	RequestTimeout badoption.Duration `json:"request_timeout,omitempty"`
 
 	// MaxResponseBytes caps how much of a measurement response is read.

@@ -69,7 +69,7 @@ func (c *controlAPI) handler(t *testing.T) http.HandlerFunc {
 				w.WriteHeader(status)
 				return
 			}
-			require.NoError(t, json.NewEncoder(w).Encode(assignment()))
+			writeAssignment(t, w, assignment())
 		case strings.HasSuffix(r.URL.Path, "/attestations"):
 			var request AttestationRequest
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
@@ -230,7 +230,7 @@ func TestRunCycleMeasuresOnlyUntilTheAssignmentExpires(t *testing.T) {
 		s := wireRunner(t, testOptions(), api.handler(t))
 
 		start := time.Now()
-		require.ErrorIs(t, s.runCycle(), errUnattestedReport)
+		require.ErrorIs(t, s.runCycle(), errAssignmentEnded)
 		assert.Equal(t, time.Second, time.Since(start))
 
 		assert.Empty(t, api.reports())
@@ -289,7 +289,7 @@ func TestRunCycleDoesNotSubmitUnattestedWindows(t *testing.T) {
 				return Attestation{}, test.err
 			}
 
-			require.ErrorIs(t, s.runCycle(), errUnattestedReport)
+			require.ErrorIs(t, s.runCycle(), errUnattestedWindow)
 			assert.Empty(t, api.reports())
 		})
 	}
@@ -312,7 +312,8 @@ func TestRunCycleSubmitsAttestedDeadlineFailures(t *testing.T) {
 		for _, window := range reports[0].Windows {
 			require.NotEmpty(t, window.AttestationToken)
 			for _, attempts := range [][]Attempt{window.CandidateAttempts, window.ControlAttempts} {
-				for _, attempt := range attempts {
+				assert.Equal(t, failureTimeout, attempts[0].FailureCode, "the deadline cut the first attempt short")
+				for _, attempt := range attempts[1:] {
 					assert.Equal(t, failureWindowDeadline, attempt.FailureCode)
 				}
 			}
@@ -344,6 +345,14 @@ func TestRunCycleErrors(t *testing.T) {
 		"rate limited":       {acquireStatus: http.StatusTooManyRequests, want: apiError{status: http.StatusTooManyRequests}},
 		"submit refused":     {submitStatus: http.StatusBadRequest, want: apiError{status: http.StatusBadRequest}},
 		"submit conflict":    {submitStatus: http.StatusConflict, want: apiError{status: http.StatusConflict}},
+		"assignment without a pair": {
+			assignment: func() Assignment {
+				assignment := serverAssignment()
+				assignment.Control = nil
+				return assignment
+			},
+			want: ErrInvalidContract,
+		},
 		"assignment beyond local bounds": {
 			assignment: func() Assignment {
 				assignment := serverAssignment()
@@ -366,18 +375,6 @@ func TestRunCycleErrors(t *testing.T) {
 			assert.ErrorIs(t, s.runCycle(), test.want)
 		})
 	}
-}
-
-func TestRunCycleSkipsAnOutboundThatWentAway(t *testing.T) {
-	api := newControlAPI()
-	s := wiredService(t, api.handler(t))
-	s.measure = reachableMeasure
-	delete(s.outbounds.(*stubOutboundManager).outbounds, "candidate")
-
-	err := s.runCycle()
-	assert.ErrorIs(t, err, errOutboundUnavailable)
-	assert.ErrorContains(t, err, "candidate")
-	assert.Empty(t, api.reports())
 }
 
 func TestRunCycleStopsWhenClosing(t *testing.T) {
@@ -434,9 +431,9 @@ func TestRetryableCycleError(t *testing.T) {
 	}{
 		"success":           {},
 		"no assignment":     {err: ErrNoAssignment},
-		"missing outbound":  {err: errOutboundUnavailable},
 		"invalid contract":  {err: ErrInvalidContract},
-		"unattested report": {err: errUnattestedReport},
+		"unattested window": {err: errUnattestedWindow},
+		"assignment ended":  {err: errAssignmentEnded},
 		"canceled":          {err: context.Canceled},
 		"refused":           {err: apiError{status: http.StatusUnauthorized}},
 		"rate limited":      {err: apiError{status: http.StatusTooManyRequests}, want: true},
@@ -471,9 +468,7 @@ func (h handlerTransport) RoundTrip(request *http.Request) (*http.Response, erro
 func wireRunner(t *testing.T, options option.OutboundEvalServiceOptions, handler http.HandlerFunc) *Service {
 	t.Helper()
 	s := newTestService(t, options)
-	s.outbounds = &stubOutboundManager{outbounds: map[string]A.Outbound{
-		"candidate": &stubOutbound{tag: "candidate"},
-	}}
+	s.outbounds = &assignmentTestManager{outbounds: map[string]A.Outbound{}}
 	s.api = &apiClient{
 		ctx:            s.ctx,
 		http:           &http.Client{Transport: handlerTransport{handler: handler}},
@@ -558,7 +553,7 @@ func TestRunPollingIntervals(t *testing.T) {
 	}
 }
 
-func TestRunBackoffRetriesWithoutWaitingForTheTicker(t *testing.T) {
+func TestRunBackoffRetriesWithoutWaitingForThePollInterval(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		api := newControlAPI()
 		api.assignment = func() Assignment {
@@ -590,7 +585,7 @@ func TestRunBackoffRetriesWithoutWaitingForTheTicker(t *testing.T) {
 		require.EqualValues(t, 1, acquired.Load())
 
 		// Jitter lands the retry in the last fifth of the capped wait, long
-		// before the tick that would otherwise start the next cycle.
+		// before the poll interval would otherwise start the next cycle.
 		time.Sleep(testRetryBase*4/5 - time.Nanosecond)
 		synctest.Wait()
 		require.EqualValues(t, 1, acquired.Load())
@@ -612,30 +607,43 @@ func TestRunBackoffRetriesWithoutWaitingForTheTicker(t *testing.T) {
 	})
 }
 
-func TestRunWaitsAfterALongCycle(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		var acquired atomic.Int64
-		startTestRunner(t, func(w http.ResponseWriter, _ *http.Request) {
-			if acquired.Add(1) == 1 {
-				time.Sleep(15 * time.Second)
-			}
-			w.WriteHeader(http.StatusServiceUnavailable)
+// The next request is spaced from the previous one, so time a cycle spent
+// counts toward the wait, and a cycle that outlasts the interval is followed
+// by the next request at once.
+func TestRunSpacesRequestsFromTheLastOne(t *testing.T) {
+	for name, test := range map[string]struct {
+		cycle, wait time.Duration
+	}{
+		"shorter than the interval": {cycle: 2 * time.Second, wait: time.Second},
+		"longer than the interval":  {cycle: 12 * time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var acquired atomic.Int64
+				startTestRunner(t, func(w http.ResponseWriter, _ *http.Request) {
+					if acquired.Add(1) == 1 {
+						time.Sleep(test.cycle)
+					}
+					w.WriteHeader(http.StatusServiceUnavailable)
+				})
+				synctest.Wait()
+				time.Sleep(10 * time.Second)
+				synctest.Wait()
+				require.EqualValues(t, 1, acquired.Load())
+				time.Sleep(test.cycle)
+				synctest.Wait()
+				if test.wait > 0 {
+					assert.EqualValues(t, 1, acquired.Load())
+					time.Sleep(test.wait - time.Nanosecond)
+					synctest.Wait()
+					assert.EqualValues(t, 1, acquired.Load())
+					time.Sleep(time.Nanosecond)
+					synctest.Wait()
+				}
+				assert.EqualValues(t, 2, acquired.Load())
+			})
 		})
-		synctest.Wait()
-		time.Sleep(10 * time.Second)
-		synctest.Wait()
-		require.EqualValues(t, 1, acquired.Load())
-		// The tick that elapses while the cycle runs must not start another one.
-		time.Sleep(15 * time.Second)
-		synctest.Wait()
-		assert.EqualValues(t, 1, acquired.Load())
-		time.Sleep(3*time.Second - time.Nanosecond)
-		synctest.Wait()
-		assert.EqualValues(t, 1, acquired.Load())
-		time.Sleep(time.Nanosecond)
-		synctest.Wait()
-		assert.EqualValues(t, 2, acquired.Load())
-	})
+	}
 }
 
 func TestRunStopsWhileWaiting(t *testing.T) {

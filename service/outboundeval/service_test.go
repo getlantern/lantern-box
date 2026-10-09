@@ -47,8 +47,8 @@ func wiredService(t *testing.T, handler http.HandlerFunc) *Service {
 	options.SubmitURL = server.URL + "/reports"
 
 	control := &stubOutbound{tag: "direct", address: server.Listener.Addr().String()}
-	candidate := &stubOutbound{tag: "candidate", address: server.Listener.Addr().String()}
-	ctx := contextWithOutbounds(map[string]A.Outbound{"direct": control, "candidate": candidate})
+	manager := &assignmentTestManager{outbounds: map[string]A.Outbound{"direct": control}}
+	ctx := targetContext(service.ContextWith[A.OutboundManager](context.Background(), manager))
 
 	created, err := NewService(ctx, log.NewNOPFactory().Logger(), "eval", options)
 	require.NoError(t, err)
@@ -56,7 +56,6 @@ func wiredService(t *testing.T, handler http.HandlerFunc) *Service {
 	s.retryDelay = time.Millisecond
 	s.timeService = liveTime{}
 	s.outbounds = service.FromContext[A.OutboundManager](ctx)
-	s.control = control
 	s.api = newAPIClient(s.ctx, control, time.Now, s.options)
 	roots := x509.NewCertPool()
 	roots.AddCert(server.Certificate())
@@ -67,13 +66,16 @@ func wiredService(t *testing.T, handler http.HandlerFunc) *Service {
 }
 
 func TestNewServiceAppliesDefaults(t *testing.T) {
-	s := newTestService(t, testOptions())
+	options := testOptions()
+	options.MinFreshSessionDelay = 0
+	s := newTestService(t, options)
 
 	assert.Equal(t, defaultControlOutboundTag, s.options.ControlOutboundTag)
 	assert.Equal(t, 5*time.Minute, time.Duration(s.options.PollInterval))
 	assert.Equal(t, 5*time.Minute, time.Duration(s.options.NoAssignmentInterval))
 	assert.Equal(t, defaultMaxRetryBackoff, time.Duration(s.options.MaxRetryBackoff))
 	assert.Equal(t, defaultRequestTimeout, time.Duration(s.options.RequestTimeout))
+	assert.Equal(t, defaultMinFreshSessionDelay, time.Duration(s.options.MinFreshSessionDelay))
 	assert.EqualValues(t, defaultMaxResponseBytes, s.options.MaxResponseBytes)
 	assert.EqualValues(t, defaultMaxAssignmentBytes, s.options.MaxAssignmentBytes)
 	assert.EqualValues(t, defaultMaxWindows, s.options.MaxWindows)
@@ -85,11 +87,13 @@ func TestDefaultPollingLeavesRoomWithinRunnerActivityWindow(t *testing.T) {
 	const assignmentLifetime = 15 * time.Minute
 	const activityWindow = 30 * time.Minute
 
+	// Requests are spaced from one another, so an assignment that runs to its
+	// expiry is followed by the next request at once.
 	for _, interval := range []time.Duration{
 		time.Duration(s.options.PollInterval),
 		time.Duration(s.options.NoAssignmentInterval),
 	} {
-		assert.Less(t, assignmentLifetime+interval, activityWindow)
+		assert.Less(t, max(assignmentLifetime, interval), activityWindow)
 	}
 }
 
@@ -105,23 +109,6 @@ func TestNewServiceRejectsUnusableOptions(t *testing.T) {
 			mutate(&options)
 			_, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "eval", options)
 			assert.Error(t, err)
-		})
-	}
-}
-
-func TestNewServiceDefaultsOutboundTag(t *testing.T) {
-	for _, tag := range []string{"", "candidate"} {
-		t.Run("tag="+tag, func(t *testing.T) {
-			options := testOptions()
-			options.OutboundTag = tag
-			options.ControlOutboundTag = "custom-control"
-			s := newTestService(t, options)
-			want := tag
-			if want == "" {
-				want = "direct"
-			}
-			assert.Equal(t, want, s.options.OutboundTag)
-			assert.Equal(t, "custom-control", s.options.ControlOutboundTag)
 		})
 	}
 }
@@ -183,31 +170,28 @@ func TestNewServiceValidatesControlURLs(t *testing.T) {
 func TestStartUsesTheBoxsTimeService(t *testing.T) {
 	pinned := time.Now().UTC().Add(4 * time.Hour)
 	ctx := service.ContextWith[ntp.TimeService](contextWithOutbounds(map[string]A.Outbound{
-		"direct": &stubOutbound{tag: "direct"}, "candidate": &stubOutbound{tag: "candidate"},
+		"direct": &stubOutbound{tag: "direct"},
 	}), fixedTime{at: pinned})
 	created, err := NewService(ctx, log.NewNOPFactory().Logger(), "eval", testOptions())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, created.Close()) })
 
-	require.NoError(t, created.Start(A.StartStateStart))
+	require.NoError(t, created.Start(A.StartStateStarted))
 
 	assert.Equal(t, pinned, created.(*Service).timeService.TimeFunc()())
 }
 
-func TestStartRequiresBothTargets(t *testing.T) {
-	candidate := &stubOutbound{tag: "candidate"}
-	direct := &stubOutbound{tag: "direct"}
+func TestStartRequiresTheControlOutbound(t *testing.T) {
 	for name, outbounds := range map[string]map[string]A.Outbound{
-		"no control outbound":    {"candidate": candidate},
-		"no outbound under test": {"direct": direct},
-		"no outbounds at all":    {},
+		"another outbound":    {"proxy": &stubOutbound{tag: "proxy"}},
+		"no outbounds at all": {},
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := contextWithOutbounds(outbounds)
 			created, err := NewService(ctx, log.NewNOPFactory().Logger(), "eval", testOptions())
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, created.Close()) })
-			assert.Error(t, created.Start(A.StartStateStart))
+			assert.Error(t, created.Start(A.StartStateStarted))
 		})
 	}
 }
@@ -216,7 +200,7 @@ func TestStartMeasuresNothingBeforeItsStage(t *testing.T) {
 	requests := 0
 	s := wiredService(t, func(http.ResponseWriter, *http.Request) { requests++ })
 
-	for _, stage := range []A.StartStage{A.StartStateInitialize, A.StartStatePostStart, A.StartStateStarted} {
+	for _, stage := range []A.StartStage{A.StartStateInitialize, A.StartStateStart, A.StartStatePostStart} {
 		require.NoError(t, s.Start(stage))
 	}
 	assert.False(t, s.started.Load())

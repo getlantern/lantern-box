@@ -15,30 +15,18 @@ type createdTarget struct {
 	remove func(tag string) error
 }
 
-func (s *Service) measureAssignment(candidateTag string, assignment Assignment) (report Report, err error) {
+func (s *Service) measureAssignment(assignment Assignment) (report Report, err error) {
 	now := s.timeService.TimeFunc()()
 	ctx, cancel := context.WithTimeout(s.ctx, assignment.ExpiresAt.Sub(now))
 	defer cancel()
-	var candidate A.Outbound
-	control := s.control
-	if assignment.Candidate != nil && assignment.Control != nil {
-		s.logger.Debug("using assignment-provided evaluation targets")
-		defer func() {
-			err = errors.Join(err, s.closeAssignmentOutbounds())
-		}()
-		candidate, control, err = s.createAssignmentOutbounds(ctx, assignment)
-		if err != nil {
-			return Report{}, err
-		}
-	} else {
-		s.logger.Debug("using configured evaluation targets")
-		var found bool
-		candidate, found = s.outbounds.Outbound(candidateTag)
-		if !found {
-			return Report{}, fmt.Errorf("%w: %q", errOutboundUnavailable, candidateTag)
-		}
+	defer func() {
+		err = errors.Join(err, s.closeAssignmentOutbounds())
+	}()
+	candidate, control, err := s.createAssignmentOutbounds(ctx, assignment)
+	if err != nil {
+		return Report{}, err
 	}
-	return s.runAssignment(ctx, candidate, control, assignment), nil
+	return s.runAssignment(ctx, candidate, control, assignment)
 }
 
 func (s *Service) createAssignmentOutbounds(ctx context.Context, assignment Assignment) (A.Outbound, A.Outbound, error) {
@@ -56,7 +44,7 @@ func (s *Service) createAssignmentOutbounds(ctx context.Context, assignment Assi
 			return nil, nil, fmt.Errorf("create assignment target %d: %w", i, err)
 		}
 		targets[i] = out
-		s.logger.Debug("outbound evaluation target created; index=", i)
+		s.logger.Trace("outbound evaluation target created; index=", i)
 	}
 	return targets[0], targets[1], nil
 }
@@ -110,7 +98,7 @@ func (s *Service) closeAssignmentOutbounds() error {
 		if removeErr := target.remove(target.tag); removeErr != nil {
 			err = errors.Join(err, fmt.Errorf("remove assignment target %q: %w", target.tag, removeErr))
 		} else {
-			s.logger.Debug("outbound evaluation target removed")
+			s.logger.Trace("outbound evaluation target removed")
 		}
 	}
 	s.assignmentTargets = nil

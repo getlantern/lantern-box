@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
 )
+
+var errEmptyAttestation = errors.New("attestation carried no token")
 
 const (
 	attestAttempts        = 3
@@ -17,18 +20,23 @@ const (
 	defaultMeasurementURL = "https://www.wikipedia.org/"
 )
 
-// runAssignment pads unmeasured attempts on both eval targets to fill the
-// assignment's grid.
-func (s *Service) runAssignment(ctx context.Context, candidate, control A.Outbound, assignment Assignment) Report {
+// runAssignment fails at the first window it cannot attest, whether
+// attestation fails or the assignment ends first, because the server refuses a
+// report with an unattested window.
+func (s *Service) runAssignment(ctx context.Context, candidate, control A.Outbound, assignment Assignment) (Report, error) {
 	report := Report{
 		ReportToken:    assignment.ReportToken,
 		IdempotencyKey: assignment.ID,
 		Windows:        make([]WindowReport, 0, len(assignment.Challenges)),
 	}
 	for _, challenge := range assignment.Challenges {
-		report.Windows = append(report.Windows, s.runWindow(ctx, candidate, control, assignment, challenge))
+		window, err := s.runWindow(ctx, candidate, control, assignment, challenge)
+		if err != nil {
+			return Report{}, err
+		}
+		report.Windows = append(report.Windows, window)
 	}
-	return report
+	return report, nil
 }
 
 func (s *Service) runWindow(
@@ -36,61 +44,47 @@ func (s *Service) runWindow(
 	candidate, control A.Outbound,
 	assignment Assignment,
 	challenge WindowChallenge,
-) (window WindowReport) {
+) (WindowReport, error) {
 	sample := assignment.Sample
 	target := assignment.MeasurementURL
 	if target == "" {
 		target = defaultMeasurementURL
 	}
-	window = WindowReport{
-		CandidateAttempts: make([]Attempt, 0, sample.AttemptsPerWindow),
-		ControlAttempts:   make([]Attempt, 0, sample.AttemptsPerWindow),
-	}
-	s.logger.Debug("outbound evaluation window starting; index=", challenge.WindowIndex,
-		", spacing=", sample.freshSessionDelay(), ", budget=", sample.windowDuration())
-	// The result is named so every way out of the window carries the instant
-	// it stopped observing.
-	defer func() {
-		window.ObservedAt = s.timeService.TimeFunc()().UTC()
-		s.logger.Debug("outbound evaluation window completed; index=", challenge.WindowIndex,
-			", attested=", window.AttestationToken != "",
-			", candidate_attempts=", len(window.CandidateAttempts),
-			", control_attempts=", len(window.ControlAttempts))
-	}()
+	spacing := max(sample.freshSessionDelay(), time.Duration(s.options.MinFreshSessionDelay))
+	s.logger.Trace("outbound evaluation window starting; index=", challenge.WindowIndex,
+		", spacing=", spacing, ", budget=", sample.windowDuration())
 	// The spacing between windows precedes the window, so it is not charged
 	// against the time the window has to measure in.
-	if !sleepContext(ctx, sample.freshSessionDelay()) {
-		return fillWindow(window, sample, failureWindowDeadline)
+	if !sleepContext(ctx, spacing) {
+		return WindowReport{}, fmt.Errorf("%w before window %d opened: %w",
+			errAssignmentEnded, challenge.WindowIndex, ctx.Err())
 	}
 	windowCtx, cancel := context.WithTimeout(ctx, sample.windowDuration())
 	defer cancel()
 
 	attestation, err := s.attestWindow(windowCtx, challenge)
 	if err != nil {
-		s.logger.Warn("outbound evaluation window ", challenge.WindowIndex, " went unattested: ", err)
-		return fillWindow(window, sample, attestationFailureCode(err))
+		if ctx.Err() != nil {
+			return WindowReport{}, fmt.Errorf("%w while attesting window %d: %w",
+				errAssignmentEnded, challenge.WindowIndex, ctx.Err())
+		}
+		return WindowReport{}, fmt.Errorf("%w: window %d: %w", errUnattestedWindow, challenge.WindowIndex, err)
 	}
-	window.AttestationToken = attestation.Token
-
-	// Alternating which eval target goes first keeps a systematic advantage
-	// from accruing to whichever one always warms the path.
-	candidateFirst := challenge.WindowIndex%2 == 0
+	window := WindowReport{
+		AttestationToken:  attestation.Token,
+		CandidateAttempts: make([]Attempt, 0, sample.AttemptsPerWindow),
+		ControlAttempts:   make([]Attempt, 0, sample.AttemptsPerWindow),
+	}
 	for attempt := range sample.AttemptsPerWindow {
 		if windowCtx.Err() != nil {
 			break
 		}
-		candidateAttempt, controlAttempt := s.measurePair(
-			windowCtx, candidate, control, target, candidateFirst)
-		// An interrupted pair is inconclusive for both eval targets.
-		if windowCtx.Err() != nil && (interrupted(candidateAttempt) || interrupted(controlAttempt)) {
-			candidateAttempt = Attempt{FailureCode: failureWindowDeadline}
-			controlAttempt = Attempt{FailureCode: failureWindowDeadline}
-		}
+		candidateAttempt, controlAttempt := s.measurePair(windowCtx, candidate, control, target)
 		for _, result := range []struct {
 			role    string
 			attempt Attempt
 		}{{"candidate", candidateAttempt}, {"control", controlAttempt}} {
-			s.logger.Debug("outbound evaluation attempt; window=", challenge.WindowIndex,
+			s.logger.Trace("outbound evaluation attempt; window=", challenge.WindowIndex,
 				", target=", result.role, ", attempt=", attempt+1,
 				", reachable=", result.attempt.Reachable, ", http_status=", result.attempt.HTTPStatus,
 				", failure=", result.attempt.FailureCode, ", bytes=", result.attempt.BytesRead,
@@ -103,28 +97,27 @@ func (s *Service) runWindow(
 		s.logger.Debug("outbound evaluation window padded; index=", challenge.WindowIndex,
 			", missing_pairs=", missing, ", failure=", failureWindowDeadline)
 	}
-	return fillWindow(window, sample, failureWindowDeadline)
+	window = fillWindow(window, sample, failureWindowDeadline)
+	window.ObservedAt = s.timeService.TimeFunc()().UTC()
+	s.logger.Trace("outbound evaluation window completed; index=", challenge.WindowIndex,
+		", candidate_attempts=", len(window.CandidateAttempts),
+		", control_attempts=", len(window.ControlAttempts))
+	return window, nil
 }
 
-// interrupted reports whether an attempt ended the way a measurement cut short
-// does, rather than completing with a verdict of its own.
-func interrupted(attempt Attempt) bool {
-	return attempt.FailureCode == failureTimeout || attempt.FailureCode == failureCanceled
-}
-
+// measurePair measures both eval targets at once. Measured one after the
+// other, a candidate that times out would spend the window the control's
+// attempts need, and the control's padded failures would turn the
+// candidate's failure into an inconclusive window.
 func (s *Service) measurePair(
 	ctx context.Context,
 	candidate, control A.Outbound,
 	target string,
-	candidateFirst bool,
 ) (candidateAttempt, controlAttempt Attempt) {
-	if candidateFirst {
-		candidateAttempt = s.measure(ctx, candidate, target)
-		controlAttempt = s.measure(ctx, control, target)
-	} else {
-		controlAttempt = s.measure(ctx, control, target)
-		candidateAttempt = s.measure(ctx, candidate, target)
-	}
+	var wg sync.WaitGroup
+	wg.Go(func() { controlAttempt = s.measure(ctx, control, target) })
+	candidateAttempt = s.measure(ctx, candidate, target)
+	wg.Wait()
 	return candidateAttempt, controlAttempt
 }
 
@@ -134,13 +127,15 @@ func (s *Service) attestWindow(ctx context.Context, challenge WindowChallenge) (
 	request := AttestationRequest{Challenge: challenge.Challenge}
 	var err error
 	for attempt := 1; attempt <= attestAttempts; attempt++ {
-		s.logger.Debug("attesting outbound evaluation window; index=", challenge.WindowIndex,
+		s.logger.Trace("attesting outbound evaluation window; index=", challenge.WindowIndex,
 			", attempt=", attempt, "/", attestAttempts)
 		var attestation Attestation
 		attestation, err = s.attest(ctx, request)
+		if err == nil && attestation.Token == "" {
+			err = errEmptyAttestation
+		}
 		if err == nil {
-			s.logger.Debug("outbound evaluation attestation completed; index=", challenge.WindowIndex,
-				", token_present=", attestation.Token != "")
+			s.logger.Trace("outbound evaluation attestation completed; index=", challenge.WindowIndex)
 			return attestation, nil
 		}
 		var status apiError
@@ -150,9 +145,7 @@ func (s *Service) attestWindow(ctx context.Context, challenge WindowChallenge) (
 			return Attestation{}, err
 		}
 		s.logger.Debug("outbound evaluation attestation failed; index=", challenge.WindowIndex,
-			", failure=", attestationFailureCode(err), ", attempts_remaining=", attestAttempts-attempt)
-		// Carrying the context error keeps the window's report on the deadline
-		// rather than the attestation failure that was about to be retried.
+			", attempts_remaining=", attestAttempts-attempt, ": ", err)
 		if attempt < attestAttempts && !sleepContext(ctx, s.retryDelay) {
 			return Attestation{}, fmt.Errorf("%w (%w)", ctx.Err(), err)
 		}
@@ -172,15 +165,4 @@ func fillWindow(window WindowReport, sample SampleSpec, code string) WindowRepor
 		window.ControlAttempts = append(window.ControlAttempts, slices.Repeat([]Attempt{failed}, missing)...)
 	}
 	return window
-}
-
-func attestationFailureCode(err error) string {
-	var status apiError
-	if errors.As(err, &status) && !status.retryable() {
-		return failureAttestationRejected
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return failureWindowDeadline
-	}
-	return failureAttestation
 }

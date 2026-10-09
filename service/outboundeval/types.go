@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"time"
 
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 
+	lbC "github.com/getlantern/lantern-box/constant"
 	lbO "github.com/getlantern/lantern-box/option"
 )
 
@@ -39,7 +41,8 @@ type Assignment struct {
 	ReportToken string `json:"report_token"`
 	// MeasurementURL is fetched by both eval targets; empty selects https://www.wikipedia.org/.
 	MeasurementURL string `json:"measurement_url,omitempty"`
-	// Candidate and Control override the configured measurement pair only when both are non-nil.
+	// Candidate and Control are the pair measured. An assignment lacking
+	// either is refused.
 	Candidate  *EvaluationTarget `json:"candidate_target,omitempty"`
 	Control    *EvaluationTarget `json:"control_target,omitempty"`
 	Sample     SampleSpec        `json:"sample_spec"`
@@ -134,8 +137,8 @@ type SampleSpec struct {
 	WindowsPerExit        uint32 `json:"windows_per_exit"`
 	AttemptsPerWindow     uint32 `json:"attempts_per_window"`
 	WindowDurationSeconds uint32 `json:"window_duration_seconds"`
-	// FreshSessionDelayMS is waited before a window opens, spacing windows so
-	// they do not share a network moment.
+	// FreshSessionDelayMS is the spacing the assignment requests before each
+	// window, so windows do not share a network moment.
 	FreshSessionDelayMS uint32 `json:"fresh_session_delay_milliseconds"`
 }
 
@@ -159,8 +162,8 @@ type Attestation struct {
 	Token string `json:"attestation_token"`
 }
 
-// Report is one assignment's complete result. Partial reports are not a thing:
-// a window that could not be measured is reported as failed attempts.
+// Report is one assignment's complete result: every window is attested and
+// fills the sample's grid.
 type Report struct {
 	ReportToken string `json:"report_token"`
 	// IdempotencyKey is stable across resubmissions of the same report.
@@ -170,7 +173,7 @@ type Report struct {
 
 // WindowReport is one window's attempts through both eval targets.
 type WindowReport struct {
-	// AttestationToken identifies the assignment's exit and window; it is empty if attestation failed.
+	// AttestationToken identifies the assignment's exit and window; it is never empty.
 	AttestationToken  string    `json:"exit_attestation_token"`
 	CandidateAttempts []Attempt `json:"candidate_attempts"`
 	ControlAttempts   []Attempt `json:"control_attempts"`
@@ -200,9 +203,12 @@ type bounds struct {
 	assignmentBytes   int64
 }
 
-// validate reports whether an assignment can be measured within the local
-// bounds.
+// validate refuses an assignment that breaks the runner contract or exceeds
+// the local bounds.
 func (a Assignment) validate(now time.Time, limits bounds) error {
+	if a.ID == "" || a.ReportToken == "" {
+		return fmt.Errorf("%w: assignment lacks an ID or report token", ErrInvalidContract)
+	}
 	if err := a.Sample.validate(limits); err != nil {
 		return err
 	}
@@ -218,31 +224,91 @@ func (a Assignment) validate(now time.Time, limits bounds) error {
 		return fmt.Errorf("%w: assignment has %d challenges, want %d",
 			ErrInvalidContract, len(a.Challenges), want)
 	}
+	seen := make(map[uint32]bool, len(a.Challenges))
+	for _, challenge := range a.Challenges {
+		switch {
+		case challenge.ExitIndex >= clientExitCount || challenge.WindowIndex >= a.Sample.WindowsPerExit:
+			return fmt.Errorf("%w: challenge for exit %d window %d is outside the sample",
+				ErrInvalidContract, challenge.ExitIndex, challenge.WindowIndex)
+		case seen[challenge.WindowIndex]:
+			return fmt.Errorf("%w: duplicate challenge for window %d", ErrInvalidContract, challenge.WindowIndex)
+		case challenge.Challenge == "":
+			return fmt.Errorf("%w: empty challenge for window %d", ErrInvalidContract, challenge.WindowIndex)
+		}
+		seen[challenge.WindowIndex] = true
+	}
 	for _, target := range []*EvaluationTarget{a.Candidate, a.Control} {
 		if err := target.validate(); err != nil {
 			return err
 		}
 	}
+	// The server tags each route's target uniquely, so a shared tag is one
+	// route on both sides of the pair.
+	if a.Candidate.tag() == a.Control.tag() {
+		return fmt.Errorf("%w: candidate and control are both %q", ErrInvalidContract, a.Candidate.tag())
+	}
 	return nil
 }
 
-// validate refuses an endpoint eval target that would listen on the device or
-// bring up a system interface, or whose type it cannot check for either: an
-// eval target is only ever dialed through.
+func (t *EvaluationTarget) tag() string {
+	switch options := t.Options.(type) {
+	case option.Outbound:
+		return options.Tag
+	case option.Endpoint:
+		return options.Tag
+	}
+	return ""
+}
+
+// nonProxyTypes are the outbound types that do not tunnel to a proxy of
+// their own, so a measurement through one is not of a proxy.
+var nonProxyTypes = map[string]bool{
+	C.TypeDirect: true, C.TypeBlock: true, C.TypeDNS: true,
+	C.TypeSelector: true, C.TypeURLTest: true,
+	lbC.TypeFallback: true, lbC.TypeMutableSelector: true,
+	lbC.TypeMutableURLTest: true, lbC.TypeMutableAutoSelect: true,
+	lbC.TypeBanditProbe: true,
+}
+
+// validate refuses an eval target that is not a proxy of its own or that
+// detours through another outbound, and an endpoint that would listen on the
+// device, bring up a system interface, or whose type it cannot check for
+// either.
 func (t *EvaluationTarget) validate() error {
-	if t == nil || t.Type != EvaluationTargetEndpoint {
+	if t == nil {
+		return fmt.Errorf("%w: assignment lacks an eval target", ErrInvalidContract)
+	}
+	var (
+		kind    string
+		options any
+	)
+	switch target := t.Options.(type) {
+	case option.Outbound:
+		kind, options = target.Type, target.Options
+	case option.Endpoint:
+		kind, options = target.Type, target.Options
+	default:
+		return fmt.Errorf("%w: %s eval target holds %T", ErrInvalidContract, t.Type, t.Options)
+	}
+	if nonProxyTypes[kind] {
+		return fmt.Errorf("%w: eval target type %q is not a proxy", ErrInvalidContract, kind)
+	}
+	if dialer, ok := options.(option.DialerOptionsWrapper); ok && dialer.TakeDialerOptions().Detour != "" {
+		return fmt.Errorf("%w: eval target detours through %q",
+			ErrInvalidContract, dialer.TakeDialerOptions().Detour)
+	}
+	if t.Type != EvaluationTargetEndpoint {
 		return nil
 	}
-	endpoint, _ := t.Options.(option.Endpoint)
 	var wireguard *option.WireGuardEndpointOptions
-	switch options := endpoint.Options.(type) {
+	switch options := options.(type) {
 	case *option.WireGuardEndpointOptions:
 		wireguard = options
 	case *lbO.AmneziaEndpointOptions:
 		wireguard = &options.WireGuardEndpointOptions
 	default:
 		return fmt.Errorf("%w: endpoint type %q is not an accepted eval target",
-			ErrInvalidContract, endpoint.Type)
+			ErrInvalidContract, kind)
 	}
 	switch {
 	case wireguard.ListenPort != 0:

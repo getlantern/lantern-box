@@ -25,15 +25,10 @@ const (
 	failureCanceled        = "canceled"
 )
 
-// Failure codes reported for every attempt of a window that could not be
-// measured at all. They fill the window so the grid stays complete, and they
-// fill both targets, which keeps the window from reading as evidence against
-// the candidate.
-const (
-	failureAttestation         = "attestation_failed"
-	failureAttestationRejected = "attestation_rejected"
-	failureWindowDeadline      = "window_deadline_exceeded"
-)
+// failureWindowDeadline marks an attempt the window ran out of time to start.
+// It is reported on both eval targets so the shortfall does not read as
+// evidence against the candidate.
+const failureWindowDeadline = "window_deadline_exceeded"
 
 // classifyFailure maps a probe failure onto a stable code. Handshake and reset
 // errors are classified ahead of the stage they surfaced at, because a TLS

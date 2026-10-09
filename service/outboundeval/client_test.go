@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	C "github.com/sagernet/sing-box/constant"
 	O "github.com/sagernet/sing-box/option"
+	sjson "github.com/sagernet/sing/common/json"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -31,7 +33,7 @@ func TestAcquireCarriesTheBearerTokenAndRequest(t *testing.T) {
 	s := wiredService(t, func(w http.ResponseWriter, r *http.Request) {
 		authorization = r.Header.Get("Authorization")
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-		require.NoError(t, json.NewEncoder(w).Encode(serverAssignment()))
+		writeAssignment(t, w, serverAssignment())
 	})
 
 	assignment, err := s.api.acquire("token",
@@ -69,6 +71,8 @@ func TestAcquireDecodesAssignmentResponse(t *testing.T) {
 		{WindowIndex: 0, Challenge: "1789257600.hQ2mS8vTzXc1pL0aBd4eFg"},
 		{WindowIndex: 1, Challenge: "1789257600.kR7nJ3wYuMb5qN9cVe2tHi"},
 	}, assignment.Challenges)
+	assert.Equal(t, C.TypeShadowsocks, assignment.Candidate.Options.(O.Outbound).Type)
+	assert.Equal(t, C.TypeWireGuard, assignment.Control.Options.(O.Endpoint).Type)
 }
 
 func TestAcquireDecodesTheTargets(t *testing.T) {
@@ -79,7 +83,6 @@ func TestAcquireDecodesTheTargets(t *testing.T) {
 		}`))
 		assert.NoError(t, err)
 	})
-	s.api.ctx = targetContext(s.ctx)
 
 	assignment, err := s.api.acquire("token", AssignmentRequest{})
 
@@ -105,7 +108,6 @@ func TestAcquireRefusesATargetItCannotDecode(t *testing.T) {
 				_, err := w.Write([]byte(body))
 				assert.NoError(t, err)
 			})
-			s.api.ctx = targetContext(s.ctx)
 
 			_, err := s.api.acquire("token", AssignmentRequest{})
 
@@ -191,6 +193,16 @@ func TestAPIErrorRetryability(t *testing.T) {
 	} {
 		assert.Equal(t, retryable, apiError{status: status}.retryable(), "HTTP %d", status)
 	}
+}
+
+// writeAssignment answers as the control API does; the standard library cannot
+// encode the targets' sing-box options.
+func writeAssignment(t *testing.T, w http.ResponseWriter, assignment Assignment) {
+	t.Helper()
+	encoded, err := sjson.MarshalContext(targetContext(context.Background()), &assignment)
+	require.NoError(t, err)
+	_, err = w.Write(encoded)
+	require.NoError(t, err)
 }
 
 // serverAssignment is what a control API hands out, current as of this moment

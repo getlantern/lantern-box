@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +17,8 @@ import (
 	sbox "github.com/sagernet/sing-box"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
+	sjson "github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
@@ -40,20 +44,40 @@ func evalBoxContext() context.Context {
 	return ctx
 }
 
-// bothTargets are the outbounds a complete cycle needs: sing-box declares no
-// implicit direct outbound for a config that names any of its own.
-func bothTargets() []option.Outbound {
-	return []option.Outbound{
-		{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}},
-		{Type: C.TypeDirect, Tag: "candidate", Options: &option.DirectOutboundOptions{}},
-	}
+// proxyPort picks a free loopback port.
+func proxyPort(t *testing.T) uint16 {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := listener.Addr().(*net.TCPAddr).Port
+	require.NoError(t, listener.Close())
+	return uint16(port)
+}
+
+// proxyTarget is a SOCKS eval target that tunnels through the box's own proxy
+// inbound on port.
+func proxyTarget(tag string, port uint16) *outboundeval.EvaluationTarget {
+	return &outboundeval.EvaluationTarget{Type: outboundeval.EvaluationTargetOutbound, Options: option.Outbound{
+		Type: C.TypeSOCKS, Tag: tag, Options: &option.SOCKSOutboundOptions{
+			ServerOptions: option.ServerOptions{Server: "127.0.0.1", ServerPort: port},
+		},
+	}}
 }
 
 // evalBoxOptions is a box running nothing but the evaluation service, pointed
-// at a control API on baseURL.
-func evalBoxOptions(baseURL, token string, outbounds []option.Outbound) option.Options {
+// at a control API on baseURL, with a proxy inbound on port for the eval
+// targets to tunnel through.
+func evalBoxOptions(baseURL, token string, outbounds []option.Outbound, port uint16) option.Options {
 	return option.Options{
-		Log:       &option.LogOptions{Disabled: true},
+		Log: &option.LogOptions{Disabled: true},
+		Inbounds: []option.Inbound{{
+			Type: C.TypeMixed, Tag: "proxy-in", Options: &option.HTTPMixedInboundOptions{
+				ListenOptions: option.ListenOptions{
+					Listen:     common.Ptr(badoption.Addr(netip.MustParseAddr("127.0.0.1"))),
+					ListenPort: port,
+				},
+			},
+		}},
 		Outbounds: outbounds,
 		Services: []option.Service{{
 			Type: constant.TypeOutboundEval,
@@ -64,17 +88,25 @@ func evalBoxOptions(baseURL, token string, outbounds []option.Outbound) option.O
 				SubmitURL:    baseURL + "/reports",
 				Token:        token,
 				CountryCode:  "RU",
-				OutboundTag:  "candidate",
 				PollInterval: badoption.Duration(10 * time.Millisecond),
+				// Windows run back to back so a test finishes in seconds.
+				MinFreshSessionDelay: badoption.Duration(time.Millisecond),
 			},
 		}},
 	}
 }
 
+func directOutbound() []option.Outbound {
+	return []option.Outbound{{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}}}
+}
+
 // controlAPI stands in for the evaluation control plane: it hands out one
 // assignment, attests every window, and captures the report.
 type controlAPI struct {
-	t           *testing.T
+	t *testing.T
+	// ctx holds the registries the targets' sing-box options encode through.
+	ctx         context.Context
+	proxyPort   uint16
 	mu          sync.Mutex
 	tokens      []string
 	challenges  []string
@@ -89,6 +121,8 @@ func (c *controlAPI) assignment() outboundeval.Assignment {
 		ID:             "e2e-assignment",
 		ReportToken:    "e2e-report-token",
 		MeasurementURL: "https://measure.invalid/resource",
+		Candidate:      proxyTarget("candidate", c.proxyPort),
+		Control:        proxyTarget("control", c.proxyPort),
 		Sample: outboundeval.SampleSpec{
 			WindowsPerExit:        2,
 			AttemptsPerWindow:     1,
@@ -108,8 +142,14 @@ func (c *controlAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.mu.Lock()
 		c.tokens = append(c.tokens, r.Header.Get("Authorization"))
 		c.mu.Unlock()
-		if err := json.NewEncoder(w).Encode(c.assignment()); err != nil {
+		assignment := c.assignment()
+		encoded, err := sjson.MarshalContext(c.ctx, &assignment)
+		if err != nil {
 			c.t.Errorf("encode assignment: %v", err)
+			return
+		}
+		if _, err := w.Write(encoded); err != nil {
+			c.t.Errorf("write assignment: %v", err)
 		}
 	case strings.HasSuffix(r.URL.Path, "/attestations"):
 		var request outboundeval.AttestationRequest
@@ -143,18 +183,18 @@ func (c *controlAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // TestOutboundEvalRunsInsideABox drives the service through a real box: the
-// registry entry, the option decoding, the outbound lookups at start, and one
-// whole cycle onto the wire.
+// registry entry, the option decoding, the control outbound lookup at start,
+// and one whole cycle onto the wire.
 //
 // The measurement target does not resolve, so every attempt fails. That is the
 // point of the assertion: the grid still has to arrive complete.
 func TestOutboundEvalRunsInsideABox(t *testing.T) {
-	api := &controlAPI{t: t, reported: make(chan struct{})}
+	boxCtx := evalBoxContext()
+	api := &controlAPI{t: t, ctx: boxCtx, proxyPort: proxyPort(t), reported: make(chan struct{})}
 	server := httptest.NewTLSServer(api)
 	t.Cleanup(server.Close)
 
-	boxCtx := evalBoxContext()
-	options := evalBoxOptions(server.URL, "e2e-token", bothTargets())
+	options := evalBoxOptions(server.URL, "e2e-token", directOutbound(), api.proxyPort)
 	options.Certificate = &option.CertificateOptions{
 		Certificate: []string{string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}))},
 	}
@@ -201,34 +241,17 @@ func TestOutboundEvalRunsInsideABox(t *testing.T) {
 	assert.Equal(t, "Bearer e2e-token", api.tokens[0])
 }
 
-// TestOutboundEvalRefusesAConfigWithoutItsTargets proves the service names the
-// outbound it could not find rather than measuring nothing in silence.
-func TestOutboundEvalRefusesAConfigWithoutItsTargets(t *testing.T) {
-	for name, test := range map[string]struct {
-		outbounds []option.Outbound
-		missing   string
-	}{
-		"no control outbound": {
-			outbounds: []option.Outbound{
-				{Type: C.TypeDirect, Tag: "candidate", Options: &option.DirectOutboundOptions{}},
-			},
-			missing: `"direct"`,
-		},
-		"no outbound under test": {
-			outbounds: []option.Outbound{
-				{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}},
-			},
-			missing: `"candidate"`,
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			instance, err := sbox.New(sbox.Options{
-				Context: evalBoxContext(),
-				Options: evalBoxOptions("https://control.invalid", "token", test.outbounds),
-			})
-			require.NoError(t, err)
-			assert.ErrorContains(t, instance.Start(), test.missing)
-			_ = instance.Close()
-		})
-	}
+// TestOutboundEvalRefusesAConfigWithoutItsControlOutbound proves the service
+// names the outbound it could not find rather than measuring nothing in
+// silence.
+func TestOutboundEvalRefusesAConfigWithoutItsControlOutbound(t *testing.T) {
+	instance, err := sbox.New(sbox.Options{
+		Context: evalBoxContext(),
+		Options: evalBoxOptions("https://control.invalid", "token", []option.Outbound{
+			{Type: C.TypeDirect, Tag: "proxy", Options: &option.DirectOutboundOptions{}},
+		}, proxyPort(t)),
+	})
+	require.NoError(t, err)
+	assert.ErrorContains(t, instance.Start(), `"direct"`)
+	_ = instance.Close()
 }

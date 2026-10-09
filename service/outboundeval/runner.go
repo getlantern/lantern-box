@@ -21,23 +21,19 @@ const clientExitCount = 1
 const retryBaseWait = 30 * time.Second
 
 var (
-	errOutboundUnavailable = errors.New("outbound under test is unavailable")
-	errUnattestedReport    = errors.New("report contains an unattested window")
+	errUnattestedWindow = errors.New("assignment has a window that could not be attested")
+	errAssignmentEnded  = errors.New("assignment ended")
 )
 
 func (s *Service) run() {
 	defer close(s.done)
 	defer s.logger.Info("outbound evaluation runner stopped")
 	s.logger.Info("outbound evaluation runner started; first poll in ", time.Duration(s.options.PollInterval))
-	ticker := time.NewTicker(time.Duration(s.options.PollInterval))
-	defer ticker.Stop()
+	if !sleepContext(s.ctx, time.Duration(s.options.PollInterval)) {
+		return
+	}
 	retries := backoff.NewExponentialBackoff(s.retryBase, time.Duration(s.options.MaxRetryBackoff))
 	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-ticker.C:
-		}
 		var err error
 		for {
 			if err = s.runCycle(); !retryableCycleError(err) {
@@ -54,11 +50,14 @@ func (s *Service) run() {
 		if err != nil {
 			interval = time.Duration(s.options.NoAssignmentInterval)
 			if !errors.Is(err, ErrNoAssignment) {
-				s.logger.Warn("outbound evaluation refused: ", err)
+				s.logger.Warn("outbound evaluation cycle failed: ", err)
 			}
 		}
-		s.logger.Debug("next outbound evaluation poll in ", interval)
-		ticker.Reset(interval)
+		wait := max(interval-time.Since(s.lastAsk), 0)
+		s.logger.Trace("next outbound evaluation poll in ", wait)
+		if !sleepContext(s.ctx, wait) {
+			return
+		}
 	}
 }
 
@@ -74,14 +73,15 @@ func (s *Service) runCycle() error {
 			ExitCount:      clientExitCount,
 		}
 	}
-	s.logger.Debug("requesting outbound evaluation assignment; retry=", retrying)
+	s.logger.Trace("requesting outbound evaluation assignment; retry=", retrying)
+	s.lastAsk = time.Now()
 	assignment, err := s.api.acquire(s.options.Token, *s.pendingAssignment)
 	if !retryableCycleError(err) {
 		s.pendingAssignment = nil
 	}
 	if err != nil {
 		if errors.Is(err, ErrNoAssignment) {
-			s.logger.Info("no outbound evaluation assignment available; next poll in ", time.Duration(s.options.NoAssignmentInterval))
+			s.logger.Debug("no outbound evaluation assignment available; next poll in ", time.Duration(s.options.NoAssignmentInterval))
 		}
 		return err
 	}
@@ -96,29 +96,23 @@ func (s *Service) runCycle() error {
 		", expires_in=", assignment.ExpiresAt.Sub(now))
 
 	started := time.Now()
-	report, err := s.measureAssignment(s.options.OutboundTag, assignment)
+	report, err := s.measureAssignment(assignment)
 	if err != nil {
 		return err
 	}
-	s.logger.Info("outbound evaluation measurements completed; windows=", len(report.Windows),
+	s.logger.Debug("outbound evaluation measurements completed; windows=", len(report.Windows),
 		", elapsed=", time.Since(started))
 	return s.submitReport(report)
 }
 
-// submitReport refuses reports with unattested windows and retries transient submission failures.
+// submitReport retries transient submission failures.
 func (s *Service) submitReport(report Report) error {
-	for i, window := range report.Windows {
-		if window.AttestationToken == "" {
-			s.logger.Debug("outbound evaluation report not submitted; unattested window=", i)
-			return fmt.Errorf("%w: window %d", errUnattestedReport, i)
-		}
-	}
 	var err error
 	for attempt := 1; attempt <= submitAttempts; attempt++ {
 		if err := s.ctx.Err(); err != nil {
 			return err
 		}
-		s.logger.Debug("submitting outbound evaluation report; attempt=", attempt, "/", submitAttempts,
+		s.logger.Trace("submitting outbound evaluation report; attempt=", attempt, "/", submitAttempts,
 			", windows=", len(report.Windows))
 		err = s.api.submit(s.options.Token, report)
 		if err == nil {
@@ -143,8 +137,8 @@ func (s *Service) submitReport(report Report) error {
 
 func retryableCycleError(err error) bool {
 	if err == nil || errors.Is(err, ErrNoAssignment) ||
-		errors.Is(err, errOutboundUnavailable) || errors.Is(err, ErrInvalidContract) ||
-		errors.Is(err, errUnattestedReport) ||
+		errors.Is(err, ErrInvalidContract) || errors.Is(err, errUnattestedWindow) ||
+		errors.Is(err, errAssignmentEnded) ||
 		errors.Is(err, context.Canceled) {
 		return false
 	}
@@ -155,15 +149,16 @@ func retryableCycleError(err error) bool {
 	return true
 }
 
-// sleepContext reports false when ctx ended before the delay elapsed.
+// sleepContext waits out delay, or until ctx ends, and reports whether ctx is
+// still live.
 func sleepContext(ctx context.Context, delay time.Duration) bool {
-	if delay <= 0 {
-		return ctx.Err() == nil
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
 	}
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(delay):
-		return true
-	}
+	return ctx.Err() == nil
 }

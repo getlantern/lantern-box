@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -133,12 +134,6 @@ func (m *assignmentTestEndpoints) Remove(tag string) error {
 	return endpoint.Close()
 }
 
-func outboundTarget(tag string) *EvaluationTarget {
-	return &EvaluationTarget{Type: EvaluationTargetOutbound, Options: O.Outbound{
-		Type: "direct", Tag: tag, Options: &O.DirectOutboundOptions{},
-	}}
-}
-
 func targetOptions(target *EvaluationTarget) any {
 	switch options := target.Options.(type) {
 	case O.Outbound:
@@ -152,8 +147,8 @@ func targetOptions(target *EvaluationTarget) any {
 func assignmentWithOutbounds() Assignment {
 	assignment := serverAssignment()
 	assignment.Sample.FreshSessionDelayMS = 0
-	assignment.Candidate = outboundTarget("candidate")
-	assignment.Control = outboundTarget("direct")
+	assignment.Candidate = proxyTarget("candidate")
+	assignment.Control = proxyTarget("direct")
 	return assignment
 }
 
@@ -161,7 +156,7 @@ func serviceWithAssignmentManager(t *testing.T) (*Service, *assignmentTestManage
 	t.Helper()
 	s := newTestService(t, testOptions())
 	manager := &assignmentTestManager{outbounds: map[string]A.Outbound{
-		"candidate": testCandidate(), "direct": s.control,
+		"candidate": testCandidate(), "direct": testControl(),
 	}}
 	s.outbounds = manager
 	s.attest = func(_ context.Context, request AttestationRequest) (Attestation, error) {
@@ -170,62 +165,36 @@ func serviceWithAssignmentManager(t *testing.T) (*Service, *assignmentTestManage
 	return s, manager
 }
 
-func TestAssignmentOutboundsRequireBothTargets(t *testing.T) {
-	for _, test := range []struct {
-		name               string
-		candidate, control bool
-	}{
-		{name: "neither"},
-		{name: "candidate only", candidate: true},
-		{name: "control only", control: true},
-		{name: "both", candidate: true, control: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			s, manager := serviceWithAssignmentManager(t)
-			configuredCandidate, _ := manager.Outbound("candidate")
-			configuredControl := s.control
-			assignment := assignmentWithOutbounds()
-			if !test.candidate {
-				assignment.Candidate = nil
-			}
-			if !test.control {
-				assignment.Control = nil
-			}
-			var measured []A.Outbound
-			s.measure = func(_ context.Context, out A.Outbound, _ string) Attempt {
-				measured = append(measured, out)
-				assert.Same(t, configuredControl, s.control)
-				return Attempt{Reachable: true}
-			}
-
-			report, err := s.measureAssignment("candidate", assignment)
-
-			require.NoError(t, err)
-			require.NoError(t, s.Close())
-			requireCompleteGrid(t, report, assignment.Sample)
-			candidate, control := configuredCandidate, configuredControl
-			if test.candidate && test.control {
-				require.Len(t, manager.created, 2)
-				assert.Equal(t, []any{targetOptions(assignment.Candidate), targetOptions(assignment.Control)}, manager.options)
-				candidate, control = manager.created[0], manager.created[1]
-				assertOutboundsClosed(t, manager.created)
-				for _, out := range manager.created {
-					_, found := manager.Outbound(out.Tag())
-					assert.False(t, found)
-				}
-			} else {
-				assert.Empty(t, manager.created)
-			}
-			assert.Equal(t, []A.Outbound{
-				candidate, control, candidate, control,
-				control, candidate, control, candidate,
-			}, measured)
-			currentCandidate, _ := manager.Outbound("candidate")
-			currentControl, _ := manager.Outbound("direct")
-			assert.Same(t, configuredCandidate, currentCandidate)
-			assert.Same(t, configuredControl, currentControl)
-		})
+func TestAssignmentOutboundsAreCreatedAndRemoved(t *testing.T) {
+	s, manager := serviceWithAssignmentManager(t)
+	configuredCandidate, _ := manager.Outbound("candidate")
+	configuredControl, _ := manager.Outbound("direct")
+	assignment := assignmentWithOutbounds()
+	measured := &recorder{}
+	s.measure = func(_ context.Context, out A.Outbound, _ string) Attempt {
+		measured.record(out.Tag())
+		return Attempt{Reachable: true}
 	}
+
+	report, err := s.measureAssignment(assignment)
+
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	requireCompleteGrid(t, report, assignment.Sample)
+	require.Len(t, manager.created, 2)
+	assert.Equal(t, []any{targetOptions(assignment.Candidate), targetOptions(assignment.Control)}, manager.options)
+	assertOutboundsClosed(t, manager.created)
+	for _, out := range manager.created {
+		_, found := manager.Outbound(out.Tag())
+		assert.False(t, found)
+	}
+	pairs := int(assignment.Sample.WindowsPerExit * assignment.Sample.AttemptsPerWindow)
+	assert.ElementsMatch(t, append(slices.Repeat([]string{manager.created[0].Tag()}, pairs),
+		slices.Repeat([]string{manager.created[1].Tag()}, pairs)...), measured.recorded())
+	currentCandidate, _ := manager.Outbound("candidate")
+	currentControl, _ := manager.Outbound("direct")
+	assert.Same(t, configuredCandidate, currentCandidate, "a configured outbound is never replaced")
+	assert.Same(t, configuredControl, currentControl, "a configured outbound is never replaced")
 }
 
 func TestAssignmentTargetsUseTheManagerOfTheirKind(t *testing.T) {
@@ -236,13 +205,13 @@ func TestAssignmentTargetsUseTheManagerOfTheirKind(t *testing.T) {
 	assignment.Control = &EvaluationTarget{Type: EvaluationTargetEndpoint, Options: O.Endpoint{
 		Type: "wireguard", Tag: "control", Options: &O.WireGuardEndpointOptions{},
 	}}
-	var measured []A.Outbound
+	measured := &recorder{}
 	s.measure = func(_ context.Context, out A.Outbound, _ string) Attempt {
-		measured = append(measured, out)
+		measured.record(out.Tag())
 		return Attempt{Reachable: true}
 	}
 
-	report, err := s.measureAssignment("candidate", assignment)
+	report, err := s.measureAssignment(assignment)
 
 	require.NoError(t, err)
 	requireCompleteGrid(t, report, assignment.Sample)
@@ -250,11 +219,9 @@ func TestAssignmentTargetsUseTheManagerOfTheirKind(t *testing.T) {
 	require.Len(t, endpoints.created, 1)
 	assert.Equal(t, []any{targetOptions(assignment.Candidate)}, manager.options)
 	assert.Equal(t, []any{targetOptions(assignment.Control)}, endpoints.options)
-	candidate, control := A.Outbound(manager.created[0]), A.Outbound(endpoints.created[0])
-	assert.Equal(t, []A.Outbound{
-		candidate, control, candidate, control,
-		control, candidate, control, candidate,
-	}, measured)
+	pairs := int(assignment.Sample.WindowsPerExit * assignment.Sample.AttemptsPerWindow)
+	assert.ElementsMatch(t, append(slices.Repeat([]string{manager.created[0].Tag()}, pairs),
+		slices.Repeat([]string{endpoints.created[0].Tag()}, pairs)...), measured.recorded())
 	assertOutboundsClosed(t, manager.created)
 	assert.EqualValues(t, 1, endpoints.created[0].closes.Load())
 	assert.Empty(t, endpoints.endpoints)
@@ -272,7 +239,7 @@ func TestAssignmentOutboundsCleanUpCreationFailure(t *testing.T) {
 				return Attempt{}
 			}
 
-			_, err := s.measureAssignment("candidate", assignmentWithOutbounds())
+			_, err := s.measureAssignment(assignmentWithOutbounds())
 
 			require.ErrorIs(t, err, manager.createErr)
 			require.Len(t, manager.created, failAt-1)
@@ -287,7 +254,7 @@ func TestAssignmentOutboundsSurfaceCleanupErrors(t *testing.T) {
 	manager.removeErr = errors.New("close failed")
 	s.measure = reachableMeasure
 
-	_, err := s.measureAssignment("candidate", assignmentWithOutbounds())
+	_, err := s.measureAssignment(assignmentWithOutbounds())
 
 	require.ErrorIs(t, err, manager.removeErr)
 	require.Len(t, manager.created, 2)
@@ -304,10 +271,9 @@ func TestAssignmentOutboundsCleanUpAfterAttestationFailure(t *testing.T) {
 		return Attempt{}
 	}
 
-	report, err := s.measureAssignment("candidate", assignmentWithOutbounds())
+	_, err := s.measureAssignment(assignmentWithOutbounds())
 
-	require.NoError(t, err)
-	require.ErrorIs(t, s.submitReport(report), errUnattestedReport)
+	require.ErrorIs(t, err, errUnattestedWindow)
 	require.Len(t, manager.created, 2)
 	assertOutboundsClosed(t, manager.created)
 	assert.Len(t, manager.outbounds, 2)
@@ -324,7 +290,7 @@ func TestCloseRemovesAssignmentOutboundsDuringMeasurement(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.measureAssignment("candidate", assignmentWithOutbounds())
+		_, err := s.measureAssignment(assignmentWithOutbounds())
 		done <- err
 	}()
 	select {
@@ -338,7 +304,7 @@ func TestCloseRemovesAssignmentOutboundsDuringMeasurement(t *testing.T) {
 
 	select {
 	case err := <-done:
-		require.NoError(t, err)
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(time.Second):
 		t.Fatal("measurement did not stop")
 	}
@@ -356,7 +322,7 @@ func TestCloseDuringAssignmentOutboundCreation(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.measureAssignment("candidate", assignmentWithOutbounds())
+		_, err := s.measureAssignment(assignmentWithOutbounds())
 		done <- err
 	}()
 	select {
@@ -389,7 +355,7 @@ func TestAssignmentDeadlineStopsOutboundCreation(t *testing.T) {
 		}
 		start := time.Now()
 
-		_, err := s.measureAssignment("candidate", assignment)
+		_, err := s.measureAssignment(assignment)
 
 		require.ErrorIs(t, err, context.DeadlineExceeded)
 		assert.Equal(t, time.Second, time.Since(start))

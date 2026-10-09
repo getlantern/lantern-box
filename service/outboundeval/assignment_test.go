@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,9 +37,9 @@ func (o *stubOutbound) DialContext(ctx context.Context, network string, _ M.Sock
 	return (&net.Dialer{}).DialContext(ctx, network, o.address)
 }
 
-// testCandidate is the outbound under test for a grid run without a cycle to
-// resolve one.
 func testCandidate() A.Outbound { return &stubOutbound{tag: "candidate"} }
+
+func testControl() A.Outbound { return &stubOutbound{tag: "direct"} }
 
 func testOptions() option.OutboundEvalServiceOptions {
 	return option.OutboundEvalServiceOptions{
@@ -45,32 +48,32 @@ func testOptions() option.OutboundEvalServiceOptions {
 		SubmitURL:   "https://127.0.0.1:1/reports",
 		Token:       "token",
 		CountryCode: "RU",
-		OutboundTag: "candidate",
+		// Disables the spacing floor so only the sample's own spacing applies.
+		MinFreshSessionDelay: badoption.Duration(time.Nanosecond),
 	}
 }
 
 func newTestService(t *testing.T, options option.OutboundEvalServiceOptions) *Service {
 	t.Helper()
-	created, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "eval", options)
+	created, err := NewService(targetContext(context.Background()), log.NewNOPFactory().Logger(), "eval", options)
 	require.NoError(t, err)
 	s := created.(*Service)
 	s.retryDelay = time.Millisecond
 	s.timeService = liveTime{}
-	s.control = &stubOutbound{tag: "direct"}
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 	return s
 }
 
-// recorder captures which eval target each measurement went through, in order.
+// recorder collects strings from concurrent callers.
 type recorder struct {
 	mu    sync.Mutex
 	calls []string
 }
 
-func (r *recorder) record(tag string) {
+func (r *recorder) record(value string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.calls = append(r.calls, tag)
+	r.calls = append(r.calls, value)
 }
 
 func (r *recorder) recorded() []string {
@@ -79,12 +82,13 @@ func (r *recorder) recorded() []string {
 	return append([]string(nil), r.calls...)
 }
 
-func TestRunAssignmentFillsTheGridAndAlternatesTargets(t *testing.T) {
+func TestRunAssignmentMeasuresEachPairTogether(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newTestService(t, testOptions())
 		calls := &recorder{}
 		s.measure = func(_ context.Context, out A.Outbound, _ string) Attempt {
 			calls.record(out.Tag())
+			time.Sleep(time.Second)
 			return Attempt{Reachable: true, HTTPStatus: http.StatusOK, BytesRead: 4096}
 		}
 		s.attest = func(_ context.Context, request AttestationRequest) (Attestation, error) {
@@ -92,18 +96,21 @@ func TestRunAssignmentFillsTheGridAndAlternatesTargets(t *testing.T) {
 		}
 
 		assignment := validAssignment()
-		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
+		start := time.Now()
+		report, err := s.runAssignment(context.Background(), testCandidate(), testControl(), assignment)
 
+		require.NoError(t, err)
 		requireCompleteGrid(t, report, assignment.Sample)
 		assert.Equal(t, assignment.ID, report.IdempotencyKey)
 		require.Len(t, report.Windows, 2)
 		assert.Equal(t, "attested-challenge-0", report.Windows[0].AttestationToken)
 		assert.Equal(t, "attested-challenge-1", report.Windows[1].AttestationToken)
-		// Even windows lead with the candidate, odd windows with the control.
-		assert.Equal(t, []string{
-			"candidate", "direct", "candidate", "direct",
-			"direct", "candidate", "direct", "candidate",
-		}, calls.recorded())
+		pairs := int(assignment.Sample.WindowsPerExit * assignment.Sample.AttemptsPerWindow)
+		spacing := time.Duration(assignment.Sample.WindowsPerExit) * assignment.Sample.freshSessionDelay()
+		assert.Equal(t, time.Duration(pairs)*time.Second+spacing, time.Since(start),
+			"each pair takes as long as one measurement")
+		assert.ElementsMatch(t, append(slices.Repeat([]string{"candidate"}, pairs),
+			slices.Repeat([]string{"direct"}, pairs)...), calls.recorded())
 	})
 }
 
@@ -128,18 +135,20 @@ func TestRunAssignmentMeasurementURL(t *testing.T) {
 				s.attest = func(context.Context, AttestationRequest) (Attestation, error) {
 					return Attestation{Token: "attested"}, nil
 				}
-				calls := make(map[string]int)
+				calls := &recorder{}
 				s.measure = func(_ context.Context, out A.Outbound, target string) Attempt {
 					assert.Equal(t, test.want, target)
-					calls[out.Tag()]++
+					calls.record(out.Tag())
 					return Attempt{Reachable: true, HTTPStatus: http.StatusOK}
 				}
 
-				report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
+				report, err := s.runAssignment(context.Background(), testCandidate(), testControl(), assignment)
 
+				require.NoError(t, err)
 				requireCompleteGrid(t, report, assignment.Sample)
 				wantCalls := int(assignment.Sample.WindowsPerExit * assignment.Sample.AttemptsPerWindow)
-				assert.Equal(t, map[string]int{"candidate": wantCalls, "direct": wantCalls}, calls)
+				assert.ElementsMatch(t, append(slices.Repeat([]string{"candidate"}, wantCalls),
+					slices.Repeat([]string{"direct"}, wantCalls)...), calls.recorded())
 				encoded, err := json.Marshal(decoded)
 				require.NoError(t, err)
 				if test.name != "override" {
@@ -150,46 +159,37 @@ func TestRunAssignmentMeasurementURL(t *testing.T) {
 	}
 }
 
-func TestRunAssignmentPadsAnUnattestedWindow(t *testing.T) {
+func TestRunAssignmentStopsAtAnUnattestedWindow(t *testing.T) {
 	for name, attestErr := range map[string]error{
 		"refused":  apiError{status: http.StatusForbidden},
 		"unstable": apiError{status: http.StatusBadGateway},
+		"no token": nil,
 	} {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				s := newTestService(t, testOptions())
-				measured := 0
+				var measured atomic.Int32
 				s.measure = func(context.Context, A.Outbound, string) Attempt {
-					measured++
+					measured.Add(1)
 					return Attempt{Reachable: true, HTTPStatus: http.StatusOK}
 				}
+				challenges := &recorder{}
 				s.attest = func(_ context.Context, request AttestationRequest) (Attestation, error) {
-					if request.Challenge == "challenge-1" {
-						return Attestation{}, attestErr
-					}
-					return Attestation{Token: "attestation-0"}, nil
+					challenges.record(request.Challenge)
+					return Attestation{}, attestErr
 				}
 
-				assignment := validAssignment()
-				report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
+				_, err := s.runAssignment(context.Background(), testCandidate(), testControl(), validAssignment())
 
-				requireCompleteGrid(t, report, assignment.Sample)
-				assert.Empty(t, report.Windows[1].AttestationToken)
-				assert.NotZero(t, report.Windows[1].ObservedAt, "a padded window is still observed")
-				want := failureAttestationRejected
-				if name == "unstable" {
-					want = failureAttestation
+				require.ErrorIs(t, err, errUnattestedWindow)
+				if attestErr != nil {
+					assert.ErrorIs(t, err, attestErr)
+				} else {
+					assert.ErrorIs(t, err, errEmptyAttestation)
 				}
-				for _, attempts := range [][]Attempt{
-					report.Windows[1].CandidateAttempts, report.Windows[1].ControlAttempts,
-				} {
-					for _, attempt := range attempts {
-						assert.False(t, attempt.Reachable)
-						assert.Equal(t, want, attempt.FailureCode)
-					}
-				}
-				// Only the attested window was measured.
-				assert.Equal(t, 2*int(assignment.Sample.AttemptsPerWindow), measured)
+				assert.Zero(t, measured.Load(), "an unattested window is not measured")
+				assert.NotContains(t, challenges.recorded(), "challenge-1",
+					"no window after an unattested one is attempted")
 			})
 		})
 	}
@@ -243,23 +243,26 @@ func TestRunAssignmentPadsWhenTheWindowRunsOutOfTime(t *testing.T) {
 		}
 
 		assignment := validAssignment()
-		assignment.Sample.AttemptsPerWindow = 4
+		assignment.Sample.AttemptsPerWindow = 5
 		assignment.Sample.WindowDurationSeconds = 1
 		assignment.Sample.FreshSessionDelayMS = 0
-		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
+		report, err := s.runAssignment(context.Background(), testCandidate(), testControl(), assignment)
 
+		require.NoError(t, err)
 		requireCompleteGrid(t, report, assignment.Sample)
-		assert.Equal(t, failureWindowDeadline,
-			report.Windows[0].CandidateAttempts[int(assignment.Sample.AttemptsPerWindow)-1].FailureCode)
+		for _, attempts := range [][]Attempt{report.Windows[0].CandidateAttempts, report.Windows[0].ControlAttempts} {
+			assert.True(t, attempts[2].Reachable)
+			assert.Equal(t, failureTimeout, attempts[3].FailureCode, "the deadline cut this attempt short")
+			assert.Equal(t, failureWindowDeadline, attempts[4].FailureCode, "the window ended before this attempt")
+		}
 	})
 }
 
-func TestRunWindowPadsWhenTheAssignmentEndsDuringTheSpacing(t *testing.T) {
+func TestRunAssignmentGivesUpWhenItEndsDuringTheSpacing(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newTestService(t, testOptions())
-		attested := false
 		s.attest = func(context.Context, AttestationRequest) (Attestation, error) {
-			attested = true
+			t.Error("a window that never opened must not be attested")
 			return Attestation{Token: "attestation"}, nil
 		}
 		s.measure = func(context.Context, A.Outbound, string) Attempt {
@@ -272,23 +275,14 @@ func TestRunWindowPadsWhenTheAssignmentEndsDuringTheSpacing(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 
-		report := s.runAssignment(ctx, testCandidate(), s.control, assignment)
+		_, err := s.runAssignment(ctx, testCandidate(), testControl(), assignment)
 
-		requireCompleteGrid(t, report, assignment.Sample)
-		assert.False(t, attested, "a window that never opened must not be attested")
-		for _, window := range report.Windows {
-			assert.Empty(t, window.AttestationToken)
-			for _, attempts := range [][]Attempt{window.CandidateAttempts, window.ControlAttempts} {
-				for _, attempt := range attempts {
-					assert.False(t, attempt.Reachable)
-					assert.Equal(t, failureWindowDeadline, attempt.FailureCode)
-				}
-			}
-		}
+		require.ErrorIs(t, err, errAssignmentEnded)
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
 	})
 }
 
-func TestRunWindowSeparatesADeadlineFromARejectedAttestation(t *testing.T) {
+func TestRunAssignmentGivesUpWhenAttestationOutlastsTheWindow(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newTestService(t, testOptions())
 		s.attest = func(ctx context.Context, _ AttestationRequest) (Attestation, error) {
@@ -303,48 +297,10 @@ func TestRunWindowSeparatesADeadlineFromARejectedAttestation(t *testing.T) {
 		assignment := validAssignment()
 		assignment.Sample.WindowDurationSeconds = 1
 
-		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
+		_, err := s.runAssignment(context.Background(), testCandidate(), testControl(), assignment)
 
-		requireCompleteGrid(t, report, assignment.Sample)
-		for _, window := range report.Windows {
-			assert.Empty(t, window.AttestationToken)
-			for _, attempts := range [][]Attempt{window.CandidateAttempts, window.ControlAttempts} {
-				for _, attempt := range attempts {
-					assert.False(t, attempt.Reachable)
-					assert.Equal(t, failureWindowDeadline, attempt.FailureCode,
-						"a deadline is not the server refusing the challenge")
-				}
-			}
-		}
-	})
-}
-
-func TestRunWindowReportsADeadlineThatLandsBetweenAttestationAttempts(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		s := newTestService(t, testOptions())
-		s.retryDelay = 2 * time.Second
-		s.attest = func(context.Context, AttestationRequest) (Attestation, error) {
-			return Attestation{}, apiError{status: http.StatusBadGateway}
-		}
-		s.measure = func(context.Context, A.Outbound, string) Attempt {
-			t.Error("an unattested window must not measure")
-			return Attempt{}
-		}
-
-		assignment := validAssignment()
-		assignment.Sample.WindowDurationSeconds = 1
-
-		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
-
-		requireCompleteGrid(t, report, assignment.Sample)
-		for _, window := range report.Windows {
-			for _, attempts := range [][]Attempt{window.CandidateAttempts, window.ControlAttempts} {
-				for _, attempt := range attempts {
-					assert.Equal(t, failureWindowDeadline, attempt.FailureCode,
-						"a window that ran out mid-retry is not an attestation failure")
-				}
-			}
-		}
+		require.ErrorIs(t, err, errUnattestedWindow)
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
 	})
 }
 
@@ -361,8 +317,9 @@ func TestRunWindowDoesNotSpendTheWindowOnItsSpacing(t *testing.T) {
 		assignment := validAssignment()
 		assignment.Sample.WindowDurationSeconds = 1
 		assignment.Sample.FreshSessionDelayMS = 1200
-		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
+		report, err := s.runAssignment(context.Background(), testCandidate(), testControl(), assignment)
 
+		require.NoError(t, err)
 		requireCompleteGrid(t, report, assignment.Sample)
 		for _, window := range report.Windows {
 			for _, attempt := range window.CandidateAttempts {
@@ -372,35 +329,42 @@ func TestRunWindowDoesNotSpendTheWindowOnItsSpacing(t *testing.T) {
 	})
 }
 
-func TestRunWindowDoesNotBlameATargetForTheWindowsOwnBudget(t *testing.T) {
+// A candidate that times out on every attempt leaves its control the whole
+// window, so the window counts against the candidate rather than reading as
+// inconclusive.
+func TestRunWindowLetsAControlOutlastADeadCandidate(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newTestService(t, testOptions())
 		s.attest = func(context.Context, AttestationRequest) (Attestation, error) {
 			return Attestation{Token: "attestation"}, nil
 		}
-		// Each eval target takes most of the window, so the second one is always
-		// the one cut short.
-		s.measure = func(ctx context.Context, _ A.Outbound, _ string) Attempt {
-			if !sleepContext(ctx, 600*time.Millisecond) {
-				return Attempt{FailureCode: failureTimeout}
+		s.measure = func(ctx context.Context, out A.Outbound, _ string) Attempt {
+			if out.Tag() != "candidate" {
+				if ctx.Err() != nil {
+					return Attempt{FailureCode: failureTimeout}
+				}
+				return Attempt{Reachable: true, HTTPStatus: http.StatusOK}
 			}
-			return Attempt{Reachable: true, HTTPStatus: http.StatusOK}
+			ctx, cancel := context.WithTimeout(ctx, time.Duration(s.options.RequestTimeout))
+			defer cancel()
+			<-ctx.Done()
+			return Attempt{FailureCode: failureTimeout}
 		}
 
 		assignment := validAssignment()
-		assignment.Sample.AttemptsPerWindow = 1
-		assignment.Sample.WindowDurationSeconds = 1
+		assignment.Sample.AttemptsPerWindow = 3
+		assignment.Sample.WindowDurationSeconds = 45
 		assignment.Sample.FreshSessionDelayMS = 0
-		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
+		report, err := s.runAssignment(context.Background(), testCandidate(), testControl(), assignment)
 
+		require.NoError(t, err)
 		requireCompleteGrid(t, report, assignment.Sample)
 		for _, window := range report.Windows {
-			for _, attempts := range [][]Attempt{window.CandidateAttempts, window.ControlAttempts} {
-				for _, attempt := range attempts {
-					assert.False(t, attempt.Reachable)
-					assert.Equal(t, failureWindowDeadline, attempt.FailureCode,
-						"neither eval target is credited with the window running out of time")
-				}
+			for _, attempt := range window.CandidateAttempts {
+				assert.Equal(t, failureTimeout, attempt.FailureCode)
+			}
+			for _, attempt := range window.ControlAttempts {
+				assert.True(t, attempt.Reachable)
 			}
 		}
 	})
@@ -415,7 +379,7 @@ func TestRunWindowKeepsACompletedVerdictAtTheDeadline(t *testing.T) {
 		// The seam ignores the window context, so both eval targets reach a
 		// verdict of their own even though the window ends during the pair.
 		s.measure = func(_ context.Context, out A.Outbound, _ string) Attempt {
-			time.Sleep(600 * time.Millisecond)
+			time.Sleep(1200 * time.Millisecond)
 			if out.Tag() == "candidate" {
 				return Attempt{HTTPStatus: http.StatusForbidden, FailureCode: failureHTTPStatus}
 			}
@@ -426,8 +390,9 @@ func TestRunWindowKeepsACompletedVerdictAtTheDeadline(t *testing.T) {
 		assignment.Sample.AttemptsPerWindow = 1
 		assignment.Sample.WindowDurationSeconds = 1
 		assignment.Sample.FreshSessionDelayMS = 0
-		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
+		report, err := s.runAssignment(context.Background(), testCandidate(), testControl(), assignment)
 
+		require.NoError(t, err)
 		requireCompleteGrid(t, report, assignment.Sample)
 		for _, window := range report.Windows {
 			assert.Equal(t, failureHTTPStatus, window.CandidateAttempts[0].FailureCode,
@@ -450,8 +415,61 @@ func TestRunAssignmentStampsObservationOnTheBoxsClock(t *testing.T) {
 		}
 
 		assignment := validAssignment()
-		report := s.runAssignment(context.Background(), testCandidate(), s.control, assignment)
+		report, err := s.runAssignment(context.Background(), testCandidate(), testControl(), assignment)
 
+		require.NoError(t, err)
 		assert.Equal(t, corrected, report.Windows[0].ObservedAt)
+	})
+}
+
+func TestRunWindowWaitsAtLeastTheMinimumSpacing(t *testing.T) {
+	for name, test := range map[string]struct {
+		requested, minimum, want time.Duration
+	}{
+		"sample asks for less": {requested: time.Second, minimum: 30 * time.Second, want: 30 * time.Second},
+		"sample asks for more": {requested: 40 * time.Second, minimum: 30 * time.Second, want: 40 * time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				options := testOptions()
+				options.MinFreshSessionDelay = badoption.Duration(test.minimum)
+				s := newTestService(t, options)
+				s.attest = func(context.Context, AttestationRequest) (Attestation, error) {
+					return Attestation{Token: "attestation"}, nil
+				}
+				s.measure = func(context.Context, A.Outbound, string) Attempt {
+					return Attempt{Reachable: true, HTTPStatus: http.StatusOK}
+				}
+
+				assignment := validAssignment()
+				assignment.Sample.FreshSessionDelayMS = uint32(test.requested / time.Millisecond)
+				start := time.Now()
+				_, err := s.runAssignment(context.Background(), testCandidate(), testControl(), assignment)
+
+				require.NoError(t, err)
+				assert.Equal(t, time.Duration(assignment.Sample.WindowsPerExit)*test.want, time.Since(start))
+			})
+		})
+	}
+}
+
+func TestRunAssignmentReportsAnAssignmentThatEndsDuringAttestation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestService(t, testOptions())
+		s.attest = func(ctx context.Context, _ AttestationRequest) (Attestation, error) {
+			<-ctx.Done()
+			return Attestation{}, ctx.Err()
+		}
+		s.measure = func(context.Context, A.Outbound, string) Attempt {
+			t.Error("an unattested window must not measure")
+			return Attempt{}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		_, err := s.runAssignment(ctx, testCandidate(), testControl(), validAssignment())
+
+		require.ErrorIs(t, err, errAssignmentEnded)
+		assert.NotErrorIs(t, err, errUnattestedWindow)
 	})
 }

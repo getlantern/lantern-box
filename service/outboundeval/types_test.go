@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	lbC "github.com/getlantern/lantern-box/constant"
 	lbO "github.com/getlantern/lantern-box/option"
 )
 
@@ -123,11 +124,21 @@ func testBounds() bounds {
 	}
 }
 
+// proxyTarget is an eval target of a type that tunnels to a proxy. Nothing in
+// these tests dials it, so its options are left empty.
+func proxyTarget(tag string) *EvaluationTarget {
+	return &EvaluationTarget{Type: EvaluationTargetOutbound, Options: O.Outbound{
+		Type: C.TypeShadowsocks, Tag: tag, Options: &O.ShadowsocksOutboundOptions{},
+	}}
+}
+
 func validAssignment() Assignment {
 	return Assignment{
 		ID:             "assignment-1",
 		ReportToken:    "report-token",
 		MeasurementURL: "https://measure.example/resource",
+		Candidate:      proxyTarget("candidate"),
+		Control:        proxyTarget("control"),
 		Sample: SampleSpec{
 			WindowsPerExit:        2,
 			AttemptsPerWindow:     2,
@@ -163,9 +174,6 @@ func TestAssignmentValidateAcceptsAServerAssignment(t *testing.T) {
 				a.Challenges[i] = WindowChallenge{WindowIndex: uint32(i), Challenge: "challenge"}
 			}
 		},
-		"challenge out of range": func(a *Assignment) { a.Challenges[1].WindowIndex = 2 },
-		"duplicate challenge":    func(a *Assignment) { a.Challenges[1].WindowIndex = 0 },
-		"empty challenge":        func(a *Assignment) { a.Challenges[1].Challenge = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			assignment := validAssignment()
@@ -190,6 +198,39 @@ func TestAssignmentValidateRejects(t *testing.T) {
 		"missing a challenge":  func(a *Assignment) { a.Challenges = a.Challenges[:1] },
 		"extra challenge": func(a *Assignment) {
 			a.Challenges = append(a.Challenges, WindowChallenge{WindowIndex: 2, Challenge: "challenge-2"})
+		},
+		"no assignment id":         func(a *Assignment) { a.ID = "" },
+		"no report token":          func(a *Assignment) { a.ReportToken = "" },
+		"window out of range":      func(a *Assignment) { a.Challenges[1].WindowIndex = 2 },
+		"exit out of range":        func(a *Assignment) { a.Challenges[1].ExitIndex = 1 },
+		"duplicate challenge":      func(a *Assignment) { a.Challenges[1].WindowIndex = 0 },
+		"empty challenge":          func(a *Assignment) { a.Challenges[1].Challenge = "" },
+		"candidate is the control": func(a *Assignment) { a.Control = proxyTarget("candidate") },
+		"no candidate":             func(a *Assignment) { a.Candidate = nil },
+		"no control":               func(a *Assignment) { a.Control = nil },
+		"direct candidate": func(a *Assignment) {
+			a.Candidate = &EvaluationTarget{Type: EvaluationTargetOutbound, Options: O.Outbound{
+				Type: C.TypeDirect, Options: &O.DirectOutboundOptions{},
+			}}
+		},
+		"group control": func(a *Assignment) {
+			a.Control = &EvaluationTarget{Type: EvaluationTargetOutbound, Options: O.Outbound{
+				Type: lbC.TypeMutableAutoSelect, Options: &lbO.MutableAutoSelectOutboundOptions{},
+			}}
+		},
+		"candidate with a detour": func(a *Assignment) {
+			a.Candidate = &EvaluationTarget{Type: EvaluationTargetOutbound, Options: O.Outbound{
+				Type: C.TypeShadowsocks, Options: &O.ShadowsocksOutboundOptions{
+					DialerOptions: O.DialerOptions{Detour: "proxy"},
+				},
+			}}
+		},
+		"endpoint with a detour": func(a *Assignment) {
+			a.Control = &EvaluationTarget{Type: EvaluationTargetEndpoint, Options: O.Endpoint{
+				Type: C.TypeWireGuard, Options: &O.WireGuardEndpointOptions{
+					DialerOptions: O.DialerOptions{Detour: "proxy"},
+				},
+			}}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -298,7 +339,6 @@ func requireCompleteGrid(t *testing.T, report Report, sample SampleSpec) {
 // that breaks them is a change to that contract.
 func TestFixturesRoundTrip(t *testing.T) {
 	for name, target := range map[string]any{
-		"assignment.json":          &Assignment{},
 		"attestation_request.json": &AttestationRequest{},
 		"attestation.json":         &Attestation{},
 		"report.json":              &Report{},
@@ -319,12 +359,12 @@ func TestFixturesRoundTrip(t *testing.T) {
 	}
 }
 
-// An assignment carrying its own pair decodes only in a registry context, so
-// it is round-tripped through sing's context JSON rather than with the other
+// An assignment's targets decode only in a registry context, so it is
+// round-tripped through sing's context JSON rather than with the other
 // fixtures.
-func TestEvaluationTargetsFixtureRoundTrips(t *testing.T) {
+func TestAssignmentFixtureRoundTrips(t *testing.T) {
 	ctx := targetContext(context.Background())
-	raw, err := os.ReadFile(filepath.Join("testdata", "assignment_targets.json"))
+	raw, err := os.ReadFile(filepath.Join("testdata", "assignment.json"))
 	require.NoError(t, err)
 	var assignment Assignment
 	require.NoError(t, sjson.UnmarshalContext(ctx, raw, &assignment))
@@ -340,19 +380,11 @@ func TestEvaluationTargetsFixtureRoundTrips(t *testing.T) {
 	assert.Equal(t, want, got)
 }
 
-func TestFixturedAssignmentIsMeasurable(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("testdata", "assignment.json"))
-	require.NoError(t, err)
-	var assignment Assignment
-	require.NoError(t, json.Unmarshal(raw, &assignment))
-	require.NoError(t, assignment.validate(fixedNow, testBounds()))
-}
-
 func TestFixturedReportsFillTheGrid(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("testdata", "assignment.json"))
 	require.NoError(t, err)
 	var assignment Assignment
-	require.NoError(t, json.Unmarshal(raw, &assignment))
+	require.NoError(t, sjson.UnmarshalContext(targetContext(context.Background()), raw, &assignment))
 
 	for _, name := range []string{"report.json", "report_padded.json"} {
 		t.Run(name, func(t *testing.T) {

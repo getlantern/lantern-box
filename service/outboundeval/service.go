@@ -27,17 +27,20 @@ import (
 
 // Defaults for every option left unset.
 const (
-	defaultOutboundTag          = "direct"
 	defaultControlOutboundTag   = "direct"
 	defaultPollInterval         = 5 * time.Minute
 	defaultNoAssignmentInterval = 5 * time.Minute
 	defaultMaxRetryBackoff      = 10 * time.Minute
-	defaultRequestTimeout       = 30 * time.Second
+	// defaultRequestTimeout divides the server's default sample, three attempts
+	// in a 45s window, so that after a quick attestation every attempt starts
+	// even when each one times out.
+	defaultRequestTimeout       = 15 * time.Second
 	defaultMaxResponseBytes     = 1 << 20
 	defaultMaxAssignmentBytes   = 32 << 20
 	defaultMaxWindows           = 8
 	defaultMaxAttemptsPerWindow = 8
 	defaultNTPServer            = "pool.ntp.org:123"
+	defaultMinFreshSessionDelay = 30 * time.Second
 )
 
 // closeGracePeriod is how long Close waits for the cycle to unwind. It stays
@@ -51,9 +54,7 @@ func RegisterService(registry *boxService.Registry) {
 	boxService.Register[option.OutboundEvalServiceOptions](registry, constant.TypeOutboundEval, NewService)
 }
 
-// Service is the measurement runner. It measures nothing until the box reaches
-// A.StartStateStart, which is the first stage at which every outbound it needs
-// exists.
+// Service is the measurement runner.
 type Service struct {
 	boxService.Adapter
 
@@ -67,9 +68,11 @@ type Service struct {
 
 	// pendingAssignment is owned by the run loop and retained across acquisition retries.
 	pendingAssignment *AssignmentRequest
-	started           atomic.Bool
-	closeOnce         sync.Once
-	closeErr          error
+	// lastAsk is owned by the run loop; the next request is spaced from it.
+	lastAsk   time.Time
+	started   atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
 
 	// assignmentMu serializes assignment target creation and removal with Close.
 	assignmentMu      sync.Mutex
@@ -78,7 +81,6 @@ type Service struct {
 	router    A.Router
 	outbounds A.OutboundManager
 	endpoints A.EndpointManager
-	control   A.Outbound
 	api       *apiClient
 	// timeService keeps the clock a report is judged and stamped against. Start
 	// resolves it before anything reads it.
@@ -90,7 +92,8 @@ type Service struct {
 	retryBase  time.Duration
 
 	// measure and attest are the network-facing steps, replaced in tests that
-	// exercise grid assembly without a network.
+	// exercise grid assembly without a network. measure is called concurrently
+	// for the two sides of a pair.
 	measure func(ctx context.Context, out A.Outbound, target string) Attempt
 	attest  func(ctx context.Context, request AttestationRequest) (Attestation, error)
 }
@@ -98,7 +101,7 @@ type Service struct {
 var _ A.Service = (*Service)(nil)
 
 // NewService builds the runner from its options, resolving no outbound and
-// making no request until Start reaches A.StartStateStart.
+// making no request until Start reaches A.StartStateStarted.
 func NewService(
 	ctx context.Context,
 	logger log.ContextLogger,
@@ -139,19 +142,16 @@ func NewService(
 	return s, nil
 }
 
+// Start acts only at A.StartStateStarted: creating an assignment's targets any
+// earlier races the box's own start.
 func (s *Service) Start(stage A.StartStage) error {
-	if stage != A.StartStateStart {
+	if stage != A.StartStateStarted {
 		return nil
 	}
 	control, found := s.outbounds.Outbound(s.options.ControlOutboundTag)
 	if !found {
 		return fmt.Errorf("control outbound %q is not declared in this config",
 			s.options.ControlOutboundTag)
-	}
-	candidateTag := s.options.OutboundTag
-	if _, found := s.outbounds.Outbound(candidateTag); !found {
-		return fmt.Errorf("outbound under test %q is not declared in this config",
-			candidateTag)
 	}
 	if timeService := service.FromContext[ntp.TimeService](s.ctx); timeService != nil {
 		s.timeService = timeService
@@ -178,7 +178,6 @@ func (s *Service) Start(stage A.StartStage) error {
 		service.MustRegister[ntp.TimeService](s.ctx, ntpService)
 		s.timeService = ntpService
 	}
-	s.control = control
 	s.api = newAPIClient(s.ctx, control, s.timeService.TimeFunc(), s.options)
 	s.attest = s.api.attest
 	s.started.Store(true)
@@ -205,9 +204,6 @@ func (s *Service) Close() error {
 }
 
 func withDefaults(options option.OutboundEvalServiceOptions) option.OutboundEvalServiceOptions {
-	if options.OutboundTag == "" {
-		options.OutboundTag = defaultOutboundTag
-	}
 	if options.ControlOutboundTag == "" {
 		options.ControlOutboundTag = defaultControlOutboundTag
 	}
@@ -234,6 +230,9 @@ func withDefaults(options option.OutboundEvalServiceOptions) option.OutboundEval
 	}
 	if options.MaxAttemptsPerWindow == 0 {
 		options.MaxAttemptsPerWindow = defaultMaxAttemptsPerWindow
+	}
+	if options.MinFreshSessionDelay <= 0 {
+		options.MinFreshSessionDelay = badoption.Duration(defaultMinFreshSessionDelay)
 	}
 	if options.NTPServer == "" {
 		options.NTPServer = defaultNTPServer
