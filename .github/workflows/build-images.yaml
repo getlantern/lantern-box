@@ -587,7 +587,6 @@ jobs:
           OCI_AVAILABILITY_DOMAIN_VAP: ${{ secrets.OCI_AVAILABILITY_DOMAIN_VAP }}
           ALICLOUD_ACCESS_KEY: ${{ secrets.ALICLOUD_ACCESS_KEY }}
           ALICLOUD_SECRET_KEY: ${{ secrets.ALICLOUD_SECRET_KEY }}
-          ALICLOUD_SSH_PASSWORD: ${{ secrets.ALICLOUD_SSH_PASSWORD }}
         run: |
           packer build \
             -var "lantern_box_version=$VERSION" \
