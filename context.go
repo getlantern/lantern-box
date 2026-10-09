@@ -7,12 +7,14 @@ import (
 	"github.com/sagernet/sing-box/include"
 
 	"github.com/getlantern/lantern-box/protocol"
+	"github.com/getlantern/lantern-box/service"
 )
 
 // Context returns a context with all sing-box and lantern-box registries.
 func Context(ctx context.Context) context.Context {
 	ctx = include.Context(ctx)
-	return protocol.RegisterProtocols(ctx)
+	ctx = protocol.RegisterProtocols(ctx)
+	return service.RegisterServices(ctx)
 }
 
 type PlatformInterface interface {
@@ -32,7 +34,8 @@ func BaseContextWithDNSTransport(platformInterface PlatformInterface) context.Co
 		pi = &platformAdapter{pltIfc: platformInterface}
 	}
 	ctx := libbox.BaseContext(pi)
-	return protocol.RegisterProtocols(ctx)
+	ctx = protocol.RegisterProtocols(ctx)
+	return service.RegisterServices(ctx)
 }
 
 // platformAdapter is a helper to adapt PlatformInterface to libbox.PlatformInterface and satisfy

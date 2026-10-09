@@ -8,12 +8,12 @@ type SamizdatOutboundOptions struct {
 	option.ServerOptions
 
 	// Authentication
-	PublicKey string `json:"public_key"`           // server X25519 public key (hex, 64 chars)
-	ShortID   string `json:"short_id"`             // pre-shared 8-byte identifier (hex, 16 chars)
+	PublicKey string `json:"public_key"` // server X25519 public key (hex, 64 chars)
+	ShortID   string `json:"short_id"`   // pre-shared 8-byte identifier (hex, 16 chars)
 
 	// TLS fingerprint
-	ServerName  string `json:"server_name,omitempty"`  // cover site SNI (e.g. "ok.ru")
-	Fingerprint string `json:"fingerprint,omitempty"`  // "chrome" (default), "firefox", "safari"
+	ServerName  string `json:"server_name,omitempty"` // cover site SNI (e.g. "ok.ru")
+	Fingerprint string `json:"fingerprint,omitempty"` // "chrome" (default), "firefox", "safari"
 
 	// Traffic shaping (enabled by default; set to true to disable)
 	DisableJitter bool `json:"disable_jitter,omitempty"` // disable timing jitter
@@ -25,8 +25,8 @@ type SamizdatOutboundOptions struct {
 
 	// Connection management
 	MaxStreamsPerConn int    `json:"max_streams_per_conn,omitempty"` // max H2 streams per TCP conn (default: 100)
-	IdleTimeout      string `json:"idle_timeout,omitempty"`         // close idle connections after (default: "5m")
-	ConnectTimeout   string `json:"connect_timeout,omitempty"`      // TCP+TLS connect timeout (default: "15s")
+	IdleTimeout       string `json:"idle_timeout,omitempty"`         // close idle connections after (default: "5m")
+	ConnectTimeout    string `json:"connect_timeout,omitempty"`      // TCP+TLS connect timeout (default: "15s")
 
 }
 
@@ -35,8 +35,8 @@ type SamizdatInboundOptions struct {
 	option.ListenOptions
 
 	// Authentication
-	PrivateKey string   `json:"private_key"`           // server X25519 private key (hex, 64 chars)
-	ShortIDs   []string `json:"short_ids"`             // allowed client short IDs (hex, 16 chars each)
+	PrivateKey string   `json:"private_key"` // server X25519 private key (hex, 64 chars)
+	ShortIDs   []string `json:"short_ids"`   // allowed client short IDs (hex, 16 chars each)
 
 	// TLS certificate
 	CertPath string `json:"cert_path,omitempty"` // path to TLS certificate PEM file

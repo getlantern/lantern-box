@@ -43,23 +43,23 @@ type UnboundedOutboundOptions struct {
 	Netstated   string `json:"netstated,omitempty"`
 
 	// WebRTC / signaling parameters.
-	DiscoverySrv      string   `json:"discovery_srv,omitempty"`
-	DiscoveryEndpoint string   `json:"discovery_endpoint,omitempty"`
+	DiscoverySrv      string `json:"discovery_srv,omitempty"`
+	DiscoveryEndpoint string `json:"discovery_endpoint,omitempty"`
 	// InsecureDoNotVerifyDiscoveryCert skips TLS verification of the
 	// signaling server's (freddie's) cert. Only for test/dev against
 	// self-signed rigs; production freddie deployments present a real cert
 	// and this flag must be false. Ignored when a direct transport is
 	// injected on the context (radiance's production path), which carries
 	// its own verification policy.
-	InsecureDoNotVerifyDiscoveryCert bool `json:"insecure_do_not_verify_discovery_cert,omitempty"`
-	GenesisAddr       string   `json:"genesis_addr,omitempty"`
-	NATFailTimeout    int      `json:"nat_fail_timeout,omitempty"` // seconds
-	STUNBatchSize     int      `json:"stun_batch_size,omitempty"`
+	InsecureDoNotVerifyDiscoveryCert bool   `json:"insecure_do_not_verify_discovery_cert,omitempty"`
+	GenesisAddr                      string `json:"genesis_addr,omitempty"`
+	NATFailTimeout                   int    `json:"nat_fail_timeout,omitempty"` // seconds
+	STUNBatchSize                    int    `json:"stun_batch_size,omitempty"`
 	// STUNServers is the full pool. At batch time the outbound samples
 	// STUNBatchSize entries at random to avoid a static fingerprint.
 	STUNServers       []string `json:"stun_servers,omitempty"`
 	Tag               string   `json:"tag,omitempty"`
-	Patience          int      `json:"patience,omitempty"`     // seconds
+	Patience          int      `json:"patience,omitempty"`      // seconds
 	ErrorBackoff      int      `json:"error_backoff,omitempty"` // seconds
 	ConsumerSessionID string   `json:"consumer_session_id,omitempty"`
 
