@@ -957,7 +957,12 @@ source "alicloud-ecs" "lantern-box" {
   security_enhancement_strategy = "Deactive"
   force_stop_instance           = true
   ssh_username         = "root"
-  ssh_password         = var.alicloud_ssh_password
+  # Alicloud no longer offers the classic network, and the plugin builds in a
+  # VPC only when a key pair, user data or VPC ID is set. Without an
+  # ssh_password Packer creates a temporary key pair, so the build gets a
+  # temporary VPC and vSwitch; the key is cleared before the image is taken.
+  ssh_clear_authorized_keys   = true
+  associate_public_ip_address = true
 
   wait_copying_image_ready_timeout = 7200 # seconds (2h) — copying to 12 regions can be slow
 
