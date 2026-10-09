@@ -101,9 +101,14 @@ func deltaTemporality(sdkmetric.InstrumentKind) metricdata.Temporality {
 // buildResource creates an OTEL resource with a default service name
 // of "lantern-box". All attributes can be overridden or extended via
 // OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES env vars.
+//
+// proxy.binary is set separately from service.name because VPS deployments
+// override service.name to "vps-proxy" for both this binary and
+// http-proxy-lantern, leaving proxy.binary as the only way to tell them apart.
 func buildResource(extras ...attribute.KeyValue) *resource.Resource {
 	attrs := append([]attribute.KeyValue{
 		semconv.ServiceNameKey.String("lantern-box"),
+		semconv.ProxyBinaryKey.String("lantern-box"),
 		semconv.ServiceVersionKey.String(vcsRevision()),
 	}, extras...)
 	r, _ := resource.New(context.Background(),
