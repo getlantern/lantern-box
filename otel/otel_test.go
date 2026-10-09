@@ -74,7 +74,7 @@ func TestBuildResource(t *testing.T) {
 
 	t.Run("proxy.binary survives a service.name override", func(t *testing.T) {
 		t.Setenv("OTEL_SERVICE_NAME", "")
-		t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.name=vps-proxy,track=t1")
+		t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.name=vps-proxy")
 		r := buildResource()
 		m := make(map[attribute.Key]attribute.Value)
 		for _, attr := range r.Attributes() {
