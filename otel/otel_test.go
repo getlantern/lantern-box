@@ -57,6 +57,7 @@ func TestEnabled(t *testing.T) {
 
 func TestBuildResource(t *testing.T) {
 	t.Run("default service name", func(t *testing.T) {
+		t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
 		r := buildResource()
 		m := make(map[attribute.Key]attribute.Value)
 		for _, attr := range r.Attributes() {
