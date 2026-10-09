@@ -348,7 +348,7 @@ jobs:
     concurrency:
       group: build-images-${{ matrix.builder }}
       cancel-in-progress: false
-    # Alicloud copies images to 8 regions (up to 2h). OCI builds 36 regions
+    # Alicloud copies images to 11 regions (up to 2h). OCI builds 36 regions
     # in parallel — usually ~7min but a slow mirror can push past 45min.
     # gcore's is computed in prepare, since GitHub expressions cannot do arithmetic. 60min
     # was not enough for even one region, and being killed mid-import strands gcore tasks.
