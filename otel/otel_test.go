@@ -67,6 +67,18 @@ func TestBuildResource(t *testing.T) {
 		assert.NotEmpty(t,
 			m[semconv.ServiceVersionKey].AsString(),
 			"service.version should be set")
+		assert.Equal(t, "lantern-box", m["proxy.binary"].AsString())
+	})
+
+	t.Run("proxy.binary survives a service.name override", func(t *testing.T) {
+		t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.name=vps-proxy,track=t1")
+		r := buildResource()
+		attrs := make(map[string]string)
+		for _, attr := range r.Attributes() {
+			attrs[string(attr.Key)] = attr.Value.AsString()
+		}
+		assert.Equal(t, "vps-proxy", attrs["service.name"])
+		assert.Equal(t, "lantern-box", attrs["proxy.binary"])
 	})
 
 	t.Run("OTEL_SERVICE_NAME overrides default", func(t *testing.T) {
