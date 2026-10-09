@@ -27,6 +27,8 @@ var (
 
 func (s *Service) run() {
 	defer close(s.done)
+	defer s.logger.Info("outbound evaluation runner stopped")
+	s.logger.Info("outbound evaluation runner started; first poll in ", time.Duration(s.options.PollInterval))
 	ticker := time.NewTicker(time.Duration(s.options.PollInterval))
 	defer ticker.Stop()
 	retries := backoff.NewExponentialBackoff(s.retryBase, time.Duration(s.options.MaxRetryBackoff))
@@ -51,12 +53,11 @@ func (s *Service) run() {
 		interval := time.Duration(s.options.PollInterval)
 		if err != nil {
 			interval = time.Duration(s.options.NoAssignmentInterval)
-			if errors.Is(err, ErrNoAssignment) {
-				s.logger.Debug("outbound evaluation: ", err)
-			} else {
+			if !errors.Is(err, ErrNoAssignment) {
 				s.logger.Warn("outbound evaluation refused: ", err)
 			}
 		}
+		s.logger.Debug("next outbound evaluation poll in ", interval)
 		ticker.Reset(interval)
 	}
 }
@@ -65,6 +66,7 @@ func (s *Service) runCycle() error {
 	if err := s.ctx.Err(); err != nil {
 		return err
 	}
+	retrying := s.pendingAssignment != nil
 	if s.pendingAssignment == nil {
 		s.pendingAssignment = &AssignmentRequest{
 			CountryCode:    s.options.CountryCode,
@@ -72,11 +74,15 @@ func (s *Service) runCycle() error {
 			ExitCount:      clientExitCount,
 		}
 	}
+	s.logger.Debug("requesting outbound evaluation assignment; retry=", retrying)
 	assignment, err := s.api.acquire(s.options.Token, *s.pendingAssignment)
 	if !retryableCycleError(err) {
 		s.pendingAssignment = nil
 	}
 	if err != nil {
+		if errors.Is(err, ErrNoAssignment) {
+			s.logger.Info("no outbound evaluation assignment available; next poll in ", time.Duration(s.options.NoAssignmentInterval))
+		}
 		return err
 	}
 
@@ -84,11 +90,18 @@ func (s *Service) runCycle() error {
 	if err := assignment.validate(now, s.limits); err != nil {
 		return fmt.Errorf("validate assignment: %w", err)
 	}
+	s.logger.Info("outbound evaluation assignment acquired; windows=", len(assignment.Challenges),
+		", attempts_per_target_per_window=", assignment.Sample.AttemptsPerWindow,
+		", window_budget=", assignment.Sample.windowDuration(),
+		", expires_in=", assignment.ExpiresAt.Sub(now))
 
+	started := time.Now()
 	report, err := s.measureAssignment(s.options.OutboundTag, assignment)
 	if err != nil {
 		return err
 	}
+	s.logger.Info("outbound evaluation measurements completed; windows=", len(report.Windows),
+		", elapsed=", time.Since(started))
 	return s.submitReport(report)
 }
 
@@ -96,6 +109,7 @@ func (s *Service) runCycle() error {
 func (s *Service) submitReport(report Report) error {
 	for i, window := range report.Windows {
 		if window.AttestationToken == "" {
+			s.logger.Debug("outbound evaluation report not submitted; unattested window=", i)
 			return fmt.Errorf("%w: window %d", errUnattestedReport, i)
 		}
 	}
@@ -104,9 +118,21 @@ func (s *Service) submitReport(report Report) error {
 		if err := s.ctx.Err(); err != nil {
 			return err
 		}
+		s.logger.Debug("submitting outbound evaluation report; attempt=", attempt, "/", submitAttempts,
+			", windows=", len(report.Windows))
 		err = s.api.submit(s.options.Token, report)
+		if err == nil {
+			s.logger.Info("outbound evaluation report submitted successfully; windows=", len(report.Windows))
+			return nil
+		}
 		if !retryableCycleError(err) {
+			s.logger.Debug("outbound evaluation submission failed; retryable=false")
 			return err
+		}
+		if attempt == submitAttempts {
+			s.logger.Debug("outbound evaluation submission retries exhausted")
+		} else {
+			s.logger.Debug("outbound evaluation submission failed; retry in ", s.retryDelay)
 		}
 		if attempt < submitAttempts && !sleepContext(s.ctx, s.retryDelay) {
 			return s.ctx.Err()

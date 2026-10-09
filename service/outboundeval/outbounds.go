@@ -22,6 +22,7 @@ func (s *Service) measureAssignment(candidateTag string, assignment Assignment) 
 	var candidate A.Outbound
 	control := s.control
 	if assignment.Candidate != nil && assignment.Control != nil {
+		s.logger.Debug("using assignment-provided evaluation targets")
 		defer func() {
 			err = errors.Join(err, s.closeAssignmentOutbounds())
 		}()
@@ -30,6 +31,7 @@ func (s *Service) measureAssignment(candidateTag string, assignment Assignment) 
 			return Report{}, err
 		}
 	} else {
+		s.logger.Debug("using configured evaluation targets")
 		var found bool
 		candidate, found = s.outbounds.Outbound(candidateTag)
 		if !found {
@@ -54,6 +56,7 @@ func (s *Service) createAssignmentOutbounds(ctx context.Context, assignment Assi
 			return nil, nil, fmt.Errorf("create assignment target %d: %w", i, err)
 		}
 		targets[i] = out
+		s.logger.Debug("outbound evaluation target created; index=", i)
 	}
 	return targets[0], targets[1], nil
 }
@@ -106,6 +109,8 @@ func (s *Service) closeAssignmentOutbounds() error {
 		target := s.assignmentTargets[i]
 		if removeErr := target.remove(target.tag); removeErr != nil {
 			err = errors.Join(err, fmt.Errorf("remove assignment target %q: %w", target.tag, removeErr))
+		} else {
+			s.logger.Debug("outbound evaluation target removed")
 		}
 	}
 	s.assignmentTargets = nil

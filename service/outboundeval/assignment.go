@@ -46,10 +46,16 @@ func (s *Service) runWindow(
 		CandidateAttempts: make([]Attempt, 0, sample.AttemptsPerWindow),
 		ControlAttempts:   make([]Attempt, 0, sample.AttemptsPerWindow),
 	}
+	s.logger.Debug("outbound evaluation window starting; index=", challenge.WindowIndex,
+		", spacing=", sample.freshSessionDelay(), ", budget=", sample.windowDuration())
 	// The result is named so every way out of the window carries the instant
 	// it stopped observing.
 	defer func() {
 		window.ObservedAt = s.timeService.TimeFunc()().UTC()
+		s.logger.Debug("outbound evaluation window completed; index=", challenge.WindowIndex,
+			", attested=", window.AttestationToken != "",
+			", candidate_attempts=", len(window.CandidateAttempts),
+			", control_attempts=", len(window.ControlAttempts))
 	}()
 	// The spacing between windows precedes the window, so it is not charged
 	// against the time the window has to measure in.
@@ -69,7 +75,7 @@ func (s *Service) runWindow(
 	// Alternating which eval target goes first keeps a systematic advantage
 	// from accruing to whichever one always warms the path.
 	candidateFirst := challenge.WindowIndex%2 == 0
-	for range sample.AttemptsPerWindow {
+	for attempt := range sample.AttemptsPerWindow {
 		if windowCtx.Err() != nil {
 			break
 		}
@@ -80,8 +86,22 @@ func (s *Service) runWindow(
 			candidateAttempt = Attempt{FailureCode: failureWindowDeadline}
 			controlAttempt = Attempt{FailureCode: failureWindowDeadline}
 		}
+		for _, result := range []struct {
+			role    string
+			attempt Attempt
+		}{{"candidate", candidateAttempt}, {"control", controlAttempt}} {
+			s.logger.Debug("outbound evaluation attempt; window=", challenge.WindowIndex,
+				", target=", result.role, ", attempt=", attempt+1,
+				", reachable=", result.attempt.Reachable, ", http_status=", result.attempt.HTTPStatus,
+				", failure=", result.attempt.FailureCode, ", bytes=", result.attempt.BytesRead,
+				", elapsed_ms=", result.attempt.ElapsedMS)
+		}
 		window.CandidateAttempts = append(window.CandidateAttempts, candidateAttempt)
 		window.ControlAttempts = append(window.ControlAttempts, controlAttempt)
+	}
+	if missing := int(sample.AttemptsPerWindow) - len(window.CandidateAttempts); missing > 0 {
+		s.logger.Debug("outbound evaluation window padded; index=", challenge.WindowIndex,
+			", missing_pairs=", missing, ", failure=", failureWindowDeadline)
 	}
 	return fillWindow(window, sample, failureWindowDeadline)
 }
@@ -114,15 +134,23 @@ func (s *Service) attestWindow(ctx context.Context, challenge WindowChallenge) (
 	request := AttestationRequest{Challenge: challenge.Challenge}
 	var err error
 	for attempt := 1; attempt <= attestAttempts; attempt++ {
+		s.logger.Debug("attesting outbound evaluation window; index=", challenge.WindowIndex,
+			", attempt=", attempt, "/", attestAttempts)
 		var attestation Attestation
 		attestation, err = s.attest(ctx, request)
 		if err == nil {
+			s.logger.Debug("outbound evaluation attestation completed; index=", challenge.WindowIndex,
+				", token_present=", attestation.Token != "")
 			return attestation, nil
 		}
 		var status apiError
 		if errors.As(err, &status) && !status.retryable() {
+			s.logger.Debug("outbound evaluation attestation rejected; index=", challenge.WindowIndex,
+				", http_status=", status.status)
 			return Attestation{}, err
 		}
+		s.logger.Debug("outbound evaluation attestation failed; index=", challenge.WindowIndex,
+			", failure=", attestationFailureCode(err), ", attempts_remaining=", attestAttempts-attempt)
 		// Carrying the context error keeps the window's report on the deadline
 		// rather than the attestation failure that was about to be retried.
 		if attempt < attestAttempts && !sleepContext(ctx, s.retryDelay) {
