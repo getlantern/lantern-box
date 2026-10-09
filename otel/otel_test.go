@@ -57,6 +57,7 @@ func TestEnabled(t *testing.T) {
 
 func TestBuildResource(t *testing.T) {
 	t.Run("default service name", func(t *testing.T) {
+		t.Setenv("OTEL_SERVICE_NAME", "")
 		t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
 		r := buildResource()
 		m := make(map[attribute.Key]attribute.Value)
@@ -68,18 +69,19 @@ func TestBuildResource(t *testing.T) {
 		assert.NotEmpty(t,
 			m[semconv.ServiceVersionKey].AsString(),
 			"service.version should be set")
-		assert.Equal(t, "lantern-box", m["proxy.binary"].AsString())
+		assert.Equal(t, "lantern-box", m[semconv.ProxyBinaryKey].AsString())
 	})
 
 	t.Run("proxy.binary survives a service.name override", func(t *testing.T) {
+		t.Setenv("OTEL_SERVICE_NAME", "")
 		t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.name=vps-proxy,track=t1")
 		r := buildResource()
-		attrs := make(map[string]string)
+		m := make(map[attribute.Key]attribute.Value)
 		for _, attr := range r.Attributes() {
-			attrs[string(attr.Key)] = attr.Value.AsString()
+			m[attr.Key] = attr.Value
 		}
-		assert.Equal(t, "vps-proxy", attrs["service.name"])
-		assert.Equal(t, "lantern-box", attrs["proxy.binary"])
+		assert.Equal(t, "vps-proxy", m[semconv.ServiceNameKey].AsString())
+		assert.Equal(t, "lantern-box", m[semconv.ProxyBinaryKey].AsString())
 	})
 
 	t.Run("OTEL_SERVICE_NAME overrides default", func(t *testing.T) {
