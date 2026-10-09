@@ -108,7 +108,7 @@ func deltaTemporality(sdkmetric.InstrumentKind) metricdata.Temporality {
 func buildResource(extras ...attribute.KeyValue) *resource.Resource {
 	attrs := append([]attribute.KeyValue{
 		semconv.ServiceNameKey.String("lantern-box"),
-		attribute.String("proxy.binary", "lantern-box"),
+		semconv.ProxyBinaryKey.String("lantern-box"),
 		semconv.ServiceVersionKey.String(vcsRevision()),
 	}, extras...)
 	r, _ := resource.New(context.Background(),
