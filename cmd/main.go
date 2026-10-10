@@ -49,75 +49,15 @@ var rootCmd = &cobra.Command{
 
 func preRun(cmd *cobra.Command, args []string) {
 	globalCtx = box.BaseContext()
-
-	// Default to not report metrics.
+	// Private builds deliberately keep telemetry and crash reporting local.
+	// No OTLP providers, crash uploaders, or official geo services are
+	// initialized unless the caller explicitly opts in at runtime.
 	sdkotel.SetMeterProvider(noop.NewMeterProvider())
-
-	if !otel.Enabled() {
-		log.Info("telemetry disabled (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)")
-	}
-
-	var attrs []attribute.KeyValue
-	// track is emitted both as a resource attr (below, via resourceAttrs) and,
-	// for the goodput histogram, as a queryable point attr (via SetupMetricsManager).
-	var track string
-	// Attempt to read proxy info, but this is merely informational,
-	// and may not be needed for every subcommand.
-	proxyInfoPath, _ := cmd.Flags().GetString("proxy-info")
-	if proxyInfoPath != "" {
-		if info, err := readProxyInfo(proxyInfoPath); err != nil {
-			log.Warn("could not read proxy info, skipping attribute addition: ", err)
-		} else {
-			attrs = info.resourceAttrs()
-			track = info.Track
-		}
-	} else {
-		log.Info("no proxy-info path provided, skipping attribute addition")
-	}
-
-	meterShutdown, err := otel.InitGlobalMeterProvider(attrs...)
-	if err != nil {
-		log.Error("init meter provider: ", err)
-		return
-	}
-	otelShutdownFuncs = append(otelShutdownFuncs, meterShutdown)
-
-	tracerShutdown, err := otel.InitGlobalTracerProvider(attrs...)
-	if err != nil {
-		log.Error("init tracer provider: ", err)
-		return
-	}
-	otelShutdownFuncs = append(otelShutdownFuncs, tracerShutdown)
-
-	for _, attr := range attrs {
-		log.Info("reporting with attribute: ", fmt.Sprintf("%s=%v", attr.Key, attr.Value.AsString()))
-	}
-
-	// Report any crash from a previous run, then set up crash output
-	// for this run. Order matters: report first (reads crash.log),
-	// then setup (truncates crash.log for the next crash).
 	configPath, _ := cmd.Flags().GetString("config")
 	if configPath != "" {
-		crashDir := filepath.Dir(configPath)
-		otel.ReportPreviousCrash(crashDir, attrs...)
-		if err := otel.SetupCrashOutput(crashDir); err != nil {
-			log.Error("set up crash output: ", err)
+		if err := otel.SetupCrashOutput(filepath.Dir(configPath)); err != nil {
+			log.Debug("local crash output unavailable", "error", err)
 		}
-	}
-
-	geoCityURL, _ := cmd.Flags().GetString("geo-city-url")
-	cityDatabaseName, _ := cmd.Flags().GetString("city-database-name")
-	if geoCityURL != "" && cityDatabaseName != "" {
-		geolookup := geo.FromWeb(
-			geoCityURL, cityDatabaseName,
-			24*time.Hour, cityDatabaseName,
-			geo.CountryCode,
-		)
-		metrics.SetupMetricsManager(geolookup, track)
-	}
-	if otel.Enabled() {
-		log.Info("telemetry enabled")
-
 	}
 }
 
