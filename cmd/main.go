@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -140,8 +141,12 @@ func preRun(cmd *cobra.Command, args []string) {
 // databaseNameFromURL is the database file a lanterngeo tarball URL such as
 // ".../GeoLite2-City.mmdb.tar.gz" holds, so overriding only --geo-city-url
 // doesn't pair that archive with the default database's filename.
-func databaseNameFromURL(url string) string {
-	return strings.TrimSuffix(path.Base(url), ".tar.gz")
+func databaseNameFromURL(rawURL string) string {
+	p := rawURL
+	if u, err := url.Parse(rawURL); err == nil {
+		p = u.Path
+	}
+	return strings.TrimSuffix(path.Base(p), ".tar.gz")
 }
 
 func readProxyInfo(path string) (*proxyInfo, error) {
