@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/getlantern/geo"
@@ -107,6 +109,9 @@ func preRun(cmd *cobra.Command, args []string) {
 
 	geoCityURL, _ := cmd.Flags().GetString("geo-city-url")
 	cityDatabaseName, _ := cmd.Flags().GetString("city-database-name")
+	if cmd.Flags().Changed("geo-city-url") && !cmd.Flags().Changed("city-database-name") {
+		cityDatabaseName = databaseNameFromURL(geoCityURL)
+	}
 	if geoCityURL != "" && cityDatabaseName != "" {
 		// The same database http-proxy uses, so both binaries report the same
 		// client.asn and client.isp values.
@@ -130,6 +135,13 @@ func preRun(cmd *cobra.Command, args []string) {
 		log.Info("telemetry enabled")
 
 	}
+}
+
+// databaseNameFromURL is the database file a lanterngeo tarball URL such as
+// ".../GeoLite2-City.mmdb.tar.gz" holds, so overriding only --geo-city-url
+// doesn't pair that archive with the default database's filename.
+func databaseNameFromURL(url string) string {
+	return strings.TrimSuffix(path.Base(url), ".tar.gz")
 }
 
 func readProxyInfo(path string) (*proxyInfo, error) {
