@@ -27,8 +27,12 @@ import (
 func init() {
 	rootCmd.AddCommand(runCmd)
 	runCmd.Flags().String("config", "config.json", "Configuration file path")
-	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-City.mmdb.tar.gz", "URL for downloading GeoLite2-City database")
-	runCmd.Flags().String("city-database-name", "GeoLite2-City.mmdb", "Filename for storing GeoLite2-City database")
+	// Only the client's country is looked up, so the default is the Country
+	// database: the whole database is held in memory, and City is about
+	// eight times larger, which adds up on hosts running one proxy per route.
+	// The flag names predate the switch and are kept for compatibility.
+	runCmd.Flags().String("geo-city-url", "https://lanterngeo.lantern.io/GeoLite2-Country.mmdb.tar.gz", "URL for downloading the GeoLite2 database used to look up client countries")
+	runCmd.Flags().String("city-database-name", "GeoLite2-Country.mmdb", "Name of the database in the tarball, and the filename it is stored under")
 	runCmd.Flags().String("geo-isp-url", "https://lanterngeo.lantern.io/GeoIP2-ISP.mmdb.tar.gz", "URL for downloading the GeoIP2-ISP database that tags proxy.io with client.asn and client.isp; empty disables the tags")
 	runCmd.Flags().String("isp-database-name", "GeoIP2-ISP.mmdb", "Filename for storing the GeoIP2-ISP database")
 	runCmd.Flags().String("datacap-url", "", "Datacap server URL")
