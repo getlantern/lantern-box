@@ -47,15 +47,17 @@ var (
 	_ adapter.ExhaustionSignaler   = (*MutableAutoSelect)(nil)
 )
 
-const defaultProbeConcurrency = 6
+const (
+	defaultProbeConcurrency       = 6
+	defaultSwitchTolerance        = 500 * time.Millisecond
+	defaultSwitchTolerancePercent = 30
+)
 
 // probeFreshnessWindow lets external probes skip members with recent outcomes.
 // Internal probes always force a fresh probe.
 const probeFreshnessWindow = 30 * time.Second
 
-// confirmedFailureSwitchCooldown limits switches after confirmed failures,
-// except when the member selected by the last such switch also fails confirmation.
-const confirmedFailureSwitchCooldown = time.Minute
+const defaultConfirmedFailureSwitchCooldown = time.Minute
 
 // MutableAutoSelect is the client-side server-selection group.
 type MutableAutoSelect struct {
@@ -128,37 +130,44 @@ type MutableAutoSelect struct {
 }
 
 type mutableAutoSelectConfig struct {
-	switchTolerance               time.Duration
-	activeInterval                time.Duration
-	idleInterval                  time.Duration
-	idleThreshold                 time.Duration
-	ladderTotalBudget             time.Duration
-	ladderCooldown                time.Duration
-	dataPlaneIdle                 time.Duration
-	dataPlaneFirstResponseTimeout time.Duration
-	dataPlaneProvedRead           uint64
-	demoteOnlySelected            bool
-	maxPersistedAge               time.Duration
-	probeConcurrency              int
+	switchTolerance                time.Duration
+	switchTolerancePercent         uint32
+	activeInterval                 time.Duration
+	idleInterval                   time.Duration
+	idleThreshold                  time.Duration
+	ladderTotalBudget              time.Duration
+	ladderCooldown                 time.Duration
+	confirmedFailureSwitchCooldown time.Duration
+	dataPlaneIdle                  time.Duration
+	dataPlaneFirstResponseTimeout  time.Duration
+	dataPlaneProvedRead            uint64
+	demoteOnlySelected             bool
+	maxPersistedAge                time.Duration
+	probeConcurrency               int
 }
 
 func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) (mutableAutoSelectConfig, historyParams) {
 	cfg := mutableAutoSelectConfig{
-		switchTolerance:               time.Duration(o.SwitchToleranceMs) * time.Millisecond,
-		activeInterval:                time.Duration(o.BackgroundIntervalSeconds) * time.Second,
-		idleInterval:                  time.Duration(o.IdleIntervalSeconds) * time.Second,
-		idleThreshold:                 time.Duration(o.IdleThresholdSeconds) * time.Second,
-		ladderTotalBudget:             time.Duration(o.LadderTotalBudgetSeconds) * time.Second,
-		ladderCooldown:                time.Duration(o.LadderCooldownSeconds) * time.Second,
-		dataPlaneIdle:                 time.Duration(o.DataPlaneIdleSeconds) * time.Second,
-		dataPlaneFirstResponseTimeout: defaultFirstResponseTimeout,
-		dataPlaneProvedRead:           uint64(o.DataPlaneProvedReadBytes),
-		demoteOnlySelected:            o.DemoteOnlySelectedTag == nil || *o.DemoteOnlySelectedTag,
-		maxPersistedAge:               time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
-		probeConcurrency:              int(o.ProbeConcurrency),
+		switchTolerance:                time.Duration(o.SwitchToleranceMs) * time.Millisecond,
+		switchTolerancePercent:         o.SwitchTolerancePercent,
+		activeInterval:                 time.Duration(o.BackgroundIntervalSeconds) * time.Second,
+		idleInterval:                   time.Duration(o.IdleIntervalSeconds) * time.Second,
+		idleThreshold:                  time.Duration(o.IdleThresholdSeconds) * time.Second,
+		ladderTotalBudget:              time.Duration(o.LadderTotalBudgetSeconds) * time.Second,
+		ladderCooldown:                 time.Duration(o.LadderCooldownSeconds) * time.Second,
+		confirmedFailureSwitchCooldown: time.Duration(o.ConfirmedFailureSwitchCooldownSeconds) * time.Second,
+		dataPlaneIdle:                  time.Duration(o.DataPlaneIdleSeconds) * time.Second,
+		dataPlaneFirstResponseTimeout:  defaultFirstResponseTimeout,
+		dataPlaneProvedRead:            uint64(o.DataPlaneProvedReadBytes),
+		demoteOnlySelected:             o.DemoteOnlySelectedTag == nil || *o.DemoteOnlySelectedTag,
+		maxPersistedAge:                time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
+		probeConcurrency:               int(o.ProbeConcurrency),
 	}
 	if cfg.switchTolerance == 0 {
-		cfg.switchTolerance = 200 * time.Millisecond
+		cfg.switchTolerance = defaultSwitchTolerance
+	}
+	if cfg.switchTolerancePercent == 0 {
+		cfg.switchTolerancePercent = defaultSwitchTolerancePercent
 	}
 	if cfg.activeInterval == 0 {
 		cfg.activeInterval = 180 * time.Second
@@ -173,7 +182,10 @@ func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) 
 		cfg.ladderTotalBudget = 10 * time.Second
 	}
 	if cfg.ladderCooldown == 0 {
-		cfg.ladderCooldown = 60 * time.Second
+		cfg.ladderCooldown = 300 * time.Second
+	}
+	if cfg.confirmedFailureSwitchCooldown == 0 {
+		cfg.confirmedFailureSwitchCooldown = defaultConfirmedFailureSwitchCooldown
 	}
 	if cfg.dataPlaneIdle == 0 {
 		cfg.dataPlaneIdle = defaultDataPlaneIdle
@@ -197,6 +209,9 @@ func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) 
 	}
 	if o.UserFailureWindowSeconds > 0 {
 		hp.userFailureWindow = time.Duration(o.UserFailureWindowSeconds) * time.Second
+	}
+	if o.UserFailureDedupeWindowSeconds > 0 {
+		hp.userFailureDedupeWindow = time.Duration(o.UserFailureDedupeWindowSeconds) * time.Second
 	}
 	return cfg, hp
 }
@@ -727,12 +742,23 @@ func (s *MutableAutoSelect) applyStickiness(
 		s.logSwitch(network, sticky, best, "last resort no longer needed")
 	case c.demote > best.demote && c.userFails > s.hist.softFailLimit:
 		s.logSwitch(network, sticky, best, "failures past retention")
-	case uint64(best.delayMs)+uint64(s.cfg.switchTolerance/time.Millisecond) <= uint64(c.delayMs):
+	case s.beatsOnDelay(best.delayMs, c.delayMs):
 		s.logSwitch(network, sticky, best, "beaten on delay")
 	default:
 		return c
 	}
 	return best
+}
+
+// beatsOnDelay reports whether candidateMs improves on stickyMs by at least
+// switchTolerance and by at least switchTolerancePercent of stickyMs.
+func (s *MutableAutoSelect) beatsOnDelay(candidateMs, stickyMs uint32) bool {
+	if candidateMs >= stickyMs {
+		return false
+	}
+	gain := uint64(stickyMs - candidateMs)
+	return gain >= uint64(s.cfg.switchTolerance/time.Millisecond) &&
+		gain*100 >= uint64(stickyMs)*uint64(s.cfg.switchTolerancePercent)
 }
 
 // logSwitch records which rule moved the group off sticky; a churn report is
@@ -1340,7 +1366,7 @@ func (s *MutableAutoSelect) trySwitchAfterConfirmedFailure(failedTag, replacemen
 		return
 	}
 	last := s.lastConfirmedFailureSwitch
-	if !last.at.IsZero() && now.Sub(last.at) < confirmedFailureSwitchCooldown && last.selectedTag != failedTag {
+	if !last.at.IsZero() && now.Sub(last.at) < s.cfg.confirmedFailureSwitchCooldown && last.selectedTag != failedTag {
 		s.logger.Info("tcp switch deferred: ", failedTag, " -> ", replacementTag, " (confirmed-failure switch cooldown)")
 		return
 	}

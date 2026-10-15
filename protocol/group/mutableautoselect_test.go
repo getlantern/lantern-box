@@ -49,15 +49,16 @@ func newTestMUR(t *testing.T, tags ...string) (*MutableAutoSelect, map[string]*m
 		urlOverrides: map[string]string{},
 		histories:    map[string]*localHistory{},
 		cfg: mutableAutoSelectConfig{
-			switchTolerance:    50 * time.Millisecond,
-			activeInterval:     time.Hour,
-			idleInterval:       4 * time.Hour,
-			idleThreshold:      10 * time.Minute,
-			ladderTotalBudget:  100 * time.Millisecond,
-			dataPlaneIdle:      time.Hour,
-			demoteOnlySelected: true,
-			maxPersistedAge:    defaultMaxPersistedAge,
-			probeConcurrency:   defaultProbeConcurrency,
+			switchTolerance:                50 * time.Millisecond,
+			activeInterval:                 time.Hour,
+			idleInterval:                   4 * time.Hour,
+			idleThreshold:                  10 * time.Minute,
+			ladderTotalBudget:              100 * time.Millisecond,
+			confirmedFailureSwitchCooldown: defaultConfirmedFailureSwitchCooldown,
+			dataPlaneIdle:                  time.Hour,
+			demoteOnlySelected:             true,
+			maxPersistedAge:                defaultMaxPersistedAge,
+			probeConcurrency:               defaultProbeConcurrency,
 		},
 		hist:         defaultHistoryParams(),
 		history:      adapter.NewAutoSelectHistoryStorage(),
@@ -462,15 +463,20 @@ func TestSelectFor_SwitchTolerance(t *testing.T) {
 		name       string
 		alphaDelay uint32
 		betaDelay  uint32
+		percent    uint32
 		want       string
 		commentary string
 	}{
-		{"sticky kept within tolerance", 100, 80, "alpha", "80+50 > 100 → keep alpha"},
-		{"switches when beats tolerance", 100, 40, "beta", "40+50 <= 100 → switch"},
+		{"sticky kept within tolerance", 100, 80, 0, "alpha", "80+50 > 100 → keep alpha"},
+		{"switches when beats tolerance", 100, 40, 0, "beta", "40+50 <= 100 → switch"},
+		{"sticky kept within percent", 1000, 750, 30, "alpha", "250 < 30% of 1000 → keep alpha"},
+		{"switches when beats both", 1000, 650, 30, "beta", "350 >= 50 and >= 30% of 1000 → switch"},
+		{"sticky kept within ms despite percent", 100, 60, 30, "alpha", "40 >= 30% of 100 but < 50 → keep alpha"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _ := newTestMUR(t, "alpha", "beta")
+			s.cfg.switchTolerancePercent = tt.percent
 			recordSuccess(s, "alpha", tt.alphaDelay)
 			recordSuccess(s, "beta", tt.betaDelay)
 			s.stickyTag.tcp.Store("alpha")

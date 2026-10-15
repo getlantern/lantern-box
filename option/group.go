@@ -28,9 +28,15 @@ type MutableAutoSelectOutboundOptions struct {
 	URL          string            `json:"url,omitempty"`
 	URLOverrides map[string]string `json:"url_overrides,omitempty"`
 
-	// SwitchToleranceMs is the delay improvement (in ms) a candidate must
-	// beat the current selection by before the group switches. Default 200.
+	// SwitchToleranceMs is the minimum delay improvement (in ms) a
+	// candidate must have over the current selection before the group
+	// switches on delay. Default 500.
 	SwitchToleranceMs uint32 `json:"switch_tolerance_ms,omitempty"`
+
+	// SwitchTolerancePercent is the minimum delay improvement, as a
+	// percentage of the current selection's delay, a candidate must also
+	// have before the group switches on delay. Default 30.
+	SwitchTolerancePercent uint32 `json:"switch_tolerance_percent,omitempty"`
 
 	// ConsecutiveFailureLimit hard-demotes a member once probe failures
 	// reach this count, or once user-traffic failures within
@@ -54,11 +60,16 @@ type MutableAutoSelectOutboundOptions struct {
 	// Default 300 (5 min).
 	UserFailureWindowSeconds uint32 `json:"user_failure_window_seconds,omitempty"`
 
+	// UserFailureDedupeWindowSeconds drops a user-traffic failure that
+	// arrives within this long of the member's previous recorded failure,
+	// so a burst counts once toward the demote rule. Default 45.
+	UserFailureDedupeWindowSeconds uint32 `json:"user_failure_dedupe_window_seconds,omitempty"`
+
 	// MaxPersistedAgeSeconds caps the age of persisted TagHistory
 	// entries on hydrate. Entries with UpdatedAt older than this are
 	// dropped — bandit-driven candidate sets typically rotate every
 	// 60 s – 15 min, so a stale snapshot from a prior session would
-	// describe a member that may no longer exist. Default 3600 (1 h).
+	// describe a member that may no longer exist. Default 900 (15 min).
 	MaxPersistedAgeSeconds uint32 `json:"max_persisted_age_seconds,omitempty"`
 
 	// BackgroundIntervalSeconds is the active cadence for the low-priority
@@ -84,8 +95,14 @@ type MutableAutoSelectOutboundOptions struct {
 	// LadderCooldownSeconds is the minimum time after a ladder run before
 	// another ladder run can fire. Suppresses repeated full-fleet
 	// re-probes when stalls or dial errors arrive in quick succession on
-	// the same already-shuffled pool. Default 60.
+	// the same already-shuffled pool. Default 300.
 	LadderCooldownSeconds uint32 `json:"ladder_cooldown_seconds,omitempty"`
+
+	// ConfirmedFailureSwitchCooldownSeconds is the minimum time between
+	// switches caused by failed confirmation probes, except when the
+	// member selected by the last such switch also fails confirmation.
+	// Default 60.
+	ConfirmedFailureSwitchCooldownSeconds uint32 `json:"confirmed_failure_switch_cooldown_seconds,omitempty"`
 
 	// DataPlaneIdleSeconds is the no-traffic threshold after which an
 	// established and proven tunnel is treated as a data-plane stall.
