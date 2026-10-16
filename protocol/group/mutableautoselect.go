@@ -1570,6 +1570,11 @@ func (s *MutableAutoSelect) runBackgroundLoop(idle *time.Timer, probeNow bool) {
 			return
 		case <-idle.C:
 			s.access.Lock()
+			if s.idleTimer == idle && time.Since(s.lastActive) < s.cfg.idleThreshold {
+				// Raced with keepAlive's Reset; keep running.
+				s.access.Unlock()
+				continue
+			}
 			s.idleTimer = nil
 			s.access.Unlock()
 			s.logger.Info("background probing stopped: idle")
