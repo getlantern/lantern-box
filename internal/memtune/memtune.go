@@ -70,7 +70,8 @@ type Tuner struct {
 
 	mu       sync.Mutex
 	baseline runtimeValues
-	content  []byte // last file content seen; nil when the file is absent
+	content  []byte   // last file content seen; nil when the file is absent
+	settings Settings // last valid file settings; empty when the file is absent
 	applied  runtimeValues
 }
 
@@ -126,10 +127,13 @@ func (t *Tuner) Run(ctx context.Context) {
 
 func (t *Tuner) checkLocked(force bool) {
 	content, err := os.ReadFile(t.path)
-	if errors.Is(err, fs.ErrNotExist) {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
 		content = nil
-	} else if err != nil {
+	case err != nil:
+		// Keep the last valid settings; on a Resync they still need applying.
 		log.Warn("memtune: reading ", t.path, ": ", err)
+		t.applyLocked()
 		return
 	}
 	// bytes.Equal treats nil and empty as equal; an empty file must still be
@@ -139,23 +143,30 @@ func (t *Tuner) checkLocked(force bool) {
 	}
 	t.content = content
 
-	var s Settings
-	if content != nil {
+	if content == nil {
+		t.settings = Settings{}
+	} else {
+		var s Settings
 		if err := json.Unmarshal(content, &s); err != nil {
-			log.Warn("memtune: ignoring ", t.path, ": ", err)
-			s = t.keepLocked()
+			log.Warn("memtune: ignoring ", t.path, ", keeping the last valid settings: ", err)
 		} else if err := s.validate(); err != nil {
-			log.Warn("memtune: ignoring ", t.path, ": ", err)
-			s = t.keepLocked()
+			log.Warn("memtune: ignoring ", t.path, ", keeping the last valid settings: ", err)
+		} else {
+			t.settings = s
 		}
 	}
+	t.applyLocked()
+}
 
+// applyLocked sets the runtime to the baseline with the last valid file
+// settings on top.
+func (t *Tuner) applyLocked() {
 	want := t.baseline
-	if s.MemoryLimitBytes != nil {
-		want.memoryLimit = *s.MemoryLimitBytes
+	if t.settings.MemoryLimitBytes != nil {
+		want.memoryLimit = *t.settings.MemoryLimitBytes
 	}
-	if s.GCPercent != nil {
-		want.gcPercent = *s.GCPercent
+	if t.settings.GCPercent != nil {
+		want.gcPercent = *t.settings.GCPercent
 	}
 	if want == t.applied {
 		return
@@ -168,17 +179,6 @@ func (t *Tuner) checkLocked(force bool) {
 	}
 	log.Info("memtune: applied memory_limit=", want.memoryLimit, " gc_percent=", want.gcPercent)
 	t.applied = want
-}
-
-// keepLocked returns settings that keep what is applied now, for a file that
-// can't be used. After a Resync nothing is known to be applied, so the
-// baseline is used instead.
-func (t *Tuner) keepLocked() Settings {
-	if t.applied.memoryLimit < 0 {
-		return Settings{}
-	}
-	limit, gc := t.applied.memoryLimit, t.applied.gcPercent
-	return Settings{MemoryLimitBytes: &limit, GCPercent: &gc}
 }
 
 func readRuntime() runtimeValues {

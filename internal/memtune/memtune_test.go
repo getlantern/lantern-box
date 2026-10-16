@@ -202,3 +202,40 @@ func TestRunPollsUntilCancelled(t *testing.T) {
 		t.Fatal("Run did not return after cancel")
 	}
 }
+
+func TestReloadKeepsLastValidSettingsOverInvalidFile(t *testing.T) {
+	withRuntime(t, 1<<30, 100)
+	path := filepath.Join(t.TempDir(), "runtime.json")
+	tuner := New(path, time.Hour)
+
+	running := debugOptions(t, "1200MB", 50)
+	applyConfig(running)
+	writeSettings(t, path, `{"memory_limit_bytes": 2147483648}`)
+	tuner.Resync(running)
+
+	writeSettings(t, path, `not json`)
+	tuner.checkLocked(false)
+
+	// A reload's config check applies other settings, then the tuner resyncs.
+	applyConfig(debugOptions(t, "600MB", 20))
+	tuner.Resync(running)
+	assert.Equal(t, runtimeValues{2 << 30, 50}, readRuntime())
+}
+
+func TestReloadKeepsLastValidSettingsOverUnreadableFile(t *testing.T) {
+	withRuntime(t, 1<<30, 100)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runtime.json")
+	tuner := New(path, time.Hour)
+
+	writeSettings(t, path, `{"memory_limit_bytes": 2147483648}`)
+	tuner.Resync(nil)
+
+	// A directory in place of the file makes ReadFile fail with an error
+	// other than "not exist".
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.Mkdir(path, 0o755))
+	debug.SetMemoryLimit(600 << 20)
+	tuner.Resync(nil)
+	assert.Equal(t, int64(2<<30), readRuntime().memoryLimit)
+}
