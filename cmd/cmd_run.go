@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	runtimeDebug "runtime/debug"
 	"strings"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"github.com/sagernet/sing/common/json"
 	"github.com/spf13/cobra"
 
+	"github.com/getlantern/lantern-box/internal/memtune"
 	lbotel "github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
@@ -37,6 +39,7 @@ func init() {
 	runCmd.Flags().String("isp-database-name", "GeoIP2-ISP.mmdb", "Filename for storing the GeoIP2-ISP database")
 	runCmd.Flags().String("datacap-url", "", "Datacap server URL")
 	runCmd.Flags().String("proxy-info", "", "Path to proxy info INI file")
+	runCmd.Flags().String("memtune-file", "", "JSON file of Go memory settings applied live (default: runtime.json next to the config file)")
 }
 
 var runCmd = &cobra.Command{
@@ -51,7 +54,14 @@ var runCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("get datacap-url flag: %w", err)
 		}
-		return run(path, datacapURL)
+		memtuneFile, err := cmd.Flags().GetString("memtune-file")
+		if err != nil {
+			return fmt.Errorf("get memtune-file flag: %w", err)
+		}
+		if memtuneFile == "" {
+			memtuneFile = filepath.Join(filepath.Dir(path), "runtime.json")
+		}
+		return run(path, datacapURL, memtuneFile)
 	},
 }
 
@@ -149,15 +159,26 @@ func closeMonitor(ctx context.Context) {
 	log.Fatal("sing-box did not close!")
 }
 
-func run(configPath string, datacapURL string) error {
+func run(configPath string, datacapURL string, memtuneFile string) error {
 	log.Info("build info: version ", version, ", commit ", commit)
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(osSignals)
+	tuner := memtune.New(memtuneFile, memtune.DefaultInterval)
+	tunerCtx, stopTuner := context.WithCancel(context.Background())
+	defer stopTuner()
+	tunerStarted := false
 	for {
 		instance, cancel, err := create(configPath, datacapURL)
 		if err != nil {
 			return err
+		}
+		// create re-applies the config's debug options, so the file's
+		// settings go back on top after every (re)load.
+		tuner.Resync()
+		if !tunerStarted {
+			go tuner.Run(tunerCtx)
+			tunerStarted = true
 		}
 		runtimeDebug.FreeOSMemory()
 		for {
