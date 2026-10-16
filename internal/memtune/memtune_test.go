@@ -2,6 +2,7 @@ package memtune
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/byteformats"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -36,7 +39,7 @@ func TestResyncAppliesFileOverBaseline(t *testing.T) {
 	writeSettings(t, path, `{"memory_limit_bytes": 2147483648}`)
 
 	tuner := New(path, time.Hour)
-	tuner.Resync()
+	tuner.Resync(nil)
 
 	got := readRuntime()
 	assert.Equal(t, int64(2<<30), got.memoryLimit)
@@ -48,7 +51,7 @@ func TestChangesAndRemovalFollowFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "runtime.json")
 
 	tuner := New(path, time.Hour)
-	tuner.Resync()
+	tuner.Resync(nil)
 	assert.Equal(t, runtimeValues{1 << 30, 100}, readRuntime(), "no file leaves the runtime alone")
 
 	writeSettings(t, path, `{"memory_limit_bytes": 3221225472, "gc_percent": 50}`)
@@ -70,7 +73,7 @@ func TestInvalidFileKeepsCurrentSettings(t *testing.T) {
 	writeSettings(t, path, `{"memory_limit_bytes": 2147483648}`)
 
 	tuner := New(path, time.Hour)
-	tuner.Resync()
+	tuner.Resync(nil)
 
 	for _, bad := range []string{
 		`{"memory_limit_bytes": 1024}`,
@@ -85,24 +88,79 @@ func TestInvalidFileKeepsCurrentSettings(t *testing.T) {
 	}
 }
 
-func TestResyncReappliesAfterReload(t *testing.T) {
+// applyConfig stands in for box.New, which applies a config's debug options.
+func applyConfig(opts *option.DebugOptions) {
+	if opts.GCPercent != nil {
+		debug.SetGCPercent(*opts.GCPercent)
+	}
+	if opts.MemoryLimit.Value() != 0 {
+		debug.SetMemoryLimit(int64(float64(opts.MemoryLimit.Value()) / 1.5))
+	}
+}
+
+// debugOptions parses the options the way a config file does, e.g. "1200MB".
+func debugOptions(t *testing.T, limit string, gcPercent int) *option.DebugOptions {
+	t.Helper()
+	opts := &option.DebugOptions{GCPercent: &gcPercent}
+	opts.MemoryLimit = new(byteformats.MemoryBytes)
+	require.NoError(t, json.Unmarshal([]byte(`"`+limit+`"`), opts.MemoryLimit))
+	return opts
+}
+
+func TestBaselineComesFromConfig(t *testing.T) {
 	withRuntime(t, 1<<30, 100)
 	path := filepath.Join(t.TempDir(), "runtime.json")
-	writeSettings(t, path, `{"memory_limit_bytes": 2147483648, "gc_percent": 50}`)
-
 	tuner := New(path, time.Hour)
-	tuner.Resync()
 
-	// A SIGHUP reload rebuilds the box, which re-applies the config's options.
-	debug.SetMemoryLimit(800 << 20)
-	debug.SetGCPercent(75)
-	tuner.Resync()
-
+	cfg := debugOptions(t, "1200MB", 50)
+	applyConfig(cfg)
+	writeSettings(t, path, `{"memory_limit_bytes": 2147483648}`)
+	tuner.Resync(cfg)
 	assert.Equal(t, runtimeValues{2 << 30, 50}, readRuntime())
 
 	require.NoError(t, os.Remove(path))
 	tuner.checkLocked(false)
-	assert.Equal(t, runtimeValues{800 << 20, 75}, readRuntime(), "the baseline is the reloaded config's")
+	assert.Equal(t, runtimeValues{800 << 20, 50}, readRuntime(), "the config's limit, divided by 1.5 as sing-box does")
+}
+
+func TestReloadWithoutDebugOptionsDropsOldOverrides(t *testing.T) {
+	withRuntime(t, 1<<30, 100)
+	path := filepath.Join(t.TempDir(), "runtime.json")
+	tuner := New(path, time.Hour)
+
+	cfg := debugOptions(t, "1200MB", 50)
+	applyConfig(cfg)
+	writeSettings(t, path, `{"memory_limit_bytes": 3221225472, "gc_percent": 75}`)
+	tuner.Resync(cfg)
+
+	// The reloaded config sets no debug options, so building it leaves the
+	// file's values in the runtime. They must not become the new baseline.
+	tuner.Resync(nil)
+	assert.Equal(t, runtimeValues{3 << 30, 75}, readRuntime())
+
+	require.NoError(t, os.Remove(path))
+	tuner.checkLocked(false)
+	assert.Equal(t, runtimeValues{1 << 30, 100}, readRuntime(), "back to the startup values")
+}
+
+func TestRejectedReloadRestoresSettings(t *testing.T) {
+	withRuntime(t, 1<<30, 100)
+	path := filepath.Join(t.TempDir(), "runtime.json")
+	tuner := New(path, time.Hour)
+
+	running := debugOptions(t, "1200MB", 50)
+	applyConfig(running)
+	writeSettings(t, path, `{"memory_limit_bytes": 2147483648}`)
+	tuner.Resync(running)
+
+	// A reload's config check builds a box from the new config and fails.
+	applyConfig(debugOptions(t, "600MB", 20))
+	tuner.Resync(running)
+	assert.Equal(t, runtimeValues{2 << 30, 50}, readRuntime())
+
+	// The unchanged file is still honored by later polls.
+	tuner.checkLocked(false)
+	assert.Equal(t, runtimeValues{2 << 30, 50}, readRuntime())
 }
 
 func TestBaselineWithGCOff(t *testing.T) {
@@ -111,7 +169,7 @@ func TestBaselineWithGCOff(t *testing.T) {
 	writeSettings(t, path, `{"gc_percent": 50}`)
 
 	tuner := New(path, time.Hour)
-	tuner.Resync()
+	tuner.Resync(nil)
 	assert.Equal(t, 50, readRuntime().gcPercent)
 
 	require.NoError(t, os.Remove(path))
@@ -124,7 +182,7 @@ func TestRunPollsUntilCancelled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "runtime.json")
 
 	tuner := New(path, 10*time.Millisecond)
-	tuner.Resync()
+	tuner.Resync(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

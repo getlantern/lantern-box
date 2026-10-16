@@ -77,10 +77,14 @@ func readConfig(path string) (option.Options, error) {
 	return options, nil
 }
 
-func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc, error) {
+func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc, *option.DebugOptions, error) {
 	options, err := readConfig(configPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read config: %w", err)
+		return nil, nil, nil, fmt.Errorf("read config: %w", err)
+	}
+	var debugOptions *option.DebugOptions
+	if options.Experimental != nil {
+		debugOptions = options.Experimental.Debug
 	}
 
 	ctx, cancel := context.WithCancel(globalCtx)
@@ -90,7 +94,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 	})
 	if err != nil {
 		cancel()
-		return nil, nil, fmt.Errorf("create service: %w", err)
+		return nil, nil, debugOptions, fmt.Errorf("create service: %w", err)
 	}
 
 	clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
@@ -121,7 +125,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		)
 		if err != nil {
 			cancel()
-			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
+			return nil, nil, debugOptions, fmt.Errorf("create datacap tracker: %w", err)
 		}
 		instance.Router().AppendTracker(datacapTracker)
 	}
@@ -144,9 +148,9 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 	finishStart()
 	if err != nil {
 		cancel()
-		return nil, nil, E.Cause(err, "start service")
+		return nil, nil, debugOptions, E.Cause(err, "start service")
 	}
-	return instance, cancel, nil
+	return instance, cancel, debugOptions, nil
 }
 
 func closeMonitor(ctx context.Context) {
@@ -169,13 +173,13 @@ func run(configPath string, datacapURL string, memtuneFile string) error {
 	defer stopTuner()
 	tunerStarted := false
 	for {
-		instance, cancel, err := create(configPath, datacapURL)
+		instance, cancel, debugOptions, err := create(configPath, datacapURL)
+		// Building the box applied the new config's debug options, even if
+		// it then failed to start.
+		tuner.Resync(debugOptions)
 		if err != nil {
 			return err
 		}
-		// create re-applies the config's debug options, so the file's
-		// settings go back on top after every (re)load.
-		tuner.Resync()
 		if !tunerStarted {
 			go tuner.Run(tunerCtx)
 			tunerStarted = true
@@ -186,6 +190,9 @@ func run(configPath string, datacapURL string, memtuneFile string) error {
 			log.Info("received signal: ", osSignal)
 			if osSignal == syscall.SIGHUP {
 				err = check(configPath)
+				// check builds a box from the new config, which applies its
+				// debug options; put the running config's back.
+				tuner.Resync(debugOptions)
 				if err != nil {
 					log.Error(E.Cause(err, "reload service"))
 					continue

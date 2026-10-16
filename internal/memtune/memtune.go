@@ -8,9 +8,9 @@
 //
 // memory_limit_bytes is passed to debug.SetMemoryLimit as is (unlike sing-box's
 // experimental.debug.memory_limit, which is divided by 1.5). Either field may be
-// omitted to leave that setting at its baseline. The baseline is whatever the
-// config applied when the service was created; it is restored when the file is
-// removed or a field is dropped.
+// omitted to leave that setting at its baseline: the running config's
+// experimental.debug value, else the process's startup value. The baseline is
+// restored when the file is removed or a field is dropped.
 package memtune
 
 import (
@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"runtime/debug"
 	"runtime/metrics"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
 )
 
 const (
@@ -64,6 +66,7 @@ type runtimeValues struct {
 type Tuner struct {
 	path     string
 	interval time.Duration
+	startup  runtimeValues
 
 	mu       sync.Mutex
 	baseline runtimeValues
@@ -71,23 +74,36 @@ type Tuner struct {
 	applied  runtimeValues
 }
 
-// New returns a Tuner for path. Call Resync once the service is created, then
-// Run to poll.
+// New returns a Tuner for path. It records the runtime's current settings as
+// the startup values, so call it before any config is applied. Then call
+// Resync once the service is created, and Run to poll.
 func New(path string, interval time.Duration) *Tuner {
 	if interval <= 0 {
 		interval = DefaultInterval
 	}
-	return &Tuner{path: path, interval: interval}
+	return &Tuner{path: path, interval: interval, startup: readRuntime()}
 }
 
-// Resync records the runtime's current settings as the baseline and applies
-// the file on top. Call it after every service (re)creation, since sing-box
-// re-applies its config's debug options when it builds the box.
-func (t *Tuner) Resync() {
+// Resync sets the baseline from the running config's debug options and
+// applies the file on top. Call it whenever anything may have built a box
+// (service creation, and a reload's config check, whether it passed or not),
+// since building a box applies that config's debug options to the runtime.
+func (t *Tuner) Resync(debugOptions *option.DebugOptions) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.baseline = readRuntime()
-	t.applied = t.baseline
+	t.baseline = t.startup
+	if debugOptions != nil {
+		if debugOptions.GCPercent != nil {
+			t.baseline.gcPercent = *debugOptions.GCPercent
+		}
+		// Mirrors sing-box's applyDebugOptions, which divides by 1.5.
+		if debugOptions.MemoryLimit.Value() != 0 {
+			t.baseline.memoryLimit = int64(float64(debugOptions.MemoryLimit.Value()) / 1.5)
+		}
+	}
+	// The runtime may hold anything now; mark it unknown so the next apply
+	// sets both values.
+	t.applied = runtimeValues{memoryLimit: -1, gcPercent: math.MinInt}
 	t.content = nil
 	t.checkLocked(true)
 }
@@ -127,11 +143,10 @@ func (t *Tuner) checkLocked(force bool) {
 	if content != nil {
 		if err := json.Unmarshal(content, &s); err != nil {
 			log.Warn("memtune: ignoring ", t.path, ": ", err)
-			return
-		}
-		if err := s.validate(); err != nil {
+			s = t.keepLocked()
+		} else if err := s.validate(); err != nil {
 			log.Warn("memtune: ignoring ", t.path, ": ", err)
-			return
+			s = t.keepLocked()
 		}
 	}
 
@@ -151,9 +166,19 @@ func (t *Tuner) checkLocked(force bool) {
 	if want.gcPercent != t.applied.gcPercent {
 		debug.SetGCPercent(want.gcPercent)
 	}
-	log.Info("memtune: memory_limit ", t.applied.memoryLimit, " -> ", want.memoryLimit,
-		", gc_percent ", t.applied.gcPercent, " -> ", want.gcPercent)
+	log.Info("memtune: applied memory_limit=", want.memoryLimit, " gc_percent=", want.gcPercent)
 	t.applied = want
+}
+
+// keepLocked returns settings that keep what is applied now, for a file that
+// can't be used. After a Resync nothing is known to be applied, so the
+// baseline is used instead.
+func (t *Tuner) keepLocked() Settings {
+	if t.applied.memoryLimit < 0 {
+		return Settings{}
+	}
+	limit, gc := t.applied.memoryLimit, t.applied.gcPercent
+	return Settings{MemoryLimitBytes: &limit, GCPercent: &gc}
 }
 
 func readRuntime() runtimeValues {
