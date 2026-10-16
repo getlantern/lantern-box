@@ -105,7 +105,8 @@ func (t *Tuner) Resync(debugOptions *option.DebugOptions) {
 	// The runtime may hold anything now; mark it unknown so the next apply
 	// sets both values.
 	t.applied = runtimeValues{memoryLimit: -1, gcPercent: math.MinInt}
-	t.content = nil
+	// Keep the cached content: a forced check re-reads the file anyway, and if
+	// it can't be read now, the cache is what lets a later removal register.
 	t.checkLocked(true)
 }
 

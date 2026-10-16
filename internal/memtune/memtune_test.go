@@ -239,3 +239,21 @@ func TestReloadKeepsLastValidSettingsOverUnreadableFile(t *testing.T) {
 	tuner.Resync(nil)
 	assert.Equal(t, int64(2<<30), readRuntime().memoryLimit)
 }
+
+func TestRemovalAfterUnreadableResyncRestoresBaseline(t *testing.T) {
+	withRuntime(t, 1<<30, 100)
+	path := filepath.Join(t.TempDir(), "runtime.json")
+	tuner := New(path, time.Hour)
+
+	writeSettings(t, path, `{"memory_limit_bytes": 2147483648}`)
+	tuner.Resync(nil)
+
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.Mkdir(path, 0o755))
+	tuner.Resync(nil)
+	assert.Equal(t, int64(2<<30), readRuntime().memoryLimit)
+
+	require.NoError(t, os.Remove(path))
+	tuner.checkLocked(false)
+	assert.Equal(t, runtimeValues{1 << 30, 100}, readRuntime(), "removing the path restores the baseline")
+}
