@@ -26,8 +26,7 @@ const defaultFirstResponseTimeout = 10 * time.Second
 type dataPlaneHooks struct {
 	onFailure func(adapter.UserFailureKind)
 	// onError runs on the IO goroutine, outside the watchdog's lock.
-	onError    func(err error, state dataPlaneIO, excused bool)
-	onActivity func()
+	onError func(err error, state dataPlaneIO, excused bool)
 }
 
 // makeHooks records chargeable failures and starts recovery. Only primary TCP
@@ -62,7 +61,6 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind)
 			s.logger.Debug("data-plane error: tag=", outerTag, " decision=", decision,
 				" err=", err, " quiet=", state.quiet, " last=", last, " proven=", state.proven)
 		},
-		onActivity: s.bumpActive,
 	}
 }
 
@@ -128,8 +126,7 @@ func endsQuietRead(isRead bool, n int, state dataPlaneIO) bool {
 
 func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	// Short-circuit once stalled: a late noteIO must not re-arm the
-	// timer, fire onActivity, or attribute a failure after the conn is
-	// logically gone.
+	// timer or attribute a failure after the conn is logically gone.
 	if w.stalled.Load() {
 		return
 	}
@@ -162,9 +159,6 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	w.lastWasWrite = !isRead
 	w.ioMu.Unlock()
 	w.timer.Reset(w.idle)
-	if w.hooks.onActivity != nil {
-		w.hooks.onActivity()
-	}
 	if !isRead {
 		return
 	}

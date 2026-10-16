@@ -56,10 +56,9 @@ func TestDataPlane_QuietReadPolicy(t *testing.T) {
 					var w dataPlaneWatchdog
 					var failures []adapter.UserFailureKind
 					var observed dataPlaneIO
-					var activity, observations int
+					var observations int
 					w.init(time.Hour, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
-						onFailure:  func(kind adapter.UserFailureKind) { failures = append(failures, kind) },
-						onActivity: func() { activity++ },
+						onFailure: func(kind adapter.UserFailureKind) { failures = append(failures, kind) },
 						onError: func(err error, state dataPlaneIO, excused bool) {
 							assert.Same(t, readErr, err)
 							assert.Equal(t, tt.excused, excused)
@@ -77,7 +76,7 @@ func TestDataPlane_QuietReadPolicy(t *testing.T) {
 						w.noteIO(n, nil, tt.last == "read")
 					}
 					time.Sleep(tt.quiet)
-					before, activityBefore := w.snapshotIO(), activity
+					before := w.snapshotIO()
 					w.noteIO(tt.n, readErr, tt.isRead)
 					synctest.Wait()
 
@@ -86,7 +85,6 @@ func TestDataPlane_QuietReadPolicy(t *testing.T) {
 					assert.Equal(t, tt.quiet, observed.quiet)
 					assert.Equal(t, tt.proven, observed.proven)
 					assert.Equal(t, before, w.snapshotIO(), "errors must not update IO state")
-					assert.Equal(t, activityBefore, activity, "errors must not count as activity")
 					assert.Equal(t, !tt.excused, w.fired.Load())
 					assert.Equal(t, !tt.excused, w.stalled.Load())
 					if tt.excused {

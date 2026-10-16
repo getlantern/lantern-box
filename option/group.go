@@ -72,20 +72,19 @@ type MutableAutoSelectOutboundOptions struct {
 	// describe a member that may no longer exist. Default 900 (15 min).
 	MaxPersistedAgeSeconds uint32 `json:"max_persisted_age_seconds,omitempty"`
 
-	// BackgroundIntervalSeconds is the active cadence for the low-priority
-	// probe cycle (when data has flowed recently — see
-	// IdleThresholdSeconds). Default 180.
+	// BackgroundIntervalSeconds is the background probe cadence while the
+	// group is in use. Default 180.
 	BackgroundIntervalSeconds uint32 `json:"background_interval_seconds,omitempty"`
 
-	// IdleIntervalSeconds is the cadence used when no data has flowed
-	// through a wrapped data-plane conn for IdleThresholdSeconds.
-	// Default 900 (15 min).
+	// Deprecated: IdleIntervalSeconds is ignored; background probing stops
+	// after IdleThresholdSeconds without use instead of slowing down.
 	IdleIntervalSeconds uint32 `json:"idle_interval_seconds,omitempty"`
 
-	// IdleThresholdSeconds is the no-data-plane-activity window after
-	// which the background probe cadence backs off from
-	// BackgroundIntervalSeconds to IdleIntervalSeconds. Default 600
-	// (10 min).
+	// IdleThresholdSeconds is how long the group may go without a dial or
+	// listen before background probing stops. The next dial or listen
+	// restarts it, probing immediately if the group was idle longer than
+	// BackgroundIntervalSeconds or the network changed meanwhile. Default 900
+	// (15 min).
 	IdleThresholdSeconds uint32 `json:"idle_threshold_seconds,omitempty"`
 
 	// LadderTotalBudgetSeconds is the total budget the reconnection ladder
