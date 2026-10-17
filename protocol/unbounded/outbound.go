@@ -37,9 +37,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 
 	UBClientcore "github.com/getlantern/broflake/clientcore"
+	UBCommon "github.com/getlantern/broflake/common"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -210,6 +212,12 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 		ui.Stop()
 		return fmt.Errorf("unbounded: start QUIC layer: %w", err)
 	}
+	// Tells the egress which outbound (and so which track and route) each
+	// session belongs to; the egress otherwise only sees the donor.
+	ql.SetConsumerHello(UBCommon.ConsumerHello{
+		Tag:      o.Tag(),
+		Platform: runtime.GOOS,
+	})
 
 	o.broflakeConn = bfConn
 	o.ui = ui
