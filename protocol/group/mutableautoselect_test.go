@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	sbAdapter "github.com/sagernet/sing-box/adapter"
@@ -49,15 +50,15 @@ func newTestMUR(t *testing.T, tags ...string) (*MutableAutoSelect, map[string]*m
 		urlOverrides: map[string]string{},
 		histories:    map[string]*localHistory{},
 		cfg: mutableAutoSelectConfig{
-			switchTolerance:    50 * time.Millisecond,
-			activeInterval:     time.Hour,
-			idleInterval:       4 * time.Hour,
-			idleThreshold:      10 * time.Minute,
-			ladderTotalBudget:  100 * time.Millisecond,
-			dataPlaneIdle:      time.Hour,
-			demoteOnlySelected: true,
-			maxPersistedAge:    defaultMaxPersistedAge,
-			probeConcurrency:   defaultProbeConcurrency,
+			switchTolerance:                50 * time.Millisecond,
+			activeInterval:                 time.Hour,
+			idleThreshold:                  10 * time.Minute,
+			ladderTotalBudget:              100 * time.Millisecond,
+			confirmedFailureSwitchCooldown: defaultConfirmedFailureSwitchCooldown,
+			dataPlaneIdle:                  time.Hour,
+			demoteOnlySelected:             true,
+			maxPersistedAge:                defaultMaxPersistedAge,
+			probeConcurrency:               defaultProbeConcurrency,
 		},
 		hist:         defaultHistoryParams(),
 		history:      adapter.NewAutoSelectHistoryStorage(),
@@ -462,15 +463,20 @@ func TestSelectFor_SwitchTolerance(t *testing.T) {
 		name       string
 		alphaDelay uint32
 		betaDelay  uint32
+		percent    uint32
 		want       string
 		commentary string
 	}{
-		{"sticky kept within tolerance", 100, 80, "alpha", "80+50 > 100 → keep alpha"},
-		{"switches when beats tolerance", 100, 40, "beta", "40+50 <= 100 → switch"},
+		{"sticky kept within tolerance", 100, 80, 0, "alpha", "80+50 > 100 → keep alpha"},
+		{"switches when beats tolerance", 100, 40, 0, "beta", "40+50 <= 100 → switch"},
+		{"sticky kept within percent", 1000, 750, 30, "alpha", "250 < 30% of 1000 → keep alpha"},
+		{"switches when beats both", 1000, 650, 30, "beta", "350 >= 50 and >= 30% of 1000 → switch"},
+		{"sticky kept within ms despite percent", 100, 60, 30, "alpha", "40 >= 30% of 100 but < 50 → keep alpha"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _ := newTestMUR(t, "alpha", "beta")
+			s.cfg.switchTolerancePercent = tt.percent
 			recordSuccess(s, "alpha", tt.alphaDelay)
 			recordSuccess(s, "beta", tt.betaDelay)
 			s.stickyTag.tcp.Store("alpha")
@@ -1118,54 +1124,6 @@ func TestHydrate_DropsStaleSnapshot(t *testing.T) {
 	assert.Nil(t, s.history.Load("a"), "stale snapshot must be deleted on hydrate too")
 }
 
-func TestNextProbeInterval(t *testing.T) {
-	tests := []struct {
-		name string
-		prep func(s *MutableAutoSelect)
-		want func(s *MutableAutoSelect) time.Duration
-	}{
-		{
-			name: "no traffic observed defaults to idle",
-			prep: func(*MutableAutoSelect) {},
-			want: func(s *MutableAutoSelect) time.Duration { return s.cfg.idleInterval },
-		},
-		{
-			name: "recent traffic selects active",
-			prep: func(s *MutableAutoSelect) { s.bumpActive() },
-			want: func(s *MutableAutoSelect) time.Duration { return s.cfg.activeInterval },
-		},
-		{
-			name: "stale traffic backs off to idle",
-			prep: func(s *MutableAutoSelect) {
-				s.lastActive.Store(time.Now().Add(-2 * s.cfg.idleThreshold).UnixNano())
-			},
-			want: func(s *MutableAutoSelect) time.Duration { return s.cfg.idleInterval },
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s, _ := newTestMUR(t, "a")
-			tt.prep(s)
-			assert.Equal(t, tt.want(s), s.nextProbeInterval())
-		})
-	}
-}
-
-func TestDataPlaneStream_OnActivityFiresOnNonEmptyIO(t *testing.T) {
-	var activity atomic.Uint32
-	d := newDataPlaneStream(echoConn{}, time.Hour, 0, dataPlaneHooks{onActivity: func() { activity.Add(1) }})
-	defer d.Close()
-	_, err := d.Write([]byte("hi"))
-	require.NoError(t, err, "Write should succeed on echoConn")
-
-	buf := make([]byte, 8)
-	_, err = d.Read(buf)
-	require.NoError(t, err, "Read should succeed on echoConn")
-
-	assert.Equal(t, uint32(2), activity.Load(),
-		"onActivity should fire once per non-empty Read/Write")
-}
-
 // failingConn returns firstN bytes on the first Read, then returns err.
 // If failWrite is set, Write returns err instead of succeeding.
 type failingConn struct {
@@ -1601,6 +1559,8 @@ func TestRunLadder_NoStep1Retry(t *testing.T) {
 func TestInterfaceUpdated_TriggersReprobe(t *testing.T) {
 	s, obs := newTestMUR(t, "a")
 	s.defaultURL = "http://probe.test/"
+	s.idleTimer = time.NewTimer(time.Hour)
+	t.Cleanup(func() { s.idleTimer.Stop() })
 	dialed := make(chan struct{}, 1)
 	obs["a"].On("DialContext").Run(func(mock.Arguments) {
 		select {
@@ -1755,7 +1715,7 @@ func TestRunBackgroundLoop_RegistersWithPauseManager(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runBackgroundLoop()
+		s.runBackgroundLoop(time.NewTimer(time.Hour), false)
 	}()
 	require.Eventually(t, func() bool { return pm.registered.Load() == 1 },
 		2*time.Second, 10*time.Millisecond)
@@ -1771,7 +1731,7 @@ func TestRunBackgroundLoop_NoPauseManagerIsNoOp(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runBackgroundLoop()
+		s.runBackgroundLoop(time.NewTimer(time.Hour), false)
 	}()
 	time.Sleep(10 * time.Millisecond)
 	cancel()
@@ -1779,6 +1739,164 @@ func TestRunBackgroundLoop_NoPauseManagerIsNoOp(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "runBackgroundLoop did not exit after ctx cancel")
+	}
+}
+
+// newIdleTestMUR returns a started group whose one member fails every probe
+// dial, counting them.
+func newIdleTestMUR(t *testing.T) (*MutableAutoSelect, *atomic.Int32) {
+	t.Helper()
+	s, obs := newTestMUR(t, "a")
+	s.defaultURL = "http://probe.test/"
+	s.cfg.activeInterval = time.Minute
+	s.cfg.idleThreshold = 5 * time.Minute
+	s.started = true
+	var dials atomic.Int32
+	obs["a"].dial = func(context.Context) (net.Conn, error) {
+		dials.Add(1)
+		return nil, errors.New("dial denied")
+	}
+	return s, &dials
+}
+
+func isProbing(s *MutableAutoSelect) bool {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.idleTimer != nil
+}
+
+func TestKeepAlive_StopsProbingAfterIdleThreshold(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, dials := newIdleTestMUR(t)
+
+		s.keepAlive()
+		synctest.Wait()
+		require.True(t, isProbing(s))
+		assert.EqualValues(t, 1, dials.Load(), "the first use probes")
+
+		time.Sleep(s.cfg.idleThreshold + time.Second)
+		synctest.Wait()
+		assert.False(t, isProbing(s))
+
+		n := dials.Load()
+		time.Sleep(10 * s.cfg.activeInterval)
+		synctest.Wait()
+		assert.Equal(t, n, dials.Load(), "a stopped loop must not probe")
+	})
+}
+
+func TestKeepAlive_UseKeepsProbing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, dials := newIdleTestMUR(t)
+
+		s.keepAlive()
+		for range 10 {
+			time.Sleep(s.cfg.activeInterval)
+			s.keepAlive()
+		}
+		synctest.Wait()
+		assert.True(t, isProbing(s))
+		assert.EqualValues(t, 11, dials.Load(), "one probe on start plus one per interval")
+	})
+}
+
+func TestKeepAlive_RestartProbesOnlyAfterInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		lastUsed time.Duration
+		want     int32
+	}{
+		{"idle longer than the interval", 2 * time.Minute, 1},
+		{"used within the interval", 30 * time.Second, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, dials := newIdleTestMUR(t)
+				s.lastActive = time.Now().Add(-tt.lastUsed)
+
+				s.keepAlive()
+				synctest.Wait()
+				assert.True(t, isProbing(s))
+				assert.Equal(t, tt.want, dials.Load())
+			})
+		})
+	}
+}
+
+func TestKeepAlive_RestartSkipsProbeWhilePaused(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, dials := newIdleTestMUR(t)
+		s.ctx = pause.WithDefaultManager(s.ctx)
+		service.FromContext[pause.Manager](s.ctx).NetworkPause()
+
+		s.keepAlive()
+		synctest.Wait()
+		assert.True(t, isProbing(s))
+		assert.Zero(t, dials.Load(), "probes while offline would count against healthy members")
+	})
+}
+
+func TestKeepAlive_RestartWaitsForProbeInFlight(t *testing.T) {
+	s, dials := newIdleTestMUR(t)
+	s.probeMu.Lock()
+	s.keepAlive()
+	time.Sleep(50 * time.Millisecond)
+	assert.Zero(t, dials.Load())
+	s.probeMu.Unlock()
+	require.Eventually(t, func() bool { return dials.Load() == 1 }, 2*time.Second, 5*time.Millisecond,
+		"the restart probe must run once the in-flight batch finishes, not drop")
+}
+
+func TestInterfaceUpdated_IdleDefersProbeToNextUse(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, dials := newIdleTestMUR(t)
+		s.lastActive = time.Now()
+
+		s.InterfaceUpdated()
+		synctest.Wait()
+		assert.Zero(t, dials.Load(), "an idle group must not probe on a network change")
+
+		s.keepAlive()
+		synctest.Wait()
+		assert.EqualValues(t, 1, dials.Load(), "the next use probes on the new network, however recent the last use")
+	})
+}
+
+func TestKeepAlive_NoLoopBeforeStartOrAfterClose(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	s.keepAlive()
+	assert.False(t, isProbing(s), "before PostStart")
+
+	s.started = true
+	s.cancel()
+	s.keepAlive()
+	assert.False(t, isProbing(s), "after Close")
+}
+
+func TestDialAndListen_StartProbing(t *testing.T) {
+	tests := []struct {
+		name string
+		use  func(*MutableAutoSelect) error
+	}{
+		{"dial", func(s *MutableAutoSelect) error {
+			_, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+			return err
+		}},
+		{"listen", func(s *MutableAutoSelect) error {
+			_, err := s.ListenPacket(context.Background(), metadata.Socksaddr{})
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, obs := newTestMUR(t, "a")
+			s.started = true
+			obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("dial denied") }
+			obs["a"].On("ListenPacket").Return(nil, errors.New("listen denied"))
+			require.Error(t, tt.use(s))
+			assert.True(t, isProbing(s))
+		})
 	}
 }
 

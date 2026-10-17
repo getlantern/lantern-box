@@ -47,15 +47,16 @@ var (
 	_ adapter.ExhaustionSignaler   = (*MutableAutoSelect)(nil)
 )
 
-const defaultProbeConcurrency = 6
+const (
+	defaultProbeConcurrency               = 6
+	defaultSwitchTolerance                = 500 * time.Millisecond
+	defaultSwitchTolerancePercent         = 30
+	defaultConfirmedFailureSwitchCooldown = time.Minute
+)
 
 // probeFreshnessWindow lets external probes skip members with recent outcomes.
 // Internal probes always force a fresh probe.
 const probeFreshnessWindow = 30 * time.Second
-
-// confirmedFailureSwitchCooldown limits switches after confirmed failures,
-// except when the member selected by the last such switch also fails confirmation.
-const confirmedFailureSwitchCooldown = time.Minute
 
 // MutableAutoSelect is the client-side server-selection group.
 type MutableAutoSelect struct {
@@ -119,61 +120,66 @@ type MutableAutoSelect struct {
 	// so each has at most one at a time. Guarded by access.
 	lastResortInFlight map[string]bool
 
-	// Unix-nano of the most recent non-empty data-plane Read/Write; 0
-	// means no traffic observed yet. Drives the adaptive probe cadence.
-	lastActive atomic.Int64
+	// Guarded by access. idleTimer is non-nil while the background loop runs.
+	lastActive time.Time
+	idleTimer  *time.Timer
 
 	started   bool
 	closeOnce sync.Once
 }
 
 type mutableAutoSelectConfig struct {
-	switchTolerance               time.Duration
-	activeInterval                time.Duration
-	idleInterval                  time.Duration
-	idleThreshold                 time.Duration
-	ladderTotalBudget             time.Duration
-	ladderCooldown                time.Duration
-	dataPlaneIdle                 time.Duration
-	dataPlaneFirstResponseTimeout time.Duration
-	dataPlaneProvedRead           uint64
-	demoteOnlySelected            bool
-	maxPersistedAge               time.Duration
-	probeConcurrency              int
+	switchTolerance                time.Duration
+	switchTolerancePercent         uint32
+	activeInterval                 time.Duration
+	idleThreshold                  time.Duration
+	ladderTotalBudget              time.Duration
+	ladderCooldown                 time.Duration
+	confirmedFailureSwitchCooldown time.Duration
+	dataPlaneIdle                  time.Duration
+	dataPlaneFirstResponseTimeout  time.Duration
+	dataPlaneProvedRead            uint64
+	demoteOnlySelected             bool
+	maxPersistedAge                time.Duration
+	probeConcurrency               int
 }
 
 func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) (mutableAutoSelectConfig, historyParams) {
 	cfg := mutableAutoSelectConfig{
-		switchTolerance:               time.Duration(o.SwitchToleranceMs) * time.Millisecond,
-		activeInterval:                time.Duration(o.BackgroundIntervalSeconds) * time.Second,
-		idleInterval:                  time.Duration(o.IdleIntervalSeconds) * time.Second,
-		idleThreshold:                 time.Duration(o.IdleThresholdSeconds) * time.Second,
-		ladderTotalBudget:             time.Duration(o.LadderTotalBudgetSeconds) * time.Second,
-		ladderCooldown:                time.Duration(o.LadderCooldownSeconds) * time.Second,
-		dataPlaneIdle:                 time.Duration(o.DataPlaneIdleSeconds) * time.Second,
-		dataPlaneFirstResponseTimeout: defaultFirstResponseTimeout,
-		dataPlaneProvedRead:           uint64(o.DataPlaneProvedReadBytes),
-		demoteOnlySelected:            o.DemoteOnlySelectedTag == nil || *o.DemoteOnlySelectedTag,
-		maxPersistedAge:               time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
-		probeConcurrency:              int(o.ProbeConcurrency),
+		switchTolerance:                time.Duration(o.SwitchToleranceMs) * time.Millisecond,
+		switchTolerancePercent:         o.SwitchTolerancePercent,
+		activeInterval:                 time.Duration(o.BackgroundIntervalSeconds) * time.Second,
+		idleThreshold:                  time.Duration(o.IdleThresholdSeconds) * time.Second,
+		ladderTotalBudget:              time.Duration(o.LadderTotalBudgetSeconds) * time.Second,
+		ladderCooldown:                 time.Duration(o.LadderCooldownSeconds) * time.Second,
+		confirmedFailureSwitchCooldown: time.Duration(o.ConfirmedFailureSwitchCooldownSeconds) * time.Second,
+		dataPlaneIdle:                  time.Duration(o.DataPlaneIdleSeconds) * time.Second,
+		dataPlaneFirstResponseTimeout:  defaultFirstResponseTimeout,
+		dataPlaneProvedRead:            uint64(o.DataPlaneProvedReadBytes),
+		demoteOnlySelected:             o.DemoteOnlySelectedTag == nil || *o.DemoteOnlySelectedTag,
+		maxPersistedAge:                time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
+		probeConcurrency:               int(o.ProbeConcurrency),
 	}
 	if cfg.switchTolerance == 0 {
-		cfg.switchTolerance = 200 * time.Millisecond
+		cfg.switchTolerance = defaultSwitchTolerance
+	}
+	if cfg.switchTolerancePercent == 0 {
+		cfg.switchTolerancePercent = defaultSwitchTolerancePercent
 	}
 	if cfg.activeInterval == 0 {
 		cfg.activeInterval = 180 * time.Second
 	}
-	if cfg.idleInterval == 0 {
-		cfg.idleInterval = 900 * time.Second
-	}
 	if cfg.idleThreshold == 0 {
-		cfg.idleThreshold = 600 * time.Second
+		cfg.idleThreshold = 900 * time.Second
 	}
 	if cfg.ladderTotalBudget == 0 {
 		cfg.ladderTotalBudget = 10 * time.Second
 	}
 	if cfg.ladderCooldown == 0 {
-		cfg.ladderCooldown = 60 * time.Second
+		cfg.ladderCooldown = 300 * time.Second
+	}
+	if cfg.confirmedFailureSwitchCooldown == 0 {
+		cfg.confirmedFailureSwitchCooldown = defaultConfirmedFailureSwitchCooldown
 	}
 	if cfg.dataPlaneIdle == 0 {
 		cfg.dataPlaneIdle = defaultDataPlaneIdle
@@ -197,6 +203,9 @@ func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) 
 	}
 	if o.UserFailureWindowSeconds > 0 {
 		hp.userFailureWindow = time.Duration(o.UserFailureWindowSeconds) * time.Second
+	}
+	if o.UserFailureDedupeWindowSeconds > 0 {
+		hp.userFailureDedupeWindow = time.Duration(o.UserFailureDedupeWindowSeconds) * time.Second
 	}
 	return cfg, hp
 }
@@ -283,8 +292,8 @@ func (s *MutableAutoSelect) hydrateHistoryLocked(tag string) {
 	s.histories[tag] = hydrateLocalHistory(snap, now, s.hist.userFailureWindow)
 }
 
-// PostStart is idempotent: a second invocation is a no-op rather than a
-// duplicate background loop.
+// PostStart is idempotent. Background probing starts on the first dial or
+// listen.
 func (s *MutableAutoSelect) PostStart() error {
 	s.access.Lock()
 	if s.started {
@@ -292,8 +301,8 @@ func (s *MutableAutoSelect) PostStart() error {
 		return nil
 	}
 	s.started = true
+	s.lastActive = time.Now()
 	s.access.Unlock()
-	go s.runBackgroundLoop()
 	s.CheckOutbounds()
 	return nil
 }
@@ -310,7 +319,18 @@ func (s *MutableAutoSelect) Close() error {
 	return nil
 }
 
+// InterfaceUpdated re-probes only while background probing is running; an
+// idle group probes on its next dial or listen.
 func (s *MutableAutoSelect) InterfaceUpdated() {
+	s.access.Lock()
+	if s.idleTimer == nil {
+		// Makes the next keepAlive probe however recent the last use was.
+		s.lastActive = time.Time{}
+		s.access.Unlock()
+		s.logger.Info("interface updated while idle, deferring re-probe until next use")
+		return
+	}
+	s.access.Unlock()
 	s.logger.Info("interface updated, re-probing mutableautoselect group")
 	go s.runProbeCycle(s.ctx)
 }
@@ -499,6 +519,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	))
 	defer span.End()
 
+	s.keepAlive()
 	o, err := s.selectFor(network)
 	if err != nil {
 		span.RecordError(err)
@@ -549,6 +570,7 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	))
 	defer span.End()
 
+	s.keepAlive()
 	o, err := s.selectFor("udp")
 	if err != nil {
 		span.RecordError(err)
@@ -727,12 +749,23 @@ func (s *MutableAutoSelect) applyStickiness(
 		s.logSwitch(network, sticky, best, "last resort no longer needed")
 	case c.demote > best.demote && c.userFails > s.hist.softFailLimit:
 		s.logSwitch(network, sticky, best, "failures past retention")
-	case uint64(best.delayMs)+uint64(s.cfg.switchTolerance/time.Millisecond) <= uint64(c.delayMs):
+	case s.beatsOnDelay(best.delayMs, c.delayMs):
 		s.logSwitch(network, sticky, best, "beaten on delay")
 	default:
 		return c
 	}
 	return best
+}
+
+// beatsOnDelay reports whether candidateMs improves on stickyMs by at least
+// switchTolerance and by at least switchTolerancePercent of stickyMs.
+func (s *MutableAutoSelect) beatsOnDelay(candidateMs, stickyMs uint32) bool {
+	if candidateMs >= stickyMs {
+		return false
+	}
+	gain := uint64(stickyMs - candidateMs)
+	return gain >= uint64(s.cfg.switchTolerance/time.Millisecond) &&
+		gain*100 >= uint64(stickyMs)*uint64(s.cfg.switchTolerancePercent)
 }
 
 // logSwitch records which rule moved the group off sticky; a churn report is
@@ -1340,7 +1373,7 @@ func (s *MutableAutoSelect) trySwitchAfterConfirmedFailure(failedTag, replacemen
 		return
 	}
 	last := s.lastConfirmedFailureSwitch
-	if !last.at.IsZero() && now.Sub(last.at) < confirmedFailureSwitchCooldown && last.selectedTag != failedTag {
+	if !last.at.IsZero() && now.Sub(last.at) < s.cfg.confirmedFailureSwitchCooldown && last.selectedTag != failedTag {
 		s.logger.Info("tcp switch deferred: ", failedTag, " -> ", replacementTag, " (confirmed-failure switch cooldown)")
 		return
 	}
@@ -1491,28 +1524,43 @@ func (s *MutableAutoSelect) emitExhaustion() {
 	}
 }
 
-func (s *MutableAutoSelect) bumpActive() {
-	s.lastActive.Store(time.Now().UnixNano())
-}
-
-// nextProbeInterval picks the cadence for the next background probe. A
-// brand-new group (lastActive == 0) is treated as idle so we don't burn
-// the fast cadence on a tunnel nobody is using yet.
-func (s *MutableAutoSelect) nextProbeInterval() time.Duration {
-	last := s.lastActive.Load()
-	if last == 0 || time.Since(time.Unix(0, last)) > s.cfg.idleThreshold {
-		return s.cfg.idleInterval
+// keepAlive records use of the group and starts background probing if it is
+// not running. It is a no-op before PostStart and after Close.
+func (s *MutableAutoSelect) keepAlive() {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if !s.started || s.isClosed() {
+		return
 	}
-	return s.cfg.activeInterval
+	now := time.Now()
+	idleFor := now.Sub(s.lastActive)
+	s.lastActive = now
+	if s.idleTimer != nil {
+		s.idleTimer.Reset(s.cfg.idleThreshold)
+		return
+	}
+	s.idleTimer = time.NewTimer(s.cfg.idleThreshold)
+	s.logger.Info("background probing started")
+	go s.runBackgroundLoop(s.idleTimer, idleFor > s.cfg.activeInterval)
 }
 
+// runBackgroundLoop probes every activeInterval until idle fires. probeNow
+// first runs a full probe, waiting for any batch in flight, unless the device
+// or network is paused.
+//
 // TODO: skip on metered connections once lantern-box's platform interface
 // gains a network-cost API.
-func (s *MutableAutoSelect) runBackgroundLoop() {
+func (s *MutableAutoSelect) runBackgroundLoop(idle *time.Timer, probeNow bool) {
+	pm := service.FromContext[pause.Manager](s.ctx)
+	if probeNow && (pm == nil || !(pm.IsDevicePaused() || pm.IsNetworkPaused())) {
+		s.probeMu.Lock()
+		s.internalProbe(s.ctx, nil)
+		s.probeMu.Unlock()
+	}
 	activeInterval := s.cfg.activeInterval
 	t := time.NewTicker(activeInterval)
 	defer t.Stop()
-	if pm := service.FromContext[pause.Manager](s.ctx); pm != nil {
+	if pm != nil {
 		cb := pause.RegisterTicker(pm, t, activeInterval, nil)
 		defer pm.UnregisterCallback(cb)
 	}
@@ -1520,8 +1568,18 @@ func (s *MutableAutoSelect) runBackgroundLoop() {
 		select {
 		case <-s.ctx.Done():
 			return
+		case <-idle.C:
+			s.access.Lock()
+			if s.idleTimer == idle && time.Since(s.lastActive) < s.cfg.idleThreshold {
+				// Raced with keepAlive's Reset; keep running.
+				s.access.Unlock()
+				continue
+			}
+			s.idleTimer = nil
+			s.access.Unlock()
+			s.logger.Info("background probing stopped: idle")
+			return
 		case <-t.C:
-			t.Reset(s.nextProbeInterval())
 			go s.runProbeCycle(s.ctx)
 		}
 	}
