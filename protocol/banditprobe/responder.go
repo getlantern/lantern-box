@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/logger"
 )
@@ -96,6 +97,12 @@ func (r *responder) serve(ctx context.Context, conn net.Conn) error {
 // Delivery is judged from what the client's kernel acknowledged, never from
 // Write returning: a successful Write only means the bytes reached the local
 // send buffer, which is exactly what a frozen flow still allows.
+//
+// A stream of an inbound multiplex session has no socket of its own; the
+// session's socket stands in for it. That socket is shared, so it is judged by
+// how much of it the client acknowledged after the probe began rather than by
+// how much is outstanding, and its deadlines are left alone, since they would
+// cut every stream of the session.
 func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	start := r.now()
 	deadline := start.Add(r.cfg.maxWait)
@@ -109,6 +116,13 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 
 	conn.SetWriteDeadline(writeDeadline)
 	tc, isTCP := common.Cast[*net.TCPConn](conn)
+	shared := false
+	if !isTCP {
+		if sc, ok := mux.SessionConnFromContext(ctx); ok {
+			tc, isTCP = common.Cast[*net.TCPConn](sc)
+			shared = isTCP
+		}
+	}
 	if !isTCP {
 		return r.awaitWrite(ctx, conn, r.writeAsync(ctx, conn, payload), start, writeDeadline, nil)
 	}
@@ -118,7 +132,9 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	// never; polling only afterwards would turn every stall into a full max_wait.
 	// Deadlines also go on the raw socket so a wrapper that ignores them cannot
 	// leave the write blocked forever.
-	tc.SetWriteDeadline(writeDeadline)
+	if !shared {
+		tc.SetWriteDeadline(writeDeadline)
+	}
 	written := r.writeAsync(ctx, conn, payload)
 	writeDone := false
 	// abortWrite unblocks an outstanding write and returns its result.
@@ -127,6 +143,9 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 			return nil
 		}
 		conn.SetWriteDeadline(time.Now())
+		if shared {
+			return r.abortStreamWrite(conn, written)
+		}
 		tc.SetWriteDeadline(time.Now())
 		return (<-written).err
 	}
@@ -144,6 +163,7 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 		// Without socket state only the write result is known.
 		return r.awaitWrite(ctx, conn, written, start, writeDeadline, tc)
 	}
+	startAcked := st.acked
 	lastAcked, lastProgress := st.acked, r.now()
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -170,7 +190,12 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 		// Delivered means nothing written is still unacknowledged. acked and
 		// unacked come from separate syscalls, so a target summed from them can
 		// fall short of the response's end; unacked alone cannot.
-		if writeDone && st.unacked == 0 {
+		// On a shared socket, other streams' bytes keep unacked from settling
+		// and a stream's Write can return before its bytes reach the socket,
+		// so delivery is instead an acknowledged span at least as long as the
+		// response. TCP delivers in order, so a frozen flow acknowledges
+		// nothing further on any stream.
+		if writeDone && ((!shared && st.unacked == 0) || (shared && st.acked-startAcked >= uint64(len(payload)))) {
 			return result{verdict: verdictDelivered, drain: r.now().Sub(start), acked: st.acked, state: st}
 		}
 		now := r.now()
@@ -258,6 +283,32 @@ func (r *responder) awaitWrite(ctx context.Context, conn net.Conn, written <-cha
 	}
 	return verdictFor(res)
 }
+
+// abortStreamWrite waits for a write on a multiplexed stream whose write
+// deadline has just been set to now. A stream that ignores the deadline is
+// closed, which ends only that stream; one that doesn't return even then is
+// abandoned after writeAbortGrace, as awaitWrite does, so the probe can't hang.
+func (r *responder) abortStreamWrite(conn net.Conn, written <-chan writeResult) error {
+	grace := time.NewTimer(writeAbortGrace)
+	defer grace.Stop()
+	select {
+	case res := <-written:
+		return res.err
+	case <-grace.C:
+	}
+	conn.Close()
+	grace.Reset(writeAbortGrace)
+	select {
+	case res := <-written:
+		return res.err
+	case <-grace.C:
+		return errWriteAbandoned
+	}
+}
+
+// errWriteAbandoned marks a probe write that never returned, even after its
+// stream was closed.
+var errWriteAbandoned = errors.New("banditprobe: probe write did not return")
 
 // writeAbortGrace bounds how long a probe waits for a write to return after
 // its conn was closed at max_wait.
