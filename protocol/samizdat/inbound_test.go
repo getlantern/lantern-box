@@ -290,7 +290,7 @@ func TestHandleConnection_CountsRelayedBytes(t *testing.T) {
 	t.Cleanup(func() { peerconn.SetListener(nil) })
 
 	client, server := net.Pipe()
-	t.Cleanup(func() { client.Close() })
+	t.Cleanup(func() { _ = client.Close() })
 	go func() {
 		_, _ = client.Write([]byte("hello"))
 		_, _ = io.ReadFull(client, make([]byte, 11))
