@@ -1609,7 +1609,7 @@ func TestInterfaceUpdated_TriggersReprobe(t *testing.T) {
 		}
 	}).Return(nil, errors.New("dial denied"))
 
-	s.InterfaceUpdated()
+	s.InterfaceUpdated(context.Background())
 
 	select {
 	case <-dialed:

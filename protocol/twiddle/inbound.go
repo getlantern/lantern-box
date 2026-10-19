@@ -97,14 +97,14 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 	return ib, nil
 }
 
-// NewConnectionEx authenticates the opening, or hands the connection to the
+// NewConnection authenticates the opening, or hands the connection to the
 // cover site.
 //
 // twiddle answers a harvested ClientHello with a synthesised ServerHello, so it
 // cannot complete a genuine handshake with a peer it does not recognise. Every
 // unauthenticated connection therefore MUST reach a real server -- an active
 // prober that gets anything else has confirmed the transport.
-func (i *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	peeked := &peekConn{Conn: conn}
 	tconn, err := tw.Server(peeked, i.cfg)
 	// Stop recording either way. On success the session continues reading through

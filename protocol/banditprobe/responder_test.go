@@ -767,6 +767,7 @@ func TestNewConfig(t *testing.T) {
 func debugLogger() log.ContextLogger {
 	factory := log.NewDefaultFactory(context.Background(), log.Formatter{}, io.Discard, "", nil, false)
 	factory.SetLevel(log.LevelDebug)
+	_ = factory.Start()
 	return factory.Logger()
 }
 
@@ -815,7 +816,7 @@ type panicConn struct{ net.Conn }
 
 func (panicConn) SetReadDeadline(time.Time) error { panic("boom") }
 
-func TestNewConnectionEx_RecoversFromPanic(t *testing.T) {
+func TestNewConnection_RecoversFromPanic(t *testing.T) {
 	rec := newCallbackRecorder(t)
 	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{}, nil)
 	o := &Outbound{responder: r}
@@ -823,7 +824,7 @@ func TestNewConnectionEx_RecoversFromPanic(t *testing.T) {
 	t.Cleanup(func() { client.Close(); server.Close() })
 
 	closed := make(chan error, 1)
-	o.NewConnectionEx(context.Background(), panicConn{server}, adapter.InboundContext{}, func(err error) { closed <- err })
+	o.NewConnection(context.Background(), panicConn{server}, adapter.InboundContext{}, func(err error) { closed <- err })
 	select {
 	case err := <-closed:
 		require.Error(t, err)
@@ -904,6 +905,8 @@ func (b *syncBuffer) String() string {
 func errorLogger(w io.Writer) log.ContextLogger {
 	factory := log.NewDefaultFactory(context.Background(), log.Formatter{}, w, "", nil, false)
 	factory.SetLevel(log.LevelError)
+	// The factory buffers entries until started.
+	_ = factory.Start()
 	return factory.Logger()
 }
 

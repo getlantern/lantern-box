@@ -7,6 +7,7 @@ import (
 
 	semconv "github.com/getlantern/semconv"
 	"github.com/sagernet/sing-box/adapter"
+	tun "github.com/sagernet/sing-tun"
 	N "github.com/sagernet/sing/common/network"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -233,4 +234,10 @@ func metadataToAttributes(metadata adapter.InboundContext) *attributes {
 		}
 	}
 	return attrs
+}
+
+// RoutedFlow returns nil: L3-forwarded TUN flows carry no stream to wrap
+// and never reach a proxy server.
+func (t *MetricsTracker) RoutedFlow(ctx context.Context, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) tun.FlowTracker {
+	return nil
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	tun "github.com/sagernet/sing-tun"
 	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
 
@@ -119,4 +120,10 @@ func (t *DatacapTracker) capped(conn any) (clientcontext.ClientInfo, bool) {
 		return info, true
 	}
 	return clientcontext.ClientInfo{}, false
+}
+
+// RoutedFlow returns nil: L3-forwarded TUN flows carry no stream to wrap
+// and never reach a proxy server.
+func (t *DatacapTracker) RoutedFlow(ctx context.Context, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) tun.FlowTracker {
+	return nil
 }
