@@ -167,7 +167,13 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	if sessionConn, ok := samizdat.SessionConnFromContext(ctx); ok {
 		ctx = mux.ContextWithSessionConn(ctx, sessionConn)
 	}
-	conn = &wrapConn{Conn: conn}
+	// Bytes are counted only for a listener to read.
+	notify := peerconn.Acquire()
+	var bytes *peerconn.Counter
+	if notify != nil {
+		bytes = &peerconn.Counter{}
+	}
+	conn = &wrapConn{Conn: conn, bytes: bytes}
 
 	var metadata adapter.InboundContext
 	metadata.Inbound = i.Tag()
@@ -190,10 +196,10 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	// Written by the routing callback and read by the deferred close, which
 	// can run without the callback having fired when shutdown times out.
 	var rejected atomic.Bool
-	if notify := peerconn.Acquire(); notify != nil {
-		notify(peerconn.Event{State: +1, Source: source, Destination: destination})
+	if notify != nil {
+		notify(peerconn.Event{State: +1, Source: source, Destination: destination, Bytes: bytes})
 		defer func() {
-			evt := peerconn.Event{State: -1, Source: source}
+			evt := peerconn.Event{State: -1, Source: source, Bytes: bytes}
 			if rejected.Load() {
 				evt.Destination, evt.Rejected = destination, true
 			}

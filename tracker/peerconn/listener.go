@@ -17,7 +17,38 @@
 // starting libbox.
 package peerconn
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
+
+// Counter is a connection's running byte totals, from the peer's side: Down
+// is sent to the remote client, Up is received from it. The inbound adds to it
+// as bytes move, so a listener holding it can read live totals while the
+// connection is open, and the final totals once the close event arrives.
+type Counter struct {
+	down, up atomic.Uint64
+}
+
+// Down returns the bytes sent to the remote client so far.
+func (c *Counter) Down() uint64 { return c.down.Load() }
+
+// Up returns the bytes received from the remote client so far.
+func (c *Counter) Up() uint64 { return c.up.Load() }
+
+// AddDown records n bytes sent to the remote client.
+func (c *Counter) AddDown(n int) {
+	if n > 0 {
+		c.down.Add(uint64(n))
+	}
+}
+
+// AddUp records n bytes received from the remote client.
+func (c *Counter) AddUp(n int) {
+	if n > 0 {
+		c.up.Add(uint64(n))
+	}
+}
 
 // Event describes a single connection lifecycle transition surfaced from
 // a lantern-box inbound to the peer-share consumer (radiance peer client).
@@ -49,6 +80,9 @@ type Event struct {
 	Source      string
 	Destination string
 	Rejected    bool
+	// Bytes is the connection's running byte totals: the same Counter on
+	// its accept and its close, or nil if the inbound does not count bytes.
+	Bytes *Counter
 }
 
 // Listener receives connection lifecycle notifications from lantern-box
