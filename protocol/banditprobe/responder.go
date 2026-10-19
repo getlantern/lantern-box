@@ -204,12 +204,12 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 			default:
 			}
 		}
-		// Delivered means nothing written is still unacknowledged. acked and
-		// unacked come from separate syscalls, so a target summed from them can
-		// fall short of the response's end; unacked alone cannot.
+		// Delivered means nothing written is still unacknowledged; unacked
+		// alone is checked because a sum with acked comes from two reads.
 		//
 		// On a shared socket other streams' bytes keep unacked from settling,
-		// so delivery is the client acknowledging up to the watermark: TCP
+		// so delivery is the client acknowledging up to the watermark, which
+		// readSendState's read order can only overstate: TCP
 		// delivers in order, so that covers the response and everything
 		// queued ahead of it. smux and yamux return from Write only once the
 		// frame reached the socket, but h2mux can still be holding the tail in
