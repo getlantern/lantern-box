@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/common/mux"
@@ -56,6 +57,7 @@ type responder struct {
 }
 
 func (r *responder) serve(ctx context.Context, conn net.Conn) error {
+	conn = closeAsync(conn)
 	conn.SetReadDeadline(r.now().Add(requestReadTimeout))
 	req, err := http.ReadRequest(bufio.NewReader(io.LimitReader(conn, maxRequestBytes)))
 	if err != nil {
@@ -313,6 +315,29 @@ func deliveredOn(shared bool, st, baseline sendState, watermark uint64, size int
 	// The watermark can overstate what was written, so an idle session that
 	// never acknowledges up to it is delivered once it has fully drained.
 	return st.acked-baseline.acked >= uint64(size) && (st.acked >= watermark || st.unacked == 0)
+}
+
+// asyncCloseConn closes its conn once, on its own goroutine, so Close never
+// blocks. sing-mux's h2mux stream holds a lock across Write that its Close
+// also takes, so closing a stream whose write is stuck on flow control would
+// otherwise block the probe, and its callback, until the session dies.
+type asyncCloseConn struct {
+	net.Conn
+	once sync.Once
+}
+
+func (c *asyncCloseConn) Close() error {
+	c.once.Do(func() { go c.Conn.Close() })
+	return nil
+}
+
+func (c *asyncCloseConn) Upstream() any { return c.Conn }
+
+func closeAsync(conn net.Conn) net.Conn {
+	if _, ok := conn.(*asyncCloseConn); ok {
+		return conn
+	}
+	return &asyncCloseConn{Conn: conn}
 }
 
 // abortStreamWrite waits for a write on a multiplexed stream whose write

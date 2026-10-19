@@ -90,5 +90,6 @@ func TestSendStateFrom_ReadsUnackedBeforeAcked(t *testing.T) {
 	}
 	st, err := sendStateFrom(outq, info)
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, st.acked+uint64(st.unacked), written)
+	// Read in the opposite order the sum would be exactly 100,000.
+	assert.Equal(t, uint64(110_000), st.acked+uint64(st.unacked))
 }

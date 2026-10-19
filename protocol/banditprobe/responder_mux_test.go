@@ -242,3 +242,42 @@ func TestServe_MuxStreamDrainedSessionIsDeliveredDespiteHighWatermark(t *testing
 
 	assert.Equal(t, "delivered", muxProbe(t, r, rec, session, stream, client))
 }
+
+// lockedWriteConn is a stream whose Close waits for an outstanding Write, as
+// sing-mux's h2mux stream does, and whose Write ignores deadlines and blocks
+// until released.
+type lockedWriteConn struct {
+	net.Conn
+	mu      sync.Mutex
+	release chan struct{}
+}
+
+func (c *lockedWriteConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *lockedWriteConn) Write([]byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	<-c.release
+	return 0, net.ErrClosed
+}
+
+func (c *lockedWriteConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Conn.Close()
+}
+
+func TestServe_MuxStreamCloseBlockedByWriteStillReports(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	session, _ := tcpPair(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{ReportStalled: true}, scriptedState(
+		sendState{acked: 1000, unacked: 5000},
+	))
+	stream, client := net.Pipe()
+	conn := &lockedWriteConn{Conn: stream, release: make(chan struct{})}
+	t.Cleanup(func() { close(conn.release); client.Close(); stream.Close() })
+
+	start := time.Now()
+	assert.Equal(t, "stalled", muxProbe(t, r, rec, session, conn, client))
+	assert.Less(t, time.Since(start), time.Duration(r.cfg.maxWait)+3*writeAbortGrace)
+}
