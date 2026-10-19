@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
+	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing-box/common/uot"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/route/rule"
@@ -160,6 +161,12 @@ func NewInbound(
 // which is required because the samizdat H2 handler closes the stream
 // when the Handler function returns.
 func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destination string) {
+	// The stream has no socket of its own. Expose the session's, under the key
+	// sing-mux streams use, so a bandit probe answered on this stream can judge
+	// delivery from the shared socket's TCP state.
+	if sessionConn, ok := samizdat.SessionConnFromContext(ctx); ok {
+		ctx = mux.ContextWithSessionConn(ctx, sessionConn)
+	}
 	conn = &wrapConn{Conn: conn}
 
 	var metadata adapter.InboundContext
