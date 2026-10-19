@@ -281,3 +281,28 @@ func TestServe_MuxStreamCloseBlockedByWriteStillReports(t *testing.T) {
 	assert.Equal(t, "stalled", muxProbe(t, r, rec, session, conn, client))
 	assert.Less(t, time.Since(start), time.Duration(r.cfg.maxWait)+3*writeAbortGrace)
 }
+
+func TestDeliveredOn(t *testing.T) {
+	baseline := sendState{acked: 1000}
+	const size = 4096
+	for _, tt := range []struct {
+		name      string
+		shared    bool
+		st        sendState
+		watermark uint64
+		want      bool
+	}{
+		{"own socket drained", false, sendState{acked: 1000, unacked: 0}, 0, true},
+		{"own socket outstanding", false, sendState{acked: 900_000, unacked: 1}, 0, false},
+		{"shared reached watermark", true, sendState{acked: 151_000, unacked: 3000}, 151_000, true},
+		{"shared short of watermark", true, sendState{acked: 141_000, unacked: 3000}, 151_000, false},
+		// The watermark overstated what was written and the session went idle.
+		{"shared drained below watermark", true, sendState{acked: 141_000, unacked: 0}, 151_000, true},
+		{"shared drained, span too short", true, sendState{acked: 1000 + size - 1, unacked: 0}, 0, false},
+		{"shared watermark, span too short", true, sendState{acked: 1000 + size - 1, unacked: 3000}, 1000, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, deliveredOn(tt.shared, tt.st, baseline, tt.watermark, size))
+		})
+	}
+}
