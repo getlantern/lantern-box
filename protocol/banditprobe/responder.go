@@ -132,7 +132,15 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	// never; polling only afterwards would turn every stall into a full max_wait.
 	// Deadlines also go on the raw socket so a wrapper that ignores them cannot
 	// leave the write blocked forever.
-	if !shared {
+	var baseline sendState
+	if shared {
+		// The client may acknowledge some of the response before the first
+		// poll, so a shared socket's baseline is taken before writing.
+		var err error
+		if baseline, err = r.readState(tc); err != nil {
+			return r.awaitWrite(ctx, conn, r.writeAsync(ctx, conn, payload), start, writeDeadline, nil)
+		}
+	} else {
 		tc.SetWriteDeadline(writeDeadline)
 	}
 	written := r.writeAsync(ctx, conn, payload)
@@ -160,10 +168,18 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 
 	st, err := r.readState(tc)
 	if err != nil {
-		// Without socket state only the write result is known.
-		return r.awaitWrite(ctx, conn, written, start, writeDeadline, tc)
+		// Without socket state only the write result is known. A shared
+		// socket's deadlines stay untouched.
+		raw := tc
+		if shared {
+			raw = nil
+		}
+		return r.awaitWrite(ctx, conn, written, start, writeDeadline, raw)
 	}
-	startAcked := st.acked
+	// watermark is, on a shared socket, the socket's byte count once the
+	// response had been written to it: everything queued ahead of it, other
+	// streams' bytes included.
+	var watermark uint64
 	lastAcked, lastProgress := st.acked, r.now()
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -184,18 +200,22 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 					return stalled(st)
 				}
 				st = next
+				watermark = st.acked + uint64(st.unacked)
 			default:
 			}
 		}
 		// Delivered means nothing written is still unacknowledged. acked and
 		// unacked come from separate syscalls, so a target summed from them can
 		// fall short of the response's end; unacked alone cannot.
-		// On a shared socket, other streams' bytes keep unacked from settling
-		// and a stream's Write can return before its bytes reach the socket,
-		// so delivery is instead an acknowledged span at least as long as the
-		// response. TCP delivers in order, so a frozen flow acknowledges
-		// nothing further on any stream.
-		if writeDone && ((!shared && st.unacked == 0) || (shared && st.acked-startAcked >= uint64(len(payload)))) {
+		//
+		// On a shared socket other streams' bytes keep unacked from settling,
+		// so delivery is the client acknowledging up to the watermark: TCP
+		// delivers in order, so that covers the response and everything
+		// queued ahead of it. smux and yamux return from Write only once the
+		// frame reached the socket, but h2mux can still be holding the tail in
+		// its HTTP/2 writer, so the client must also have acknowledged at least
+		// the response's length since the baseline.
+		if writeDone && deliveredOn(shared, st, baseline, watermark, len(payload)) {
 			return result{verdict: verdictDelivered, drain: r.now().Sub(start), acked: st.acked, state: st}
 		}
 		now := r.now()
@@ -282,6 +302,15 @@ func (r *responder) awaitWrite(ctx context.Context, conn net.Conn, written <-cha
 		return result{verdict: verdictStalled, drain: r.now().Sub(start)}
 	}
 	return verdictFor(res)
+}
+
+// deliveredOn reports whether st shows a fully written response delivered;
+// see respond.
+func deliveredOn(shared bool, st, baseline sendState, watermark uint64, size int) bool {
+	if !shared {
+		return st.unacked == 0
+	}
+	return st.acked >= watermark && st.acked-baseline.acked >= uint64(size)
 }
 
 // abortStreamWrite waits for a write on a multiplexed stream whose write
