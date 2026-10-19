@@ -137,6 +137,9 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 }
 
 func (o *Outbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	// serve closes conn the same way; sharing the wrapper keeps the close
+	// below from blocking on a stuck stream write too.
+	conn = closeAsync(conn)
 	go func() {
 		var err error
 		// A probe is a side channel: a panic while answering one must not take
