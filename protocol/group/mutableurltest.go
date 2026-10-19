@@ -158,8 +158,10 @@ func (s *MutableURLTest) URLTest(ctx context.Context) (map[string]uint16, error)
 }
 
 // PerformUpdateCheck re-picks the selected outbounds from the current
-// URL-test history.
+// URL-test history. It holds the group lock so it can't race Add or Remove.
 func (s *MutableURLTest) PerformUpdateCheck() {
+	s.group.access.Lock()
+	defer s.group.access.Unlock()
 	s.group.updateSelected()
 }
 
