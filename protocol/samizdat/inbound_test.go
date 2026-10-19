@@ -274,6 +274,66 @@ func TestHandleConnection_CloseEventMarksRejections(t *testing.T) {
 	}
 }
 
+// The accept and close events share one Counter, which the relay fills as it
+// reads from and writes to the client, so a listener can read live totals and
+// the final ones at close.
+func TestHandleConnection_CountsRelayedBytes(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []peerconn.Event
+	)
+	peerconn.SetListener(func(evt peerconn.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, evt)
+	})
+	t.Cleanup(func() { peerconn.SetListener(nil) })
+
+	client, server := net.Pipe()
+	t.Cleanup(func() { client.Close() })
+	go func() {
+		_, _ = client.Write([]byte("hello"))
+		_, _ = io.ReadFull(client, make([]byte, 11))
+	}()
+
+	ib := &Inbound{
+		logger: log.NewNOPFactory().Logger(),
+		router: &mockRouter{onRoute: func(_ context.Context, conn net.Conn, _ adapter.InboundContext, onClose N.CloseHandlerFunc) {
+			_, err := io.ReadFull(conn, make([]byte, 5))
+			if err == nil {
+				_, err = conn.Write([]byte("hello world"))
+			}
+			onClose(err)
+		}},
+	}
+	ib.handleConnection(context.Background(), server, "example.com:443")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, events, 2)
+	require.NotNil(t, events[0].Bytes)
+	assert.Same(t, events[0].Bytes, events[1].Bytes, "accept and close share one counter")
+	assert.Equal(t, uint64(5), events[1].Bytes.Up(), "bytes received from the client")
+	assert.Equal(t, uint64(11), events[1].Bytes.Down(), "bytes sent to the client")
+}
+
+// With no listener there is no one to read a count, so none is kept.
+func TestHandleConnection_NoListenerNoCounter(t *testing.T) {
+	peerconn.SetListener(nil)
+	var routed net.Conn
+	ib := &Inbound{
+		logger: log.NewNOPFactory().Logger(),
+		router: &mockRouter{onRoute: func(_ context.Context, conn net.Conn, _ adapter.InboundContext, onClose N.CloseHandlerFunc) {
+			routed = conn
+			onClose(nil)
+		}},
+	}
+	ib.handleConnection(context.Background(), dummyConn(t), "example.com:443")
+	wc, ok := routed.(*wrapConn)
+	require.True(t, ok)
+	assert.Nil(t, wc.bytes)
+}
+
 // A stream routed by the inbound carries the session's TCP socket under the
 // key the bandit probe responder reads, so a probe answered on a samizdat
 // stream can be judged delivered or stalled rather than unknown.
