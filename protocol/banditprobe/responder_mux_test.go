@@ -223,3 +223,22 @@ func TestServe_MuxStreamWithoutSocketStateLeavesSessionSocketUsable(t *testing.T
 		})
 	}
 }
+
+func TestServe_MuxStreamDrainedSessionIsDeliveredDespiteHighWatermark(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	session, _ := tcpPair(t)
+	// An ack between the two socket reads put the watermark at 151,000 when
+	// only 141,000 bytes were written; the session then goes idle with
+	// everything acknowledged.
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{ReportStalled: true}, scriptedState(
+		sendState{acked: 1000, unacked: 0},
+		sendState{acked: 1000, unacked: 0},
+		sendState{acked: 101_000, unacked: 50_000},
+		sendState{acked: 141_000, unacked: 0},
+	))
+	stream, client := net.Pipe()
+	t.Cleanup(func() { client.Close(); stream.Close() })
+	drain(t, client)
+
+	assert.Equal(t, "delivered", muxProbe(t, r, rec, session, stream, client))
+}

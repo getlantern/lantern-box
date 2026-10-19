@@ -310,7 +310,9 @@ func deliveredOn(shared bool, st, baseline sendState, watermark uint64, size int
 	if !shared {
 		return st.unacked == 0
 	}
-	return st.acked >= watermark && st.acked-baseline.acked >= uint64(size)
+	// The watermark can overstate what was written, so an idle session that
+	// never acknowledges up to it is delivered once it has fully drained.
+	return st.acked-baseline.acked >= uint64(size) && (st.acked >= watermark || st.unacked == 0)
 }
 
 // abortStreamWrite waits for a write on a multiplexed stream whose write
