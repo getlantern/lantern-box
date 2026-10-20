@@ -1292,11 +1292,10 @@ func (s *MutableAutoSelect) mutateHistoryIf(tag string, guard func() bool, fn fu
 // kicks) on collapsed events.
 func (s *MutableAutoSelect) recordUserFailure(tag string, kind adapter.UserFailureKind) bool {
 	// Members tear down their transports during shutdown, and the
-	// resulting errors don't reflect their health.
-	if s.isClosed() {
-		return false
-	}
-	recorded := s.mutateHistory(tag, func(h *localHistory, now time.Time) bool {
+	// resulting errors don't reflect their health. Checked under s.access
+	// so a failure waiting on the lock while Close runs is dropped too.
+	open := func() bool { return !s.isClosed() }
+	recorded := s.mutateHistoryIf(tag, open, func(h *localHistory, now time.Time) bool {
 		return h.addUserFailure(adapter.UserFailure{At: now, Kind: kind}, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
 	})
 	if recorded {

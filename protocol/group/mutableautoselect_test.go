@@ -2043,9 +2043,24 @@ func TestDialAndListen_MemberContextErrorIsCharged(t *testing.T) {
 }
 
 func TestRecordUserFailure_ClosedGroupIsNotCharged(t *testing.T) {
-	s, _ := newTestMUR(t, "a")
-	s.cancel()
-	assert.False(t, s.recordUserFailure("a", adapter.UserFailureReset))
-	uf, _ := userFailures(s, "a")
-	assert.Empty(t, uf)
+	t.Run("closed before the call", func(t *testing.T) {
+		s, _ := newTestMUR(t, "a")
+		s.cancel()
+		assert.False(t, s.recordUserFailure("a", adapter.UserFailureReset))
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf)
+	})
+	t.Run("closed while waiting for the lock", func(t *testing.T) {
+		s, _ := newTestMUR(t, "a")
+		s.access.Lock()
+		recorded := make(chan bool)
+		go func() { recorded <- s.recordUserFailure("a", adapter.UserFailureReset) }()
+		// Let the call reach the lock before the group closes.
+		time.Sleep(50 * time.Millisecond)
+		s.cancel()
+		s.access.Unlock()
+		assert.False(t, <-recorded)
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf)
+	})
 }
