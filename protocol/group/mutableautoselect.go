@@ -1115,7 +1115,7 @@ func (s *MutableAutoSelect) runProbeCycle() {
 		return
 	}
 	defer s.probeMu.Unlock()
-	s.probeForWinnerLocked(s.ctx, "probe cycle")
+	s.probeReachableLocked(s.ctx, "probe cycle")
 }
 
 // runExternalProbe runs a fire-and-forget, freshness-filtered probe for tags,
@@ -1254,7 +1254,7 @@ func (s *MutableAutoSelect) finishLastResortProbe(tag, probeURL string) {
 }
 
 // lastResortSuccessFreshness bounds how old a last resort's latest successful
-// probe may be for the ladder to treat it as a winner.
+// probe may be for a full probe to count it as reachable.
 const lastResortSuccessFreshness = 5 * time.Minute
 
 // lastResortProbeBound is how long a last-resort probe may run before it is
@@ -1459,7 +1459,7 @@ func (s *MutableAutoSelect) runLadder(target string) {
 	s.probeMu.Lock()
 	fullCtx, cancel := context.WithTimeout(s.ctx, s.cfg.ladderTotalBudget)
 	defer cancel()
-	winner, current := s.probeForWinnerLocked(fullCtx, "ladder")
+	reachable, total, current := s.probeReachableLocked(fullCtx, "ladder")
 	s.probeMu.Unlock()
 	// Skipping the stamp lets the new network ladder without a cooldown.
 	if !current {
@@ -1468,65 +1468,56 @@ func (s *MutableAutoSelect) runLadder(target string) {
 	// Stamp on completion, not entry, so a slow ladder's runtime counts
 	// toward the cooldown.
 	s.lastLadderAt.Store(time.Now().UnixNano())
-	if winner != nil {
-		s.logger.Info("ladder found winner: ", winner.Tag())
+	if reachable > 0 {
+		s.logger.Info("ladder complete: ", reachable, "/", total, " members reachable")
 	}
 }
 
-// probeForWinnerLocked probes every member and returns the best-ranked one
-// that can carry traffic, signalling exhaustion if none can. It reports false
-// and signals nothing if the group closed or the network changed during the
-// probe, since the result then describes the old network. Caller must hold
-// s.probeMu.
-func (s *MutableAutoSelect) probeForWinnerLocked(ctx context.Context, source string) (A.Outbound, bool) {
+// probeReachableLocked returns reachable and total candidate counts after probing.
+//
+// Reachability requires success in this cycle, or a last-resort member's latest
+// probe succeeding within lastResortSuccessFreshness. It signals exhaustion if
+// none qualify. If the group closes or the network changes during probing,
+// current is false and no exhaustion is signalled. Caller must hold s.probeMu.
+func (s *MutableAutoSelect) probeReachableLocked(ctx context.Context, source string) (reachable, total int, current bool) {
 	changes := s.networkChanges.Load()
-	cycleStart := time.Now()
 	// A probe failure advances lastOutcomeAt while leaving
 	// lastSuccessDelayMs intact, so the ranked set alone cannot tell a
-	// member that succeeded this cycle from one that only failed in it.
-	// Rank still orders the winner; this decides whether one exists. The
+	// member that succeeded this cycle from one that only failed in it. The
 	// map needs no lock of its own: probeAll serializes onSuccess, and
 	// internalProbe returns only after its workers finish.
 	succeeded := make(map[string]struct{})
 	s.internalProbe(ctx, func(res probeResult) {
 		succeeded[res.tag] = struct{}{}
 	})
-	var winner A.Outbound
 	s.access.Lock()
 	defer s.access.Unlock()
 	if s.isClosed() || s.networkChanges.Load() != changes {
-		return nil, false
+		return 0, 0, false
 	}
-	for _, c := range s.rankLocked(time.Now(), cycleStart) {
+	now := time.Now()
+	members := s.rankLocked(now, time.Time{})
+	for _, c := range members {
 		if _, ok := succeeded[c.tag]; ok {
-			winner = c.outbound
-			break
+			reachable++
+			continue
 		}
-	}
-	if winner == nil {
-		// lastResort members are probed asynchronously and can't report
-		// inside the cycle. One whose latest probe succeeded within
-		// lastResortSuccessFreshness can still carry traffic, so the group
-		// isn't exhausted. An older success doesn't count, since trusting
-		// it would suppress the exhaustion signal on stale evidence.
-		now := time.Now()
-		for _, c := range s.rankLocked(now, time.Time{}) {
-			if c.demote != demoteLastResort {
-				continue
-			}
-			if h, ok := s.peekHistoryLocked(c.tag); ok {
-				if delay, at, consec, _, _ := h.snapshot(now, s.hist.userFailureWindow); delay > 0 && consec == 0 && now.Sub(at) <= lastResortSuccessFreshness {
-					winner = c.outbound
-					break
-				}
+		if c.demote != demoteLastResort {
+			continue
+		}
+		// An older success doesn't count, since trusting it would suppress
+		// the exhaustion signal on stale evidence.
+		if h, ok := s.peekHistoryLocked(c.tag); ok {
+			if delay, at, consec, _, _ := h.snapshot(now, s.hist.userFailureWindow); delay > 0 && consec == 0 && now.Sub(at) <= lastResortSuccessFreshness {
+				reachable++
 			}
 		}
 	}
-	if winner == nil {
+	if reachable == 0 {
 		s.logger.Warn(source, " exhausted: no candidate succeeded")
 		s.emitExhaustionLocked()
 	}
-	return winner, true
+	return reachable, len(members), true
 }
 
 // emitExhaustionLocked requires s.access, which Close holds while closing the

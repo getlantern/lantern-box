@@ -1454,10 +1454,7 @@ func TestFullProbe_ExhaustionSignalWhenAllFail(t *testing.T) {
 		{"background cycle signals", (*MutableAutoSelect).runProbeCycle, true},
 		{"network-change or wake probe stays silent", (*MutableAutoSelect).reprobe, false},
 	}
-	// seedPriorSuccess leaves lastSuccessDelayMs set so the cycle's own
-	// failures advance lastOutcomeAt past freshSince while a stale delay
-	// remains — the combination that previously let a fully-failing
-	// probe report a winner and stay silent.
+	// Prior success must not suppress exhaustion when every current probe fails.
 	for _, seedPriorSuccess := range []bool{false, true} {
 		for _, tt := range runs {
 			t.Run(fmt.Sprintf("%s/prior success %v", tt.name, seedPriorSuccess), func(t *testing.T) {
@@ -1479,9 +1476,6 @@ func TestFullProbe_ExhaustionSignalWhenAllFail(t *testing.T) {
 	}
 }
 
-// Guards the opposite direction from the exhaustion tests: the winner gate
-// must not be so tight that a live member is missed, which would signal
-// exhaustion every cycle and drive a /config-new refetch each time.
 func TestFullProbe_StaysSilentWhenAMemberSucceeds(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	t.Cleanup(srv.Close)
@@ -1508,6 +1502,36 @@ func TestFullProbe_StaysSilentWhenAMemberSucceeds(t *testing.T) {
 		})
 	}
 }
+
+func TestProbeReachableLocked_CountsReachableMembers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(srv.Close)
+
+	s, obs := newTestMUR(t, "dead", "live1", "live2")
+	s.defaultURL = "http://probe.test/"
+	for _, tag := range []string{"dead", "live1", "live2"} {
+		recordSuccess(s, tag, 100)
+	}
+	obs["dead"].dial = denyDial
+	liveDial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Listener.Addr().String())
+	}
+	obs["live1"].dial = liveDial
+	obs["live2"].dial = liveDial
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s.probeMu.Lock()
+	reachable, total, current := s.probeReachableLocked(ctx, "test")
+	s.probeMu.Unlock()
+
+	assert.True(t, current)
+	assert.Equal(t, 2, reachable)
+	assert.Equal(t, 3, total)
+	assert.False(t, exhausted(s))
+}
+
 func TestExhaustionSignal_CoalescesPendingSignal(t *testing.T) {
 	s, obs := newTestMUR(t, "a")
 	s.defaultURL = "http://probe.test/"
