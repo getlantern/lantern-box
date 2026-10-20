@@ -4,7 +4,7 @@ go 1.26.2
 
 // replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.18-lantern
 
-replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.13.19-lantern
+replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.13.20-0.20261019115333-624aa48e0252
 
 // replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4
 
@@ -28,8 +28,8 @@ require (
 	github.com/getlantern/common v1.2.1-0.20260918012933-d4772c51b208
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260520145825-958775d51395
-	github.com/getlantern/samizdat v0.0.3-0.20260819153658-ebc74116a064
-	github.com/getlantern/semconv v0.0.0-20261003143130-94b11ff9bfeb
+	github.com/getlantern/samizdat v0.0.3-0.20261019142234-18bd41c612f1
+	github.com/getlantern/semconv v0.0.0-20261009113645-6897603ca940
 	github.com/getlantern/twiddle v0.0.0-20260914204124-f698a0d67d2f
 	github.com/gobwas/ws v1.4.0
 	github.com/hashicorp/yamux v0.1.2
@@ -135,7 +135,7 @@ require (
 	github.com/getlantern/golog v0.0.0-20230503153817-8e72de7e0a65 // indirect
 	github.com/getlantern/hex v0.0.0-20220104173244-ad7e4b9194dc // indirect
 	github.com/getlantern/hidden v0.0.0-20220104173330-f221c5a24770 // indirect
-	github.com/getlantern/keepcurrent v0.0.0-20260616120552-f204338b01a3 // indirect
+	github.com/getlantern/keepcurrent v0.0.0-20261009194109-22f33eaeac6e // indirect
 	github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534 // indirect
 	github.com/getlantern/telemetry v0.0.0-20250606052628-8960164ec1f5 // indirect
 	github.com/go-chi/chi/v5 v5.2.5 // indirect

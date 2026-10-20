@@ -951,15 +951,23 @@ source "alicloud-ecs" "lantern-box" {
   }
   io_optimized                  = true
   internet_charge_type          = "PayByTraffic"
-  internet_max_bandwidth_out    = 5
+  # 0 so the VPC instance is created without a public IP: the build reaches it
+  # through the EIP that associate_public_ip_address allocates (at Alicloud's
+  # default bandwidth), and an instance that already has one cannot take an EIP.
+  internet_max_bandwidth_out    = 0
   # Disable Alibaba's "security enhancement" (China-specific Aegis/CloudMonitor agent).
   # We run our own monitoring and don't want the extra agent on proxy servers.
   security_enhancement_strategy = "Deactive"
   force_stop_instance           = true
   ssh_username         = "root"
-  ssh_password         = var.alicloud_ssh_password
+  # Alicloud no longer offers the classic network, and the plugin builds in a
+  # VPC only when a key pair, user data or VPC ID is set. Without an
+  # ssh_password Packer creates a temporary key pair, so the build gets a
+  # temporary VPC and vSwitch; the key is cleared before the image is taken.
+  ssh_clear_authorized_keys   = true
+  associate_public_ip_address = true
 
-  wait_copying_image_ready_timeout = 7200 # seconds (2h) — copying to 10 regions can be slow
+  wait_copying_image_ready_timeout = 7200 # seconds (2h) — copying to 12 regions can be slow
 
   image_copy_regions = [
     "ap-southeast-1",  # Singapore
@@ -972,6 +980,8 @@ source "alicloud-ecs" "lantern-box" {
     "cn-hongkong",     # Hong Kong
     "eu-central-1",    # Germany (Frankfurt)
     "eu-west-1",       # UK (London)
+    "eu-west-2",       # France (Paris)
+    "eu-west-3",       # Netherlands (Amsterdam)
   ]
   image_copy_names = [
     "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Singapore
@@ -984,6 +994,8 @@ source "alicloud-ecs" "lantern-box" {
     "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Hong Kong
     "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Germany
     "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # UK
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # France
+    "lantern-box-${var.lantern_box_version}-{{timestamp}}",  # Netherlands
   ]
 }
 

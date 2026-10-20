@@ -47,7 +47,7 @@ func (r *outboundRegistry) Upstream() any {
 // Groups, including lantern-box's fallback, are excluded because they dial
 // through member outbounds, which are wrapped themselves.
 func canWrapOutbound(out adapter.Outbound) bool {
-	if out.Type() == lconstant.TypeFallback {
+	if out.Type() == lconstant.TypeFallback || out.Type() == lconstant.TypeUnbounded {
 		return false
 	}
 	switch out.(type) {

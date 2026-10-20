@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -12,12 +13,16 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/route/rule"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/getlantern/lantern-box/tracker/peerconn"
+
+	samizdat "github.com/getlantern/samizdat"
 )
 
 // mockRouter implements adapter.ConnectionRouterEx with controllable callback behavior.
@@ -267,4 +272,129 @@ func TestHandleConnection_CloseEventMarksRejections(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The accept and close events share one Counter, which the relay fills as it
+// reads from and writes to the client, so a listener can read live totals and
+// the final ones at close.
+func TestHandleConnection_CountsRelayedBytes(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []peerconn.Event
+	)
+	peerconn.SetListener(func(evt peerconn.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, evt)
+	})
+	t.Cleanup(func() { peerconn.SetListener(nil) })
+
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = client.Close() })
+	go func() {
+		_, _ = client.Write([]byte("hello"))
+		_, _ = io.ReadFull(client, make([]byte, 11))
+	}()
+
+	ib := &Inbound{
+		logger: log.NewNOPFactory().Logger(),
+		router: &mockRouter{onRoute: func(_ context.Context, conn net.Conn, _ adapter.InboundContext, onClose N.CloseHandlerFunc) {
+			_, err := io.ReadFull(conn, make([]byte, 5))
+			if err == nil {
+				_, err = conn.Write([]byte("hello world"))
+			}
+			onClose(err)
+		}},
+	}
+	ib.handleConnection(context.Background(), server, "example.com:443")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, events, 2)
+	require.NotNil(t, events[0].Bytes)
+	assert.Same(t, events[0].Bytes, events[1].Bytes, "accept and close share one counter")
+	assert.Equal(t, uint64(5), events[1].Bytes.Up(), "bytes received from the client")
+	assert.Equal(t, uint64(11), events[1].Bytes.Down(), "bytes sent to the client")
+}
+
+// With no listener there is no one to read a count, so none is kept.
+func TestHandleConnection_NoListenerNoCounter(t *testing.T) {
+	peerconn.SetListener(nil)
+	var routed net.Conn
+	ib := &Inbound{
+		logger: log.NewNOPFactory().Logger(),
+		router: &mockRouter{onRoute: func(_ context.Context, conn net.Conn, _ adapter.InboundContext, onClose N.CloseHandlerFunc) {
+			routed = conn
+			onClose(nil)
+		}},
+	}
+	ib.handleConnection(context.Background(), dummyConn(t), "example.com:443")
+	wc, ok := routed.(*wrapConn)
+	require.True(t, ok)
+	assert.Nil(t, wc.bytes)
+}
+
+// A stream routed by the inbound carries the session's TCP socket under the
+// key the bandit probe responder reads, so a probe answered on a samizdat
+// stream can be judged delivered or stalled rather than unknown.
+func TestHandleConnection_ExposesSessionConnToRouter(t *testing.T) {
+	serverPriv, serverPub, err := samizdat.GenerateKeyPair()
+	require.NoError(t, err)
+	shortID, err := samizdat.GenerateShortID()
+	require.NoError(t, err)
+	certPEM, keyPEM := testCertKeyPEM(t)
+
+	type routed struct {
+		session net.Conn
+		ok      bool
+	}
+	routedCh := make(chan routed, 1)
+	ib := &Inbound{
+		Adapter: inbound.NewAdapter("samizdat", "samizdat-in"),
+		logger:  log.NewNOPFactory().Logger(),
+		router: &mockRouter{onRoute: func(ctx context.Context, conn net.Conn, _ adapter.InboundContext, onClose N.CloseHandlerFunc) {
+			session, ok := mux.SessionConnFromContext(ctx)
+			routedCh <- routed{session: session, ok: ok}
+			conn.Write([]byte("ok"))
+			onClose(nil)
+		}},
+	}
+
+	server, err := samizdat.NewServer(samizdat.ServerConfig{
+		PrivateKey: serverPriv,
+		ShortIDs:   [][8]byte{shortID},
+		CertPEM:    []byte(certPEM),
+		KeyPEM:     []byte(keyPEM),
+		Handler:    ib.handleConnection,
+	})
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go server.Serve(ln)
+	t.Cleanup(func() { server.Close() })
+
+	client, err := samizdat.NewClient(samizdat.ClientConfig{
+		ServerAddr: ln.Addr().String(),
+		ServerName: "127.0.0.1",
+		PublicKey:  serverPub,
+		ShortID:    shortID,
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "tcp", "example.com:443")
+	require.NoError(t, err)
+	defer conn.Close()
+	buf := make([]byte, 2)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = io.ReadFull(conn, buf)
+	require.NoError(t, err)
+
+	got := <-routedCh
+	require.True(t, got.ok, "router ctx carries no session conn")
+	_, isTCP := got.session.(*net.TCPConn)
+	assert.True(t, isTCP, "session conn is %T, want *net.TCPConn", got.session)
+	assert.Equal(t, conn.LocalAddr().String(), got.session.RemoteAddr().String())
 }

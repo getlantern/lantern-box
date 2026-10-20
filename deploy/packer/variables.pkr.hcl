@@ -27,11 +27,6 @@ variable "alicloud_secret_key" {
   default   = env("ALICLOUD_SECRET_KEY")
 }
 
-variable "alicloud_ssh_password" {
-  type      = string
-  sensitive = true
-  default   = env("ALICLOUD_SSH_PASSWORD")
-}
 
 # QEMU (gcore) — build-time password so Packer can SSH into the cloud image; locked again
 # in generalize, and cloud-init injects the real key at first boot. NOT a stored secret:

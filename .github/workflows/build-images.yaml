@@ -348,7 +348,7 @@ jobs:
     concurrency:
       group: build-images-${{ matrix.builder }}
       cancel-in-progress: false
-    # Alicloud copies images to 8 regions (up to 2h). OCI builds 36 regions
+    # Alicloud copies images to 12 regions (up to 2h). OCI builds 36 regions
     # in parallel — usually ~7min but a slow mirror can push past 45min.
     # gcore's is computed in prepare, since GitHub expressions cannot do arithmetic. 60min
     # was not enough for even one region, and being killed mid-import strands gcore tasks.
@@ -587,7 +587,6 @@ jobs:
           OCI_AVAILABILITY_DOMAIN_VAP: ${{ secrets.OCI_AVAILABILITY_DOMAIN_VAP }}
           ALICLOUD_ACCESS_KEY: ${{ secrets.ALICLOUD_ACCESS_KEY }}
           ALICLOUD_SECRET_KEY: ${{ secrets.ALICLOUD_SECRET_KEY }}
-          ALICLOUD_SSH_PASSWORD: ${{ secrets.ALICLOUD_SSH_PASSWORD }}
         run: |
           packer build \
             -var "lantern_box_version=$VERSION" \
