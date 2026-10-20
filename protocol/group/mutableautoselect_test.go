@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	sbAdapter "github.com/sagernet/sing-box/adapter"
@@ -1909,4 +1910,142 @@ func TestChargeable_Policy(t *testing.T) {
 
 	s.cfg.demoteOnlySelected = false
 	assert.True(t, s.chargeable("b", primaryRoute), "the gate off makes everything chargeable")
+}
+
+func TestDialAndListen_EndedDialIsNotCharged(t *testing.T) {
+	ends := []struct {
+		name string
+		// start returns the caller's context and a func the member whose
+		// dial is ended runs before it returns.
+		start func(*testing.T, *MutableAutoSelect) (context.Context, func())
+		// runLadder returns at once on a closed group, so only the context
+		// cases can show whether a ladder was started.
+		ladderObservable bool
+	}{
+		{"caller canceled", func(t *testing.T, _ *MutableAutoSelect) (context.Context, func()) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			return ctx, cancel
+		}, true},
+		{"caller deadline passed", func(t *testing.T, _ *MutableAutoSelect) (context.Context, func()) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			t.Cleanup(cancel)
+			return ctx, func() { <-ctx.Done() }
+		}, true},
+		{"group closed", func(_ *testing.T, s *MutableAutoSelect) (context.Context, func()) {
+			return context.Background(), s.cancel
+		}, false},
+	}
+	uses := []struct {
+		name string
+		use  func(context.Context, *MutableAutoSelect) error
+	}{
+		{"dial", func(ctx context.Context, s *MutableAutoSelect) error {
+			_, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
+			return err
+		}},
+		{"listen", func(ctx context.Context, s *MutableAutoSelect) error {
+			_, err := s.ListenPacket(ctx, metadata.Socksaddr{})
+			return err
+		}},
+	}
+	for _, e := range ends {
+		for _, u := range uses {
+			for _, onAlternate := range []bool{false, true} {
+				name := e.name + "/" + u.name + "/primary"
+				if onAlternate {
+					name = e.name + "/" + u.name + "/alternate"
+				}
+				t.Run(name, func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						s, obs := newTestMUR(t, "a", "b")
+						recordSuccess(s, "a", 10)
+						recordSuccess(s, "b", 20)
+						ctx, end := e.start(t, s)
+						refused := errors.New("dial refused")
+						ended := errors.New("CONNECT: context canceled")
+						fail := func(ob *mockOutbound, endsDial bool) *atomic.Int32 {
+							var calls atomic.Int32
+							err, run := refused, func() {}
+							if endsDial {
+								err, run = ended, end
+							}
+							ob.dial = func(context.Context) (net.Conn, error) {
+								calls.Add(1)
+								run()
+								return nil, err
+							}
+							ob.On("ListenPacket").Run(func(mock.Arguments) {
+								calls.Add(1)
+								run()
+							}).Return(nil, err)
+							return &calls
+						}
+						fail(obs["a"], !onAlternate)
+						altCalls := fail(obs["b"], onAlternate)
+
+						require.ErrorIs(t, u.use(ctx, s), ended)
+						if !onAlternate {
+							assert.Zero(t, altCalls.Load(), "an ended dial must not be retried on an alternate")
+						}
+						synctest.Wait()
+
+						wantPrimary := 0
+						if onAlternate {
+							wantPrimary = 1
+						}
+						uf, _ := userFailures(s, "a")
+						assert.Len(t, uf, wantPrimary, "only a primary failure on a live context is charged")
+						uf, _ = userFailures(s, "b")
+						assert.Empty(t, uf, "the alternate must not be charged for a dial its caller ended")
+						if e.ladderObservable {
+							assert.Equal(t, onAlternate, s.lastLadderAt.Load() != 0,
+								"a ladder starts only for a real primary failure")
+						}
+					})
+				})
+			}
+		}
+	}
+}
+
+func TestDialAndListen_MemberContextErrorIsCharged(t *testing.T) {
+	tests := []struct {
+		name string
+		use  func(*MutableAutoSelect) (io.Closer, error)
+	}{
+		{"dial", func(s *MutableAutoSelect) (io.Closer, error) {
+			return s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		}},
+		{"listen", func(s *MutableAutoSelect) (io.Closer, error) {
+			return s.ListenPacket(context.Background(), metadata.Socksaddr{})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, obs := newTestMUR(t, "a", "b")
+			recordSuccess(s, "a", 10)
+			recordSuccess(s, "b", 20)
+			memberErr := &net.OpError{Op: tt.name, Err: context.Canceled}
+			obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, memberErr }
+			obs["a"].On("ListenPacket").Return(nil, memberErr)
+			obs["b"].dial = func(context.Context) (net.Conn, error) { return echoConn{}, nil }
+			obs["b"].On("ListenPacket").Return(&addressedPacketConn{}, nil)
+
+			conn, err := tt.use(s)
+			require.NoError(t, err, "fast failover should have produced b's conn")
+			defer conn.Close()
+
+			uf, _ := userFailures(s, "a")
+			assert.Len(t, uf, 1, "a member's own context error is charged while the caller's context is live")
+		})
+	}
+}
+
+func TestRecordUserFailure_ClosedGroupIsNotCharged(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	s.cancel()
+	assert.False(t, s.recordUserFailure("a", adapter.UserFailureReset))
+	uf, _ := userFailures(s, "a")
+	assert.Empty(t, uf)
 }
