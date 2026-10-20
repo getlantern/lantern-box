@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
+	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing-box/common/uot"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/route/rule"
@@ -160,7 +161,19 @@ func NewInbound(
 // which is required because the samizdat H2 handler closes the stream
 // when the Handler function returns.
 func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destination string) {
-	conn = &wrapConn{Conn: conn}
+	// The stream has no socket of its own. Expose the session's, under the key
+	// sing-mux streams use, so a bandit probe answered on this stream can judge
+	// delivery from the shared socket's TCP state.
+	if sessionConn, ok := samizdat.SessionConnFromContext(ctx); ok {
+		ctx = mux.ContextWithSessionConn(ctx, sessionConn)
+	}
+	// Bytes are counted only for a listener to read.
+	notify := peerconn.Acquire()
+	var bytes *peerconn.Counter
+	if notify != nil {
+		bytes = &peerconn.Counter{}
+	}
+	conn = &wrapConn{Conn: conn, bytes: bytes}
 
 	var metadata adapter.InboundContext
 	metadata.Inbound = i.Tag()
@@ -183,10 +196,10 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	// Written by the routing callback and read by the deferred close, which
 	// can run without the callback having fired when shutdown times out.
 	var rejected atomic.Bool
-	if notify := peerconn.Acquire(); notify != nil {
-		notify(peerconn.Event{State: +1, Source: source, Destination: destination})
+	if notify != nil {
+		notify(peerconn.Event{State: +1, Source: source, Destination: destination, Bytes: bytes})
 		defer func() {
-			evt := peerconn.Event{State: -1, Source: source}
+			evt := peerconn.Event{State: -1, Source: source, Bytes: bytes}
 			if rejected.Load() {
 				evt.Destination, evt.Rejected = destination, true
 			}

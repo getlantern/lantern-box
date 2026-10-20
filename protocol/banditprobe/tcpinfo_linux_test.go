@@ -11,6 +11,7 @@ import (
 	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/getlantern/lantern-box/option"
 )
@@ -76,4 +77,19 @@ func TestReadSendState_StalledWhenPeerStopsAcknowledging(t *testing.T) {
 	calls := rec.calls()
 	require.Len(t, calls, 1)
 	assert.Equal(t, "stalled", calls[0].Get("verdict"))
+}
+
+func TestSendStateFrom_ReadsUnackedBeforeAcked(t *testing.T) {
+	// 10 KB is acknowledged between the two reads. Reading unacked first keeps
+	// the sum at or above the 100 KB actually written.
+	written, acked := uint64(100_000), uint64(50_000)
+	outq := func() (int, error) { return int(written - acked), nil }
+	info := func() (*unix.TCPInfo, error) {
+		acked += 10_000
+		return &unix.TCPInfo{Bytes_acked: acked}, nil
+	}
+	st, err := sendStateFrom(outq, info)
+	require.NoError(t, err)
+	// Read in the opposite order the sum would be exactly 100,000.
+	assert.Equal(t, uint64(110_000), st.acked+uint64(st.unacked))
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	runtimeDebug "runtime/debug"
 	"strings"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"github.com/sagernet/sing/common/json"
 	"github.com/spf13/cobra"
 
+	"github.com/getlantern/lantern-box/internal/memtune"
 	lbotel "github.com/getlantern/lantern-box/otel"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
@@ -37,6 +39,7 @@ func init() {
 	runCmd.Flags().String("isp-database-name", "GeoIP2-ISP.mmdb", "Filename for storing the GeoIP2-ISP database")
 	runCmd.Flags().String("datacap-url", "", "Datacap server URL")
 	runCmd.Flags().String("proxy-info", "", "Path to proxy info INI file")
+	runCmd.Flags().String("memtune-file", "", "JSON file of Go memory settings applied live (default: runtime.json next to the config file)")
 }
 
 var runCmd = &cobra.Command{
@@ -51,7 +54,14 @@ var runCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("get datacap-url flag: %w", err)
 		}
-		return run(path, datacapURL)
+		memtuneFile, err := cmd.Flags().GetString("memtune-file")
+		if err != nil {
+			return fmt.Errorf("get memtune-file flag: %w", err)
+		}
+		if memtuneFile == "" {
+			memtuneFile = filepath.Join(filepath.Dir(path), "runtime.json")
+		}
+		return run(path, datacapURL, memtuneFile)
 	},
 }
 
@@ -67,10 +77,14 @@ func readConfig(path string) (option.Options, error) {
 	return options, nil
 }
 
-func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc, error) {
+func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc, *option.DebugOptions, error) {
 	options, err := readConfig(configPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read config: %w", err)
+		return nil, nil, nil, fmt.Errorf("read config: %w", err)
+	}
+	var debugOptions *option.DebugOptions
+	if options.Experimental != nil {
+		debugOptions = options.Experimental.Debug
 	}
 
 	ctx, cancel := context.WithCancel(globalCtx)
@@ -80,7 +94,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 	})
 	if err != nil {
 		cancel()
-		return nil, nil, fmt.Errorf("create service: %w", err)
+		return nil, nil, debugOptions, fmt.Errorf("create service: %w", err)
 	}
 
 	clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
@@ -111,7 +125,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		)
 		if err != nil {
 			cancel()
-			return nil, nil, fmt.Errorf("create datacap tracker: %w", err)
+			return nil, nil, debugOptions, fmt.Errorf("create datacap tracker: %w", err)
 		}
 		instance.Router().AppendTracker(datacapTracker)
 	}
@@ -134,9 +148,9 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 	finishStart()
 	if err != nil {
 		cancel()
-		return nil, nil, E.Cause(err, "start service")
+		return nil, nil, debugOptions, E.Cause(err, "start service")
 	}
-	return instance, cancel, nil
+	return instance, cancel, debugOptions, nil
 }
 
 func closeMonitor(ctx context.Context) {
@@ -149,15 +163,26 @@ func closeMonitor(ctx context.Context) {
 	log.Fatal("sing-box did not close!")
 }
 
-func run(configPath string, datacapURL string) error {
+func run(configPath string, datacapURL string, memtuneFile string) error {
 	log.Info("build info: version ", version, ", commit ", commit)
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(osSignals)
+	tuner := memtune.New(memtuneFile, memtune.DefaultInterval)
+	tunerCtx, stopTuner := context.WithCancel(context.Background())
+	defer stopTuner()
+	tunerStarted := false
 	for {
-		instance, cancel, err := create(configPath, datacapURL)
+		instance, cancel, debugOptions, err := create(configPath, datacapURL)
+		// Building the box applied the new config's debug options, even if
+		// it then failed to start.
+		tuner.Resync(debugOptions)
 		if err != nil {
 			return err
+		}
+		if !tunerStarted {
+			go tuner.Run(tunerCtx)
+			tunerStarted = true
 		}
 		runtimeDebug.FreeOSMemory()
 		for {
@@ -165,6 +190,9 @@ func run(configPath string, datacapURL string) error {
 			log.Info("received signal: ", osSignal)
 			if osSignal == syscall.SIGHUP {
 				err = check(configPath)
+				// check builds a box from the new config, which applies its
+				// debug options; put the running config's back.
+				tuner.Resync(debugOptions)
 				if err != nil {
 					log.Error(E.Cause(err, "reload service"))
 					continue

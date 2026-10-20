@@ -4,7 +4,7 @@ go 1.26.2
 
 // replace github.com/sagernet/sing => github.com/getlantern/sing v0.7.18-lantern
 
-replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.13.19-lantern
+replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.13.20-0.20261019115333-624aa48e0252
 
 // replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4
 
@@ -27,7 +27,7 @@ require (
 	github.com/getlantern/broflake v0.0.0-20261004155437-e0237743ac3d
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260520145825-958775d51395
-	github.com/getlantern/samizdat v0.0.3-0.20260819153658-ebc74116a064
+	github.com/getlantern/samizdat v0.0.3-0.20261019142234-18bd41c612f1
 	github.com/getlantern/semconv v0.0.0-20261009113645-6897603ca940
 	github.com/getlantern/twiddle v0.0.0-20260914204124-f698a0d67d2f
 	github.com/gobwas/ws v1.4.0
