@@ -161,14 +161,15 @@ func (s *MutableSelector) selectOutbound(tag string) bool {
 	return true
 }
 
-// storeSelected sets the selection with a fresh group, and retires the old
-// group off s.mu, since a remote Close can block. Retiring also closes conns
-// whose dial was still in flight.
+// storeSelected retires the old group, then sets the selection with a fresh
+// one. Retiring first means no conn can join the old group after the switch:
+// dials refuse (errSelectionChanged) and late routed flows are closed. Retire
+// closes the old conns in the background, off s.mu.
 func (s *MutableSelector) storeSelected(outbound A.Outbound) {
-	prev := s.selected.Swap(&selection{outbound: outbound, group: interrupt.NewGroup()})
-	if prev != nil {
-		go prev.group.Retire()
+	if prev := s.selected.Load(); prev != nil {
+		prev.group.Retire()
 	}
+	s.selected.Store(&selection{outbound: outbound, group: interrupt.NewGroup()})
 }
 
 // routeContext has the connection manager track the flow in g.
@@ -268,12 +269,13 @@ func (s *MutableSelector) DialContext(ctx context.Context, network string, desti
 		span.RecordError(err)
 		return nil, err
 	}
-	if sel.group.Retired() {
+	wrapped, ok := sel.group.TryNewConn(conn, interrupt.IsExternalConnectionFromContext(ctx))
+	if !ok {
 		conn.Close()
 		span.RecordError(errSelectionChanged)
 		return nil, errSelectionChanged
 	}
-	conn = sel.group.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx))
+	conn = wrapped
 	if taggedConn, ok := conn.(*adapter.TaggedConn); ok {
 		return taggedConn, nil
 	}
@@ -299,12 +301,13 @@ func (s *MutableSelector) ListenPacket(ctx context.Context, destination metadata
 		span.RecordError(err)
 		return nil, err
 	}
-	if sel.group.Retired() {
+	wrapped, ok := sel.group.TryNewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx))
+	if !ok {
 		conn.Close()
 		span.RecordError(errSelectionChanged)
 		return nil, errSelectionChanged
 	}
-	conn = sel.group.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx))
+	conn = wrapped
 	if taggedConn, ok := conn.(*adapter.TaggedPacketConn); ok {
 		return taggedConn, nil
 	}

@@ -275,3 +275,15 @@ func TestMutableSelector_StartSelectsFirstOutbound(t *testing.T) {
 	require.True(t, s.SelectOutbound("b"))
 	requireClosed(t, closed)
 }
+
+func TestMutableSelector_SwitchRetiresOldSelectionBeforeReturning(t *testing.T) {
+	s := newTestSelector(t, loopbackOutbound(t, "a", nil, nil), loopbackOutbound(t, "b", nil, nil))
+	old := s.selected.Load()
+	require.True(t, s.SelectOutbound("b"))
+	require.True(t, old.group.Retired(), "a dial finishing right after the switch must see it")
+
+	old = s.selected.Load()
+	_, err := s.Remove("a", "b")
+	require.NoError(t, err)
+	require.True(t, old.group.Retired())
+}

@@ -275,8 +275,8 @@ github.com/getlantern/samizdat v0.0.3-0.20261019142234-18bd41c612f1 h1:Q1AHHHTd3
 github.com/getlantern/samizdat v0.0.3-0.20261019142234-18bd41c612f1/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
 github.com/getlantern/semconv v0.0.0-20261009113645-6897603ca940 h1:68i4KNj2sEMa1KbRQXtfbvtvOUz1+jSEJGzTvRiO78g=
 github.com/getlantern/semconv v0.0.0-20261009113645-6897603ca940/go.mod h1:GkPT5P9JoOTIRXRmFWxYgu1hhXgTFFTNc2hoG7WQc3g=
-github.com/getlantern/sing-box-minimal v1.13.20-0.20261020004510-b1b7df205b3d h1:ftf7fD9tb68QB+1XYHLA7YAqU8W2shqNiq+6edOYmWs=
-github.com/getlantern/sing-box-minimal v1.13.20-0.20261020004510-b1b7df205b3d/go.mod h1:JabDg1f8cGSvCwwyebN2e1rFr/XfupwC7PgLuoVPSmY=
+github.com/getlantern/sing-box-minimal v1.13.20-0.20261020005650-f6b850f50d34 h1:a9gxQKHH+sVLOnnQYgVLIExPceE8kJf6G6ePic7TqP0=
+github.com/getlantern/sing-box-minimal v1.13.20-0.20261020005650-f6b850f50d34/go.mod h1:JabDg1f8cGSvCwwyebN2e1rFr/XfupwC7PgLuoVPSmY=
 github.com/getlantern/telemetry v0.0.0-20250606052628-8960164ec1f5 h1:6ITBYqNkLbVZ1tQNXwmH8N80rZtvyW6IZa8L6EAhBQo=
 github.com/getlantern/telemetry v0.0.0-20250606052628-8960164ec1f5/go.mod h1:gx3dPUhZtQszPX5C+TshhxPXQHlY5t4gMnOOMA+viPA=
 github.com/getlantern/twiddle v0.0.0-20260914204124-f698a0d67d2f h1:8WL/o8hKl27jpHunB4nO5dJZKSTfyMwvS7J72ix6vqQ=
