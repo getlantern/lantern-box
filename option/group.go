@@ -30,13 +30,14 @@ type MutableAutoSelectOutboundOptions struct {
 
 	// SwitchToleranceMs is the minimum delay improvement (in ms) a
 	// candidate must have over the current selection before the group
-	// switches on delay. Default 500.
+	// switches on delay. Default 300.
 	SwitchToleranceMs uint32 `json:"switch_tolerance_ms,omitempty"`
 
 	// SwitchTolerancePercent is the minimum delay improvement, as a
 	// percentage of the current selection's delay, a candidate must also
-	// have before the group switches on delay. Default 30.
-	SwitchTolerancePercent uint32 `json:"switch_tolerance_percent,omitempty"`
+	// have before the group switches on delay. Nil uses the default of 30;
+	// 0 disables the check. Values over 100 are rejected.
+	SwitchTolerancePercent *uint32 `json:"switch_tolerance_percent,omitempty"`
 
 	// ConsecutiveFailureLimit hard-demotes a member once probe failures
 	// reach this count, or once user-traffic failures within
@@ -80,11 +81,11 @@ type MutableAutoSelectOutboundOptions struct {
 	// after IdleThresholdSeconds without use instead of slowing down.
 	IdleIntervalSeconds uint32 `json:"idle_interval_seconds,omitempty"`
 
-	// IdleThresholdSeconds is how long the group may go without a dial or
-	// listen before background probing stops. The next dial or listen
-	// restarts it, probing immediately if the group was idle longer than
-	// BackgroundIntervalSeconds or the network changed meanwhile. Default 900
-	// (15 min).
+	// IdleThresholdSeconds is how long the group may go without a dial,
+	// listen, or data-plane traffic before background probing stops. The
+	// next dial or listen restarts it, starting a full probe in the
+	// background if the group was idle longer than BackgroundIntervalSeconds
+	// or the network changed meanwhile. Default 900 (15 min).
 	IdleThresholdSeconds uint32 `json:"idle_threshold_seconds,omitempty"`
 
 	// LadderTotalBudgetSeconds is the total budget the reconnection ladder
@@ -92,9 +93,9 @@ type MutableAutoSelectOutboundOptions struct {
 	LadderTotalBudgetSeconds uint32 `json:"ladder_total_budget_seconds,omitempty"`
 
 	// LadderCooldownSeconds is the minimum time after a ladder run before
-	// another ladder run can fire. Suppresses repeated full-fleet
-	// re-probes when stalls or dial errors arrive in quick succession on
-	// the same already-shuffled pool. Default 300.
+	// another can fire. A ladder runs when a dial or listen fails on the
+	// selected member and on its fast-failover alternate, or has no
+	// alternate. Default 60.
 	LadderCooldownSeconds uint32 `json:"ladder_cooldown_seconds,omitempty"`
 
 	// ConfirmedFailureSwitchCooldownSeconds is the minimum time between

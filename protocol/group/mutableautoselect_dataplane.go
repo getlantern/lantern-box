@@ -26,7 +26,8 @@ const defaultFirstResponseTimeout = 10 * time.Second
 type dataPlaneHooks struct {
 	onFailure func(adapter.UserFailureKind)
 	// onError runs on the IO goroutine, outside the watchdog's lock.
-	onError func(err error, state dataPlaneIO, excused bool)
+	onError    func(err error, state dataPlaneIO, excused bool)
+	onActivity func(time.Time)
 }
 
 // makeHooks records chargeable failures and starts recovery. Only primary TCP
@@ -41,7 +42,6 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind)
 			if !s.recordUserFailure(outerTag, kind) {
 				return
 			}
-			go s.runLadder(outerTag)
 			if confirms && (kind == adapter.UserFailureReset || kind == adapter.UserFailureNoResponse) {
 				go s.confirmSelectedFailure(outerTag, "")
 			}
@@ -61,6 +61,7 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind)
 			s.logger.Debug("data-plane error: tag=", outerTag, " decision=", decision,
 				" err=", err, " quiet=", state.quiet, " last=", last, " proven=", state.proven)
 		},
+		onActivity: s.noteDataActivity,
 	}
 }
 
@@ -125,6 +126,15 @@ func endsQuietRead(isRead bool, n int, state dataPlaneIO) bool {
 }
 
 func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
+	var now time.Time
+	if n > 0 && err == nil {
+		now = time.Now()
+		// Before the stalled check: a stall leaves the conn open, and
+		// traffic that resumes on it is still use of the group.
+		if w.hooks.onActivity != nil {
+			w.hooks.onActivity(now)
+		}
+	}
 	// Short-circuit once stalled: a late noteIO must not re-arm the
 	// timer or attribute a failure after the conn is logically gone.
 	if w.stalled.Load() {
@@ -155,7 +165,7 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	}
 	// Publish the IO state before re-arming the stall timer.
 	w.ioMu.Lock()
-	w.lastIO = time.Now()
+	w.lastIO = now
 	w.lastWasWrite = !isRead
 	w.ioMu.Unlock()
 	w.timer.Reset(w.idle)
