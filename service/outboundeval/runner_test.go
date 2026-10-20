@@ -113,22 +113,23 @@ func TestRunCycleMeasuresAndSubmitsACompleteGrid(t *testing.T) {
 	assert.Equal(t, assignment.ID, reports[0].IdempotencyKey, "the assignment identifies the report through its key")
 }
 
+// Every request a service makes names one acquisition, so a retried cycle is
+// handed the assignment the server already issued.
 func TestRunCycleAcquisitionKeys(t *testing.T) {
 	for _, test := range []struct {
 		name          string
 		acquireStatus int
 		refuseSubmits int
 		wantErr       error
-		reuseKey      bool
 	}{
 		{name: "completed"},
 		{
 			name: "acquisition retry", acquireStatus: http.StatusBadGateway,
-			wantErr: apiError{status: http.StatusBadGateway}, reuseKey: true,
+			wantErr: apiError{status: http.StatusBadGateway},
 		},
 		{
 			name: "rate limited", acquireStatus: http.StatusTooManyRequests,
-			wantErr: apiError{status: http.StatusTooManyRequests}, reuseKey: true,
+			wantErr: apiError{status: http.StatusTooManyRequests},
 		},
 		{
 			name: "no assignment", acquireStatus: http.StatusServiceUnavailable,
@@ -170,13 +171,12 @@ func TestRunCycleAcquisitionKeys(t *testing.T) {
 				assert.LessOrEqual(t, len(request.IdempotencyKey), 128)
 				assert.NotEqual(t, s.options.Token, request.IdempotencyKey)
 			}
-			if test.reuseKey {
-				assert.Equal(t, requests[0], requests[1])
-			} else {
-				assert.NotEqual(t, requests[0].IdempotencyKey, requests[1].IdempotencyKey)
-			}
+			assert.Equal(t, requests[0], requests[1])
 		})
 	}
+	first, second := newTestService(t, testOptions()), newTestService(t, testOptions())
+	assert.NotEqual(t, first.request.IdempotencyKey, second.request.IdempotencyKey,
+		"separate services are separate acquisitions")
 }
 
 func TestRunCycleRefusesAnExpiryTheBoxsClockRejects(t *testing.T) {
@@ -495,54 +495,27 @@ func startTestRunner(t *testing.T, handler http.HandlerFunc) *Service {
 	return s
 }
 
-func TestRunPollingIntervals(t *testing.T) {
-	for name, test := range map[string]struct {
-		status     int
-		assignment func() Assignment
-		wait       time.Duration
-	}{
-		"completed":     {wait: 10 * time.Second},
-		"no assignment": {status: http.StatusServiceUnavailable, wait: 3 * time.Second},
-		"refused":       {status: http.StatusUnauthorized, wait: 3 * time.Second},
-		"invalid": {
-			assignment: func() Assignment {
-				assignment := serverAssignment()
-				assignment.Sample.WindowsPerExit = defaultMaxWindows + 1
-				return assignment
-			},
-			wait: 3 * time.Second,
-		},
+func TestRunPollsWhileThereIsNothingToMeasure(t *testing.T) {
+	for name, status := range map[string]int{
+		"no assignment": http.StatusServiceUnavailable,
+		"bad request":   http.StatusBadRequest,
 	} {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				api := newControlAPI()
-				api.acquireStatus = test.status
-				assignment := serverAssignment
-				if test.assignment != nil {
-					assignment = test.assignment
-				}
-				api.assignment = func() Assignment {
-					served := assignment()
-					served.Sample.FreshSessionDelayMS = 0
-					return served
-				}
-				handler := api.handler(t)
 				var acquired atomic.Int64
-				startTestRunner(t, func(w http.ResponseWriter, r *http.Request) {
-					if r.URL.Path == "/assignments" {
-						acquired.Add(1)
-					}
-					handler(w, r)
+				startTestRunner(t, func(w http.ResponseWriter, _ *http.Request) {
+					acquired.Add(1)
+					w.WriteHeader(status)
 				})
 				synctest.Wait()
-				time.Sleep(9 * time.Second)
+				time.Sleep(10*time.Second - time.Nanosecond)
 				synctest.Wait()
 				assert.Zero(t, acquired.Load())
-				time.Sleep(time.Second)
+				time.Sleep(time.Nanosecond)
 				synctest.Wait()
 				require.EqualValues(t, 1, acquired.Load())
 
-				time.Sleep(test.wait - time.Nanosecond)
+				time.Sleep(3*time.Second - time.Nanosecond)
 				synctest.Wait()
 				assert.EqualValues(t, 1, acquired.Load())
 				time.Sleep(time.Nanosecond)
@@ -553,28 +526,121 @@ func TestRunPollingIntervals(t *testing.T) {
 	}
 }
 
-func TestRunBackoffRetriesWithoutWaitingForThePollInterval(t *testing.T) {
+func TestRunStopsOnceItsAssignmentIsDone(t *testing.T) {
+	for name, test := range map[string]struct {
+		acquireStatus, submitStatus int
+		assignment                  func() Assignment
+		reported                    int
+	}{
+		"report accepted":     {reported: 1},
+		"token refused":       {acquireStatus: http.StatusUnauthorized},
+		"assignment finished": {acquireStatus: http.StatusForbidden},
+		"report refused":      {submitStatus: http.StatusForbidden, reported: 1},
+		"assignment invalid": {assignment: func() Assignment {
+			assignment := serverAssignment()
+			assignment.Sample.WindowsPerExit = defaultMaxWindows + 1
+			return assignment
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				api := newControlAPI()
+				api.acquireStatus = test.acquireStatus
+				api.submitStatus = test.submitStatus
+				if test.assignment != nil {
+					api.assignment = test.assignment
+				}
+				handler := api.handler(t)
+				var acquired atomic.Int64
+				s := startTestRunner(t, func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/assignments" {
+						acquired.Add(1)
+					}
+					handler(w, r)
+				})
+				// The first request goes out at 10s; the sample's spacing makes the
+				// run last a few milliseconds more.
+				time.Sleep(11 * time.Second)
+				synctest.Wait()
+
+				select {
+				case <-s.done:
+				default:
+					t.Fatal("the runner did not stop")
+				}
+				assert.EqualValues(t, 1, acquired.Load())
+				assert.Len(t, api.reports(), test.reported)
+			})
+		})
+	}
+}
+
+// A cycle that fails after acquiring is retried with the same request, and the
+// runner stops once the assignment expires even while the server keeps failing.
+func TestRunRetriesItsAssignmentUntilItExpires(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
+		expiresAt := time.Now().Add(15 * time.Second)
 		api := newControlAPI()
 		api.assignment = func() Assignment {
 			assignment := serverAssignment()
-			assignment.Sample.FreshSessionDelayMS = 0
+			assignment.ExpiresAt = expiresAt
 			return assignment
 		}
 		handler := api.handler(t)
-		var acquired, retriedAt atomic.Int64
 		var requests []AssignmentRequest
-		startTestRunner(t, func(w http.ResponseWriter, r *http.Request) {
+		s := startTestRunner(t, func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/assignments":
+				var request AssignmentRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+				requests = append(requests, request)
+				if len(requests) > 1 {
+					w.WriteHeader(http.StatusBadGateway)
+					return
+				}
+			case "/attestations":
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			handler(w, r)
+		})
+		time.Sleep(time.Until(expiresAt) - time.Nanosecond)
+		synctest.Wait()
+		select {
+		case <-s.done:
+			t.Fatal("the runner stopped before its assignment expired")
+		default:
+		}
+
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		select {
+		case <-s.done:
+		default:
+			t.Fatal("the runner outlived its assignment")
+		}
+		require.Greater(t, len(requests), 2)
+		for _, request := range requests[1:] {
+			assert.Equal(t, requests[0], request)
+		}
+		assert.Empty(t, api.reports())
+	})
+}
+
+func TestRunBackoffRetriesWithoutWaitingForTheNoAssignmentInterval(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		api := newControlAPI()
+		handler := api.handler(t)
+		var acquired atomic.Int64
+		var requests []AssignmentRequest
+		s := startTestRunner(t, func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/assignments" {
 				var request AssignmentRequest
 				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
 				requests = append(requests, request)
-				switch acquired.Add(1) {
-				case 1:
+				if acquired.Add(1) == 1 {
 					w.WriteHeader(http.StatusBadGateway)
 					return
-				case 2:
-					retriedAt.Store(time.Now().UnixNano())
 				}
 			}
 			handler(w, r)
@@ -584,8 +650,8 @@ func TestRunBackoffRetriesWithoutWaitingForThePollInterval(t *testing.T) {
 		synctest.Wait()
 		require.EqualValues(t, 1, acquired.Load())
 
-		// Jitter lands the retry in the last fifth of the capped wait, long
-		// before the poll interval would otherwise start the next cycle.
+		// Jitter lands the retry in the last fifth of the capped wait, before the
+		// no-assignment interval would otherwise start the next cycle.
 		time.Sleep(testRetryBase*4/5 - time.Nanosecond)
 		synctest.Wait()
 		require.EqualValues(t, 1, acquired.Load())
@@ -593,17 +659,15 @@ func TestRunBackoffRetriesWithoutWaitingForThePollInterval(t *testing.T) {
 		synctest.Wait()
 		require.EqualValues(t, 2, acquired.Load())
 
-		// The cycle after a retried one waits a whole poll interval.
-		time.Sleep(time.Until(time.Unix(0, retriedAt.Load()).Add(10*time.Second)) - time.Nanosecond)
+		time.Sleep(time.Second)
 		synctest.Wait()
-		assert.EqualValues(t, 2, acquired.Load())
-		time.Sleep(time.Nanosecond)
-		synctest.Wait()
-		assert.EqualValues(t, 3, acquired.Load())
-		require.Len(t, requests, 3)
-		assert.NotEmpty(t, requests[0].IdempotencyKey)
+		select {
+		case <-s.done:
+		default:
+			t.Fatal("the runner did not stop after its retried cycle completed")
+		}
+		assert.Len(t, api.reports(), 1)
 		assert.Equal(t, requests[0], requests[1])
-		assert.NotEqual(t, requests[1].IdempotencyKey, requests[2].IdempotencyKey)
 	})
 }
 
@@ -682,4 +746,69 @@ func TestSleepContextReportsCancellation(t *testing.T) {
 	cancel()
 	assert.False(t, sleepContext(ctx, 0))
 	assert.False(t, sleepContext(ctx, time.Minute))
+}
+
+// Attestation is not bearer-authenticated, so its refusal says nothing about
+// the runner's token, and the runner polls again after the no-assignment
+// interval.
+func TestRunRetriesAfterARefusedAttestation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		api := newControlAPI()
+		handler := api.handler(t)
+		var acquired atomic.Int64
+		s := startTestRunner(t, func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/assignments":
+				acquired.Add(1)
+			case "/attestations":
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			handler(w, r)
+		})
+		time.Sleep(14 * time.Second)
+		synctest.Wait()
+
+		select {
+		case <-s.done:
+			t.Fatal("an attestation refusal stopped the runner")
+		default:
+		}
+		assert.EqualValues(t, 2, acquired.Load(), "asked at 10s and again at 13s")
+	})
+}
+
+// A wait between cycles ends at the assignment's expiry, so the runner stops
+// then rather than asking once more after it.
+func TestRunStopsAtExpiryRatherThanAfterItsWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		expiresAt := time.Now().Add(11 * time.Second)
+		api := newControlAPI()
+		api.assignment = func() Assignment {
+			assignment := serverAssignment()
+			assignment.ExpiresAt = expiresAt
+			return assignment
+		}
+		handler := api.handler(t)
+		var acquired atomic.Int64
+		s := startTestRunner(t, func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/assignments":
+				acquired.Add(1)
+			case "/attestations":
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			handler(w, r)
+		})
+		time.Sleep(time.Until(expiresAt))
+		synctest.Wait()
+
+		select {
+		case <-s.done:
+		default:
+			t.Fatal("the runner waited past its assignment's expiry")
+		}
+		assert.EqualValues(t, 1, acquired.Load())
+	})
 }

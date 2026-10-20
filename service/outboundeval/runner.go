@@ -2,7 +2,6 @@ package outboundeval
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"time"
@@ -34,57 +33,84 @@ func (s *Service) run() {
 	}
 	retries := backoff.NewExponentialBackoff(s.retryBase, time.Duration(s.options.MaxRetryBackoff))
 	for {
-		var err error
-		for {
-			if err = s.runCycle(); !retryableCycleError(err) {
-				break
-			}
-			s.logger.Debug("outbound evaluation will retry: ", err)
-			retries.Wait(s.ctx)
-		}
+		err := s.runCycle()
 		if s.ctx.Err() != nil {
 			return
 		}
-		retries.Reset()
-		interval := time.Duration(s.options.PollInterval)
-		if err != nil {
-			interval = time.Duration(s.options.NoAssignmentInterval)
+		if s.finished(err) {
+			return
+		}
+		waitCtx, cancel := s.untilExpiry()
+		if retryableCycleError(err) {
+			s.logger.Debug("outbound evaluation will retry: ", err)
+			retries.Wait(waitCtx)
+		} else {
+			retries.Reset()
 			if !errors.Is(err, ErrNoAssignment) {
 				s.logger.Warn("outbound evaluation cycle failed: ", err)
 			}
+			wait := max(time.Duration(s.options.NoAssignmentInterval)-time.Since(s.lastAsk), 0)
+			s.logger.Trace("next outbound evaluation poll in ", wait)
+			sleepContext(waitCtx, wait)
 		}
-		wait := max(interval-time.Since(s.lastAsk), 0)
-		s.logger.Trace("next outbound evaluation poll in ", wait)
-		if !sleepContext(s.ctx, wait) {
+		cancel()
+		if s.ctx.Err() != nil {
+			return
+		}
+		if s.expired() {
+			s.logger.Info("outbound evaluation assignment expired")
 			return
 		}
 	}
+}
+
+// untilExpiry returns a context that ends with s.ctx or at the acquired
+// assignment's expiry, whichever comes first.
+func (s *Service) untilExpiry() (context.Context, context.CancelFunc) {
+	if s.expiresAt.IsZero() {
+		return context.WithCancel(s.ctx)
+	}
+	return context.WithTimeout(s.ctx, s.expiresAt.Sub(s.timeService.TimeFunc()()))
+}
+
+func (s *Service) expired() bool {
+	return !s.expiresAt.IsZero() && !s.timeService.TimeFunc()().Before(s.expiresAt)
+}
+
+// finished reports whether the cycle that returned err leaves nothing for the
+// service to do, and logs why when it does.
+func (s *Service) finished(err error) bool {
+	var status apiError
+	switch {
+	case err == nil:
+		s.logger.Info("outbound evaluation assignment completed")
+	// Attestation is not bearer-authenticated, so its refusals say nothing about the runner or report token.
+	case !errors.Is(err, errUnattestedWindow) && errors.As(err, &status) && status.final():
+		s.logger.Info("outbound evaluation assignment finished or its token was refused: ", err)
+	case s.expired():
+		s.logger.Info("outbound evaluation assignment expired: ", err)
+	case errors.Is(err, ErrInvalidContract):
+		s.logger.Warn("outbound evaluation assignment refused: ", err)
+	default:
+		return false
+	}
+	return true
 }
 
 func (s *Service) runCycle() error {
 	if err := s.ctx.Err(); err != nil {
 		return err
 	}
-	retrying := s.pendingAssignment != nil
-	if s.pendingAssignment == nil {
-		s.pendingAssignment = &AssignmentRequest{
-			CountryCode:    s.options.CountryCode,
-			IdempotencyKey: rand.Text(),
-			ExitCount:      clientExitCount,
-		}
-	}
-	s.logger.Trace("requesting outbound evaluation assignment; retry=", retrying)
+	s.logger.Trace("requesting outbound evaluation assignment")
 	s.lastAsk = time.Now()
-	assignment, err := s.api.acquire(s.options.Token, *s.pendingAssignment)
-	if !retryableCycleError(err) {
-		s.pendingAssignment = nil
-	}
+	assignment, err := s.api.acquire(s.options.Token, s.request)
 	if err != nil {
 		if errors.Is(err, ErrNoAssignment) {
 			s.logger.Debug("no outbound evaluation assignment available; next poll in ", time.Duration(s.options.NoAssignmentInterval))
 		}
 		return err
 	}
+	s.expiresAt = assignment.ExpiresAt
 
 	now := s.timeService.TimeFunc()().UTC()
 	if err := assignment.validate(now, s.limits); err != nil {

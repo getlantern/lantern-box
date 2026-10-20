@@ -26,14 +26,14 @@ type OutboundEvalServiceOptions struct {
 	// declares no outbounds at all.
 	ControlOutboundTag string `json:"control_outbound_tag,omitempty"`
 
-	// PollInterval is the wait before the first assignment request, and the
-	// spacing between a request whose assignment completed and the next one.
-	// A cycle that outlasts it is followed by the next request at once.
+	// PollInterval is the wait before the first assignment request.
 	// Default 5m.
 	PollInterval badoption.Duration `json:"poll_interval,omitempty"`
 
 	// NoAssignmentInterval spaces the next assignment request from one the
-	// server had nothing for, or whose cycle failed in a way a retry cannot fix.
+	// server had nothing for, or whose cycle failed with an error that is not
+	// retried with backoff.
+	// A cycle that outlasts it is followed by the next request at once.
 	// Default 5m.
 	NoAssignmentInterval badoption.Duration `json:"no_assignment_interval,omitempty"`
 

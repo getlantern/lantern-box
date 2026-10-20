@@ -3,6 +3,7 @@ package outboundeval
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"net/url"
@@ -54,7 +55,10 @@ func RegisterService(registry *boxService.Registry) {
 	boxService.Register[option.OutboundEvalServiceOptions](registry, constant.TypeOutboundEval, NewService)
 }
 
-// Service is the measurement runner.
+// Service is the measurement runner. It runs at most one assignment and then
+// stops: once its report is accepted, once the server refuses its token or the
+// assignment, once the assignment fails the service's own validation, or once
+// the assignment expires.
 type Service struct {
 	boxService.Adapter
 
@@ -66,10 +70,15 @@ type Service struct {
 	options option.OutboundEvalServiceOptions
 	limits  bounds
 
-	// pendingAssignment is owned by the run loop and retained across acquisition retries.
-	pendingAssignment *AssignmentRequest
-	// lastAsk is owned by the run loop; the next request is spaced from it.
-	lastAsk   time.Time
+	// request, lastAsk and expiresAt are owned by the run loop.
+
+	// request keeps one idempotency key for the life of the service, so a
+	// retried cycle is handed the same assignment.
+	request AssignmentRequest
+	lastAsk time.Time
+	// expiresAt is zero until an assignment has been acquired.
+	expiresAt time.Time
+
 	started   atomic.Bool
 	closeOnce sync.Once
 	closeErr  error
@@ -124,6 +133,11 @@ func NewService(
 		done:    make(chan struct{}),
 		logger:  logger,
 		options: options,
+		request: AssignmentRequest{
+			CountryCode:    options.CountryCode,
+			IdempotencyKey: rand.Text(),
+			ExitCount:      clientExitCount,
+		},
 
 		router:    router,
 		outbounds: outbounds,

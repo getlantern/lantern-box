@@ -48,6 +48,13 @@ func (e apiError) retryable() bool {
 	return e.status == http.StatusTooManyRequests || e.status >= http.StatusInternalServerError
 }
 
+// final reports whether the server has refused a bearer-authenticated request
+// for good: 401 for a runner token it does not accept, 403 when the assignment
+// the request names has ended or its report token is no longer accepted.
+func (e apiError) final() bool {
+	return e.status == http.StatusUnauthorized || e.status == http.StatusForbidden
+}
+
 // apiClient talks to the control API over one outbound. Every call travels that
 // outbound, including attestation, whose source address the server attributes
 // the measurement to.
