@@ -10,6 +10,7 @@ on:
     branches: [main]
     paths:
       - "deploy/packer/**"
+      - "deploy/trust/**"
       - ".github/workflows/build-images.yaml"
 
   # Allow manual trigger for ad-hoc rebuilds (base-image updates, etc.)

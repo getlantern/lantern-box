@@ -1,11 +1,15 @@
-FROM --platform=$BUILDPLATFORM golang:1.26.8-bookworm AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm AS builder
 ARG TARGETOS TARGETARCH
 ARG GOPROXY=""
 ARG VERSION=""
 ARG COMMIT=""
 
+COPY deploy/trust /usr/local/lib/lantern-trust
+
 RUN set -ex \
     && apt-get update \
+    && apt-get install -y ca-certificates openssl \
+    && sh /usr/local/lib/lantern-trust/update-trust.sh \
     && if [ "$TARGETARCH" = "arm64" ]; then \
            apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-user; \
        else \
@@ -32,10 +36,12 @@ RUN set -ex \
        -o /usr/local/bin/lantern-box ./cmd
 
 FROM debian:bookworm-slim
+COPY deploy/trust /usr/local/lib/lantern-trust
 # Keep runtime deps in sync with deploy/packer/provision.sh
 RUN set -ex \
     && apt-get update \
-    && apt-get install -y ca-certificates tzdata nftables wireguard-tools \
+    && apt-get install -y ca-certificates openssl tzdata nftables wireguard-tools \
+    && sh /usr/local/lib/lantern-trust/update-trust.sh \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/lantern-box /usr/local/bin/lantern-box

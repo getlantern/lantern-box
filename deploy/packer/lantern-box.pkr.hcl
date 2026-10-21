@@ -1088,6 +1088,15 @@ build {
     "source.qemu.lantern-box-gcore",
   ]
 
+  provisioner "shell" {
+    script = "${path.root}/prepare-trust.sh"
+  }
+
+  provisioner "file" {
+    source      = "${path.root}/../trust/"
+    destination = "/tmp/lantern-trust/"
+  }
+
   # Upload OTel Collector config before the shell provisioner copies it into place.
   provisioner "file" {
     source      = "${path.root}/otelcol.yaml"
