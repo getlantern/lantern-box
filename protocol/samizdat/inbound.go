@@ -57,18 +57,9 @@ func NewInbound(
 		return nil, fmt.Errorf("private_key must be 64 hex characters (32 bytes)")
 	}
 
-	if len(options.ShortIDs) < 1 {
-		return nil, fmt.Errorf("short_ids must contain at least one element")
-	}
-
-	// Decode hex short IDs
-	shortIDs := make([][8]byte, len(options.ShortIDs))
-	for i, sid := range options.ShortIDs {
-		b, decodeErr := hex.DecodeString(sid)
-		if decodeErr != nil || len(b) != 8 {
-			return nil, fmt.Errorf("short_ids[%d] must be 16 hex characters (8 bytes)", i)
-		}
-		copy(shortIDs[i][:], b)
+	shortIDs, err := decodeShortIDs(options.ShortIDs)
+	if err != nil {
+		return nil, err
 	}
 
 	// Validate and load TLS certificate/key pair
@@ -264,4 +255,32 @@ func (i *Inbound) Close() error {
 		listenerErr = i.listener.Close()
 	}
 	return errors.Join(serverErr, listenerErr)
+}
+
+// UpdateShortIDs replaces the short IDs the inbound accepts while it runs.
+// Connections that authenticated with an ID the new set leaves out are
+// closed. ids takes the form of the short_ids option and, like it, must not
+// be empty. On error the accepted set is unchanged.
+func (i *Inbound) UpdateShortIDs(ids []string) error {
+	shortIDs, err := decodeShortIDs(ids)
+	if err != nil {
+		return err
+	}
+	return i.server.SetShortIDs(shortIDs)
+}
+
+// decodeShortIDs parses short IDs of 16 hex characters each.
+func decodeShortIDs(ids []string) ([][8]byte, error) {
+	if len(ids) < 1 {
+		return nil, fmt.Errorf("short_ids must contain at least one element")
+	}
+	out := make([][8]byte, len(ids))
+	for i, sid := range ids {
+		b, err := hex.DecodeString(sid)
+		if err != nil || len(b) != 8 {
+			return nil, fmt.Errorf("short_ids[%d] must be 16 hex characters (8 bytes)", i)
+		}
+		copy(out[i][:], b)
+	}
+	return out, nil
 }
