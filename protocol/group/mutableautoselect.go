@@ -119,6 +119,12 @@ type MutableAutoSelect struct {
 	// so each has at most one at a time. Guarded by access.
 	lastResortInFlight map[string]bool
 
+	// abandonedProbes holds the member outbounds whose batch probe probeAll
+	// stopped waiting for and whose dial hasn't returned yet. Keyed by
+	// instance, so a replacement added under the same tag is still probed.
+	// Guarded by access.
+	abandonedProbes map[A.Outbound]bool
+
 	// Unix-nano of the most recent non-empty data-plane Read/Write; 0
 	// means no traffic observed yet. Drives the adaptive probe cadence.
 	lastActive atomic.Int64
@@ -789,9 +795,10 @@ func (s *MutableAutoSelect) peekHistoryLocked(tag string) (*localHistory, bool) 
 
 // collectProbeJobsLocked builds jobs for tags, or all members when tags is nil.
 // excludeFromPool and lastResort members are skipped; lastResort members are
-// probed by kickLastResortProbesLocked instead. With force=false, members with
-// outcomes newer than probeFreshnessWindow are skipped. Caller must hold
-// s.access.
+// probed by kickLastResortProbesLocked instead. Members with an abandoned probe
+// still running are skipped, so a stalled peer can't accumulate stuck dials.
+// With force=false, members with outcomes newer than probeFreshnessWindow are
+// skipped. Caller must hold s.access.
 func (s *MutableAutoSelect) collectProbeJobsLocked(now time.Time, tags []string, force bool) []probeJob {
 	if tags == nil {
 		tags = s.tags
@@ -803,7 +810,7 @@ func (s *MutableAutoSelect) collectProbeJobsLocked(now time.Time, tags []string,
 			continue
 		}
 		beh := behaviorFor(o.Type())
-		if beh.excludeFromPool || beh.lastResort {
+		if beh.excludeFromPool || beh.lastResort || s.abandonedProbes[o] {
 			continue
 		}
 		if !force {
@@ -1142,7 +1149,7 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 		}
 		s.lastResortInFlight[tag] = true
 		probeURL := s.probeURLForLocked(tag)
-		bound := lastResortProbeBound(beh)
+		bound := probeBound(beh)
 		go func() {
 			done := make(chan probeResult, 1)
 			go func() { done <- probeMember(s.ctx, o, probeURL, beh) }()
@@ -1210,10 +1217,9 @@ func (s *MutableAutoSelect) finishLastResortProbe(tag, probeURL string) {
 // probe may be for the ladder to treat it as a winner.
 const lastResortSuccessFreshness = 5 * time.Minute
 
-// lastResortProbeBound is how long a last-resort probe may run before it is
-// counted as failed even if the outbound hasn't returned. A variable so tests
-// can shorten it.
-var lastResortProbeBound = func(beh protocolBehavior) time.Duration {
+// probeBound is how long a probe may run before it is counted as failed even
+// if the outbound hasn't returned. A variable so tests can shorten it.
+var probeBound = func(beh protocolBehavior) time.Duration {
 	return beh.probeTimeout + 5*time.Second
 }
 
