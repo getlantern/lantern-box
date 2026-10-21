@@ -509,6 +509,11 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	if err == nil {
 		return s.wrapStream(conn, network, o, primaryRoute), nil
 	}
+	if s.dialEnded(ctx) {
+		s.logger.DebugContext(ctx, "dial ended: ", err)
+		span.RecordError(err)
+		return nil, err
+	}
 	s.logger.ErrorContext(ctx, err)
 	// Attribute the failure to the outer (member) tag so rankLocked and
 	// runLadder's gating both see it. For nested groups, the inner tag
@@ -529,6 +534,13 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 				go s.confirmSelectedFailure(outerTag, replacementTag)
 			}
 			return s.wrapStream(conn, network, alt, fallbackRoute), nil
+		}
+		if s.dialEnded(ctx) {
+			s.logger.DebugContext(ctx, "dial ended: ", err)
+			// The primary's failure was real, so it still starts a ladder.
+			go s.runLadder(outerTag)
+			span.RecordError(err)
+			return nil, err
 		}
 		s.logger.ErrorContext(ctx, err)
 		s.recordUserFailure(replacementTag, adapter.UserFailureDial)
@@ -559,6 +571,11 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	if err == nil {
 		return s.wrapPacket(conn, o, primaryRoute), nil
 	}
+	if s.dialEnded(ctx) {
+		s.logger.DebugContext(ctx, "listen ended: ", err)
+		span.RecordError(err)
+		return nil, err
+	}
 	s.logger.ErrorContext(ctx, err)
 	s.recordUserFailure(outerTag, adapter.UserFailureDial)
 
@@ -570,6 +587,13 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 			go s.runLadder(outerTag)
 			return s.wrapPacket(conn, alt, fallbackRoute), nil
 		}
+		if s.dialEnded(ctx) {
+			s.logger.DebugContext(ctx, "listen ended: ", err)
+			// The primary's failure was real, so it still starts a ladder.
+			go s.runLadder(outerTag)
+			span.RecordError(err)
+			return nil, err
+		}
 		s.logger.ErrorContext(ctx, err)
 		s.recordUserFailure(replacementTag, adapter.UserFailureDial)
 		outerTag = replacementTag
@@ -578,6 +602,15 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	go s.runLadder(outerTag)
 	span.RecordError(err)
 	return nil, err
+}
+
+// dialEnded reports whether a failed dial or listen was cut short by its
+// caller's context or by the group closing, so the failure says nothing
+// about the member. It checks ctx rather than the error: outbounds can
+// report a caller's deadline as context.Canceled, and their own timeouts
+// as context errors.
+func (s *MutableAutoSelect) dialEnded(ctx context.Context) bool {
+	return ctx.Err() != nil || s.isClosed()
 }
 
 // routeKind records whether a conn used the selected member or a
@@ -1254,11 +1287,15 @@ func (s *MutableAutoSelect) mutateHistoryIf(tag string, guard func() bool, fn fu
 // errors and confirmed data-plane stalls both pass through here; each counts
 // as one failure, with softFailLimit tripping the soft tier and
 // consecutiveFailLimit tripping the hard tier. Returns true if the
-// failure was persisted; false on dedup or non-member tag, so callers
-// can suppress downstream side effects (e.g. ladder kicks) on collapsed
-// events.
+// failure was persisted; false on dedup, non-member tag, or a closed
+// group, so callers can suppress downstream side effects (e.g. ladder
+// kicks) on collapsed events.
 func (s *MutableAutoSelect) recordUserFailure(tag string, kind adapter.UserFailureKind) bool {
-	recorded := s.mutateHistory(tag, func(h *localHistory, now time.Time) bool {
+	// Members tear down their transports during shutdown, and the
+	// resulting errors don't reflect their health. Checked under s.access
+	// so a failure waiting on the lock while Close runs is dropped too.
+	open := func() bool { return !s.isClosed() }
+	recorded := s.mutateHistoryIf(tag, open, func(h *localHistory, now time.Time) bool {
 		return h.addUserFailure(adapter.UserFailure{At: now, Kind: kind}, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
 	})
 	if recorded {
@@ -1380,14 +1417,15 @@ func (s *MutableAutoSelect) findProbedReplacementLocked(now time.Time, network, 
 	return ""
 }
 
-// runLadder is invoked on any dial/listen error (after the dial-site
-// fast-failover step has already had its shot) and on data-plane stall
-// callbacks. It does not retry the failing member: the dial caller
-// already retries on its own schedule, and the fast-failover path has
-// already exercised the next-best alternate. The ladder's job is to
-// reshape the candidate pool: full parallel re-probe; if nothing
-// succeeds inside ladderTotalBudget, emit the exhaustion signal so
-// radiance can refetch /config-new.
+// runLadder is invoked on any dial/listen error not ended by its caller
+// or by the group closing (after the dial-site fast-failover step has
+// already had its shot) and on data-plane stall callbacks. It does not
+// retry the failing member: the dial caller already retries on its own
+// schedule, and the fast-failover path has already exercised the
+// next-best alternate. The ladder's job is to reshape the candidate
+// pool: full parallel re-probe; if nothing succeeds inside
+// ladderTotalBudget, emit the exhaustion signal so radiance can refetch
+// /config-new.
 //
 // A ladderCooldown window after the previous run suppresses repeat
 // kicks: probe data is still fresh, and rank demotion via
