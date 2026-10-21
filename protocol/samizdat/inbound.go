@@ -14,13 +14,13 @@ import (
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/mux"
-	"github.com/sagernet/sing-box/common/uot"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/route/rule"
 	M "github.com/sagernet/sing/common/metadata"
 
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/protocol/internal/uotrouter"
 	"github.com/getlantern/lantern-box/tracker/peerconn"
 
 	samizdat "github.com/getlantern/samizdat"
@@ -108,7 +108,7 @@ func NewInbound(
 		Adapter: inbound.NewAdapter(constant.TypeSamizdat, tag),
 		ctx:     ctx,
 		logger:  logger,
-		router:  uot.NewRouter(router, logger),
+		router:  uotrouter.New(router, logger),
 		listener: listener.New(listener.Options{
 			Context: ctx,
 			Logger:  logger,

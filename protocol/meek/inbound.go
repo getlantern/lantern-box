@@ -14,7 +14,6 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
-	"github.com/sagernet/sing-box/common/uot"
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/protocol/socks/socks5"
@@ -22,6 +21,7 @@ import (
 	"github.com/getlantern/lantern-box/constant"
 	L "github.com/getlantern/lantern-box/log"
 	"github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/protocol/internal/uotrouter"
 )
 
 // RegisterInbound registers the meek inbound adapter with the given registry.
@@ -103,7 +103,7 @@ func NewInbound(
 		Adapter: inbound.NewAdapter(constant.TypeMeek, tag),
 		ctx:     ctx,
 		logger:  logger,
-		router:  uot.NewRouter(router, logger),
+		router:  uotrouter.New(router, logger),
 		listener: listener.New(listener.Options{
 			Context: ctx,
 			Logger:  logger,
