@@ -17,6 +17,9 @@ on:
   # push doesn't trigger the tags filter above.
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   go:
     uses: ./.github/workflows/go.yaml
