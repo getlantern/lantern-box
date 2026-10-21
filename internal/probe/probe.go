@@ -35,6 +35,9 @@ var ErrUnusableInput = errors.New("unusable probe input")
 //
 // The reported duration spans the handshake and the request, plus the dial for
 // an outbound that does not defer its handshake to first use.
+//
+// out's DialContext must return once ctx is cancelled or its deadline passes;
+// Run returns no sooner than that dial does.
 func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Duration) (time.Duration, error) {
 	if probeURL == "" {
 		return 0, fmt.Errorf("%w: empty probe URL", ErrUnusableInput)
