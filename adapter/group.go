@@ -32,9 +32,9 @@ type OutboundChecker interface {
 }
 
 // ExhaustionSignaler exposes a channel the host can select on to learn that
-// the group's reconnection ladder finished without finding a working
-// candidate. At most one value is sent per ladder run; the host decides
-// what to do (typically a rate-limited config refetch).
+// a full probe of the group's members found no working candidate. At most
+// one value is sent per probe; the host decides what to do (typically a
+// rate-limited config refetch).
 type ExhaustionSignaler interface {
 	ExhaustionSignal() <-chan struct{}
 }

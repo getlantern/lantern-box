@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	sbAdapter "github.com/sagernet/sing-box/adapter"
@@ -28,6 +30,7 @@ import (
 
 	"github.com/getlantern/lantern-box/adapter"
 	lConst "github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/option"
 )
 
 // Type returns m.typeName so tests can drive behaviorFor branches
@@ -49,15 +52,15 @@ func newTestMUR(t *testing.T, tags ...string) (*MutableAutoSelect, map[string]*m
 		urlOverrides: map[string]string{},
 		histories:    map[string]*localHistory{},
 		cfg: mutableAutoSelectConfig{
-			switchTolerance:    50 * time.Millisecond,
-			activeInterval:     time.Hour,
-			idleInterval:       4 * time.Hour,
-			idleThreshold:      10 * time.Minute,
-			ladderTotalBudget:  100 * time.Millisecond,
-			dataPlaneIdle:      time.Hour,
-			demoteOnlySelected: true,
-			maxPersistedAge:    defaultMaxPersistedAge,
-			probeConcurrency:   defaultProbeConcurrency,
+			switchTolerance:                50 * time.Millisecond,
+			activeInterval:                 time.Hour,
+			idleThreshold:                  10 * time.Minute,
+			ladderTotalBudget:              100 * time.Millisecond,
+			confirmedFailureSwitchCooldown: defaultConfirmedFailureSwitchCooldown,
+			dataPlaneIdle:                  time.Hour,
+			demoteOnlySelected:             true,
+			maxPersistedAge:                defaultMaxPersistedAge,
+			probeConcurrency:               defaultProbeConcurrency,
 		},
 		hist:         defaultHistoryParams(),
 		history:      adapter.NewAutoSelectHistoryStorage(),
@@ -462,15 +465,20 @@ func TestSelectFor_SwitchTolerance(t *testing.T) {
 		name       string
 		alphaDelay uint32
 		betaDelay  uint32
+		percent    uint32
 		want       string
 		commentary string
 	}{
-		{"sticky kept within tolerance", 100, 80, "alpha", "80+50 > 100 → keep alpha"},
-		{"switches when beats tolerance", 100, 40, "beta", "40+50 <= 100 → switch"},
+		{"sticky kept within tolerance", 100, 80, 0, "alpha", "80+50 > 100 → keep alpha"},
+		{"switches when beats tolerance", 100, 40, 0, "beta", "40+50 <= 100 → switch"},
+		{"sticky kept within percent", 1000, 750, 30, "alpha", "250 < 30% of 1000 → keep alpha"},
+		{"switches when beats both", 1000, 650, 30, "beta", "350 >= 50 and >= 30% of 1000 → switch"},
+		{"sticky kept within ms despite percent", 100, 60, 30, "alpha", "40 >= 30% of 100 but < 50 → keep alpha"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _ := newTestMUR(t, "alpha", "beta")
+			s.cfg.switchTolerancePercent = tt.percent
 			recordSuccess(s, "alpha", tt.alphaDelay)
 			recordSuccess(s, "beta", tt.betaDelay)
 			s.stickyTag.tcp.Store("alpha")
@@ -765,17 +773,19 @@ func (stallPacketConn) SetDeadline(time.Time) error               { return nil }
 func (stallPacketConn) SetReadDeadline(time.Time) error           { return nil }
 func (stallPacketConn) SetWriteDeadline(time.Time) error          { return nil }
 
-func TestRunLadder_DoesNotEmitExhaustionWhenClosed(t *testing.T) {
-	s, _ := newTestMUR(t, "a")
-	s.cancel()
-	s.runLadder("")
-	select {
-	case <-s.ExhaustionSignal():
-		t.Errorf("closed group must not emit exhaustion")
-	default:
+func TestFullProbe_DoesNotSignalExhaustionWhenClosed(t *testing.T) {
+	for name, run := range map[string]func(*MutableAutoSelect){
+		"ladder":           func(s *MutableAutoSelect) { s.runLadder("") },
+		"background cycle": (*MutableAutoSelect).runProbeCycle,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, _ := newTestMUR(t, "a")
+			s.cancel()
+			run(s)
+			assert.False(t, exhausted(s), "closed group must not emit exhaustion")
+		})
 	}
 }
-
 func TestRecordProbeOutcome_Persists(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -1118,54 +1128,6 @@ func TestHydrate_DropsStaleSnapshot(t *testing.T) {
 	assert.Nil(t, s.history.Load("a"), "stale snapshot must be deleted on hydrate too")
 }
 
-func TestNextProbeInterval(t *testing.T) {
-	tests := []struct {
-		name string
-		prep func(s *MutableAutoSelect)
-		want func(s *MutableAutoSelect) time.Duration
-	}{
-		{
-			name: "no traffic observed defaults to idle",
-			prep: func(*MutableAutoSelect) {},
-			want: func(s *MutableAutoSelect) time.Duration { return s.cfg.idleInterval },
-		},
-		{
-			name: "recent traffic selects active",
-			prep: func(s *MutableAutoSelect) { s.bumpActive() },
-			want: func(s *MutableAutoSelect) time.Duration { return s.cfg.activeInterval },
-		},
-		{
-			name: "stale traffic backs off to idle",
-			prep: func(s *MutableAutoSelect) {
-				s.lastActive.Store(time.Now().Add(-2 * s.cfg.idleThreshold).UnixNano())
-			},
-			want: func(s *MutableAutoSelect) time.Duration { return s.cfg.idleInterval },
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s, _ := newTestMUR(t, "a")
-			tt.prep(s)
-			assert.Equal(t, tt.want(s), s.nextProbeInterval())
-		})
-	}
-}
-
-func TestDataPlaneStream_OnActivityFiresOnNonEmptyIO(t *testing.T) {
-	var activity atomic.Uint32
-	d := newDataPlaneStream(echoConn{}, time.Hour, 0, dataPlaneHooks{onActivity: func() { activity.Add(1) }})
-	defer d.Close()
-	_, err := d.Write([]byte("hi"))
-	require.NoError(t, err, "Write should succeed on echoConn")
-
-	buf := make([]byte, 8)
-	_, err = d.Read(buf)
-	require.NoError(t, err, "Read should succeed on echoConn")
-
-	assert.Equal(t, uint32(2), activity.Load(),
-		"onActivity should fire once per non-empty Read/Write")
-}
-
 // failingConn returns firstN bytes on the first Read, then returns err.
 // If failWrite is set, Write returns err instead of succeeding.
 type failingConn struct {
@@ -1482,69 +1444,92 @@ func (echoConn) SetDeadline(time.Time) error      { return nil }
 func (echoConn) SetReadDeadline(time.Time) error  { return nil }
 func (echoConn) SetWriteDeadline(time.Time) error { return nil }
 
-func TestExhaustionSignal_FiresOnFullLadderFailure(t *testing.T) {
-	// seedPriorSuccess leaves lastSuccessDelayMs set so the cycle's own
-	// failures advance lastOutcomeAt past freshSince while a stale delay
-	// remains — the combination that previously let a fully-failing
-	// ladder report a winner and stay silent.
-	tests := []struct {
-		name             string
-		seedPriorSuccess bool
+func TestFullProbe_ExhaustionSignalWhenAllFail(t *testing.T) {
+	runs := []struct {
+		name string
+		run  func(*MutableAutoSelect)
+		want bool
 	}{
-		{"no history", false},
-		{"prior success", true},
+		{"ladder signals", func(s *MutableAutoSelect) { s.runLadder("a") }, true},
+		{"background cycle signals", (*MutableAutoSelect).runProbeCycle, true},
+		{"network-change or wake probe stays silent", (*MutableAutoSelect).reprobe, false},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s, obs := newTestMUR(t, "a", "b")
+	// Prior success must not suppress exhaustion when every current probe fails.
+	for _, seedPriorSuccess := range []bool{false, true} {
+		for _, tt := range runs {
+			t.Run(fmt.Sprintf("%s/prior success %v", tt.name, seedPriorSuccess), func(t *testing.T) {
+				s, obs := newTestMUR(t, "a", "b")
+				s.defaultURL = "http://probe.test/"
+				if seedPriorSuccess {
+					recordSuccess(s, "a", 100)
+					recordSuccess(s, "b", 200)
+				}
+				obs["a"].On("DialContext").Return(nil, errors.New("dial denied"))
+				obs["b"].On("DialContext").Return(nil, errors.New("dial denied"))
+
+				tt.run(s)
+
+				obs["a"].AssertNumberOfCalls(t, "DialContext", 1)
+				assert.Equal(t, tt.want, exhausted(s))
+			})
+		}
+	}
+}
+
+func TestFullProbe_StaysSilentWhenAMemberSucceeds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(srv.Close)
+
+	for name, run := range map[string]func(*MutableAutoSelect){
+		"ladder":           func(s *MutableAutoSelect) { s.runLadder("dead") },
+		"background cycle": (*MutableAutoSelect).runProbeCycle,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, obs := newTestMUR(t, "dead", "live")
 			s.defaultURL = "http://probe.test/"
-			if tt.seedPriorSuccess {
-				recordSuccess(s, "a", 100)
-				recordSuccess(s, "b", 200)
-			}
-			obs["a"].On("DialContext").Return(nil, errors.New("dial denied"))
-			obs["b"].On("DialContext").Return(nil, errors.New("dial denied"))
+			s.cfg.ladderTotalBudget = 10 * time.Second
+			recordSuccess(s, "dead", 100)
+			recordSuccess(s, "live", 200)
 
-			sig := s.ExhaustionSignal()
-			s.runLadder("a")
-
-			select {
-			case _, ok := <-sig:
-				assert.True(t, ok, "exhaustion channel should deliver a value, not be closed")
-			case <-time.After(2 * time.Second):
-				require.FailNow(t, "exhaustion signal not delivered within timeout")
+			obs["dead"].dial = denyDial
+			obs["live"].dial = func(ctx context.Context) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "tcp", srv.Listener.Addr().String())
 			}
+
+			run(s)
+			assert.False(t, exhausted(s), "a probe with a live member must not signal exhaustion")
 		})
 	}
 }
 
-// Guards the opposite direction from the exhaustion tests: the winner gate
-// must not be so tight that a live member is missed, which would signal
-// exhaustion every cycle and drive a /config-new refetch each time.
-func TestRunLadder_StaysSilentWhenAMemberSucceeds(t *testing.T) {
+func TestProbeReachableLocked_CountsReachableMembers(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	t.Cleanup(srv.Close)
 
-	s, obs := newTestMUR(t, "dead", "live")
+	s, obs := newTestMUR(t, "dead", "live1", "live2")
 	s.defaultURL = "http://probe.test/"
-	s.cfg.ladderTotalBudget = 10 * time.Second
-	recordSuccess(s, "dead", 100)
-	recordSuccess(s, "live", 200)
-
-	obs["dead"].On("DialContext").Return(nil, errors.New("dial denied"))
-	obs["live"].dial = func(ctx context.Context) (net.Conn, error) {
+	for _, tag := range []string{"dead", "live1", "live2"} {
+		recordSuccess(s, tag, 100)
+	}
+	obs["dead"].dial = denyDial
+	liveDial := func(ctx context.Context) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp", srv.Listener.Addr().String())
 	}
+	obs["live1"].dial = liveDial
+	obs["live2"].dial = liveDial
 
-	sig := s.ExhaustionSignal()
-	s.runLadder("dead")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s.probeMu.Lock()
+	reachable, total, current := s.probeReachableLocked(ctx, "test")
+	s.probeMu.Unlock()
 
-	select {
-	case <-sig:
-		require.FailNow(t, "a cycle with a live member must not signal exhaustion")
-	default:
-	}
+	assert.True(t, current)
+	assert.Equal(t, 2, reachable)
+	assert.Equal(t, 3, total)
+	assert.False(t, exhausted(s))
 }
 
 func TestExhaustionSignal_CoalescesPendingSignal(t *testing.T) {
@@ -1601,6 +1586,7 @@ func TestRunLadder_NoStep1Retry(t *testing.T) {
 func TestInterfaceUpdated_TriggersReprobe(t *testing.T) {
 	s, obs := newTestMUR(t, "a")
 	s.defaultURL = "http://probe.test/"
+	s.probing = true
 	dialed := make(chan struct{}, 1)
 	obs["a"].On("DialContext").Run(func(mock.Arguments) {
 		select {
@@ -1875,7 +1861,7 @@ func TestRunBackgroundLoop_RegistersWithPauseManager(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runBackgroundLoop()
+		s.runBackgroundLoop(false)
 	}()
 	require.Eventually(t, func() bool { return pm.registered.Load() == 1 },
 		2*time.Second, 10*time.Millisecond)
@@ -1891,7 +1877,7 @@ func TestRunBackgroundLoop_NoPauseManagerIsNoOp(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runBackgroundLoop()
+		s.runBackgroundLoop(false)
 	}()
 	time.Sleep(10 * time.Millisecond)
 	cancel()
@@ -1902,6 +1888,414 @@ func TestRunBackgroundLoop_NoPauseManagerIsNoOp(t *testing.T) {
 	}
 }
 
+// newIdleTestMUR returns a started group whose one member fails every probe
+// dial, counting them.
+func newIdleTestMUR(t *testing.T) (*MutableAutoSelect, *atomic.Int32) {
+	t.Helper()
+	s, obs := newTestMUR(t, "a")
+	s.defaultURL = "http://probe.test/"
+	s.cfg.activeInterval = time.Minute
+	s.cfg.idleThreshold = 5 * time.Minute
+	s.started = true
+	var dials atomic.Int32
+	obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+		dials.Add(1)
+		return denyDial(ctx)
+	}
+	return s, &dials
+}
+
+func keepAlive(s *MutableAutoSelect) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.keepAliveLocked()
+}
+
+func isProbing(s *MutableAutoSelect) bool {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.probing
+}
+
+func denyDial(context.Context) (net.Conn, error) { return nil, errors.New("dial denied") }
+
+// exhausted reports whether an exhaustion signal is pending, consuming it.
+func exhausted(s *MutableAutoSelect) bool {
+	select {
+	case <-s.ExhaustionSignal():
+		return true
+	default:
+		return false
+	}
+}
+
+func withPauseManager(s *MutableAutoSelect) pause.Manager {
+	s.ctx = pause.WithDefaultManager(s.ctx)
+	return service.FromContext[pause.Manager](s.ctx)
+}
+
+func TestKeepAlive_StopsProbingAfterIdleThreshold(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, dials := newIdleTestMUR(t)
+
+		keepAlive(s)
+		synctest.Wait()
+		require.True(t, isProbing(s))
+		assert.EqualValues(t, 1, dials.Load(), "the first use probes")
+
+		time.Sleep(s.cfg.idleThreshold + time.Second)
+		synctest.Wait()
+		assert.False(t, isProbing(s))
+
+		n := dials.Load()
+		time.Sleep(10 * s.cfg.activeInterval)
+		synctest.Wait()
+		assert.Equal(t, n, dials.Load(), "a stopped loop must not probe")
+	})
+}
+
+func TestKeepAlive_UseKeepsProbing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, dials := newIdleTestMUR(t)
+
+		keepAlive(s)
+		for range 10 {
+			time.Sleep(s.cfg.activeInterval)
+			keepAlive(s)
+		}
+		synctest.Wait()
+		assert.True(t, isProbing(s))
+		assert.EqualValues(t, 11, dials.Load(), "one probe on start plus one per interval")
+	})
+}
+
+func TestKeepAlive_RestartProbesOnlyAfterInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		lastUsed time.Duration
+		want     int32
+	}{
+		{"idle longer than the interval", 2 * time.Minute, 1},
+		{"used within the interval", 30 * time.Second, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, dials := newIdleTestMUR(t)
+				s.lastActive = time.Now().Add(-tt.lastUsed)
+
+				keepAlive(s)
+				synctest.Wait()
+				assert.True(t, isProbing(s))
+				assert.Equal(t, tt.want, dials.Load())
+			})
+		})
+	}
+}
+
+func TestKeepAlive_RestartSkipsProbeWhilePaused(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, dials := newIdleTestMUR(t)
+		pm := withPauseManager(s)
+		pm.NetworkPause()
+
+		keepAlive(s)
+		synctest.Wait()
+		assert.True(t, isProbing(s))
+		assert.Zero(t, dials.Load(), "probes while offline would count against healthy members")
+
+		pm.NetworkWake()
+		synctest.Wait()
+		assert.Zero(t, dials.Load(), "a wake alone leaves the probe to the network reset after it")
+
+		s.InterfaceUpdated()
+		synctest.Wait()
+		assert.EqualValues(t, 1, dials.Load(), "the network reset after the wake probes")
+	})
+}
+
+func TestReprobeTriggers_WaitForProbeInFlight(t *testing.T) {
+	tests := []struct {
+		name    string
+		trigger func(*MutableAutoSelect)
+	}{
+		{"restart", keepAlive},
+		{"network change", func(s *MutableAutoSelect) {
+			s.probing = true
+			s.InterfaceUpdated()
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, dials := newIdleTestMUR(t)
+			s.probeMu.Lock()
+			tt.trigger(s)
+			time.Sleep(50 * time.Millisecond)
+			assert.Zero(t, dials.Load())
+			s.probeMu.Unlock()
+			require.Eventually(t, func() bool { return dials.Load() == 1 }, 2*time.Second, 5*time.Millisecond,
+				"the probe must run once the in-flight batch finishes, not drop")
+		})
+	}
+}
+func TestInterfaceUpdated_IdleDefersProbeToNextUse(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, dials := newIdleTestMUR(t)
+		s.lastActive = time.Now()
+
+		s.InterfaceUpdated()
+		synctest.Wait()
+		assert.Zero(t, dials.Load(), "an idle group must not probe on a network change")
+
+		keepAlive(s)
+		synctest.Wait()
+		assert.EqualValues(t, 1, dials.Load(), "the next use probes on the new network, however recent the last use")
+	})
+}
+
+func TestKeepAlive_NoLoopBeforeStartOrAfterClose(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	keepAlive(s)
+	assert.False(t, isProbing(s), "before PostStart")
+
+	s.started = true
+	s.cancel()
+	keepAlive(s)
+	assert.False(t, isProbing(s), "after Close")
+}
+
+func TestDialAndListen_StartProbing(t *testing.T) {
+	tests := []struct {
+		name string
+		use  func(*MutableAutoSelect) error
+	}{
+		{"dial", func(s *MutableAutoSelect) error {
+			_, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+			return err
+		}},
+		{"listen", func(s *MutableAutoSelect) error {
+			_, err := s.ListenPacket(context.Background(), metadata.Socksaddr{})
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, obs := newTestMUR(t, "a")
+			s.started = true
+			obs["a"].dial = denyDial
+			obs["a"].On("ListenPacket").Return(nil, errors.New("listen denied"))
+			require.Error(t, tt.use(s))
+			assert.True(t, isProbing(s))
+		})
+	}
+}
+
+func TestDataPlaneStream_OnActivityFiresOnNonEmptyIO(t *testing.T) {
+	var activity atomic.Uint32
+	d := newDataPlaneStream(echoConn{}, time.Hour, 0, dataPlaneHooks{onActivity: func(time.Time) { activity.Add(1) }})
+	defer d.Close()
+	_, err := d.Write([]byte("hi"))
+	require.NoError(t, err, "Write should succeed on echoConn")
+
+	buf := make([]byte, 8)
+	_, err = d.Read(buf)
+	require.NoError(t, err, "Read should succeed on echoConn")
+
+	assert.Equal(t, uint32(2), activity.Load(),
+		"onActivity should fire once per non-empty Read/Write")
+}
+
+func TestKeepAlive_DataActivityKeepsProbing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := newIdleTestMUR(t)
+		keepAlive(s)
+		for range 10 {
+			time.Sleep(s.cfg.activeInterval)
+			s.noteDataActivity(time.Now())
+		}
+		synctest.Wait()
+		assert.True(t, isProbing(s), "a long transfer with no new dials keeps the group in use")
+
+		time.Sleep(s.cfg.idleThreshold + time.Second)
+		synctest.Wait()
+		assert.False(t, isProbing(s), "probing stops once the traffic does")
+	})
+}
+
+func TestReprobe_SkipsIfPausedWhileWaiting(t *testing.T) {
+	s, dials := newIdleTestMUR(t)
+	pm := withPauseManager(s)
+	s.probing = true
+	s.probeMu.Lock()
+	s.InterfaceUpdated()
+	require.Eventually(t, s.reprobePending.Load, 2*time.Second, 5*time.Millisecond)
+	pm.NetworkPause()
+	s.probeMu.Unlock()
+
+	require.Eventually(t, func() bool { return !s.reprobePending.Load() }, 2*time.Second, 5*time.Millisecond)
+	s.probeMu.Lock()
+	s.probeMu.Unlock()
+	assert.Zero(t, dials.Load(), "a pause during the wait must stop the queued probe")
+}
+
+func TestInterfaceUpdated_SkipsWhilePaused(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, dials := newIdleTestMUR(t)
+		pm := withPauseManager(s)
+		keepAlive(s)
+		synctest.Wait()
+		require.EqualValues(t, 1, dials.Load())
+
+		// sing-box resets the network on suspend as well as on resume.
+		pm.DevicePause()
+		s.InterfaceUpdated()
+		synctest.Wait()
+		assert.EqualValues(t, 1, dials.Load(), "a network reset while paused must not probe")
+
+		pm.DeviceWake()
+		s.InterfaceUpdated()
+		synctest.Wait()
+		assert.EqualValues(t, 2, dials.Load())
+	})
+}
+
+func TestDialContext_FailoverFailureRunsLadderAfterCooldown(t *testing.T) {
+	tests := []struct {
+		name       string
+		lastLadder time.Duration
+		wantRun    bool
+	}{
+		{"past the cooldown", 2 * time.Minute, true},
+		{"within the cooldown", 30 * time.Second, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, obs := newTestMUR(t, "a", "b")
+				s.cfg.ladderCooldown = time.Minute
+				for _, tag := range []string{"a", "b"} {
+					recordSuccess(s, tag, 10)
+					obs[tag].dial = denyDial
+				}
+				last := time.Now().Add(-tt.lastLadder).UnixNano()
+				s.lastLadderAt.Store(last)
+
+				_, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+				require.Error(t, err)
+				synctest.Wait()
+				assert.Equal(t, tt.wantRun, s.lastLadderAt.Load() != last)
+			})
+		})
+	}
+}
+
+func TestRunLadder_KeepsCooldown(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	s.cfg.ladderCooldown = 5 * time.Minute
+	last := time.Now().Add(-2 * time.Minute).UnixNano()
+	s.lastLadderAt.Store(last)
+	s.runLadder("a")
+	assert.Equal(t, last, s.lastLadderAt.Load())
+}
+
+func TestResolveOptions(t *testing.T) {
+	pct := func(v uint32) *uint32 { return &v }
+	cfg, _ := resolveMutableAutoSelectOptions(option.MutableAutoSelectOutboundOptions{})
+	assert.EqualValues(t, defaultSwitchTolerancePercent, cfg.switchTolerancePercent, "nil uses the default")
+	assert.Equal(t, time.Minute, cfg.ladderCooldown)
+	cfg, _ = resolveMutableAutoSelectOptions(option.MutableAutoSelectOutboundOptions{SwitchTolerancePercent: pct(0)})
+	assert.Zero(t, cfg.switchTolerancePercent, "0 disables the relative check")
+
+	_, err := NewMutableAutoSelect(context.Background(), nil, log.NewNOPFactory().Logger(), "g",
+		option.MutableAutoSelectOutboundOptions{SwitchTolerancePercent: pct(101)})
+	assert.Error(t, err)
+	_, err = NewMutableAutoSelect(context.Background(), nil, log.NewNOPFactory().Logger(), "g",
+		option.MutableAutoSelectOutboundOptions{SwitchTolerancePercent: pct(100)})
+	assert.NoError(t, err)
+}
+
+func TestDataPlaneWatchdog_ActivityCountsAfterStall(t *testing.T) {
+	var activity int
+	var w dataPlaneWatchdog
+	w.init(time.Hour, 0, dataPlaneHooks{onActivity: func(time.Time) { activity++ }})
+	defer w.closeWatchdog()
+	// A stall marks the watchdog but leaves the conn open.
+	w.stalled.Store(true)
+
+	w.noteIO(10, nil, true)
+	assert.Equal(t, 1, activity, "traffic that resumes after a stall is still use of the group")
+}
+
+func TestKeepAlive_NoProbeWhileNetworkStillPaused(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, dials := newIdleTestMUR(t)
+		pm := withPauseManager(s)
+		keepAlive(s)
+		synctest.Wait()
+		require.EqualValues(t, 1, dials.Load())
+
+		pm.NetworkPause()
+		pm.DevicePause()
+		pm.DeviceWake()
+		time.Sleep(2 * s.cfg.activeInterval)
+		synctest.Wait()
+		assert.EqualValues(t, 1, dials.Load(), "a device wake while offline must not probe on tick")
+	})
+}
+
+func TestReprobe_CollapsesWaitingCalls(t *testing.T) {
+	s, dials := newIdleTestMUR(t)
+	s.probeMu.Lock()
+	go s.reprobe()
+	require.Eventually(t, s.reprobePending.Load, 2*time.Second, 5*time.Millisecond)
+	// Both return at once: the waiting reprobe starts after this batch too.
+	s.reprobe()
+	s.reprobe()
+	s.probeMu.Unlock()
+	require.Eventually(t, func() bool { return dials.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	assert.EqualValues(t, 1, dials.Load(), "calls waiting behind the same batch collapse into one probe")
+
+	// Once that probe holds the lock, a new call queues one more.
+	s.reprobe()
+	assert.EqualValues(t, 2, dials.Load())
+}
+
+func TestNetworkChangeMidProbe_DiscardsExhaustion(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*MutableAutoSelect)
+	}{
+		{"background cycle", (*MutableAutoSelect).runProbeCycle},
+		// The second ladder also shows the discarded one started no cooldown.
+		{"ladder", func(s *MutableAutoSelect) { s.runLadder("a") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, obs := newTestMUR(t, "a", "b")
+				s.defaultURL = "http://probe.test/"
+				s.cfg.ladderTotalBudget = 2 * time.Second
+				s.cfg.ladderCooldown = time.Minute
+				obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+					time.Sleep(500 * time.Millisecond)
+					return denyDial(ctx)
+				}
+				obs["b"].dial = denyDial
+
+				go tt.run(s)
+				time.Sleep(100 * time.Millisecond)
+				s.InterfaceUpdated()
+				time.Sleep(time.Second)
+				synctest.Wait()
+				assert.False(t, exhausted(s), "a probe that measured the old network must not signal exhaustion")
+
+				tt.run(s)
+				assert.True(t, exhausted(s), "a probe entirely on the new network still signals exhaustion")
+			})
+		})
+	}
+}
 func TestClose_RaceWithEmitExhaustionDoesNotPanic(t *testing.T) {
 	const iterations = 200
 	for i := 0; i < iterations; i++ {
@@ -1910,7 +2304,9 @@ func TestClose_RaceWithEmitExhaustionDoesNotPanic(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			s.emitExhaustion()
+			s.access.Lock()
+			s.emitExhaustionLocked()
+			s.access.Unlock()
 		}()
 		go func() {
 			defer wg.Done()
@@ -2029,4 +2425,51 @@ func TestChargeable_Policy(t *testing.T) {
 
 	s.cfg.demoteOnlySelected = false
 	assert.True(t, s.chargeable("b", primaryRoute), "the gate off makes everything chargeable")
+}
+
+func TestFailoverSuccess_DoesNotRunLadder(t *testing.T) {
+	tests := []struct {
+		name string
+		use  func(*MutableAutoSelect) (io.Closer, error)
+	}{
+		{"dial", func(s *MutableAutoSelect) (io.Closer, error) {
+			return s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		}},
+		{"listen", func(s *MutableAutoSelect) (io.Closer, error) {
+			return s.ListenPacket(context.Background(), metadata.Socksaddr{})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, obs := newTestMUR(t, "a", "b")
+				s.defaultURL = "http://probe.test/"
+				recordSuccess(s, "a", 10)
+				recordSuccess(s, "b", 20)
+				obs["a"].dial = denyDial
+				obs["a"].On("ListenPacket").Return(nil, errors.New("listen denied"))
+				obs["b"].dial = func(context.Context) (net.Conn, error) { return echoConn{}, nil }
+				obs["b"].On("ListenPacket").Return(&addressedPacketConn{}, nil)
+
+				conn, err := tt.use(s)
+				require.NoError(t, err)
+				defer conn.Close()
+				synctest.Wait()
+				assert.Zero(t, s.lastLadderAt.Load(), "a failover that succeeded must not re-probe every member")
+			})
+		})
+	}
+}
+
+func TestMakeHooks_FailureDoesNotRunLadder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newTestMUR(t, "a", "b")
+		s.defaultURL = "http://probe.test/"
+		obs["a"].dial = denyDial
+		obs["b"].dial = denyDial
+		s.stickyTag.tcp.Store("a")
+		s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureReset)
+		synctest.Wait()
+		assert.Zero(t, s.lastLadderAt.Load(), "a data-plane failure must not re-probe every member")
+	})
 }
