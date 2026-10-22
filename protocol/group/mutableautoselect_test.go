@@ -1716,6 +1716,126 @@ func TestProbeAll_CanceledBatchDoesNotRecordOutcome(t *testing.T) {
 		"canceled batch must not overwrite the seeded outcome")
 }
 
+// stuckDial returns a dial that ignores its ctx and blocks until the returned
+// release func is called.
+func stuckDial(t *testing.T) (func(context.Context) (net.Conn, error), func()) {
+	stuck := make(chan struct{})
+	release := sync.OnceFunc(func() { close(stuck) })
+	t.Cleanup(release)
+	return func(context.Context) (net.Conn, error) {
+		<-stuck
+		return nil, errors.New("released")
+	}, release
+}
+
+// probeJobsFor collects forced probe jobs for tags, or all members when none
+// are given.
+func probeJobsFor(s *MutableAutoSelect, tags ...string) []probeJob {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.collectProbeJobsLocked(time.Now(), tags, true)
+}
+
+func requireReturnsWithin(t *testing.T, d time.Duration, fn func(), msg string) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatal(msg)
+	}
+}
+
+func TestProbeAll_StopsWaitingWhenCtxEndsDuringStuckDial(t *testing.T) {
+	s, obs := newTestMUR(t, "a")
+	s.defaultURL = "http://probe.test/"
+	dial, release := stuckDial(t)
+	obs["a"].dial = dial
+	seed := time.Now().Add(-time.Hour)
+	s.historyForLocked("a").recordProbeSuccess(50, seed)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	jobs := probeJobsFor(s)
+	requireReturnsWithin(t, 5*time.Second, func() { s.probeAll(ctx, jobs, nil) },
+		"probeAll must not wait past ctx for a dial that ignores it")
+
+	assert.Equal(t, seed, s.historyForLocked("a").outcomeAt(),
+		"a probe abandoned at batch cancellation is not member evidence")
+	assert.Empty(t, probeJobsFor(s), "a member with an abandoned probe still running must not be probed again")
+
+	release()
+	require.Eventually(t, func() bool { return len(probeJobsFor(s)) == 1 },
+		2*time.Second, 10*time.Millisecond, "the member must be probed again once its stuck dial returns")
+}
+
+func TestProbeAll_WatchdogFailsStuckDial(t *testing.T) {
+	orig := probeBound
+	probeBound = func(protocolBehavior) time.Duration { return 50 * time.Millisecond }
+	t.Cleanup(func() { probeBound = orig })
+
+	s, obs := newTestMUR(t, "a")
+	s.defaultURL = "http://probe.test/"
+	dial, release := stuckDial(t)
+	obs["a"].dial = dial
+
+	jobs := probeJobsFor(s)
+	requireReturnsWithin(t, 5*time.Second, func() { s.probeAll(context.Background(), jobs, nil) },
+		"probeAll must not wait past probeBound for a dial that ignores its ctx")
+
+	h, ok := s.peekHistoryLocked("a")
+	require.True(t, ok, "an overrunning probe must be recorded")
+	_, _, consec, _, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
+	assert.Equal(t, uint32(1), consec, "an overrunning probe must count as failed")
+	assert.Empty(t, probeJobsFor(s), "a member with an abandoned probe still running must not be probed again")
+
+	release()
+	require.Eventually(t, func() bool { return len(probeJobsFor(s)) == 1 },
+		2*time.Second, 10*time.Millisecond, "the member must be probed again once its stuck dial returns")
+}
+
+func TestProbeAll_AbandonedProbeDoesNotSkipReplacementUnderSameTag(t *testing.T) {
+	s, obs := newTestMUR(t, "a")
+	s.defaultURL = "http://probe.test/"
+	dial, _ := stuckDial(t)
+	obs["a"].dial = dial
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	jobs := probeJobsFor(s)
+	requireReturnsWithin(t, 5*time.Second, func() { s.probeAll(ctx, jobs, nil) },
+		"probeAll must not wait past ctx for a dial that ignores it")
+	require.Empty(t, probeJobsFor(s))
+
+	_, err := s.Remove("a")
+	require.NoError(t, err)
+	replacement := &mockOutbound{tag: "a"}
+	s.access.Lock()
+	s.members.Store("a", sbAdapter.Outbound(replacement))
+	s.tags = append(s.tags, "a")
+	s.access.Unlock()
+
+	jobs = probeJobsFor(s)
+	require.Len(t, jobs, 1, "a replacement under the same tag must be probed despite the old member's stuck dial")
+	assert.Same(t, replacement, jobs[0].outbound)
+}
+
+func TestRunLadder_ReleasesProbeMuWithinBudgetDespiteStuckDial(t *testing.T) {
+	s, obs := newTestMUR(t, "a")
+	s.defaultURL = "http://probe.test/"
+	dial, _ := stuckDial(t)
+	obs["a"].dial = dial
+
+	requireReturnsWithin(t, 5*time.Second, func() { s.runLadder("a") },
+		"runLadder must not hold probeMu past its budget for a dial that ignores ctx")
+	require.True(t, s.probeMu.TryLock(), "runLadder must release probeMu")
+	s.probeMu.Unlock()
+}
+
 type fakePauseManager struct {
 	pause.Manager
 	registered atomic.Uint32

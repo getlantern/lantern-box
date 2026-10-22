@@ -1,7 +1,9 @@
 FROM debian:bookworm-slim
+COPY deploy/trust /usr/local/lib/lantern-trust
 RUN set -ex \
     && apt-get update \
-    && apt-get install -y ca-certificates tzdata nftables wireguard-tools \
+    && apt-get install -y ca-certificates openssl tzdata nftables wireguard-tools \
+    && sh /usr/local/lib/lantern-trust/update-trust.sh \
     && rm -rf /var/lib/apt/lists/*
 
 COPY lantern-box /usr/local/bin/lantern-box

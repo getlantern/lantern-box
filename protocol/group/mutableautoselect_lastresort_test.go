@@ -270,9 +270,9 @@ func TestProbeReachableLocked_LastResortNeedsFreshSuccess(t *testing.T) {
 // watchdog, but the slot stays taken until the dial returns, so a stalled
 // peer can't accumulate stuck dials across cycles.
 func TestLastResortProbe_WatchdogFailsOverrunningProbe(t *testing.T) {
-	orig := lastResortProbeBound
-	lastResortProbeBound = func(protocolBehavior) time.Duration { return 50 * time.Millisecond }
-	t.Cleanup(func() { lastResortProbeBound = orig })
+	orig := probeBound
+	probeBound = func(protocolBehavior) time.Duration { return 50 * time.Millisecond }
+	t.Cleanup(func() { probeBound = orig })
 
 	s, obs := newLastResortMUR(t)
 	s.defaultURL = "http://probe.test/"
