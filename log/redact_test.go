@@ -34,9 +34,9 @@ func TestHelperTagsRedacted(t *testing.T) {
 
 	buf.Reset()
 	f.NewLogger("outbound/unbounded[unbounded-out-pool1]").InfoContext(context.Background(),
-		"using outbound/unbounded[unbounded-out-pool1] helper-text helper-0123456789abcd xhelper-0123456789ab helper-0123456789AB")
+		"using outbound/unbounded[unbounded-out-pool1] helper-text xhelper-0123456789ab helper-0123456789AB helper-0123456789ab_failed")
 	out = buf.String()
 	assert.Contains(t, out, "tag=outbound/unbounded[unbounded-out-pool1]")
-	assert.Contains(t, out, "using outbound/unbounded[unbounded-out-pool1] helper-text helper-0123456789abcd xhelper-0123456789ab helper-0123456789AB",
-		"pool tags and anything not exactly a word-bounded helper-<12 lowercase hex> are unchanged")
+	assert.Contains(t, out, "using outbound/unbounded[unbounded-out-pool1] helper-text xhelper-0123456789ab helper-0123456789AB helper_failed",
+		"pool tags and anything not a helper-<12 lowercase hex> are unchanged; a suffix does not shield a tag")
 }

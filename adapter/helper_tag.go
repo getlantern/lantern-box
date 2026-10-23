@@ -14,7 +14,12 @@ import (
 // RedactHelperTags first.
 const HelperTagPrefix = "helper-"
 
-var helperTagRE = regexp.MustCompile(`\b` + HelperTagPrefix + `[0-9a-f]{` + strconv.Itoa(helperTagHexLen) + `}\b`)
+// helperTagRE finds helper tags inside longer strings for redaction. It has a
+// leading word boundary, so "xhelper-…" is left alone, but no trailing one:
+// a suffix such as "_failed" must not shield a tag. Over-redacting is safe, so
+// a longer hex run simply loses its first 12 digits. IsHelperTag, which
+// decides whether a tag gets tickets, matches the whole tag exactly instead.
+var helperTagRE = regexp.MustCompile(`\b` + HelperTagPrefix + `[0-9a-f]{` + strconv.Itoa(helperTagHexLen) + `}`)
 
 // helperTagHexLen is the number of lowercase hex digits after HelperTagPrefix.
 const helperTagHexLen = 12

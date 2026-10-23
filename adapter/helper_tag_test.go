@@ -11,13 +11,21 @@ func TestRedactHelperTags(t *testing.T) {
 		"helper-0123456789ab":                           "helper",
 		"a helper-0123456789ab, b helper-abcdefabcdef.": "a helper, b helper.",
 		"outbound/unbounded[helper-0123456789ab]":       "outbound/unbounded[helper]",
-		"no tag here":          "no tag here",
-		"":                     "",
-		"unbounded-out-pool1":  "unbounded-out-pool1",
-		"helper-text":          "helper-text",
-		"helper-0123456789abc": "helper-0123456789abc",
-		"xhelper-0123456789ab": "xhelper-0123456789ab",
-		"helper-0123456789AB":  "helper-0123456789AB",
+		"no tag here":         "no tag here",
+		"":                    "",
+		"unbounded-out-pool1": "unbounded-out-pool1",
+		"helper-text":         "helper-text",
+		// Over-redacting is safe: a longer hex run loses its first 12 digits.
+		"helper-0123456789abc": "helperc",
+		// Suffixes, word characters included, never shield a tag.
+		"helper-0123456789ab_failed":        "helper_failed",
+		"helper-0123456789ab_success":       "helper_success",
+		"helper-0123456789ab.":              "helper.",
+		"helper-0123456789ab-x":             "helper-x",
+		"[helper-0123456789ab]":             "[helper]",
+		"tried helper-abcdefabcdef_failed.": "tried helper_failed.",
+		"xhelper-0123456789ab":              "xhelper-0123456789ab",
+		"helper-0123456789AB":               "helper-0123456789AB",
 	} {
 		assert.Equal(t, want, RedactHelperTags(in), "input %q", in)
 	}
