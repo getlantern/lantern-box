@@ -35,6 +35,19 @@ variable "tencent_copy_regions" {
     "na-siliconvalley",
     "sa-saopaulo",
   ]
+  validation {
+    condition     = length(var.tencent_copy_regions) <= 20
+    error_message = "The two Tencent copy batches support at most 20 destinations."
+  }
+}
+
+variable "tencent_copy_batch" {
+  type    = number
+  default = 0
+  validation {
+    condition     = contains([0, 1], var.tencent_copy_batch)
+    error_message = "Tencent copy batch must be 0 or 1."
+  }
 }
 
 source "tencentcloud-cvm" "lantern-box" {
@@ -46,7 +59,9 @@ source "tencentcloud-cvm" "lantern-box" {
   source_image_id        = var.tencent_source_image_id
   instance_charge_type   = "POSTPAID_BY_HOUR"
   image_name             = "lantern-box-${var.lantern_box_version}-amd64-{{timestamp}}"
-  image_copy_regions     = var.tencent_copy_regions
+  image_copy_regions = slice(var.tencent_copy_regions,
+    min(var.tencent_copy_batch * 10, length(var.tencent_copy_regions)),
+  min((var.tencent_copy_batch + 1) * 10, length(var.tencent_copy_regions)))
   # The v1.2.0 builder cannot represent CLOUD_BSSD; S5 supports CLOUD_PREMIUM.
   disk_type                   = "CLOUD_PREMIUM"
   disk_size                   = 50

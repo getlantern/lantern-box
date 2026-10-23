@@ -25,9 +25,11 @@ dedicated image-builder CAM key:
 - `TENCENTCLOUD_SECRET_KEY`
 
 Dispatch `.github/workflows/build-images.yaml` with
-`builders=tencentcloud-cvm`. Packer builds once in Hong Kong, submits the
-fixed destination list, waits for the copies and records their IDs in the
-uploaded Packer manifest. Tencent remains opt-in for automatic builds.
+`builders=tencentcloud-cvm`. Tencent accepts at most ten copy destinations per
+request, and the pinned plugin submits one request per build. The workflow
+runs two Hong Kong builds: batch 0 copies to the first ten destinations, and
+batch 1 copies to the remaining three. Packer waits for the copies and records
+both builds in the uploaded manifest. Tencent remains opt-in for automatic builds.
 
 ## Local build
 
@@ -37,16 +39,18 @@ Provide the same two credentials in environment variables and run from
 ```bash
 packer init .
 packer validate -only=tencentcloud-cvm.lantern-box -var lantern_box_version=2026.10.23 .
-packer build -only=tencentcloud-cvm.lantern-box -var lantern_box_version=2026.10.23 .
+packer build -only=tencentcloud-cvm.lantern-box -var lantern_box_version=2026.10.23 -var tencent_copy_batch=0 .
+packer build -only=tencentcloud-cvm.lantern-box -var lantern_box_version=2026.10.23 -var tencent_copy_batch=1 .
 ```
 
 The destination list has one checked-in definition. The Packer variable
 `tencent_copy_regions` can limit a canary build; an empty list disables copies.
+`tencent_copy_batch` selects destinations 0–9 or 10–19 from that list.
 The `tencent_region`, `tencent_zone`, `tencent_source_image_id` and
 `tencent_instance_type` variables allow deliberate source overrides.
 
 The plugin generates a fresh builder name and launch token for each build.
-Use a new image version for each build. If native copying fails, Packer cleans
+Use a new image version for each workflow run. If native copying fails, Packer cleans
 the temporary builder and may delete the source image; completed destination
 copies can remain without a completed manifest. Inspect the workflow log and
 regional inventory before retrying with a fresh build. This workflow does not

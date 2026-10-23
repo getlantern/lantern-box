@@ -520,7 +520,9 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           TENCENTCLOUD_SECRET_ID: ${{ secrets.TENCENTCLOUD_SECRET_ID }}
           TENCENTCLOUD_SECRET_KEY: ${{ secrets.TENCENTCLOUD_SECRET_KEY }}
-        run: packer build -var "lantern_box_version=$VERSION" -only=tencentcloud-cvm.lantern-box .
+        run: |
+          packer build -var "lantern_box_version=$VERSION" -var tencent_copy_batch=0 -only=tencentcloud-cvm.lantern-box .
+          packer build -var "lantern_box_version=$VERSION" -var tencent_copy_batch=1 -only=tencentcloud-cvm.lantern-box .
 
       - name: Build
         if: matrix.builder != 'gcore' && matrix.builder != 'tencentcloud-cvm'
