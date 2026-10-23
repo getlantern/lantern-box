@@ -13,6 +13,8 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/observable"
+
+	"github.com/getlantern/lantern-box/adapter"
 )
 
 const (
@@ -91,9 +93,12 @@ func (f *factory) Logger() log.ContextLogger {
 
 // NewLogger implements the [Factory] interface and returns a [log.ContextLogger] with the provided
 // tag.
+//
+// sing-box names outbound loggers after the outbound's tag, so a helper tag in
+// it is redacted (see adapter.RedactHelperTags), as it is in every message.
 func (f *factory) NewLogger(tag string) log.ContextLogger {
 	nf := f.clone()
-	return &slogLogger{factory: nf, tag: tag}
+	return &slogLogger{factory: nf, tag: adapter.RedactHelperTags(tag)}
 }
 
 func (f *factory) clone() *factory {
@@ -153,7 +158,7 @@ func (l *slogLogger) log(ctx context.Context, level slog.Level, args []any) stri
 	}
 
 	format := strings.Join(slices.Repeat([]string{"%v"}, len(args)), " ")
-	message := fmt.Sprintf(format, args...)
+	message := adapter.RedactHelperTags(fmt.Sprintf(format, args...))
 	args = []any{}
 	if l.tag != "" {
 		args = append(args, slog.String("tag", l.tag))

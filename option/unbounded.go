@@ -11,9 +11,10 @@ import (
 // QUIC over that channel. See getlantern/broflake for the full protocol.
 //
 // Only JSON-serializable fields live here. Runtime-only dependencies — the
-// HTTP transport used for signaling, the current STUN-server list, a logger
-// — are injected from the hosting process (e.g. radiance) via context
-// (adapter.ContextWithDirectTransport) at service startup, not via this
+// HTTP transport used for signaling, the current STUN-server list, a logger,
+// the helper pairing tickets — are injected from the hosting process (e.g.
+// radiance) via context (adapter.ContextWithDirectTransport,
+// adapter.ContextWithRoomTicketSource) at service startup, not via this
 // struct. This is a deliberate design choice: sing-box's custom marshaler
 // reaches through struct tags and would fail on func or *http.Client fields,
 // and polluting the options struct with runtime-injected plumbing would also

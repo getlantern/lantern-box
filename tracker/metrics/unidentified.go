@@ -12,6 +12,8 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+
+	lbAdapter "github.com/getlantern/lantern-box/adapter"
 )
 
 // Connections that carry no client info are relayed like any other but are
@@ -31,7 +33,7 @@ import (
 func unidentifiedAttrs(metadata adapter.InboundContext) []attribute.KeyValue {
 	return []attribute.KeyValue{
 		semconv.NetworkProtocolNameKey.String(metadata.Protocol),
-		semconv.ProxyInboundKey.String(metadata.Inbound),
+		semconv.ProxyInboundKey.String(lbAdapter.RedactHelperTags(metadata.Inbound)),
 		semconv.ProxyInboundTypeKey.String(metadata.InboundType),
 		attribute.String("track", metrics.track),
 	}
