@@ -19,7 +19,7 @@ and locks the builder user before image capture.
 ## GitHub build
 
 Add these repository Actions secrets to `getlantern/lantern-box`, using the
-Packer identity stored at `secret/lantern_cloud/vps/tencent_packer_api_key`:
+dedicated image-builder CAM key:
 
 - `TENCENTCLOUD_SECRET_ID`
 - `TENCENTCLOUD_SECRET_KEY`
@@ -29,27 +29,25 @@ Dispatch `.github/workflows/build-images.yaml` with
 fixed destination list, waits for the copies and records their IDs in the
 uploaded Packer manifest. Tencent remains opt-in for automatic builds.
 
-## Local build through lantern-cloud
+## Local build
 
-The launcher reads the same Packer identity from staging Vault and passes it
-to Packer through environment variables without printing credentials:
+Provide the same two credentials in environment variables and run from
+`deploy/packer`:
 
 ```bash
-source staging.env
-timeout 10m mise r tencent:build-image -- --repo "$HOME/lantern/lantern-box" --version 2026.10.23 --validate
-timeout --signal=INT --kill-after=6m 100m mise r tencent:build-image -- --repo "$HOME/lantern/lantern-box" --version 2026.10.23
+packer init .
+packer validate -only=tencentcloud-cvm.lantern-box -var lantern_box_version=2026.10.23 .
+packer build -only=tencentcloud-cvm.lantern-box -var lantern_box_version=2026.10.23 .
 ```
 
-The destination list has one checked-in definition. An explicit
-`--copy-regions ap-singapore` overrides it for a limited canary;
-`--copy-regions ''` disables copies for a source-only build.
-
-Packer itself can be invoked from `deploy/packer` with
-`packer init .` and
-`packer build -only=tencentcloud-cvm.lantern-box -var lantern_box_version=2026.10.23 .`.
-Its `tencent_region`, `tencent_zone`, `tencent_source_image_id` and
+The destination list has one checked-in definition. The Packer variable
+`tencent_copy_regions` can limit a canary build; an empty list disables copies.
+The `tencent_region`, `tencent_zone`, `tencent_source_image_id` and
 `tencent_instance_type` variables allow deliberate source overrides.
 
-Use a new image version for each build. After an interrupted build, inspect
-the Packer output and regional inventory before retrying. Retained custom
-images remain subject to account quota; this workflow does not prune them.
+The plugin generates a fresh builder name and launch token for each build.
+Use a new image version for each build. If native copying fails, Packer cleans
+the temporary builder and may delete the source image; completed destination
+copies can remain without a completed manifest. Inspect the workflow log and
+regional inventory before retrying with a fresh build. This workflow does not
+resume failed builds or prune retained custom images.

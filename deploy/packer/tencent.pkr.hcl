@@ -45,7 +45,6 @@ source "tencentcloud-cvm" "lantern-box" {
   instance_type          = var.tencent_instance_type
   source_image_id        = var.tencent_source_image_id
   instance_charge_type   = "POSTPAID_BY_HOUR"
-  instance_name          = "lantern-box-packer"
   image_name             = "lantern-box-${var.lantern_box_version}-amd64-{{timestamp}}"
   image_copy_regions     = var.tencent_copy_regions
   # The v1.2.0 builder cannot represent CLOUD_BSSD; S5 supports CLOUD_PREMIUM.
