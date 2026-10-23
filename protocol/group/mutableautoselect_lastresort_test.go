@@ -217,7 +217,7 @@ func TestLastResortProbe_DropsOutcomeOnShutdown(t *testing.T) {
 	assert.False(t, ok, "shutdown is not evidence against the member")
 }
 
-func TestRunLadder_LastResortWithLatestSuccessIsNotExhausted(t *testing.T) {
+func TestProbeReachableLocked_LastResortNeedsFreshSuccess(t *testing.T) {
 	tests := []struct {
 		name           string
 		latestFailed   bool
@@ -233,8 +233,7 @@ func TestRunLadder_LastResortWithLatestSuccessIsNotExhausted(t *testing.T) {
 			s, obs := newLastResortMUR(t)
 			s.defaultURL = "http://probe.test/"
 			obs["a"].On("DialContext").Return(nil, errors.New("dial denied"))
-			// The ladder kicks a last-resort probe; keep it pending so it
-			// can't change the outcome under test.
+			// Keep the last-resort probe pending so it cannot change the seeded outcome.
 			obs["ub"].dial = func(ctx context.Context) (net.Conn, error) {
 				<-ctx.Done()
 				return nil, ctx.Err()
@@ -250,15 +249,18 @@ func TestRunLadder_LastResortWithLatestSuccessIsNotExhausted(t *testing.T) {
 				s.recordProbeOutcome("ub", false, 0)
 			}
 
-			sig := s.ExhaustionSignal()
-			s.runLadder("a")
+			s.probeMu.Lock()
+			reachable, total, current := s.probeReachableLocked(s.ctx, "test")
+			s.probeMu.Unlock()
 
-			select {
-			case <-sig:
-				assert.True(t, tt.wantExhaustion, "a last resort whose latest probe succeeded can still carry traffic")
-			default:
-				assert.False(t, tt.wantExhaustion, "a last resort whose latest probe failed is no winner")
+			require.True(t, current)
+			assert.Equal(t, 2, total)
+			wantReachable := 1
+			if tt.wantExhaustion {
+				wantReachable = 0
 			}
+			assert.Equal(t, wantReachable, reachable, "a last resort counts only if its latest probe succeeded recently")
+			assert.Equal(t, tt.wantExhaustion, exhausted(s))
 		})
 	}
 }
@@ -268,9 +270,9 @@ func TestRunLadder_LastResortWithLatestSuccessIsNotExhausted(t *testing.T) {
 // watchdog, but the slot stays taken until the dial returns, so a stalled
 // peer can't accumulate stuck dials across cycles.
 func TestLastResortProbe_WatchdogFailsOverrunningProbe(t *testing.T) {
-	orig := lastResortProbeBound
-	lastResortProbeBound = func(protocolBehavior) time.Duration { return 50 * time.Millisecond }
-	t.Cleanup(func() { lastResortProbeBound = orig })
+	orig := probeBound
+	probeBound = func(protocolBehavior) time.Duration { return 50 * time.Millisecond }
+	t.Cleanup(func() { probeBound = orig })
 
 	s, obs := newLastResortMUR(t)
 	s.defaultURL = "http://probe.test/"

@@ -8,6 +8,7 @@ on:
     tags: ['v*']
     paths:
       - 'Dockerfile'
+      - 'deploy/trust/**'
       - 'go.mod'
       - 'go.sum'
       - '**.go'
@@ -15,6 +16,9 @@ on:
   # auto-tag.yaml dispatches this on each release tag: its GITHUB_TOKEN tag
   # push doesn't trigger the tags filter above.
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   go:

@@ -13,6 +13,8 @@ on:
       - 'go.sum'
       - 'Dockerfile'
       - 'Dockerfile.goreleaser'
+      - 'deploy/trust/**'
+      - '.goreleaser.yaml'
       - 'cmd/release/*.service'
 
 permissions:

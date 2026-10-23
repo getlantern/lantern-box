@@ -16,7 +16,6 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
-	"github.com/sagernet/sing-box/common/uot"
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -24,6 +23,7 @@ import (
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/protocol/internal/masquerade"
+	"github.com/getlantern/lantern-box/protocol/internal/uotrouter"
 	tw "github.com/getlantern/twiddle"
 )
 
@@ -80,7 +80,7 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 		Adapter: inbound.NewAdapter(constant.TypeTwiddle, tag),
 		ctx:     ctx,
 		logger:  lg,
-		router:  uot.NewRouter(router, lg),
+		router:  uotrouter.New(router, lg),
 		cfg: tw.ServerConfig{
 			TicketKey: key,
 			Cover:     cover,

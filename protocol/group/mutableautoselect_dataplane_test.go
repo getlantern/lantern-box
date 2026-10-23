@@ -59,7 +59,7 @@ func TestDataPlane_QuietReadPolicy(t *testing.T) {
 					var activity, observations int
 					w.init(time.Hour, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
 						onFailure:  func(kind adapter.UserFailureKind) { failures = append(failures, kind) },
-						onActivity: func() { activity++ },
+						onActivity: func(time.Time) { activity++ },
 						onError: func(err error, state dataPlaneIO, excused bool) {
 							assert.Same(t, readErr, err)
 							assert.Equal(t, tt.excused, excused)

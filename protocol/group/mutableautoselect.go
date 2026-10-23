@@ -47,15 +47,16 @@ var (
 	_ adapter.ExhaustionSignaler   = (*MutableAutoSelect)(nil)
 )
 
-const defaultProbeConcurrency = 6
+const (
+	defaultProbeConcurrency               = 6
+	defaultSwitchTolerance                = 300 * time.Millisecond
+	defaultSwitchTolerancePercent         = 30
+	defaultConfirmedFailureSwitchCooldown = time.Minute
+)
 
 // probeFreshnessWindow lets external probes skip members with recent outcomes.
 // Internal probes always force a fresh probe.
 const probeFreshnessWindow = 30 * time.Second
-
-// confirmedFailureSwitchCooldown limits switches after confirmed failures,
-// except when the member selected by the last such switch also fails confirmation.
-const confirmedFailureSwitchCooldown = time.Minute
 
 // MutableAutoSelect is the client-side server-selection group.
 type MutableAutoSelect struct {
@@ -96,9 +97,8 @@ type MutableAutoSelect struct {
 	// independently. Fire-and-forget batches TryLock; other batches Lock.
 	probeMu   sync.Mutex
 	laddering atomic.Bool
-	// Unix-nano of the most recent runLadder completion. Read by the
-	// cooldown gate to suppress back-to-back full-fleet re-probes when
-	// stalls or dial errors arrive in quick succession.
+	// Unix-nano of the most recent runLadder completion, read by its
+	// cooldown gate.
 	lastLadderAt atomic.Int64
 	exhaustionCh chan struct{}
 
@@ -119,61 +119,78 @@ type MutableAutoSelect struct {
 	// so each has at most one at a time. Guarded by access.
 	lastResortInFlight map[string]bool
 
-	// Unix-nano of the most recent non-empty data-plane Read/Write; 0
-	// means no traffic observed yet. Drives the adaptive probe cadence.
-	lastActive atomic.Int64
+	// abandonedProbes holds the member outbounds whose batch probe probeAll
+	// stopped waiting for and whose dial hasn't returned yet. Keyed by
+	// instance, so a replacement added under the same tag is still probed.
+	// Guarded by access.
+	abandonedProbes map[A.Outbound]bool
+
+	// Guarded by access. probing is set while the background loop runs.
+	lastActive time.Time
+	probing    bool
+	// Unix-nano of the most recent non-empty data-plane Read or Write.
+	lastDataAt atomic.Int64
+	// reprobePending is held by the one reprobe waiting for probeMu.
+	reprobePending atomic.Bool
+	// networkChanges counts InterfaceUpdated calls. Written under access.
+	networkChanges atomic.Uint64
 
 	started   bool
 	closeOnce sync.Once
 }
 
 type mutableAutoSelectConfig struct {
-	switchTolerance               time.Duration
-	activeInterval                time.Duration
-	idleInterval                  time.Duration
-	idleThreshold                 time.Duration
-	ladderTotalBudget             time.Duration
-	ladderCooldown                time.Duration
-	dataPlaneIdle                 time.Duration
-	dataPlaneFirstResponseTimeout time.Duration
-	dataPlaneProvedRead           uint64
-	demoteOnlySelected            bool
-	maxPersistedAge               time.Duration
-	probeConcurrency              int
+	switchTolerance                time.Duration
+	switchTolerancePercent         uint32
+	activeInterval                 time.Duration
+	idleThreshold                  time.Duration
+	ladderTotalBudget              time.Duration
+	ladderCooldown                 time.Duration
+	confirmedFailureSwitchCooldown time.Duration
+	dataPlaneIdle                  time.Duration
+	dataPlaneFirstResponseTimeout  time.Duration
+	dataPlaneProvedRead            uint64
+	demoteOnlySelected             bool
+	maxPersistedAge                time.Duration
+	probeConcurrency               int
 }
 
 func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) (mutableAutoSelectConfig, historyParams) {
 	cfg := mutableAutoSelectConfig{
-		switchTolerance:               time.Duration(o.SwitchToleranceMs) * time.Millisecond,
-		activeInterval:                time.Duration(o.BackgroundIntervalSeconds) * time.Second,
-		idleInterval:                  time.Duration(o.IdleIntervalSeconds) * time.Second,
-		idleThreshold:                 time.Duration(o.IdleThresholdSeconds) * time.Second,
-		ladderTotalBudget:             time.Duration(o.LadderTotalBudgetSeconds) * time.Second,
-		ladderCooldown:                time.Duration(o.LadderCooldownSeconds) * time.Second,
-		dataPlaneIdle:                 time.Duration(o.DataPlaneIdleSeconds) * time.Second,
-		dataPlaneFirstResponseTimeout: defaultFirstResponseTimeout,
-		dataPlaneProvedRead:           uint64(o.DataPlaneProvedReadBytes),
-		demoteOnlySelected:            o.DemoteOnlySelectedTag == nil || *o.DemoteOnlySelectedTag,
-		maxPersistedAge:               time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
-		probeConcurrency:              int(o.ProbeConcurrency),
+		switchTolerance:                time.Duration(o.SwitchToleranceMs) * time.Millisecond,
+		switchTolerancePercent:         defaultSwitchTolerancePercent,
+		activeInterval:                 time.Duration(o.BackgroundIntervalSeconds) * time.Second,
+		idleThreshold:                  time.Duration(o.IdleThresholdSeconds) * time.Second,
+		ladderTotalBudget:              time.Duration(o.LadderTotalBudgetSeconds) * time.Second,
+		ladderCooldown:                 time.Duration(o.LadderCooldownSeconds) * time.Second,
+		confirmedFailureSwitchCooldown: time.Duration(o.ConfirmedFailureSwitchCooldownSeconds) * time.Second,
+		dataPlaneIdle:                  time.Duration(o.DataPlaneIdleSeconds) * time.Second,
+		dataPlaneFirstResponseTimeout:  defaultFirstResponseTimeout,
+		dataPlaneProvedRead:            uint64(o.DataPlaneProvedReadBytes),
+		demoteOnlySelected:             o.DemoteOnlySelectedTag == nil || *o.DemoteOnlySelectedTag,
+		maxPersistedAge:                time.Duration(o.MaxPersistedAgeSeconds) * time.Second,
+		probeConcurrency:               int(o.ProbeConcurrency),
 	}
 	if cfg.switchTolerance == 0 {
-		cfg.switchTolerance = 200 * time.Millisecond
+		cfg.switchTolerance = defaultSwitchTolerance
+	}
+	if o.SwitchTolerancePercent != nil {
+		cfg.switchTolerancePercent = *o.SwitchTolerancePercent
 	}
 	if cfg.activeInterval == 0 {
 		cfg.activeInterval = 180 * time.Second
 	}
-	if cfg.idleInterval == 0 {
-		cfg.idleInterval = 900 * time.Second
-	}
 	if cfg.idleThreshold == 0 {
-		cfg.idleThreshold = 600 * time.Second
+		cfg.idleThreshold = 900 * time.Second
 	}
 	if cfg.ladderTotalBudget == 0 {
 		cfg.ladderTotalBudget = 10 * time.Second
 	}
 	if cfg.ladderCooldown == 0 {
-		cfg.ladderCooldown = 60 * time.Second
+		cfg.ladderCooldown = time.Minute
+	}
+	if cfg.confirmedFailureSwitchCooldown == 0 {
+		cfg.confirmedFailureSwitchCooldown = defaultConfirmedFailureSwitchCooldown
 	}
 	if cfg.dataPlaneIdle == 0 {
 		cfg.dataPlaneIdle = defaultDataPlaneIdle
@@ -198,10 +215,16 @@ func resolveMutableAutoSelectOptions(o option.MutableAutoSelectOutboundOptions) 
 	if o.UserFailureWindowSeconds > 0 {
 		hp.userFailureWindow = time.Duration(o.UserFailureWindowSeconds) * time.Second
 	}
+	if o.UserFailureDedupeWindowSeconds > 0 {
+		hp.userFailureDedupeWindow = time.Duration(o.UserFailureDedupeWindowSeconds) * time.Second
+	}
 	return cfg, hp
 }
 
 func NewMutableAutoSelect(ctx context.Context, _ A.Router, logger log.ContextLogger, tag string, options option.MutableAutoSelectOutboundOptions) (A.Outbound, error) {
+	if p := options.SwitchTolerancePercent; p != nil && *p > 100 {
+		return nil, fmt.Errorf("switch_tolerance_percent %d exceeds 100", *p)
+	}
 	cfg, hp := resolveMutableAutoSelectOptions(options)
 	ctx, cancel := context.WithCancel(ctx)
 	out := &MutableAutoSelect{
@@ -283,8 +306,8 @@ func (s *MutableAutoSelect) hydrateHistoryLocked(tag string) {
 	s.histories[tag] = hydrateLocalHistory(snap, now, s.hist.userFailureWindow)
 }
 
-// PostStart is idempotent: a second invocation is a no-op rather than a
-// duplicate background loop.
+// PostStart is idempotent. Background probing starts on the first dial or
+// listen.
 func (s *MutableAutoSelect) PostStart() error {
 	s.access.Lock()
 	if s.started {
@@ -292,8 +315,8 @@ func (s *MutableAutoSelect) PostStart() error {
 		return nil
 	}
 	s.started = true
+	s.lastActive = time.Now()
 	s.access.Unlock()
-	go s.runBackgroundLoop()
 	s.CheckOutbounds()
 	return nil
 }
@@ -301,8 +324,7 @@ func (s *MutableAutoSelect) PostStart() error {
 func (s *MutableAutoSelect) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancel()
-		// Close under s.access so emitExhaustion (which holds the same
-		// lock around its send) can't race a send into a closed channel.
+		// Under s.access: see emitExhaustionLocked.
 		s.access.Lock()
 		close(s.exhaustionCh)
 		s.access.Unlock()
@@ -310,9 +332,28 @@ func (s *MutableAutoSelect) Close() error {
 	return nil
 }
 
+// InterfaceUpdated re-probes only while background probing is running; an
+// idle group probes on its next dial or listen. sing-box resets the network
+// after every wake, so this is also the probe that follows a wake.
 func (s *MutableAutoSelect) InterfaceUpdated(ctx context.Context) {
+	s.access.Lock()
+	s.networkChanges.Add(1)
+	if !s.probing {
+		// Makes the next keepAliveLocked probe however recent the last use was.
+		s.lastActive = time.Time{}
+		s.access.Unlock()
+		s.logger.Info("interface updated while idle, deferring re-probe until next use")
+		return
+	}
+	s.access.Unlock()
 	s.logger.Info("interface updated, re-probing mutableautoselect group")
-	go s.runProbeCycle(s.ctx)
+	go s.reprobe()
+}
+
+// paused reports whether the device or network is paused.
+func (s *MutableAutoSelect) paused() bool {
+	pm := service.FromContext[pause.Manager](s.ctx)
+	return pm != nil && (pm.IsDevicePaused() || pm.IsNetworkPaused())
 }
 
 // Now reports the most recent dial-time selection, TCP preferred, UDP
@@ -453,8 +494,8 @@ func (s *MutableAutoSelect) CheckOutbounds() {
 func (s *MutableAutoSelect) PerformUpdateCheck() {}
 
 // ExhaustionSignal returns a receive-only channel that emits when every
-// candidate fails within a ladder's budget. Buffers one pending signal;
-// an unread signal is replaced by the next ladder's emission. Closed on
+// candidate fails a ladder or background probe cycle. Buffers one pending
+// signal; an unread signal is replaced by the next emission. Closed on
 // group Close so range-loop consumers terminate cleanly.
 func (s *MutableAutoSelect) ExhaustionSignal() <-chan struct{} {
 	return s.exhaustionCh
@@ -514,21 +555,19 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		return s.wrapStream(conn, network, o, primaryRoute), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	// Attribute the failure to the outer (member) tag so rankLocked and
-	// runLadder's gating both see it. For nested groups, the inner tag
-	// isn't a member of this group, so recordUserFailure would drop on
-	// the member gate.
+	// Attribute the failure to the outer (member) tag so rankLocked sees
+	// it. For nested groups, the inner tag isn't a member of this group,
+	// so recordUserFailure would drop on the member gate.
 	s.recordUserFailure(outerTag, adapter.UserFailureDial)
 
-	// Fast failover: try one alternate from the current rank before
-	// kicking the ladder. The active 3-min cadence keeps the probe
-	// history fresh enough to pick a working peer without re-probing.
+	// Fast failover: try one alternate from the current rank. The active
+	// 3-min cadence keeps the probe history fresh enough to pick a working
+	// peer without re-probing.
 	alt, altErr := s.selectForExcluding(network, outerTag)
 	if altErr == nil {
 		replacementTag := alt.Tag()
 		conn, err = alt.DialContext(ctx, network, destination)
 		if err == nil {
-			go s.runLadder(outerTag)
 			if network == N.NetworkTCP {
 				go s.confirmSelectedFailure(outerTag, replacementTag)
 			}
@@ -571,7 +610,6 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		replacementTag := alt.Tag()
 		conn, err = alt.ListenPacket(ctx, destination)
 		if err == nil {
-			go s.runLadder(outerTag)
 			return s.wrapPacket(conn, alt, fallbackRoute), nil
 		}
 		s.logger.ErrorContext(ctx, err)
@@ -650,6 +688,9 @@ func (s *MutableAutoSelect) selectForExcluding(network, excludeTag string) (A.Ou
 		return nil, fmt.Errorf("network %s not supported", network)
 	}
 	s.access.Lock()
+	if excludeTag == "" {
+		s.keepAliveLocked()
+	}
 	ranked := s.rankLocked(time.Now(), time.Time{})
 	if excludeTag != "" {
 		// A regular member still clean or soft-demoted, the excluded one
@@ -731,12 +772,23 @@ func (s *MutableAutoSelect) applyStickiness(
 		s.logSwitch(network, sticky, best, "last resort no longer needed")
 	case c.demote > best.demote && c.userFails > s.hist.softFailLimit:
 		s.logSwitch(network, sticky, best, "failures past retention")
-	case uint64(best.delayMs)+uint64(s.cfg.switchTolerance/time.Millisecond) <= uint64(c.delayMs):
+	case s.beatsOnDelay(best.delayMs, c.delayMs):
 		s.logSwitch(network, sticky, best, "beaten on delay")
 	default:
 		return c
 	}
 	return best
+}
+
+// beatsOnDelay reports whether candidateMs improves on stickyMs by at least
+// switchTolerance and by at least switchTolerancePercent of stickyMs.
+func (s *MutableAutoSelect) beatsOnDelay(candidateMs, stickyMs uint32) bool {
+	if candidateMs >= stickyMs {
+		return false
+	}
+	gain := uint64(stickyMs - candidateMs)
+	return gain >= uint64(s.cfg.switchTolerance/time.Millisecond) &&
+		gain*100 >= uint64(stickyMs)*uint64(s.cfg.switchTolerancePercent)
 }
 
 // logSwitch records which rule moved the group off sticky; a churn report is
@@ -793,9 +845,10 @@ func (s *MutableAutoSelect) peekHistoryLocked(tag string) (*localHistory, bool) 
 
 // collectProbeJobsLocked builds jobs for tags, or all members when tags is nil.
 // excludeFromPool and lastResort members are skipped; lastResort members are
-// probed by kickLastResortProbesLocked instead. With force=false, members with
-// outcomes newer than probeFreshnessWindow are skipped. Caller must hold
-// s.access.
+// probed by kickLastResortProbesLocked instead. Members with an abandoned probe
+// still running are skipped, so a stalled peer can't accumulate stuck dials.
+// With force=false, members with outcomes newer than probeFreshnessWindow are
+// skipped. Caller must hold s.access.
 func (s *MutableAutoSelect) collectProbeJobsLocked(now time.Time, tags []string, force bool) []probeJob {
 	if tags == nil {
 		tags = s.tags
@@ -807,7 +860,7 @@ func (s *MutableAutoSelect) collectProbeJobsLocked(now time.Time, tags []string,
 			continue
 		}
 		beh := behaviorFor(o.Type())
-		if beh.excludeFromPool || beh.lastResort {
+		if beh.excludeFromPool || beh.lastResort || s.abandonedProbes[o] {
 			continue
 		}
 		if !force {
@@ -1065,14 +1118,15 @@ func (s *MutableAutoSelect) rankLocked(now time.Time, freshSince time.Time) []ra
 	return out
 }
 
-// runProbeCycle is the fire-and-forget internal probe path; it skips when
-// another internal cycle is already in flight.
-func (s *MutableAutoSelect) runProbeCycle(ctx context.Context) {
+// runProbeCycle is the background loop's periodic probe. It skips when
+// another internal cycle is already in flight and signals exhaustion if no
+// member can carry traffic.
+func (s *MutableAutoSelect) runProbeCycle() {
 	if !s.probeMu.TryLock() {
 		return
 	}
 	defer s.probeMu.Unlock()
-	s.internalProbe(ctx, nil)
+	s.probeReachableLocked(s.ctx, "probe cycle")
 }
 
 // runExternalProbe runs a fire-and-forget, freshness-filtered probe for tags,
@@ -1146,7 +1200,7 @@ func (s *MutableAutoSelect) kickLastResortProbesLocked(now time.Time, tags []str
 		}
 		s.lastResortInFlight[tag] = true
 		probeURL := s.probeURLForLocked(tag)
-		bound := lastResortProbeBound(beh)
+		bound := probeBound(beh)
 		go func() {
 			done := make(chan probeResult, 1)
 			go func() { done <- probeMember(s.ctx, o, probeURL, beh) }()
@@ -1211,13 +1265,12 @@ func (s *MutableAutoSelect) finishLastResortProbe(tag, probeURL string) {
 }
 
 // lastResortSuccessFreshness bounds how old a last resort's latest successful
-// probe may be for the ladder to treat it as a winner.
+// probe may be for a full probe to count it as reachable.
 const lastResortSuccessFreshness = 5 * time.Minute
 
-// lastResortProbeBound is how long a last-resort probe may run before it is
-// counted as failed even if the outbound hasn't returned. A variable so tests
-// can shorten it.
-var lastResortProbeBound = func(beh protocolBehavior) time.Duration {
+// probeBound is how long a probe may run before it is counted as failed even
+// if the outbound hasn't returned. A variable so tests can shorten it.
+var probeBound = func(beh protocolBehavior) time.Duration {
 	return beh.probeTimeout + 5*time.Second
 }
 
@@ -1258,9 +1311,7 @@ func (s *MutableAutoSelect) mutateHistoryIf(tag string, guard func() bool, fn fu
 // errors and confirmed data-plane stalls both pass through here; each counts
 // as one failure, with softFailLimit tripping the soft tier and
 // consecutiveFailLimit tripping the hard tier. Returns true if the
-// failure was persisted; false on dedup or non-member tag, so callers
-// can suppress downstream side effects (e.g. ladder kicks) on collapsed
-// events.
+// failure was persisted; false on dedup or non-member tag.
 func (s *MutableAutoSelect) recordUserFailure(tag string, kind adapter.UserFailureKind) bool {
 	recorded := s.mutateHistory(tag, func(h *localHistory, now time.Time) bool {
 		return h.addUserFailure(adapter.UserFailure{At: now, Kind: kind}, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
@@ -1344,7 +1395,7 @@ func (s *MutableAutoSelect) trySwitchAfterConfirmedFailure(failedTag, replacemen
 		return
 	}
 	last := s.lastConfirmedFailureSwitch
-	if !last.at.IsZero() && now.Sub(last.at) < confirmedFailureSwitchCooldown && last.selectedTag != failedTag {
+	if !last.at.IsZero() && now.Sub(last.at) < s.cfg.confirmedFailureSwitchCooldown && last.selectedTag != failedTag {
 		s.logger.Info("tcp switch deferred: ", failedTag, " -> ", replacementTag, " (confirmed-failure switch cooldown)")
 		return
 	}
@@ -1384,22 +1435,19 @@ func (s *MutableAutoSelect) findProbedReplacementLocked(now time.Time, network, 
 	return ""
 }
 
-// runLadder is invoked on any dial/listen error (after the dial-site
-// fast-failover step has already had its shot) and on data-plane stall
-// callbacks. It does not retry the failing member: the dial caller
-// already retries on its own schedule, and the fast-failover path has
-// already exercised the next-best alternate. The ladder's job is to
-// reshape the candidate pool: full parallel re-probe; if nothing
-// succeeds inside ladderTotalBudget, emit the exhaustion signal so
-// radiance can refetch /config-new.
+// runLadder is invoked when a dial or listen fails on the selected member
+// and on its fast-failover alternate, or has no alternate. It does not
+// retry the failing member: the dial caller already retries on its own
+// schedule. The ladder's job is to reshape the candidate pool: full
+// parallel re-probe; if nothing succeeds inside ladderTotalBudget, emit
+// the exhaustion signal.
 //
 // A ladderCooldown window after the previous run suppresses repeat
-// kicks: probe data is still fresh, and rank demotion via
-// recordUserFailure already moves traffic off bad peers without
+// kicks during an outage: probe data is still fresh, and rank demotion
+// via recordUserFailure already moves traffic off bad peers without
 // needing the ladder to re-shape the pool.
 //
-// target is for diagnostic logging only and to gate concurrent
-// invocations through laddering's CAS.
+// target is for diagnostic logging only.
 func (s *MutableAutoSelect) runLadder(target string) {
 	if s.isClosed() {
 		return
@@ -1421,66 +1469,70 @@ func (s *MutableAutoSelect) runLadder(target string) {
 	s.probeMu.Lock()
 	fullCtx, cancel := context.WithTimeout(s.ctx, s.cfg.ladderTotalBudget)
 	defer cancel()
-	cycleStart := time.Now()
-	// A probe failure advances lastOutcomeAt while leaving
-	// lastSuccessDelayMs intact, so the ranked set alone cannot tell a
-	// member that succeeded this cycle from one that only failed in it.
-	// Rank still orders the winner; this decides whether one exists. The
-	// map needs no lock of its own: probeAll serializes onSuccess, and
-	// internalProbe returns only after its workers finish.
-	succeeded := make(map[string]struct{})
-	s.internalProbe(fullCtx, func(res probeResult) {
-		succeeded[res.tag] = struct{}{}
-	})
-	var winner A.Outbound
-	s.access.Lock()
-	for _, c := range s.rankLocked(time.Now(), cycleStart) {
-		if _, ok := succeeded[c.tag]; ok {
-			winner = c.outbound
-			break
-		}
-	}
-	if winner == nil {
-		// lastResort members are probed asynchronously and can't report
-		// inside the ladder budget. One whose latest probe succeeded within
-		// lastResortSuccessFreshness can still carry traffic, so the group
-		// isn't exhausted. An older success doesn't count: a later failure
-		// doesn't rerun the ladder, so trusting it could suppress the
-		// exhaustion signal for good.
-		now := time.Now()
-		for _, c := range s.rankLocked(now, time.Time{}) {
-			if c.demote != demoteLastResort {
-				continue
-			}
-			if h, ok := s.peekHistoryLocked(c.tag); ok {
-				if delay, at, consec, _, _ := h.snapshot(now, s.hist.userFailureWindow); delay > 0 && consec == 0 && now.Sub(at) <= lastResortSuccessFreshness {
-					winner = c.outbound
-					break
-				}
-			}
-		}
-	}
-	s.access.Unlock()
+	reachable, total, current := s.probeReachableLocked(fullCtx, "ladder")
 	s.probeMu.Unlock()
+	// Skipping the stamp lets the new network ladder without a cooldown.
+	if !current {
+		return
+	}
 	// Stamp on completion, not entry, so a slow ladder's runtime counts
 	// toward the cooldown.
 	s.lastLadderAt.Store(time.Now().UnixNano())
-	if s.isClosed() {
-		return
+	if reachable > 0 {
+		s.logger.Info("ladder complete: ", reachable, "/", total, " members reachable")
 	}
-	if winner == nil {
-		s.logger.Warn("ladder exhausted: no candidate succeeded")
-		s.emitExhaustion()
-		return
-	}
-	s.logger.Info("ladder found winner: ", winner.Tag())
 }
 
-func (s *MutableAutoSelect) emitExhaustion() {
-	// Hold s.access across drain+send so Close (which closes the channel
-	// under the same lock) can't turn the send into a panic-on-closed.
+// probeReachableLocked returns reachable and total candidate counts after probing.
+//
+// Reachability requires success in this cycle, or a last-resort member's latest
+// probe succeeding within lastResortSuccessFreshness. It signals exhaustion if
+// none qualify. If the group closes or the network changes during probing,
+// current is false and no exhaustion is signalled. Caller must hold s.probeMu.
+func (s *MutableAutoSelect) probeReachableLocked(ctx context.Context, source string) (reachable, total int, current bool) {
+	changes := s.networkChanges.Load()
+	// A probe failure advances lastOutcomeAt while leaving
+	// lastSuccessDelayMs intact, so the ranked set alone cannot tell a
+	// member that succeeded this cycle from one that only failed in it. The
+	// map needs no lock of its own: probeAll serializes onSuccess, and
+	// internalProbe returns only after its workers finish.
+	succeeded := make(map[string]struct{})
+	s.internalProbe(ctx, func(res probeResult) {
+		succeeded[res.tag] = struct{}{}
+	})
 	s.access.Lock()
 	defer s.access.Unlock()
+	if s.isClosed() || s.networkChanges.Load() != changes {
+		return 0, 0, false
+	}
+	now := time.Now()
+	members := s.rankLocked(now, time.Time{})
+	for _, c := range members {
+		if _, ok := succeeded[c.tag]; ok {
+			reachable++
+			continue
+		}
+		if c.demote != demoteLastResort {
+			continue
+		}
+		// An older success doesn't count, since trusting it would suppress
+		// the exhaustion signal on stale evidence.
+		if h, ok := s.peekHistoryLocked(c.tag); ok {
+			if delay, at, consec, _, _ := h.snapshot(now, s.hist.userFailureWindow); delay > 0 && consec == 0 && now.Sub(at) <= lastResortSuccessFreshness {
+				reachable++
+			}
+		}
+	}
+	if reachable == 0 {
+		s.logger.Warn(source, " exhausted: no candidate succeeded")
+		s.emitExhaustionLocked()
+	}
+	return reachable, len(members), true
+}
+
+// emitExhaustionLocked requires s.access, which Close holds while closing the
+// channel, so the send can't hit a closed channel.
+func (s *MutableAutoSelect) emitExhaustionLocked() {
 	if s.isClosed() {
 		return
 	}
@@ -1495,28 +1547,70 @@ func (s *MutableAutoSelect) emitExhaustion() {
 	}
 }
 
-func (s *MutableAutoSelect) bumpActive() {
-	s.lastActive.Store(time.Now().UnixNano())
-}
-
-// nextProbeInterval picks the cadence for the next background probe. A
-// brand-new group (lastActive == 0) is treated as idle so we don't burn
-// the fast cadence on a tunnel nobody is using yet.
-func (s *MutableAutoSelect) nextProbeInterval() time.Duration {
-	last := s.lastActive.Load()
-	if last == 0 || time.Since(time.Unix(0, last)) > s.cfg.idleThreshold {
-		return s.cfg.idleInterval
+// keepAliveLocked records use of the group and starts background probing if
+// it is not running. It is a no-op before PostStart and after Close. Caller
+// must hold s.access.
+func (s *MutableAutoSelect) keepAliveLocked() {
+	if !s.started || s.isClosed() {
+		return
 	}
-	return s.cfg.activeInterval
+	now := time.Now()
+	idleFor := now.Sub(s.lastActive)
+	s.lastActive = now
+	if s.probing {
+		return
+	}
+	s.probing = true
+	s.logger.Info("background probing started")
+	go s.runBackgroundLoop(idleFor > s.cfg.activeInterval)
 }
 
+// noteDataActivity records data-plane traffic, which keeps background probing
+// running but does not restart it.
+func (s *MutableAutoSelect) noteDataActivity(now time.Time) {
+	// The idle check needs only coarse precision, so skip most writes to a
+	// field every connection's Read and Write would otherwise contend on.
+	if n := now.UnixNano(); n-s.lastDataAt.Load() >= int64(time.Second) {
+		s.lastDataAt.Store(n)
+	}
+}
+
+// reprobe waits for any probe batch in flight, then probes every member
+// unless the device or network is paused by then; the network reset after the
+// wake re-probes. A call made while another reprobe is already waiting
+// returns at once, since the waiting one starts after it. It never signals
+// exhaustion: it runs on network changes, when connectivity may not be up yet.
+func (s *MutableAutoSelect) reprobe() {
+	if !s.reprobePending.CompareAndSwap(false, true) {
+		return
+	}
+	s.probeMu.Lock()
+	s.reprobePending.Store(false)
+	defer s.probeMu.Unlock()
+	// Checked after the wait, which can outlast the pause starting.
+	if s.paused() {
+		s.logger.Info("re-probe skipped: paused until wake")
+		return
+	}
+	s.internalProbe(s.ctx, nil)
+}
+
+// runBackgroundLoop probes every activeInterval until idleThreshold passes
+// with no use or data-plane traffic. probeNow first runs reprobe.
+//
 // TODO: skip on metered connections once lantern-box's platform interface
 // gains a network-cost API.
-func (s *MutableAutoSelect) runBackgroundLoop() {
+func (s *MutableAutoSelect) runBackgroundLoop(probeNow bool) {
+	idle := time.NewTimer(s.cfg.idleThreshold)
+	defer idle.Stop()
+	if probeNow {
+		s.reprobe()
+	}
 	activeInterval := s.cfg.activeInterval
 	t := time.NewTicker(activeInterval)
 	defer t.Stop()
 	if pm := service.FromContext[pause.Manager](s.ctx); pm != nil {
+		// No resume probe: InterfaceUpdated runs after every wake.
 		cb := pause.RegisterTicker(pm, t, activeInterval, nil)
 		defer pm.UnregisterCallback(cb)
 	}
@@ -1524,9 +1618,28 @@ func (s *MutableAutoSelect) runBackgroundLoop() {
 		select {
 		case <-s.ctx.Done():
 			return
+		case <-idle.C:
+			s.access.Lock()
+			lastUse := s.lastActive
+			if data := time.Unix(0, s.lastDataAt.Load()); data.After(lastUse) {
+				lastUse = data
+			}
+			// Use since the timer was armed pushes the stop back.
+			if remaining := s.cfg.idleThreshold - time.Since(lastUse); remaining > 0 {
+				idle.Reset(remaining)
+				s.access.Unlock()
+				continue
+			}
+			s.probing = false
+			s.access.Unlock()
+			s.logger.Info("background probing stopped: idle")
+			return
 		case <-t.C:
-			t.Reset(s.nextProbeInterval())
-			go s.runProbeCycle(s.ctx)
+			// RegisterTicker resets the ticker on either wake, even while
+			// the other pause still holds.
+			if !s.paused() {
+				go s.runProbeCycle()
+			}
 		}
 	}
 }

@@ -68,9 +68,14 @@ apt-get "${APT_OPTS[@]}" update -q
 # Keep this package list in sync with Dockerfile
 apt-get "${APT_OPTS[@]}" install -y -q \
   ca-certificates \
+  openssl \
   tzdata \
   nftables \
   wireguard-tools
+
+install -d -m 0755 /usr/local/lib/lantern-trust
+install -m 0644 /tmp/lantern-trust/* /usr/local/lib/lantern-trust/
+sh /usr/local/lib/lantern-trust/update-trust.sh
 
 # Reflog's Option B (Slack thread ts=1776197690.140869 in
 # #infrastructure-and-services, 2026-04-16): the packer image no longer

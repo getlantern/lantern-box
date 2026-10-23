@@ -150,7 +150,7 @@ func TestTrySwitchAfterConfirmedFailure(t *testing.T) {
 			s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = time.Now(), "c"
 		}, ""},
 		{"rate limit expired", func(s *MutableAutoSelect) {
-			s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = time.Now().Add(-confirmedFailureSwitchCooldown), "c"
+			s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = time.Now().Add(-s.cfg.confirmedFailureSwitchCooldown), "c"
 		}, "b"},
 		{"replacement fails again", func(s *MutableAutoSelect) {
 			s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = time.Now(), "a"

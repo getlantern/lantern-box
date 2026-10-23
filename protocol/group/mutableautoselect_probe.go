@@ -41,9 +41,40 @@ func probeMember(
 	return probeResult{tag: tag, success: true, delayMs: delayMs}
 }
 
+// probeWithWatchdog probes j's member and returns its result, or a failed
+// result once probeBound passes or ctx ends while the outbound's dial is still
+// running. An abandoned probe keeps its outbound in abandonedProbes until the
+// dial returns, and its late result is discarded.
+func (s *MutableAutoSelect) probeWithWatchdog(ctx context.Context, j probeJob) probeResult {
+	done := make(chan probeResult, 1)
+	go func() { done <- probeMember(ctx, j.outbound, j.probeURL, j.beh) }()
+	watchdog := time.NewTimer(probeBound(j.beh))
+	defer watchdog.Stop()
+	select {
+	case res := <-done:
+		return res
+	case <-watchdog.C:
+	case <-ctx.Done():
+	}
+	s.access.Lock()
+	if s.abandonedProbes == nil {
+		s.abandonedProbes = make(map[A.Outbound]bool)
+	}
+	s.abandonedProbes[j.outbound] = true
+	s.access.Unlock()
+	go func() {
+		<-done
+		s.access.Lock()
+		delete(s.abandonedProbes, j.outbound)
+		s.access.Unlock()
+	}()
+	return probeResult{tag: j.outbound.Tag()}
+}
+
 // probeAll runs jobs with up to probeConcurrency workers, records each
-// outcome, and calls onSuccess serially for successful probes. It returns
-// after all queued probes complete or ctx is canceled.
+// outcome, and calls onSuccess serially for successful probes. It doesn't wait
+// past ctx, or past probeBound for any one probe, even when an outbound ignores
+// ctx.
 func (s *MutableAutoSelect) probeAll(
 	ctx context.Context,
 	jobs []probeJob,
@@ -61,7 +92,7 @@ func (s *MutableAutoSelect) probeAll(
 	for range workers {
 		wg.Go(func() {
 			for j := range queue {
-				res := probeMember(ctx, j.outbound, j.probeURL, j.beh)
+				res := s.probeWithWatchdog(ctx, j)
 				// Batch cancellation (shutdown or ladder budget) is not member
 				// evidence. Per-probe timeouts use a child context, so the
 				// batch ctx remains live and the failure still counts.

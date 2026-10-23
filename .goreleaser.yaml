@@ -124,6 +124,8 @@ dockers:
       - "getlantern/lantern-box:latest"
       - "getlantern/lantern-box:{{ .Tag }}"
     dockerfile: Dockerfile.goreleaser
+    extra_files:
+      - deploy/trust/
     ids: [amd64]
 
 dockerhub:

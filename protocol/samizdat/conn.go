@@ -6,6 +6,8 @@ import (
 	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/bufio/deadline"
 	N "github.com/sagernet/sing/common/network"
+
+	"github.com/getlantern/lantern-box/tracker/peerconn"
 )
 
 // wrapConn normalizes HTTP/2 read errors on a samizdat stream conn.
@@ -25,14 +27,29 @@ import (
 // bypass the normalization. The cost of that opacity is that capabilities
 // sing-box would otherwise discover through the Upstream() chain must be
 // forwarded explicitly: the NeedAdditionalReadDeadline hint and TCP half-close
-// (CloseWrite), below.
+// (CloseWrite), below. The same opacity means every relayed byte passes
+// through Read and Write, which is where an inbound conn's bytes are counted.
 type wrapConn struct {
 	net.Conn
+	// bytes is set on inbound conns while a peer-connection listener is
+	// registered; nil otherwise.
+	bytes *peerconn.Counter
 }
 
 func (c *wrapConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
+	if c.bytes != nil {
+		c.bytes.AddUp(n)
+	}
 	return n, baderror.WrapH2(err)
+}
+
+func (c *wrapConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if c.bytes != nil {
+		c.bytes.AddDown(n)
+	}
+	return n, err
 }
 
 func (c *wrapConn) NeedAdditionalReadDeadline() bool {

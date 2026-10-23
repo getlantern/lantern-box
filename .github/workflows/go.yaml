@@ -7,6 +7,7 @@ on:
     branches-ignore: [main]
     paths:
       - 'Dockerfile'
+      - 'deploy/trust/**'
       - 'go.mod'
       - 'go.sum'
       - '**.go'
@@ -15,6 +16,7 @@ on:
   pull_request:
     paths:
       - 'Dockerfile'
+      - 'deploy/trust/**'
       - 'go.mod'
       - 'go.sum'
       - '**.go'
