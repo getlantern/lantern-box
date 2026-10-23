@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 from tencent_api import TencentAPI
 
@@ -19,6 +20,7 @@ from tencent_api import TencentAPI
 MAINLAND = {"ap-beijing", "ap-shanghai", "ap-nanjing", "ap-guangzhou", "ap-chengdu", "ap-chongqing", "ap-zhongwei"}
 OVERSEAS = {"ap-hongkong", "ap-singapore", "ap-johorbahru", "ap-jakarta", "ap-seoul", "ap-tokyo", "ap-osaka", "ap-bangkok", "me-saudi-arabia", "sa-saopaulo", "na-queretaro", "na-siliconvalley", "na-ashburn", "eu-frankfurt"}
 STOP = threading.Event()
+FAILED_IMAGE_STATES = {"CREATEFAILED", "IMPORTFAILED", "SYNCFAILED"}
 
 
 class PackerBuildError(RuntimeError):
@@ -62,10 +64,11 @@ def run_packer(command, root):
         reader.join(timeout=10)
 
 
-def submit_copies(api, seed_region, seed_id, targets):
+def submit_copies(api, seed_region, seed_id, targets, version):
     if STOP.is_set():
         raise InterruptedError("regional publication interrupted")
-    return api.call("SyncImages", {"ImageIds": [seed_id], "DestinationRegions": targets, "ImageSetRequired": True}, seed_region)
+    name = f"lantern-box-{version}-amd64-{uuid.uuid4().hex[:12]}"
+    return api.call("SyncImages", {"ImageIds": [seed_id], "DestinationRegions": targets, "ImageSetRequired": True, "ImageName": name}, seed_region)
 
 
 def wait_image(api, region, image_id, timeout=2400):
@@ -78,7 +81,7 @@ def wait_image(api, region, image_id, timeout=2400):
             state = images[0]["ImageState"]
             if state == "NORMAL":
                 return images[0]
-            if state in {"CREATEFAILED", "IMPORTFAILED", "SYNCFAILED"}:
+            if state in FAILED_IMAGE_STATES:
                 raise RuntimeError(f"{region}/{image_id}: image state {state}")
         STOP.wait(10)
     raise TimeoutError(f"{region}/{image_id} did not become NORMAL")
@@ -86,7 +89,8 @@ def wait_image(api, region, image_id, timeout=2400):
 def matching_images(api, region, version):
     name = f"lantern-box-{version}-amd64-"
     return sorted((image for image in api.pages("DescribeImages", {"Filters": [{"Name": "image-type", "Values": ["PRIVATE_IMAGE"]}]}, region, "ImageSet")
-                   if image["ImageName"].startswith(name) and image["Architecture"] == "x86_64"),
+                   if (image.get("ImageName") or "").startswith(name) and image.get("Architecture") == "x86_64"
+                   and image.get("ImageState") not in FAILED_IMAGE_STATES | {"DELETING"}),
                   key=lambda image: (image.get("CreatedTime") or "", image["ImageId"]), reverse=True)
 
 
@@ -131,6 +135,8 @@ def main():
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--report", type=Path, default=Path("tencent-regions-report.json"))
     args = parser.parse_args()
+    if len(f"lantern-box-{args.version}-amd64-" + "0" * 12) > 60:
+        parser.error("version is too long for Tencent's 60-character image names")
     api = TencentAPI()
     root = Path(__file__).resolve().parent
     discovered = api.call("DescribeRegions", {})["RegionSet"]
@@ -200,7 +206,7 @@ def main():
             if missing:
                 try:
                     wait_image(api, seed_region, seed["ImageId"])
-                    copied = submit_copies(api, seed_region, seed["ImageId"], missing)
+                    copied = submit_copies(api, seed_region, seed["ImageId"], missing, args.version)
                     returned = copied.get("ImageSet", [])
                     for target in missing:
                         identifiers = [item["ImageId"] for item in returned if item["Region"] == target]
@@ -212,15 +218,15 @@ def main():
                     save()
                 except Exception as error:
                     for target in missing:
-                        plan["results"][target] = {"status": "failed", "error": str(error)}
+                        plan["results"][target] = {**plan["results"].get(target, {}), "status": "failed", "error": str(error)}
                     save()
         for future in as_completed(futures):
             target = futures[future]
             try:
                 result = future.result()
-                plan["results"][target] = {"status": "validated" if args.validate else "ready", **result}
+                plan["results"][target] = {**plan["results"].get(target, {}), "status": "validated" if args.validate else "ready", **result}
             except Exception as error:
-                plan["results"][target] = {"status": "failed", "error": str(error)}
+                plan["results"][target] = {**plan["results"].get(target, {}), "status": "failed", "error": str(error)}
             print(f"{target}: {plan['results'][target]['status']}", flush=True)
             save()
     print(json.dumps({region: result.get("status") for region, result in plan["results"].items()}, indent=2))

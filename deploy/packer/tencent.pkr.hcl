@@ -1,3 +1,9 @@
+variable "tencent_security_token" {
+  type      = string
+  default   = env("TENCENTCLOUD_SECURITY_TOKEN")
+  sensitive = true
+}
+
 variable "tencent_region" {
   type    = string
   default = "ap-hongkong"
@@ -24,6 +30,7 @@ variable "tencent_copy_regions" {
 }
 
 source "tencentcloud-cvm" "lantern-box" {
+  security_token       = var.tencent_security_token
   region               = var.tencent_region
   zone                 = var.tencent_zone
   instance_type        = var.tencent_instance_type
