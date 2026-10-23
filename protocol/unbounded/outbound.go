@@ -24,8 +24,8 @@
 // # Options
 //
 // option.UnboundedOutboundOptions holds only JSON-serializable fields.
-// Runtime-only deps (HTTP transport for signaling, logger) come in via the
-// sing-box logger interface and the ctx, respectively.
+// Runtime-only deps (HTTP transport for signaling, helper pairing tickets,
+// logger) come in via the ctx and the sing-box logger interface.
 package unbounded
 
 import (
@@ -37,6 +37,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	UBClientcore "github.com/getlantern/broflake/clientcore"
@@ -53,6 +54,14 @@ import (
 	C "github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
 )
+
+// helperTagPrefix starts the tag of the Unbounded consumer that lantern-cloud
+// dedicates to a paired inviter's helpers (see HelperUnboundedTag in
+// lantern-cloud's cmd/api/pairing/peersid.go). Only that consumer presents the
+// inviter's room tickets: the pool consumers the bandit assigns read the same
+// context, and if they joined her rooms too she would hold up to twice her
+// helpers' slots.
+const helperTagPrefix = "helper-"
 
 // RegisterOutbound registers the Unbounded outbound with the given sing-box
 // OutboundRegistry.
@@ -150,6 +159,11 @@ func NewOutbound(
 	}
 	rtcOpt.Net = rtcNet
 	rtcOpt.HTTPClient = signalingClient(ctx, outboundDialer, opts.InsecureDoNotVerifyDiscoveryCert)
+	// Helper pairing rooms: broflake reads the tickets at every subscribe, so
+	// radiance can renew them without restarting the outbound.
+	if strings.HasPrefix(tag, helperTagPrefix) {
+		rtcOpt.RoomTicketSource = lbAdapter.RoomTicketSourceFromContext(ctx)
+	}
 
 	o := &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(
