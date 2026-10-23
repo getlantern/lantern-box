@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -84,6 +85,9 @@ func TestUnboundedE2E(t *testing.T) {
 	freddieAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
 	f, err := freddie.New(ctx, freddieAddr)
 	require.NoError(t, err, "freddie.New")
+	// Shutdown waits on f's context for in-flight long polls; cancel it
+	// first so the listener closes without that wait.
+	t.Cleanup(func() { cancel(); _ = f.Shutdown() })
 	go func() { _ = f.ListenAndServe() }()
 	freddieURL := "http://" + freddieAddr
 	waitForHTTP(t, freddieURL+"/v1/", 5*time.Second)
@@ -293,8 +297,9 @@ const (
 // rooms).
 //
 // freddie keeps its tables in package globals shared by every freddie in the
-// process, so this test must not overlap another Unbounded test. Go runs them
-// one after another, and TestUnboundedE2E's cleanup stops its pool widget.
+// process, so this test must not overlap another Unbounded test, and neither
+// Unbounded test may call t.Parallel(). Go runs them one after another, and
+// TestUnboundedE2E's cleanup stops its pool widget and its freddie.
 func TestUnboundedRoomE2E(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e (requires live WebRTC bootstrap)")
@@ -326,6 +331,9 @@ func TestUnboundedRoomE2E(t *testing.T) {
 	freddieAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
 	f, err := freddie.New(ctx, freddieAddr)
 	require.NoError(t, err, "freddie.New")
+	// Shutdown waits on f's context for in-flight long polls; cancel it
+	// first so the listener closes without that wait.
+	t.Cleanup(func() { cancel(); _ = f.Shutdown() })
 	f.RoomTicket = helperticket.RoomFunc(func() []helperticket.Key { return keys }, time.Now)
 	go func() { _ = f.ListenAndServe() }()
 	freddieURL := "http://" + freddieAddr
@@ -333,11 +341,22 @@ func TestUnboundedRoomE2E(t *testing.T) {
 
 	egressURL := startEgress(t, ctx)
 
-	var accepted atomic.Int64
+	// The volunteer's connection slots (workers) that a consumer ever
+	// connected to over WebRTC. Only the helper consumer may ever connect, so
+	// a room leak fails the test here even if the leaked connection could not
+	// have carried traffic.
+	var (
+		accepted     atomic.Int64
+		connectedMu  sync.Mutex
+		connectedIdx = map[int]bool{}
+	)
 	startWidget(t, ctx, freddieURL, egressURL, func(bfOpt *UBClientcore.BroflakeOptions, rtcOpt *UBClientcore.WebRTCOptions) {
-		bfOpt.OnConnectionChangeFunc = func(state int, _ int, _ net.IP) {
+		bfOpt.OnConnectionChangeFunc = func(state int, workerIdx int, _ net.IP) {
 			if state == 1 {
 				accepted.Add(1)
+				connectedMu.Lock()
+				connectedIdx[workerIdx] = true
+				connectedMu.Unlock()
 			}
 		}
 		rtcOpt.SetRoomTickets([]string{ticket(helperticket.RoleVolunteer)})
@@ -357,10 +376,16 @@ func TestUnboundedRoomE2E(t *testing.T) {
 	requireProxies(t, inviter[e2eHelperTag], upstream.URL, 60*time.Second)
 	require.GreaterOrEqual(t, accepted.Load(), int64(1), "the volunteer saw the helper consumer connect")
 
-	// The volunteer now has a free slot, and neither the inviter's pool
-	// consumer nor the unpaired consumer ever gets it.
+	// The volunteer now has a free slot, and the inviter's pool consumer
+	// never gets it. (The unpaired consumer is still waiting too, so this
+	// window covers it with a free slot as well.)
 	requireNeverProxies(t, inviter[e2ePoolTag], upstream.URL, &upstreamHits, 10*time.Second)
-	requireNeverProxies(t, unpaired, upstream.URL, &upstreamHits, 5*time.Second)
+
+	connectedMu.Lock()
+	workers := len(connectedIdx)
+	connectedMu.Unlock()
+	require.Equal(t, 1, workers,
+		"only the helper consumer may ever connect to the volunteer; %d of its workers saw a connection", workers)
 }
 
 // startEgress starts the broflake egress layer (QUIC over WebSocket) in front
