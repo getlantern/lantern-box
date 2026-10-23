@@ -36,8 +36,8 @@ func RegisterMutableSelector(registry *outbound.Registry) {
 var (
 	_ adapter.MutableOutboundGroup = (*MutableSelector)(nil)
 	_ A.OutboundGroup              = (*MutableSelector)(nil)
-	_ A.ConnectionHandlerEx        = (*MutableSelector)(nil)
-	_ A.PacketConnectionHandlerEx  = (*MutableSelector)(nil)
+	_ A.ConnectionHandler          = (*MutableSelector)(nil)
+	_ A.PacketConnectionHandler    = (*MutableSelector)(nil)
 )
 
 type MutableSelector struct {
@@ -251,8 +251,8 @@ func (s *MutableSelector) ListenPacket(ctx context.Context, destination metadata
 	return adapter.NewTaggedPacketConn(conn, realTag(outbound)), nil
 }
 
-func (s *MutableSelector) NewConnectionEx(ctx context.Context, conn net.Conn, metadata A.InboundContext, onClose network.CloseHandlerFunc) {
-	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.NewConnectionEx", trace.WithAttributes(
+func (s *MutableSelector) NewConnection(ctx context.Context, conn net.Conn, metadata A.InboundContext, onClose network.CloseHandlerFunc) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.NewConnection", trace.WithAttributes(
 		attribute.String("inbound", s.Now()),
 		attribute.String("outbound", metadata.Outbound),
 		attribute.String("protocol", metadata.Protocol),
@@ -274,15 +274,15 @@ func (s *MutableSelector) NewConnectionEx(ctx context.Context, conn net.Conn, me
 		wrappedOnClose(err)
 		return
 	}
-	if handler, isHandler := selected.(A.ConnectionHandlerEx); isHandler {
-		handler.NewConnectionEx(ctx, conn, metadata, wrappedOnClose)
+	if handler, isHandler := selected.(A.ConnectionHandler); isHandler {
+		handler.NewConnection(ctx, conn, metadata, wrappedOnClose)
 		return
 	}
 	s.connMgr.NewConnection(ctx, selected, conn, metadata, wrappedOnClose)
 }
 
-func (s *MutableSelector) NewPacketConnectionEx(ctx context.Context, conn network.PacketConn, metadata A.InboundContext, onClose network.CloseHandlerFunc) {
-	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.NewPacketConnectionEx", trace.WithAttributes(
+func (s *MutableSelector) NewPacketConnection(ctx context.Context, conn network.PacketConn, metadata A.InboundContext, onClose network.CloseHandlerFunc) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.NewPacketConnection", trace.WithAttributes(
 		attribute.String("inbound", s.Now()),
 		attribute.String("outbound", metadata.Outbound),
 		attribute.String("protocol", metadata.Protocol),
@@ -304,8 +304,8 @@ func (s *MutableSelector) NewPacketConnectionEx(ctx context.Context, conn networ
 		wrappedOnClose(err)
 		return
 	}
-	if handler, isHandler := selected.(A.PacketConnectionHandlerEx); isHandler {
-		handler.NewPacketConnectionEx(ctx, conn, metadata, wrappedOnClose)
+	if handler, isHandler := selected.(A.PacketConnectionHandler); isHandler {
+		handler.NewPacketConnection(ctx, conn, metadata, wrappedOnClose)
 		return
 	}
 	s.connMgr.NewPacketConnection(ctx, selected, conn, metadata, wrappedOnClose)

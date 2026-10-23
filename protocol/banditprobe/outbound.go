@@ -48,7 +48,7 @@ func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.BanditProbeOutboundOptions](registry, constant.TypeBanditProbe, NewOutbound)
 }
 
-var _ adapter.ConnectionHandlerEx = (*Outbound)(nil)
+var _ adapter.ConnectionHandler = (*Outbound)(nil)
 
 // Outbound only handles connections the router hands it; it never dials.
 type Outbound struct {
@@ -136,7 +136,7 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return nil, syscall.EPERM
 }
 
-func (o *Outbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (o *Outbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	// serve closes conn the same way; sharing the wrapper keeps the close
 	// below from blocking on a stuck stream write too.
 	conn = closeAsync(conn)

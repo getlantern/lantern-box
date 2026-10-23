@@ -40,8 +40,8 @@ var (
 	_ A.OutboundGroup              = (*MutableAutoSelect)(nil)
 	_ A.URLTestGroup               = (*MutableAutoSelect)(nil)
 	_ A.InterfaceUpdateListener    = (*MutableAutoSelect)(nil)
-	_ A.ConnectionHandlerEx        = (*MutableAutoSelect)(nil)
-	_ A.PacketConnectionHandlerEx  = (*MutableAutoSelect)(nil)
+	_ A.ConnectionHandler          = (*MutableAutoSelect)(nil)
+	_ A.PacketConnectionHandler    = (*MutableAutoSelect)(nil)
 	_ adapter.URLOverrideSetter    = (*MutableAutoSelect)(nil)
 	_ adapter.OutboundChecker      = (*MutableAutoSelect)(nil)
 	_ adapter.ExhaustionSignaler   = (*MutableAutoSelect)(nil)
@@ -335,7 +335,7 @@ func (s *MutableAutoSelect) Close() error {
 // InterfaceUpdated re-probes only while background probing is running; an
 // idle group probes on its next dial or listen. sing-box resets the network
 // after every wake, so this is also the probe that follows a wake.
-func (s *MutableAutoSelect) InterfaceUpdated() {
+func (s *MutableAutoSelect) InterfaceUpdated(ctx context.Context) {
 	s.access.Lock()
 	s.networkChanges.Add(1)
 	if !s.probing {
@@ -488,6 +488,10 @@ func (s *MutableAutoSelect) markProbeStaleLocked(tag string) {
 func (s *MutableAutoSelect) CheckOutbounds() {
 	go s.runExternalProbe(nil)
 }
+
+// PerformUpdateCheck implements [A.URLTestGroup]. Selection is ranked on
+// every dial, so there is no cached choice to refresh.
+func (s *MutableAutoSelect) PerformUpdateCheck() {}
 
 // ExhaustionSignal returns a receive-only channel that emits when every
 // candidate fails a ladder or background probe cycle. Buffers one pending
@@ -653,11 +657,11 @@ func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, o A.Outbound, route 
 	return adapter.NewTaggedPacketConn(wrapped, realTag(o))
 }
 
-func (s *MutableAutoSelect) NewConnectionEx(ctx context.Context, conn net.Conn, metadata A.InboundContext, onClose N.CloseHandlerFunc) {
+func (s *MutableAutoSelect) NewConnection(ctx context.Context, conn net.Conn, metadata A.InboundContext, onClose N.CloseHandlerFunc) {
 	s.connMgr.NewConnection(ctx, s, conn, metadata, onClose)
 }
 
-func (s *MutableAutoSelect) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata A.InboundContext, onClose N.CloseHandlerFunc) {
+func (s *MutableAutoSelect) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata A.InboundContext, onClose N.CloseHandlerFunc) {
 	s.connMgr.NewPacketConnection(ctx, s, conn, metadata, onClose)
 }
 

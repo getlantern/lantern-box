@@ -16,6 +16,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -373,4 +374,10 @@ func (c *readPacketConn) writeAck(destination metadata.Socksaddr) error {
 
 func (c *readPacketConn) Upstream() any {
 	return c.PacketConn
+}
+
+// RoutedFlow returns nil: an L3-forwarded flow has no stream to read a
+// client-info frame from.
+func (m *Manager) RoutedFlow(ctx context.Context, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) tun.FlowTracker {
+	return nil
 }
