@@ -24,6 +24,18 @@ func TestRedactHelperTags(t *testing.T) {
 	assert.Equal(t, "helper-", HelperTagPrefix)
 }
 
+func TestIsHelperTag(t *testing.T) {
+	assert.True(t, IsHelperTag("helper-0123456789ab"))
+	assert.True(t, IsHelperTag("helper-abcdefabcdef"))
+	for _, tag := range []string{
+		"", "helper", "helper-", "helper-text", "helper-0123456789abc", "helper-0123456789a",
+		"helper-0123456789AB", "xhelper-0123456789ab", "helper-0123456789ab-x", " helper-0123456789ab",
+		"unbounded-out-pool1",
+	} {
+		assert.False(t, IsHelperTag(tag), "tag %q", tag)
+	}
+}
+
 func BenchmarkRedactHelperTagsNoMatch(b *testing.B) {
 	s := "[1] outbound connection to example.com:443 using outbound/shadowsocks[ss-out-pool1]"
 	for i := 0; i < b.N; i++ {

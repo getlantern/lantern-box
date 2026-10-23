@@ -33,7 +33,10 @@ func TestNewOutbound_RoomTicketSourceOnlyForHelperTags(t *testing.T) {
 	assert.Equal(t, []string{"a.b"}, helper.rtcOpt.CurrentRoomTickets())
 	assert.Equal(t, 2, calls, "broflake reads the source on every subscribe")
 
-	for _, tag := range []string{"unbounded-out-pool1", "", "helper", "xhelper-0123456789ab"} {
+	for _, tag := range []string{
+		"unbounded-out-pool1", "", "helper", "xhelper-0123456789ab",
+		"helper-text", "helper-0123456789abc", "helper-0123456789AB", "helper-0123456789ab-x",
+	} {
 		pool := newTestOutbound(t, ctx, tag)
 		assert.Nil(t, pool.rtcOpt.RoomTicketSource, "tag %q must not present the inviter's tickets", tag)
 		assert.Empty(t, pool.rtcOpt.CurrentRoomTickets(), "tag %q", tag)

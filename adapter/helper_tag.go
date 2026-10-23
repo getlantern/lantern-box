@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -13,7 +14,25 @@ import (
 // RedactHelperTags first.
 const HelperTagPrefix = "helper-"
 
-var helperTagRE = regexp.MustCompile(`\b` + HelperTagPrefix + `[0-9a-f]{12}\b`)
+var helperTagRE = regexp.MustCompile(`\b` + HelperTagPrefix + `[0-9a-f]{` + strconv.Itoa(helperTagHexLen) + `}\b`)
+
+// helperTagHexLen is the number of lowercase hex digits after HelperTagPrefix.
+const helperTagHexLen = 12
+
+// IsHelperTag reports whether tag is, in full, a helper tag: HelperTagPrefix
+// followed by exactly 12 lowercase hex digits.
+func IsHelperTag(tag string) bool {
+	hex, ok := strings.CutPrefix(tag, HelperTagPrefix)
+	if !ok || len(hex) != helperTagHexLen {
+		return false
+	}
+	for i := 0; i < len(hex); i++ {
+		if c := hex[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 // RedactHelperTags replaces each helper tag in s with "helper". It is cheap
 // when s has none, so it is safe on hot logging and tracing paths.
