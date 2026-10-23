@@ -63,6 +63,16 @@ import (
 // helpers' slots.
 const helperTagPrefix = "helper-"
 
+// logTag returns tag as it may appear in logs. A helper tag is a pseudonym of
+// the inviter's pairing that clients must not export, so it is logged as the
+// fixed string "helper"; other tags are returned unchanged.
+func logTag(tag string) string {
+	if strings.HasPrefix(tag, helperTagPrefix) {
+		return "helper"
+	}
+	return tag
+}
+
 // RegisterOutbound registers the Unbounded outbound with the given sing-box
 // OutboundRegistry.
 func RegisterOutbound(registry *outbound.Registry) {
@@ -199,7 +209,7 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 
 	startCtx := context.Background()
 	o.logger.InfoContext(startCtx, "unbounded Start begin",
-		"tag", o.Tag(),
+		"tag", logTag(o.Tag()),
 		"discovery_srv", o.rtcOpt.DiscoverySrv,
 		"egress_addr", o.egOpt.Addr,
 		"ctable_size", o.bfOpt.CTableSize,
