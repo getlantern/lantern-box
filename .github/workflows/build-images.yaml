@@ -368,6 +368,8 @@ jobs:
 
       - name: Init Packer plugins
         working-directory: deploy/packer
+        env:
+          PACKER_GITHUB_API_TOKEN: ${{ github.token }}
         # Retried: plugin downloads hit the GitHub release CDN and a transient fetch
         # error here throws away the whole (long) build for nothing.
         run: |
