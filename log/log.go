@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -14,6 +13,8 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/observable"
+
+	"github.com/getlantern/lantern-box/adapter"
 )
 
 const (
@@ -27,21 +28,6 @@ const (
 
 	Disable = slog.LevelInfo + 255 // A level that disables logging, used for testing or no-op logger.
 )
-
-// helperTagRE matches the tag lantern-cloud gives a paired inviter's helper
-// outbounds ("helper-" + 12 hex; see HelperTag and HelperUnboundedTag in
-// lantern-cloud's cmd/api/pairing/peersid.go). The tag is a pseudonym of the
-// pairing that clients must not export, and sing-box writes outbound tags into
-// logger names and connection logs, so every log line is redacted here.
-var helperTagRE = regexp.MustCompile(`\bhelper-[0-9a-f]{12}\b`)
-
-// redactHelperTags replaces each helper tag in s with "helper".
-func redactHelperTags(s string) string {
-	if !strings.Contains(s, "helper-") {
-		return s
-	}
-	return helperTagRE.ReplaceAllLiteralString(s, "helper")
-}
 
 type Factory interface {
 	log.ObservableFactory
@@ -107,9 +93,12 @@ func (f *factory) Logger() log.ContextLogger {
 
 // NewLogger implements the [Factory] interface and returns a [log.ContextLogger] with the provided
 // tag.
+//
+// sing-box names outbound loggers after the outbound's tag, so a helper tag in
+// it is redacted (see adapter.RedactHelperTags), as it is in every message.
 func (f *factory) NewLogger(tag string) log.ContextLogger {
 	nf := f.clone()
-	return &slogLogger{factory: nf, tag: tag}
+	return &slogLogger{factory: nf, tag: adapter.RedactHelperTags(tag)}
 }
 
 func (f *factory) clone() *factory {
@@ -169,10 +158,10 @@ func (l *slogLogger) log(ctx context.Context, level slog.Level, args []any) stri
 	}
 
 	format := strings.Join(slices.Repeat([]string{"%v"}, len(args)), " ")
-	message := redactHelperTags(fmt.Sprintf(format, args...))
+	message := adapter.RedactHelperTags(fmt.Sprintf(format, args...))
 	args = []any{}
 	if l.tag != "" {
-		args = append(args, slog.String("tag", redactHelperTags(l.tag)))
+		args = append(args, slog.String("tag", l.tag))
 	}
 	if ctx != nil {
 		if id, hasId := log.IDFromContext(ctx); hasId {

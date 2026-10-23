@@ -55,24 +55,6 @@ import (
 	"github.com/getlantern/lantern-box/option"
 )
 
-// helperTagPrefix starts the tag of the Unbounded consumer that lantern-cloud
-// dedicates to a paired inviter's helpers (see HelperUnboundedTag in
-// lantern-cloud's cmd/api/pairing/peersid.go). Only that consumer presents the
-// inviter's room tickets: the pool consumers the bandit assigns read the same
-// context, and if they joined her rooms too she would hold up to twice her
-// helpers' slots.
-const helperTagPrefix = "helper-"
-
-// logTag returns tag as it may appear in logs. A helper tag is a pseudonym of
-// the inviter's pairing that clients must not export, so it is logged as the
-// fixed string "helper"; other tags are returned unchanged.
-func logTag(tag string) string {
-	if strings.HasPrefix(tag, helperTagPrefix) {
-		return "helper"
-	}
-	return tag
-}
-
 // RegisterOutbound registers the Unbounded outbound with the given sing-box
 // OutboundRegistry.
 func RegisterOutbound(registry *outbound.Registry) {
@@ -170,8 +152,12 @@ func NewOutbound(
 	rtcOpt.Net = rtcNet
 	rtcOpt.HTTPClient = signalingClient(ctx, outboundDialer, opts.InsecureDoNotVerifyDiscoveryCert)
 	// Helper pairing rooms: broflake reads the tickets at every subscribe, so
-	// radiance can renew them without restarting the outbound.
-	if strings.HasPrefix(tag, helperTagPrefix) {
+	// radiance can renew them without restarting the outbound. Only the
+	// consumer lantern-cloud dedicates to the inviter's helpers presents
+	// them: the pool consumers the bandit assigns read the same context, and
+	// if they joined her rooms too she would hold up to twice her helpers'
+	// slots.
+	if strings.HasPrefix(tag, lbAdapter.HelperTagPrefix) {
 		rtcOpt.RoomTicketSource = lbAdapter.RoomTicketSourceFromContext(ctx)
 	}
 
@@ -209,7 +195,7 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 
 	startCtx := context.Background()
 	o.logger.InfoContext(startCtx, "unbounded Start begin",
-		"tag", logTag(o.Tag()),
+		"tag", lbAdapter.RedactHelperTags(o.Tag()),
 		"discovery_srv", o.rtcOpt.DiscoverySrv,
 		"egress_addr", o.egOpt.Addr,
 		"ctable_size", o.bfOpt.CTableSize,

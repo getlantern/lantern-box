@@ -8,9 +8,10 @@ type roomTicketSourceKey struct{}
 // the helper pairing tickets an Unbounded consumer presents to freddie to join
 // its pairings' rooms (the inviter-role tickets lantern-cloud issues the
 // device). The unbounded outbound calls src each time it subscribes for a
-// volunteer, about every 20 seconds, so src must be cheap and must not block,
-// and its result may change while the outbound runs: tickets live 15 minutes
-// and the caller (radiance) renews them in the background.
+// volunteer, about every 20 seconds, from broflake's signaling goroutines. So
+// src must be cheap, must not block, must not panic, and must be safe for
+// concurrent calls. Its result may change while the outbound runs: tickets
+// live 15 minutes and the caller (radiance) renews them in the background.
 //
 // Tickets are credentials: neither src nor anything that reads it may log them.
 // With no source, the outbound joins no rooms and uses the pool as before.

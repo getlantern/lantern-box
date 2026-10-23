@@ -46,12 +46,3 @@ func TestNewOutbound_HelperTagWithoutSource(t *testing.T) {
 	assert.Nil(t, o.rtcOpt.RoomTicketSource)
 	assert.Empty(t, o.rtcOpt.CurrentRoomTickets())
 }
-
-func TestLogTag_RedactsHelperTags(t *testing.T) {
-	assert.Equal(t, "helper", logTag("helper-0123456789ab"))
-	assert.NotContains(t, logTag("helper-0123456789ab"), "0123456789ab")
-	assert.Equal(t, "helper", logTag("helper-"))
-	for _, tag := range []string{"unbounded-out-pool1", "", "helper", "xhelper-0123456789ab"} {
-		assert.Equal(t, tag, logTag(tag), "non-helper tag %q is logged unchanged", tag)
-	}
-}

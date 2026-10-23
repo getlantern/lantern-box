@@ -198,8 +198,8 @@ func (s *MutableSelector) DialContext(ctx context.Context, network string, desti
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.DialContext", trace.WithAttributes(
 		attribute.String("network", network),
 		attribute.StringSlice("supported_network_options", s.Network()),
-		attribute.String("outbound", s.Now()),
-		attribute.String("tag", s.Tag()),
+		tagAttr("outbound", s.Now()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
@@ -207,13 +207,13 @@ func (s *MutableSelector) DialContext(ctx context.Context, network string, desti
 	outbound := s.selected.Load()
 	if outbound == nil {
 		err := errors.New("no outbound available")
-		span.RecordError(err)
+		recordError(span, err)
 		return nil, err
 	}
 
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err != nil {
-		span.RecordError(err)
+		recordError(span, err)
 		return nil, err
 	}
 	conn = s.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx))
@@ -226,8 +226,8 @@ func (s *MutableSelector) DialContext(ctx context.Context, network string, desti
 func (s *MutableSelector) ListenPacket(ctx context.Context, destination metadata.Socksaddr) (net.PacketConn, error) {
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.ListenPacket", trace.WithAttributes(
 		attribute.StringSlice("supported_network_options", s.Network()),
-		attribute.String("outbound", s.Now()),
-		attribute.String("tag", s.Tag()),
+		tagAttr("outbound", s.Now()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
@@ -235,13 +235,13 @@ func (s *MutableSelector) ListenPacket(ctx context.Context, destination metadata
 	outbound := s.selected.Load()
 	if outbound == nil {
 		err := errors.New("no outbound available")
-		span.RecordError(err)
+		recordError(span, err)
 		return nil, err
 	}
 
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err != nil {
-		span.RecordError(err)
+		recordError(span, err)
 		return nil, err
 	}
 	conn = s.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx))
@@ -253,16 +253,16 @@ func (s *MutableSelector) ListenPacket(ctx context.Context, destination metadata
 
 func (s *MutableSelector) NewConnectionEx(ctx context.Context, conn net.Conn, metadata A.InboundContext, onClose network.CloseHandlerFunc) {
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.NewConnectionEx", trace.WithAttributes(
-		attribute.String("inbound", s.Now()),
-		attribute.String("outbound", metadata.Outbound),
+		tagAttr("inbound", s.Now()),
+		tagAttr("outbound", metadata.Outbound),
 		attribute.String("protocol", metadata.Protocol),
-		attribute.String("tag", s.Tag()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
 
 	wrappedOnClose := func(it error) {
-		span.RecordError(it)
+		recordError(span, it)
 		if onClose != nil {
 			onClose(it)
 		}
@@ -283,16 +283,16 @@ func (s *MutableSelector) NewConnectionEx(ctx context.Context, conn net.Conn, me
 
 func (s *MutableSelector) NewPacketConnectionEx(ctx context.Context, conn network.PacketConn, metadata A.InboundContext, onClose network.CloseHandlerFunc) {
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.NewPacketConnectionEx", trace.WithAttributes(
-		attribute.String("inbound", s.Now()),
-		attribute.String("outbound", metadata.Outbound),
+		tagAttr("inbound", s.Now()),
+		tagAttr("outbound", metadata.Outbound),
 		attribute.String("protocol", metadata.Protocol),
-		attribute.String("tag", s.Tag()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
 
 	wrappedOnClose := func(it error) {
-		span.RecordError(it)
+		recordError(span, it)
 		if onClose != nil {
 			onClose(it)
 		}
