@@ -55,6 +55,14 @@ type UnboundedOutboundOptions struct {
 	InsecureDoNotVerifyDiscoveryCert bool `json:"insecure_do_not_verify_discovery_cert,omitempty"`
 	GenesisAddr       string   `json:"genesis_addr,omitempty"`
 	NATFailTimeout    int      `json:"nat_fail_timeout,omitempty"` // seconds
+	// Tuning overrides pion's ICE, DTLS and SCTP defaults (broflake's
+	// clientcore.WebRTCTuning), as decimal strings keyed by name: see
+	// protocol/unbounded/tuning.go for the keys. It is a map rather than
+	// fields so a server can add knobs without breaking older clients, which
+	// ignore keys they don't know. Clients that predate the option reject it
+	// outright, though, so servers must send it only to clients advertising
+	// common.CapabilityUnboundedTuning.
+	Tuning map[string]string `json:"tuning,omitempty"`
 	STUNBatchSize     int      `json:"stun_batch_size,omitempty"`
 	// STUNServers is the full pool. At batch time the outbound samples
 	// STUNBatchSize entries at random to avoid a static fingerprint.
