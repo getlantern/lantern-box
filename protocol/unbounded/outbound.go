@@ -123,6 +123,11 @@ func NewOutbound(
 	setStringIfNonEmpty(&rtcOpt.Tag, opts.Tag)
 	setStringIfNonEmpty(&rtcOpt.ConsumerSessionID, opts.ConsumerSessionID)
 	setDurationSeconds(&rtcOpt.NATFailTimeout, opts.NATFailTimeout)
+	tuning, ignored := parseTuning(opts.Tuning)
+	rtcOpt.Tuning = tuning
+	if len(ignored) > 0 {
+		lg.WarnContext(ctx, "unbounded: ignoring unknown or invalid tuning options", "ignored", ignored)
+	}
 	setDurationSeconds(&rtcOpt.Patience, opts.Patience)
 	setDurationSeconds(&rtcOpt.ErrorBackoff, opts.ErrorBackoff)
 	if opts.STUNBatchSize != 0 {
