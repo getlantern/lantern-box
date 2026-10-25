@@ -722,3 +722,9 @@ Run tests with:
 ```bash
 go test -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale" ./...
 ```
+
+## License
+
+lantern-box is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later), because it links [sing-box](https://github.com/SagerNet/sing-box), which is GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+Contributions made while this repository was licensed under Apache-2.0 remain available under those terms as well; see [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0).

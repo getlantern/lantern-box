@@ -91,6 +91,8 @@ nfpms:
         dst: /usr/lib/systemd/system/lantern-box.service
       - src: cmd/release/lantern-box@.service
         dst: /usr/lib/systemd/system/lantern-box@.service
+      - src: LICENSE
+        dst: /usr/share/doc/lantern-box/LICENSE
 
   # Backward-compatible package for Gemfury consumers (e.g. private server feature).
   # Same binary and service files, just published under the old name.
@@ -111,6 +113,8 @@ nfpms:
         dst: /usr/lib/systemd/system/sing-box-extensions.service
       - src: cmd/release/lantern-box@.service
         dst: /usr/lib/systemd/system/sing-box-extensions@.service
+      - src: LICENSE
+        dst: /usr/share/doc/sing-box-extensions/LICENSE
 
 furies:
   - account: getlantern
