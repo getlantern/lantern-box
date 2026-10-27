@@ -538,15 +538,15 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableAutoSelect.DialContext", trace.WithAttributes(
 		attribute.String("network", network),
 		attribute.StringSlice("supported_network_options", s.Network()),
-		attribute.String("outbound", s.Now()),
-		attribute.String("tag", s.Tag()),
+		tagAttr("outbound", s.Now()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
 
 	o, err := s.selectFor(network)
 	if err != nil {
-		span.RecordError(err)
+		recordError(span, err)
 		return nil, err
 	}
 	outerTag := o.Tag()
@@ -579,22 +579,22 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	}
 
 	go s.runLadder(outerTag)
-	span.RecordError(err)
+	recordError(span, err)
 	return nil, err
 }
 
 func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableAutoSelect.ListenPacket", trace.WithAttributes(
 		attribute.StringSlice("supported_network_options", s.Network()),
-		attribute.String("outbound", s.Now()),
-		attribute.String("tag", s.Tag()),
+		tagAttr("outbound", s.Now()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
 
 	o, err := s.selectFor("udp")
 	if err != nil {
-		span.RecordError(err)
+		recordError(span, err)
 		return nil, err
 	}
 	outerTag := o.Tag()
@@ -618,7 +618,7 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	}
 
 	go s.runLadder(outerTag)
-	span.RecordError(err)
+	recordError(span, err)
 	return nil, err
 }
 

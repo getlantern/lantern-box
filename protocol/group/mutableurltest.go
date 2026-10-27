@@ -173,8 +173,8 @@ func (s *MutableURLTest) DialContext(ctx context.Context, network string, destin
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableURLTest.DialContext", trace.WithAttributes(
 		attribute.String("network", network),
 		attribute.StringSlice("supported_network_options", s.Network()),
-		attribute.String("outbound", s.Now()),
-		attribute.String("tag", s.Tag()),
+		tagAttr("outbound", s.Now()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
@@ -193,8 +193,8 @@ func (s *MutableURLTest) DialContext(ctx context.Context, network string, destin
 func (s *MutableURLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableURLTest.ListenPacket", trace.WithAttributes(
 		attribute.StringSlice("supported_network_options", s.Network()),
-		attribute.String("outbound", s.Now()),
-		attribute.String("tag", s.Tag()),
+		tagAttr("outbound", s.Now()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
@@ -232,7 +232,7 @@ func tryEachOutbound[T any](
 			if !errors.Is(err, errNetworkNotSupported) && lastErr != nil {
 				err = fmt.Errorf("%w: %w", ErrAllOutboundsFailed, lastErr)
 			}
-			span.RecordError(err)
+			recordError(span, err)
 			return zero, "", err
 		}
 		triedTag := realTag(outbound)
@@ -246,20 +246,20 @@ func tryEachOutbound[T any](
 		s.logger.DebugContext(ctx, "outbound attempt failed",
 			"outbound", triedTag, "attempt", n+1, "error", err)
 		span.AddEvent(failEvent, trace.WithAttributes(
-			attribute.String("outbound", triedTag),
+			tagAttr("outbound", triedTag),
 			attribute.Int("attempt", n+1),
-			attribute.String("error", err.Error()),
+			attribute.String("error", adapter.RedactHelperTags(err.Error())),
 		))
 		s.group.markFailedAndReselect(outbound)
 		lastErr = err
 		if ctx.Err() != nil {
-			span.RecordError(ctx.Err())
+			recordError(span, ctx.Err())
 			return zero, "", ctx.Err()
 		}
 		tried[triedTag] = true
 	}
 	err := fmt.Errorf("%w: %w", ErrAllOutboundsFailed, lastErr)
-	span.RecordError(err)
+	recordError(span, err)
 	return zero, "", err
 }
 

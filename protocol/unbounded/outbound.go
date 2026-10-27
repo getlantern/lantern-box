@@ -24,19 +24,22 @@
 // # Options
 //
 // option.UnboundedOutboundOptions holds only JSON-serializable fields.
-// Runtime-only deps (HTTP transport for signaling, logger) come in via the
-// sing-box logger interface and the ctx, respectively.
+// Runtime-only deps (HTTP transport for signaling, helper pairing tickets,
+// logger) come in via the ctx and the sing-box logger interface.
 package unbounded
 
 import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	UBClientcore "github.com/getlantern/broflake/clientcore"
@@ -120,6 +123,11 @@ func NewOutbound(
 	setStringIfNonEmpty(&rtcOpt.Tag, opts.Tag)
 	setStringIfNonEmpty(&rtcOpt.ConsumerSessionID, opts.ConsumerSessionID)
 	setDurationSeconds(&rtcOpt.NATFailTimeout, opts.NATFailTimeout)
+	tuning, ignored := parseTuning(opts.Tuning)
+	rtcOpt.Tuning = tuning
+	if len(ignored) > 0 {
+		lg.WarnContext(ctx, "unbounded: ignoring unknown or invalid tuning options", "ignored", ignored)
+	}
 	setDurationSeconds(&rtcOpt.Patience, opts.Patience)
 	setDurationSeconds(&rtcOpt.ErrorBackoff, opts.ErrorBackoff)
 	if opts.STUNBatchSize != 0 {
@@ -150,6 +158,15 @@ func NewOutbound(
 	}
 	rtcOpt.Net = rtcNet
 	rtcOpt.HTTPClient = signalingClient(ctx, outboundDialer, opts.InsecureDoNotVerifyDiscoveryCert)
+	// Helper pairing rooms: broflake reads the tickets at every subscribe, so
+	// radiance can renew them without restarting the outbound. Only the
+	// consumer lantern-cloud dedicates to the inviter's helpers presents
+	// them: the pool consumers the bandit assigns read the same context, and
+	// if they joined her rooms too she would hold up to twice her helpers'
+	// slots.
+	if lbAdapter.IsHelperTag(tag) {
+		rtcOpt.RoomTicketSource = lbAdapter.RoomTicketSourceFromContext(ctx)
+	}
 
 	o := &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(
@@ -185,7 +202,7 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 
 	startCtx := context.Background()
 	o.logger.InfoContext(startCtx, "unbounded Start begin",
-		"tag", o.Tag(),
+		"tag", lbAdapter.RedactHelperTags(o.Tag()),
 		"discovery_srv", o.rtcOpt.DiscoverySrv,
 		"egress_addr", o.egOpt.Addr,
 		"ctable_size", o.bfOpt.CTableSize,
@@ -348,9 +365,13 @@ func (o *Outbound) recordWatchdog(ctx context.Context, elapsed time.Duration) {
 //  2. Fall back to a plain transport that dials via the outbound's own dialer.
 //     This does NOT bypass the tunnel, so it's only suitable for standalone
 //     sing-box use and tests — not on-device production.
+//
+// Either way the client refuses redirects to another origin (see
+// checkSignalingRedirect), for every outbound: only helper outbounds carry
+// room tickets, but no outbound has a reason to follow freddie elsewhere.
 func signalingClient(ctx context.Context, fallback N.Dialer, insecureSkipDiscoveryVerify bool) *http.Client {
 	if rt := lbAdapter.DirectTransportFromContext(ctx); rt != nil {
-		return &http.Client{Transport: rt}
+		return &http.Client{Transport: rt, CheckRedirect: checkSignalingRedirect}
 	}
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -364,7 +385,46 @@ func signalingClient(ctx context.Context, fallback N.Dialer, insecureSkipDiscove
 		// is not a general-purpose TLS relaxation.
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
-	return &http.Client{Transport: tr}
+	return &http.Client{Transport: tr, CheckRedirect: checkSignalingRedirect}
+}
+
+// maxSignalingRedirects matches net/http's default redirect limit.
+const maxSignalingRedirects = 10
+
+// checkSignalingRedirect is the signaling client's CheckRedirect. It follows
+// a redirect only within the origin (scheme, host and port) of the request
+// it came from. net/http would otherwise forward broflake's custom headers,
+// among them the room tickets header, to whatever another origin names, even
+// over plain HTTP.
+func checkSignalingRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxSignalingRedirects {
+		return fmt.Errorf("unbounded: signaling: stopped after %d redirects", maxSignalingRedirects)
+	}
+	if len(via) > 0 && !sameOrigin(via[len(via)-1].URL, req.URL) {
+		return errors.New("unbounded: signaling: refusing a redirect to another origin")
+	}
+	return nil
+}
+
+// sameOrigin reports whether a and b share scheme, host and port, with each
+// scheme's default port made explicit.
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https", "wss":
+		return "443"
+	case "http", "ws":
+		return "80"
+	}
+	return ""
 }
 
 // randomSTUNBatch returns a batch-sampler closure over the given pool. Each

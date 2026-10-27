@@ -1,5 +1,9 @@
 packer {
   required_plugins {
+    tencentcloud = {
+      version = "= 1.2.0"
+      source  = "github.com/hashicorp/tencentcloud"
+    }
     linode = {
       version = ">= 1.1.0"
       source  = "github.com/linode/linode"
@@ -1042,6 +1046,7 @@ source "qemu" "lantern-box-gcore" {
 
 build {
   sources = [
+    "source.tencentcloud-cvm.lantern-box",
     "source.linode.lantern-box",
     "source.oracle-oci.lantern-box-iad",
     "source.oracle-oci.lantern-box-fra",
@@ -1143,6 +1148,12 @@ build {
       "rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf",
       "passwd -l ubuntu",
     ]
+  }
+
+  provisioner "shell" {
+    only            = ["tencentcloud-cvm.lantern-box"]
+    execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
+    script          = "${path.root}/tencent-cleanup.sh"
   }
 
   post-processor "manifest" {

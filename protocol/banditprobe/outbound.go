@@ -14,12 +14,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"syscall"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -61,6 +63,16 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 	if err != nil {
 		return nil, err
 	}
+	// The callback goes out like any outbound's direct traffic, not through
+	// Go's default dialer and the system resolver. On a residential peer whose
+	// device also runs the Lantern VPN, only sing-box's dialer honours
+	// route.auto_detect_interface and keeps the callback, and the lookup of
+	// its host, off the VPN tunnel.
+	_, ipErr := netip.ParseAddr(cfg.callbackURL.Hostname())
+	callbackDialer, err := dialer.New(ctx, options.DialerOptions, ipErr != nil)
+	if err != nil {
+		return nil, fmt.Errorf("banditprobe: callback dialer: %w", err)
+	}
 	pool := make([]byte, bodyPoolSize)
 	if _, err := rand.Read(pool); err != nil {
 		return nil, fmt.Errorf("filling body pool: %w", err)
@@ -70,20 +82,30 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		logger:     lg,
 		pool:       pool,
 		readState:  readSendState,
-		httpClient: newCallbackClient(),
+		httpClient: newCallbackClient(callbackDialer),
 		now:        time.Now,
 	}
 	return &Outbound{
-		Adapter:   outbound.NewAdapter(constant.TypeBanditProbe, tag, []string{N.NetworkTCP}, nil),
+		Adapter:   outbound.NewAdapterWithDialerOptions(constant.TypeBanditProbe, tag, []string{N.NetworkTCP}, options.DialerOptions),
 		responder: r,
 	}, nil
 }
 
-// newCallbackClient never follows redirects: a redirect could move the token,
-// device ID and verdict off the validated https callback_url.
-func newCallbackClient() *http.Client {
+// newCallbackClient dials the callback, host unresolved, through d. It ignores
+// proxy environment variables, which would route around d, and never follows
+// redirects: a redirect could move the token, device ID and verdict off the
+// validated https callback_url.
+func newCallbackClient(d N.Dialer) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return d.DialContext(ctx, network, M.ParseSocksaddr(addr))
+	}
+	// A custom DialContext turns off HTTP/2 unless asked for explicitly.
+	transport.ForceAttemptHTTP2 = true
 	return &http.Client{
-		Timeout: callbackTimeout,
+		Transport: transport,
+		Timeout:   callbackTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

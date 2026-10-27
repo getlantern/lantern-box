@@ -11,9 +11,10 @@ import (
 // QUIC over that channel. See getlantern/broflake for the full protocol.
 //
 // Only JSON-serializable fields live here. Runtime-only dependencies — the
-// HTTP transport used for signaling, the current STUN-server list, a logger
-// — are injected from the hosting process (e.g. radiance) via context
-// (adapter.ContextWithDirectTransport) at service startup, not via this
+// HTTP transport used for signaling, the current STUN-server list, a logger,
+// the helper pairing tickets — are injected from the hosting process (e.g.
+// radiance) via context (adapter.ContextWithDirectTransport,
+// adapter.ContextWithRoomTicketSource) at service startup, not via this
 // struct. This is a deliberate design choice: sing-box's custom marshaler
 // reaches through struct tags and would fail on func or *http.Client fields,
 // and polluting the options struct with runtime-injected plumbing would also
@@ -54,6 +55,14 @@ type UnboundedOutboundOptions struct {
 	InsecureDoNotVerifyDiscoveryCert bool `json:"insecure_do_not_verify_discovery_cert,omitempty"`
 	GenesisAddr       string   `json:"genesis_addr,omitempty"`
 	NATFailTimeout    int      `json:"nat_fail_timeout,omitempty"` // seconds
+	// Tuning overrides pion's ICE, DTLS and SCTP defaults (broflake's
+	// clientcore.WebRTCTuning), as decimal strings keyed by name: see
+	// protocol/unbounded/tuning.go for the keys. It is a map rather than
+	// fields so a server can add knobs without breaking older clients, which
+	// ignore keys they don't know. Clients that predate the option reject it
+	// outright, though, so servers must send it only to clients advertising
+	// common.CapabilityUnboundedTuning.
+	Tuning map[string]string `json:"tuning,omitempty"`
 	STUNBatchSize     int      `json:"stun_batch_size,omitempty"`
 	// STUNServers is the full pool. At batch time the outbound samples
 	// STUNBatchSize entries at random to avoid a static fingerprint.

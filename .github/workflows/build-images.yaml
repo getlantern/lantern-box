@@ -21,7 +21,7 @@ on:
         required: false
         type: string
       builders:
-        description: "Comma-separated builders (linode,oracle-oci,alicloud-ecs,gcore)"
+        description: "Comma-separated builders (linode,oracle-oci,alicloud-ecs,gcore,tencentcloud-cvm)"
         required: false
         default: "linode,oracle-oci,alicloud-ecs,gcore"
         type: string
@@ -353,7 +353,7 @@ jobs:
     # in parallel — usually ~7min but a slow mirror can push past 45min.
     # gcore's is computed in prepare, since GitHub expressions cannot do arithmetic. 60min
     # was not enough for even one region, and being killed mid-import strands gcore tasks.
-    timeout-minutes: ${{ matrix.builder == 'alicloud-ecs' && 150 || (matrix.builder == 'gcore' && fromJSON(needs.prepare.outputs.gcore_timeout || '90') || 60) }}
+    timeout-minutes: ${{ matrix.builder == 'tencentcloud-cvm' && 120 || (matrix.builder == 'alicloud-ecs' && 150 || (matrix.builder == 'gcore' && fromJSON(needs.prepare.outputs.gcore_timeout || '90') || 60)) }}
 
     steps:
       - name: Checkout
@@ -368,6 +368,8 @@ jobs:
 
       - name: Init Packer plugins
         working-directory: deploy/packer
+        env:
+          PACKER_GITHUB_API_TOKEN: ${{ github.token }}
         # Retried: plugin downloads hit the GitHub release CDN and a transient fetch
         # error here throws away the whole (long) build for nothing.
         run: |
@@ -395,7 +397,7 @@ jobs:
               done
               echo "flag=$joined" >> "$GITHUB_OUTPUT"
               ;;
-            linode|alicloud-ecs)
+            linode|alicloud-ecs|tencentcloud-cvm)
               echo "flag=${BUILDER}.lantern-box" >> "$GITHUB_OUTPUT"
               ;;
             gcore)
@@ -502,8 +504,28 @@ jobs:
           fi
           echo "All OCI region secrets present"
 
+      - name: Verify Tencent credentials
+        if: matrix.builder == 'tencentcloud-cvm'
+        env:
+          TENCENTCLOUD_SECRET_ID: ${{ secrets.TENCENTCLOUD_SECRET_ID }}
+          TENCENTCLOUD_SECRET_KEY: ${{ secrets.TENCENTCLOUD_SECRET_KEY }}
+        run: |
+          test -n "$TENCENTCLOUD_SECRET_ID" || { echo "::error::Missing TENCENTCLOUD_SECRET_ID"; exit 1; }
+          test -n "$TENCENTCLOUD_SECRET_KEY" || { echo "::error::Missing TENCENTCLOUD_SECRET_KEY"; exit 1; }
+
+      - name: Build Tencent images
+        if: matrix.builder == 'tencentcloud-cvm'
+        working-directory: deploy/packer
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TENCENTCLOUD_SECRET_ID: ${{ secrets.TENCENTCLOUD_SECRET_ID }}
+          TENCENTCLOUD_SECRET_KEY: ${{ secrets.TENCENTCLOUD_SECRET_KEY }}
+        run: |
+          packer build -var "lantern_box_version=$VERSION" -var tencent_copy_batch=0 -only=tencentcloud-cvm.lantern-box .
+          packer build -var "lantern_box_version=$VERSION" -var tencent_copy_batch=1 -only=tencentcloud-cvm.lantern-box .
+
       - name: Build
-        if: matrix.builder != 'gcore'
+        if: matrix.builder != 'gcore' && matrix.builder != 'tencentcloud-cvm'
         working-directory: deploy/packer
         env:
           VERSION: ${{ needs.prepare.outputs.version }}

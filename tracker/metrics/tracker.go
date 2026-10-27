@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
+	lbAdapter "github.com/getlantern/lantern-box/adapter"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 )
 
@@ -217,9 +218,9 @@ func metadataToAttributes(metadata adapter.InboundContext) *attributes {
 	attrs := &attributes{
 		attrs: []attribute.KeyValue{
 			semconv.NetworkProtocolNameKey.String(metadata.Protocol),
-			semconv.ProxyInboundKey.String(metadata.Inbound),
+			semconv.ProxyInboundKey.String(lbAdapter.RedactHelperTags(metadata.Inbound)),
 			semconv.ProxyInboundTypeKey.String(metadata.InboundType),
-			semconv.ProxyOutboundKey.String(metadata.Outbound),
+			semconv.ProxyOutboundKey.String(lbAdapter.RedactHelperTags(metadata.Outbound)),
 		},
 	}
 	attrs.country.Store(ccNa)

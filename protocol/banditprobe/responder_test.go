@@ -19,6 +19,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/json/badoption"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -706,7 +707,7 @@ func TestSendCallback_DoesNotFollowRedirects(t *testing.T) {
 
 	cfg, err := newConfig(option.BanditProbeOutboundOptions{CallbackURL: api.URL + "/v1/bandit/callback"})
 	require.NoError(t, err)
-	client := newCallbackClient()
+	client := newCallbackClient(N.SystemDialer)
 	client.Transport = api.Client().Transport
 	r := &responder{cfg: cfg, httpClient: client, now: time.Now}
 
