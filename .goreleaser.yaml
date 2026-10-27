@@ -72,6 +72,11 @@ changelog:
 
 release:
   replace_existing_artifacts: true
+  # A client-only release (see auto-tag.yaml) stays off GitHub's latest
+  # release, which is what lantern-cloud rolls the proxy fleet to. Otherwise
+  # empty, leaving GitHub's own choice, so re-running an old tag's release
+  # can't make it latest.
+  make_latest: '{{ if eq (envOrDefault "CLIENT_ONLY" "false") "true" }}false{{ end }}'
 
 nfpms:
   - id: lantern-box
@@ -121,7 +126,7 @@ furies:
 
 dockers:
   - image_templates:
-      - "getlantern/lantern-box:latest"
+      - '{{ if ne (envOrDefault "CLIENT_ONLY" "false") "true" }}getlantern/lantern-box:latest{{ end }}'
       - "getlantern/lantern-box:{{ .Tag }}"
     dockerfile: Dockerfile.goreleaser
     extra_files:
