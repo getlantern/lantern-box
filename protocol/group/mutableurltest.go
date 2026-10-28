@@ -87,8 +87,7 @@ func NewMutableURLTest(ctx context.Context, _ A.Router, logger log.ContextLogger
 
 	log := logger
 	if slogger, ok := logger.(lLog.SLogger); ok {
-		nfact := lLog.NewFactory(slogger.SlogHandler().WithAttrs([]slog.Attr{slog.String("urltest_group", tag)}))
-		log = nfact.Logger()
+		log = slogger.WithAttrs(slog.String("urltest_group", tag))
 	}
 	outboundMgr := service.FromContext[A.OutboundManager](ctx)
 	outbound := &MutableURLTest{

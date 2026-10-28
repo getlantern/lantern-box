@@ -244,8 +244,7 @@ func NewMutableAutoSelect(ctx context.Context, _ A.Router, logger log.ContextLog
 		exhaustionCh: make(chan struct{}, 1),
 	}
 	if slogger, ok := logger.(lLog.SLogger); ok {
-		nfact := lLog.NewFactory(slogger.SlogHandler().WithAttrs([]slog.Attr{slog.String("mutableautoselect_group", tag)}))
-		out.logger = nfact.Logger()
+		out.logger = slogger.WithAttrs(slog.String("mutableautoselect_group", tag))
 	}
 	return out, nil
 }
