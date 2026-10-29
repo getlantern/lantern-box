@@ -605,3 +605,129 @@ func TestURLTestGroup_ReplacedAgainDropsInFlightProbe(t *testing.T) {
 	assert.NotNil(t, g.history.LoadURLTestHistory("a"), "the superseded probe's failure must be dropped")
 	assert.Same(t, a2, g.selectedOutboundTCP.Load())
 }
+
+func blockingProbe(tag string) (ob *mockOutbound, entered, release chan struct{}) {
+	entered = make(chan struct{})
+	release = make(chan struct{})
+	var once sync.Once
+	ob = &mockOutbound{tag: tag, dial: func(ctx context.Context) (net.Conn, error) {
+		once.Do(func() { close(entered) })
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil, assert.AnError
+	}}
+	return ob, entered, release
+}
+
+func TestURLTestGroup_StaleResultKeepsPendingReplacementSelected(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	oldA, oldEntered, oldRelease := blockingProbe("a")
+	mgr := newSyncOutboundManager(oldA)
+	u := startedURLTest(t, ctx, mgr, "http://127.0.0.1:1", "a")
+	g := u.group
+
+	regular := make(chan struct{})
+	go func() {
+		defer close(regular)
+		g.CheckOutbounds(true)
+	}()
+	<-oldEntered
+
+	newA, newEntered, newRelease := blockingProbe("a")
+	defer close(newRelease)
+	mgr.set(newA)
+	_, err := u.Replace("a")
+	require.NoError(t, err)
+	<-newEntered
+
+	// The regular test's result for the old instance lands before the
+	// replacement's probe.
+	close(oldRelease)
+	<-regular
+	assert.Same(t, newA, g.selectedOutboundTCP.Load())
+	assert.Same(t, newA, g.selectedOutboundUDP.Load())
+	assert.Equal(t, "a", u.Now())
+}
+
+func TestURLTestGroup_SupersededReplacementProbeKeepsSelection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a0, _ := countingOutbound("a")
+	mgr := newSyncOutboundManager(a0)
+	u := startedURLTest(t, ctx, mgr, "http://127.0.0.1:1", "a")
+	g := u.group
+
+	a1, a1Entered, a1Release := blockingProbe("a")
+	mgr.set(a1)
+	_, err := u.Replace("a")
+	require.NoError(t, err)
+	<-a1Entered
+
+	a2, a2Entered, a2Release := blockingProbe("a")
+	defer close(a2Release)
+	mgr.set(a2)
+	_, err = u.Replace("a")
+	require.NoError(t, err)
+	<-a2Entered
+
+	close(a1Release)
+	time.Sleep(50 * time.Millisecond)
+	assert.Same(t, a2, g.selectedOutboundTCP.Load())
+	assert.Equal(t, "a", u.Now())
+}
+
+func TestURLTestGroup_ReplaceWithNarrowerNetworks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	t.Run("other member takes the network", func(t *testing.T) {
+		a, _ := countingOutbound("a")
+		b, _ := countingOutbound("b")
+		mgr := newSyncOutboundManager(a, b)
+		u := newTestURLTest(t, ctx, mgr, "http://127.0.0.1:1", "a", "b")
+		g := u.group
+		g.history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
+		g.history.StoreURLTestHistory("b", &adapter.URLTestHistory{Time: time.Now(), Delay: 500})
+		g.updateSelected()
+		require.Same(t, a, g.selectedOutboundUDP.Load())
+
+		tcpOnly, _ := countingOutbound("a")
+		tcpOnly.networks = []string{"tcp"}
+		mgr.set(tcpOnly)
+		_, err := u.Replace("a")
+		require.NoError(t, err)
+		assert.Same(t, tcpOnly, g.selectedOutboundTCP.Load())
+		assert.Same(t, b, g.selectedOutboundUDP.Load())
+	})
+
+	t.Run("sole member clears the network", func(t *testing.T) {
+		a, _ := countingOutbound("a")
+		mgr := newSyncOutboundManager(a)
+		u := newTestURLTest(t, ctx, mgr, "http://127.0.0.1:1", "a")
+		g := u.group
+		require.Same(t, a, g.selectedOutboundUDP.Load())
+
+		tcpOnly, _ := countingOutbound("a")
+		tcpOnly.networks = []string{"tcp"}
+		mgr.set(tcpOnly)
+		_, err := u.Replace("a")
+		require.NoError(t, err)
+		assert.Same(t, tcpOnly, g.selectedOutboundTCP.Load())
+		assert.Nil(t, g.selectedOutboundUDP.Load())
+	})
+
+	t.Run("selection seeding skips an unsupported current", func(t *testing.T) {
+		tcpOnly, _ := countingOutbound("a")
+		tcpOnly.networks = []string{"tcp"}
+		b, _ := countingOutbound("b")
+		mgr := newSyncOutboundManager(tcpOnly, b)
+		u := newTestURLTest(t, ctx, mgr, "http://127.0.0.1:1", "a", "b")
+		g := u.group
+		g.history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
+		g.history.StoreURLTestHistory("b", &adapter.URLTestHistory{Time: time.Now(), Delay: 500})
+		assert.Same(t, b, g.pickBestOutbound("udp", tcpOnly, nil))
+	})
+}

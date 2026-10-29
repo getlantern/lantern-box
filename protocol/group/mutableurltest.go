@@ -326,6 +326,9 @@ type urlTestGroup struct {
 	// selection serializes computing and publishing the selection, and
 	// storing probe results, with Replace swapping members.
 	selection sync.Mutex
+	// awaitingProbe maps a replaced member's tag to the new outbound while its
+	// first probe is in flight, so selection keeps it despite having no history.
+	awaitingProbe isync.TypedMap[string, A.Outbound]
 	started             bool
 	isAlive             bool
 	idleTimer           *time.Timer
@@ -485,18 +488,39 @@ func (g *urlTestGroup) Replace(tags []string) (n int, err error) {
 		}
 		g.outbounds.Store(tag, outbound)
 		g.history.DeleteURLTestHistory(tag)
-		g.selectedOutboundTCP.CompareAndSwap(old, outbound)
-		g.selectedOutboundUDP.CompareAndSwap(old, outbound)
-		g.logger.Debug("replaced outbound", "tag", tag)
+		g.awaitingProbe.Delete(tag)
 		// A nested group probes its own members.
 		if _, isGroup := outbound.(A.OutboundGroup); !isGroup && g.started {
+			g.awaitingProbe.Store(tag, outbound)
 			go g.probeReplacement(tag, outbound, g.testURLForTag(tag))
 		}
+		g.replaceSelected(&g.selectedOutboundTCP, "tcp", old, outbound)
+		g.replaceSelected(&g.selectedOutboundUDP, "udp", old, outbound)
+		g.logger.Debug("replaced outbound", "tag", tag)
 	}
 	if len(missing) > 0 {
 		return n, fmt.Errorf("%d outbounds not found: %v", len(missing), missing)
 	}
 	return n, nil
+}
+
+// replaceSelected moves selected from old to its replacement outbound, or, if the replacement
+// doesn't support network, to the best other member that does. Called with selection held.
+func (g *urlTestGroup) replaceSelected(selected *common.TypedValue[A.Outbound], network string, old, outbound A.Outbound) {
+	if selected.Load() != old {
+		return
+	}
+	if slices.Contains(outbound.Network(), network) {
+		selected.Store(outbound)
+		return
+	}
+	selected.Store(g.pickBestOutbound(network, nil, nil))
+}
+
+// isAwaitingProbe reports whether outbound is a replacement whose first probe is in flight.
+func (g *urlTestGroup) isAwaitingProbe(outbound A.Outbound) bool {
+	pending, ok := g.awaitingProbe.Load(outbound.Tag())
+	return ok && pending == outbound
 }
 
 func (g *urlTestGroup) SetURLOverrides(overrides map[string]string) {
@@ -529,6 +553,7 @@ func (g *urlTestGroup) Remove(tags []string) (n int, err error) {
 		}
 		g.outbounds.Delete(tag)
 		g.history.DeleteURLTestHistory(tag)
+		g.awaitingProbe.Delete(tag)
 		n++
 	}
 	g.tags = g.tags[:0]
@@ -719,6 +744,7 @@ func (g *urlTestGroup) probeReplacement(tag string, member A.Outbound, testURL s
 		g.logger.Debug("dropping result for replaced outbound", "tag", tag)
 		return
 	}
+	g.awaitingProbe.CompareAndDelete(tag, member)
 	if err != nil {
 		g.logger.Debug("replaced outbound unavailable", "tag", tag, "error", err)
 		g.history.DeleteURLTestHistory(tag)
@@ -733,6 +759,7 @@ func (g *urlTestGroup) probeReplacement(tag string, member A.Outbound, testURL s
 // markFailedAndReselect drops the URL-test history for outbound and recomputes
 // the selection.
 func (g *urlTestGroup) markFailedAndReselect(outbound A.Outbound) {
+	g.awaitingProbe.CompareAndDelete(outbound.Tag(), outbound)
 	g.history.DeleteURLTestHistory(realTag(outbound))
 	g.updateSelected()
 }
@@ -765,10 +792,13 @@ func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound, excl
 		minDelay    uint16
 		minOutbound A.Outbound
 	)
-	if current != nil && !excluded[realTag(current)] {
+	if current != nil && !excluded[realTag(current)] && slices.Contains(current.Network(), network) {
 		if history := g.history.LoadURLTestHistory(realTag(current)); history != nil {
 			minOutbound = current
 			minDelay = history.Delay
+		} else if g.isAwaitingProbe(current) {
+			// A replacement keeps its selection until its first probe lands.
+			return current
 		}
 	}
 	for _, outbound := range g.outbounds.Iter() {
