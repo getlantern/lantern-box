@@ -471,100 +471,40 @@ func TestURLTestGroup_ReplaceDuringSelectionUpdatePublishesCurrentMember(t *test
 	assert.Same(t, newA, g.selectedOutboundUDP.Load(), "selection must not publish the replaced outbound")
 }
 
-func TestURLTestGroup_ReplaceDuringProbeReprobesAndDropsStaleResult(t *testing.T) {
+// startedURLTest returns a started group over the given outbounds, as PostStart
+// leaves it but without its initial probe.
+func startedURLTest(t *testing.T, ctx context.Context, mgr adapter.OutboundManager, link string, tags ...string) *MutableURLTest {
+	u := newTestURLTest(t, ctx, mgr, link, tags...)
+	u.group.access.Lock()
+	u.group.started = true
+	u.group.pauseMgr = &mockPauseManager{}
+	u.group.access.Unlock()
+	return u
+}
+
+func TestURLTestGroup_ReplaceDuringRegularTestProbesReplacement(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	link, dial := probeServer(t)
 	oldEntered := make(chan struct{})
 	oldRelease := make(chan struct{})
-	oldA := &mockOutbound{tag: "a", dial: func(ctx context.Context) (net.Conn, error) {
+	// The old instance fails once released: were its result kept, it would
+	// clear the replacement's history.
+	oldA := &mockOutbound{tag: "a", dial: func(context.Context) (net.Conn, error) {
 		close(oldEntered)
 		<-oldRelease
-		return dial(ctx)
+		return nil, assert.AnError
 	}}
 	mgr := newSyncOutboundManager(oldA)
-	u := newTestURLTest(t, ctx, mgr, link, "a")
+	u := startedURLTest(t, ctx, mgr, link, "a")
 	g := u.group
-	g.access.Lock()
-	g.started = true
-	g.pauseMgr = &mockPauseManager{}
-	g.access.Unlock()
 
-	probed := make(chan struct{})
+	regular := make(chan struct{})
 	go func() {
-		defer close(probed)
+		defer close(regular)
 		g.CheckOutbounds(true)
 	}()
 	<-oldEntered
-
-	// The new instance fails its probe, so any history left for "a" can only
-	// have come from the superseded instance.
-	var newProbes atomic.Int32
-	newA := &mockOutbound{tag: "a", dial: func(context.Context) (net.Conn, error) {
-		newProbes.Add(1)
-		return nil, assert.AnError
-	}}
-	mgr.set(newA)
-	n, err := u.Replace("a")
-	require.NoError(t, err)
-	require.Equal(t, 1, n)
-
-	close(oldRelease)
-	<-probed
-	assert.Eventually(t, func() bool {
-		return newProbes.Load() > 0 && !g.checking.Load()
-	}, 5*time.Second, 10*time.Millisecond, "a replacement overlapping a running probe must be probed afterwards")
-	assert.Nil(t, g.history.LoadURLTestHistory("a"), "the superseded instance's probe result must be dropped")
-}
-
-// A test finishing just as a newer one starts must not consume the recheck a
-// Replace requested while the newer one was running on the old member.
-func TestURLTestGroup_FinishingProbeDoesNotStealRecheck(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	link, dial := probeServer(t)
-	var oldDials atomic.Int32
-	bEntered := make(chan struct{})
-	bRelease := make(chan struct{})
-	oldA := &mockOutbound{tag: "a", dial: func(ctx context.Context) (net.Conn, error) {
-		if oldDials.Add(1) == 2 {
-			close(bEntered)
-			<-bRelease
-		}
-		return dial(ctx)
-	}}
-	mgr := newSyncOutboundManager(oldA)
-	u := newTestURLTest(t, ctx, mgr, link, "a")
-	g := u.group
-	aPaused := make(chan struct{})
-	aResume := make(chan struct{})
-	var releases atomic.Int32
-	g.access.Lock()
-	g.started = true
-	g.pauseMgr = &mockPauseManager{}
-	g.checkReleased = func() {
-		if releases.Add(1) == 1 {
-			close(aPaused)
-			<-aResume
-		}
-	}
-	g.access.Unlock()
-
-	// Test A finishes and pauses right after releasing checking.
-	aDone := make(chan struct{})
-	go func() {
-		defer close(aDone)
-		g.CheckOutbounds(true)
-	}()
-	<-aPaused
-
-	// Test B starts and is probing the old member.
-	bDone := make(chan struct{})
-	go func() {
-		defer close(bDone)
-		g.CheckOutbounds(true)
-	}()
-	<-bEntered
 
 	var newProbes atomic.Int32
 	newA := &mockOutbound{tag: "a", dial: func(ctx context.Context) (net.Conn, error) {
@@ -576,15 +516,92 @@ func TestURLTestGroup_FinishingProbeDoesNotStealRecheck(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 
-	close(aResume)
-	<-aDone
-	// Let anything A started run into B's ownership of checking before B ends.
-	time.Sleep(50 * time.Millisecond)
-	close(bRelease)
-	<-bDone
-
 	assert.Eventually(t, func() bool {
-		return newProbes.Load() > 0 && g.history.LoadURLTestHistory("a") != nil && !g.checking.Load()
-	}, 5*time.Second, 10*time.Millisecond, "the replacement must be probed")
+		return newProbes.Load() > 0 && g.history.LoadURLTestHistory("a") != nil
+	}, 5*time.Second, 10*time.Millisecond, "the replacement must be probed while the regular test runs")
+
+	close(oldRelease)
+	<-regular
+	assert.NotNil(t, g.history.LoadURLTestHistory("a"), "the superseded instance's result must be dropped")
 	assert.Same(t, newA, g.selectedOutboundTCP.Load())
+	assert.Equal(t, "a", u.Now())
+}
+
+func TestURLTestGroup_URLTestHonorsDeadlineDuringReplaces(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stalling := func() *mockOutbound {
+		return &mockOutbound{tag: "a", dial: func(ctx context.Context) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}
+	}
+	mgr := newSyncOutboundManager(stalling())
+	u := startedURLTest(t, ctx, mgr, "http://127.0.0.1:1", "a")
+
+	stop := make(chan struct{})
+	var replacing sync.WaitGroup
+	replacing.Add(1)
+	go func() {
+		defer replacing.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+			mgr.set(stalling())
+			_, _ = u.Replace("a")
+		}
+	}()
+	defer func() {
+		close(stop)
+		replacing.Wait()
+	}()
+
+	testCtx, testCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer testCancel()
+	start := time.Now()
+	_, err := u.URLTest(testCtx)
+	require.NoError(t, err)
+	assert.Less(t, time.Since(start), time.Second, "URLTest must return within its caller's deadline")
+}
+
+func TestURLTestGroup_ReplacedAgainDropsInFlightProbe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	link, dial := probeServer(t)
+	a0, _ := countingOutbound("a")
+	mgr := newSyncOutboundManager(a0)
+	u := startedURLTest(t, ctx, mgr, link, "a")
+	g := u.group
+
+	a1Entered := make(chan struct{})
+	a1Release := make(chan struct{})
+	var a1Returned atomic.Bool
+	a1 := &mockOutbound{tag: "a", dial: func(context.Context) (net.Conn, error) {
+		close(a1Entered)
+		<-a1Release
+		a1Returned.Store(true)
+		return nil, assert.AnError
+	}}
+	mgr.set(a1)
+	_, err := u.Replace("a")
+	require.NoError(t, err)
+	<-a1Entered
+
+	a2 := &mockOutbound{tag: "a", dial: dial}
+	mgr.set(a2)
+	_, err = u.Replace("a")
+	require.NoError(t, err)
+	assert.Eventually(t, func() bool {
+		return g.history.LoadURLTestHistory("a") != nil
+	}, 5*time.Second, 10*time.Millisecond, "the latest replacement must be probed")
+
+	close(a1Release)
+	require.Eventually(t, a1Returned.Load, time.Second, time.Millisecond)
+	// Give a1's probe time to settle its failed result.
+	time.Sleep(50 * time.Millisecond)
+	assert.NotNil(t, g.history.LoadURLTestHistory("a"), "the superseded probe's failure must be dropped")
+	assert.Same(t, a2, g.selectedOutboundTCP.Load())
 }

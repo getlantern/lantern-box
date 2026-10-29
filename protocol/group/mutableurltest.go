@@ -323,15 +323,9 @@ type urlTestGroup struct {
 	selectedOutboundUDP common.TypedValue[A.Outbound]
 	access              sync.Mutex
 	checking            atomic.Bool
-	// recheck asks the running URL test to run again when it finishes, for
-	// members replaced after it started.
-	recheck atomic.Bool
 	// selection serializes computing and publishing the selection, and
 	// storing probe results, with Replace swapping members.
 	selection sync.Mutex
-	// checkReleased, if set, is called right after a URL test releases
-	// checking. Tests use it to pause there.
-	checkReleased func()
 	started             bool
 	isAlive             bool
 	idleTimer           *time.Timer
@@ -458,7 +452,8 @@ func (g *urlTestGroup) Add(tags []string) (n int, err error) {
 // Replace re-resolves each given member tag from the outbound manager and swaps the new outbound
 // into the group in place, for an outbound recreated under the same tag. The tag never leaves the
 // group, so the group never empties. A replaced member's URL-test history is dropped and, once the
-// group has started, a probe of the new outbound is triggered, or queued behind a running one. If the replaced member was
+// group has started, the new outbound is probed in the background, independently of any running
+// test. If the replaced member was
 // selected, the selection moves to the new outbound and stays there until that probe's result is
 // evaluated by the normal selection logic. Tags not in the group are ignored; a member missing from
 // the outbound manager keeps its current outbound and is reported in the error.
@@ -474,7 +469,6 @@ func (g *urlTestGroup) Replace(tags []string) (n int, err error) {
 	defer g.selection.Unlock()
 
 	var missing []string
-	replaced := false
 	for _, tag := range tags {
 		old, exists := g.outbounds.Load(tag)
 		if !exists {
@@ -493,12 +487,11 @@ func (g *urlTestGroup) Replace(tags []string) (n int, err error) {
 		g.history.DeleteURLTestHistory(tag)
 		g.selectedOutboundTCP.CompareAndSwap(old, outbound)
 		g.selectedOutboundUDP.CompareAndSwap(old, outbound)
-		replaced = true
 		g.logger.Debug("replaced outbound", "tag", tag)
-	}
-	if replaced && g.started {
-		g.recheck.Store(true)
-		go func() { _, _ = g.urlTest(g.ctx, false) }()
+		// A nested group probes its own members.
+		if _, isGroup := outbound.(A.OutboundGroup); !isGroup && g.started {
+			go g.probeReplacement(tag, outbound, g.testURLForTag(tag))
+		}
 	}
 	if len(missing) > 0 {
 		return n, fmt.Errorf("%d outbounds not found: %v", len(missing), missing)
@@ -634,35 +627,13 @@ func (g *urlTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 }
 
 func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
-	if g.checking.Swap(true) {
-		return make(map[string]uint16), nil
-	}
-	result := g.runURLTest(ctx, force)
-	for {
-		// A Replace that overlapped this test could not start its own. The
-		// recheck is consumed only while holding checking, so a finishing
-		// test can't take one that belongs to a newer running test.
-		if g.recheck.Swap(false) && !g.isClosed() {
-			g.runURLTest(g.ctx, false)
-			continue
-		}
-		g.checking.Store(false)
-		if g.checkReleased != nil {
-			g.checkReleased()
-		}
-		// A recheck requested after the swap above, whose own test found
-		// checking still held, is picked up here unless another test owns it.
-		if !g.recheck.Load() || !g.checking.CompareAndSwap(false, true) {
-			return result, nil
-		}
-	}
-}
-
-func (g *urlTestGroup) runURLTest(ctx context.Context, force bool) map[string]uint16 {
 	result := make(map[string]uint16)
-	g.recheck.Store(false)
+	if g.checking.Swap(true) {
+		return result, nil
+	}
+	defer g.checking.Store(false)
 	if len(g.tags) == 0 {
-		return result
+		return result, nil
 	}
 	g.logger.Trace("checking outbounds...")
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](6))
@@ -733,7 +704,30 @@ func (g *urlTestGroup) runURLTest(ctx context.Context, force bool) map[string]ui
 	}
 	b.Wait()
 	g.updateSelected()
-	return result
+	return result, nil
+}
+
+// probeReplacement URL-tests member, which Replace just installed under tag, independently of the
+// group's regular tests. Its result is kept only if member is still the tag's member.
+func (g *urlTestGroup) probeReplacement(tag string, member A.Outbound, testURL string) {
+	ctx, cancel := context.WithTimeout(g.ctx, C.TCPTimeout)
+	defer cancel()
+	t, err := urlTestGET(ctx, testURL, member)
+	g.selection.Lock()
+	if current, _ := g.outbounds.Load(tag); current != member {
+		g.selection.Unlock()
+		g.logger.Debug("dropping result for replaced outbound", "tag", tag)
+		return
+	}
+	if err != nil {
+		g.logger.Debug("replaced outbound unavailable", "tag", tag, "error", err)
+		g.history.DeleteURLTestHistory(tag)
+	} else {
+		g.logger.Debug("replaced outbound available", "tag", tag, "delay_ms", t)
+		g.history.StoreURLTestHistory(tag, &A.URLTestHistory{Time: time.Now(), Delay: t})
+	}
+	g.selection.Unlock()
+	g.updateSelected()
 }
 
 // markFailedAndReselect drops the URL-test history for outbound and recomputes
