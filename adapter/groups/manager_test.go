@@ -277,6 +277,79 @@ func TestRemoveFromGroup(t *testing.T) {
 	})
 }
 
+func TestReplaceInGroup(t *testing.T) {
+	logger := log.NewNOPFactory().Logger()
+	tag := "outbound"
+
+	newMgr := func(group lbAdapter.MutableOutboundGroup) *MutableGroupManager {
+		return &MutableGroupManager{
+			outboundMgr: &mockOutboundManager{tags: []string{tag}},
+			endpointMgr: &mockEndpointManager{},
+			groups:      map[string]lbAdapter.MutableOutboundGroup{"auto-test": group},
+			removalQueue: newRemovalQueue(
+				logger, &mockOutboundManager{}, &mockEndpointManager{}, &mockConnectionManager{},
+				pollInterval, forceAfter,
+			),
+		}
+	}
+
+	t.Run("delegates to MemberReplacer group and cancels pending removal", func(t *testing.T) {
+		group := &mockReplacerGroup{replaceN: 1}
+		mgr := newMgr(group)
+		mgr.removalQueue.mu.Lock()
+		mgr.removalQueue.pending[tag] = item{tag: tag, addedAt: time.Now()}
+		mgr.removalQueue.mu.Unlock()
+
+		require.NoError(t, mgr.ReplaceInGroup("auto-test", tag))
+		assert.Equal(t, []string{tag}, group.replaced)
+		mgr.removalQueue.mu.RLock()
+		_, pending := mgr.removalQueue.pending[tag]
+		mgr.removalQueue.mu.RUnlock()
+		assert.False(t, pending, "the replacement must not be removed by an earlier scheduled removal")
+	})
+
+	t.Run("error when tag is not a member", func(t *testing.T) {
+		mgr := newMgr(&mockReplacerGroup{replaceN: 0})
+		assert.ErrorContains(t, mgr.ReplaceInGroup("auto-test", tag), "not a member")
+	})
+
+	t.Run("group errors propagate", func(t *testing.T) {
+		mgr := newMgr(&mockReplacerGroup{replaceErr: lbAdapter.ErrGroupClosed})
+		assert.ErrorIs(t, mgr.ReplaceInGroup("auto-test", tag), lbAdapter.ErrGroupClosed)
+	})
+
+	t.Run("error when group not found", func(t *testing.T) {
+		mgr := newMgr(&mockReplacerGroup{})
+		assert.ErrorContains(t, mgr.ReplaceInGroup("nonexistent", tag), "not found")
+	})
+
+	t.Run("error when group does not implement MemberReplacer", func(t *testing.T) {
+		mgr := newMgr(&mockPlainGroup{})
+		assert.ErrorContains(t, mgr.ReplaceInGroup("auto-test", tag), "does not support replacing members")
+	})
+
+	t.Run("error when manager is closed", func(t *testing.T) {
+		group := &mockReplacerGroup{replaceN: 1}
+		mgr := newMgr(group)
+		mgr.closed.Store(true)
+		assert.ErrorIs(t, mgr.ReplaceInGroup("auto-test", tag), ErrIsClosed)
+		assert.Empty(t, group.replaced)
+	})
+}
+
+// mockReplacerGroup implements both MutableOutboundGroup and MemberReplacer.
+type mockReplacerGroup struct {
+	lbAdapter.MutableOutboundGroup
+	replaceN   int
+	replaceErr error
+	replaced   []string
+}
+
+func (m *mockReplacerGroup) Replace(tags ...string) (int, error) {
+	m.replaced = append(m.replaced, tags...)
+	return m.replaceN, m.replaceErr
+}
+
 // mockRemovableGroup implements MutableOutboundGroup with a configurable Remove.
 type mockRemovableGroup struct {
 	lbAdapter.MutableOutboundGroup

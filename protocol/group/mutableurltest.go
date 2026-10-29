@@ -55,6 +55,7 @@ const maxOutboundAttempts = 3
 
 var (
 	_ adapter.MutableOutboundGroup = (*MutableURLTest)(nil)
+	_ adapter.MemberReplacer       = (*MutableURLTest)(nil)
 	_ A.InterfaceUpdateListener    = (*MutableURLTest)(nil)
 	_ A.ConnectionHandlerEx        = (*MutableURLTest)(nil)
 	_ A.PacketConnectionHandlerEx  = (*MutableURLTest)(nil)
@@ -139,6 +140,13 @@ func (s *MutableURLTest) All() []string {
 // outbound tag already exists, it will be ignored.
 func (s *MutableURLTest) Add(tags ...string) (n int, err error) {
 	return s.group.Add(tags)
+}
+
+// Replace swaps in the outbound manager's current outbound for each given tag already in the group
+// and returns the number of members replaced. Tags not in the group are ignored. See
+// [urlTestGroup.Replace].
+func (s *MutableURLTest) Replace(tags ...string) (n int, err error) {
+	return s.group.Replace(tags)
 }
 
 // Remove removes the given outbound tags from the group and returns the number of outbounds removed.
@@ -438,6 +446,53 @@ func (g *urlTestGroup) Add(tags []string) (n int, err error) {
 	return n, nil
 }
 
+// Replace re-resolves each given member tag from the outbound manager and swaps the new outbound
+// into the group in place, for an outbound recreated under the same tag. The tag never leaves the
+// group, so the group never empties. A replaced member's URL-test history is dropped and, once the
+// group has started, a probe is triggered to measure the new outbound. If the replaced member was
+// selected, the selection moves to the new outbound and stays there until that probe's result is
+// evaluated by the normal selection logic. Tags not in the group are ignored; a member missing from
+// the outbound manager keeps its current outbound and is reported in the error.
+func (g *urlTestGroup) Replace(tags []string) (n int, err error) {
+	g.access.Lock()
+	defer g.access.Unlock()
+
+	if g.isClosed() {
+		return 0, adapter.ErrGroupClosed
+	}
+
+	var missing []string
+	replaced := false
+	for _, tag := range tags {
+		old, exists := g.outbounds.Load(tag)
+		if !exists {
+			continue
+		}
+		outbound, found := g.outboundMgr.Outbound(tag)
+		if !found {
+			missing = append(missing, tag)
+			continue
+		}
+		n++
+		if outbound == old {
+			continue
+		}
+		g.outbounds.Store(tag, outbound)
+		g.history.DeleteURLTestHistory(tag)
+		g.selectedOutboundTCP.CompareAndSwap(old, outbound)
+		g.selectedOutboundUDP.CompareAndSwap(old, outbound)
+		replaced = true
+		g.logger.Debug("replaced outbound", "tag", tag)
+	}
+	if replaced && g.started {
+		go func() { _, _ = g.urlTest(g.ctx, false) }()
+	}
+	if len(missing) > 0 {
+		return n, fmt.Errorf("%d outbounds not found: %v", len(missing), missing)
+	}
+	return n, nil
+}
+
 func (g *urlTestGroup) SetURLOverrides(overrides map[string]string) {
 	g.access.Lock()
 	defer g.access.Unlock()
@@ -570,11 +625,11 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	if g.checking.Swap(true) {
 		return result, nil
 	}
+	defer g.checking.Store(false)
 	if len(g.tags) == 0 {
 		return result, nil
 	}
 	g.logger.Trace("checking outbounds...")
-	defer g.checking.Store(false)
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](6))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex

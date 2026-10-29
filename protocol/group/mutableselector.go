@@ -35,6 +35,7 @@ func RegisterMutableSelector(registry *outbound.Registry) {
 
 var (
 	_ adapter.MutableOutboundGroup = (*MutableSelector)(nil)
+	_ adapter.MemberReplacer       = (*MutableSelector)(nil)
 	_ A.OutboundGroup              = (*MutableSelector)(nil)
 	_ A.ConnectionHandlerEx        = (*MutableSelector)(nil)
 	_ A.PacketConnectionHandlerEx  = (*MutableSelector)(nil)
@@ -159,6 +160,42 @@ func (s *MutableSelector) Add(tags ...string) (n int, err error) {
 		s.outbounds[tag] = outbound
 		s.tags = append(s.tags, tag)
 		n++
+	}
+	if len(missing) > 0 {
+		return n, fmt.Errorf("%d outbounds not found: %v", len(missing), missing)
+	}
+	return n, nil
+}
+
+// Replace re-resolves each given member tag from the outbound manager and swaps the new outbound
+// into the group in place, for an outbound recreated under the same tag, and returns the number of
+// members replaced. The tag never leaves the group and the selected tag never changes: if the
+// replaced member is selected, new connections go to the new outbound. No connections are
+// interrupted; the interrupt group spans every tag, and the old outbound is closed by its manager.
+// Tags not in the group are ignored; a member missing from the outbound manager keeps its current
+// outbound and is reported in the error.
+func (s *MutableSelector) Replace(tags ...string) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var missing []string
+	for _, tag := range tags {
+		old, exists := s.outbounds[tag]
+		if !exists {
+			continue
+		}
+		outbound, found := s.outboundMgr.Outbound(tag)
+		if !found {
+			missing = append(missing, tag)
+			continue
+		}
+		n++
+		if outbound == old {
+			continue
+		}
+		s.outbounds[tag] = outbound
+		s.selected.CompareAndSwap(old, outbound)
+		s.logger.Debug("replaced outbound ", tag)
 	}
 	if len(missing) > 0 {
 		return n, fmt.Errorf("%d outbounds not found: %v", len(missing), missing)

@@ -159,6 +159,35 @@ func (m *MutableGroupManager) addToGroup(outGroup adapter.MutableOutboundGroup, 
 	return nil
 }
 
+// ReplaceInGroup swaps the outbound/endpoint currently registered under tag into the specified
+// group in place of the member's old one, for an outbound recreated under the same tag. The group
+// must implement [adapter.MemberReplacer] and tag must already be a member.
+func (m *MutableGroupManager) ReplaceInGroup(group, tag string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed.Load() {
+		return ErrIsClosed
+	}
+	outGroup, found := m.groups[group]
+	if !found {
+		return fmt.Errorf("group %s not found", group)
+	}
+	replacer, ok := outGroup.(adapter.MemberReplacer)
+	if !ok {
+		return fmt.Errorf("group %q does not support replacing members", group)
+	}
+	n, err := replacer.Replace(tag)
+	if err != nil {
+		return fmt.Errorf("failed to replace %s in %s: %w", tag, group, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("failed to replace %s in %s: not a member", tag, group)
+	}
+	// the new outbound must not be removed by an earlier scheduled removal of the tag
+	m.removalQueue.dequeue(tag)
+	return nil
+}
+
 // SetURLOverrides updates the per-outbound URL test overrides for the specified group.
 // The group must implement [adapter.URLOverrideSetter].
 func (m *MutableGroupManager) SetURLOverrides(group string, overrides map[string]string) error {
