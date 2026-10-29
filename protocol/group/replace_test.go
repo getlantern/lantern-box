@@ -404,3 +404,115 @@ func TestMutableURLTest_ReplaceIgnoresMissingTagsAndClosedGroup(t *testing.T) {
 	_, err = u.Replace("a")
 	assert.ErrorIs(t, err, lbA.ErrGroupClosed)
 }
+
+// blockingHistory wraps a history storage so that, once armed, the next load
+// of a tag reads the stored value and then blocks until released, holding a
+// selection computation mid-pick.
+type blockingHistory struct {
+	adapter.URLTestHistoryStorage
+	armedTag atomic.Value
+	blocked  chan struct{}
+	release  chan struct{}
+}
+
+func (h *blockingHistory) LoadURLTestHistory(tag string) *adapter.URLTestHistory {
+	v := h.URLTestHistoryStorage.LoadURLTestHistory(tag)
+	if armed, _ := h.armedTag.Load().(string); armed == tag && h.armedTag.CompareAndSwap(tag, "") {
+		close(h.blocked)
+		<-h.release
+	}
+	return v
+}
+
+func TestURLTestGroup_ReplaceDuringSelectionUpdatePublishesCurrentMember(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	oldA, _ := countingOutbound("a")
+	b, _ := countingOutbound("b")
+	mgr := newSyncOutboundManager(oldA, b)
+	u := newTestURLTest(t, ctx, mgr, "http://127.0.0.1:1", "a", "b")
+	g := u.group
+	history := &blockingHistory{
+		URLTestHistoryStorage: g.history,
+		blocked:               make(chan struct{}),
+		release:               make(chan struct{}),
+	}
+	g.history = history
+	history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
+	history.StoreURLTestHistory("b", &adapter.URLTestHistory{Time: time.Now(), Delay: 500})
+	g.selectedOutboundTCP.Store(b)
+	g.selectedOutboundUDP.Store(b)
+
+	// Hold a selection update after it has seen the old "a" as the best member.
+	history.armedTag.Store("a")
+	updated := make(chan struct{})
+	go func() {
+		defer close(updated)
+		g.updateSelected()
+	}()
+	<-history.blocked
+
+	newA, _ := countingOutbound("a")
+	mgr.set(newA)
+	replaced := make(chan struct{})
+	go func() {
+		defer close(replaced)
+		_, _ = u.Replace("a")
+	}()
+	select {
+	case <-replaced:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(history.release)
+	<-updated
+	<-replaced
+
+	assert.Same(t, newA, g.selectedOutboundTCP.Load(), "selection must not publish the replaced outbound")
+	assert.Same(t, newA, g.selectedOutboundUDP.Load(), "selection must not publish the replaced outbound")
+}
+
+func TestURLTestGroup_ReplaceDuringProbeReprobesAndDropsStaleResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	link, dial := probeServer(t)
+	oldEntered := make(chan struct{})
+	oldRelease := make(chan struct{})
+	oldA := &mockOutbound{tag: "a", dial: func(ctx context.Context) (net.Conn, error) {
+		close(oldEntered)
+		<-oldRelease
+		return dial(ctx)
+	}}
+	mgr := newSyncOutboundManager(oldA)
+	u := newTestURLTest(t, ctx, mgr, link, "a")
+	g := u.group
+	g.access.Lock()
+	g.started = true
+	g.pauseMgr = &mockPauseManager{}
+	g.access.Unlock()
+
+	probed := make(chan struct{})
+	go func() {
+		defer close(probed)
+		g.CheckOutbounds(true)
+	}()
+	<-oldEntered
+
+	// The new instance fails its probe, so any history left for "a" can only
+	// have come from the superseded instance.
+	var newProbes atomic.Int32
+	newA := &mockOutbound{tag: "a", dial: func(context.Context) (net.Conn, error) {
+		newProbes.Add(1)
+		return nil, assert.AnError
+	}}
+	mgr.set(newA)
+	n, err := u.Replace("a")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	close(oldRelease)
+	<-probed
+	assert.Eventually(t, func() bool {
+		return newProbes.Load() > 0 && !g.checking.Load()
+	}, 5*time.Second, 10*time.Millisecond, "a replacement overlapping a running probe must be probed afterwards")
+	assert.Nil(t, g.history.LoadURLTestHistory("a"), "the superseded instance's probe result must be dropped")
+}

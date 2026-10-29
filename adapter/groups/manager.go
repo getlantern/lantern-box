@@ -176,15 +176,20 @@ func (m *MutableGroupManager) ReplaceInGroup(group, tag string) error {
 	if !ok {
 		return fmt.Errorf("group %q does not support replacing members", group)
 	}
-	n, err := replacer.Replace(tag)
+	var n int
+	var err error
+	// Hold off the removal queue so an earlier scheduled removal of the tag
+	// can't remove the new outbound between installing it and cancelling.
+	m.removalQueue.cancelIf(tag, func() bool {
+		n, err = replacer.Replace(tag)
+		return err == nil && n > 0
+	})
 	if err != nil {
 		return fmt.Errorf("failed to replace %s in %s: %w", tag, group, err)
 	}
 	if n == 0 {
 		return fmt.Errorf("failed to replace %s in %s: not a member", tag, group)
 	}
-	// the new outbound must not be removed by an earlier scheduled removal of the tag
-	m.removalQueue.dequeue(tag)
 	return nil
 }
 
@@ -335,6 +340,16 @@ func (rq *removalQueue) dequeue(tag string) {
 	rq.mu.Lock()
 	delete(rq.pending, tag)
 	rq.mu.Unlock()
+}
+
+// cancelIf runs fn while no pending removal can run and cancels the pending removal of tag if fn
+// returns true.
+func (rq *removalQueue) cancelIf(tag string, fn func() bool) {
+	rq.mu.Lock()
+	defer rq.mu.Unlock()
+	if fn() {
+		delete(rq.pending, tag)
+	}
 }
 
 func (rq *removalQueue) checkLoop() {

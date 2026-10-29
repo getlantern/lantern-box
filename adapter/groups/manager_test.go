@@ -308,6 +308,34 @@ func TestReplaceInGroup(t *testing.T) {
 		assert.False(t, pending, "the replacement must not be removed by an earlier scheduled removal")
 	})
 
+	t.Run("pending removal cannot run between install and cancel", func(t *testing.T) {
+		outMgr := &mockOutboundManager{tags: []string{tag}}
+		mgr := newMgr(nil)
+		mgr.outboundMgr = outMgr
+		mgr.removalQueue = newRemovalQueue(
+			logger, outMgr, &mockEndpointManager{}, &mockConnectionManager{}, pollInterval, forceAfter,
+		)
+		mgr.removalQueue.pending[tag] = item{tag: tag, addedAt: time.Now()}
+		cleanupDone := make(chan struct{})
+		// Cleanup runs right after the group installs the new outbound.
+		mgr.groups["auto-test"] = &mockReplacerGroup{replaceN: 1, onReplace: func() {
+			go func() {
+				defer close(cleanupDone)
+				mgr.removalQueue.checkPending()
+			}()
+			select {
+			case <-cleanupDone:
+			case <-time.After(100 * time.Millisecond):
+			}
+		}}
+
+		require.NoError(t, mgr.ReplaceInGroup("auto-test", tag))
+		<-cleanupDone
+		outMgr.mu.Lock()
+		defer outMgr.mu.Unlock()
+		assert.Contains(t, outMgr.tags, tag, "cleanup removed the replacement outbound")
+	})
+
 	t.Run("error when tag is not a member", func(t *testing.T) {
 		mgr := newMgr(&mockReplacerGroup{replaceN: 0})
 		assert.ErrorContains(t, mgr.ReplaceInGroup("auto-test", tag), "not a member")
@@ -343,10 +371,14 @@ type mockReplacerGroup struct {
 	replaceN   int
 	replaceErr error
 	replaced   []string
+	onReplace  func()
 }
 
 func (m *mockReplacerGroup) Replace(tags ...string) (int, error) {
 	m.replaced = append(m.replaced, tags...)
+	if m.onReplace != nil {
+		m.onReplace()
+	}
 	return m.replaceN, m.replaceErr
 }
 
