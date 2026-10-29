@@ -329,6 +329,9 @@ type urlTestGroup struct {
 	// selection serializes computing and publishing the selection, and
 	// storing probe results, with Replace swapping members.
 	selection sync.Mutex
+	// checkReleased, if set, is called right after a URL test releases
+	// checking. Tests use it to pause there.
+	checkReleased func()
 	started             bool
 	isAlive             bool
 	idleTimer           *time.Timer
@@ -631,20 +634,35 @@ func (g *urlTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 }
 
 func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
-	result := make(map[string]uint16)
 	if g.checking.Swap(true) {
-		return result, nil
+		return make(map[string]uint16), nil
 	}
-	defer func() {
-		g.checking.Store(false)
-		// A Replace that overlapped this test could not start its own.
+	result := g.runURLTest(ctx, force)
+	for {
+		// A Replace that overlapped this test could not start its own. The
+		// recheck is consumed only while holding checking, so a finishing
+		// test can't take one that belongs to a newer running test.
 		if g.recheck.Swap(false) && !g.isClosed() {
-			go func() { _, _ = g.urlTest(g.ctx, false) }()
+			g.runURLTest(g.ctx, false)
+			continue
 		}
-	}()
+		g.checking.Store(false)
+		if g.checkReleased != nil {
+			g.checkReleased()
+		}
+		// A recheck requested after the swap above, whose own test found
+		// checking still held, is picked up here unless another test owns it.
+		if !g.recheck.Load() || !g.checking.CompareAndSwap(false, true) {
+			return result, nil
+		}
+	}
+}
+
+func (g *urlTestGroup) runURLTest(ctx context.Context, force bool) map[string]uint16 {
+	result := make(map[string]uint16)
 	g.recheck.Store(false)
 	if len(g.tags) == 0 {
-		return result, nil
+		return result
 	}
 	g.logger.Trace("checking outbounds...")
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](6))
@@ -715,7 +733,7 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	}
 	b.Wait()
 	g.updateSelected()
-	return result, nil
+	return result
 }
 
 // markFailedAndReselect drops the URL-test history for outbound and recomputes

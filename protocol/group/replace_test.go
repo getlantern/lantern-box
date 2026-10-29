@@ -516,3 +516,75 @@ func TestURLTestGroup_ReplaceDuringProbeReprobesAndDropsStaleResult(t *testing.T
 	}, 5*time.Second, 10*time.Millisecond, "a replacement overlapping a running probe must be probed afterwards")
 	assert.Nil(t, g.history.LoadURLTestHistory("a"), "the superseded instance's probe result must be dropped")
 }
+
+// A test finishing just as a newer one starts must not consume the recheck a
+// Replace requested while the newer one was running on the old member.
+func TestURLTestGroup_FinishingProbeDoesNotStealRecheck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	link, dial := probeServer(t)
+	var oldDials atomic.Int32
+	bEntered := make(chan struct{})
+	bRelease := make(chan struct{})
+	oldA := &mockOutbound{tag: "a", dial: func(ctx context.Context) (net.Conn, error) {
+		if oldDials.Add(1) == 2 {
+			close(bEntered)
+			<-bRelease
+		}
+		return dial(ctx)
+	}}
+	mgr := newSyncOutboundManager(oldA)
+	u := newTestURLTest(t, ctx, mgr, link, "a")
+	g := u.group
+	aPaused := make(chan struct{})
+	aResume := make(chan struct{})
+	var releases atomic.Int32
+	g.access.Lock()
+	g.started = true
+	g.pauseMgr = &mockPauseManager{}
+	g.checkReleased = func() {
+		if releases.Add(1) == 1 {
+			close(aPaused)
+			<-aResume
+		}
+	}
+	g.access.Unlock()
+
+	// Test A finishes and pauses right after releasing checking.
+	aDone := make(chan struct{})
+	go func() {
+		defer close(aDone)
+		g.CheckOutbounds(true)
+	}()
+	<-aPaused
+
+	// Test B starts and is probing the old member.
+	bDone := make(chan struct{})
+	go func() {
+		defer close(bDone)
+		g.CheckOutbounds(true)
+	}()
+	<-bEntered
+
+	var newProbes atomic.Int32
+	newA := &mockOutbound{tag: "a", dial: func(ctx context.Context) (net.Conn, error) {
+		newProbes.Add(1)
+		return dial(ctx)
+	}}
+	mgr.set(newA)
+	n, err := u.Replace("a")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	close(aResume)
+	<-aDone
+	// Let anything A started run into B's ownership of checking before B ends.
+	time.Sleep(50 * time.Millisecond)
+	close(bRelease)
+	<-bDone
+
+	assert.Eventually(t, func() bool {
+		return newProbes.Load() > 0 && g.history.LoadURLTestHistory("a") != nil && !g.checking.Load()
+	}, 5*time.Second, 10*time.Millisecond, "the replacement must be probed")
+	assert.Same(t, newA, g.selectedOutboundTCP.Load())
+}
