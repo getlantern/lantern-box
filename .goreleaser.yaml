@@ -6,7 +6,7 @@ metadata:
     - "Lantern Team <dev@getlantern.org>"
   description: Lantern Box
   homepage: "https://github.com/getlantern/lantern-box"
-  license: "GPL"
+  license: "GPL-3.0-or-later"
 
 builds:
   - id: amd64
@@ -72,6 +72,11 @@ changelog:
 
 release:
   replace_existing_artifacts: true
+  # A client-only release (see auto-tag.yaml) stays off GitHub's latest
+  # release, which is what lantern-cloud rolls the proxy fleet to. Otherwise
+  # empty, leaving GitHub's own choice, so re-running an old tag's release
+  # can't make it latest.
+  make_latest: '{{ if eq (envOrDefault "CLIENT_ONLY" "false") "true" }}false{{ end }}'
 
 nfpms:
   - id: lantern-box
@@ -85,12 +90,14 @@ nfpms:
       Lantern Box
     vendor: "Brave New Software"
     homepage: "https://github.com/getlantern/lantern-box"
-    license: "GPL"
+    license: "GPL-3.0-or-later"
     contents:
       - src: cmd/release/lantern-box.service
         dst: /usr/lib/systemd/system/lantern-box.service
       - src: cmd/release/lantern-box@.service
         dst: /usr/lib/systemd/system/lantern-box@.service
+      - src: LICENSE
+        dst: /usr/share/doc/lantern-box/LICENSE
 
   # Backward-compatible package for Gemfury consumers (e.g. private server feature).
   # Same binary and service files, just published under the old name.
@@ -105,12 +112,14 @@ nfpms:
       Lantern Box (legacy sing-box-extensions package name)
     vendor: "Brave New Software"
     homepage: "https://github.com/getlantern/lantern-box"
-    license: "GPL"
+    license: "GPL-3.0-or-later"
     contents:
       - src: cmd/release/lantern-box.service
         dst: /usr/lib/systemd/system/sing-box-extensions.service
       - src: cmd/release/lantern-box@.service
         dst: /usr/lib/systemd/system/sing-box-extensions@.service
+      - src: LICENSE
+        dst: /usr/share/doc/sing-box-extensions/LICENSE
 
 furies:
   - account: getlantern
@@ -121,7 +130,7 @@ furies:
 
 dockers:
   - image_templates:
-      - "getlantern/lantern-box:latest"
+      - '{{ if ne (envOrDefault "CLIENT_ONLY" "false") "true" }}getlantern/lantern-box:latest{{ end }}'
       - "getlantern/lantern-box:{{ .Tag }}"
     dockerfile: Dockerfile.goreleaser
     extra_files:

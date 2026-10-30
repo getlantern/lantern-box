@@ -244,8 +244,7 @@ func NewMutableAutoSelect(ctx context.Context, _ A.Router, logger log.ContextLog
 		exhaustionCh: make(chan struct{}, 1),
 	}
 	if slogger, ok := logger.(lLog.SLogger); ok {
-		nfact := lLog.NewFactory(slogger.SlogHandler().WithAttrs([]slog.Attr{slog.String("mutableautoselect_group", tag)}))
-		out.logger = nfact.Logger()
+		out.logger = slogger.WithAttrs(slog.String("mutableautoselect_group", tag))
 	}
 	return out, nil
 }
@@ -424,6 +423,7 @@ func (s *MutableAutoSelect) Remove(tags ...string) (n int, err error) {
 			continue
 		}
 		s.members.Delete(tag)
+		delete(s.urlOverrides, tag)
 		delete(s.histories, tag)
 		if s.history != nil {
 			s.history.Delete(tag)
@@ -446,22 +446,21 @@ func (s *MutableAutoSelect) Remove(tags ...string) (n int, err error) {
 	return
 }
 
-// SetURLOverrides replaces per-member callback URL overrides.
-// Changed or removed overrides keep history and mark probe results stale.
+// SetURLOverrides merges overrides into the per-member callback URL overrides.
+// A member whose URL changes keeps its history but has its probe result
+// marked stale.
 func (s *MutableAutoSelect) SetURLOverrides(overrides map[string]string) {
 	s.access.Lock()
 	defer s.access.Unlock()
-	old := s.urlOverrides
-	s.urlOverrides = maps.Clone(overrides)
-	for tag, v := range s.urlOverrides {
-		if old[tag] != v {
-			s.markProbeStaleLocked(tag)
-		}
+	if s.urlOverrides == nil {
+		s.urlOverrides = make(map[string]string, len(overrides))
 	}
-	for tag := range old {
-		if _, kept := s.urlOverrides[tag]; !kept {
-			s.markProbeStaleLocked(tag)
+	for tag, u := range overrides {
+		if s.urlOverrides[tag] == u {
+			continue
 		}
+		s.urlOverrides[tag] = u
+		s.markProbeStaleLocked(tag)
 	}
 }
 

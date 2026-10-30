@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/sagernet/sing-box/log"
@@ -77,8 +78,9 @@ func (h *slogHandler) Handle(ctx context.Context, record slog.Record) error {
 // WithAttrs returns a new Handler whose attributes consist of
 // both the receiver's attributes and the arguments.
 func (h *slogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	h.attrs = fmt.Sprintf("%s %s", h.attrs, parseAttrs(attrs))
-	return h
+	nh := *h
+	nh.attrs = fmt.Sprintf("%s %s", h.attrs, parseAttrs(attrs))
+	return &nh
 }
 
 func parseAttrs(attrs []slog.Attr) string {
@@ -116,12 +118,7 @@ func parseAttrs(attrs []slog.Attr) string {
 // WithGroup returns a new Handler with the given group appended to
 // the receiver's existing groups.
 func (h *slogHandler) WithGroup(name string) slog.Handler {
-	newGroups := append(h.groups, name)
-	return &slogHandler{
-		logger:   h.logger,
-		minLevel: h.minLevel,
-		opts:     h.opts,
-		attrs:    h.attrs,
-		groups:   newGroups,
-	}
+	nh := *h
+	nh.groups = append(slices.Clip(h.groups), name)
+	return &nh
 }

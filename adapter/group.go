@@ -21,6 +21,12 @@ type MutableOutboundGroup interface {
 	Remove(tags ...string) (n int, err error)
 }
 
+// MemberReplacer is implemented by outbound groups that can swap in an outbound recreated under a
+// member's tag without removing the member.
+type MemberReplacer interface {
+	Replace(tags ...string) (n int, err error)
+}
+
 // URLOverrideSetter is implemented by outbound groups that support per-outbound URL test overrides.
 type URLOverrideSetter interface {
 	SetURLOverrides(overrides map[string]string)
