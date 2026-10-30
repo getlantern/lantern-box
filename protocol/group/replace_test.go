@@ -790,3 +790,71 @@ func TestURLTestGroup_RemoveDuringReplacementProbeWrite(t *testing.T) {
 	assert.Same(t, b, g.selectedOutboundTCP.Load())
 	assert.Equal(t, []string{"b"}, u.All())
 }
+
+// destOutbound dials the probe's actual destination, so a test can tell which
+// URL a probe used.
+type destOutbound struct {
+	*mockOutbound
+	dialDest func(ctx context.Context, destination metadata.Socksaddr) (net.Conn, error)
+}
+
+func (o *destOutbound) DialContext(ctx context.Context, _ string, destination metadata.Socksaddr) (net.Conn, error) {
+	return o.dialDest(ctx, destination)
+}
+
+func countingServer(t *testing.T) (string, *atomic.Int32) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, &hits
+}
+
+func TestURLTestGroup_URLOverrideDuringReplacementProbe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	oldURL, oldHits := countingServer(t)
+	newURL, newHits := countingServer(t)
+	a, _ := countingOutbound("a")
+	mgr := newSyncOutboundManager(a)
+	u := startedURLTest(t, ctx, mgr, oldURL, "a")
+	g := u.group
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var dials atomic.Int32
+	newA := &destOutbound{mockOutbound: &mockOutbound{tag: "a"}}
+	newA.dialDest = func(ctx context.Context, destination metadata.Socksaddr) (net.Conn, error) {
+		if dials.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", destination.String())
+	}
+	mgr.set(newA)
+	_, err := u.Replace("a")
+	require.NoError(t, err)
+	<-entered
+
+	// The override lands while the probe of the old URL is in flight.
+	overridden := make(chan struct{})
+	go func() {
+		defer close(overridden)
+		u.SetURLOverrides(map[string]string{"a": newURL})
+	}()
+	select {
+	case <-overridden:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	<-overridden
+
+	assert.Eventually(t, func() bool {
+		_, awaiting := g.awaitingProbe.Load("a")
+		return newHits.Load() > 0 && g.history.LoadURLTestHistory("a") != nil && !awaiting
+	}, 5*time.Second, 10*time.Millisecond, "the replacement must be probed with the overriding URL")
+	assert.Equal(t, int32(1), oldHits.Load())
+}

@@ -528,6 +528,9 @@ func (g *urlTestGroup) isAwaitingProbe(outbound A.Outbound) bool {
 func (g *urlTestGroup) SetURLOverrides(overrides map[string]string) {
 	g.access.Lock()
 	defer g.access.Unlock()
+	// Probes check their URL is current under selection when storing a result.
+	g.selection.Lock()
+	defer g.selection.Unlock()
 	g.urlOverrides = maps.Clone(overrides)
 	// Clear URL test history for overridden tags so the next test cycle
 	// re-tests them with the new callback URLs. Without this, outbounds
@@ -695,7 +698,10 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			g.logger.Trace("skipping outbound", "tag", realTag, "reason", "not found")
 			continue
 		}
+		g.selection.Lock()
 		testURL := g.testURLForTag(tag)
+		g.selection.Unlock()
+		baseURL := testURL
 		member := outbound
 		b.Go(realTag, func() (any, error) {
 			// Compute how long this outbound waited in the worker pool queue.
@@ -715,6 +721,11 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			// and a new test queued; this result describes the old instance.
 			if current, _ := g.outbounds.Load(tag); current != member {
 				g.logger.Debug("dropping result for replaced outbound", "tag", realTag)
+				return nil, nil
+			}
+			// SetURLOverrides reset the history for a new URL; the next test uses it.
+			if g.testURLForTag(tag) != baseURL {
+				g.logger.Debug("dropping result for overridden URL", "tag", realTag)
 				return nil, nil
 			}
 			if err != nil {
@@ -748,6 +759,13 @@ func (g *urlTestGroup) probeReplacement(tag string, member A.Outbound, testURL s
 	if current, _ := g.outbounds.Load(tag); current != member {
 		g.selection.Unlock()
 		g.logger.Debug("dropping result for replaced outbound", "tag", tag)
+		return
+	}
+	if currentURL := g.testURLForTag(tag); currentURL != testURL {
+		// The member stays awaiting its probe; probe it again with the new URL.
+		g.selection.Unlock()
+		g.logger.Debug("reprobing replaced outbound with overridden URL", "tag", tag)
+		go g.probeReplacement(tag, member, currentURL)
 		return
 	}
 	g.awaitingProbe.CompareAndDelete(tag, member)
