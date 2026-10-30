@@ -732,5 +732,3 @@ A change that only matters to clients, such as a bump of a library only the clie
 ## License
 
 lantern-box is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later), because it links [sing-box](https://github.com/SagerNet/sing-box), which is GPL-3.0-or-later. See [LICENSE](LICENSE).
-
-Contributions made while this repository was licensed under Apache-2.0 remain available under those terms as well; see [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0).
