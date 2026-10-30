@@ -89,7 +89,7 @@ func (m *MutableGroupManager) CreateOutboundForGroup(
 	group, tag, typ string,
 	options any,
 ) error {
-	return m.createForGroup(ctx, m.outboundMgr, router, logger, group, tag, typ, options)
+	return m.createForGroup(ctx, m.outboundMgr, false, router, logger, group, tag, typ, options)
 }
 
 // CreateEndpointForGroup creates an endpoint and adds it to the specified group.
@@ -100,7 +100,7 @@ func (m *MutableGroupManager) CreateEndpointForGroup(
 	group, tag, typ string,
 	options any,
 ) error {
-	return m.createForGroup(ctx, m.endpointMgr, router, logger, group, tag, typ, options)
+	return m.createForGroup(ctx, m.endpointMgr, true, router, logger, group, tag, typ, options)
 }
 
 type outboundManager interface {
@@ -110,6 +110,7 @@ type outboundManager interface {
 func (m *MutableGroupManager) createForGroup(
 	ctx context.Context,
 	mgr outboundManager,
+	isEndpoint bool,
 	router A.Router,
 	logger log.ContextLogger,
 	group, tag, typ string,
@@ -126,20 +127,38 @@ func (m *MutableGroupManager) createForGroup(
 		return fmt.Errorf("group %s not found", group)
 	}
 
-	var createErr, addErr error
+	var (
+		createErr, addErr error
+		referenced        bool
+	)
 	// Hold off the removal queue so a removal of the tag queued before it was
 	// re-created can't remove the new outbound before it is cancelled.
 	m.removalQueue.cancelIf(tag, func() bool {
 		if createErr = mgr.Create(ctx, router, logger, tag, typ, options); createErr != nil {
 			return false
 		}
-		addErr = addTag(outGroup, tag)
-		return true
+		var n int
+		n, addErr = outGroup.Add(tag)
+		// n == 0 without an error means the group already holds the tag, and
+		// so now the new outbound under it.
+		referenced = addErr == nil
+		if addErr == nil && n == 0 {
+			addErr = errors.New("unknown")
+		}
+		return referenced
 	})
 	if createErr != nil {
 		return createErr
 	}
-	return addErr
+	if addErr != nil {
+		if !referenced {
+			// The new outbound joined no group; keep any queued removal of the
+			// tag, or queue one, so it doesn't stay registered until shutdown.
+			m.removalQueue.enqueue(tag, isEndpoint)
+		}
+		return fmt.Errorf("failed to add %s to %s: %w", tag, outGroup.Tag(), addErr)
+	}
+	return nil
 }
 
 func (m *MutableGroupManager) AddToGroup(group, tag string) error {

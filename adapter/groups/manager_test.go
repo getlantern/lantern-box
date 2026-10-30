@@ -577,14 +577,77 @@ func TestAddToGroup_PendingRemovalCannotRemoveAddedOutbound(t *testing.T) {
 // mockAddGroup implements MutableOutboundGroup with an Add that accepts every tag.
 type mockAddGroup struct {
 	lbAdapter.MutableOutboundGroup
-	onAdd func()
+	onAdd  func()
+	addErr error
+	addN   int
+	fixedN bool
 }
 
 func (m *mockAddGroup) Add(tags ...string) (int, error) {
 	if m.onAdd != nil {
 		m.onAdd()
 	}
+	if m.addErr != nil {
+		return 0, m.addErr
+	}
+	if m.fixedN {
+		return m.addN, nil
+	}
 	return len(tags), nil
 }
 
 func (m *mockAddGroup) Tag() string { return "auto-test" }
+
+func TestCreateOutboundForGroup_FailedAddKeepsCleanup(t *testing.T) {
+	logger := log.NewNOPFactory().Logger()
+	tag := "outbound"
+	newMgr := func(group lbAdapter.MutableOutboundGroup) (*MutableGroupManager, *mockOutboundManager) {
+		outMgr := &mockOutboundManager{}
+		return &MutableGroupManager{
+			outboundMgr: outMgr,
+			endpointMgr: &mockEndpointManager{},
+			groups:      map[string]lbAdapter.MutableOutboundGroup{"auto-test": group},
+			removalQueue: newRemovalQueue(
+				logger, outMgr, &mockEndpointManager{}, &mockConnectionManager{}, time.Hour, forceAfter,
+			),
+		}, outMgr
+	}
+	pending := func(mgr *MutableGroupManager) (item, bool) {
+		mgr.removalQueue.mu.RLock()
+		defer mgr.removalQueue.mu.RUnlock()
+		it, ok := mgr.removalQueue.pending[tag]
+		return it, ok
+	}
+	create := func(mgr *MutableGroupManager) error {
+		return mgr.CreateOutboundForGroup(context.Background(), nil, logger, "auto-test", tag, "type", nil)
+	}
+
+	t.Run("pending removal is kept when the add fails", func(t *testing.T) {
+		mgr, _ := newMgr(&mockAddGroup{addErr: lbAdapter.ErrGroupClosed})
+		queued := item{tag: tag, addedAt: time.Now().Add(-time.Minute)}
+		mgr.removalQueue.pending[tag] = queued
+		assert.ErrorIs(t, create(mgr), lbAdapter.ErrGroupClosed)
+		it, ok := pending(mgr)
+		assert.True(t, ok, "the queued removal must not be cancelled")
+		assert.Equal(t, queued, it)
+	})
+
+	t.Run("an unreferenced new outbound is queued for removal", func(t *testing.T) {
+		mgr, outMgr := newMgr(&mockAddGroup{addErr: lbAdapter.ErrGroupClosed})
+		defer mgr.Close()
+		assert.Error(t, create(mgr))
+		assert.Eventually(t, func() bool {
+			outMgr.mu.Lock()
+			defer outMgr.mu.Unlock()
+			return !slices.Contains(outMgr.tags, tag)
+		}, 5*time.Second, 10*time.Millisecond, "the new outbound joined no group and must be cleaned up")
+	})
+
+	t.Run("an outbound already in the group still cancels the removal", func(t *testing.T) {
+		mgr, _ := newMgr(&mockAddGroup{addN: 0, fixedN: true})
+		mgr.removalQueue.pending[tag] = item{tag: tag, addedAt: time.Now()}
+		assert.Error(t, create(mgr), "Add reports the existing member as not added")
+		_, ok := pending(mgr)
+		assert.False(t, ok, "the group references the new outbound under its tag")
+	})
+}
