@@ -722,12 +722,12 @@ func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound, excl
 
 // testURLForTag returns the URL to use when testing the given outbound tag.
 // If the tag has a per-outbound override, that URL is returned; otherwise the
-// group's default URL is used.
+// group's default URL is used. Callers must not hold g.access.
 func (g *urlTestGroup) testURLForTag(tag string) string {
-	if g.urlOverrides != nil {
-		if override, ok := g.urlOverrides[tag]; ok {
-			return override
-		}
+	g.access.Lock()
+	defer g.access.Unlock()
+	if override, ok := g.urlOverrides[tag]; ok {
+		return override
 	}
 	return g.url
 }

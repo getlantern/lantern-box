@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"testing"
 	"time"
@@ -193,6 +194,32 @@ func TestSetURLOverrides_DoesNotMutateCallerMap(t *testing.T) {
 	// Mutating the caller's map after SetURLOverrides should not affect the group
 	callerMap["out1"] = "https://mutated.example.com"
 	assert.Equal(t, "https://original.example.com", g.testURLForTag("out1"))
+}
+
+func TestTestURLForTag_ConcurrentWithSetURLOverrides(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{"out1": nil}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"out1"},
+		"https://default.example.com",
+		nil,
+		time.Minute, time.Minute, 50,
+	)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 1000 {
+			g.SetURLOverrides(map[string]string{fmt.Sprintf("out%d", i): "https://override.example.com"})
+		}
+	}()
+	for range 1000 {
+		g.testURLForTag("out1")
+	}
+	<-done
 }
 
 func TestTestURLForTag_WithOverrides(t *testing.T) {
