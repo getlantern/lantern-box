@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service/pause"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestURLTestGroup_CloseStopsCheckLoop(t *testing.T) {
@@ -477,4 +478,60 @@ func TestAppendClientDelay_InvalidURL(t *testing.T) {
 	// Invalid URLs are returned unchanged
 	bad := "://not-a-url"
 	assert.Equal(t, bad, appendClientDelay(bad, 100*time.Millisecond))
+}
+
+// The first check, started by PostStart, runs while members are removed and
+// listed. Run with -race: the check must not read the member list unlocked.
+func TestURLTestGroup_RemoveDuringFirstCheck(t *testing.T) {
+	for range 10 {
+		ctx, cancel := context.WithCancel(context.Background())
+		link, dial := probeServer(t)
+		a := &mockOutbound{tag: "a", dial: dial}
+		b := &mockOutbound{tag: "b", dial: dial}
+		u := newTestURLTest(t, ctx, newSyncOutboundManager(a, b), link, "a", "b")
+		require.NoError(t, u.PostStart())
+
+		listed := make(chan []string)
+		go func() { listed <- u.All() }()
+		n, err := u.Remove("b")
+		require.NoError(t, err)
+		require.Equal(t, 1, n)
+		<-listed
+
+		require.Eventually(t, func() bool { return !u.group.checking.Load() }, 5*time.Second, time.Millisecond)
+		assert.Equal(t, []string{"a"}, u.All())
+		cancel()
+	}
+}
+
+// A deterministic form of TestURLTestGroup_RemoveDuringFirstCheck: the readers
+// run after Remove, ordered only by a sleep, which the race detector does not
+// count as synchronization.
+func TestURLTestGroup_ReadMembersAfterRemove(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	link, dial := probeServer(t)
+	a := &mockOutbound{tag: "a", dial: dial}
+	b := &mockOutbound{tag: "b", dial: dial}
+	u := newTestURLTest(t, ctx, newSyncOutboundManager(a, b), link, "a", "b")
+
+	done := make(chan []string)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_, _ = u.URLTest(ctx)
+		done <- u.All()
+	}()
+	_, err := u.Remove("b")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a"}, <-done)
+}
+
+func TestMutableURLTest_AllReturnsCopy(t *testing.T) {
+	a := &mockOutbound{tag: "a"}
+	b := &mockOutbound{tag: "b"}
+	u := newTestURLTest(t, context.Background(), newSyncOutboundManager(a, b), "", "a", "b")
+	all := u.All()
+	_, err := u.Remove("a")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b"}, all, "a removal must not rewrite a slice already returned")
 }
