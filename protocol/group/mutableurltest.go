@@ -154,7 +154,8 @@ func (s *MutableURLTest) Remove(tags ...string) (n int, err error) {
 	return s.group.Remove(tags)
 }
 
-// SetURLOverrides replaces the per-outbound URL override map used during URL testing.
+// SetURLOverrides merges overrides into the per-outbound URLs used during URL
+// testing. An override lasts until its tag is removed from the group.
 func (s *MutableURLTest) SetURLOverrides(overrides map[string]string) {
 	s.group.SetURLOverrides(overrides)
 }
@@ -362,7 +363,7 @@ func newURLTestGroup(
 		logger:       logger,
 		tags:         tags,
 		url:          link,
-		urlOverrides: urlOverrides,
+		urlOverrides: maps.Clone(urlOverrides),
 		history:      history,
 		interval:     interval,
 		idleTimeout:  idleTimeout,
@@ -494,7 +495,7 @@ func (g *urlTestGroup) Replace(tags []string) (n int, err error) {
 		// A nested group probes its own members.
 		if _, isGroup := outbound.(A.OutboundGroup); !isGroup && g.started {
 			g.awaitingProbe.Store(tag, outbound)
-			go g.probeReplacement(tag, outbound, g.testURLForTag(tag))
+			go g.probeReplacement(tag, outbound, g.testURLForTagLocked(tag))
 		}
 		g.replaceSelected(&g.selectedOutboundTCP, "tcp", old, outbound)
 		g.replaceSelected(&g.selectedOutboundUDP, "udp", old, outbound)
@@ -531,12 +532,16 @@ func (g *urlTestGroup) SetURLOverrides(overrides map[string]string) {
 	// Probes check their URL is current under selection when storing a result.
 	g.selection.Lock()
 	defer g.selection.Unlock()
-	g.urlOverrides = maps.Clone(overrides)
-	// Clear URL test history for overridden tags so the next test cycle
-	// re-tests them with the new callback URLs. Without this, outbounds
-	// tested recently (within the configured interval) with OLD URLs would be
-	// skipped, and the new bandit probe callbacks would never fire.
-	for tag := range overrides {
+	if g.urlOverrides == nil {
+		g.urlOverrides = make(map[string]string, len(overrides))
+	}
+	for tag, u := range overrides {
+		if old, ok := g.urlOverrides[tag]; ok && old == u {
+			continue
+		}
+		g.urlOverrides[tag] = u
+		// Otherwise a tag tested within the interval is skipped and never
+		// probes its new URL.
 		g.history.DeleteURLTestHistory(tag)
 	}
 }
@@ -561,6 +566,7 @@ func (g *urlTestGroup) Remove(tags []string) (n int, err error) {
 			continue
 		}
 		g.outbounds.Delete(tag)
+		delete(g.urlOverrides, tag)
 		g.history.DeleteURLTestHistory(tag)
 		g.awaitingProbe.Delete(tag)
 		n++
@@ -698,9 +704,7 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			g.logger.Trace("skipping outbound", "tag", realTag, "reason", "not found")
 			continue
 		}
-		g.selection.Lock()
 		testURL := g.testURLForTag(tag)
-		g.selection.Unlock()
 		baseURL := testURL
 		member := outbound
 		b.Go(realTag, func() (any, error) {
@@ -724,7 +728,7 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 				return nil, nil
 			}
 			// SetURLOverrides reset the history for a new URL; the next test uses it.
-			if g.testURLForTag(tag) != baseURL {
+			if g.testURLForTagLocked(tag) != baseURL {
 				g.logger.Debug("dropping result for overridden URL", "tag", realTag)
 				return nil, nil
 			}
@@ -761,7 +765,7 @@ func (g *urlTestGroup) probeReplacement(tag string, member A.Outbound, testURL s
 		g.logger.Debug("dropping result for replaced outbound", "tag", tag)
 		return
 	}
-	if currentURL := g.testURLForTag(tag); currentURL != testURL {
+	if currentURL := g.testURLForTagLocked(tag); currentURL != testURL {
 		// The member stays awaiting its probe; probe it again with the new URL.
 		g.selection.Unlock()
 		g.logger.Debug("reprobing replaced outbound with overridden URL", "tag", tag)
@@ -869,12 +873,18 @@ func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound, excl
 
 // testURLForTag returns the URL to use when testing the given outbound tag.
 // If the tag has a per-outbound override, that URL is returned; otherwise the
-// group's default URL is used.
+// group's default URL is used. Callers must not hold g.selection.
 func (g *urlTestGroup) testURLForTag(tag string) string {
-	if g.urlOverrides != nil {
-		if override, ok := g.urlOverrides[tag]; ok {
-			return override
-		}
+	g.selection.Lock()
+	defer g.selection.Unlock()
+	return g.testURLForTagLocked(tag)
+}
+
+// testURLForTagLocked is testURLForTag for callers holding g.selection or
+// g.access; the overrides change only under both.
+func (g *urlTestGroup) testURLForTagLocked(tag string) string {
+	if override, ok := g.urlOverrides[tag]; ok {
+		return override
 	}
 	return g.url
 }
