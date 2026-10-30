@@ -81,7 +81,9 @@ func (m *MutableGroupManager) OutboundGroups() []adapter.MutableOutboundGroup {
 	return slices.Collect(maps.Values(m.groups))
 }
 
-// CreateOutboundForGroup creates an outbound and adds it to the specified group.
+// CreateOutboundForGroup creates an outbound and adds it to the specified group. If the group
+// already holds the tag and implements [adapter.MemberReplacer], the new outbound is swapped in
+// for the one it replaced.
 func (m *MutableGroupManager) CreateOutboundForGroup(
 	ctx context.Context,
 	router A.Router,
@@ -130,6 +132,7 @@ func (m *MutableGroupManager) createForGroup(
 	var (
 		createErr, addErr error
 		referenced        bool
+		memberExisted     bool
 	)
 	// Hold off the removal queue so a removal of the tag queued before it was
 	// re-created can't remove the new outbound before it is cancelled.
@@ -139,9 +142,15 @@ func (m *MutableGroupManager) createForGroup(
 		}
 		var n int
 		n, addErr = outGroup.Add(tag)
-		// n == 0 without an error means the group already holds the tag, and
-		// so now the new outbound under it.
-		referenced = addErr == nil
+		if addErr == nil && n == 0 {
+			// The group already holds the tag, still with the outbound the new
+			// one replaced; swap the new one in where the group supports it.
+			if replacer, ok := outGroup.(adapter.MemberReplacer); ok {
+				n, addErr = replacer.Replace(tag)
+			}
+			memberExisted = true
+		}
+		referenced = addErr == nil && n > 0
 		if addErr == nil && n == 0 {
 			addErr = errors.New("unknown")
 		}
@@ -151,7 +160,8 @@ func (m *MutableGroupManager) createForGroup(
 		return createErr
 	}
 	if addErr != nil {
-		if !referenced {
+		// A tag the group still holds by name isn't cleaned up from here.
+		if !referenced && !memberExisted {
 			// The new outbound joined no group; keep any queued removal of the
 			// tag, or queue one, so it doesn't stay registered until shutdown.
 			m.removalQueue.enqueue(tag, isEndpoint)

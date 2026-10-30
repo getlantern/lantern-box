@@ -643,11 +643,32 @@ func TestCreateOutboundForGroup_FailedAddKeepsCleanup(t *testing.T) {
 		}, 5*time.Second, 10*time.Millisecond, "the new outbound joined no group and must be cleaned up")
 	})
 
-	t.Run("an outbound already in the group still cancels the removal", func(t *testing.T) {
+	t.Run("a group that can't replace keeps the removal of an existing member's tag", func(t *testing.T) {
 		mgr, _ := newMgr(&mockAddGroup{addN: 0, fixedN: true})
 		mgr.removalQueue.pending[tag] = item{tag: tag, addedAt: time.Now()}
-		assert.Error(t, create(mgr), "Add reports the existing member as not added")
+		assert.Error(t, create(mgr), "the group still holds the old outbound")
 		_, ok := pending(mgr)
-		assert.False(t, ok, "the group references the new outbound under its tag")
+		assert.True(t, ok, "the group doesn't hold the new outbound, so its removal must not be cancelled")
 	})
+
+	t.Run("an existing member is replaced with the new outbound", func(t *testing.T) {
+		group := &mockAddReplacerGroup{mockAddGroup: mockAddGroup{addN: 0, fixedN: true}}
+		mgr, _ := newMgr(group)
+		mgr.removalQueue.pending[tag] = item{tag: tag, addedAt: time.Now()}
+		require.NoError(t, create(mgr))
+		assert.Equal(t, []string{tag}, group.replaced, "the group must swap in the new outbound")
+		_, ok := pending(mgr)
+		assert.False(t, ok, "the group now holds the new outbound")
+	})
+}
+
+// mockAddReplacerGroup is a mockAddGroup that also implements MemberReplacer.
+type mockAddReplacerGroup struct {
+	mockAddGroup
+	replaced []string
+}
+
+func (m *mockAddReplacerGroup) Replace(tags ...string) (int, error) {
+	m.replaced = append(m.replaced, tags...)
+	return len(tags), nil
 }
