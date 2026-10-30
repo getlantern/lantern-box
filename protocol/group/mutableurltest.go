@@ -55,6 +55,7 @@ const maxOutboundAttempts = 3
 
 var (
 	_ adapter.MutableOutboundGroup = (*MutableURLTest)(nil)
+	_ adapter.MemberReplacer       = (*MutableURLTest)(nil)
 	_ A.InterfaceUpdateListener    = (*MutableURLTest)(nil)
 	_ A.ConnectionHandlerEx        = (*MutableURLTest)(nil)
 	_ A.PacketConnectionHandlerEx  = (*MutableURLTest)(nil)
@@ -139,6 +140,13 @@ func (s *MutableURLTest) All() []string {
 // outbound tag already exists, it will be ignored.
 func (s *MutableURLTest) Add(tags ...string) (n int, err error) {
 	return s.group.Add(tags)
+}
+
+// Replace swaps in the outbound manager's current outbound for each given tag already in the group
+// and returns the number of members replaced. Tags not in the group are ignored. See
+// [urlTestGroup.Replace].
+func (s *MutableURLTest) Replace(tags ...string) (n int, err error) {
+	return s.group.Replace(tags)
 }
 
 // Remove removes the given outbound tags from the group and returns the number of outbounds removed.
@@ -316,6 +324,12 @@ type urlTestGroup struct {
 	selectedOutboundUDP common.TypedValue[A.Outbound]
 	access              sync.Mutex
 	checking            atomic.Bool
+	// selection serializes computing and publishing the selection, and
+	// storing probe results, with Replace swapping members.
+	selection sync.Mutex
+	// awaitingProbe maps a replaced member's tag to the new outbound while its
+	// first probe is in flight, so selection keeps it despite having no history.
+	awaitingProbe isync.TypedMap[string, A.Outbound]
 	started             bool
 	isAlive             bool
 	idleTimer           *time.Timer
@@ -429,8 +443,10 @@ func (g *urlTestGroup) Add(tags []string) (n int, err error) {
 			missing = append(missing, tag)
 			continue
 		}
+		g.selection.Lock()
 		g.outbounds.Store(tag, outbound)
 		g.tags = append(g.tags, tag)
+		g.selection.Unlock()
 		n++
 	}
 	if len(missing) > 0 {
@@ -439,9 +455,83 @@ func (g *urlTestGroup) Add(tags []string) (n int, err error) {
 	return n, nil
 }
 
+// Replace re-resolves each given member tag from the outbound manager and swaps the new outbound
+// into the group in place, for an outbound recreated under the same tag. The tag never leaves the
+// group, so the group never empties. A replaced member's URL-test history is dropped and, once the
+// group has started, the new outbound is probed in the background, independently of any running
+// test. If the replaced member was
+// selected, the selection moves to the new outbound and stays there until that probe's result is
+// evaluated by the normal selection logic. Tags not in the group are ignored; a member missing from
+// the outbound manager keeps its current outbound and is reported in the error.
+func (g *urlTestGroup) Replace(tags []string) (n int, err error) {
+	g.access.Lock()
+	defer g.access.Unlock()
+
+	if g.isClosed() {
+		return 0, adapter.ErrGroupClosed
+	}
+
+	g.selection.Lock()
+	defer g.selection.Unlock()
+
+	var missing []string
+	for _, tag := range tags {
+		old, exists := g.outbounds.Load(tag)
+		if !exists {
+			continue
+		}
+		outbound, found := g.outboundMgr.Outbound(tag)
+		if !found {
+			missing = append(missing, tag)
+			continue
+		}
+		n++
+		if outbound == old {
+			continue
+		}
+		g.outbounds.Store(tag, outbound)
+		g.history.DeleteURLTestHistory(tag)
+		g.awaitingProbe.Delete(tag)
+		// A nested group probes its own members.
+		if _, isGroup := outbound.(A.OutboundGroup); !isGroup && g.started {
+			g.awaitingProbe.Store(tag, outbound)
+			go g.probeReplacement(tag, outbound, g.testURLForTagLocked(tag))
+		}
+		g.replaceSelected(&g.selectedOutboundTCP, "tcp", old, outbound)
+		g.replaceSelected(&g.selectedOutboundUDP, "udp", old, outbound)
+		g.logger.Debug("replaced outbound", "tag", tag)
+	}
+	if len(missing) > 0 {
+		return n, fmt.Errorf("%d outbounds not found: %v", len(missing), missing)
+	}
+	return n, nil
+}
+
+// replaceSelected moves selected from old to its replacement outbound, or, if the replacement
+// doesn't support network, to the best other member that does. Called with selection held.
+func (g *urlTestGroup) replaceSelected(selected *common.TypedValue[A.Outbound], network string, old, outbound A.Outbound) {
+	if selected.Load() != old {
+		return
+	}
+	if slices.Contains(outbound.Network(), network) {
+		selected.Store(outbound)
+		return
+	}
+	selected.Store(g.pickBestOutbound(network, nil, nil))
+}
+
+// isAwaitingProbe reports whether outbound is a replacement whose first probe is in flight.
+func (g *urlTestGroup) isAwaitingProbe(outbound A.Outbound) bool {
+	pending, ok := g.awaitingProbe.Load(outbound.Tag())
+	return ok && pending == outbound
+}
+
 func (g *urlTestGroup) SetURLOverrides(overrides map[string]string) {
 	g.access.Lock()
 	defer g.access.Unlock()
+	// Probes check their URL is current under selection when storing a result.
+	g.selection.Lock()
+	defer g.selection.Unlock()
 	if g.urlOverrides == nil {
 		g.urlOverrides = make(map[string]string, len(overrides))
 	}
@@ -467,6 +557,10 @@ func (g *urlTestGroup) Remove(tags []string) (n int, err error) {
 		return 0, nil
 	}
 
+	// A probe holds selection between checking its member is current and
+	// storing its result, so it can't restore a removed member's history.
+	g.selection.Lock()
+	defer g.selection.Unlock()
 	for _, tag := range tags {
 		if _, exists := g.outbounds.Load(tag); !exists {
 			continue
@@ -474,6 +568,7 @@ func (g *urlTestGroup) Remove(tags []string) (n int, err error) {
 		g.outbounds.Delete(tag)
 		delete(g.urlOverrides, tag)
 		g.history.DeleteURLTestHistory(tag)
+		g.awaitingProbe.Delete(tag)
 		n++
 	}
 	g.tags = g.tags[:0]
@@ -486,7 +581,7 @@ func (g *urlTestGroup) Remove(tags []string) (n int, err error) {
 		default:
 		}
 	}
-	g.updateSelected()
+	g.updateSelectedLocked()
 	return
 }
 
@@ -576,11 +671,11 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	if g.checking.Swap(true) {
 		return result, nil
 	}
+	defer g.checking.Store(false)
 	if len(g.tags) == 0 {
 		return result, nil
 	}
 	g.logger.Trace("checking outbounds...")
-	defer g.checking.Store(false)
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](6))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
@@ -610,6 +705,8 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			continue
 		}
 		testURL := g.testURLForTag(tag)
+		baseURL := testURL
+		member := outbound
 		b.Go(realTag, func() (any, error) {
 			// Compute how long this outbound waited in the worker pool queue.
 			// Append as &cd=<ms> so the server can subtract scheduling overhead
@@ -622,6 +719,19 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			defer cancel()
 			g.logger.Trace("checking outbound", "tag", realTag)
 			t, err := urlTestGET(testCtx, testURL, p)
+			g.selection.Lock()
+			defer g.selection.Unlock()
+			// A member replaced during the test has had its history reset
+			// and a new test queued; this result describes the old instance.
+			if current, _ := g.outbounds.Load(tag); current != member {
+				g.logger.Debug("dropping result for replaced outbound", "tag", realTag)
+				return nil, nil
+			}
+			// SetURLOverrides reset the history for a new URL; the next test uses it.
+			if g.testURLForTagLocked(tag) != baseURL {
+				g.logger.Debug("dropping result for overridden URL", "tag", realTag)
+				return nil, nil
+			}
 			if err != nil {
 				g.logger.Debug("outbound unavailable", "tag", realTag, "error", err)
 				g.history.DeleteURLTestHistory(realTag)
@@ -643,14 +753,52 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	return result, nil
 }
 
+// probeReplacement URL-tests member, which Replace just installed under tag, independently of the
+// group's regular tests. Its result is kept only if member is still the tag's member.
+func (g *urlTestGroup) probeReplacement(tag string, member A.Outbound, testURL string) {
+	ctx, cancel := context.WithTimeout(g.ctx, C.TCPTimeout)
+	defer cancel()
+	t, err := urlTestGET(ctx, testURL, member)
+	g.selection.Lock()
+	if current, _ := g.outbounds.Load(tag); current != member {
+		g.selection.Unlock()
+		g.logger.Debug("dropping result for replaced outbound", "tag", tag)
+		return
+	}
+	if currentURL := g.testURLForTagLocked(tag); currentURL != testURL {
+		// The member stays awaiting its probe; probe it again with the new URL.
+		g.selection.Unlock()
+		g.logger.Debug("reprobing replaced outbound with overridden URL", "tag", tag)
+		go g.probeReplacement(tag, member, currentURL)
+		return
+	}
+	g.awaitingProbe.CompareAndDelete(tag, member)
+	if err != nil {
+		g.logger.Debug("replaced outbound unavailable", "tag", tag, "error", err)
+		g.history.DeleteURLTestHistory(tag)
+	} else {
+		g.logger.Debug("replaced outbound available", "tag", tag, "delay_ms", t)
+		g.history.StoreURLTestHistory(tag, &A.URLTestHistory{Time: time.Now(), Delay: t})
+	}
+	g.selection.Unlock()
+	g.updateSelected()
+}
+
 // markFailedAndReselect drops the URL-test history for outbound and recomputes
 // the selection.
 func (g *urlTestGroup) markFailedAndReselect(outbound A.Outbound) {
+	g.awaitingProbe.CompareAndDelete(outbound.Tag(), outbound)
 	g.history.DeleteURLTestHistory(realTag(outbound))
 	g.updateSelected()
 }
 
 func (g *urlTestGroup) updateSelected() {
+	g.selection.Lock()
+	defer g.selection.Unlock()
+	g.updateSelectedLocked()
+}
+
+func (g *urlTestGroup) updateSelectedLocked() {
 	if len(g.tags) == 0 {
 		g.selectedOutboundTCP.Store(nil)
 		g.selectedOutboundUDP.Store(nil)
@@ -676,10 +824,13 @@ func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound, excl
 		minDelay    uint16
 		minOutbound A.Outbound
 	)
-	if current != nil && !excluded[realTag(current)] {
+	if current != nil && !excluded[realTag(current)] && slices.Contains(current.Network(), network) {
 		if history := g.history.LoadURLTestHistory(realTag(current)); history != nil {
 			minOutbound = current
 			minDelay = history.Delay
+		} else if g.isAwaitingProbe(current) {
+			// A replacement keeps its selection until its first probe lands.
+			return current
 		}
 	}
 	for _, outbound := range g.outbounds.Iter() {
@@ -722,10 +873,16 @@ func (g *urlTestGroup) pickBestOutbound(network string, current A.Outbound, excl
 
 // testURLForTag returns the URL to use when testing the given outbound tag.
 // If the tag has a per-outbound override, that URL is returned; otherwise the
-// group's default URL is used. Callers must not hold g.access.
+// group's default URL is used. Callers must not hold g.selection.
 func (g *urlTestGroup) testURLForTag(tag string) string {
-	g.access.Lock()
-	defer g.access.Unlock()
+	g.selection.Lock()
+	defer g.selection.Unlock()
+	return g.testURLForTagLocked(tag)
+}
+
+// testURLForTagLocked is testURLForTag for callers holding g.selection or
+// g.access; the overrides change only under both.
+func (g *urlTestGroup) testURLForTagLocked(tag string) string {
 	if override, ok := g.urlOverrides[tag]; ok {
 		return override
 	}

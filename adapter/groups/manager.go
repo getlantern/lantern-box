@@ -81,7 +81,9 @@ func (m *MutableGroupManager) OutboundGroups() []adapter.MutableOutboundGroup {
 	return slices.Collect(maps.Values(m.groups))
 }
 
-// CreateOutboundForGroup creates an outbound and adds it to the specified group.
+// CreateOutboundForGroup creates an outbound and adds it to the specified group. If the group
+// already holds the tag and implements [adapter.MemberReplacer], the new outbound is swapped in
+// for the one it replaced.
 func (m *MutableGroupManager) CreateOutboundForGroup(
 	ctx context.Context,
 	router A.Router,
@@ -89,7 +91,7 @@ func (m *MutableGroupManager) CreateOutboundForGroup(
 	group, tag, typ string,
 	options any,
 ) error {
-	return m.createForGroup(ctx, m.outboundMgr, router, logger, group, tag, typ, options)
+	return m.createForGroup(ctx, m.outboundMgr, false, router, logger, group, tag, typ, options)
 }
 
 // CreateEndpointForGroup creates an endpoint and adds it to the specified group.
@@ -100,7 +102,7 @@ func (m *MutableGroupManager) CreateEndpointForGroup(
 	group, tag, typ string,
 	options any,
 ) error {
-	return m.createForGroup(ctx, m.endpointMgr, router, logger, group, tag, typ, options)
+	return m.createForGroup(ctx, m.endpointMgr, true, router, logger, group, tag, typ, options)
 }
 
 type outboundManager interface {
@@ -110,6 +112,7 @@ type outboundManager interface {
 func (m *MutableGroupManager) createForGroup(
 	ctx context.Context,
 	mgr outboundManager,
+	isEndpoint bool,
 	router A.Router,
 	logger log.ContextLogger,
 	group, tag, typ string,
@@ -126,10 +129,46 @@ func (m *MutableGroupManager) createForGroup(
 		return fmt.Errorf("group %s not found", group)
 	}
 
-	if err := mgr.Create(ctx, router, logger, tag, typ, options); err != nil {
-		return err
+	var (
+		createErr, addErr error
+		referenced        bool
+		memberExisted     bool
+	)
+	// Hold off the removal queue so a removal of the tag queued before it was
+	// re-created can't remove the new outbound before it is cancelled.
+	m.removalQueue.cancelIf(tag, func() bool {
+		if createErr = mgr.Create(ctx, router, logger, tag, typ, options); createErr != nil {
+			return false
+		}
+		var n int
+		n, addErr = outGroup.Add(tag)
+		if addErr == nil && n == 0 {
+			// The group already holds the tag, still with the outbound the new
+			// one replaced; swap the new one in where the group supports it.
+			if replacer, ok := outGroup.(adapter.MemberReplacer); ok {
+				n, addErr = replacer.Replace(tag)
+			}
+			memberExisted = true
+		}
+		referenced = addErr == nil && n > 0
+		if addErr == nil && n == 0 {
+			addErr = errors.New("unknown")
+		}
+		return referenced
+	})
+	if createErr != nil {
+		return createErr
 	}
-	return m.addToGroup(outGroup, tag)
+	if addErr != nil {
+		// A tag the group still holds by name isn't cleaned up from here.
+		if !referenced && !memberExisted {
+			// The new outbound joined no group; keep any queued removal of the
+			// tag, or queue one, so it doesn't stay registered until shutdown.
+			m.removalQueue.enqueue(tag, isEndpoint)
+		}
+		return fmt.Errorf("failed to add %s to %s: %w", tag, outGroup.Tag(), addErr)
+	}
+	return nil
 }
 
 func (m *MutableGroupManager) AddToGroup(group, tag string) error {
@@ -147,6 +186,17 @@ func (m *MutableGroupManager) AddToGroup(group, tag string) error {
 }
 
 func (m *MutableGroupManager) addToGroup(outGroup adapter.MutableOutboundGroup, tag string) error {
+	var err error
+	// Hold off the removal queue so a pending removal of the tag can't run
+	// between adding it and cancelling the removal.
+	m.removalQueue.cancelIf(tag, func() bool {
+		err = addTag(outGroup, tag)
+		return err == nil
+	})
+	return err
+}
+
+func addTag(outGroup adapter.MutableOutboundGroup, tag string) error {
 	n, err := outGroup.Add(tag)
 	if err != nil || n == 0 {
 		if err == nil {
@@ -154,8 +204,40 @@ func (m *MutableGroupManager) addToGroup(outGroup adapter.MutableOutboundGroup, 
 		}
 		return fmt.Errorf("failed to add %s to %s: %w", tag, outGroup.Tag(), err)
 	}
-	// remove from removal queue in case it was scheduled for removal
-	m.removalQueue.dequeue(tag)
+	return nil
+}
+
+// ReplaceInGroup swaps the outbound/endpoint currently registered under tag into the specified
+// group in place of the member's old one, for an outbound recreated under the same tag. The group
+// must implement [adapter.MemberReplacer] and tag must already be a member.
+func (m *MutableGroupManager) ReplaceInGroup(group, tag string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed.Load() {
+		return ErrIsClosed
+	}
+	outGroup, found := m.groups[group]
+	if !found {
+		return fmt.Errorf("group %s not found", group)
+	}
+	replacer, ok := outGroup.(adapter.MemberReplacer)
+	if !ok {
+		return fmt.Errorf("group %q does not support replacing members", group)
+	}
+	var n int
+	var err error
+	// Hold off the removal queue so an earlier scheduled removal of the tag
+	// can't remove the new outbound between installing it and cancelling.
+	m.removalQueue.cancelIf(tag, func() bool {
+		n, err = replacer.Replace(tag)
+		return err == nil && n > 0
+	})
+	if err != nil {
+		return fmt.Errorf("failed to replace %s in %s: %w", tag, group, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("failed to replace %s in %s: not a member", tag, group)
+	}
 	return nil
 }
 
@@ -308,6 +390,16 @@ func (rq *removalQueue) dequeue(tag string) {
 	rq.mu.Unlock()
 }
 
+// cancelIf runs fn while no pending removal can run and cancels the pending removal of tag if fn
+// returns true.
+func (rq *removalQueue) cancelIf(tag string, fn func() bool) {
+	rq.mu.Lock()
+	defer rq.mu.Unlock()
+	if fn() {
+		delete(rq.pending, tag)
+	}
+}
+
 func (rq *removalQueue) checkLoop() {
 	if !rq.running.CompareAndSwap(false, true) {
 		return
@@ -341,7 +433,7 @@ func (rq *removalQueue) checkPending() {
 	maps.Copy(pending, rq.pending)
 	rq.mu.RUnlock()
 
-	hasConns := make(map[string]bool, len(rq.pending))
+	hasConns := make(map[string]bool, len(pending))
 	for _, conn := range rq.connMgr.Connections() {
 		if _, exists := pending[conn.Outbound]; exists {
 			hasConns[conn.Outbound] = hasConns[conn.Outbound] || conn.ClosedAt.IsZero()
