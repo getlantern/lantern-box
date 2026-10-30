@@ -6,7 +6,7 @@ metadata:
     - "Lantern Team <dev@getlantern.org>"
   description: Lantern Box
   homepage: "https://github.com/getlantern/lantern-box"
-  license: "GPL"
+  license: "GPL-3.0-or-later"
 
 builds:
   - id: amd64
@@ -90,12 +90,14 @@ nfpms:
       Lantern Box
     vendor: "Brave New Software"
     homepage: "https://github.com/getlantern/lantern-box"
-    license: "GPL"
+    license: "GPL-3.0-or-later"
     contents:
       - src: cmd/release/lantern-box.service
         dst: /usr/lib/systemd/system/lantern-box.service
       - src: cmd/release/lantern-box@.service
         dst: /usr/lib/systemd/system/lantern-box@.service
+      - src: LICENSE
+        dst: /usr/share/doc/lantern-box/LICENSE
 
   # Backward-compatible package for Gemfury consumers (e.g. private server feature).
   # Same binary and service files, just published under the old name.
@@ -110,12 +112,14 @@ nfpms:
       Lantern Box (legacy sing-box-extensions package name)
     vendor: "Brave New Software"
     homepage: "https://github.com/getlantern/lantern-box"
-    license: "GPL"
+    license: "GPL-3.0-or-later"
     contents:
       - src: cmd/release/lantern-box.service
         dst: /usr/lib/systemd/system/sing-box-extensions.service
       - src: cmd/release/lantern-box@.service
         dst: /usr/lib/systemd/system/sing-box-extensions@.service
+      - src: LICENSE
+        dst: /usr/share/doc/sing-box-extensions/LICENSE
 
 furies:
   - account: getlantern
