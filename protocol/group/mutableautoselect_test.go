@@ -568,7 +568,7 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 		overrides map[string]string
 	}{
 		{"changed", map[string]string{"a": "https://override.example/a?token=2", "b": "https://override.example/b"}},
-		{"removed", map[string]string{"b": "https://override.example/b"}},
+		{"partial", map[string]string{"a": "https://override.example/a?token=2"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -585,6 +585,7 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 			s.access.Unlock()
 
 			s.SetURLOverrides(tt.overrides)
+			assert.Equal(t, "https://override.example/b", s.probeURLForLocked("b"), "an omitted or unchanged override is kept")
 
 			h, ok := s.peekHistoryLocked("a")
 			require.True(t, ok, "a changed override keeps the member's history")
@@ -605,6 +606,16 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 			assert.Equal(t, "a", jobs[0].outbound.Tag())
 		})
 	}
+}
+
+func TestRemove_DeletesURLOverride(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	s.SetURLOverrides(map[string]string{"a": "https://override.example/a", "b": "https://override.example/b"})
+
+	n, err := s.Remove("a")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	assert.Equal(t, map[string]string{"b": "https://override.example/b"}, s.urlOverrides)
 }
 
 func TestSetURLOverrides_MarksPersistedOnlyEntryStale(t *testing.T) {
