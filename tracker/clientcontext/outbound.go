@@ -52,9 +52,9 @@ func canWrapOutbound(out adapter.Outbound) bool {
 	}
 	switch out.(type) {
 	case adapter.OutboundGroup,
-		adapter.ConnectionHandlerEx,
-		adapter.PacketConnectionHandlerEx,
-		adapter.DirectRouteOutbound,
+		adapter.ConnectionHandler,
+		adapter.PacketConnectionHandler,
+		adapter.FlowOutbound,
 		adapter.OutboundWithPreferredRoutes,
 		dialer.DirectDialer,
 		dialer.ParallelInterfaceDialer,
@@ -129,9 +129,9 @@ func (o *outbound) Close() error {
 	return common.Close(o.Outbound)
 }
 
-func (o *outbound) InterfaceUpdated() {
+func (o *outbound) InterfaceUpdated(ctx context.Context) {
 	if listener, ok := o.Outbound.(adapter.InterfaceUpdateListener); ok {
-		listener.InterfaceUpdated()
+		listener.InterfaceUpdated(ctx)
 	}
 }
 

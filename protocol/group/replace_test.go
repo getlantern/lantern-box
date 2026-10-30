@@ -409,14 +409,14 @@ func TestMutableURLTest_ReplaceIgnoresMissingTagsAndClosedGroup(t *testing.T) {
 // of a tag reads the stored value and then blocks until released, holding a
 // selection computation mid-pick.
 type blockingHistory struct {
-	adapter.URLTestHistoryStorage
+	urlTestHistoryStorage
 	armedTag atomic.Value
 	blocked  chan struct{}
 	release  chan struct{}
 }
 
 func (h *blockingHistory) LoadURLTestHistory(tag string) *adapter.URLTestHistory {
-	v := h.URLTestHistoryStorage.LoadURLTestHistory(tag)
+	v := h.urlTestHistoryStorage.LoadURLTestHistory(tag)
 	if armed, _ := h.armedTag.Load().(string); armed == tag && h.armedTag.CompareAndSwap(tag, "") {
 		close(h.blocked)
 		<-h.release
@@ -433,7 +433,7 @@ func TestURLTestGroup_ReplaceDuringSelectionUpdatePublishesCurrentMember(t *test
 	u := newTestURLTest(t, ctx, mgr, "http://127.0.0.1:1", "a", "b")
 	g := u.group
 	history := &blockingHistory{
-		URLTestHistoryStorage: g.history,
+		urlTestHistoryStorage: g.history,
 		blocked:               make(chan struct{}),
 		release:               make(chan struct{}),
 	}
@@ -735,7 +735,7 @@ func TestURLTestGroup_ReplaceWithNarrowerNetworks(t *testing.T) {
 // blockingStore blocks the first history write for a tag once armed, holding
 // a probe between its still-current check and its write.
 type blockingStore struct {
-	adapter.URLTestHistoryStorage
+	urlTestHistoryStorage
 	armedTag atomic.Value
 	blocked  chan struct{}
 	release  chan struct{}
@@ -746,7 +746,7 @@ func (h *blockingStore) StoreURLTestHistory(tag string, history *adapter.URLTest
 		close(h.blocked)
 		<-h.release
 	}
-	h.URLTestHistoryStorage.StoreURLTestHistory(tag, history)
+	h.urlTestHistoryStorage.StoreURLTestHistory(tag, history)
 }
 
 func TestURLTestGroup_RemoveDuringReplacementProbeWrite(t *testing.T) {
@@ -759,7 +759,7 @@ func TestURLTestGroup_RemoveDuringReplacementProbeWrite(t *testing.T) {
 	u := startedURLTest(t, ctx, mgr, link, "a", "b")
 	g := u.group
 	history := &blockingStore{
-		URLTestHistoryStorage: g.history,
+		urlTestHistoryStorage: g.history,
 		blocked:               make(chan struct{}),
 		release:               make(chan struct{}),
 	}

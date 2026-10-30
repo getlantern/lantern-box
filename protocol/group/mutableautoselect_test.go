@@ -1606,7 +1606,7 @@ func TestInterfaceUpdated_TriggersReprobe(t *testing.T) {
 		}
 	}).Return(nil, errors.New("dial denied"))
 
-	s.InterfaceUpdated()
+	s.InterfaceUpdated(context.Background())
 
 	select {
 	case <-dialed:
@@ -2019,7 +2019,7 @@ func TestKeepAlive_RestartSkipsProbeWhilePaused(t *testing.T) {
 		synctest.Wait()
 		assert.Zero(t, dials.Load(), "a wake alone leaves the probe to the network reset after it")
 
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		synctest.Wait()
 		assert.EqualValues(t, 1, dials.Load(), "the network reset after the wake probes")
 	})
@@ -2033,7 +2033,7 @@ func TestReprobeTriggers_WaitForProbeInFlight(t *testing.T) {
 		{"restart", keepAlive},
 		{"network change", func(s *MutableAutoSelect) {
 			s.probing = true
-			s.InterfaceUpdated()
+			s.InterfaceUpdated(context.Background())
 		}},
 	}
 	for _, tt := range tests {
@@ -2054,7 +2054,7 @@ func TestInterfaceUpdated_IdleDefersProbeToNextUse(t *testing.T) {
 		s, dials := newIdleTestMUR(t)
 		s.lastActive = time.Now()
 
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		synctest.Wait()
 		assert.Zero(t, dials.Load(), "an idle group must not probe on a network change")
 
@@ -2138,7 +2138,7 @@ func TestReprobe_SkipsIfPausedWhileWaiting(t *testing.T) {
 	pm := withPauseManager(s)
 	s.probing = true
 	s.probeMu.Lock()
-	s.InterfaceUpdated()
+	s.InterfaceUpdated(context.Background())
 	require.Eventually(t, s.reprobePending.Load, 2*time.Second, 5*time.Millisecond)
 	pm.NetworkPause()
 	s.probeMu.Unlock()
@@ -2159,12 +2159,12 @@ func TestInterfaceUpdated_SkipsWhilePaused(t *testing.T) {
 
 		// sing-box resets the network on suspend as well as on resume.
 		pm.DevicePause()
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		synctest.Wait()
 		assert.EqualValues(t, 1, dials.Load(), "a network reset while paused must not probe")
 
 		pm.DeviceWake()
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		synctest.Wait()
 		assert.EqualValues(t, 2, dials.Load())
 	})
@@ -2296,7 +2296,7 @@ func TestNetworkChangeMidProbe_DiscardsExhaustion(t *testing.T) {
 
 				go tt.run(s)
 				time.Sleep(100 * time.Millisecond)
-				s.InterfaceUpdated()
+				s.InterfaceUpdated(context.Background())
 				time.Sleep(time.Second)
 				synctest.Wait()
 				assert.False(t, exhausted(s), "a probe that measured the old network must not signal exhaustion")

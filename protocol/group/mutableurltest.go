@@ -57,8 +57,9 @@ var (
 	_ adapter.MutableOutboundGroup = (*MutableURLTest)(nil)
 	_ adapter.MemberReplacer       = (*MutableURLTest)(nil)
 	_ A.InterfaceUpdateListener    = (*MutableURLTest)(nil)
-	_ A.ConnectionHandlerEx        = (*MutableURLTest)(nil)
-	_ A.PacketConnectionHandlerEx  = (*MutableURLTest)(nil)
+	_ A.URLTestGroup               = (*MutableURLTest)(nil)
+	_ A.ConnectionHandler          = (*MutableURLTest)(nil)
+	_ A.PacketConnectionHandler    = (*MutableURLTest)(nil)
 )
 
 type MutableURLTest struct {
@@ -117,7 +118,7 @@ func (s *MutableURLTest) Close() error {
 	return s.group.Close()
 }
 
-func (s *MutableURLTest) InterfaceUpdated() {
+func (s *MutableURLTest) InterfaceUpdated(ctx context.Context) {
 	s.logger.Info("interface updated, restarting URL tests")
 	s.group.onInterfaceUpdated()
 }
@@ -162,6 +163,14 @@ func (s *MutableURLTest) SetURLOverrides(overrides map[string]string) {
 
 func (s *MutableURLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return s.group.URLTest(ctx)
+}
+
+// PerformUpdateCheck re-picks the selected outbounds from the current
+// URL-test history. It holds the group lock so it can't race Add or Remove.
+func (s *MutableURLTest) PerformUpdateCheck() {
+	s.group.access.Lock()
+	defer s.group.access.Unlock()
+	s.group.updateSelected()
 }
 
 func (s *MutableURLTest) CheckOutbounds() {
@@ -299,12 +308,18 @@ func (s *MutableURLTest) selectOutbound(network string, excluded map[string]bool
 	return outbound, nil
 }
 
-func (s *MutableURLTest) NewConnectionEx(ctx context.Context, conn net.Conn, metadata A.InboundContext, onClose N.CloseHandlerFunc) {
+func (s *MutableURLTest) NewConnection(ctx context.Context, conn net.Conn, metadata A.InboundContext, onClose N.CloseHandlerFunc) {
 	s.connMgr.NewConnection(ctx, s, conn, metadata, onClose)
 }
 
-func (s *MutableURLTest) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata A.InboundContext, onClose N.CloseHandlerFunc) {
+func (s *MutableURLTest) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata A.InboundContext, onClose N.CloseHandlerFunc) {
 	s.connMgr.NewPacketConnection(ctx, s, conn, metadata, onClose)
+}
+
+type urlTestHistoryStorage interface {
+	LoadURLTestHistory(tag string) *A.URLTestHistory
+	StoreURLTestHistory(tag string, history *A.URLTestHistory)
+	DeleteURLTestHistory(tag string)
 }
 
 type urlTestGroup struct {
@@ -319,7 +334,7 @@ type urlTestGroup struct {
 	interval            time.Duration
 	tolerance           uint16
 	idleTimeout         time.Duration
-	history             A.URLTestHistoryStorage
+	history             urlTestHistoryStorage
 	selectedOutboundTCP common.TypedValue[A.Outbound]
 	selectedOutboundUDP common.TypedValue[A.Outbound]
 	access              sync.Mutex
@@ -349,12 +364,8 @@ func newURLTestGroup(
 	tolerance uint16,
 ) *urlTestGroup {
 	ctx, cancel := context.WithCancel(ctx)
-	var history A.URLTestHistoryStorage
-	if historyFromCtx := service.FromContext[A.URLTestHistoryStorage](ctx); historyFromCtx != nil {
-		history = historyFromCtx
-	} else if clashServer := service.FromContext[A.ClashServer](ctx); clashServer != nil {
-		history = clashServer.HistoryStorage()
-	} else {
+	history := service.PtrFromContext[urltest.HistoryStorage](ctx)
+	if history == nil {
 		history = urltest.NewHistoryStorage()
 	}
 	return &urlTestGroup{

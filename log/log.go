@@ -86,6 +86,10 @@ func (f *factory) Level() log.Level {
 // so this method is a no-op.
 func (f *factory) SetLevel(level log.Level) {}
 
+// AttachPlatformWriter implements the [Factory] interface. Output goes to the [slog.Handler], so
+// this method is a no-op.
+func (f *factory) AttachPlatformWriter(writer log.PlatformWriter) {}
+
 // Logger implements the [Factory] interface and returns a [log.ContextLogger] with an empty tag.
 func (f *factory) Logger() log.ContextLogger {
 	return &slogLogger{factory: f}
