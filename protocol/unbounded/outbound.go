@@ -164,8 +164,14 @@ func NewOutbound(
 	// them: the pool consumers the bandit assigns read the same context, and
 	// if they joined her rooms too she would hold up to twice her helpers'
 	// slots.
+	//
+	// That consumer is also rooms-only: it answers only her helpers' room
+	// genesis messages and never falls back to the stranger pool, which
+	// would route a personal proxy through strangers. With no helper online
+	// it has no connection; the bandit's pool outbounds cover that case.
 	if lbAdapter.IsHelperTag(tag) {
 		rtcOpt.RoomTicketSource = lbAdapter.RoomTicketSourceFromContext(ctx)
+		rtcOpt.ConsumerRoomsOnly = true
 	}
 
 	o := &Outbound{

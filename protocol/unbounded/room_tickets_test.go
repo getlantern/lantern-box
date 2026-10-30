@@ -32,6 +32,7 @@ func TestNewOutbound_RoomTicketSourceOnlyForHelperTags(t *testing.T) {
 	assert.Equal(t, []string{"a.b"}, helper.rtcOpt.CurrentRoomTickets())
 	assert.Equal(t, []string{"a.b"}, helper.rtcOpt.CurrentRoomTickets())
 	assert.Equal(t, 2, calls, "broflake reads the source on every subscribe")
+	assert.True(t, helper.rtcOpt.ConsumerRoomsOnly, "a helper- outbound never falls back to the pool")
 
 	for _, tag := range []string{
 		"unbounded-out-pool1", "", "helper", "xhelper-0123456789ab",
@@ -40,6 +41,7 @@ func TestNewOutbound_RoomTicketSourceOnlyForHelperTags(t *testing.T) {
 		pool := newTestOutbound(t, ctx, tag)
 		assert.Nil(t, pool.rtcOpt.RoomTicketSource, "tag %q must not present the inviter's tickets", tag)
 		assert.Empty(t, pool.rtcOpt.CurrentRoomTickets(), "tag %q", tag)
+		assert.False(t, pool.rtcOpt.ConsumerRoomsOnly, "tag %q must answer pool genesis", tag)
 	}
 	assert.Equal(t, 2, calls, "non-helper outbounds never read the source")
 }
@@ -48,4 +50,5 @@ func TestNewOutbound_HelperTagWithoutSource(t *testing.T) {
 	o := newTestOutbound(t, context.Background(), "helper-0123456789ab")
 	assert.Nil(t, o.rtcOpt.RoomTicketSource)
 	assert.Empty(t, o.rtcOpt.CurrentRoomTickets())
+	assert.True(t, o.rtcOpt.ConsumerRoomsOnly, "rooms-only follows the tag, not the presence of tickets")
 }
