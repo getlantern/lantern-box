@@ -385,7 +385,7 @@ func (rq *removalQueue) checkPending() {
 	maps.Copy(pending, rq.pending)
 	rq.mu.RUnlock()
 
-	hasConns := make(map[string]bool, len(rq.pending))
+	hasConns := make(map[string]bool, len(pending))
 	for _, conn := range rq.connMgr.Connections() {
 		if _, exists := pending[conn.Outbound]; exists {
 			hasConns[conn.Outbound] = hasConns[conn.Outbound] || conn.ClosedAt.IsZero()

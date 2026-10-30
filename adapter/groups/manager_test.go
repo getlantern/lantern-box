@@ -3,6 +3,7 @@ package groups
 import (
 	"errors"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -465,4 +466,29 @@ func (m *mockConnectionManager) Connections() []trafficontrol.TrackerMetadata {
 		return nil
 	}
 	return m.conns
+}
+
+func TestRemovalQueue_CheckPendingConcurrentWithEnqueue(t *testing.T) {
+	rq := newRemovalQueue(
+		log.NewNOPFactory().Logger(), &mockOutboundManager{}, &mockEndpointManager{},
+		&mockConnectionManager{}, time.Hour, time.Hour,
+	)
+	defer rq.close()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 2000 {
+			rq.checkPending()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := range 2000 {
+			tag := "tag" + strconv.Itoa(i%10)
+			rq.enqueue(tag, false)
+			rq.dequeue(tag)
+		}
+	}()
+	wg.Wait()
 }
