@@ -523,7 +523,8 @@ func TestURLTestGroup_ReadMembersAfterRemove(t *testing.T) {
 	}()
 	_, err := u.Remove("b")
 	require.NoError(t, err)
-	assert.Equal(t, []string{"a"}, <-done)
+	<-done
+	assert.Equal(t, []string{"a"}, u.All())
 }
 
 func TestMutableURLTest_AllReturnsCopy(t *testing.T) {
