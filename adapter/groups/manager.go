@@ -126,10 +126,20 @@ func (m *MutableGroupManager) createForGroup(
 		return fmt.Errorf("group %s not found", group)
 	}
 
-	if err := mgr.Create(ctx, router, logger, tag, typ, options); err != nil {
-		return err
+	var createErr, addErr error
+	// Hold off the removal queue so a removal of the tag queued before it was
+	// re-created can't remove the new outbound before it is cancelled.
+	m.removalQueue.cancelIf(tag, func() bool {
+		if createErr = mgr.Create(ctx, router, logger, tag, typ, options); createErr != nil {
+			return false
+		}
+		addErr = addTag(outGroup, tag)
+		return true
+	})
+	if createErr != nil {
+		return createErr
 	}
-	return m.addToGroup(outGroup, tag)
+	return addErr
 }
 
 func (m *MutableGroupManager) AddToGroup(group, tag string) error {
@@ -147,6 +157,17 @@ func (m *MutableGroupManager) AddToGroup(group, tag string) error {
 }
 
 func (m *MutableGroupManager) addToGroup(outGroup adapter.MutableOutboundGroup, tag string) error {
+	var err error
+	// Hold off the removal queue so a pending removal of the tag can't run
+	// between adding it and cancelling the removal.
+	m.removalQueue.cancelIf(tag, func() bool {
+		err = addTag(outGroup, tag)
+		return err == nil
+	})
+	return err
+}
+
+func addTag(outGroup adapter.MutableOutboundGroup, tag string) error {
 	n, err := outGroup.Add(tag)
 	if err != nil || n == 0 {
 		if err == nil {
@@ -154,8 +175,6 @@ func (m *MutableGroupManager) addToGroup(outGroup adapter.MutableOutboundGroup, 
 		}
 		return fmt.Errorf("failed to add %s to %s: %w", tag, outGroup.Tag(), err)
 	}
-	// remove from removal queue in case it was scheduled for removal
-	m.removalQueue.dequeue(tag)
 	return nil
 }
 

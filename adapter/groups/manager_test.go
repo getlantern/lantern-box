@@ -1,6 +1,7 @@
 package groups
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"strconv"
@@ -421,12 +422,27 @@ type mockPlainGroup struct {
 
 type mockOutboundManager struct {
 	adapter.OutboundManager
-	tags []string
-	mu   sync.Mutex
+	tags     []string
+	mu       sync.Mutex
+	onCreate func()
 }
 
 func (m *mockOutboundManager) Outbound(tag string) (adapter.Outbound, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return nil, slices.Contains(m.tags, tag)
+}
+
+func (m *mockOutboundManager) Create(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag, _ string, _ any) error {
+	m.mu.Lock()
+	if !slices.Contains(m.tags, tag) {
+		m.tags = append(m.tags, tag)
+	}
+	m.mu.Unlock()
+	if m.onCreate != nil {
+		m.onCreate()
+	}
+	return nil
 }
 
 func (m *mockOutboundManager) Remove(tag string) error {
@@ -492,3 +508,83 @@ func TestRemovalQueue_CheckPendingConcurrentWithEnqueue(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+func TestCreateOutboundForGroup_PendingRemovalCannotRemoveNewOutbound(t *testing.T) {
+	logger := log.NewNOPFactory().Logger()
+	tag := "outbound"
+	outMgr := &mockOutboundManager{}
+	mgr := &MutableGroupManager{
+		outboundMgr: outMgr,
+		endpointMgr: &mockEndpointManager{},
+		groups:      map[string]lbAdapter.MutableOutboundGroup{"auto-test": &mockAddGroup{}},
+		removalQueue: newRemovalQueue(
+			logger, outMgr, &mockEndpointManager{}, &mockConnectionManager{}, pollInterval, forceAfter,
+		),
+	}
+	// The withdrawn outbound's removal is still queued when it is re-added.
+	mgr.removalQueue.pending[tag] = item{tag: tag, addedAt: time.Now()}
+	cleanupDone := make(chan struct{})
+	outMgr.onCreate = func() {
+		go func() {
+			defer close(cleanupDone)
+			mgr.removalQueue.checkPending()
+		}()
+		select {
+		case <-cleanupDone:
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	require.NoError(t, mgr.CreateOutboundForGroup(context.Background(), nil, logger, "auto-test", tag, "type", nil))
+	<-cleanupDone
+	outMgr.mu.Lock()
+	defer outMgr.mu.Unlock()
+	assert.Contains(t, outMgr.tags, tag, "cleanup removed the newly created outbound")
+}
+
+func TestAddToGroup_PendingRemovalCannotRemoveAddedOutbound(t *testing.T) {
+	logger := log.NewNOPFactory().Logger()
+	tag := "outbound"
+	outMgr := &mockOutboundManager{tags: []string{tag}}
+	cleanupDone := make(chan struct{})
+	var rq *removalQueue
+	group := &mockAddGroup{onAdd: func() {
+		go func() {
+			defer close(cleanupDone)
+			rq.checkPending()
+		}()
+		select {
+		case <-cleanupDone:
+		case <-time.After(100 * time.Millisecond):
+		}
+	}}
+	rq = newRemovalQueue(logger, outMgr, &mockEndpointManager{}, &mockConnectionManager{}, pollInterval, forceAfter)
+	mgr := &MutableGroupManager{
+		outboundMgr:  outMgr,
+		endpointMgr:  &mockEndpointManager{},
+		groups:       map[string]lbAdapter.MutableOutboundGroup{"auto-test": group},
+		removalQueue: rq,
+	}
+	rq.pending[tag] = item{tag: tag, addedAt: time.Now()}
+
+	require.NoError(t, mgr.AddToGroup("auto-test", tag))
+	<-cleanupDone
+	outMgr.mu.Lock()
+	defer outMgr.mu.Unlock()
+	assert.Contains(t, outMgr.tags, tag, "cleanup removed the outbound just added to the group")
+}
+
+// mockAddGroup implements MutableOutboundGroup with an Add that accepts every tag.
+type mockAddGroup struct {
+	lbAdapter.MutableOutboundGroup
+	onAdd func()
+}
+
+func (m *mockAddGroup) Add(tags ...string) (int, error) {
+	if m.onAdd != nil {
+		m.onAdd()
+	}
+	return len(tags), nil
+}
+
+func (m *mockAddGroup) Tag() string { return "auto-test" }
