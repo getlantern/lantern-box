@@ -125,6 +125,7 @@ func (f *factory) SlogHandler() slog.Handler {
 type SLogger interface {
 	Factory
 	log.ContextLogger
+	WithAttrs(attrs ...slog.Attr) SLogger
 }
 
 var _ SLogger = (*slogLogger)(nil)
@@ -144,6 +145,13 @@ func (l *slogLogger) Log(ctx context.Context, level log.Level, args ...any) stri
 		ctx = context.Background()
 	}
 	return l.log(ctx, toSLevel(level), args)
+}
+
+// WithAttrs returns a logger that adds attrs to every record and shares l's tag and subscribers.
+func (l *slogLogger) WithAttrs(attrs ...slog.Attr) SLogger {
+	nf := l.clone()
+	nf.handler = l.handler.WithAttrs(attrs)
+	return &slogLogger{factory: nf, tag: l.tag}
 }
 
 func (l *slogLogger) log(ctx context.Context, level slog.Level, args []any) string {

@@ -3,6 +3,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      client_only:
+        description: "Publish without marking the release latest, so the proxy fleet doesn't hot-swap to it"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -50,6 +55,7 @@ jobs:
           GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           FURY_TOKEN: ${{ secrets.FURY_TOKEN }}
+          CLIENT_ONLY: ${{ inputs.client_only && 'true' || 'false' }}
 
       # Under Reflog's Option B the packer image no longer bakes in a
       # specific lantern-box version — cloud-init installs the target
