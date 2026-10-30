@@ -731,3 +731,62 @@ func TestURLTestGroup_ReplaceWithNarrowerNetworks(t *testing.T) {
 		assert.Same(t, b, g.pickBestOutbound("udp", tcpOnly, nil))
 	})
 }
+
+// blockingStore blocks the first history write for a tag once armed, holding
+// a probe between its still-current check and its write.
+type blockingStore struct {
+	adapter.URLTestHistoryStorage
+	armedTag atomic.Value
+	blocked  chan struct{}
+	release  chan struct{}
+}
+
+func (h *blockingStore) StoreURLTestHistory(tag string, history *adapter.URLTestHistory) {
+	if armed, _ := h.armedTag.Load().(string); armed == tag && h.armedTag.CompareAndSwap(tag, "") {
+		close(h.blocked)
+		<-h.release
+	}
+	h.URLTestHistoryStorage.StoreURLTestHistory(tag, history)
+}
+
+func TestURLTestGroup_RemoveDuringReplacementProbeWrite(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	link, dial := probeServer(t)
+	oldA, _ := countingOutbound("a")
+	b, _ := countingOutbound("b")
+	mgr := newSyncOutboundManager(oldA, b)
+	u := startedURLTest(t, ctx, mgr, link, "a", "b")
+	g := u.group
+	history := &blockingStore{
+		URLTestHistoryStorage: g.history,
+		blocked:               make(chan struct{}),
+		release:               make(chan struct{}),
+	}
+	g.history = history
+	history.StoreURLTestHistory("b", &adapter.URLTestHistory{Time: time.Now(), Delay: 500})
+	history.armedTag.Store("a")
+
+	newA := &mockOutbound{tag: "a", dial: dial}
+	mgr.set(newA)
+	_, err := u.Replace("a")
+	require.NoError(t, err)
+	<-history.blocked
+
+	removed := make(chan struct{})
+	go func() {
+		defer close(removed)
+		_, _ = u.Remove("a")
+	}()
+	select {
+	case <-removed:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(history.release)
+	<-removed
+
+	assert.Nil(t, g.history.LoadURLTestHistory("a"), "a removed member's history must not be restored")
+	g.updateSelected()
+	assert.Same(t, b, g.selectedOutboundTCP.Load())
+	assert.Equal(t, []string{"b"}, u.All())
+}

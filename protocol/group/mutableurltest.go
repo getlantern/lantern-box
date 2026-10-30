@@ -442,8 +442,10 @@ func (g *urlTestGroup) Add(tags []string) (n int, err error) {
 			missing = append(missing, tag)
 			continue
 		}
+		g.selection.Lock()
 		g.outbounds.Store(tag, outbound)
 		g.tags = append(g.tags, tag)
+		g.selection.Unlock()
 		n++
 	}
 	if len(missing) > 0 {
@@ -547,6 +549,10 @@ func (g *urlTestGroup) Remove(tags []string) (n int, err error) {
 		return 0, nil
 	}
 
+	// A probe holds selection between checking its member is current and
+	// storing its result, so it can't restore a removed member's history.
+	g.selection.Lock()
+	defer g.selection.Unlock()
 	for _, tag := range tags {
 		if _, exists := g.outbounds.Load(tag); !exists {
 			continue
@@ -566,7 +572,7 @@ func (g *urlTestGroup) Remove(tags []string) (n int, err error) {
 		default:
 		}
 	}
-	g.updateSelected()
+	g.updateSelectedLocked()
 	return
 }
 
@@ -767,6 +773,10 @@ func (g *urlTestGroup) markFailedAndReselect(outbound A.Outbound) {
 func (g *urlTestGroup) updateSelected() {
 	g.selection.Lock()
 	defer g.selection.Unlock()
+	g.updateSelectedLocked()
+}
+
+func (g *urlTestGroup) updateSelectedLocked() {
 	if len(g.tags) == 0 {
 		g.selectedOutboundTCP.Store(nil)
 		g.selectedOutboundUDP.Store(nil)
