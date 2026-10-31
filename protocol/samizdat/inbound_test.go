@@ -263,6 +263,8 @@ func TestHandleConnection_CloseEventMarksRejections(t *testing.T) {
 			assert.Equal(t, "blocked.example:443", events[0].Destination)
 			assert.False(t, events[0].Rejected)
 			closeEvt := events[1]
+			assert.Zero(t, events[0].ShortID, "no short ID in the context")
+			assert.Zero(t, closeEvt.ShortID, "no short ID in the context")
 			assert.Equal(t, -1, closeEvt.State)
 			assert.Equal(t, tc.rejected, closeEvt.Rejected)
 			if tc.rejected {
@@ -397,4 +399,75 @@ func TestHandleConnection_ExposesSessionConnToRouter(t *testing.T) {
 	_, isTCP := got.session.(*net.TCPConn)
 	assert.True(t, isTCP, "session conn is %T, want *net.TCPConn", got.session)
 	assert.Equal(t, conn.LocalAddr().String(), got.session.RemoteAddr().String())
+}
+
+// Both halves of a connection's lifecycle carry the short ID its session
+// authenticated with, so a listener can tell which pairing the connection
+// came through. Routed through a real samizdat client and server, since only
+// the server can put a short ID in the stream's context.
+func TestHandleConnection_EventsCarrySessionShortID(t *testing.T) {
+	serverPriv, serverPub, err := samizdat.GenerateKeyPair()
+	require.NoError(t, err)
+	shortID, err := samizdat.GenerateShortID()
+	require.NoError(t, err)
+	otherID, err := samizdat.GenerateShortID()
+	require.NoError(t, err)
+	certPEM, keyPEM := testCertKeyPEM(t)
+
+	events := make(chan peerconn.Event, 4)
+	peerconn.SetListener(func(evt peerconn.Event) { events <- evt })
+	t.Cleanup(func() { peerconn.SetListener(nil) })
+
+	ib := &Inbound{
+		Adapter: inbound.NewAdapter("samizdat", "samizdat-in"),
+		logger:  log.NewNOPFactory().Logger(),
+		router: &mockRouter{onRoute: func(_ context.Context, conn net.Conn, _ adapter.InboundContext, onClose N.CloseHandlerFunc) {
+			_, _ = conn.Write([]byte("ok"))
+			onClose(&rule.RejectedError{})
+		}},
+	}
+
+	server, err := samizdat.NewServer(samizdat.ServerConfig{
+		PrivateKey: serverPriv,
+		ShortIDs:   [][8]byte{otherID, shortID},
+		CertPEM:    []byte(certPEM),
+		KeyPEM:     []byte(keyPEM),
+		Handler:    ib.handleConnection,
+	})
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = server.Serve(ln) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	client, err := samizdat.NewClient(samizdat.ClientConfig{
+		ServerAddr: ln.Addr().String(),
+		ServerName: "127.0.0.1",
+		PublicKey:  serverPub,
+		ShortID:    shortID,
+	})
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "tcp", "example.com:443")
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = io.ReadFull(conn, make([]byte, 2))
+	require.NoError(t, err)
+
+	for _, want := range []int{+1, -1} {
+		select {
+		case evt := <-events:
+			assert.Equal(t, want, evt.State)
+			assert.Equal(t, shortID, evt.ShortID, "state %d", want)
+			if want == -1 {
+				assert.True(t, evt.Rejected, "a rejected close carries the short ID too")
+			}
+		case <-ctx.Done():
+			t.Fatalf("no event with state %d", want)
+		}
+	}
 }
