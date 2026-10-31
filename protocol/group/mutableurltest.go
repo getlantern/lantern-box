@@ -133,7 +133,9 @@ func (s *MutableURLTest) Now() string {
 }
 
 func (s *MutableURLTest) All() []string {
-	return s.group.tags
+	s.group.selection.Lock()
+	defer s.group.selection.Unlock()
+	return slices.Clone(s.group.tags)
 }
 
 // Add adds the given outbound tags to the group and returns the number of outbounds added. If an
@@ -285,7 +287,7 @@ func (s *MutableURLTest) selectOutbound(network string, excluded map[string]bool
 		outbound = s.group.pickBestOutbound(network, nil, excluded)
 	}
 	recoveryStarted := false
-	if outbound == nil && len(excluded) == 0 && len(s.group.tags) > 0 {
+	if outbound == nil && len(excluded) == 0 && s.group.hasMembers() {
 		recoveryStarted = true
 		s.logger.Warn("no outbound available, starting async URL test for recovery")
 		go s.group.CheckOutbounds(true)
@@ -308,10 +310,11 @@ func (s *MutableURLTest) NewPacketConnectionEx(ctx context.Context, conn N.Packe
 }
 
 type urlTestGroup struct {
-	ctx                 context.Context
-	outboundMgr         A.OutboundManager
-	pauseMgr            pause.Manager
-	logger              log.Logger
+	ctx         context.Context
+	outboundMgr A.OutboundManager
+	pauseMgr    pause.Manager
+	logger      log.Logger
+	// tags is written under both access and selection, so either suffices to read it.
 	tags                []string
 	outbounds           isync.TypedMap[string, A.Outbound]
 	url                 string
@@ -330,12 +333,12 @@ type urlTestGroup struct {
 	// awaitingProbe maps a replaced member's tag to the new outbound while its
 	// first probe is in flight, so selection keeps it despite having no history.
 	awaitingProbe isync.TypedMap[string, A.Outbound]
-	started             bool
-	isAlive             bool
-	idleTimer           *time.Timer
-	lastActive          common.TypedValue[time.Time]
-	pauseC              chan struct{}
-	cancel              context.CancelFunc
+	started       bool
+	isAlive       bool
+	idleTimer     *time.Timer
+	lastActive    common.TypedValue[time.Time]
+	pauseC        chan struct{}
+	cancel        context.CancelFunc
 }
 
 func newURLTestGroup(
@@ -361,7 +364,7 @@ func newURLTestGroup(
 		ctx:          ctx,
 		outboundMgr:  outboundMgr,
 		logger:       logger,
-		tags:         tags,
+		tags:         slices.Clone(tags),
 		url:          link,
 		urlOverrides: maps.Clone(urlOverrides),
 		history:      history,
@@ -672,7 +675,7 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		return result, nil
 	}
 	defer g.checking.Store(false)
-	if len(g.tags) == 0 {
+	if !g.hasMembers() {
 		return result, nil
 	}
 	g.logger.Trace("checking outbounds...")
@@ -751,6 +754,13 @@ func (g *urlTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	b.Wait()
 	g.updateSelected()
 	return result, nil
+}
+
+// hasMembers reports whether the group has any member. Callers must not hold g.selection.
+func (g *urlTestGroup) hasMembers() bool {
+	g.selection.Lock()
+	defer g.selection.Unlock()
+	return len(g.tags) > 0
 }
 
 // probeReplacement URL-tests member, which Replace just installed under tag, independently of the
