@@ -85,6 +85,10 @@ type Outbound struct {
 	ui           UBClientcore.UI
 	ql           *UBClientcore.QUICLayer
 	uot          *uot.Client
+	// consumerSlots reports broflake's WebRTC slots. A rooms-only consumer
+	// reads it before each dial so it can fail at once when no helper is
+	// connected.
+	consumerSlots func() []UBClientcore.ConsumerSlot
 
 	// Constructed in NewOutbound; observes successful dial latencies and
 	// emits structured warnings when the current pairing's dials look
@@ -236,6 +240,7 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 
 	o.broflakeConn = bfConn
 	o.ui = ui
+	o.consumerSlots = ui.BroflakeEngine.ConsumerSlots
 	o.ql = ql
 	o.dial = UBClientcore.CreateSOCKS5Dialer(ql)
 
@@ -270,6 +275,9 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 
 	if o.dial == nil {
 		return nil, fmt.Errorf("unbounded: not started (DialContext called before Start)")
+	}
+	if err := o.checkHelperConnected(); err != nil {
+		return nil, err
 	}
 	started := time.Now()
 	dest := destination.String()
@@ -318,6 +326,9 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if o.dial == nil {
 		return nil, fmt.Errorf("unbounded: not started (ListenPacket called before Start)")
 	}
+	if err := o.checkHelperConnected(); err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	dest := destination.String()
 	o.logger.DebugContext(ctx, "unbounded UoT ListenPacket start", "dest", dest)
@@ -335,6 +346,28 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 		"elapsed", elapsed)
 	o.recordWatchdog(ctx, elapsed)
 	return pc, nil
+}
+
+// ErrNoHelperConnected is returned by a rooms-only (helper) outbound's dials
+// while none of its WebRTC slots is connected to a helper.
+var ErrNoHelperConnected = errors.New("unbounded: no helper connected")
+
+// checkHelperConnected fails a rooms-only consumer's dial at once while no
+// slot is connected, including while one is still connecting. Broflake's
+// QUIC dial would otherwise wait for a peer until the caller's context ends,
+// and route dials have no deadline: a url-test group that picked this
+// outbound would hang instead of trying its other members. A pool consumer
+// keeps waiting, since the pool eventually provides a peer.
+func (o *Outbound) checkHelperConnected() error {
+	if !o.rtcOpt.ConsumerRoomsOnly || o.consumerSlots == nil {
+		return nil
+	}
+	for _, slot := range o.consumerSlots() {
+		if slot.Connected {
+			return nil
+		}
+	}
+	return ErrNoHelperConnected
 }
 
 // recordWatchdog feeds a successful dial's elapsed time into the per-outbound
