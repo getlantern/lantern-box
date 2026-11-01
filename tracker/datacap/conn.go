@@ -62,18 +62,13 @@ type ConnConfig struct {
 func NewConn(config ConnConfig) *Conn {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Default to disabled throttler if not provided
-	throttler := config.Throttler
-	if throttler == nil {
-		throttler = NewThrottler(0) // Disabled by default
-	}
-
 	reporter, owns := config.Reporter, false
 	if reporter == nil {
 		reporter = NewReporter(config.Client, config.Logger, config.ReportInterval)
 		owns = true
 	}
 
+	usage := reporter.acquire(config.ClientInfo, config.Throttler)
 	return &Conn{
 		trafficCategory: config.TrafficCategory,
 		Conn:            config.Conn,
@@ -82,10 +77,10 @@ func NewConn(config ConnConfig) *Conn {
 		client:          config.Client,
 		logger:          config.Logger,
 		clientInfo:      config.ClientInfo,
-		usage:           reporter.acquire(config.ClientInfo, throttler),
+		usage:           usage,
 		reporter:        reporter,
 		ownsReporter:    owns,
-		throttler:       throttler,
+		throttler:       usage.throttler,
 	}
 }
 
@@ -93,11 +88,14 @@ func NewConn(config ConnConfig) *Conn {
 func (c *Conn) Read(b []byte) (n int, err error) {
 	n, err = c.Conn.Read(b)
 	if n > 0 {
-		c.usage.addBytes(int64(n), c.trafficCategory)
+		// Count the connection before its bytes: a flush holds a count until
+		// a report carries bytes in its category, so counting first means the
+		// bytes that made it bidirectional always carry it.
 		if c.trafficCategory != "" {
 			c.hasRead.Store(true)
 			c.countIfBidirectional()
 		}
+		c.usage.addBytes(int64(n), c.trafficCategory)
 
 		// Apply throttling after read (token bucket wait)
 		if c.throttler.IsEnabled() {
@@ -115,11 +113,14 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 func (c *Conn) Write(b []byte) (n int, err error) {
 	n, err = c.Conn.Write(b)
 	if n > 0 {
-		c.usage.addBytes(int64(n), c.trafficCategory)
+		// Count the connection before its bytes: a flush holds a count until
+		// a report carries bytes in its category, so counting first means the
+		// bytes that made it bidirectional always carry it.
 		if c.trafficCategory != "" {
 			c.hasWritten.Store(true)
 			c.countIfBidirectional()
 		}
+		c.usage.addBytes(int64(n), c.trafficCategory)
 
 		// Apply throttling after write (token bucket wait)
 		if c.throttler.IsEnabled() {

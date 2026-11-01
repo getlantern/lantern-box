@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestThrottler_ZeroOrNegativeRates(t *testing.T) {
@@ -305,4 +306,28 @@ func TestThrottler_UpdateRates_NoResetOnRepeatedCalls(t *testing.T) {
 	err := throttler.WaitRead(ctx, 80)
 	assert.NoError(t, err)
 	assert.GreaterOrEqual(t, time.Since(start).Milliseconds(), int64(400))
+}
+
+// A caller waiting for tokens does not hold the throttler's lock, so rate
+// updates from the reporter are not blocked behind it.
+func TestThrottler_UpdateRatesDuringWait(t *testing.T) {
+	th := NewThrottler(1000)
+	require.NoError(t, th.WaitWrite(context.Background(), 1000)) // drain the bucket
+
+	waiting := make(chan error, 1)
+	go func() { waiting <- th.WaitWrite(context.Background(), 2000) }() // ~2s of debt
+	time.Sleep(50 * time.Millisecond)
+
+	updated := make(chan struct{})
+	go func() {
+		th.UpdateRates(1000, 1000)
+		th.Disable()
+		close(updated)
+	}()
+	select {
+	case <-updated:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("rate update blocked behind a waiting caller")
+	}
+	require.NoError(t, <-waiting)
 }

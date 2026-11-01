@@ -55,18 +55,13 @@ type PacketConnConfig struct {
 func NewPacketConn(config PacketConnConfig) *PacketConn {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Default to disabled throttler if not provided
-	throttler := config.Throttler
-	if throttler == nil {
-		throttler = NewThrottler(0) // Disabled by default
-	}
-
 	reporter, owns := config.Reporter, false
 	if reporter == nil {
 		reporter = NewReporter(config.Client, config.Logger, config.ReportInterval)
 		owns = true
 	}
 
+	usage := reporter.acquire(config.ClientInfo, config.Throttler)
 	category := ""
 	if config.TrafficCategories {
 		category = "unknown"
@@ -79,10 +74,10 @@ func NewPacketConn(config PacketConnConfig) *PacketConn {
 		client:          config.Client,
 		logger:          config.Logger,
 		clientInfo:      config.ClientInfo,
-		usage:           reporter.acquire(config.ClientInfo, throttler),
+		usage:           usage,
 		reporter:        reporter,
 		ownsReporter:    owns,
-		throttler:       throttler,
+		throttler:       usage.throttler,
 	}
 }
 

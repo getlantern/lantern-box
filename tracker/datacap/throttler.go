@@ -136,16 +136,19 @@ func (t *Throttler) WaitWrite(ctx context.Context, n int) error {
 	return t.wait(ctx, n, false)
 }
 
-// wait implements the token bucket algorithm for rate limiting.
+// wait implements the token bucket algorithm for rate limiting. A caller
+// short of tokens reserves them anyway, leaving the bucket in debt, and sleeps
+// off its share of the debt without holding the lock. Later callers queue
+// behind the debt, so the shared rate holds, and rate updates never wait on a
+// sleeping caller.
 func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 	if n <= 0 {
 		return nil
 	}
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if !t.enabled {
+		t.mu.Unlock()
 		return nil
 	}
 
@@ -169,43 +172,33 @@ func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 
 	// If rate is 0 or negative, no throttling
 	if rate <= 0 {
+		t.mu.Unlock()
 		return nil
 	}
 
 	// Refill tokens based on time elapsed
 	now := time.Now()
 	elapsed := now.Sub(*lastRefill)
-	tokensToAdd := elapsed.Seconds() * float64(rate)
-	*tokens += tokensToAdd
+	*tokens += elapsed.Seconds() * float64(rate)
 	if *tokens > *capacity {
 		*tokens = *capacity
 	}
 	*lastRefill = now
 
-	// Check if we have enough tokens
-	required := float64(n)
-	if *tokens >= required {
-		// Consume tokens and proceed immediately
-		*tokens -= required
+	*tokens -= float64(n)
+	if *tokens >= 0 {
+		t.mu.Unlock()
 		return nil
 	}
+	waitTime := time.Duration(-*tokens / float64(rate) * float64(time.Second))
+	t.mu.Unlock()
 
-	// Not enough tokens - calculate wait time for the deficit
-	deficit := required - *tokens
-	waitTime := time.Duration(deficit / float64(rate) * float64(time.Second))
-
-	// Consume all available tokens
-	*tokens = 0
-
-	// Wait while holding the lock (this serializes all consumers)
+	timer := time.NewTimer(waitTime)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(waitTime):
-		// Update lastRefill to prevent next caller from getting "free" tokens
-		// for the time we just waited. Without this, elapsed time would include
-		// our wait, giving the next caller unearned tokens.
-		*lastRefill = time.Now()
+	case <-timer.C:
 		return nil
 	}
 }

@@ -212,12 +212,17 @@ func (r *Reporter) Close() {
 }
 
 // acquire returns the usage entry for info's device and counts a connection
-// on it. Every acquire must be paired with a release.
+// on it. Every acquire must be paired with a release. A new entry takes
+// throttler, or a disabled one when it is nil; the entry's throttler is the
+// one its reports update.
 func (r *Reporter) acquire(info clientcontext.ClientInfo, throttler *Throttler) *deviceUsage {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	d, ok := r.devices[info.DeviceID]
 	if !ok {
+		if throttler == nil {
+			throttler = NewThrottler(0) // Disabled by default
+		}
 		d = &deviceUsage{deviceID: info.DeviceID, throttler: throttler}
 		r.devices[info.DeviceID] = d
 	}

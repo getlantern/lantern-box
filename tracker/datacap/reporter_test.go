@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
@@ -247,4 +248,28 @@ func TestReporterReportsBytesCountedAfterClose(t *testing.T) {
 	reports := sink.take()
 	require.Len(t, reports, 1)
 	require.EqualValues(t, 5, reports[0].BytesUsed)
+}
+
+// Connections sharing a reporter share their device's throttler even when
+// constructed without one, so a report throttles all of them.
+func TestReporterSharesDeviceThrottler(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"throttle":true}`))
+	}))
+	defer srv.Close()
+	reporter := NewReporter(NewClient(srv.URL, time.Second), noopLogger, time.Hour)
+	defer reporter.Close()
+
+	info := clientcontext.ClientInfo{DeviceID: "device"}
+	first := NewConn(ConnConfig{Conn: newMockConn(make([]byte, 8)), Logger: noopLogger, ClientInfo: info, Reporter: reporter})
+	defer first.Close()
+	second := NewConn(ConnConfig{Conn: newMockConn(nil), Logger: noopLogger, ClientInfo: info, Reporter: reporter})
+	defer second.Close()
+	require.Same(t, first.throttler, second.throttler)
+
+	_, err := first.Read(make([]byte, 8))
+	require.NoError(t, err)
+	reporter.flush(context.Background())
+	require.True(t, second.throttler.IsEnabled())
 }
