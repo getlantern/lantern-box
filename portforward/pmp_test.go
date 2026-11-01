@@ -36,6 +36,8 @@ type fakePMPGateway struct {
 	grant uint32
 	// onMap, if set, sees each NAT-PMP MAP request.
 	onMap func(req []byte)
+	// headerOnlyErrors makes PCP error answers carry only the common header.
+	headerOnlyErrors bool
 	// maps records each MAP request: protocol, internal port, lifetime.
 	maps []fakeMap
 	// nonces records the nonce of each PCP MAP request.
@@ -109,6 +111,9 @@ func (g *fakePMPGateway) answer(req []byte) []byte {
 			res = append(res, m...)
 			if g.dropAdds && binary.BigEndian.Uint32(req[4:8]) > 0 {
 				return nil
+			}
+			if g.headerOnlyErrors && g.result != 0 {
+				return res[:pcpHeaderLen]
 			}
 		}
 		return res
@@ -449,4 +454,88 @@ func TestForwarder_LostRenewalAnswerDuringTeardownIsRemoved(t *testing.T) {
 	assert.False(t, f.renew(m, c))
 	ms := collapse(g.recorded())
 	assert.Equal(t, fakeMap{UDP, 41641, 0}, ms[len(ms)-1], "the possibly re-created mapping must be deleted")
+}
+
+// A PCP refusal carrying only the common header is a refusal, not a lost
+// answer, so it fails at once and sends no compensating delete.
+func TestPCP_HeaderOnlyErrorIsARefusal(t *testing.T) {
+	g := newFakePMPGateway(t, true)
+	g.set(func() { g.result = 8; g.headerOnlyErrors = true })
+	c := newPCPClient(g.addr(), time.Second)
+	start := time.Now()
+	err := c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600)
+	assert.ErrorContains(t, err, "result code 8")
+	assert.NotErrorIs(t, err, errNoAnswer)
+	assert.Less(t, time.Since(start), 500*time.Millisecond)
+	assert.Equal(t, []fakeMap{{UDP, 41641, 3600}}, collapse(g.recorded()))
+}
+
+// Cancelling discovery returns at once, with no client, even while the probes
+// wait on a silent gateway.
+func TestDiscoverPMP_HonoursCancellation(t *testing.T) {
+	g := newFakePMPGateway(t, true)
+	g.set(func() { g.silent = true })
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	c, _, err := discoverPMP(ctx, g.addr())
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, c)
+	assert.Less(t, time.Since(start), pmpProbeTimeout/2)
+}
+
+// The renewal interval comes from the lease asked for, so a short first grant
+// doesn't cap it once the gateway grants more.
+func TestForwarder_StartRenewal_UsesTheRequestedLease(t *testing.T) {
+	g := newFakePMPGateway(t, true)
+	g.set(func() { g.grant = 120 })
+	f := &Forwarder{client: newPCPClient(g.addr(), time.Second), method: "pcp"}
+	_, err := f.MapPort(context.Background(), UDP, 41641, "udp")
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.StartRenewal(ctx)
+
+	g.set(func() { g.grant = 3600 })
+	f.mu.Lock()
+	m := f.mappings[UDP]
+	f.mu.Unlock()
+	require.True(t, f.renew(m, f.client))
+	assert.InDelta(t, 30*time.Minute, f.nextRenewal(30*time.Minute), float64(time.Second))
+}
+
+// A failed renewal doesn't move the lease's deadline: it is retried soon, and
+// well before a 120s grant runs out.
+func TestForwarder_FailedRenewalRetriesWithinTheLease(t *testing.T) {
+	g := newFakePMPGateway(t, true)
+	g.set(func() { g.grant = 120 })
+	c := newPCPClient(g.addr(), 300*time.Millisecond)
+	f := &Forwarder{client: c, method: "pcp"}
+	_, err := f.MapPort(context.Background(), UDP, 41641, "udp")
+	require.NoError(t, err)
+	// Due now: added half the 120s grant ago.
+	f.mu.Lock()
+	m := f.mappings[UDP]
+	m.renewed = m.renewed.Add(-60 * time.Second)
+	renewed := m.renewed
+	f.mu.Unlock()
+
+	g.set(func() { g.dropAdds = true })
+	require.True(t, f.renew(m, c))
+	f.mu.Lock()
+	assert.Equal(t, renewed, m.renewed, "a failed renewal must not move the deadline")
+	f.mu.Unlock()
+	assert.InDelta(t, 15*time.Second, f.nextRenewal(30*time.Minute), float64(time.Second),
+		"retry an eighth of the lease later")
+
+	g.set(func() { g.dropAdds = false })
+	require.True(t, f.renew(m, c))
+	assert.InDelta(t, 60*time.Second, f.nextRenewal(30*time.Minute), float64(time.Second),
+		"a confirmed renewal resets the schedule")
+}
+
+func TestRenewRetryDelay(t *testing.T) {
+	assert.Equal(t, 15*time.Second, renewRetryDelay(&Mapping{LeaseDuration: 120 * time.Second}))
+	assert.Equal(t, time.Minute, renewRetryDelay(&Mapping{LeaseDuration: time.Hour}))
+	assert.Equal(t, time.Second, renewRetryDelay(&Mapping{LeaseDuration: 2 * time.Second}))
 }

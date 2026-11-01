@@ -46,9 +46,11 @@ type Mapping struct {
 	// requested is the lease MapPort asked for, in seconds, which renewals ask
 	// for again. LeaseDuration is what the gateway granted, when it says.
 	requested uint32
-	// renewed is when the mapping was last added or renewal was last
-	// attempted. Guarded by the Forwarder's mu.
+	// renewed is when the mapping was added or last confirmed renewed, and
+	// retryAt, if set, when a failed renewal is retried. Guarded by the
+	// Forwarder's mu.
 	renewed time.Time
+	retryAt time.Time
 }
 
 // leaseReporter is a client whose gateway says what lease it granted, as
@@ -427,8 +429,9 @@ func (f *Forwarder) StartRenewal(ctx context.Context) {
 	renewCtx, cancel := context.WithCancel(ctx)
 	f.cancel = cancel
 	// Every mapping requests the same lease, so the first one's sets the pace.
-	// nextRenewal comes sooner for a gateway that granted less.
-	interval := ms[0].LeaseDuration / 2
+	// nextRenewal comes sooner for a gateway that grants less; basing this on
+	// what was granted would cap renewal by the first grant for good.
+	interval := time.Duration(ms[0].requested) * time.Second / 2
 	if interval < 1*time.Minute {
 		interval = 1 * time.Minute
 	}
@@ -507,11 +510,21 @@ func (f *Forwarder) nextRenewal(interval time.Duration) time.Duration {
 	var next time.Time
 	for _, m := range f.mappings {
 		due := m.renewed.Add(renewPeriod(m, interval))
+		if due.Before(m.retryAt) {
+			due = m.retryAt
+		}
 		if next.IsZero() || due.Before(next) {
 			next = due
 		}
 	}
 	return max(time.Until(next), 0)
+}
+
+// renewRetryDelay is how long after a failed renewal it is retried: an eighth
+// of the lease, so a few tries fit before it runs out, but at least a second
+// and at most a minute.
+func renewRetryDelay(m *Mapping) time.Duration {
+	return min(max(m.LeaseDuration/8, time.Second), time.Minute)
 }
 
 // renewPeriod is how often m is renewed: interval, or half the lease the
@@ -536,12 +549,13 @@ func (f *Forwarder) renew(m *Mapping, client igdClient) bool {
 	go func() {
 		errCh <- client.AddPortMapping("", m.ExternalPort, m.Protocol, m.InternalPort, m.InternalIP, true, m.description+" (renew)", m.requested)
 	}()
-	var landed bool
+	var landed, confirmed bool
 	select {
 	case err := <-errCh:
 		// A NAT-PMP or PCP gateway that never answered may still have
 		// re-added the mapping, the same unknown as the timeout below.
 		landed = err == nil || errors.Is(err, errNoAnswer)
+		confirmed = err == nil
 		if err != nil {
 			slog.Warn("portforward: lease renewal failed", "err", err, protocolAttr(m.Protocol), "external_port", m.ExternalPort)
 		}
@@ -560,8 +574,14 @@ func (f *Forwarder) renew(m *Mapping, client igdClient) bool {
 	// on f.mu orders this strictly after UnmapPort's delete.
 	f.mu.Lock()
 	teardownRaced := f.closed
-	m.renewed = time.Now()
-	if lr, ok := client.(leaseReporter); ok && !teardownRaced {
+	// Only a confirmed renewal extends the lease. Otherwise retry soon,
+	// within what's left of it.
+	if confirmed {
+		m.renewed, m.retryAt = time.Now(), time.Time{}
+	} else {
+		m.retryAt = time.Now().Add(renewRetryDelay(m))
+	}
+	if lr, ok := client.(leaseReporter); ok && !teardownRaced && confirmed {
 		// The gateway may grant a different lease this time.
 		if granted, ok := lr.lease(m.Protocol, m.InternalPort); ok {
 			m.LeaseDuration = granted

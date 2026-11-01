@@ -296,8 +296,10 @@ func pcpHeader(op byte, lifetime uint32, local net.IP) []byte {
 	return h
 }
 
-// pcpAccept takes a response to op, and returns check's verdict on it once its
-// result code is a success.
+// pcpAccept takes a response to op that check accepts. An error response can
+// carry only the common header (RFC 6887 §7.2), so its result code is read
+// before check sees the payload. Each request has its own socket, connected to
+// the gateway, so an error answer for op is this request's.
 func pcpAccept(op byte, check func(b []byte) bool) func(b []byte) (bool, error) {
 	return func(b []byte) (bool, error) {
 		if len(b) >= 1 && b[0] != pcpVersion {
@@ -306,13 +308,10 @@ func pcpAccept(op byte, check func(b []byte) bool) func(b []byte) (bool, error) 
 		if len(b) < pcpHeaderLen || b[1] != 0x80|op {
 			return false, nil
 		}
-		if !check(b) {
-			return false, nil
-		}
 		if b[3] != 0 {
 			return false, fmt.Errorf("PCP result code %d", b[3])
 		}
-		return true, nil
+		return check(b), nil
 	}
 }
 
@@ -426,7 +425,17 @@ func discoverPMP(ctx context.Context, gw *net.UDPAddr) (igdClient, string, error
 		_, err := pmp.GetExternalIPAddress()
 		pmpErr <- err
 	}()
-	errPCP, errNATPMP := <-pcpErr, <-pmpErr
+	var errPCP, errNATPMP error
+	for range 2 {
+		select {
+		case errPCP = <-pcpErr:
+		case errNATPMP = <-pmpErr:
+		case <-ctx.Done():
+			// The probes end within their timeout, and their results are
+			// dropped.
+			return nil, "", ctx.Err()
+		}
+	}
 	if errPCP == nil {
 		pcp.timeout = pmpTimeout
 		return pcp, "pcp", nil
