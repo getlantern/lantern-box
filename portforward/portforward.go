@@ -1,7 +1,7 @@
-// Package portforward opens TCP and UDP ports on the local network gateway via
-// UPnP IGD so a node's inbounds are reachable from the public internet without
-// manual router configuration. IGDv2 is tried first and IGDv1 is the
-// fallback.
+// Package portforward opens TCP and UDP ports on the local network gateway so
+// a node's inbounds are reachable from the public internet without manual
+// router configuration. It tries PCP, then NAT-PMP, then UPnP IGDv2, then
+// IGDv1.
 package portforward
 
 import (
@@ -21,7 +21,7 @@ import (
 	"github.com/huin/goupnp/dcps/internetgateway2"
 )
 
-// ErrNoPortForwarding is returned when no UPnP gateway is reachable, the
+// ErrNoPortForwarding is returned when no gateway is reachable, the
 // gateway refuses to map a port, or the discovery scan times out. Callers
 // should treat this as "this network can't host a peer proxy" and surface it
 // to the user rather than retry indefinitely.
@@ -69,8 +69,8 @@ type Forwarder struct {
 	closed bool
 }
 
-// ProbeUPnP reports whether IGD discovery on the local network turns up a
-// gateway that could host a port mapping. No port is actually mapped — this
+// ProbeUPnP reports whether discovery on the local network turns up a gateway
+// that could host a port mapping, by PCP, NAT-PMP or UPnP IGD. No port is actually mapped — this
 // is the "would Share My Connection's residential-proxy mode work on this
 // network?" pre-flight check that UI flows show before committing to the
 // long-lived SmC path.
@@ -110,8 +110,10 @@ func ProbeUPnP(ctx context.Context) bool {
 }
 
 // NewForwarder discovers the local gateway and returns a Forwarder bound to
-// it. Callers should pick a 5-10s timeout on ctx — UPnP discovery is M-SEARCH
-// multicast and waits for replies.
+// it, using the first of PCP, NAT-PMP, UPnP IGDv2 and IGDv1 the gateway
+// speaks. Callers should pick a 5-10s timeout on ctx — UPnP discovery is
+// M-SEARCH multicast and waits for replies. PCP and NAT-PMP take at most
+// pmpProbeTimeout of it.
 //
 // Returns ErrNoPortForwarding only when discovery completes without finding
 // a usable gateway. If ctx was canceled or its deadline expired during
@@ -124,9 +126,14 @@ func NewForwarder(ctx context.Context) (*Forwarder, error) {
 	// while the failure path logged nothing at all. Whether IGDv2 was refused
 	// or simply absent is the first thing anyone asks when a peer turns out to
 	// be unreachable.
+	cp, method, errPMP := discoverPMP(ctx, nil)
+	if errPMP == nil {
+		slog.Info("portforward: gateway discovered", "method", method)
+		return &Forwarder{client: cp, method: method}, nil
+	}
 	c2, err2 := discoverIGDv2(ctx)
 	if err2 == nil && c2 != nil {
-		slog.Info("portforward: gateway discovered", "method", "upnp-igd2")
+		slog.Info("portforward: gateway discovered", "method", "upnp-igd2", "pmp_err", errPMP)
 		return &Forwarder{client: c2, method: "upnp-igd2"}, nil
 	}
 	c1, err1 := discoverIGDv1(ctx)
@@ -134,17 +141,17 @@ func NewForwarder(ctx context.Context) (*Forwarder, error) {
 		slog.Info("portforward: gateway discovered", "method", "upnp-igd1",
 			// Worth knowing: a router that answers v1 but not v2 is common, and
 			// it is also the shape of a gateway with a partial UPnP stack.
-			"igd2_err", errOrAbsent(err2, c2))
+			"igd2_err", errOrAbsent(err2, c2), "pmp_err", errPMP)
 		return &Forwarder{client: c1, method: "upnp-igd1"}, nil
 	}
 
 	if err := ctx.Err(); err != nil {
 		slog.Warn("portforward: gateway discovery was canceled or timed out",
-			"err", err, "igd2_err", errOrAbsent(err2, c2), "igd1_err", errOrAbsent(err1, c1))
+			"err", err, "pmp_err", errPMP, "igd2_err", errOrAbsent(err2, c2), "igd1_err", errOrAbsent(err1, c1))
 		return nil, err
 	}
-	slog.Warn("portforward: no UPnP gateway found; this network cannot host a peer",
-		"igd2_err", errOrAbsent(err2, c2), "igd1_err", errOrAbsent(err1, c1))
+	slog.Warn("portforward: no gateway found; this network cannot host a peer",
+		"pmp_err", errPMP, "igd2_err", errOrAbsent(err2, c2), "igd1_err", errOrAbsent(err1, c1))
 	return nil, ErrNoPortForwarding
 }
 
