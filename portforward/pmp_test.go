@@ -539,3 +539,26 @@ func TestRenewRetryDelay(t *testing.T) {
 	assert.Equal(t, time.Minute, renewRetryDelay(&Mapping{LeaseDuration: time.Hour}))
 	assert.Equal(t, time.Second, renewRetryDelay(&Mapping{LeaseDuration: 2 * time.Second}))
 }
+
+// An error answer carrying a MAP payload for another request, such as one
+// with another nonce, isn't taken as this request's refusal.
+func TestPCP_ErrorForAnotherNonceIsIgnored(t *testing.T) {
+	c := newPCPClient(&net.UDPAddr{}, time.Second)
+	nonce, err := c.nonce(UDP, 41641)
+	require.NoError(t, err)
+	accept := pcpAccept(pcpOpMap, func(b []byte) bool {
+		return [12]byte(b[pcpHeaderLen:pcpHeaderLen+12]) == nonce
+	})
+	res := make([]byte, pcpHeaderLen+pcpMapLen)
+	res[0], res[1], res[3] = pcpVersion, 0x80|pcpOpMap, 8
+	ok, err := accept(res)
+	assert.False(t, ok)
+	assert.NoError(t, err, "an error for another nonce must be ignored")
+
+	copy(res[pcpHeaderLen:], nonce[:])
+	_, err = accept(res)
+	assert.ErrorContains(t, err, "result code 8")
+
+	_, err = accept(res[:pcpHeaderLen])
+	assert.ErrorContains(t, err, "result code 8", "a header-only error is taken as the request's")
+}

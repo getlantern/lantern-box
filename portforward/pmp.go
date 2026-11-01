@@ -297,15 +297,19 @@ func pcpHeader(op byte, lifetime uint32, local net.IP) []byte {
 }
 
 // pcpAccept takes a response to op that check accepts. An error response can
-// carry only the common header (RFC 6887 §7.2), so its result code is read
-// before check sees the payload. Each request has its own socket, connected to
-// the gateway, so an error answer for op is this request's.
+// carry only the common header (RFC 6887 §7.2), and then nothing in it ties it
+// to the request; each request has its own socket, connected to the gateway,
+// so it is taken as this request's. An error that carries a payload must pass
+// check like a success.
 func pcpAccept(op byte, check func(b []byte) bool) func(b []byte) (bool, error) {
 	return func(b []byte) (bool, error) {
 		if len(b) >= 1 && b[0] != pcpVersion {
 			return false, errPMPVersion
 		}
 		if len(b) < pcpHeaderLen || b[1] != 0x80|op {
+			return false, nil
+		}
+		if len(b) > pcpHeaderLen && !check(b) {
 			return false, nil
 		}
 		if b[3] != 0 {
