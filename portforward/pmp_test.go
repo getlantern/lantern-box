@@ -28,6 +28,14 @@ type fakePMPGateway struct {
 	result byte
 	// silent drops every request.
 	silent bool
+	// dropAdds drops the answer to every MAP request that isn't a delete,
+	// after recording it, as when the gateway acts but its answer is lost.
+	dropAdds bool
+	// grant, if set, is the lifetime the gateway grants instead of the one
+	// asked for.
+	grant uint32
+	// onMap, if set, sees each NAT-PMP MAP request.
+	onMap func(req []byte)
 	// maps records each MAP request: protocol, internal port, lifetime.
 	maps []fakeMap
 	// nonces records the nonce of each PCP MAP request.
@@ -83,6 +91,9 @@ func (g *fakePMPGateway) answer(req []byte) []byte {
 		res := make([]byte, pcpHeaderLen, pcpHeaderLen+pcpMapLen)
 		res[0], res[1], res[3] = pcpVersion, 0x80|req[1], g.result
 		copy(res[4:8], req[4:8])
+		if g.grant != 0 && binary.BigEndian.Uint32(req[4:8]) > 0 {
+			binary.BigEndian.PutUint32(res[4:8], g.grant)
+		}
 		if req[1] == pcpOpMap {
 			m := append([]byte(nil), req[pcpHeaderLen:pcpHeaderLen+pcpMapLen]...)
 			proto := TCP
@@ -96,6 +107,9 @@ func (g *fakePMPGateway) answer(req []byte) []byte {
 			}
 			copy(m[20:36], net.IPv4(203, 0, 113, 7).To16())
 			res = append(res, m...)
+			if g.dropAdds && binary.BigEndian.Uint32(req[4:8]) > 0 {
+				return nil
+			}
 		}
 		return res
 	}
@@ -116,6 +130,9 @@ func (g *fakePMPGateway) answer(req []byte) []byte {
 		if op == natPMPOpMapUDP {
 			proto = UDP
 		}
+		if g.onMap != nil {
+			g.onMap(req)
+		}
 		internal := binary.BigEndian.Uint16(req[4:6])
 		lifetime := binary.BigEndian.Uint32(req[8:12])
 		g.maps = append(g.maps, fakeMap{proto, internal, lifetime})
@@ -125,6 +142,12 @@ func (g *fakePMPGateway) answer(req []byte) []byte {
 			binary.BigEndian.PutUint16(res[10:12], g.assign)
 		}
 		copy(res[12:16], req[8:12])
+		if g.grant != 0 && lifetime > 0 {
+			binary.BigEndian.PutUint32(res[12:16], g.grant)
+		}
+		if g.dropAdds && lifetime > 0 {
+			return nil
+		}
 		return res
 	}
 	return nil
@@ -137,6 +160,17 @@ func (g *fakePMPGateway) set(f func()) {
 	f()
 }
 
+// collapse drops consecutive repeats, which are a request's resends.
+func collapse(ms []fakeMap) []fakeMap {
+	var out []fakeMap
+	for _, m := range ms {
+		if len(out) == 0 || out[len(out)-1] != m {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 func (g *fakePMPGateway) recorded() []fakeMap {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -145,7 +179,7 @@ func (g *fakePMPGateway) recorded() []fakeMap {
 
 func TestNATPMP_MapAndDelete(t *testing.T) {
 	g := newFakePMPGateway(t, false)
-	c := natPMPClient{gw: g.addr(), timeout: time.Second}
+	c := newNATPMPClient(g.addr(), time.Second)
 
 	require.NoError(t, c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600))
 	require.NoError(t, c.AddPortMapping("", 30001, TCP, 30001, "", true, "test", 3600))
@@ -162,7 +196,7 @@ func TestNATPMP_MapAndDelete(t *testing.T) {
 func TestNATPMP_WrongPortIsRemovedAndRefused(t *testing.T) {
 	g := newFakePMPGateway(t, false)
 	g.set(func() { g.assign = 50000 })
-	c := natPMPClient{gw: g.addr(), timeout: time.Second}
+	c := newNATPMPClient(g.addr(), time.Second)
 
 	err := c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600)
 	assert.ErrorContains(t, err, "assigned external port 50000")
@@ -172,7 +206,7 @@ func TestNATPMP_WrongPortIsRemovedAndRefused(t *testing.T) {
 func TestNATPMP_ResultCodeIsAnError(t *testing.T) {
 	g := newFakePMPGateway(t, false)
 	g.set(func() { g.result = 2 })
-	c := natPMPClient{gw: g.addr(), timeout: time.Second}
+	c := newNATPMPClient(g.addr(), time.Second)
 	assert.ErrorContains(t, c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600), "result code 2")
 }
 
@@ -199,10 +233,13 @@ func TestPCP_MapRenewAndDeleteShareANonce(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "203.0.113.7", ip)
 
-	// A new mapping after the delete gets a fresh nonce.
+	// The nonce outlives the delete: a renewal racing teardown can re-create
+	// the mapping, and only the same nonce can then remove it.
 	require.NoError(t, c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600))
+	require.NoError(t, c.DeletePortMapping("", 41641, UDP))
 	g.mu.Lock()
-	assert.NotEqual(t, nonces[0], g.nonces[3])
+	assert.Equal(t, nonces[0], g.nonces[3])
+	assert.Equal(t, nonces[0], g.nonces[4])
 	g.mu.Unlock()
 }
 
@@ -230,7 +267,7 @@ func TestDiscoverPMP_FallsBackToNATPMP(t *testing.T) {
 	c, method, err := discoverPMP(context.Background(), g.addr())
 	require.NoError(t, err)
 	assert.Equal(t, "nat-pmp", method)
-	assert.IsType(t, natPMPClient{}, c)
+	assert.IsType(t, &natPMPClient{}, c)
 }
 
 // A gateway that ignores both protocols costs discovery pmpProbeTimeout, not
@@ -269,4 +306,71 @@ func TestForwarder_OnPCP(t *testing.T) {
 	assert.Equal(t, "203.0.113.7", ip)
 	require.NoError(t, f.UnmapPort(context.Background()))
 	assert.Equal(t, []fakeMap{{UDP, 41641, 3600}, {UDP, 41641, 0}}, g.recorded())
+}
+
+// A NAT-PMP deletion asks for external port 0, as RFC 6886 §3.4 requires.
+func TestNATPMP_DeleteSuggestsPortZero(t *testing.T) {
+	g := newFakePMPGateway(t, false)
+	var seen []uint16
+	g.set(func() { g.onMap = func(req []byte) { seen = append(seen, binary.BigEndian.Uint16(req[6:8])) } })
+	c := newNATPMPClient(g.addr(), time.Second)
+	require.NoError(t, c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600))
+	require.NoError(t, c.DeletePortMapping("", 41641, UDP))
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	assert.Equal(t, []uint16{41641, 0}, seen)
+}
+
+// An add whose answer never comes is deleted, since the gateway may have made
+// it and the Forwarder won't track it. A renewal whose answer never comes is
+// left for teardown, since deleting it would remove a live mapping.
+func TestPMP_LostAnswer(t *testing.T) {
+	for _, pcp := range []bool{false, true} {
+		g := newFakePMPGateway(t, pcp)
+		var c igdClient = newNATPMPClient(g.addr(), 300*time.Millisecond)
+		if pcp {
+			c = newPCPClient(g.addr(), 300*time.Millisecond)
+		}
+		g.set(func() { g.dropAdds = true })
+		err := c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600)
+		assert.ErrorIs(t, err, errNoAnswer, "pcp=%v", pcp)
+		assert.Equal(t, []fakeMap{{UDP, 41641, 3600}, {UDP, 41641, 0}}, collapse(g.recorded()), "pcp=%v: a fresh add whose answer was lost must be deleted", pcp)
+
+		g.set(func() { g.dropAdds = false; g.maps = nil })
+		require.NoError(t, c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600))
+		g.set(func() { g.dropAdds = true })
+		assert.ErrorIs(t, c.AddPortMapping("", 41641, UDP, 41641, "", true, "test (renew)", 3600), errNoAnswer)
+		assert.Equal(t, []fakeMap{{UDP, 41641, 3600}}, collapse(g.recorded()), "pcp=%v: a renewal must not be deleted", pcp)
+	}
+}
+
+// A gateway that grants a shorter lease than asked sets the mapping's lease,
+// and renewal comes at half of it.
+func TestForwarder_RenewsWithinTheGrantedLease(t *testing.T) {
+	for _, pcp := range []bool{false, true} {
+		g := newFakePMPGateway(t, pcp)
+		g.set(func() { g.grant = 120 })
+		var c igdClient = newNATPMPClient(g.addr(), time.Second)
+		if pcp {
+			c = newPCPClient(g.addr(), time.Second)
+		}
+		f := &Forwarder{client: c, method: "test"}
+		m, err := f.MapPort(context.Background(), UDP, 41641, "test")
+		require.NoError(t, err)
+		assert.Equal(t, 120*time.Second, m.LeaseDuration, "pcp=%v", pcp)
+		assert.Equal(t, 60*time.Second, f.nextRenewal(30*time.Minute), "pcp=%v", pcp)
+
+		// A renewal asks for the original lease again, and records what it got.
+		g.set(func() { g.grant = 600 })
+		require.True(t, f.renew(f.mappings[UDP], c))
+		assert.Equal(t, uint32(3600), g.recorded()[1].lifetime, "pcp=%v", pcp)
+		assert.Equal(t, 300*time.Second, f.nextRenewal(30*time.Minute), "pcp=%v", pcp)
+	}
+}
+
+// A gateway granting seconds can't make renewal spin.
+func TestForwarder_RenewalIntervalHasAFloor(t *testing.T) {
+	f := &Forwarder{mappings: map[string]*Mapping{UDP: {Protocol: UDP, LeaseDuration: 2 * time.Second}}}
+	assert.Equal(t, minRenewInterval, f.nextRenewal(30*time.Minute))
+	assert.Equal(t, time.Second, f.nextRenewal(time.Second), "a shorter interval passed in still wins")
 }

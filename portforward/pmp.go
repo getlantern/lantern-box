@@ -37,9 +37,15 @@ const (
 	pmpFirstResend = 250 * time.Millisecond
 )
 
-// errPMPVersion is returned when the gateway answers in the other protocol's
-// version, so discovery can move on at once rather than wait out the timeout.
-var errPMPVersion = errors.New("gateway does not speak this protocol version")
+var (
+	// errPMPVersion is returned when the gateway answers in the other
+	// protocol's version, so discovery can move on at once rather than wait out
+	// the timeout.
+	errPMPVersion = errors.New("gateway does not speak this protocol version")
+	// errNoAnswer is returned when the gateway never answered. Unlike a refusal,
+	// the request may still have taken effect.
+	errNoAnswer = errors.New("no answer")
+)
 
 // pmpExchange sends the request build returns to gw, resending on the RFCs'
 // schedule, and returns the first response accept takes, or accept's error.
@@ -83,9 +89,82 @@ func pmpExchange(gw *net.UDPAddr, timeout time.Duration, build func(local net.IP
 			}
 		}
 		if !time.Now().Before(deadline) {
-			return nil, fmt.Errorf("no answer from %s within %s", gw, timeout)
+			return nil, fmt.Errorf("%w from %s within %s", errNoAnswer, gw, timeout)
 		}
 	}
+}
+
+// mapFunc sends one mapping request and returns the external port and the
+// lifetime, in seconds, the gateway granted. A lifetime of 0 deletes the
+// mapping for internalPort.
+type mapFunc func(protocol string, internalPort, externalPort uint16, lifetime uint32) (port uint16, granted uint32, err error)
+
+// pmpMappings is what a NAT-PMP or PCP client knows of its live mappings: the
+// lifetime the gateway granted each, which can be shorter than requested.
+type pmpMappings struct {
+	mu      sync.Mutex
+	granted map[pcpKey]uint32
+}
+
+type pcpKey struct {
+	protocol     string
+	internalPort uint16
+}
+
+// add maps internalPort to externalPort, or renews that mapping.
+func (s *pmpMappings) add(method string, mapPort mapFunc, protocol string, internalPort, externalPort uint16, lifetime uint32) error {
+	k := pcpKey{protocol, internalPort}
+	s.mu.Lock()
+	_, renewing := s.granted[k]
+	s.mu.Unlock()
+	got, granted, err := mapPort(protocol, internalPort, externalPort, lifetime)
+	if err != nil {
+		// The gateway may have created a new mapping and lost only its answer,
+		// and the Forwarder won't track a mapping whose add failed. A renewal's
+		// mapping is already tracked, and teardown removes it.
+		if !renewing && errors.Is(err, errNoAnswer) {
+			if _, _, err := mapPort(protocol, internalPort, externalPort, 0); err != nil {
+				slog.Warn("portforward: could not remove a mapping whose answer was lost", "method", method, "err", err)
+			}
+		}
+		return err
+	}
+	if got != externalPort {
+		if _, _, err := mapPort(protocol, internalPort, got, 0); err != nil {
+			slog.Warn("portforward: could not remove a mapping on the wrong port", "method", method, "err", err)
+		}
+		s.forget(k)
+		return fmt.Errorf("%s: gateway assigned external port %d, not %d", method, got, externalPort)
+	}
+	s.mu.Lock()
+	s.granted[k] = granted
+	s.mu.Unlock()
+	return nil
+}
+
+// remove deletes the mapping for internalPort. AddPortMapping only keeps
+// mappings whose external port equals their internal one, so callers pass
+// either.
+func (s *pmpMappings) remove(mapPort mapFunc, protocol string, internalPort uint16) error {
+	if _, _, err := mapPort(protocol, internalPort, internalPort, 0); err != nil {
+		return err
+	}
+	s.forget(pcpKey{protocol, internalPort})
+	return nil
+}
+
+func (s *pmpMappings) forget(k pcpKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.granted, k)
+}
+
+// lease is the lifetime the gateway granted the mapping for internalPort.
+func (s *pmpMappings) lease(protocol string, internalPort uint16) (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, ok := s.granted[pcpKey{protocol, internalPort}]
+	return time.Duration(g) * time.Second, ok
 }
 
 // natPMPClient speaks NAT-PMP. The gateway maps to whichever host sent the
@@ -93,6 +172,11 @@ func pmpExchange(gw *net.UDPAddr, timeout time.Duration, build func(local net.IP
 type natPMPClient struct {
 	gw      *net.UDPAddr
 	timeout time.Duration
+	pmpMappings
+}
+
+func newNATPMPClient(gw *net.UDPAddr, timeout time.Duration) *natPMPClient {
+	return &natPMPClient{gw: gw, timeout: timeout, pmpMappings: pmpMappings{granted: map[pcpKey]uint32{}}}
 }
 
 const (
@@ -102,7 +186,7 @@ const (
 	natPMPOpMapTCP     = 2
 )
 
-func (c natPMPClient) request(op byte, req []byte, minLen int) ([]byte, error) {
+func (c *natPMPClient) request(op byte, req []byte, minLen int) ([]byte, error) {
 	res, err := pmpExchange(c.gw, c.timeout, func(net.IP) []byte { return req },
 		func(b []byte) (bool, error) {
 			if len(b) >= 2 && b[0] != natPMPVersion {
@@ -122,12 +206,15 @@ func (c natPMPClient) request(op byte, req []byte, minLen int) ([]byte, error) {
 	return res, nil
 }
 
-// mapPort asks for a mapping and returns the external port the gateway
-// assigned. A lifetime of 0 deletes the mapping for internalPort.
-func (c natPMPClient) mapPort(protocol string, internalPort, externalPort uint16, lifetime uint32) (uint16, error) {
+// mapPort is NAT-PMP's mapFunc.
+func (c *natPMPClient) mapPort(protocol string, internalPort, externalPort uint16, lifetime uint32) (uint16, uint32, error) {
 	op := byte(natPMPOpMapTCP)
 	if protocol == UDP {
 		op = natPMPOpMapUDP
+	}
+	if lifetime == 0 {
+		// RFC 6886 §3.4: a deletion's suggested external port must be zero.
+		externalPort = 0
 	}
 	req := make([]byte, 12)
 	req[0], req[1] = natPMPVersion, op
@@ -136,36 +223,24 @@ func (c natPMPClient) mapPort(protocol string, internalPort, externalPort uint16
 	binary.BigEndian.PutUint32(req[8:12], lifetime)
 	res, err := c.request(op, req, 16)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if got := binary.BigEndian.Uint16(res[8:10]); got != internalPort {
-		return 0, fmt.Errorf("nat-pmp: answer is for internal port %d, not %d", got, internalPort)
+		return 0, 0, fmt.Errorf("nat-pmp: answer is for internal port %d, not %d", got, internalPort)
 	}
-	return binary.BigEndian.Uint16(res[10:12]), nil
+	return binary.BigEndian.Uint16(res[10:12]), binary.BigEndian.Uint32(res[12:16]), nil
 }
 
-func (c natPMPClient) AddPortMapping(_ string, externalPort uint16, protocol string, internalPort uint16, _ string, _ bool, _ string, leaseDuration uint32) error {
-	got, err := c.mapPort(protocol, internalPort, externalPort, leaseDuration)
-	if err != nil {
-		return err
-	}
-	if got != externalPort {
-		if _, err := c.mapPort(protocol, internalPort, 0, 0); err != nil {
-			slog.Warn("portforward: could not remove a mapping on the wrong port", "method", "nat-pmp", "err", err)
-		}
-		return fmt.Errorf("nat-pmp: gateway assigned external port %d, not %d", got, externalPort)
-	}
-	return nil
+func (c *natPMPClient) AddPortMapping(_ string, externalPort uint16, protocol string, internalPort uint16, _ string, _ bool, _ string, leaseDuration uint32) error {
+	return c.add("nat-pmp", c.mapPort, protocol, internalPort, externalPort, leaseDuration)
 }
 
 // DeletePortMapping deletes by internal port, which NAT-PMP keys mappings on.
-// AddPortMapping only keeps mappings whose external port equals it.
-func (c natPMPClient) DeletePortMapping(_ string, externalPort uint16, protocol string) error {
-	_, err := c.mapPort(protocol, externalPort, 0, 0)
-	return err
+func (c *natPMPClient) DeletePortMapping(_ string, externalPort uint16, protocol string) error {
+	return c.remove(c.mapPort, protocol, externalPort)
 }
 
-func (c natPMPClient) GetExternalIPAddress() (string, error) {
+func (c *natPMPClient) GetExternalIPAddress() (string, error) {
 	res, err := c.request(natPMPOpExternalIP, []byte{natPMPVersion, natPMPOpExternalIP}, 12)
 	if err != nil {
 		return "", err
@@ -174,21 +249,17 @@ func (c natPMPClient) GetExternalIPAddress() (string, error) {
 }
 
 // pcpClient speaks PCP. Refreshing or deleting a mapping needs the nonce that
-// created it, so the client keeps one per protocol and internal port. PCP has
-// no request for the external address alone, so the client remembers the one
-// its last mapping reported.
+// created it, so the client keeps one per protocol and internal port for as
+// long as it lives: a renewal racing a delete may re-create the mapping, and
+// only the same nonce can then remove it. PCP has no request for the external
+// address alone, so the client remembers the one its last mapping reported.
 type pcpClient struct {
 	gw      *net.UDPAddr
 	timeout time.Duration
+	pmpMappings
 
-	mu         sync.Mutex
 	nonces     map[pcpKey][12]byte
 	externalIP net.IP
-}
-
-type pcpKey struct {
-	protocol     string
-	internalPort uint16
 }
 
 const (
@@ -202,7 +273,7 @@ const (
 )
 
 func newPCPClient(gw *net.UDPAddr, timeout time.Duration) *pcpClient {
-	return &pcpClient{gw: gw, timeout: timeout, nonces: map[pcpKey][12]byte{}}
+	return &pcpClient{gw: gw, timeout: timeout, pmpMappings: pmpMappings{granted: map[pcpKey]uint32{}}, nonces: map[pcpKey][12]byte{}}
 }
 
 // pcpHeader builds a request header from local, the address the request is
@@ -250,12 +321,11 @@ func (c *pcpClient) nonce(protocol string, internalPort uint16) ([12]byte, error
 	return n, nil
 }
 
-// mapPort sends a MAP request and returns the external port the gateway
-// assigned. A lifetime of 0 deletes the mapping.
-func (c *pcpClient) mapPort(protocol string, internalPort, externalPort uint16, lifetime uint32) (uint16, error) {
+// mapPort is PCP's mapFunc, a MAP request.
+func (c *pcpClient) mapPort(protocol string, internalPort, externalPort uint16, lifetime uint32) (uint16, uint32, error) {
 	nonce, err := c.nonce(protocol, internalPort)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	proto := byte(pcpProtocolTCP)
 	if protocol == UDP {
@@ -280,40 +350,24 @@ func (c *pcpClient) mapPort(protocol string, internalPort, externalPort uint16, 
 		return [12]byte(m[0:12]) == nonce && m[12] == proto && binary.BigEndian.Uint16(m[16:18]) == internalPort
 	}))
 	if err != nil {
-		return 0, fmt.Errorf("pcp: %w", err)
+		return 0, 0, fmt.Errorf("pcp: %w", err)
 	}
 	m := res[pcpHeaderLen:]
 	if lifetime > 0 {
 		c.mu.Lock()
 		c.externalIP = net.IP(append([]byte(nil), m[20:36]...))
 		c.mu.Unlock()
-	} else {
-		c.mu.Lock()
-		delete(c.nonces, pcpKey{protocol, internalPort})
-		c.mu.Unlock()
 	}
-	return binary.BigEndian.Uint16(m[18:20]), nil
+	return binary.BigEndian.Uint16(m[18:20]), binary.BigEndian.Uint32(res[4:8]), nil
 }
 
 func (c *pcpClient) AddPortMapping(_ string, externalPort uint16, protocol string, internalPort uint16, _ string, _ bool, _ string, leaseDuration uint32) error {
-	got, err := c.mapPort(protocol, internalPort, externalPort, leaseDuration)
-	if err != nil {
-		return err
-	}
-	if got != externalPort {
-		if _, err := c.mapPort(protocol, internalPort, got, 0); err != nil {
-			slog.Warn("portforward: could not remove a mapping on the wrong port", "method", "pcp", "err", err)
-		}
-		return fmt.Errorf("pcp: gateway assigned external port %d, not %d", got, externalPort)
-	}
-	return nil
+	return c.add("pcp", c.mapPort, protocol, internalPort, externalPort, leaseDuration)
 }
 
 // DeletePortMapping deletes by internal port, as the mapping's nonce is keyed.
-// AddPortMapping only keeps mappings whose external port equals it.
 func (c *pcpClient) DeletePortMapping(_ string, externalPort uint16, protocol string) error {
-	_, err := c.mapPort(protocol, externalPort, externalPort, 0)
-	return err
+	return c.remove(c.mapPort, protocol, externalPort)
 }
 
 func (c *pcpClient) GetExternalIPAddress() (string, error) {
@@ -354,7 +408,7 @@ func discoverPMP(ctx context.Context, gw *net.UDPAddr) (igdClient, string, error
 		timeout = time.Until(d)
 	}
 	pcp := newPCPClient(gw, timeout)
-	pmp := natPMPClient{gw: gw, timeout: timeout}
+	pmp := newNATPMPClient(gw, timeout)
 	pcpErr := make(chan error, 1)
 	pmpErr := make(chan error, 1)
 	go func() { pcpErr <- pcp.announce() }()
