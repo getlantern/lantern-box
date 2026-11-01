@@ -337,3 +337,86 @@ func TestReporterPeriodicFlushIsBoundedByInterval(t *testing.T) {
 	}
 	require.EqualValues(t, 8, conn.GetBytesConsumed(), "unreported usage is kept")
 }
+
+// Concurrent reads, writes and flushes, including a rejected report, count
+// each bidirectional connection exactly once in the acknowledged reports.
+func TestReporterCountsBidirectionalConnectionsOnce(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		accepted []DataCapReport
+		calls    int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var report DataCapReport
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&report))
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls == 1 { // reject the first report; its delta must come back
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		accepted = append(accepted, report)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"throttle":false}`))
+	}))
+	defer srv.Close()
+	tracker, err := NewDatacapTracker(Options{URL: srv.URL, ReportInterval: "1h", TrafficCategories: true}, noopLogger)
+	require.NoError(t, err)
+	defer tracker.Close()
+
+	const conns, ops = 8, 200
+	var wg sync.WaitGroup
+	for range conns {
+		conn := routeConn(t, tracker, "device", make([]byte, ops))
+		defer conn.Close()
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for range ops {
+				_, _ = conn.Read(make([]byte, 1))
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range ops {
+				_, _ = conn.Write([]byte{0})
+			}
+		}()
+	}
+	stop := make(chan struct{})
+	flushed := make(chan struct{})
+	go func() {
+		defer close(flushed)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				tracker.reporter.flush(context.Background())
+			}
+		}
+	}()
+	wg.Wait()
+	close(stop)
+	<-flushed
+	// Two final flushes, so a delta restored by the last loop flush is
+	// retried even if the rejection came late.
+	tracker.reporter.flush(context.Background())
+	tracker.reporter.flush(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Greater(t, calls, len(accepted), "a report must have been rejected")
+	var bytes, otherBytes, otherConns int64
+	for _, r := range accepted {
+		require.NotNil(t, r.TrafficUsage)
+		require.LessOrEqual(t, r.TrafficUsage.OtherConnections, r.TrafficUsage.OtherBytes)
+		bytes += r.BytesUsed
+		otherBytes += r.TrafficUsage.OtherBytes
+		otherConns += r.TrafficUsage.OtherConnections
+	}
+	require.EqualValues(t, conns*2*ops, bytes)
+	require.EqualValues(t, bytes, otherBytes)
+	require.EqualValues(t, conns, otherConns)
+}

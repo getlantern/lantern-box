@@ -24,6 +24,10 @@ type Throttler struct {
 	writeTokens     float64
 	writeCapacity   float64
 	writeLastRefill time.Time
+
+	// released is closed by Disable to wake callers sleeping off token debt;
+	// a fresh one replaces it.
+	released chan struct{}
 }
 
 // NewThrottler creates a new throttler with the specified bytes per second limit.
@@ -46,6 +50,7 @@ func NewThrottlerWithRates(readBytesPerSec, writeBytesPerSec int64) *Throttler {
 		writeTokens:     float64(writeBytesPerSec),
 		writeCapacity:   float64(writeBytesPerSec),
 		writeLastRefill: now,
+		released:        make(chan struct{}),
 	}
 	return t
 }
@@ -109,11 +114,13 @@ func (t *Throttler) UpdateRates(readBytesPerSec, writeBytesPerSec int64) {
 	}
 }
 
-// Disable disables throttling.
+// Disable disables throttling and releases callers waiting for tokens.
 func (t *Throttler) Disable() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.enabled = false
+	close(t.released)
+	t.released = make(chan struct{})
 }
 
 // IsEnabled returns whether throttling is enabled.
@@ -191,6 +198,7 @@ func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 		return nil
 	}
 	waitTime := time.Duration(-*tokens / float64(rate) * float64(time.Second))
+	released := t.released
 	t.mu.Unlock()
 
 	timer := time.NewTimer(waitTime)
@@ -199,6 +207,8 @@ func (t *Throttler) wait(ctx context.Context, n int, isRead bool) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-timer.C:
+		return nil
+	case <-released:
 		return nil
 	}
 }

@@ -331,3 +331,27 @@ func TestThrottler_UpdateRatesDuringWait(t *testing.T) {
 	}
 	require.NoError(t, <-waiting)
 }
+
+// Lifting a cap releases every caller already sleeping off token debt, not
+// just later ones.
+func TestThrottler_DisableReleasesWaiters(t *testing.T) {
+	th := NewThrottler(1000)
+	require.NoError(t, th.WaitWrite(context.Background(), 1000)) // drain the bucket
+
+	const waiters = 5
+	done := make(chan error, waiters)
+	for range waiters {
+		go func() { done <- th.WaitWrite(context.Background(), 2000) }() // seconds of debt each
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	th.Disable()
+	for range waiters {
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("waiter still blocked after Disable")
+		}
+	}
+}
