@@ -16,6 +16,7 @@ import (
 	boxService "github.com/sagernet/sing-box/adapter/service"
 	"github.com/sagernet/sing-box/common/dialer"
 	sblog "github.com/sagernet/sing-box/log"
+	sbOption "github.com/sagernet/sing-box/option"
 
 	C "github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
@@ -43,6 +44,12 @@ const (
 type Volunteer struct {
 	tag    string
 	logger sblog.ContextLogger
+
+	// ctx is the box's context, kept for Start: the signaling dialer resolves freddie's hostname
+	// through the box's DNS, which is ready by then.
+	ctx                   context.Context
+	dialerOptions         sbOption.DialerOptions
+	insecureDiscoveryCert bool
 
 	bfOpt         *UBClientcore.BroflakeOptions
 	rtcOpt        *UBClientcore.WebRTCOptions
@@ -84,7 +91,13 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 		}
 	}
 
-	v := &Volunteer{tag: tag, logger: lg}
+	v := &Volunteer{
+		tag:                   tag,
+		logger:                lg,
+		ctx:                   ctx,
+		dialerOptions:         opts.DialerOptions,
+		insecureDiscoveryCert: opts.InsecureDoNotVerifyDiscoveryCert,
+	}
 
 	bfOpt := UBClientcore.NewDefaultBroflakeOptions()
 	bfOpt.ClientType = "widget"
@@ -118,12 +131,6 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 	rtcOpt.TargetCountries = opts.TargetCountries
 	rtcOpt.OnSTUNPreflight = v.stunPreflight
 
-	signalingDialer, err := dialer.New(ctx, opts.DialerOptions, false)
-	if err != nil {
-		return nil, fmt.Errorf("unbounded volunteer: build signaling dialer: %w", err)
-	}
-	rtcOpt.HTTPClient = signalingClient(ctx, signalingDialer, opts.InsecureDoNotVerifyDiscoveryCert)
-
 	egOpt := UBClientcore.NewDefaultEgressOptions()
 	egOpt.Addr = opts.EgressAddr
 	setStringIfNonEmpty(&egOpt.Endpoint, opts.EgressEndpoint)
@@ -154,6 +161,12 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 	if v.ui != nil {
 		return nil
 	}
+	// freddie is normally a hostname, which the dialer has to resolve through the box's DNS.
+	signalingDialer, err := dialer.New(v.ctx, v.dialerOptions, true)
+	if err != nil {
+		return fmt.Errorf("unbounded volunteer: build signaling dialer: %w", err)
+	}
+	v.rtcOpt.HTTPClient = signalingClient(v.ctx, signalingDialer, v.insecureDiscoveryCert)
 	_, ui, err := UBClientcore.NewBroflake(v.bfOpt, v.rtcOpt, v.egOpt)
 	if err != nil {
 		return fmt.Errorf("unbounded volunteer: start broflake: %w", err)

@@ -165,7 +165,8 @@ func newVolunteerBoxContext(t *testing.T) context.Context {
 }
 
 // A box started from a config with the volunteer service checks its STUN servers and then asks
-// freddie for an offer.
+// freddie for an offer. freddie's address is a hostname, as in production, so the signaling dialer
+// must resolve it.
 func TestVolunteerServiceSendsGenesis(t *testing.T) {
 	stunAddr := startTestSTUNServer(t)
 	genesis := make(chan url.Values, 8)
@@ -181,10 +182,14 @@ func TestVolunteerServiceSendsGenesis(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(freddie.Close)
+	freddieURL, err := url.Parse(freddie.URL)
+	require.NoError(t, err)
+	freddieURL.Host = net.JoinHostPort("localhost", freddieURL.Port())
 
 	ctx := newVolunteerBoxContext(t)
 	opts, err := json.UnmarshalExtendedContext[sbOption.Options](ctx, []byte(fmt.Sprintf(`{
 		"log": {"disabled": true},
+		"dns": {"strategy": "ipv4_only"},
 		"services": [{
 			"type": "unbounded",
 			"tag": "volunteer",
@@ -194,10 +199,21 @@ func TestVolunteerServiceSendsGenesis(t *testing.T) {
 			"max_peers": 1,
 			"stats_interval": -1
 		}]
-	}`, freddie.URL, "stun:"+stunAddr)))
+	}`, freddieURL.String(), "stun:"+stunAddr)))
 	require.NoError(t, err)
 	b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
 	require.NoError(t, err)
+	// Close in cleanup, so the volunteer's workers stop even when an assertion below fails.
+	t.Cleanup(func() {
+		closed := make(chan error, 1)
+		go func() { closed <- b.Close() }()
+		select {
+		case err := <-closed:
+			assert.NoError(t, err)
+		case <-time.After(20 * time.Second):
+			t.Error("closing the box hung")
+		}
+	})
 	require.NoError(t, b.Start())
 
 	select {
@@ -206,15 +222,6 @@ func TestVolunteerServiceSendsGenesis(t *testing.T) {
 			"the first genesis after a passed STUN check reports it")
 	case <-time.After(15 * time.Second):
 		t.Fatal("the volunteer never sent genesis")
-	}
-
-	closed := make(chan error, 1)
-	go func() { closed <- b.Close() }()
-	select {
-	case err := <-closed:
-		require.NoError(t, err)
-	case <-time.After(20 * time.Second):
-		t.Fatal("closing the box hung")
 	}
 }
 
