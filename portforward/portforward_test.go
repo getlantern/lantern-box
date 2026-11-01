@@ -23,12 +23,16 @@ type fakeIGD struct {
 	addBlock    chan struct{} // if non-nil, AddPortMapping blocks on receive
 	lastAdd     mappingArgs
 	lastDelete  deleteArgs
+	// adds and deletes are the protocol of every call, in order.
+	adds, deletes []string
+	// deleteErrFor, if set, overrides deleteErr per protocol.
+	deleteErrFor map[string]error
 }
 
 type mappingArgs struct {
-	externalPort, internalPort  uint16
-	internalClient, description string
-	leaseDuration               uint32
+	externalPort, internalPort            uint16
+	protocol, internalClient, description string
+	leaseDuration                         uint32
 }
 
 type deleteArgs struct {
@@ -36,15 +40,17 @@ type deleteArgs struct {
 	protocol     string
 }
 
-func (f *fakeIGD) AddPortMapping(_ string, externalPort uint16, _ string, internalPort uint16, internalClient string, _ bool, description string, leaseDuration uint32) error {
+func (f *fakeIGD) AddPortMapping(_ string, externalPort uint16, protocol string, internalPort uint16, internalClient string, _ bool, description string, leaseDuration uint32) error {
 	f.addCalls.Add(1)
 	if f.addBlock != nil {
 		<-f.addBlock
 	}
 	f.mu.Lock()
+	f.adds = append(f.adds, protocol)
 	f.lastAdd = mappingArgs{
 		externalPort:   externalPort,
 		internalPort:   internalPort,
+		protocol:       protocol,
 		internalClient: internalClient,
 		description:    description,
 		leaseDuration:  leaseDuration,
@@ -57,8 +63,13 @@ func (f *fakeIGD) DeletePortMapping(_ string, externalPort uint16, protocol stri
 	f.deleteCalls.Add(1)
 	f.mu.Lock()
 	f.lastDelete = deleteArgs{externalPort: externalPort, protocol: protocol}
+	f.deletes = append(f.deletes, protocol)
+	err := f.deleteErr
+	if f.deleteErrFor != nil {
+		err = f.deleteErrFor[protocol]
+	}
 	f.mu.Unlock()
-	return f.deleteErr
+	return err
 }
 
 func (f *fakeIGD) GetExternalIPAddress() (string, error) {
@@ -80,7 +91,7 @@ func TestForwarder_MapPort_HappyPath(t *testing.T) {
 	c := &fakeIGD{}
 	f := newTestForwarder(t, c)
 
-	m, err := f.MapPort(context.Background(), 30001, "test")
+	m, err := f.MapPort(context.Background(), TCP, 30001, "test")
 	require.NoError(t, err)
 	assert.Equal(t, uint16(30001), m.ExternalPort)
 	assert.Equal(t, uint16(30001), m.InternalPort)
@@ -93,17 +104,17 @@ func TestForwarder_MapPort_DoubleMapRejected(t *testing.T) {
 	c := &fakeIGD{}
 	f := newTestForwarder(t, c)
 
-	_, err := f.MapPort(context.Background(), 30001, "test")
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
 	require.NoError(t, err)
-	_, err = f.MapPort(context.Background(), 30002, "test")
-	assert.ErrorContains(t, err, "already has an active mapping")
+	_, err = f.MapPort(context.Background(), TCP, 30002, "test")
+	assert.ErrorContains(t, err, "already has an active TCP mapping")
 }
 
 func TestForwarder_MapPort_PropagatesGatewayError(t *testing.T) {
 	c := &fakeIGD{addErr: errors.New("conflict")}
 	f := newTestForwarder(t, c)
 
-	_, err := f.MapPort(context.Background(), 30001, "test")
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
 	assert.ErrorContains(t, err, "add port mapping")
 }
 
@@ -135,7 +146,7 @@ func TestForwarder_MapPort_RespectsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := f.MapPort(ctx, 30001, "test")
+	_, err := f.MapPort(ctx, TCP, 30001, "test")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.Canceled)
 	close(block) // release the leaked goroutine
@@ -153,7 +164,7 @@ func TestForwarder_UnmapPort_RemovesMapping(t *testing.T) {
 	c := &fakeIGD{}
 	f := newTestForwarder(t, c)
 
-	_, err := f.MapPort(context.Background(), 30001, "test")
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
 	require.NoError(t, err)
 
 	require.NoError(t, f.UnmapPort(context.Background()))
@@ -162,7 +173,7 @@ func TestForwarder_UnmapPort_RemovesMapping(t *testing.T) {
 	assert.Equal(t, "TCP", c.lastDelete.protocol)
 
 	// Calling MapPort after UnmapPort must succeed (mapping cleared).
-	_, err = f.MapPort(context.Background(), 30002, "test")
+	_, err = f.MapPort(context.Background(), TCP, 30002, "test")
 	require.NoError(t, err)
 }
 
@@ -172,7 +183,7 @@ func TestForwarder_StartRenewal_ReissuesAddPortMapping(t *testing.T) {
 
 	// Use a short lease so the renewal interval clamps to the 1m floor; we
 	// invoke the loop directly with a fast interval to avoid waiting.
-	_, err := f.MapPort(context.Background(), 30001, "test")
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -194,7 +205,7 @@ func TestForwarder_StartRenewal_CancelsCleanly(t *testing.T) {
 	c := &fakeIGD{}
 	f := newTestForwarder(t, c)
 
-	_, err := f.MapPort(context.Background(), 30001, "test")
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -270,7 +281,7 @@ func TestForwarder_MapPort_GatewayErrorWrapsErrNoPortForwarding(t *testing.T) {
 	c := &fakeIGD{addErr: errors.New("ConflictInMappingEntry")}
 	f := newTestForwarder(t, c)
 
-	_, err := f.MapPort(context.Background(), 30001, "test")
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrNoPortForwarding, "callers must be able to detect via errors.Is")
 	assert.ErrorContains(t, err, "ConflictInMappingEntry", "underlying gateway error must survive for diagnostics")
@@ -284,10 +295,10 @@ func TestForwarder_RenewalRacingTeardown_DeletesWhatItReAdded(t *testing.T) {
 	release := make(chan struct{})
 	c := &fakeIGD{addBlock: release}
 	f := newTestForwarder(t, c)
-	f.mapping = &Mapping{
+	f.mappings = map[string]*Mapping{TCP: {
 		ExternalPort: 15000, InternalPort: 15000, InternalIP: "192.168.1.10",
-		Protocol: "TCP", LeaseDuration: time.Hour,
-	}
+		Protocol: TCP, LeaseDuration: time.Hour,
+	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	f.cancel = cancel
@@ -319,10 +330,10 @@ func TestForwarder_RenewalRacingTeardown_DeletesWhatItReAdded(t *testing.T) {
 func TestForwarder_RenewalAfterTeardown_DoesNotReAdd(t *testing.T) {
 	c := &fakeIGD{}
 	f := newTestForwarder(t, c)
-	f.mapping = &Mapping{
+	f.mappings = map[string]*Mapping{TCP: {
 		ExternalPort: 15001, InternalPort: 15001, InternalIP: "192.168.1.10",
-		Protocol: "TCP", LeaseDuration: time.Hour,
-	}
+		Protocol: TCP, LeaseDuration: time.Hour,
+	}}
 	require.NoError(t, f.UnmapPort(context.Background()))
 	require.Equal(t, int64(1), c.deleteCalls.Load())
 
@@ -354,7 +365,7 @@ func TestForwarder_MapPort_CancelledMidCall_RemovesAcceptedMapping(t *testing.T)
 	}
 	res := make(chan result, 1)
 	go func() {
-		m, err := f.MapPort(ctx, 15100, "test")
+		m, err := f.MapPort(ctx, TCP, 15100, "test")
 		res <- result{m, err}
 	}()
 
@@ -374,7 +385,7 @@ func TestForwarder_MapPort_CancelledMidCall_RemovesAcceptedMapping(t *testing.T)
 	require.Error(t, got.err, "a cancelled caller must get an error")
 	assert.ErrorIs(t, got.err, context.Canceled)
 	assert.Nil(t, got.m)
-	assert.Nil(t, f.mapping, "no mapping should be recorded")
+	assert.Empty(t, f.mappings, "no mapping should be recorded")
 	assert.Equal(t, int64(1), c.deleteCalls.Load(),
 		"the accepted-but-unreported mapping must be deleted, or it survives untracked")
 	assert.Equal(t, uint16(15100), c.lastDelete.externalPort)
@@ -412,7 +423,7 @@ func TestForwarder_MapPort_RemovesTheMappingWhenTheGatewayNeverAnswers(t *testin
 	c := &fakeIGD{addBlock: block}
 	f := newTestForwarder(t, c)
 
-	_, err := f.MapPort(context.Background(), 30001, "test")
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
 	require.Error(t, err)
 	// Still the "this network can't host a peer" sentinel: the caller has no
 	// mapping either way, and the retry decision is the same.
@@ -426,5 +437,124 @@ func TestForwarder_MapPort_RemovesTheMappingWhenTheGatewayNeverAnswers(t *testin
 	// stale to delete and StartRenewal has nothing to renew.
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	assert.Nil(t, f.mapping)
+	assert.Empty(t, f.mappings)
+}
+
+// A node maps TCP for its inbounds and UDP for WebRTC on one forwarder. Each
+// protocol gets its own gateway rule, and a second mapping of the same
+// protocol is still refused.
+func TestForwarder_MapPort_OneMappingPerProtocol(t *testing.T) {
+	c := &fakeIGD{}
+	f := newTestForwarder(t, c)
+
+	tcp, err := f.MapPort(context.Background(), TCP, 30001, "tcp")
+	require.NoError(t, err)
+	udp, err := f.MapPort(context.Background(), UDP, 30002, "udp")
+	require.NoError(t, err)
+	assert.Equal(t, TCP, tcp.Protocol)
+	assert.Equal(t, UDP, udp.Protocol)
+	assert.Equal(t, uint16(30002), udp.ExternalPort)
+	assert.Equal(t, []string{TCP, UDP}, c.adds)
+
+	_, err = f.MapPort(context.Background(), UDP, 30003, "udp")
+	assert.ErrorContains(t, err, "already has an active UDP mapping")
+}
+
+func TestForwarder_MapPort_RejectsUnknownProtocol(t *testing.T) {
+	c := &fakeIGD{}
+	f := newTestForwarder(t, c)
+	_, err := f.MapPort(context.Background(), "SCTP", 30001, "test")
+	assert.ErrorContains(t, err, "unsupported protocol")
+	assert.Equal(t, int64(0), c.addCalls.Load())
+}
+
+func TestForwarder_UnmapPort_RemovesEveryProtocol(t *testing.T) {
+	c := &fakeIGD{}
+	f := newTestForwarder(t, c)
+	_, err := f.MapPort(context.Background(), UDP, 30002, "udp")
+	require.NoError(t, err)
+	_, err = f.MapPort(context.Background(), TCP, 30001, "tcp")
+	require.NoError(t, err)
+
+	require.NoError(t, f.UnmapPort(context.Background()))
+	assert.Equal(t, []string{TCP, UDP}, c.deletes)
+	assert.Empty(t, f.mappings)
+}
+
+// A failed delete keeps that mapping so a retry can remove it, without holding
+// up the other protocol's delete.
+func TestForwarder_UnmapPort_KeepsOnlyWhatFailedToDelete(t *testing.T) {
+	c := &fakeIGD{deleteErrFor: map[string]error{TCP: errors.New("gateway busy")}}
+	f := newTestForwarder(t, c)
+	_, err := f.MapPort(context.Background(), TCP, 30001, "tcp")
+	require.NoError(t, err)
+	_, err = f.MapPort(context.Background(), UDP, 30002, "udp")
+	require.NoError(t, err)
+
+	err = f.UnmapPort(context.Background())
+	assert.ErrorContains(t, err, "delete TCP port mapping")
+	assert.ErrorContains(t, err, "gateway busy")
+	assert.Equal(t, []string{TCP, UDP}, c.deletes)
+	require.Len(t, f.mappings, 1)
+	assert.NotNil(t, f.mappings[TCP])
+
+	c.mu.Lock()
+	c.deleteErrFor = nil
+	c.mu.Unlock()
+	require.NoError(t, f.UnmapPort(context.Background()))
+	assert.Empty(t, f.mappings)
+}
+
+// Renewal re-adds every protocol's mapping, including one added after it
+// started, each with its own protocol and description.
+func TestForwarder_Renewal_RenewsEveryProtocol(t *testing.T) {
+	c := &fakeIGD{}
+	f := newTestForwarder(t, c)
+	_, err := f.MapPort(context.Background(), TCP, 30001, "tcp")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { f.renewLoop(ctx, 5*time.Millisecond); close(done) }()
+
+	_, err = f.MapPort(context.Background(), UDP, 30002, "udp")
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.lastAdd.protocol == UDP && c.lastAdd.description == "udp (renew)"
+	}, 2*time.Second, time.Millisecond, "the UDP mapping was never renewed")
+	cancel()
+	<-done
+}
+
+// A renewal racing teardown with two mappings stops at the first raced one and
+// removes what it re-added, without renewing the rest.
+func TestForwarder_RenewalRacingTeardown_StopsAcrossProtocols(t *testing.T) {
+	release := make(chan struct{})
+	c := &fakeIGD{addBlock: release}
+	f := newTestForwarder(t, c)
+	f.mappings = map[string]*Mapping{
+		TCP: {ExternalPort: 15000, InternalPort: 15000, Protocol: TCP, LeaseDuration: time.Hour},
+		UDP: {ExternalPort: 15001, InternalPort: 15001, Protocol: UDP, LeaseDuration: time.Hour},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	f.cancel = cancel
+	loopDone := make(chan struct{})
+	go func() { f.renewLoop(ctx, time.Millisecond); close(loopDone) }()
+
+	require.Eventually(t, func() bool { return c.addCalls.Load() >= 1 },
+		2*time.Second, time.Millisecond, "renewal never reached AddPortMapping")
+	require.NoError(t, f.UnmapPort(context.Background()))
+	close(release)
+
+	select {
+	case <-loopDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("renewLoop did not exit after teardown")
+	}
+	assert.Equal(t, int64(1), c.addCalls.Load(), "no renewal may start after teardown")
+	assert.Equal(t, []string{TCP, UDP, TCP}, c.deletes,
+		"teardown deletes both, then the raced TCP renewal is undone")
 }

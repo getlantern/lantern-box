@@ -43,18 +43,18 @@ func TestParseManualPort(t *testing.T) {
 }
 
 // ManualForwarder satisfies the portForwarder contract: MapPort returns
-// a Mapping with external==internal port, Protocol="TCP" matching the
-// UPnP forwarder, and the "manual" method tag. UnmapPort and
+// a Mapping with external==internal port, the requested protocol, and the
+// "manual" method tag. UnmapPort and
 // StartRenewal are no-ops, ExternalIP returns "" so the server
 // substitutes the IP it observed on the register call.
 func TestManualForwarder(t *testing.T) {
 	f := NewManualForwarder(5698)
 
-	m, err := f.MapPort(context.Background(), 30001, "ignored")
+	m, err := f.MapPort(context.Background(), TCP, 30001, "ignored")
 	require.NoError(t, err)
 	assert.Equal(t, uint16(5698), m.ExternalPort)
 	assert.Equal(t, uint16(5698), m.InternalPort, "external==internal — user mapped them themselves")
-	assert.Equal(t, "TCP", m.Protocol, "Protocol matches UPnP forwarder's hard-coded value")
+	assert.Equal(t, TCP, m.Protocol)
 	assert.Equal(t, "manual", m.Method)
 
 	require.NoError(t, f.UnmapPort(context.Background()), "UnmapPort is a no-op for manual forwarders")
@@ -67,12 +67,24 @@ func TestManualForwarder(t *testing.T) {
 	assert.Empty(t, ip, "empty IP signals server to use observed source address")
 }
 
+// A manual forward is reported for either protocol, since only the user knows
+// which they forwarded.
+func TestManualForwarder_UDP(t *testing.T) {
+	m, err := NewManualForwarder(5698).MapPort(context.Background(), UDP, 30001, "ignored")
+	require.NoError(t, err)
+	assert.Equal(t, UDP, m.Protocol)
+	assert.Equal(t, uint16(5698), m.ExternalPort)
+
+	_, err = NewManualForwarder(5698).MapPort(context.Background(), "SCTP", 30001, "ignored")
+	assert.Error(t, err)
+}
+
 // MapPort defensively rejects a zero-port forwarder so a caller that
 // somehow gets one (bypassing pickManualForwarder's range check) can
 // fall through to UPnP rather than register a non-listening port.
 func TestManualForwarder_RejectsZeroPort(t *testing.T) {
 	f := NewManualForwarder(0)
-	m, err := f.MapPort(context.Background(), 30001, "ignored")
+	m, err := f.MapPort(context.Background(), TCP, 30001, "ignored")
 	assert.Nil(t, m)
 	assert.Error(t, err)
 }

@@ -32,7 +32,7 @@ func NewManualForwarder(port uint16) *ManualForwarder {
 // Port returns the router port this forwarder was configured with.
 func (m *ManualForwarder) Port() uint16 { return m.port }
 
-// ParseManualPort parses a string into a TCP port number. Values outside
+// ParseManualPort parses a string into a port number. Values outside
 // 1..65535 return an error so callers can log and fall through to UPnP
 // discovery rather than register a non-listening port with the server.
 func ParseManualPort(s string) (uint16, error) {
@@ -46,24 +46,24 @@ func ParseManualPort(s string) (uint16, error) {
 	return uint16(p), nil
 }
 
-// MapPort reports the configured port as both external and internal. The
-// router-side rule is already in place; nothing to do at the protocol
-// layer. Returns an error if the forwarder was constructed with port==0
-// (not a valid listen/registration port) so callers can fall through to
-// UPnP rather than register a port no peer will listen on.
-//
-// Protocol is set to "TCP" to match the UPnP-based Forwarder, which
-// hard-codes the same value. Samizdat-in inbound traffic is TCP-only;
-// when UDP support is added the two forwarders should be widened
-// together.
-func (m *ManualForwarder) MapPort(_ context.Context, _ uint16, _ string) (*Mapping, error) {
+// MapPort reports the configured port as both external and internal, for
+// protocol. The router-side rule is already in place; nothing to do at the
+// protocol layer. Whether the user forwarded that protocol is unknown here, so
+// callers verify reachability for each protocol they use. Returns an error if
+// the forwarder was constructed with port==0 (not a valid
+// listen/registration port) so callers can fall through to UPnP rather than
+// register a port no peer will listen on.
+func (m *ManualForwarder) MapPort(_ context.Context, protocol string, _ uint16, _ string) (*Mapping, error) {
+	if protocol != TCP && protocol != UDP {
+		return nil, fmt.Errorf("unsupported protocol %q", protocol)
+	}
 	if m.port == 0 {
 		return nil, fmt.Errorf("manual forwarder constructed with port=0")
 	}
 	return &Mapping{
 		ExternalPort: m.port,
 		InternalPort: m.port,
-		Protocol:     "TCP",
+		Protocol:     protocol,
 		Method:       "manual",
 	}, nil
 }
