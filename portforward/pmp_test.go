@@ -358,19 +358,95 @@ func TestForwarder_RenewsWithinTheGrantedLease(t *testing.T) {
 		m, err := f.MapPort(context.Background(), UDP, 41641, "test")
 		require.NoError(t, err)
 		assert.Equal(t, 120*time.Second, m.LeaseDuration, "pcp=%v", pcp)
-		assert.Equal(t, 60*time.Second, f.nextRenewal(30*time.Minute), "pcp=%v", pcp)
+		assert.InDelta(t, 60*time.Second, f.nextRenewal(30*time.Minute), float64(time.Second), "pcp=%v", pcp)
 
 		// A renewal asks for the original lease again, and records what it got.
 		g.set(func() { g.grant = 600 })
 		require.True(t, f.renew(f.mappings[UDP], c))
 		assert.Equal(t, uint32(3600), g.recorded()[1].lifetime, "pcp=%v", pcp)
-		assert.Equal(t, 300*time.Second, f.nextRenewal(30*time.Minute), "pcp=%v", pcp)
+		assert.InDelta(t, 300*time.Second, f.nextRenewal(30*time.Minute), float64(time.Second), "pcp=%v", pcp)
+
+		// A renewal granted next to nothing is kept, and renewed at the floor.
+		g.set(func() { g.grant = 1 })
+		require.True(t, f.renew(f.mappings[UDP], c))
+		assert.Equal(t, minRenewInterval, renewPeriod(f.mappings[UDP], 30*time.Minute), "pcp=%v", pcp)
 	}
 }
 
-// A gateway granting seconds can't make renewal spin.
-func TestForwarder_RenewalIntervalHasAFloor(t *testing.T) {
-	f := &Forwarder{mappings: map[string]*Mapping{UDP: {Protocol: UDP, LeaseDuration: 2 * time.Second}}}
-	assert.Equal(t, minRenewInterval, f.nextRenewal(30*time.Minute))
-	assert.Equal(t, time.Second, f.nextRenewal(time.Second), "a shorter interval passed in still wins")
+// A new mapping granted only seconds is removed and refused, rather than
+// renewed every second or two.
+func TestPMP_RefusesATooShortFreshLease(t *testing.T) {
+	for _, pcp := range []bool{false, true} {
+		g := newFakePMPGateway(t, pcp)
+		g.set(func() { g.grant = 5 })
+		var c igdClient = newNATPMPClient(g.addr(), time.Second)
+		if pcp {
+			c = newPCPClient(g.addr(), time.Second)
+		}
+		err := c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600)
+		assert.ErrorContains(t, err, "lease of only 5s", "pcp=%v", pcp)
+		assert.Equal(t, []fakeMap{{UDP, 41641, 3600}, {UDP, 41641, 0}}, collapse(g.recorded()), "pcp=%v", pcp)
+	}
+}
+
+func TestRenewPeriod(t *testing.T) {
+	m := &Mapping{LeaseDuration: time.Hour}
+	assert.Equal(t, 30*time.Minute, renewPeriod(m, 30*time.Minute))
+	assert.Equal(t, 20*time.Millisecond, renewPeriod(m, 20*time.Millisecond), "a shorter interval wins")
+	m.LeaseDuration = 120 * time.Second
+	assert.Equal(t, 60*time.Second, renewPeriod(m, 30*time.Minute))
+	m.LeaseDuration = 0
+	assert.Equal(t, minRenewInterval, renewPeriod(m, 30*time.Minute))
+}
+
+// A mapping added while renewal waits on a long lease reschedules it, so a
+// short grant is renewed in time.
+func TestForwarder_LateShortGrantReschedulesRenewal(t *testing.T) {
+	g := newFakePMPGateway(t, true)
+	c := newPCPClient(g.addr(), time.Second)
+	f := &Forwarder{client: c, method: "pcp"}
+	_, err := f.MapPort(context.Background(), TCP, 30001, "tcp")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	// TCP alone would next be renewed in an hour.
+	go func() { f.renewLoop(ctx, time.Hour); close(done) }()
+	require.Eventually(t, func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.wake != nil
+	}, time.Second, time.Millisecond)
+
+	// A fresh grant must be at least minGrantedLease, so ask for 10s and get it.
+	g.set(func() { g.grant = minGrantedLease })
+	_, err = f.MapPort(context.Background(), UDP, 41641, "udp")
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		ms := collapse(g.recorded())
+		return len(ms) >= 3 && ms[len(ms)-1].protocol == UDP
+	}, 2*renewPeriod(&Mapping{LeaseDuration: minGrantedLease * time.Second}, time.Hour)+2*time.Second, 50*time.Millisecond,
+		"the UDP mapping, granted %ds, was not renewed in time", minGrantedLease)
+	cancel()
+	<-done
+}
+
+// A renewal whose answer is lost while teardown runs may have re-created the
+// mapping, so it is removed like one that timed out.
+func TestForwarder_LostRenewalAnswerDuringTeardownIsRemoved(t *testing.T) {
+	g := newFakePMPGateway(t, true)
+	c := newPCPClient(g.addr(), 300*time.Millisecond)
+	f := &Forwarder{client: c, method: "pcp"}
+	_, err := f.MapPort(context.Background(), UDP, 41641, "udp")
+	require.NoError(t, err)
+
+	g.set(func() { g.dropAdds = true })
+	f.mu.Lock()
+	m := f.mappings[UDP]
+	f.closed = true // teardown has begun
+	f.mu.Unlock()
+	assert.False(t, f.renew(m, c))
+	ms := collapse(g.recorded())
+	assert.Equal(t, fakeMap{UDP, 41641, 0}, ms[len(ms)-1], "the possibly re-created mapping must be deleted")
 }

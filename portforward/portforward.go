@@ -46,6 +46,9 @@ type Mapping struct {
 	// requested is the lease MapPort asked for, in seconds, which renewals ask
 	// for again. LeaseDuration is what the gateway granted, when it says.
 	requested uint32
+	// renewed is when the mapping was last added or renewal was last
+	// attempted. Guarded by the Forwarder's mu.
+	renewed time.Time
 }
 
 // leaseReporter is a client whose gateway says what lease it granted, as
@@ -55,9 +58,10 @@ type leaseReporter interface {
 	lease(protocol string, internalPort uint16) (time.Duration, bool)
 }
 
-// minRenewInterval floors the renewal interval a short granted lease sets, so
-// a gateway granting seconds can't make renewal spin.
-const minRenewInterval = 5 * time.Second
+// minRenewInterval floors the renewal period a granted lease sets. Clients
+// refuse fresh grants far shorter than this would need; it only guards against
+// a renewal granting next to nothing.
+const minRenewInterval = time.Second
 
 // igdClient is the subset of the IGDv2/v1 clients we use. goupnp's generated
 // clients already satisfy this shape.
@@ -81,6 +85,8 @@ type Forwarder struct {
 	// an AddPortMapping that lands after the delete gets undone rather than
 	// left on the gateway forever.
 	closed bool
+	// wake tells renewLoop a mapping was added, so it reschedules for it.
+	wake chan struct{}
 }
 
 // ProbeUPnP reports whether discovery on the local network turns up a gateway
@@ -298,7 +304,14 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 	if f.mappings == nil {
 		f.mappings = map[string]*Mapping{}
 	}
+	m.renewed = time.Now()
 	f.mappings[protocol] = m
+	if f.wake != nil {
+		select {
+		case f.wake <- struct{}{}:
+		default:
+		}
+	}
 	// Logged here rather than only by the caller on full success. A mapping that
 	// the gateway accepts and then does not honour is invisible otherwise: the
 	// caller's success line never runs because verification fails afterwards, so
@@ -446,15 +459,24 @@ func (f *Forwarder) deleteRacedMapping(m *Mapping, client igdClient, why string)
 		protocolAttr(m.Protocol), "external_port", m.ExternalPort, "why", why)
 }
 
-// renewLoop renews every mapping each interval, or sooner when a gateway
-// granted a lease shorter than twice it.
+// renewLoop renews every mapping once any is due: each interval after it was
+// last renewed, or sooner when a gateway granted a lease shorter than twice
+// that. A mapping added meanwhile reschedules it.
 func (f *Forwarder) renewLoop(ctx context.Context, interval time.Duration) {
+	f.mu.Lock()
+	if f.wake == nil {
+		f.wake = make(chan struct{}, 1)
+	}
+	wake := f.wake
+	f.mu.Unlock()
 	for {
 		t := time.NewTimer(f.nextRenewal(interval))
 		select {
 		case <-ctx.Done():
 			t.Stop()
 			return
+		case <-wake:
+			t.Stop()
 		case <-t.C:
 			f.mu.Lock()
 			ms := f.activeMappings()
@@ -475,17 +497,27 @@ func (f *Forwarder) renewLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// nextRenewal is how long renewLoop waits: interval, or half the shortest
-// lease a gateway granted, if that's sooner.
+// nextRenewal is how long renewLoop waits before the first mapping is due.
 func (f *Forwarder) nextRenewal(interval time.Duration) time.Duration {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if len(f.mappings) == 0 {
+		return interval
+	}
+	var next time.Time
 	for _, m := range f.mappings {
-		if half := max(m.LeaseDuration/2, minRenewInterval); half < interval {
-			interval = half
+		due := m.renewed.Add(renewPeriod(m, interval))
+		if next.IsZero() || due.Before(next) {
+			next = due
 		}
 	}
-	return interval
+	return max(time.Until(next), 0)
+}
+
+// renewPeriod is how often m is renewed: interval, or half the lease the
+// gateway granted if that's sooner.
+func renewPeriod(m *Mapping, interval time.Duration) time.Duration {
+	return min(interval, max(m.LeaseDuration/2, minRenewInterval))
 }
 
 // renew re-issues m's AddPortMapping, and reports false if UnmapPort ran
@@ -507,7 +539,9 @@ func (f *Forwarder) renew(m *Mapping, client igdClient) bool {
 	var landed bool
 	select {
 	case err := <-errCh:
-		landed = err == nil
+		// A NAT-PMP or PCP gateway that never answered may still have
+		// re-added the mapping, the same unknown as the timeout below.
+		landed = err == nil || errors.Is(err, errNoAnswer)
 		if err != nil {
 			slog.Warn("portforward: lease renewal failed", "err", err, protocolAttr(m.Protocol), "external_port", m.ExternalPort)
 		}
@@ -526,6 +560,7 @@ func (f *Forwarder) renew(m *Mapping, client igdClient) bool {
 	// on f.mu orders this strictly after UnmapPort's delete.
 	f.mu.Lock()
 	teardownRaced := f.closed
+	m.renewed = time.Now()
 	if lr, ok := client.(leaseReporter); ok && !teardownRaced {
 		// The gateway may grant a different lease this time.
 		if granted, ok := lr.lease(m.Protocol, m.InternalPort); ok {

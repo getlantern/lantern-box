@@ -35,6 +35,10 @@ const (
 	// pmpFirstResend is the RFCs' initial retransmission interval, doubled on
 	// each resend.
 	pmpFirstResend = 250 * time.Millisecond
+	// minGrantedLease is the shortest lease, in seconds, a new mapping may be
+	// granted. Anything shorter would need renewing every few seconds. PCP
+	// gateways should grant at least 120 (RFC 6887 §15).
+	minGrantedLease = 10
 )
 
 var (
@@ -135,6 +139,12 @@ func (s *pmpMappings) add(method string, mapPort mapFunc, protocol string, inter
 		}
 		s.forget(k)
 		return fmt.Errorf("%s: gateway assigned external port %d, not %d", method, got, externalPort)
+	}
+	if !renewing && granted < minGrantedLease {
+		if _, _, err := mapPort(protocol, internalPort, externalPort, 0); err != nil {
+			slog.Warn("portforward: could not remove a mapping with too short a lease", "method", method, "err", err)
+		}
+		return fmt.Errorf("%s: gateway granted a lease of only %ds", method, granted)
 	}
 	s.mu.Lock()
 	s.granted[k] = granted
