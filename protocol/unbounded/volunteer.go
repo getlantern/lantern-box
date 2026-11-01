@@ -67,8 +67,21 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 	if len(opts.STUNServers) == 0 {
 		return nil, errors.New("unbounded volunteer: stun_servers is required")
 	}
-	if opts.MaxPeers < 0 {
-		return nil, fmt.Errorf("unbounded volunteer: max_peers must be positive, got %d", opts.MaxPeers)
+	for name, v := range map[string]int{
+		"max_peers":              opts.MaxPeers,
+		"bus_buffer_sz":          opts.BusBufferSz,
+		"stun_batch_size":        opts.STUNBatchSize,
+		"nat_fail_timeout":       opts.NATFailTimeout,
+		"patience":               opts.Patience,
+		"error_backoff":          opts.ErrorBackoff,
+		"egress_connect_timeout": opts.EgressConnectTimeout,
+		"egress_error_backoff":   opts.EgressErrorBackoff,
+	} {
+		// broflake sizes channels and timers from these, and a negative value panics or
+		// fires at once.
+		if v < 0 {
+			return nil, fmt.Errorf("unbounded volunteer: %s must not be negative, got %d", name, v)
+		}
 	}
 
 	v := &Volunteer{tag: tag, logger: lg}
@@ -97,9 +110,6 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 	}
 	if len(ignored) > 0 {
 		lg.WarnContext(ctx, "unbounded volunteer: ignoring unknown or invalid tuning options", "ignored", ignored)
-	}
-	if opts.STUNBatchSize < 0 {
-		return nil, fmt.Errorf("unbounded volunteer: stun_batch_size must be non-negative, got %d", opts.STUNBatchSize)
 	}
 	if opts.STUNBatchSize > 0 {
 		rtcOpt.STUNBatchSize = uint32(opts.STUNBatchSize)

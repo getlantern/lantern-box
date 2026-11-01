@@ -48,6 +48,12 @@ func TestNewVolunteer_RequiresDiscoveryEgressAndSTUN(t *testing.T) {
 		"stun_servers":  func(o *option.UnboundedVolunteerOptions) { o.STUNServers = nil },
 		"max_peers":     func(o *option.UnboundedVolunteerOptions) { o.MaxPeers = -1 },
 		"stun_batch":    func(o *option.UnboundedVolunteerOptions) { o.STUNBatchSize = -1 },
+		"bus_buffer":    func(o *option.UnboundedVolunteerOptions) { o.BusBufferSz = -1 },
+		"nat_fail":      func(o *option.UnboundedVolunteerOptions) { o.NATFailTimeout = -1 },
+		"patience":      func(o *option.UnboundedVolunteerOptions) { o.Patience = -1 },
+		"error_backoff": func(o *option.UnboundedVolunteerOptions) { o.ErrorBackoff = -1 },
+		"egress_conn":   func(o *option.UnboundedVolunteerOptions) { o.EgressConnectTimeout = -1 },
+		"egress_back":   func(o *option.UnboundedVolunteerOptions) { o.EgressErrorBackoff = -1 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			opts := validVolunteerOptions()
