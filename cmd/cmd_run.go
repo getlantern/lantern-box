@@ -207,8 +207,10 @@ func run(configPath string, datacapURL string, memtuneFile string) error {
 			closeCtx, closed := context.WithCancel(context.Background())
 			go closeMonitor(closeCtx)
 			err = instance.Close()
-			closeTrackers()
 			closed()
+			// After the box has closed its connections, so their last bytes
+			// are reported. Bounded by the tracker's final flush budget.
+			closeTrackers()
 			if osSignal != syscall.SIGHUP {
 				if err != nil {
 					log.Error(E.Cause(err, "sing-box did not closed properly"))

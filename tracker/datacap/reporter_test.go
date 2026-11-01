@@ -226,3 +226,25 @@ func TestReporterSnapshotsStayConsistent(t *testing.T) {
 	}
 	require.EqualValues(t, writes*size, total)
 }
+
+// Bytes a closing connection counts after a flush took its device's usage
+// still go out, because an idle device is kept for one more flush.
+func TestReporterReportsBytesCountedAfterClose(t *testing.T) {
+	sink := &reportSink{}
+	tracker, err := NewDatacapTracker(Options{URL: sink.server(t).URL, ReportInterval: "1h"}, noopLogger)
+	require.NoError(t, err)
+	defer tracker.Close()
+
+	conn := routeConn(t, tracker, "device", make([]byte, 16))
+	_, err = conn.Read(make([]byte, 16))
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+
+	tracker.reporter.flush(context.Background())
+	require.Len(t, sink.take(), 1)
+	conn.usage.addBytes(5, "") // a Read finishing during Close
+	tracker.reporter.flush(context.Background())
+	reports := sink.take()
+	require.Len(t, reports, 1)
+	require.EqualValues(t, 5, reports[0].BytesUsed)
+}

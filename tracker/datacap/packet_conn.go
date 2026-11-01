@@ -136,12 +136,12 @@ func (c *PacketConn) Close() error {
 	// Cancel context to release throttle waits
 	c.cancel()
 
+	err := c.PacketConn.Close()
 	c.reporter.release(c.usage)
 	if c.ownsReporter {
 		c.reporter.Close()
 	}
-
-	return c.PacketConn.Close()
+	return err
 }
 
 // sendReport flushes the reporter's pending usage now.

@@ -55,7 +55,9 @@ type Reporter struct {
 	mu      sync.Mutex
 	devices map[string]*deviceUsage
 
-	flushMu sync.Mutex // serializes flushes so restored deltas keep their order
+	flushMu sync.Mutex      // serializes flushes so restored deltas keep their order
+	ctx     context.Context // canceled by Close to cut short a periodic flush
+	cancel  context.CancelFunc
 	stop    chan struct{}
 	done    chan struct{}
 	once    sync.Once
@@ -68,6 +70,7 @@ type deviceUsage struct {
 
 	info  atomic.Pointer[clientcontext.ClientInfo] // latest country and platform
 	conns atomic.Int64                             // open connections; guarded by Reporter.mu for eviction
+	idle  bool                                     // no open connections at the last flush; guarded by Reporter.mu
 
 	// Each byte is counted in exactly one counter, and a report's total is
 	// the sum of what it takes from them, so the categories of a report can
@@ -111,7 +114,7 @@ type usageDelta struct {
 }
 
 func (d *deviceUsage) take() usageDelta {
-	u := usageDelta{uncategorized: d.uncategorized.Swap(0), hasTraffic: d.hasTrafficInfo.Load()}
+	u := usageDelta{uncategorized: d.uncategorized.Swap(0)}
 	u.bytes = u.uncategorized
 	for i := range trafficCategoryCount {
 		u.trafficBytes[i] = d.trafficBytes[i].Swap(0)
@@ -126,6 +129,9 @@ func (d *deviceUsage) take() usageDelta {
 		}
 		u.trafficConns[i] = conns
 	}
+	// addBytes sets the flag before counting, so reading it after the swaps
+	// sees it for any categorized bytes taken above.
+	u.hasTraffic = d.hasTrafficInfo.Load()
 	return u
 }
 
@@ -161,7 +167,10 @@ func NewReporter(client *Client, logger log.ContextLogger, interval time.Duratio
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	r := &Reporter{
+		ctx:      ctx,
+		cancel:   cancel,
 		client:   client,
 		logger:   logger,
 		interval: interval,
@@ -180,7 +189,7 @@ func (r *Reporter) run() {
 	for {
 		select {
 		case <-ticker.C:
-			r.flush(context.Background())
+			r.flush(r.ctx)
 		case <-r.stop:
 			ctx, cancel := context.WithTimeout(context.Background(), closeFlushBudget)
 			r.flush(ctx)
@@ -193,7 +202,12 @@ func (r *Reporter) run() {
 // Close stops the flush loop after a final flush, and returns once that
 // flush is done.
 func (r *Reporter) Close() {
-	r.once.Do(func() { close(r.stop) })
+	r.once.Do(func() {
+		// Usage a canceled flush fails to report is restored for the final
+		// flush.
+		r.cancel()
+		close(r.stop)
+	})
 	<-r.done
 }
 
@@ -216,8 +230,9 @@ func (r *Reporter) release(d *deviceUsage) {
 	d.conns.Add(-1)
 }
 
-// flush reports every device's pending usage and drops devices with no open
-// connections. Their final usage is part of this flush.
+// flush reports every device's pending usage. A device with no open
+// connections at two flushes in a row is dropped after the second, so bytes a
+// closing connection counts late still go out with the first.
 func (r *Reporter) flush(ctx context.Context) {
 	if r.client == nil {
 		return
@@ -232,8 +247,12 @@ func (r *Reporter) flush(ctx context.Context) {
 	var reports []pending
 	r.mu.Lock()
 	for id, d := range r.devices {
-		if d.conns.Load() == 0 {
+		if d.conns.Load() > 0 {
+			d.idle = false
+		} else if d.idle {
 			delete(r.devices, id)
+		} else {
+			d.idle = true
 		}
 		if u := d.take(); u.bytes > 0 {
 			reports = append(reports, pending{d, u})
