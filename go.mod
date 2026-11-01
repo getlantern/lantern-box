@@ -32,6 +32,7 @@ require (
 	github.com/getlantern/twiddle v0.0.0-20260914204124-f698a0d67d2f
 	github.com/gobwas/ws v1.4.0
 	github.com/hashicorp/yamux v0.1.2
+	github.com/huin/goupnp v1.3.0
 	github.com/pion/transport/v5 v5.1.1
 	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/sing v0.8.13
