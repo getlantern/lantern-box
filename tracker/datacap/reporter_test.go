@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
@@ -90,7 +89,7 @@ func TestReporterAggregatesConnectionsPerDevice(t *testing.T) {
 	_, err = quiet.Read(make([]byte, 7))
 	require.NoError(t, err)
 
-	tracker.reporter.flush()
+	tracker.reporter.flush(context.Background())
 	reports := byDevice(sink.take())
 	require.Len(t, reports, 2)
 	require.EqualValues(t, 5*110, reports["busy"].BytesUsed)
@@ -99,7 +98,7 @@ func TestReporterAggregatesConnectionsPerDevice(t *testing.T) {
 	require.EqualValues(t, 7, reports["quiet"].BytesUsed)
 
 	// Nothing new, nothing reported.
-	tracker.reporter.flush()
+	tracker.reporter.flush(context.Background())
 	require.Empty(t, sink.take())
 }
 
@@ -117,11 +116,11 @@ func TestReporterReportsClosedConnectionsAndRetries(t *testing.T) {
 	require.NoError(t, conn.Close())
 
 	sink.setFail(true)
-	tracker.reporter.flush()
+	tracker.reporter.flush(context.Background())
 	require.Len(t, sink.take(), 1)
 
 	sink.setFail(false)
-	tracker.reporter.flush()
+	tracker.reporter.flush(context.Background())
 	reports := sink.take()
 	require.Len(t, reports, 1)
 	require.EqualValues(t, 64, reports[0].BytesUsed)
@@ -145,11 +144,11 @@ func TestReporterKeepsDevicesWithOpenConnections(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, closed.Close())
 
-	tracker.reporter.flush()
+	tracker.reporter.flush(context.Background())
 	require.Len(t, sink.take(), 1)
 	_, err = open.Read(make([]byte, 8))
 	require.NoError(t, err)
-	tracker.reporter.flush()
+	tracker.reporter.flush(context.Background())
 	reports := sink.take()
 	require.Len(t, reports, 1)
 	require.EqualValues(t, 8, reports[0].BytesUsed)
@@ -177,25 +176,53 @@ func TestReporterHoldsConnectionsWithoutBytes(t *testing.T) {
 	require.EqualValues(t, 1, third.OtherConnections)
 }
 
-// Ending the tracker's context reports pending usage once more.
-func TestTrackerContextFlushesOnDone(t *testing.T) {
+// Closing the tracker reports pending usage once more before returning.
+func TestTrackerCloseFlushes(t *testing.T) {
 	sink := &reportSink{}
-	ctx, cancel := context.WithCancel(context.Background())
-	tracker, err := NewDatacapTracker(Options{URL: sink.server(t).URL, ReportInterval: "1h", Context: ctx}, noopLogger)
+	tracker, err := NewDatacapTracker(Options{URL: sink.server(t).URL, ReportInterval: "1h"}, noopLogger)
 	require.NoError(t, err)
 
 	conn := routeConn(t, tracker, "device", make([]byte, 32))
-	defer conn.Close()
 	_, err = conn.Read(make([]byte, 32))
 	require.NoError(t, err)
+	require.NoError(t, conn.Close())
 
-	cancel()
-	select {
-	case <-tracker.reporter.done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("reporter did not stop")
-	}
+	tracker.Close()
 	reports := sink.take()
 	require.Len(t, reports, 1)
 	require.EqualValues(t, 32, reports[0].BytesUsed)
+}
+
+// Concurrent writes during flushes never put more bytes in a category than
+// in the report, and no byte is lost or counted twice.
+func TestReporterSnapshotsStayConsistent(t *testing.T) {
+	sink := &reportSink{}
+	tracker, err := NewDatacapTracker(Options{URL: sink.server(t).URL, ReportInterval: "1h", TrafficCategories: true}, noopLogger)
+	require.NoError(t, err)
+	defer tracker.Close()
+
+	conn := routeConn(t, tracker, "device", nil)
+	defer conn.Close()
+	const writes, size = 2000, 7
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range writes {
+			_, _ = conn.Write(make([]byte, size))
+		}
+	}()
+	for range 20 {
+		tracker.reporter.flush(context.Background())
+	}
+	wg.Wait()
+	tracker.reporter.flush(context.Background())
+
+	var total int64
+	for _, r := range sink.take() {
+		require.NotNil(t, r.TrafficUsage)
+		require.LessOrEqual(t, r.TrafficUsage.OtherBytes, r.BytesUsed)
+		total += r.BytesUsed
+	}
+	require.EqualValues(t, writes*size, total)
 }

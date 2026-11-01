@@ -70,7 +70,7 @@ func NewConn(config ConnConfig) *Conn {
 
 	reporter, owns := config.Reporter, false
 	if reporter == nil {
-		reporter = NewReporter(context.Background(), config.Client, config.Logger, config.ReportInterval)
+		reporter = NewReporter(config.Client, config.Logger, config.ReportInterval)
 		owns = true
 	}
 
@@ -162,7 +162,7 @@ func (c *Conn) Close() error {
 
 // sendReport flushes the reporter's pending usage now.
 func (c *Conn) sendReport() {
-	c.reporter.flush()
+	c.reporter.flush(context.Background())
 }
 
 // GetStatus queries the sidecar for current data cap status.
@@ -186,7 +186,7 @@ func (c *Conn) GetStatus() (*DataCapStatus, error) {
 // GetBytesConsumed returns the bytes of this connection's device not yet
 // accepted by the sidecar.
 func (c *Conn) GetBytesConsumed() int64 {
-	return c.usage.bytes.Load()
+	return c.usage.pendingBytes()
 }
 
 func (c *Conn) Upstream() any {

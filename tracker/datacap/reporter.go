@@ -11,6 +11,10 @@ import (
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 )
 
+// closeFlushBudget bounds the final flush on Close, so an unreachable sidecar
+// cannot hold up a shutdown or reload.
+const closeFlushBudget = 5 * time.Second
+
 // reportWorkers bounds the concurrent sidecar requests of one flush. The
 // sidecar runs on the same host, so a few workers drain thousands of devices
 // well within a report interval.
@@ -65,18 +69,31 @@ type deviceUsage struct {
 	info  atomic.Pointer[clientcontext.ClientInfo] // latest country and platform
 	conns atomic.Int64                             // open connections; guarded by Reporter.mu for eviction
 
-	bytes          atomic.Int64
+	// Each byte is counted in exactly one counter, and a report's total is
+	// the sum of what it takes from them, so the categories of a report can
+	// never exceed its total however writes interleave with a flush.
+	uncategorized  atomic.Int64
 	trafficBytes   [trafficCategoryCount]atomic.Int64
 	trafficConns   [trafficCategoryCount]atomic.Int64
 	hasTrafficInfo atomic.Bool
 }
 
 func (d *deviceUsage) addBytes(n int64, category string) {
-	d.bytes.Add(n)
-	if category != "" {
-		d.hasTrafficInfo.Store(true)
-		d.trafficBytes[trafficSlot(category)].Add(n)
+	if category == "" {
+		d.uncategorized.Add(n)
+		return
 	}
+	d.hasTrafficInfo.Store(true)
+	d.trafficBytes[trafficSlot(category)].Add(n)
+}
+
+// pendingBytes returns the device's bytes not yet taken for a report.
+func (d *deviceUsage) pendingBytes() int64 {
+	n := d.uncategorized.Load()
+	for i := range trafficCategoryCount {
+		n += d.trafficBytes[i].Load()
+	}
+	return n
 }
 
 func (d *deviceUsage) addConnection(category string) {
@@ -86,16 +103,19 @@ func (d *deviceUsage) addConnection(category string) {
 
 // usageDelta is one device's usage taken for a report.
 type usageDelta struct {
-	bytes        int64
-	trafficBytes [trafficCategoryCount]int64
-	trafficConns [trafficCategoryCount]int64
-	hasTraffic   bool
+	bytes         int64 // total, including uncategorized
+	uncategorized int64
+	trafficBytes  [trafficCategoryCount]int64
+	trafficConns  [trafficCategoryCount]int64
+	hasTraffic    bool
 }
 
 func (d *deviceUsage) take() usageDelta {
-	u := usageDelta{bytes: d.bytes.Swap(0), hasTraffic: d.hasTrafficInfo.Load()}
+	u := usageDelta{uncategorized: d.uncategorized.Swap(0), hasTraffic: d.hasTrafficInfo.Load()}
+	u.bytes = u.uncategorized
 	for i := range trafficCategoryCount {
 		u.trafficBytes[i] = d.trafficBytes[i].Swap(0)
+		u.bytes += u.trafficBytes[i]
 		// The sidecar rejects a report with more connections than bytes in a
 		// category. A connection can turn bidirectional after its bytes were
 		// taken, so hold such connections for a report that carries bytes.
@@ -110,7 +130,7 @@ func (d *deviceUsage) take() usageDelta {
 }
 
 func (d *deviceUsage) restore(u usageDelta) {
-	d.bytes.Add(u.bytes)
+	d.uncategorized.Add(u.uncategorized)
 	for i := range trafficCategoryCount {
 		d.trafficBytes[i].Add(u.trafficBytes[i])
 		d.trafficConns[i].Add(u.trafficConns[i])
@@ -136,9 +156,8 @@ func (u usageDelta) trafficUsage() *TrafficUsage {
 	}
 }
 
-// NewReporter starts a reporter that flushes every interval until ctx is done
-// or Close is called, then flushes once more.
-func NewReporter(ctx context.Context, client *Client, logger log.ContextLogger, interval time.Duration) *Reporter {
+// NewReporter starts a reporter that flushes every interval until Close.
+func NewReporter(client *Client, logger log.ContextLogger, interval time.Duration) *Reporter {
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
@@ -150,29 +169,29 @@ func NewReporter(ctx context.Context, client *Client, logger log.ContextLogger, 
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
-	go r.run(ctx)
+	go r.run()
 	return r
 }
 
-func (r *Reporter) run(ctx context.Context) {
+func (r *Reporter) run() {
 	defer close(r.done)
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			r.flush()
-		case <-ctx.Done():
-			r.flush()
-			return
+			r.flush(context.Background())
 		case <-r.stop:
-			r.flush()
+			ctx, cancel := context.WithTimeout(context.Background(), closeFlushBudget)
+			r.flush(ctx)
+			cancel()
 			return
 		}
 	}
 }
 
-// Close stops the flush loop after a final flush.
+// Close stops the flush loop after a final flush, and returns once that
+// flush is done.
 func (r *Reporter) Close() {
 	r.once.Do(func() { close(r.stop) })
 	<-r.done
@@ -199,7 +218,7 @@ func (r *Reporter) release(d *deviceUsage) {
 
 // flush reports every device's pending usage and drops devices with no open
 // connections. Their final usage is part of this flush.
-func (r *Reporter) flush() {
+func (r *Reporter) flush(ctx context.Context) {
 	if r.client == nil {
 		return
 	}
@@ -232,7 +251,7 @@ func (r *Reporter) flush() {
 		go func() {
 			defer wg.Done()
 			for p := range work {
-				r.report(p.d, p.u)
+				r.report(ctx, p.d, p.u)
 			}
 		}()
 	}
@@ -243,7 +262,7 @@ func (r *Reporter) flush() {
 	wg.Wait()
 }
 
-func (r *Reporter) report(d *deviceUsage, u usageDelta) {
+func (r *Reporter) report(ctx context.Context, d *deviceUsage, u usageDelta) {
 	info := d.info.Load()
 	report := &DataCapReport{
 		DeviceID:     d.deviceID,
@@ -256,7 +275,7 @@ func (r *Reporter) report(d *deviceUsage, u usageDelta) {
 	if timeout == 0 {
 		timeout = 10 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	status, err := r.client.ReportDataCapConsumption(ctx, report)

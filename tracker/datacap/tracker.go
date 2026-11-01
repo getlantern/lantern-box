@@ -30,11 +30,6 @@ type Options struct {
 	URL               string   `json:"url,omitempty"`
 	ReportInterval    string   `json:"report_interval,omitempty"`
 	HTTPTimeout       string   `json:"http_timeout,omitempty"`
-
-	// Context bounds the tracker's usage reporting: when it is done, pending
-	// usage is reported once more and reporting stops. Defaults to
-	// context.Background.
-	Context context.Context `json:"-"`
 }
 
 func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTracker, error) {
@@ -63,15 +58,11 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 	if options.TrafficCategories {
 		classify = newTrafficClassifier(options.LanternHosts, options.ProbeHosts)
 	}
-	ctx := options.Context
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	client := NewClient(options.URL, httpTimeout)
 	return &DatacapTracker{
 		classify:         classify,
 		client:           client,
-		reporter:         NewReporter(ctx, client, logger, reportInterval),
+		reporter:         NewReporter(client, logger, reportInterval),
 		throttleRegistry: NewThrottleRegistry(),
 		logger:           logger,
 	}, nil
@@ -113,7 +104,8 @@ func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 	})
 }
 
-// Close reports pending usage once more and stops reporting.
+// Close reports pending usage once more and stops reporting. Call it after
+// the box has closed its connections, so their last bytes are included.
 func (t *DatacapTracker) Close() {
 	t.reporter.Close()
 }
