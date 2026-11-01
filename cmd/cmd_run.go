@@ -120,6 +120,7 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 				LanternHosts:      strings.Split(os.Getenv("LANTERN_TRAFFIC_SERVICE_HOSTS"), ","),
 				ProbeHosts:        strings.Split(os.Getenv("LANTERN_TRAFFIC_PROBE_HOSTS"), ","),
 				ReportInterval:    "10s",
+				Context:           ctx,
 			},
 			log.StdLogger(),
 		)

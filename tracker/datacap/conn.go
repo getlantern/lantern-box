@@ -3,7 +3,6 @@ package datacap
 import (
 	"context"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,10 +22,10 @@ const (
 
 // Conn wraps a net.Conn and tracks data consumption for datacap reporting.
 type Conn struct {
-	trafficCategory       string
-	hasRead               atomic.Bool
-	hasWritten            atomic.Bool
-	bidirectionalReported bool // Guarded by reportMutex.
+	trafficCategory string
+	hasRead         atomic.Bool
+	hasWritten      atomic.Bool
+	counted         atomic.Bool // bidirectional connection added to usage
 	net.Conn
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -35,15 +34,10 @@ type Conn struct {
 
 	clientInfo clientcontext.ClientInfo
 
-	// Atomic counters for thread-safe tracking
-	bytesSent     atomic.Int64
-	bytesReceived atomic.Int64
-
-	// Reporting control
-	reportTicker *time.Ticker
-	reportMutex  sync.Mutex
+	usage        *deviceUsage
+	reporter     *Reporter
+	ownsReporter bool
 	closed       atomic.Bool
-	wg           sync.WaitGroup
 
 	// Throttling
 	throttler *Throttler
@@ -56,18 +50,17 @@ type ConnConfig struct {
 	Client          *Client
 	Logger          log.ContextLogger
 	ClientInfo      clientcontext.ClientInfo
-	ReportInterval  time.Duration
-	Throttler       *Throttler // Shared throttler from registry
+	// Reporter aggregates usage with the device's other connections. When
+	// nil, the connection gets its own reporter, flushing every
+	// ReportInterval and once more on Close.
+	Reporter       *Reporter
+	ReportInterval time.Duration
+	Throttler      *Throttler // Shared throttler from registry
 }
 
 // NewConn creates a new datacap-tracked connection wrapper.
 func NewConn(config ConnConfig) *Conn {
 	ctx, cancel := context.WithCancel(context.Background())
-
-	// Default report interval to 10 seconds if not specified
-	if config.ReportInterval == 0 {
-		config.ReportInterval = 10 * time.Second
-	}
 
 	// Default to disabled throttler if not provided
 	throttler := config.Throttler
@@ -75,7 +68,13 @@ func NewConn(config ConnConfig) *Conn {
 		throttler = NewThrottler(0) // Disabled by default
 	}
 
-	conn := &Conn{
+	reporter, owns := config.Reporter, false
+	if reporter == nil {
+		reporter = NewReporter(context.Background(), config.Client, config.Logger, config.ReportInterval)
+		owns = true
+	}
+
+	return &Conn{
 		trafficCategory: config.TrafficCategory,
 		Conn:            config.Conn,
 		ctx:             ctx,
@@ -83,25 +82,22 @@ func NewConn(config ConnConfig) *Conn {
 		client:          config.Client,
 		logger:          config.Logger,
 		clientInfo:      config.ClientInfo,
-		reportTicker:    time.NewTicker(config.ReportInterval),
+		usage:           reporter.acquire(config.ClientInfo, throttler),
+		reporter:        reporter,
+		ownsReporter:    owns,
 		throttler:       throttler,
 	}
-
-	// Start periodic reporting goroutine
-	conn.wg.Add(1)
-	go conn.periodicReport()
-
-	return conn
 }
 
 // Read tracks bytes received and applies throttling if enabled.
 func (c *Conn) Read(b []byte) (n int, err error) {
 	n, err = c.Conn.Read(b)
 	if n > 0 {
+		c.usage.addBytes(int64(n), c.trafficCategory)
 		if c.trafficCategory != "" {
 			c.hasRead.Store(true)
+			c.countIfBidirectional()
 		}
-		c.bytesReceived.Add(int64(n))
 
 		// Apply throttling after read (token bucket wait)
 		if c.throttler.IsEnabled() {
@@ -119,10 +115,11 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 func (c *Conn) Write(b []byte) (n int, err error) {
 	n, err = c.Conn.Write(b)
 	if n > 0 {
+		c.usage.addBytes(int64(n), c.trafficCategory)
 		if c.trafficCategory != "" {
 			c.hasWritten.Store(true)
+			c.countIfBidirectional()
 		}
-		c.bytesSent.Add(int64(n))
 
 		// Apply throttling after write (token bucket wait)
 		if c.throttler.IsEnabled() {
@@ -136,105 +133,36 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 	return
 }
 
-// Close stops reporting and closes the underlying connection.
+// countIfBidirectional counts the connection once it has both read and
+// written bytes.
+func (c *Conn) countIfBidirectional() {
+	if c.hasRead.Load() && c.hasWritten.Load() && c.counted.CompareAndSwap(false, true) {
+		c.usage.addConnection(c.trafficCategory)
+	}
+}
+
+// Close releases the connection's usage and closes the underlying connection.
+// Its last bytes go out with the reporter's next flush, or right away when the
+// connection owns its reporter.
 func (c *Conn) Close() error {
 	if c.closed.Swap(true) {
 		return nil // Already closed
 	}
 
-	// Stop the reporting ticker
-	c.reportTicker.Stop()
-
-	// Cancel context to signal goroutines to stop
+	// Cancel context to release throttle waits
 	c.cancel()
 
-	// Wait for all goroutines to finish
-	c.wg.Wait()
-
-	// Send final report
-	c.sendReport()
+	c.reporter.release(c.usage)
+	if c.ownsReporter {
+		c.reporter.Close()
+	}
 
 	return c.Conn.Close()
 }
 
-// periodicReport runs in a goroutine and periodically reports data consumption.
-func (c *Conn) periodicReport() {
-	defer c.wg.Done()
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-c.reportTicker.C:
-			c.sendReport()
-		}
-	}
-}
-
-// sendReport sends the delta consumption data to the sidecar.
+// sendReport flushes the reporter's pending usage now.
 func (c *Conn) sendReport() {
-	c.reportMutex.Lock()
-	defer c.reportMutex.Unlock()
-
-	if c.client == nil {
-		return
-	}
-	sent := c.bytesSent.Swap(0)
-	received := c.bytesReceived.Swap(0)
-	delta := sent + received
-
-	if delta == 0 {
-		return
-	}
-
-	report := &DataCapReport{
-		DeviceID:    c.clientInfo.DeviceID,
-		CountryCode: c.clientInfo.CountryCode,
-		Platform:    c.clientInfo.Platform,
-		BytesUsed:   delta,
-	}
-
-	bidirectional := c.trafficCategory != "" && c.hasRead.Load() && c.hasWritten.Load() && !c.bidirectionalReported
-	report.TrafficUsage = trafficReport(c.trafficCategory, delta, bidirectional)
-
-	timeout := c.client.httpClient.Timeout
-	if timeout == 0 {
-		timeout = 10 * time.Second
-	}
-	reportCtx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	status, err := c.client.ReportDataCapConsumption(reportCtx, report)
-	if err != nil {
-		// On failure, add bytes back for next report attempt
-		c.bytesSent.Add(sent)
-		c.bytesReceived.Add(received)
-		c.logger.Debug("failed to report datacap consumption (will retry): ", err)
-	} else {
-		if bidirectional {
-			c.bidirectionalReported = true
-		}
-		c.logger.Debug("reported datacap delta: ", delta, " bytes (sent: ", sent, ", received: ", received, ") for device ", c.clientInfo.DeviceID)
-		if status != nil {
-			c.updateThrottleState(status)
-		}
-	}
-}
-
-// updateThrottleState updates the throttling configuration based on the current status.
-func (c *Conn) updateThrottleState(status *DataCapStatus) {
-	if c.throttler == nil {
-		c.logger.Debug("throttler not initialized, skipping update")
-		return
-	}
-
-	if status.Throttle {
-		// We want to throttle Download (Write) but keep Upload (Read) fast enough for requests.
-		c.throttler.UpdateRates(defaultUploadSpeedBytesPerSec, lowTierSpeedBytesPerSec)
-		c.logger.Debug("data cap exhausted, throttling at ", lowTierSpeedBytesPerSec, " bytes/s")
-	} else {
-		c.throttler.Disable()
-		c.logger.Debug("throttling disabled - full speed")
-	}
+	c.reporter.flush()
 }
 
 // GetStatus queries the sidecar for current data cap status.
@@ -255,9 +183,10 @@ func (c *Conn) GetStatus() (*DataCapStatus, error) {
 	return c.client.GetDataCapStatus(statusCtx, c.clientInfo.DeviceID)
 }
 
-// GetBytesConsumed returns the total bytes consumed by this connection.
+// GetBytesConsumed returns the bytes of this connection's device not yet
+// accepted by the sidecar.
 func (c *Conn) GetBytesConsumed() int64 {
-	return c.bytesSent.Load() + c.bytesReceived.Load()
+	return c.usage.bytes.Load()
 }
 
 func (c *Conn) Upstream() any {

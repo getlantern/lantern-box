@@ -19,7 +19,7 @@ type DatacapTracker struct {
 	classify         func(string) string
 	client           *Client
 	logger           log.ContextLogger
-	reportInterval   time.Duration
+	reporter         *Reporter
 	throttleRegistry *ThrottleRegistry
 }
 
@@ -30,6 +30,11 @@ type Options struct {
 	URL               string   `json:"url,omitempty"`
 	ReportInterval    string   `json:"report_interval,omitempty"`
 	HTTPTimeout       string   `json:"http_timeout,omitempty"`
+
+	// Context bounds the tracker's usage reporting: when it is done, pending
+	// usage is reported once more and reporting stops. Defaults to
+	// context.Background.
+	Context context.Context `json:"-"`
 }
 
 func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTracker, error) {
@@ -58,10 +63,15 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 	if options.TrafficCategories {
 		classify = newTrafficClassifier(options.LanternHosts, options.ProbeHosts)
 	}
+	ctx := options.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	client := NewClient(options.URL, httpTimeout)
 	return &DatacapTracker{
 		classify:         classify,
-		client:           NewClient(options.URL, httpTimeout),
-		reportInterval:   reportInterval,
+		client:           client,
+		reporter:         NewReporter(ctx, client, logger, reportInterval),
 		throttleRegistry: NewThrottleRegistry(),
 		logger:           logger,
 	}, nil
@@ -82,7 +92,7 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 		Client:          t.client,
 		Logger:          t.logger,
 		ClientInfo:      info,
-		ReportInterval:  t.reportInterval,
+		Reporter:        t.reporter,
 		Throttler:       t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
 }
@@ -98,9 +108,14 @@ func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 		Client:            t.client,
 		Logger:            t.logger,
 		ClientInfo:        info,
-		ReportInterval:    t.reportInterval,
+		Reporter:          t.reporter,
 		Throttler:         t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
+}
+
+// Close reports pending usage once more and stops reporting.
+func (t *DatacapTracker) Close() {
+	t.reporter.Close()
 }
 
 // capped returns the client info of conn if its usage counts against a data
