@@ -104,12 +104,10 @@ type UnboundedVolunteerOptions struct {
 	EgressConnectTimeout int    `json:"egress_connect_timeout,omitempty"` // seconds
 	EgressErrorBackoff   int    `json:"egress_error_backoff,omitempty"`   // seconds
 
-	// MaxPeers is how many censored users the node serves at once: broflake's CTableSize for a
-	// volunteer. Zero means broflake's default of 5.
-	MaxPeers int `json:"max_peers,omitempty"`
-	// PTableSize is the number of egress connections, not the volunteer's concurrency. Leave it
-	// unset unless you know you need it.
-	PTableSize  int    `json:"p_table_size,omitempty"`
+	// MaxPeers is how many censored users the node serves at once. Zero means broflake's default
+	// of 5. It sizes both of broflake's worker tables, which a volunteer pairs one to one: each
+	// WebRTC slot relays through the egress connection with the same index.
+	MaxPeers    int    `json:"max_peers,omitempty"`
 	BusBufferSz int    `json:"bus_buffer_sz,omitempty"`
 	Netstated   string `json:"netstated,omitempty"`
 

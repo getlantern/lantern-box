@@ -76,7 +76,8 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 	bfOpt := UBClientcore.NewDefaultBroflakeOptions()
 	bfOpt.ClientType = "widget"
 	setIfNonZero(&bfOpt.CTableSize, opts.MaxPeers)
-	setIfNonZero(&bfOpt.PTableSize, opts.PTableSize)
+	// broflake's widget routing maps WebRTC slot i to egress connection i, so the tables must match.
+	bfOpt.PTableSize = bfOpt.CTableSize
 	setIfNonZero(&bfOpt.BusBufferSz, opts.BusBufferSz)
 	setStringIfNonEmpty(&bfOpt.Netstated, opts.Netstated)
 	bfOpt.OnConnectionChangeFunc = v.stats.connectionChange

@@ -70,6 +70,7 @@ func TestNewVolunteer_MapsOptions(t *testing.T) {
 
 	assert.Equal(t, "widget", v.bfOpt.ClientType, "a volunteer is broflake's widget role")
 	assert.Equal(t, 25, v.bfOpt.CTableSize, "max_peers sets the volunteer's concurrent consumers")
+	assert.Equal(t, 25, v.bfOpt.PTableSize, "each WebRTC slot needs the egress connection with its index")
 	assert.Equal(t, "https://freddie.example", v.rtcOpt.DiscoverySrv)
 	assert.Equal(t, "/v1/signal", v.rtcOpt.Endpoint)
 	assert.Equal(t, "wss://egress.example", v.egOpt.Addr)
@@ -79,6 +80,11 @@ func TestNewVolunteer_MapsOptions(t *testing.T) {
 	assert.EqualValues(t, 40, v.rtcOpt.Tuning.ICEMaxBindingRequests)
 	assert.Equal(t, defaultStatsInterval, v.statsInterval)
 	assert.NotNil(t, v.rtcOpt.OnSTUNPreflight, "STUN check failures must reach the operator's log")
+}
+
+func TestNewVolunteer_DefaultTablesMatch(t *testing.T) {
+	v := newTestVolunteer(t, validVolunteerOptions())
+	assert.Equal(t, v.bfOpt.CTableSize, v.bfOpt.PTableSize)
 }
 
 func TestNewVolunteer_NATFailTimeout(t *testing.T) {
@@ -229,4 +235,3 @@ func startTestSTUNServer(t *testing.T) string {
 	}()
 	return conn.LocalAddr().String()
 }
-
