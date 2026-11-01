@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -272,4 +273,67 @@ func TestReporterSharesDeviceThrottler(t *testing.T) {
 	require.NoError(t, err)
 	reporter.flush(context.Background())
 	require.True(t, second.throttler.IsEnabled())
+}
+
+// A throttle decision reaches a device that reconnected under a new entry
+// while its old entry's usage was being reported.
+func TestReporterThrottlesReconnectedDevice(t *testing.T) {
+	reconnected := make(chan *Conn, 1)
+	var reporter *Reporter
+	info := clientcontext.ClientInfo{DeviceID: "device"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The device reconnects after its idle entry was dropped and while
+		// that entry's report is in flight.
+		reconnected <- NewConn(ConnConfig{Conn: newMockConn(nil), Logger: noopLogger, ClientInfo: info, Reporter: reporter})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"throttle":true}`))
+	}))
+	defer srv.Close()
+	reporter = NewReporter(NewClient(srv.URL, time.Second), noopLogger, time.Hour)
+	defer reporter.Close()
+
+	old := NewConn(ConnConfig{Conn: newMockConn(make([]byte, 8)), Logger: noopLogger, ClientInfo: info, Reporter: reporter})
+	_, err := old.Read(make([]byte, 8))
+	require.NoError(t, err)
+	require.NoError(t, old.Close())
+	reporter.mu.Lock()
+	reporter.devices["device"].idle = true // dropped by the next flush
+	reporter.mu.Unlock()
+
+	reporter.flush(context.Background())
+	conn := <-reconnected
+	defer conn.Close()
+	require.NotSame(t, old.throttler, conn.throttler)
+	require.True(t, conn.throttler.IsEnabled())
+}
+
+// A periodic flush gives up at the report interval when the sidecar never
+// answers, so the next flush retries the usage instead of queueing behind it.
+func TestReporterPeriodicFlushIsBoundedByInterval(t *testing.T) {
+	var attempts atomic.Int32
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		<-done // never answers while the test runs
+	}))
+	defer srv.Close()
+	defer close(done)
+	reporter := NewReporter(NewClient(srv.URL, time.Hour), noopLogger, 100*time.Millisecond)
+
+	conn := NewConn(ConnConfig{Conn: newMockConn(make([]byte, 8)), Logger: noopLogger, ClientInfo: clientcontext.ClientInfo{DeviceID: "device"}, Reporter: reporter})
+	defer conn.Close()
+	_, err := conn.Read(make([]byte, 8))
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool { return attempts.Load() >= 3 }, 2*time.Second, 20*time.Millisecond,
+		"each flush should time out and the next retry the restored usage")
+
+	closed := make(chan struct{})
+	go func() { reporter.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(closeFlushBudget + 2*time.Second):
+		t.Fatal("close did not finish within its flush budget")
+	}
+	require.EqualValues(t, 8, conn.GetBytesConsumed(), "unreported usage is kept")
 }

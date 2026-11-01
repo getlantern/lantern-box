@@ -189,7 +189,12 @@ func (r *Reporter) run() {
 	for {
 		select {
 		case <-ticker.C:
-			r.flush(r.ctx)
+			// Bound each flush by the interval, so a sidecar that accepts
+			// requests but never answers can't hold up the next one. Usage a
+			// timed-out report misses is restored for the next flush.
+			ctx, cancel := context.WithTimeout(r.ctx, r.interval)
+			r.flush(ctx)
+			cancel()
 		case <-r.stop:
 			ctx, cancel := context.WithTimeout(context.Background(), closeFlushBudget)
 			r.flush(ctx)
@@ -311,6 +316,15 @@ func (r *Reporter) report(ctx context.Context, d *deviceUsage, u usageDelta) {
 	r.logger.Debug("reported datacap delta: ", u.bytes, " bytes for device ", d.deviceID)
 	if status != nil {
 		updateThrottleState(r.logger, d.throttler, status)
+		// The device may have reconnected under a new entry since this flush
+		// dropped d. Its throttler is d's when the tracker supplied both from
+		// its registry; otherwise it needs the status too.
+		r.mu.Lock()
+		cur, ok := r.devices[d.deviceID]
+		r.mu.Unlock()
+		if ok && cur.throttler != d.throttler {
+			updateThrottleState(r.logger, cur.throttler, status)
+		}
 	}
 }
 
