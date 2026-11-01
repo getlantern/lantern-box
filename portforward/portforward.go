@@ -423,7 +423,9 @@ func (f *Forwarder) renewLoop(ctx context.Context, interval time.Duration) {
 				return
 			}
 			for _, m := range ms {
-				if !f.renew(m, client) {
+				// A renewal in flight finishes and does its teardown check, but
+				// once ctx ends no further protocol is renewed.
+				if ctx.Err() != nil || !f.renew(m, client) {
 					return
 				}
 			}

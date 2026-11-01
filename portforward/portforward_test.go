@@ -558,3 +558,30 @@ func TestForwarder_RenewalRacingTeardown_StopsAcrossProtocols(t *testing.T) {
 	assert.Equal(t, []string{TCP, UDP, TCP}, c.deletes,
 		"teardown deletes both, then the raced TCP renewal is undone")
 }
+
+// Cancelling renewal while one protocol's renewal is in flight lets that call
+// finish but renews no other protocol.
+func TestForwarder_RenewalCancelled_StopsBeforeNextProtocol(t *testing.T) {
+	release := make(chan struct{})
+	c := &fakeIGD{addBlock: release}
+	f := newTestForwarder(t, c)
+	f.mappings = map[string]*Mapping{
+		TCP: {ExternalPort: 15000, InternalPort: 15000, Protocol: TCP, LeaseDuration: time.Hour},
+		UDP: {ExternalPort: 15001, InternalPort: 15001, Protocol: UDP, LeaseDuration: time.Hour},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() { f.renewLoop(ctx, time.Millisecond); close(loopDone) }()
+
+	require.Eventually(t, func() bool { return c.addCalls.Load() >= 1 },
+		2*time.Second, time.Millisecond, "renewal never reached AddPortMapping")
+	cancel()
+	close(release)
+
+	select {
+	case <-loopDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("renewLoop did not exit after cancel")
+	}
+	assert.Equal(t, []string{TCP}, c.adds, "the UDP mapping was renewed after renewal was cancelled")
+}
