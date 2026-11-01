@@ -12,9 +12,11 @@ import (
 	"log/slog"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
+	semconv "github.com/getlantern/semconv"
 	"github.com/huin/goupnp/dcps/internetgateway1"
 	"github.com/huin/goupnp/dcps/internetgateway2"
 )
@@ -218,7 +220,7 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 		// The caller gave up but the gateway accepted the mapping. Remove it —
 		// otherwise it survives with no Forwarder tracking it.
 		slog.Warn("portforward: caller gave up while the gateway was accepting the mapping; removing it",
-			"protocol", protocol, "external_port", externalPort, "internal_port", internalPort, "err", ctxErr)
+			protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort, "err", ctxErr)
 		f.deleteRacedMapping(&Mapping{ExternalPort: externalPort, Protocol: protocol}, client,
 			"caller gave up while the gateway was accepting it")
 		return nil, fmt.Errorf("add port mapping: %w", ctxErr)
@@ -228,7 +230,7 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 		// rather than treating it as a permanent "this network won't work".
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			slog.Warn("portforward: adding the mapping was canceled or timed out",
-				"protocol", protocol, "external_port", externalPort, "internal_port", internalPort,
+				protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
 				"internal_ip", internalIP, "method", f.method, "err", ctxErr)
 			return nil, fmt.Errorf("add port mapping: %w", ctxErr)
 		}
@@ -241,14 +243,14 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 			// possibly permanent, with no Forwarder holding it. Same leak
 			// renewLoop already defends against on its own timeouts.
 			slog.Warn("portforward: gateway did not answer in time; removing any mapping it may have created",
-				"protocol", protocol, "external_port", externalPort, "internal_port", internalPort,
+				protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
 				"internal_ip", internalIP, "method", f.method, "err", err)
 			f.deleteRacedMapping(&Mapping{ExternalPort: externalPort, Protocol: protocol}, client,
 				"gateway never answered the add")
 			return nil, fmt.Errorf("add port mapping: %w", errors.Join(ErrNoPortForwarding, err))
 		}
 		slog.Warn("portforward: gateway refused the mapping",
-			"protocol", protocol, "external_port", externalPort, "internal_port", internalPort,
+			protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
 			"internal_ip", internalIP, "method", f.method, "err", err)
 		// Per the ErrNoPortForwarding docstring, a gateway refusing to map a
 		// port is the "this network can't host a peer" case. Join the
@@ -277,7 +279,7 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 	// router's own table — were nowhere in the log. That is exactly the shape of
 	// a 422 "could not connect to peer port".
 	slog.Info("portforward: mapping added",
-		"protocol", protocol, "external_port", externalPort, "internal_port", internalPort,
+		protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
 		"internal_ip", internalIP, "method", f.method,
 		"requested_lease_s", requestedLease)
 	return m, nil
@@ -322,6 +324,12 @@ func (f *Forwarder) UnmapPort(ctx context.Context) error {
 		delete(f.mappings, m.Protocol)
 	}
 	return errors.Join(errs...)
+}
+
+// protocolAttr is a mapping's protocol as a log attribute, under OTel's key and
+// in its lowercase form.
+func protocolAttr(protocol string) slog.Attr {
+	return slog.String(string(semconv.NetworkProtocolNameKey), strings.ToLower(protocol))
 }
 
 // activeMappings returns the mappings in protocol order, so teardown and
@@ -399,11 +407,11 @@ func (f *Forwarder) deleteRacedMapping(m *Mapping, client igdClient, why string)
 		return client.DeletePortMapping("", m.ExternalPort, m.Protocol)
 	}); err != nil {
 		slog.Warn("portforward: could not remove an untracked mapping",
-			"err", err, "protocol", m.Protocol, "external_port", m.ExternalPort, "why", why)
+			"err", err, protocolAttr(m.Protocol), "external_port", m.ExternalPort, "why", why)
 		return
 	}
 	slog.Info("portforward: removed an untracked mapping",
-		"protocol", m.Protocol, "external_port", m.ExternalPort, "why", why)
+		protocolAttr(m.Protocol), "external_port", m.ExternalPort, "why", why)
 }
 
 func (f *Forwarder) renewLoop(ctx context.Context, interval time.Duration) {
@@ -454,14 +462,14 @@ func (f *Forwarder) renew(m *Mapping, client igdClient) bool {
 	case err := <-errCh:
 		landed = err == nil
 		if err != nil {
-			slog.Warn("portforward: lease renewal failed", "err", err, "protocol", m.Protocol, "external_port", m.ExternalPort)
+			slog.Warn("portforward: lease renewal failed", "err", err, protocolAttr(m.Protocol), "external_port", m.ExternalPort)
 		}
 	case <-time.After(renewCallTimeout):
 		// Outcome unknowable — the call may still land. Assume it did
 		// so teardown removes it rather than leaving a forward behind.
 		landed = true
 		slog.Warn("portforward: lease renewal timed out; treating the mapping as re-added",
-			"protocol", m.Protocol, "external_port", m.ExternalPort, "timeout", renewCallTimeout)
+			protocolAttr(m.Protocol), "external_port", m.ExternalPort, "timeout", renewCallTimeout)
 	}
 
 	// UnmapPort may have deleted the mapping while the renewal was in

@@ -518,6 +518,10 @@ func TestForwarder_Renewal_RenewsEveryProtocol(t *testing.T) {
 	done := make(chan struct{})
 	go func() { f.renewLoop(ctx, 5*time.Millisecond); close(done) }()
 
+	// Add UDP only once renewal has ticked with TCP alone, so a loop that
+	// snapshots its mappings at startup fails.
+	require.Eventually(t, func() bool { return c.addCalls.Load() >= 2 },
+		2*time.Second, time.Millisecond, "the TCP mapping was never renewed")
 	_, err = f.MapPort(context.Background(), UDP, 30002, "udp")
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
