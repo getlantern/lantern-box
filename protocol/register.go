@@ -9,6 +9,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	boxService "github.com/sagernet/sing-box/adapter/service"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/libbox"
 	"github.com/sagernet/sing/common"
@@ -85,6 +86,11 @@ func RegisterProtocols(ctx context.Context) context.Context {
 			registerEndpoints(reg)
 		}
 	}
+	if registry := service.FromContext[adapter.ServiceRegistry](ctx); registry != nil {
+		if reg, ok := registry.(*boxService.Registry); ok {
+			registerServices(reg)
+		}
+	}
 	return ctx
 }
 
@@ -121,6 +127,10 @@ func registerOutbounds(registry *outbound.Registry) {
 
 func registerEndpoints(registry *endpoint.Registry) {
 	amnezia.RegisterEndpoint(registry)
+}
+
+func registerServices(registry *boxService.Registry) {
+	unbounded.RegisterService(registry)
 }
 
 func SupportedProtocols() []string {
