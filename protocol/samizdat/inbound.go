@@ -188,9 +188,12 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	// can run without the callback having fired when shutdown times out.
 	var rejected atomic.Bool
 	if notify != nil {
-		notify(peerconn.Event{State: +1, Source: source, Destination: destination, Bytes: bytes})
+		// The short ID tells the listener which pairing, if any, this
+		// connection came through. Zero when the session has none.
+		shortID, _ := samizdat.ShortIDFromContext(ctx)
+		notify(peerconn.Event{State: +1, Source: source, Destination: destination, Bytes: bytes, ShortID: shortID})
 		defer func() {
-			evt := peerconn.Event{State: -1, Source: source, Bytes: bytes}
+			evt := peerconn.Event{State: -1, Source: source, Bytes: bytes, ShortID: shortID}
 			if rejected.Load() {
 				evt.Destination, evt.Rejected = destination, true
 			}

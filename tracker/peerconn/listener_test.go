@@ -1,6 +1,11 @@
 package peerconn
 
 import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -179,4 +184,25 @@ func TestAcquire_PairCompletesAfterUnregister(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, []int{+1, -1}, states,
 		"an accepted connection must still report its close after SetListener(nil)")
+}
+
+// A short ID identifies a pairing, so no formatting of an Event may reveal it.
+func TestEvent_FormattingOmitsShortID(t *testing.T) {
+	id := [8]byte{0xde, 0xad, 0xbe, 0xef, 0x01, 0x23, 0x45, 0x67}
+	evt := Event{State: +1, Source: "10.0.0.1:443", Destination: "example.com:443", Rejected: true, Bytes: &Counter{}, ShortID: id}
+
+	var logged bytes.Buffer
+	slog.New(slog.NewTextHandler(&logged, nil)).Info("event", "evt", evt)
+	slog.New(slog.NewJSONHandler(&logged, nil)).Info("event", "evt", evt)
+
+	for _, out := range []string{
+		fmt.Sprint(evt), fmt.Sprintf("%v", evt), fmt.Sprintf("%+v", evt), fmt.Sprintf("%#v", evt),
+		fmt.Sprintf("%v", &evt), fmt.Sprintf("%+v", &evt), evt.GoString(),
+		logged.String(),
+	} {
+		assert.Contains(t, out, "example.com:443", "formatting still shows the event")
+		for _, leak := range []string{hex.EncodeToString(id[:]), "222 173 190 239", "0xde", "ShortID", "DEADBEEF"} {
+			assert.False(t, strings.Contains(strings.ToLower(out), strings.ToLower(leak)), "%q leaks the short ID as %q", out, leak)
+		}
+	}
 }

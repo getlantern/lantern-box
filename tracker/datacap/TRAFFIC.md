@@ -25,9 +25,12 @@ which also includes automated traffic and is not evidence of humanity.
 IP-only destinations are unknown. UDP associations can contain several
 destinations and report unknown bytes, without connection counts.
 
-A TCP connection contributes a connection count only once after bytes have
-been read and written, on a report acknowledged by the sidecar. Failed reports
-retain the pending count for retry. An acknowledgement lost after ingestion
+Usage is summed per device and reported once per interval, so one report
+covers all of a device's connections. A TCP connection contributes a
+connection count only once after bytes have been read and written, on a report
+acknowledged by the sidecar. Failed reports retain the pending count for
+retry. A report never carries more connections than bytes in a category; a
+count without bytes waits for the device's next bytes in that category. An acknowledgement lost after ingestion
 can still cause duplication because the existing datacap protocol reports
 deltas without stable report IDs. Bidirectional bytes do not establish
 application success. Connections without client-context metadata and Pro

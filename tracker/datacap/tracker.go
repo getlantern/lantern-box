@@ -20,7 +20,7 @@ type DatacapTracker struct {
 	classify         func(string) string
 	client           *Client
 	logger           log.ContextLogger
-	reportInterval   time.Duration
+	reporter         *Reporter
 	throttleRegistry *ThrottleRegistry
 }
 
@@ -59,10 +59,11 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 	if options.TrafficCategories {
 		classify = newTrafficClassifier(options.LanternHosts, options.ProbeHosts)
 	}
+	client := NewClient(options.URL, httpTimeout)
 	return &DatacapTracker{
 		classify:         classify,
-		client:           NewClient(options.URL, httpTimeout),
-		reportInterval:   reportInterval,
+		client:           client,
+		reporter:         NewReporter(client, logger, reportInterval),
 		throttleRegistry: NewThrottleRegistry(),
 		logger:           logger,
 	}, nil
@@ -83,7 +84,7 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 		Client:          t.client,
 		Logger:          t.logger,
 		ClientInfo:      info,
-		ReportInterval:  t.reportInterval,
+		Reporter:        t.reporter,
 		Throttler:       t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
 }
@@ -99,9 +100,15 @@ func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 		Client:            t.client,
 		Logger:            t.logger,
 		ClientInfo:        info,
-		ReportInterval:    t.reportInterval,
+		Reporter:          t.reporter,
 		Throttler:         t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
+}
+
+// Close reports pending usage once more and stops reporting. Call it after
+// the box has closed its connections, so their last bytes are included.
+func (t *DatacapTracker) Close() {
+	t.reporter.Close()
 }
 
 // capped returns the client info of conn if its usage counts against a data
