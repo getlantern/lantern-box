@@ -23,6 +23,9 @@ type fakeIGD struct {
 	extIPErr    error
 	extIP       string
 	addBlock    chan struct{} // if non-nil, AddPortMapping blocks on receive
+	// deleteGates, if set, holds the nth DeletePortMapping call until
+	// deleteGates[n-1] is closed.
+	deleteGates []chan struct{}
 	lastAdd     mappingArgs
 	lastDelete  deleteArgs
 	// adds and deletes are the protocol of every call, in order.
@@ -62,7 +65,9 @@ func (f *fakeIGD) AddPortMapping(_ string, externalPort uint16, protocol string,
 }
 
 func (f *fakeIGD) DeletePortMapping(_ string, externalPort uint16, protocol string) error {
-	f.deleteCalls.Add(1)
+	if n := f.deleteCalls.Add(1); int(n) <= len(f.deleteGates) {
+		<-f.deleteGates[n-1]
+	}
 	f.mu.Lock()
 	f.lastDelete = deleteArgs{externalPort: externalPort, protocol: protocol}
 	f.deletes = append(f.deletes, protocol)
@@ -766,4 +771,36 @@ func TestUPnPOutcome(t *testing.T) {
 	err := upnpOutcome(errors.New("goupnp: error decoding response body: EOF"))
 	assert.ErrorIs(t, err, errOutcomeUnknown)
 	assert.True(t, mayHaveLanded(err))
+}
+
+// The grace delete holds the port until it returns, even when the add
+// resolves and finishes its own cleanup first, so a re-map can't be deleted
+// by it.
+func TestForwarder_GraceDeleteHoldsThePort(t *testing.T) {
+	prevAdd, prevGrace := addCallTimeout, abandonedAddGrace
+	addCallTimeout, abandonedAddGrace = 10*time.Millisecond, 30*time.Millisecond
+	t.Cleanup(func() { addCallTimeout, abandonedAddGrace = prevAdd, prevGrace })
+	addGate := make(chan struct{})
+	graceDelete, cleanupDelete := make(chan struct{}), make(chan struct{})
+	c := &fakeIGD{addBlock: addGate, deleteGates: []chan struct{}{graceDelete, cleanupDelete}}
+	f := newTestForwarder(t, c)
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
+	require.ErrorIs(t, err, ErrNoPortForwarding)
+
+	// The grace delete starts and blocks.
+	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 1 }, 2*time.Second, time.Millisecond)
+	// The add resolves; its own cleanup deletes too, and blocks.
+	close(addGate)
+	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 2 }, 2*time.Second, time.Millisecond)
+	// The add's cleanup finishes while the grace delete is still pending.
+	close(cleanupDelete)
+	time.Sleep(20 * time.Millisecond)
+	_, err = f.MapPort(context.Background(), TCP, 30001, "retry")
+	assert.ErrorContains(t, err, "still being cleaned up", "the port was released while the grace delete was still pending")
+	close(graceDelete)
+	require.Eventually(t, func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return len(f.inflight) == 0
+	}, 2*time.Second, time.Millisecond)
 }

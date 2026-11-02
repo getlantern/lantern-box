@@ -470,10 +470,11 @@ func (f *Forwarder) addLocked(client igdClient, m *Mapping, description string) 
 	var resolved atomic.Bool
 	grace := time.AfterFunc(abandonedAddGrace, func() {
 		f.mu.Lock()
-		gone := !resolved.Load() && f.untrackedLocked(m)
-		f.mu.Unlock()
-		if gone {
-			f.deleteUntracked(m, client, "an add the gateway never answered")
+		defer f.mu.Unlock()
+		if !resolved.Load() && f.untrackedLocked(m) {
+			// Holds the port until this delete returns, even if the add
+			// resolves and finishes its own cleanup first.
+			f.removeLocked(m, client, "an add the gateway never answered")
 		}
 	})
 	go func() {
