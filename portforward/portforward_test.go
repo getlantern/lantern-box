@@ -3,6 +3,7 @@ package portforward
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -321,9 +322,11 @@ func TestForwarder_RenewalRacingTeardown_DeletesWhatItReAdded(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("renewLoop did not exit after teardown")
 	}
-	assert.Equal(t, int64(2), c.deleteCalls.Load(),
+	assert.Eventually(t, func() bool { return c.deleteCalls.Load() == 2 }, 2*time.Second, time.Millisecond,
 		"the renewal must delete the mapping it re-added after teardown")
+	c.mu.Lock()
 	assert.Equal(t, uint16(15000), c.lastDelete.externalPort)
+	c.mu.Unlock()
 }
 
 // Once teardown has run, a later tick must not touch the gateway at all.
@@ -598,8 +601,11 @@ func TestForwarder_RenewalRacingTeardown_StopsAcrossProtocols(t *testing.T) {
 		t.Fatal("renewLoop did not exit after teardown")
 	}
 	assert.Equal(t, int64(1), c.addCalls.Load(), "no renewal may start after teardown")
-	assert.Equal(t, []string{TCP, UDP, TCP}, c.deletes,
-		"teardown deletes both, then the raced TCP renewal is undone")
+	assert.Eventually(t, func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return slices.Equal(c.deletes, []string{TCP, UDP, TCP})
+	}, 2*time.Second, time.Millisecond, "teardown deletes both, then the raced TCP renewal is undone")
 }
 
 // Cancelling renewal while one protocol's renewal is in flight lets that call
@@ -649,24 +655,79 @@ func TestForwarder_RemapAfterUnmap_Renews(t *testing.T) {
 	c.mu.Unlock()
 }
 
-// Cleanup of an abandoned add leaves the port alone if the Forwarder has
-// since mapped it again: that mapping is live.
-func TestForwarder_AbandonedAddCleanupSparesARemappedPort(t *testing.T) {
+// A port whose abandoned add is still being cleaned up is refused by MapPort
+// until the cleanup's delete has returned, so the cleanup can't remove a new
+// mapping of the same port.
+func TestForwarder_SettlingPortIsRefusedUntilCleanedUp(t *testing.T) {
+	release := make(chan struct{})
+	c := &fakeIGD{addBlock: release}
+	f := newTestForwarder(t, c)
+	ctx, cancel := context.WithCancel(context.Background())
+	res := make(chan error, 1)
+	go func() {
+		_, err := f.MapPort(ctx, UDP, 41641, "test")
+		res <- err
+	}()
+	require.Eventually(t, func() bool { return c.addCalls.Load() >= 1 }, 2*time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-res, context.Canceled)
+
+	_, err := f.MapPort(context.Background(), UDP, 41641, "retry")
+	assert.ErrorContains(t, err, "still being cleaned up")
+
+	close(release)
+	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 1 }, 2*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return len(f.settling) == 0
+	}, 2*time.Second, time.Millisecond)
+	_, err = f.MapPort(context.Background(), UDP, 41641, "retry")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), c.deleteCalls.Load(), "the new mapping was deleted by the old cleanup")
+}
+
+// An abandoned add that never resolves still gets a delete after the grace
+// period, and another if it resolves later.
+func TestForwarder_UnresolvedAddIsDeletedAfterGrace(t *testing.T) {
+	prevAdd, prevGrace := addCallTimeout, abandonedAddGrace
+	addCallTimeout, abandonedAddGrace = 20*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { addCallTimeout, abandonedAddGrace = prevAdd, prevGrace })
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	c := &fakeIGD{addBlock: release}
+	f := newTestForwarder(t, c)
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
+	require.ErrorIs(t, err, ErrNoPortForwarding)
+
+	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 1 }, 2*time.Second, time.Millisecond,
+		"no delete was sent for an add that never resolved")
+	close(release)
+	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 2 }, 2*time.Second, time.Millisecond,
+		"an add that resolved after the first delete must be deleted again")
+}
+
+// A renewal that raced a teardown leaves alone a port the Forwarder has since
+// mapped again: that mapping is live.
+func TestForwarder_RacedRenewalSparesARemappedPort(t *testing.T) {
 	c := &fakeIGD{}
 	f := newTestForwarder(t, c)
 	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
 	require.NoError(t, err)
+	f.mu.Lock()
+	old, teardowns := f.mappings[TCP], f.teardowns
+	f.mu.Unlock()
+	require.NoError(t, f.UnmapPort(context.Background()))
+	_, err = f.MapPort(context.Background(), TCP, 30001, "again")
+	require.NoError(t, err)
 
-	addErr := make(chan error, 1)
-	addErr <- nil
-	f.deleteWhenResolved(addErr, &Mapping{ExternalPort: 30001, Protocol: TCP}, c, "test")
-	assert.Equal(t, int64(0), c.deleteCalls.Load(), "the live mapping on that port was deleted")
-
-	addErr <- nil
-	f.deleteWhenResolved(addErr, &Mapping{ExternalPort: 30009, Protocol: TCP}, c, "test")
-	assert.Equal(t, int64(1), c.deleteCalls.Load(), "an untracked port must still be deleted")
-
-	addErr <- errors.New("refused")
-	f.deleteWhenResolved(addErr, &Mapping{ExternalPort: 30010, Protocol: TCP}, c, "test")
-	assert.Equal(t, int64(1), c.deleteCalls.Load(), "a refused add created nothing to delete")
+	assert.False(t, f.renew(old, c, teardowns))
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int64(1), c.deleteCalls.Load(), "only UnmapPort's delete; the re-mapped port must survive")
 }

@@ -461,8 +461,10 @@ func TestForwarder_LostRenewalAnswerDuringTeardownIsRemoved(t *testing.T) {
 	delete(f.mappings, UDP)
 	f.mu.Unlock()
 	assert.False(t, f.renew(m, c, teardowns))
-	ms := collapse(g.recorded())
-	assert.Equal(t, fakeMap{UDP, 41641, 0}, ms[len(ms)-1], "the possibly re-created mapping must be deleted")
+	assert.Eventually(t, func() bool {
+		ms := collapse(g.recorded())
+		return ms[len(ms)-1] == fakeMap{UDP, 41641, 0}
+	}, 2*time.Second, time.Millisecond, "the possibly re-created mapping must be deleted")
 }
 
 // A PCP refusal carrying only the common header is a refusal, not a lost
