@@ -53,7 +53,9 @@ var (
 
 // pmpExchange sends the request build returns to gw, resending on the RFCs'
 // schedule, and returns the first response accept takes, or accept's error.
-// build gets the socket's local address, which PCP puts in its requests.
+// build gets the socket's local address, which PCP puts in its requests. Once
+// a request has gone out, a transport error leaves its outcome unknown, so it
+// is wrapped in errNoAnswer.
 func pmpExchange(gw *net.UDPAddr, timeout time.Duration, build func(local net.IP) []byte, accept func(b []byte) (bool, error)) ([]byte, error) {
 	conn, err := net.DialUDP("udp4", nil, gw)
 	if err != nil {
@@ -63,16 +65,24 @@ func pmpExchange(gw *net.UDPAddr, timeout time.Duration, build func(local net.IP
 	req := build(conn.LocalAddr().(*net.UDPAddr).IP)
 	deadline := time.Now().Add(timeout)
 	buf := make([]byte, 1100)
+	sent := false
+	uncertain := func(err error) error {
+		if sent {
+			return fmt.Errorf("%w: %w", errNoAnswer, err)
+		}
+		return err
+	}
 	for wait := pmpFirstResend; ; wait *= 2 {
 		if _, err := conn.Write(req); err != nil {
-			return nil, err
+			return nil, uncertain(err)
 		}
+		sent = true
 		next := time.Now().Add(wait)
 		if next.After(deadline) {
 			next = deadline
 		}
 		if err := conn.SetReadDeadline(next); err != nil {
-			return nil, err
+			return nil, uncertain(err)
 		}
 		for {
 			n, err := conn.Read(buf)
@@ -80,7 +90,7 @@ func pmpExchange(gw *net.UDPAddr, timeout time.Duration, build func(local net.IP
 				var ne net.Error
 				if !errors.As(err, &ne) || !ne.Timeout() {
 					// Typically ICMP port unreachable: nothing listens on 5351.
-					return nil, err
+					return nil, uncertain(err)
 				}
 				break
 			}

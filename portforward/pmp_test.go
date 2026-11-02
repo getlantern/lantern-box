@@ -609,3 +609,18 @@ func TestPCP_ErrorForAnotherNonceIsIgnored(t *testing.T) {
 	_, err = accept(res[:pcpHeaderLen])
 	assert.ErrorContains(t, err, "result code 8", "a header-only error is taken as the request's")
 }
+
+// A transport error after a request has gone out leaves its outcome unknown,
+// so it counts as a lost answer, keeping the underlying error.
+func TestPMPExchange_ErrorAfterSendIsUncertain(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	addr := conn.LocalAddr().(*net.UDPAddr)
+	conn.Close()
+	_, err = pmpExchange(addr, time.Second, func(net.IP) []byte { return []byte{0, 0} },
+		func([]byte) (bool, error) { return false, nil })
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errNoAnswer)
+	var opErr *net.OpError
+	assert.ErrorAs(t, err, &opErr, "the transport error is kept")
+}
