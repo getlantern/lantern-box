@@ -344,13 +344,13 @@ func TestPMP_LostAnswer(t *testing.T) {
 		}
 		g.set(func() { g.dropAdds = true })
 		err := c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600)
-		assert.ErrorIs(t, err, errNoAnswer, "pcp=%v", pcp)
+		assert.ErrorIs(t, err, errOutcomeUnknown, "pcp=%v", pcp)
 		assert.Equal(t, []fakeMap{{UDP, 41641, 3600}, {UDP, 41641, 0}}, collapse(g.recorded()), "pcp=%v: a fresh add whose answer was lost must be deleted", pcp)
 
 		g.set(func() { g.dropAdds = false; g.maps = nil })
 		require.NoError(t, c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600))
 		g.set(func() { g.dropAdds = true })
-		assert.ErrorIs(t, c.AddPortMapping("", 41641, UDP, 41641, "", true, "test (renew)", 3600), errNoAnswer)
+		assert.ErrorIs(t, c.AddPortMapping("", 41641, UDP, 41641, "", true, "test (renew)", 3600), errOutcomeUnknown)
 		assert.Equal(t, []fakeMap{{UDP, 41641, 3600}}, collapse(g.recorded()), "pcp=%v: a renewal must not be deleted", pcp)
 	}
 }
@@ -444,7 +444,7 @@ func TestForwarder_LateShortGrantReschedulesRenewal(t *testing.T) {
 }
 
 // A renewal whose answer is lost while teardown runs may have re-created the
-// mapping, so it is removed like one that timed out.
+// mapping, so it is removed once the renewal resolves.
 func TestForwarder_LostRenewalAnswerDuringTeardownIsRemoved(t *testing.T) {
 	g := newFakePMPGateway(t, true)
 	c := newPCPClient(g.addr(), 300*time.Millisecond)
@@ -454,17 +454,23 @@ func TestForwarder_LostRenewalAnswerDuringTeardownIsRemoved(t *testing.T) {
 
 	g.set(func() { g.dropAdds = true })
 	f.mu.Lock()
-	m := f.mappings[UDP]
-	teardowns := f.teardowns
-	// UnmapPort ran meanwhile and deleted the mapping.
-	f.teardowns++
-	delete(f.mappings, UDP)
+	m, teardowns := f.mappings[UDP], f.teardowns
 	f.mu.Unlock()
-	assert.False(t, f.renew(m, c, teardowns))
+	done := make(chan bool, 1)
+	go func() { done <- f.renew(m, c, teardowns) }()
+	require.Eventually(t, func() bool { return len(g.recorded()) >= 2 }, 2*time.Second, time.Millisecond,
+		"the renewal never reached the gateway")
+	// Teardown runs while the renewal's answer is lost.
+	require.NoError(t, f.UnmapPort(context.Background()))
+	assert.False(t, <-done)
 	assert.Eventually(t, func() bool {
-		ms := collapse(g.recorded())
-		return ms[len(ms)-1] == fakeMap{UDP, 41641, 0}
-	}, 2*time.Second, time.Millisecond, "the possibly re-created mapping must be deleted")
+		ms := g.recorded()
+		return ms[len(ms)-1] == fakeMap{UDP, 41641, 0} && func() bool {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			return len(f.inflight) == 0
+		}()
+	}, 3*time.Second, 10*time.Millisecond, "the possibly re-created mapping must be deleted once the renewal resolves")
 }
 
 // A PCP refusal carrying only the common header is a refusal, not a lost
@@ -476,7 +482,7 @@ func TestPCP_HeaderOnlyErrorIsARefusal(t *testing.T) {
 	start := time.Now()
 	err := c.AddPortMapping("", 41641, UDP, 41641, "", true, "test", 3600)
 	assert.ErrorContains(t, err, "result code 8")
-	assert.NotErrorIs(t, err, errNoAnswer)
+	assert.NotErrorIs(t, err, errOutcomeUnknown)
 	assert.Less(t, time.Since(start), 500*time.Millisecond)
 	assert.Equal(t, []fakeMap{{UDP, 41641, 3600}}, collapse(g.recorded()))
 }
@@ -625,7 +631,7 @@ func TestPMPExchange_ErrorAfterSendIsUncertain(t *testing.T) {
 	_, err = pmpExchange(addr, time.Second, func(net.IP) []byte { return []byte{0, 0} },
 		func([]byte) (bool, error) { return false, nil })
 	require.Error(t, err)
-	assert.ErrorIs(t, err, errNoAnswer)
+	assert.ErrorIs(t, err, errOutcomeUnknown)
 	var opErr *net.OpError
 	assert.ErrorAs(t, err, &opErr, "the transport error is kept")
 }

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/huin/goupnp/soap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -680,7 +681,7 @@ func TestForwarder_SettlingPortIsRefusedUntilCleanedUp(t *testing.T) {
 	require.Eventually(t, func() bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		return len(f.settling) == 0
+		return len(f.inflight) == 0
 	}, 2*time.Second, time.Millisecond)
 	_, err = f.MapPort(context.Background(), UDP, 41641, "retry")
 	require.NoError(t, err)
@@ -730,4 +731,39 @@ func TestForwarder_RacedRenewalSparesARemappedPort(t *testing.T) {
 	assert.False(t, f.renew(old, c, teardowns))
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, int64(1), c.deleteCalls.Load(), "only UnmapPort's delete; the re-mapped port must survive")
+}
+
+// A renewal that timed out and was then torn down is removed when its add
+// finally resolves: nothing else tracks it by then.
+func TestForwarder_TimedOutRenewalThenTeardownIsRemoved(t *testing.T) {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{} // MapPort's add goes through; the renewal's waits
+	c := &fakeIGD{addBlock: gate}
+	f := newTestForwarder(t, c)
+	f.renewWait = 20 * time.Millisecond
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
+	require.NoError(t, err)
+	f.mu.Lock()
+	m, teardowns := f.mappings[TCP], f.teardowns
+	f.mu.Unlock()
+
+	assert.True(t, f.renew(m, c, teardowns), "the renewal timed out with no teardown yet")
+	require.NoError(t, f.UnmapPort(context.Background()))
+	require.Equal(t, int64(1), c.deleteCalls.Load())
+
+	gate <- struct{}{} // the renewal's add lands after the teardown
+	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 2 }, 2*time.Second, time.Millisecond,
+		"the renewal re-added the mapping after teardown and nothing removed it")
+}
+
+// Only a SOAP fault, the gateway's refusal, is a definite failure. Any other
+// UPnP error may come after the gateway acted, so its outcome is unknown.
+func TestUPnPOutcome(t *testing.T) {
+	assert.NoError(t, upnpOutcome(nil))
+	fault := &soap.SOAPFaultError{FaultCode: "s:Client", FaultString: "UPnPError"}
+	assert.Same(t, fault, upnpOutcome(fault))
+	assert.False(t, mayHaveLanded(upnpOutcome(fault)))
+	err := upnpOutcome(errors.New("goupnp: error decoding response body: EOF"))
+	assert.ErrorIs(t, err, errOutcomeUnknown)
+	assert.True(t, mayHaveLanded(err))
 }
