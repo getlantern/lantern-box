@@ -428,14 +428,15 @@ func (f *Forwarder) StartRenewal(ctx context.Context) {
 	}
 	renewCtx, cancel := context.WithCancel(ctx)
 	f.cancel = cancel
-	// Every mapping requests the same lease, so the first one's sets the pace.
-	// nextRenewal comes sooner for a gateway that grants less; basing this on
-	// what was granted would cap renewal by the first grant for good.
-	interval := time.Duration(ms[0].requested) * time.Second / 2
-	if interval < 1*time.Minute {
-		interval = 1 * time.Minute
-	}
-	go f.renewLoop(renewCtx, interval)
+	go f.renewLoop(renewCtx, baseRenewInterval(ms[0]))
+}
+
+// baseRenewInterval is renewLoop's interval: half the lease m asked for, and
+// at least a minute. Every mapping asks for the same lease. nextRenewal comes
+// sooner for a gateway that grants less; basing this on what was granted
+// would cap renewal by the first grant for good.
+func baseRenewInterval(m *Mapping) time.Duration {
+	return max(time.Duration(m.requested)*time.Second/2, time.Minute)
 }
 
 // deleteRacedMapping removes a mapping the Forwarder is not tracking and so

@@ -38,6 +38,9 @@ type fakePMPGateway struct {
 	onMap func(req []byte)
 	// headerOnlyErrors makes PCP error answers carry only the common header.
 	headerOnlyErrors bool
+	// ignoreV0 makes a PCP gateway drop NAT-PMP requests instead of answering
+	// them with an unsupported-version error.
+	ignoreV0 bool
 	// maps records each MAP request: protocol, internal port, lifetime.
 	maps []fakeMap
 	// nonces records the nonce of each PCP MAP request.
@@ -85,6 +88,9 @@ func (g *fakePMPGateway) answer(req []byte) []byte {
 	}
 	if g.pcp {
 		if req[0] != pcpVersion {
+			if g.ignoreV0 {
+				return nil
+			}
 			// Unsupported version, answered as PCP.
 			res := make([]byte, pcpHeaderLen)
 			res[0], res[1], res[3] = pcpVersion, 0x80|req[1], 1
@@ -501,7 +507,48 @@ func TestForwarder_StartRenewal_UsesTheRequestedLease(t *testing.T) {
 	m := f.mappings[UDP]
 	f.mu.Unlock()
 	require.True(t, f.renew(m, f.client))
-	assert.InDelta(t, 30*time.Minute, f.nextRenewal(30*time.Minute), float64(time.Second))
+	interval := baseRenewInterval(m)
+	assert.Equal(t, 30*time.Minute, interval, "the loop's interval comes from the 3600s asked for, not the first 120s grant")
+	assert.InDelta(t, 30*time.Minute, f.nextRenewal(interval), float64(time.Second))
+}
+
+func TestBaseRenewInterval(t *testing.T) {
+	assert.Equal(t, 30*time.Minute, baseRenewInterval(&Mapping{requested: 3600, LeaseDuration: 120 * time.Second}))
+	assert.Equal(t, time.Minute, baseRenewInterval(&Mapping{requested: 30}))
+}
+
+// A gateway lookup that hangs, as route print can on Windows, can't hold
+// discovery past its bound.
+func TestDiscoverPMP_BoundsTheGatewayLookup(t *testing.T) {
+	prev := findGateway
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release); findGateway = prev })
+	findGateway = func(ctx context.Context) (net.IP, error) {
+		select {
+		case <-release:
+			return nil, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	start := time.Now()
+	_, _, err := discoverPMP(context.Background(), nil)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), pmpProbeTimeout+500*time.Millisecond)
+}
+
+// A gateway that answers PCP at once is used at once, even when NAT-PMP's
+// probe would wait out the bound.
+func TestDiscoverPMP_PCPAnswerDoesNotWaitForNATPMP(t *testing.T) {
+	g := newFakePMPGateway(t, true)
+	// The fake answers NAT-PMP's version-0 request with an unsupported-version
+	// error, which ends that probe at once; make it silent instead.
+	g.set(func() { g.ignoreV0 = true })
+	start := time.Now()
+	_, method, err := discoverPMP(context.Background(), g.addr())
+	require.NoError(t, err)
+	assert.Equal(t, "pcp", method)
+	assert.Less(t, time.Since(start), pmpProbeTimeout/2)
 }
 
 // A failed renewal doesn't move the lease's deadline: it is retried soon, and

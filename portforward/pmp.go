@@ -402,6 +402,26 @@ func (c *pcpClient) announce() error {
 	return nil
 }
 
+// findGateway is the default gateway's address, or ctx's error if it ends
+// first. A lookup still running then finishes on its own.
+var findGateway = func(ctx context.Context) (net.IP, error) {
+	type found struct {
+		ip  net.IP
+		err error
+	}
+	ch := make(chan found, 1)
+	go func() {
+		ip, err := gateway.DiscoverGateway()
+		ch <- found{ip, err}
+	}()
+	select {
+	case f := <-ch:
+		return f.ip, f.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // discoverPMP finds a gateway that speaks PCP or NAT-PMP, preferring PCP. It
 // asks both at once, bounded by pmpProbeTimeout. gw is the gateway's address,
 // or nil to find the default gateway.
@@ -409,17 +429,19 @@ func discoverPMP(ctx context.Context, gw *net.UDPAddr) (igdClient, string, error
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
+	// The gateway lookup counts against the probe bound too: on Windows it
+	// runs route print, which takes no context.
+	bounded, cancel := context.WithTimeout(ctx, pmpProbeTimeout)
+	defer cancel()
 	if gw == nil {
-		ip, err := gateway.DiscoverGateway()
+		ip, err := findGateway(bounded)
 		if err != nil {
 			return nil, "", fmt.Errorf("find default gateway: %w", err)
 		}
 		gw = &net.UDPAddr{IP: ip, Port: pmpServerPort}
 	}
-	timeout := pmpProbeTimeout
-	if d, ok := ctx.Deadline(); ok && time.Until(d) < timeout {
-		timeout = time.Until(d)
-	}
+	d, _ := bounded.Deadline()
+	timeout := time.Until(d)
 	pcp := newPCPClient(gw, timeout)
 	pmp := newNATPMPClient(gw, timeout)
 	pcpErr := make(chan error, 1)
@@ -429,22 +451,40 @@ func discoverPMP(ctx context.Context, gw *net.UDPAddr) (igdClient, string, error
 		_, err := pmp.GetExternalIPAddress()
 		pmpErr <- err
 	}()
+	// Probes still running when this returns end within their timeout, and
+	// their results are dropped.
 	var errPCP, errNATPMP error
-	for range 2 {
+	pcpDone, pmpDone := false, false
+wait:
+	for !pcpDone || !pmpDone {
 		select {
 		case errPCP = <-pcpErr:
+			pcpDone = true
+			if errPCP == nil {
+				// PCP is preferred, so NAT-PMP's answer doesn't matter.
+				break wait
+			}
 		case errNATPMP = <-pmpErr:
-		case <-ctx.Done():
-			// The probes end within their timeout, and their results are
-			// dropped.
-			return nil, "", ctx.Err()
+			pmpDone = true
+		case <-bounded.Done():
+			if err := ctx.Err(); err != nil {
+				return nil, "", err
+			}
+			// The probe bound ended: keep whichever answered.
+			if !pcpDone {
+				errPCP = fmt.Errorf("pcp: %w", bounded.Err())
+			}
+			if !pmpDone {
+				errNATPMP = fmt.Errorf("nat-pmp: %w", bounded.Err())
+			}
+			break wait
 		}
 	}
-	if errPCP == nil {
+	if pcpDone && errPCP == nil {
 		pcp.timeout = pmpTimeout
 		return pcp, "pcp", nil
 	}
-	if errNATPMP == nil {
+	if pmpDone && errNATPMP == nil {
 		pmp.timeout = pmpTimeout
 		return pmp, "nat-pmp", nil
 	}
