@@ -385,10 +385,44 @@ func TestForwarder_MapPort_CancelledMidCall_RemovesAcceptedMapping(t *testing.T)
 	require.Error(t, got.err, "a cancelled caller must get an error")
 	assert.ErrorIs(t, got.err, context.Canceled)
 	assert.Nil(t, got.m)
+	f.mu.Lock()
 	assert.Empty(t, f.mappings, "no mapping should be recorded")
-	assert.Equal(t, int64(1), c.deleteCalls.Load(),
+	f.mu.Unlock()
+	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 1 }, 2*time.Second, time.Millisecond,
 		"the accepted-but-unreported mapping must be deleted, or it survives untracked")
+	c.mu.Lock()
 	assert.Equal(t, uint16(15100), c.lastDelete.externalPort)
+	c.mu.Unlock()
+}
+
+// A caller that gives up gets MapPort back at once, without waiting on a slow
+// gateway while holding the Forwarder, and the add's cleanup waits for the add
+// to resolve.
+func TestForwarder_MapPort_ReturnsWhenCancelledMidCall(t *testing.T) {
+	release := make(chan struct{})
+	c := &fakeIGD{addBlock: release}
+	f := newTestForwarder(t, c)
+	ctx, cancel := context.WithCancel(context.Background())
+	res := make(chan error, 1)
+	go func() {
+		_, err := f.MapPort(ctx, TCP, 15200, "test")
+		res <- err
+	}()
+	require.Eventually(t, func() bool { return c.addCalls.Load() >= 1 },
+		2*time.Second, time.Millisecond, "MapPort never reached AddPortMapping")
+	cancel()
+	select {
+	case err := <-res:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("MapPort kept waiting on the gateway after its caller gave up")
+	}
+	// The Forwarder isn't held meanwhile.
+	require.True(t, f.mu.TryLock(), "MapPort returned but left the Forwarder locked")
+	f.mu.Unlock()
+	assert.Equal(t, int64(0), c.deleteCalls.Load(), "no delete may be sent before the add resolves")
+	close(release)
+	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 1 }, 2*time.Second, time.Millisecond)
 }
 
 // errOrAbsent keeps "discovery completed, nothing answered" from rendering as
@@ -430,6 +464,11 @@ func TestForwarder_MapPort_RemovesTheMappingWhenTheGatewayNeverAnswers(t *testin
 	assert.ErrorIs(t, err, ErrNoPortForwarding)
 	assert.ErrorContains(t, err, "timed out")
 
+	// The delete waits for the add to resolve: sent earlier, it could reach
+	// the gateway ahead of the add.
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int64(0), c.deleteCalls.Load(), "a delete was sent while the add was still in flight")
+	block <- struct{}{}
 	assert.Eventually(t, func() bool { return c.deleteCalls.Load() == 1 }, time.Second, 10*time.Millisecond,
 		"a mapping the gateway may have created was left on the router")
 
@@ -588,4 +627,46 @@ func TestForwarder_RenewalCancelled_StopsBeforeNextProtocol(t *testing.T) {
 		t.Fatal("renewLoop did not exit after cancel")
 	}
 	assert.Equal(t, []string{TCP}, c.adds, "the UDP mapping was renewed after renewal was cancelled")
+}
+
+// A Forwarder that maps again after UnmapPort renews its new mapping.
+func TestForwarder_RemapAfterUnmap_Renews(t *testing.T) {
+	c := &fakeIGD{}
+	f := newTestForwarder(t, c)
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
+	require.NoError(t, err)
+	require.NoError(t, f.UnmapPort(context.Background()))
+	_, err = f.MapPort(context.Background(), TCP, 30002, "test")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go f.renewLoop(ctx, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return c.addCalls.Load() >= 4 }, 2*time.Second, time.Millisecond,
+		"the mapping made after UnmapPort was never renewed")
+	c.mu.Lock()
+	assert.Equal(t, uint16(30002), c.lastAdd.externalPort)
+	c.mu.Unlock()
+}
+
+// Cleanup of an abandoned add leaves the port alone if the Forwarder has
+// since mapped it again: that mapping is live.
+func TestForwarder_AbandonedAddCleanupSparesARemappedPort(t *testing.T) {
+	c := &fakeIGD{}
+	f := newTestForwarder(t, c)
+	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
+	require.NoError(t, err)
+
+	addErr := make(chan error, 1)
+	addErr <- nil
+	f.deleteWhenResolved(addErr, &Mapping{ExternalPort: 30001, Protocol: TCP}, c, "test")
+	assert.Equal(t, int64(0), c.deleteCalls.Load(), "the live mapping on that port was deleted")
+
+	addErr <- nil
+	f.deleteWhenResolved(addErr, &Mapping{ExternalPort: 30009, Protocol: TCP}, c, "test")
+	assert.Equal(t, int64(1), c.deleteCalls.Load(), "an untracked port must still be deleted")
+
+	addErr <- errors.New("refused")
+	f.deleteWhenResolved(addErr, &Mapping{ExternalPort: 30010, Protocol: TCP}, c, "test")
+	assert.Equal(t, int64(1), c.deleteCalls.Load(), "a refused add created nothing to delete")
 }

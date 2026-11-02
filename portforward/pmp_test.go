@@ -373,13 +373,13 @@ func TestForwarder_RenewsWithinTheGrantedLease(t *testing.T) {
 
 		// A renewal asks for the original lease again, and records what it got.
 		g.set(func() { g.grant = 600 })
-		require.True(t, f.renew(f.mappings[UDP], c))
+		require.True(t, f.renew(f.mappings[UDP], c, f.teardowns))
 		assert.Equal(t, uint32(3600), g.recorded()[1].lifetime, "pcp=%v", pcp)
 		assert.InDelta(t, 300*time.Second, f.nextRenewal(30*time.Minute), float64(time.Second), "pcp=%v", pcp)
 
 		// A renewal granted next to nothing is kept, and renewed at the floor.
 		g.set(func() { g.grant = 1 })
-		require.True(t, f.renew(f.mappings[UDP], c))
+		require.True(t, f.renew(f.mappings[UDP], c, f.teardowns))
 		assert.Equal(t, minRenewInterval, renewPeriod(f.mappings[UDP], 30*time.Minute), "pcp=%v", pcp)
 	}
 }
@@ -455,9 +455,12 @@ func TestForwarder_LostRenewalAnswerDuringTeardownIsRemoved(t *testing.T) {
 	g.set(func() { g.dropAdds = true })
 	f.mu.Lock()
 	m := f.mappings[UDP]
-	f.closed = true // teardown has begun
+	teardowns := f.teardowns
+	// UnmapPort ran meanwhile and deleted the mapping.
+	f.teardowns++
+	delete(f.mappings, UDP)
 	f.mu.Unlock()
-	assert.False(t, f.renew(m, c))
+	assert.False(t, f.renew(m, c, teardowns))
 	ms := collapse(g.recorded())
 	assert.Equal(t, fakeMap{UDP, 41641, 0}, ms[len(ms)-1], "the possibly re-created mapping must be deleted")
 }
@@ -506,7 +509,7 @@ func TestForwarder_StartRenewal_UsesTheRequestedLease(t *testing.T) {
 	f.mu.Lock()
 	m := f.mappings[UDP]
 	f.mu.Unlock()
-	require.True(t, f.renew(m, f.client))
+	require.True(t, f.renew(m, f.client, f.teardowns))
 	interval := baseRenewInterval(m)
 	assert.Equal(t, 30*time.Minute, interval, "the loop's interval comes from the 3600s asked for, not the first 120s grant")
 	assert.InDelta(t, 30*time.Minute, f.nextRenewal(interval), float64(time.Second))
@@ -568,7 +571,7 @@ func TestForwarder_FailedRenewalRetriesWithinTheLease(t *testing.T) {
 	f.mu.Unlock()
 
 	g.set(func() { g.dropAdds = true })
-	require.True(t, f.renew(m, c))
+	require.True(t, f.renew(m, c, f.teardowns))
 	f.mu.Lock()
 	assert.Equal(t, renewed, m.renewed, "a failed renewal must not move the deadline")
 	f.mu.Unlock()
@@ -576,7 +579,7 @@ func TestForwarder_FailedRenewalRetriesWithinTheLease(t *testing.T) {
 		"retry an eighth of the lease later")
 
 	g.set(func() { g.dropAdds = false })
-	require.True(t, f.renew(m, c))
+	require.True(t, f.renew(m, c, f.teardowns))
 	assert.InDelta(t, 60*time.Second, f.nextRenewal(30*time.Minute), float64(time.Second),
 		"a confirmed renewal resets the schedule")
 }
