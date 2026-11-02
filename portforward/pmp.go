@@ -46,16 +46,17 @@ var (
 	// protocol's version, so discovery can move on at once rather than wait out
 	// the timeout.
 	errPMPVersion = errors.New("gateway does not speak this protocol version")
-	// errNoAnswer is returned when the gateway never answered. Unlike a refusal,
-	// the request may still have taken effect.
-	errNoAnswer = errors.New("no answer")
+	// errOutcomeUnknown is returned when a request's outcome is unknown: the
+	// gateway never answered, or the transport failed after sending. Unlike a
+	// refusal, the request may still have taken effect.
+	errOutcomeUnknown = errors.New("outcome unknown")
 )
 
 // pmpExchange sends the request build returns to gw, resending on the RFCs'
 // schedule, and returns the first response accept takes, or accept's error.
 // build gets the socket's local address, which PCP puts in its requests. Once
 // a request has gone out, a transport error leaves its outcome unknown, so it
-// is wrapped in errNoAnswer.
+// is wrapped in errOutcomeUnknown.
 func pmpExchange(gw *net.UDPAddr, timeout time.Duration, build func(local net.IP) []byte, accept func(b []byte) (bool, error)) ([]byte, error) {
 	conn, err := net.DialUDP("udp4", nil, gw)
 	if err != nil {
@@ -68,7 +69,7 @@ func pmpExchange(gw *net.UDPAddr, timeout time.Duration, build func(local net.IP
 	sent := false
 	uncertain := func(err error) error {
 		if sent {
-			return fmt.Errorf("%w: %w", errNoAnswer, err)
+			return fmt.Errorf("%w: %w", errOutcomeUnknown, err)
 		}
 		return err
 	}
@@ -103,7 +104,7 @@ func pmpExchange(gw *net.UDPAddr, timeout time.Duration, build func(local net.IP
 			}
 		}
 		if !time.Now().Before(deadline) {
-			return nil, fmt.Errorf("%w from %s within %s", errNoAnswer, gw, timeout)
+			return nil, fmt.Errorf("%w: no answer from %s within %s", errOutcomeUnknown, gw, timeout)
 		}
 	}
 }
@@ -136,7 +137,7 @@ func (s *pmpMappings) add(method string, mapPort mapFunc, protocol string, inter
 		// The gateway may have created a new mapping and lost only its answer,
 		// and the Forwarder won't track a mapping whose add failed. A renewal's
 		// mapping is already tracked, and teardown removes it.
-		if !renewing && errors.Is(err, errNoAnswer) {
+		if !renewing && errors.Is(err, errOutcomeUnknown) {
 			if _, _, err := mapPort(protocol, internalPort, externalPort, 0); err != nil {
 				slog.Warn("portforward: could not remove a mapping whose answer was lost", "method", method, "err", err)
 			}

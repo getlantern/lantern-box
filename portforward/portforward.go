@@ -19,6 +19,7 @@ import (
 	semconv "github.com/getlantern/semconv"
 	"github.com/huin/goupnp/dcps/internetgateway1"
 	"github.com/huin/goupnp/dcps/internetgateway2"
+	"github.com/huin/goupnp/soap"
 )
 
 // ErrNoPortForwarding is returned when no gateway is reachable, the
@@ -82,13 +83,25 @@ type Forwarder struct {
 	// mappings holds the active mapping for each protocol.
 	mappings map[string]*Mapping
 	cancel   context.CancelFunc
-	// closed marks that UnmapPort has begun tearing the mappings down. A
-	// renewal already past its pre-check consults this again afterwards, so
-	// an AddPortMapping that lands after the delete gets undone rather than
-	// left on the gateway forever.
-	closed bool
+	// teardowns counts UnmapPort calls. A renewal compares it before and
+	// after its AddPortMapping, so one that lands after a teardown's delete
+	// gets undone rather than left on the gateway forever. A count rather
+	// than a flag, so a Forwarder that maps again after UnmapPort renews its
+	// new mappings.
+	teardowns uint64
 	// wake tells renewLoop a mapping was added, so it reschedules for it.
 	wake chan struct{}
+	// renewWait, if set, replaces renewCallTimeout, for tests.
+	renewWait time.Duration
+	// inflight counts the adds on each port that haven't resolved and been
+	// cleaned up after (see addLocked). MapPort refuses a port with any, so a
+	// stale add's cleanup can't remove a new mapping of the same port.
+	inflight map[portKey]int
+}
+
+type portKey struct {
+	protocol string
+	port     uint16
 }
 
 // ProbeUPnP reports whether discovery on the local network turns up a gateway
@@ -205,6 +218,9 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 	if f.mappings[protocol] != nil {
 		return nil, fmt.Errorf("forwarder already has an active %s mapping", protocol)
 	}
+	if f.inflight[portKey{protocol, internalPort}] > 0 {
+		return nil, fmt.Errorf("%s port %d is still being cleaned up after an earlier attempt", protocol, internalPort)
+	}
 
 	// Bail before localIP's interface enumeration; runWithCtx only checks ctx
 	// once it is reached, so an already-cancelled caller would otherwise pay
@@ -225,34 +241,50 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 	// retry with a different internalPort.
 	externalPort := internalPort
 	client := f.client
-	// Deliberately NOT runWithCtx, for the same reason as renewLoop: it
-	// returns the moment ctx is cancelled while its goroutine keeps running,
-	// so the mapping could land on the gateway after we returned an error and
-	// without f.mappings recording it — and UnmapPort only deletes what
-	// f.mappings records, so nothing would ever remove it. Wait for the outcome, then
-	// clean up if the caller has given up.
-	addErrCh := make(chan error, 1)
-	go func() {
-		addErrCh <- client.AddPortMapping("", externalPort, protocol, internalPort, internalIP, true, description, requestedLease)
-	}()
-	var addLanded, addTimedOut bool
-	select {
-	case err = <-addErrCh:
-		addLanded = err == nil
-	case <-time.After(addCallTimeout):
-		// Outcome unknowable; assume it landed so the cleanup below removes it.
-		addLanded = true
-		addTimedOut = true
-		err = fmt.Errorf("add port mapping timed out after %s", addCallTimeout)
+	m := &Mapping{
+		ExternalPort:  externalPort,
+		InternalPort:  internalPort,
+		InternalIP:    internalIP,
+		Protocol:      protocol,
+		LeaseDuration: time.Duration(requestedLease) * time.Second,
+		Method:        f.method,
+		description:   description,
+		requested:     requestedLease,
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil && addLanded {
-		// The caller gave up but the gateway accepted the mapping. Remove it —
-		// otherwise it survives with no Forwarder tracking it.
+	// The add can't be cancelled. When the caller gives up, or the gateway is
+	// too slow, return at once rather than hold f.mu: m is then never
+	// recorded, and addLocked removes whatever the add created once it
+	// resolves.
+	op := f.addLocked(client, m, description)
+	select {
+	case err = <-op.result:
+		// f.mu is held throughout, so the goroutine can't have dealt with it.
+		f.claim(op)
+	case <-ctx.Done():
+		slog.Warn("portforward: caller gave up while the gateway was adding the mapping; removing it once the add resolves",
+			protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort, "err", ctx.Err())
+		return nil, fmt.Errorf("add port mapping: %w", ctx.Err())
+	case <-time.After(addCallTimeout):
+		err = fmt.Errorf("add port mapping timed out after %s", addCallTimeout)
+		slog.Warn("portforward: gateway did not answer in time; removing any mapping it creates once the add resolves",
+			protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
+			"internal_ip", internalIP, "method", f.method, "err", err)
+		// Still the "this network can't host a peer" sentinel: the caller has
+		// no mapping either way, and the retry decision is the same.
+		return nil, fmt.Errorf("add port mapping: %w", errors.Join(ErrNoPortForwarding, err))
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil && mayHaveLanded(err) {
+		// The add resolved just as the caller gave up. Remove what it may have
+		// created — otherwise it survives with no Forwarder tracking it.
 		slog.Warn("portforward: caller gave up while the gateway was accepting the mapping; removing it",
 			protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort, "err", ctxErr)
-		f.deleteRacedMapping(&Mapping{ExternalPort: externalPort, Protocol: protocol}, client,
-			"caller gave up while the gateway was accepting it")
+		f.removeLocked(m, client, "caller gave up while the gateway was accepting it")
 		return nil, fmt.Errorf("add port mapping: %w", ctxErr)
+	}
+	if err != nil && mayHaveLanded(err) {
+		// The add failed in a way that leaves it unknown whether the gateway
+		// made the mapping, and it won't be tracked.
+		f.removeLocked(m, client, "an add whose outcome is unknown")
 	}
 	if err != nil {
 		// Propagate ctx cancellation/deadline verbatim so callers can retry
@@ -262,21 +294,6 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 				protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
 				"internal_ip", internalIP, "method", f.method, "err", ctxErr)
 			return nil, fmt.Errorf("add port mapping: %w", ctxErr)
-		}
-		if addTimedOut {
-			// The call never returned, so the gateway may well have created the
-			// mapping — which is what the comment on the timeout branch above
-			// promises to clean up. It did not: that cleanup is gated on
-			// ctx.Err(), so a local timeout with a live context fell straight
-			// through to here and left an untracked forward on the router,
-			// possibly permanent, with no Forwarder holding it. Same leak
-			// renewLoop already defends against on its own timeouts.
-			slog.Warn("portforward: gateway did not answer in time; removing any mapping it may have created",
-				protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
-				"internal_ip", internalIP, "method", f.method, "err", err)
-			f.deleteRacedMapping(&Mapping{ExternalPort: externalPort, Protocol: protocol}, client,
-				"gateway never answered the add")
-			return nil, fmt.Errorf("add port mapping: %w", errors.Join(ErrNoPortForwarding, err))
 		}
 		slog.Warn("portforward: gateway refused the mapping",
 			protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
@@ -288,16 +305,6 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 		return nil, fmt.Errorf("add port mapping: %w", errors.Join(ErrNoPortForwarding, err))
 	}
 
-	m := &Mapping{
-		ExternalPort:  externalPort,
-		InternalPort:  internalPort,
-		InternalIP:    internalIP,
-		Protocol:      protocol,
-		LeaseDuration: time.Duration(requestedLease) * time.Second,
-		Method:        f.method,
-		description:   description,
-		requested:     requestedLease,
-	}
 	if lr, ok := client.(leaseReporter); ok {
 		if granted, ok := lr.lease(protocol, internalPort); ok {
 			m.LeaseDuration = granted
@@ -352,9 +359,9 @@ func (f *Forwarder) UnmapPort(ctx context.Context) error {
 		f.cancel()
 		f.cancel = nil
 	}
-	// Set before the delete and while holding the lock: a renewal blocked on
-	// f.mu will observe it and undo anything it re-added.
-	f.closed = true
+	// Counted before the delete and while holding the lock: a renewal blocked
+	// on f.mu will observe it and undo anything it re-added.
+	f.teardowns++
 	client := f.client
 	var errs []error
 	for _, m := range f.activeMappings() {
@@ -400,10 +407,6 @@ func (f *Forwarder) activeMappings() []*Mapping {
 // session; routine 30-minute refresh of an hour-long requested lease
 // handles the common case where the router honors the requested duration.
 const (
-	// racedUnmapTimeout bounds the compensating delete issued when a renewal
-	// re-added a mapping after teardown. Short: the session is already going
-	// away and nothing waits on this.
-	racedUnmapTimeout = 10 * time.Second
 	// renewCallTimeout bounds how long a renewal waits for the gateway before
 	// giving up on learning whether the mapping was re-added. SOAP to a LAN
 	// gateway normally answers in milliseconds.
@@ -439,22 +442,109 @@ func baseRenewInterval(m *Mapping) time.Duration {
 	return max(time.Duration(m.requested)*time.Second/2, time.Minute)
 }
 
-// deleteRacedMapping removes a mapping the Forwarder is not tracking and so
-// would never renew or delete: one an in-flight renewal re-added after
-// UnmapPort had already deleted it, or one the gateway may have created for an
-// add that was abandoned or never answered. why says which, because that is
-// the only place the three are distinguishable and they are diagnosed
-// differently.
+// addOp is an AddPortMapping in flight for one mapping.
+type addOp struct {
+	result <-chan error
+	key    portKey
+	// handled is set, under f.mu, by whichever of the caller (claim) and the
+	// goroutine making the call first deals with the add's outcome.
+	handled bool
+}
+
+// addLocked issues the AddPortMapping for m, the mapping it is for. The
+// caller that receives the result claims it (see claim) and deals with it.
+// A caller may stop waiting instead; then, when the add resolves, it checks
+// under f.mu whether m is the mapping tracked for its protocol. If not — the
+// add was abandoned, or UnmapPort tore m down meanwhile — and the add may have
+// created the mapping, it deletes it, leaving the port alone if the Forwarder
+// has since mapped it again. Every client bounds its calls (upnpCallTimeout,
+// pmpTimeout), so the add always resolves and this check always runs; a call
+// that runs out of time is an unknown outcome and gets the delete.
 //
-// The calling ctx is typically already cancelled, so this takes its own short
-// deadline; best effort, since the only remaining recourse is the router's own
-// lease expiry.
-func (f *Forwarder) deleteRacedMapping(m *Mapping, client igdClient, why string) {
-	ctx, cancel := context.WithTimeout(context.Background(), racedUnmapTimeout)
-	defer cancel()
-	if err := runWithCtx(ctx, func() error {
-		return client.DeletePortMapping("", m.ExternalPort, m.Protocol)
-	}); err != nil {
+// The port counts as in flight until all that is done, and MapPort refuses it.
+// f.mu must be held.
+func (f *Forwarder) addLocked(client igdClient, m *Mapping, description string) *addOp {
+	ch := make(chan error, 1)
+	op := &addOp{result: ch, key: portKey{m.Protocol, m.ExternalPort}}
+	f.holdLocked(op.key)
+	go func() {
+		err := client.AddPortMapping("", m.ExternalPort, m.Protocol, m.InternalPort, m.InternalIP, true, description, m.requested)
+		ch <- err
+		f.mu.Lock()
+		if op.handled {
+			f.mu.Unlock()
+			return
+		}
+		op.handled = true
+		gone := mayHaveLanded(err) && f.untrackedLocked(m)
+		f.mu.Unlock()
+		if gone {
+			f.deleteUntracked(m, client, "an add that resolved after its mapping was abandoned or torn down")
+		}
+		f.mu.Lock()
+		f.releaseLocked(op.key)
+		f.mu.Unlock()
+	}()
+	return op
+}
+
+// claim takes over op's outcome for a caller that received its result, and
+// reports whether it did; false means the goroutine already dealt with it.
+// f.mu must be held.
+func (f *Forwarder) claim(op *addOp) bool {
+	if op.handled {
+		return false
+	}
+	op.handled = true
+	f.releaseLocked(op.key)
+	return true
+}
+
+// removeLocked deletes m's port, which the Forwarder doesn't track, in the
+// background, holding the port until the delete returns. f.mu must be held.
+func (f *Forwarder) removeLocked(m *Mapping, client igdClient, why string) {
+	k := portKey{m.Protocol, m.ExternalPort}
+	f.holdLocked(k)
+	go func() {
+		f.deleteUntracked(m, client, why)
+		f.mu.Lock()
+		f.releaseLocked(k)
+		f.mu.Unlock()
+	}()
+}
+
+// untrackedLocked reports whether m is not the tracked mapping for its
+// protocol and no other tracked mapping uses its port. f.mu must be held.
+func (f *Forwarder) untrackedLocked(m *Mapping) bool {
+	cur := f.mappings[m.Protocol]
+	return cur != m && (cur == nil || cur.ExternalPort != m.ExternalPort)
+}
+
+func (f *Forwarder) holdLocked(k portKey) {
+	if f.inflight == nil {
+		f.inflight = map[portKey]int{}
+	}
+	f.inflight[k]++
+}
+
+func (f *Forwarder) releaseLocked(k portKey) {
+	if f.inflight[k]--; f.inflight[k] <= 0 {
+		delete(f.inflight, k)
+	}
+}
+
+func (f *Forwarder) renewTimeout() time.Duration {
+	if f.renewWait > 0 {
+		return f.renewWait
+	}
+	return renewCallTimeout
+}
+
+// deleteUntracked deletes m's port on the gateway, waiting for the answer so
+// addLocked holds the port until the delete is done. Best effort: the only
+// remaining recourse is the router's own lease expiry.
+func (f *Forwarder) deleteUntracked(m *Mapping, client igdClient, why string) {
+	if err := client.DeletePortMapping("", m.ExternalPort, m.Protocol); err != nil {
 		slog.Warn("portforward: could not remove an untracked mapping",
 			"err", err, protocolAttr(m.Protocol), "external_port", m.ExternalPort, "why", why)
 		return
@@ -485,15 +575,15 @@ func (f *Forwarder) renewLoop(ctx context.Context, interval time.Duration) {
 			f.mu.Lock()
 			ms := f.activeMappings()
 			client := f.client
-			closed := f.closed
+			teardowns := f.teardowns
 			f.mu.Unlock()
-			if len(ms) == 0 || closed {
+			if len(ms) == 0 {
 				return
 			}
 			for _, m := range ms {
 				// A renewal in flight finishes and does its teardown check, but
 				// once ctx ends no further protocol is renewed.
-				if ctx.Err() != nil || !f.renew(m, client) {
+				if ctx.Err() != nil || !f.renew(m, client, teardowns) {
 					return
 				}
 			}
@@ -535,46 +625,47 @@ func renewPeriod(m *Mapping, interval time.Duration) time.Duration {
 }
 
 // renew re-issues m's AddPortMapping, and reports false if UnmapPort ran
-// meanwhile, after removing what the renewal may have re-added.
-func (f *Forwarder) renew(m *Mapping, client igdClient) bool {
+// since the caller read teardowns, after removing what the renewal may have
+// re-added. The caller reads teardowns along with m, so a teardown between the
+// two can't go unnoticed.
+func (f *Forwarder) renew(m *Mapping, client igdClient, teardowns uint64) bool {
 	// Most routers treat a re-issued AddPortMapping as "extend the
 	// existing lease"; some replace it with a fresh one. Either is
 	// fine here.
 	//
-	// Deliberately NOT runWithCtx: that returns the moment ctx is
-	// cancelled while its goroutine keeps running, so the request can
-	// reach the gateway at any later point. The teardown check below
-	// is only sound if we know the call has finished, so wait for it
-	// and bound a wedged gateway with renewCallTimeout instead.
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- client.AddPortMapping("", m.ExternalPort, m.Protocol, m.InternalPort, m.InternalIP, true, m.description+" (renew)", m.requested)
-	}()
-	var landed, confirmed bool
+	// addLocked removes the mapping again if, by the time the add resolves
+	// however late, a teardown has untracked it. The wait here is bounded by
+	// renewCallTimeout only so a wedged gateway can't stall the loop.
+	f.mu.Lock()
+	if f.mappings[m.Protocol] != m {
+		// Torn down since the loop's snapshot: nothing to renew.
+		f.mu.Unlock()
+		return false
+	}
+	op := f.addLocked(client, m, m.description+" (renew)")
+	f.mu.Unlock()
+	var confirmed, received bool
+	var addErr error
 	select {
-	case err := <-errCh:
-		// A NAT-PMP or PCP gateway that never answered may still have
-		// re-added the mapping, the same unknown as the timeout below.
-		landed = err == nil || errors.Is(err, errNoAnswer)
-		confirmed = err == nil
-		if err != nil {
-			slog.Warn("portforward: lease renewal failed", "err", err, protocolAttr(m.Protocol), "external_port", m.ExternalPort)
+	case addErr = <-op.result:
+		received = true
+		confirmed = addErr == nil
+		if addErr != nil {
+			slog.Warn("portforward: lease renewal failed", "err", addErr, protocolAttr(m.Protocol), "external_port", m.ExternalPort)
 		}
-	case <-time.After(renewCallTimeout):
-		// Outcome unknowable — the call may still land. Assume it did
-		// so teardown removes it rather than leaving a forward behind.
-		landed = true
-		slog.Warn("portforward: lease renewal timed out; treating the mapping as re-added",
-			protocolAttr(m.Protocol), "external_port", m.ExternalPort, "timeout", renewCallTimeout)
+	case <-time.After(f.renewTimeout()):
+		slog.Warn("portforward: lease renewal timed out; it is removed if teardown runs before it resolves",
+			protocolAttr(m.Protocol), "external_port", m.ExternalPort, "timeout", f.renewTimeout())
 	}
 
-	// UnmapPort may have deleted the mapping while the renewal was in
-	// flight, in which case the renewal just re-added an inbound
-	// forward to this host that no other code path removes —
-	// permanent on routers that ignore the requested lease. Blocking
-	// on f.mu orders this strictly after UnmapPort's delete.
 	f.mu.Lock()
-	teardownRaced := f.closed
+	defer f.mu.Unlock()
+	tornDown := f.teardowns != teardowns
+	if received && f.claim(op) && mayHaveLanded(addErr) && f.untrackedLocked(m) {
+		// UnmapPort deleted m while the renewal was in flight, and the renewal
+		// may have re-added it.
+		f.removeLocked(m, client, "re-added by an in-flight renewal")
+	}
 	// Only a confirmed renewal extends the lease. Otherwise retry soon,
 	// within what's left of it.
 	if confirmed {
@@ -582,20 +673,19 @@ func (f *Forwarder) renew(m *Mapping, client igdClient) bool {
 	} else {
 		m.retryAt = time.Now().Add(renewRetryDelay(m))
 	}
-	if lr, ok := client.(leaseReporter); ok && !teardownRaced && confirmed {
+	if lr, ok := client.(leaseReporter); ok && !tornDown && confirmed {
 		// The gateway may grant a different lease this time.
 		if granted, ok := lr.lease(m.Protocol, m.InternalPort); ok {
 			m.LeaseDuration = granted
 		}
 	}
-	f.mu.Unlock()
-	if teardownRaced {
-		if landed {
-			f.deleteRacedMapping(m, client, "re-added by an in-flight renewal")
-		}
-		return false
-	}
-	return true
+	return !tornDown
+}
+
+// mayHaveLanded reports whether an add that returned err may have created its
+// mapping: it succeeded, or its outcome is unknown.
+func mayHaveLanded(err error) bool {
+	return err == nil || errors.Is(err, errOutcomeUnknown)
 }
 
 // ExternalIP queries the gateway for its WAN-side IP address. Cheaper than
@@ -733,6 +823,27 @@ func discoverIGDv1(ctx context.Context) (igdClient, error) {
 	return wanPPPv1Wrapper{c: clients[0]}, nil
 }
 
+// upnpCallTimeout bounds every UPnP SOAP call, so a gateway that accepts the
+// connection and never answers can't hold an add, or the port it is for,
+// forever. Longer than addCallTimeout, so callers normally stop waiting first.
+// A var only so tests can shorten it.
+var upnpCallTimeout = addCallTimeout + 15*time.Second
+
+func upnpCallContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), upnpCallTimeout)
+}
+
+// upnpOutcome marks an AddPortMapping error as an unknown outcome unless it is
+// a SOAP fault, the gateway's refusal. A transport or decoding error can come
+// after the gateway has acted on the request.
+func upnpOutcome(err error) error {
+	var fault *soap.SOAPFaultError
+	if err == nil || errors.As(err, &fault) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errOutcomeUnknown, err)
+}
+
 // IGDv1 and IGDv2's generated clients have slightly different method
 // signatures, so wrappers normalize them to a single igdClient interface.
 
@@ -741,13 +852,19 @@ type wanIPv2Wrapper struct {
 }
 
 func (w wanIPv2Wrapper) AddPortMapping(remoteHost string, externalPort uint16, protocol string, internalPort uint16, internalClient string, enabled bool, description string, leaseDuration uint32) error {
-	return w.c.AddPortMapping(remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration)
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return upnpOutcome(w.c.AddPortMappingCtx(ctx, remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration))
 }
 func (w wanIPv2Wrapper) DeletePortMapping(remoteHost string, externalPort uint16, protocol string) error {
-	return w.c.DeletePortMapping(remoteHost, externalPort, protocol)
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.DeletePortMappingCtx(ctx, remoteHost, externalPort, protocol)
 }
 func (w wanIPv2Wrapper) GetExternalIPAddress() (string, error) {
-	return w.c.GetExternalIPAddress()
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.GetExternalIPAddressCtx(ctx)
 }
 
 type wanIPv1Wrapper struct {
@@ -755,13 +872,19 @@ type wanIPv1Wrapper struct {
 }
 
 func (w wanIPv1Wrapper) AddPortMapping(remoteHost string, externalPort uint16, protocol string, internalPort uint16, internalClient string, enabled bool, description string, leaseDuration uint32) error {
-	return w.c.AddPortMapping(remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration)
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return upnpOutcome(w.c.AddPortMappingCtx(ctx, remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration))
 }
 func (w wanIPv1Wrapper) DeletePortMapping(remoteHost string, externalPort uint16, protocol string) error {
-	return w.c.DeletePortMapping(remoteHost, externalPort, protocol)
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.DeletePortMappingCtx(ctx, remoteHost, externalPort, protocol)
 }
 func (w wanIPv1Wrapper) GetExternalIPAddress() (string, error) {
-	return w.c.GetExternalIPAddress()
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.GetExternalIPAddressCtx(ctx)
 }
 
 type wanPPPv1Wrapper struct {
@@ -769,13 +892,19 @@ type wanPPPv1Wrapper struct {
 }
 
 func (w wanPPPv1Wrapper) AddPortMapping(remoteHost string, externalPort uint16, protocol string, internalPort uint16, internalClient string, enabled bool, description string, leaseDuration uint32) error {
-	return w.c.AddPortMapping(remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration)
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return upnpOutcome(w.c.AddPortMappingCtx(ctx, remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration))
 }
 func (w wanPPPv1Wrapper) DeletePortMapping(remoteHost string, externalPort uint16, protocol string) error {
-	return w.c.DeletePortMapping(remoteHost, externalPort, protocol)
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.DeletePortMappingCtx(ctx, remoteHost, externalPort, protocol)
 }
 func (w wanPPPv1Wrapper) GetExternalIPAddress() (string, error) {
-	return w.c.GetExternalIPAddress()
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.GetExternalIPAddressCtx(ctx)
 }
 
 var (
