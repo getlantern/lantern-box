@@ -3,12 +3,17 @@ package portforward
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/huin/goupnp"
+	"github.com/huin/goupnp/dcps/internetgateway2"
 	"github.com/huin/goupnp/soap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -23,9 +28,6 @@ type fakeIGD struct {
 	extIPErr    error
 	extIP       string
 	addBlock    chan struct{} // if non-nil, AddPortMapping blocks on receive
-	// deleteGates, if set, holds the nth DeletePortMapping call until
-	// deleteGates[n-1] is closed.
-	deleteGates []chan struct{}
 	lastAdd     mappingArgs
 	lastDelete  deleteArgs
 	// adds and deletes are the protocol of every call, in order.
@@ -65,9 +67,8 @@ func (f *fakeIGD) AddPortMapping(_ string, externalPort uint16, protocol string,
 }
 
 func (f *fakeIGD) DeletePortMapping(_ string, externalPort uint16, protocol string) error {
-	if n := f.deleteCalls.Add(1); int(n) <= len(f.deleteGates) {
-		<-f.deleteGates[n-1]
-	}
+	// Recorded before it is counted, so a test that sees the count also sees
+	// the delete.
 	f.mu.Lock()
 	f.lastDelete = deleteArgs{externalPort: externalPort, protocol: protocol}
 	f.deletes = append(f.deletes, protocol)
@@ -76,6 +77,7 @@ func (f *fakeIGD) DeletePortMapping(_ string, externalPort uint16, protocol stri
 		err = f.deleteErrFor[protocol]
 	}
 	f.mu.Unlock()
+	f.deleteCalls.Add(1)
 	return err
 }
 
@@ -693,32 +695,6 @@ func TestForwarder_SettlingPortIsRefusedUntilCleanedUp(t *testing.T) {
 	assert.Equal(t, int64(1), c.deleteCalls.Load(), "the new mapping was deleted by the old cleanup")
 }
 
-// An abandoned add that never resolves still gets a delete after the grace
-// period, and another if it resolves later.
-func TestForwarder_UnresolvedAddIsDeletedAfterGrace(t *testing.T) {
-	prevAdd, prevGrace := addCallTimeout, abandonedAddGrace
-	addCallTimeout, abandonedAddGrace = 20*time.Millisecond, 50*time.Millisecond
-	t.Cleanup(func() { addCallTimeout, abandonedAddGrace = prevAdd, prevGrace })
-	release := make(chan struct{})
-	t.Cleanup(func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	})
-	c := &fakeIGD{addBlock: release}
-	f := newTestForwarder(t, c)
-	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
-	require.ErrorIs(t, err, ErrNoPortForwarding)
-
-	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 1 }, 2*time.Second, time.Millisecond,
-		"no delete was sent for an add that never resolved")
-	close(release)
-	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 2 }, 2*time.Second, time.Millisecond,
-		"an add that resolved after the first delete must be deleted again")
-}
-
 // A renewal that raced a teardown leaves alone a port the Forwarder has since
 // mapped again: that mapping is live.
 func TestForwarder_RacedRenewalSparesARemappedPort(t *testing.T) {
@@ -773,34 +749,33 @@ func TestUPnPOutcome(t *testing.T) {
 	assert.True(t, mayHaveLanded(err))
 }
 
-// The grace delete holds the port until it returns, even when the add
-// resolves and finishes its own cleanup first, so a re-map can't be deleted
-// by it.
-func TestForwarder_GraceDeleteHoldsThePort(t *testing.T) {
-	prevAdd, prevGrace := addCallTimeout, abandonedAddGrace
-	addCallTimeout, abandonedAddGrace = 10*time.Millisecond, 30*time.Millisecond
-	t.Cleanup(func() { addCallTimeout, abandonedAddGrace = prevAdd, prevGrace })
-	addGate := make(chan struct{})
-	graceDelete, cleanupDelete := make(chan struct{}), make(chan struct{})
-	c := &fakeIGD{addBlock: addGate, deleteGates: []chan struct{}{graceDelete, cleanupDelete}}
-	f := newTestForwarder(t, c)
-	_, err := f.MapPort(context.Background(), TCP, 30001, "test")
-	require.ErrorIs(t, err, ErrNoPortForwarding)
+// UPnP calls are bounded, so a gateway that accepts the connection and never
+// answers can't hold an add, or its port, forever. An add that runs out of
+// time is an unknown outcome, which gets the cleanup delete.
+func TestUPnPCallsAreBounded(t *testing.T) {
+	prev := upnpCallTimeout
+	upnpCallTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { upnpCallTimeout = prev })
+	hang := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-hang:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(hang); srv.Close() })
+	u, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	w := wanIPv2Wrapper{c: &internetgateway2.WANIPConnection2{ServiceClient: goupnp.ServiceClient{
+		SOAPClient: soap.NewSOAPClient(*u),
+		Service:    &goupnp.Service{ServiceType: internetgateway2.URN_WANIPConnection_2},
+	}}}
 
-	// The grace delete starts and blocks.
-	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 1 }, 2*time.Second, time.Millisecond)
-	// The add resolves; its own cleanup deletes too, and blocks.
-	close(addGate)
-	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 2 }, 2*time.Second, time.Millisecond)
-	// The add's cleanup finishes while the grace delete is still pending.
-	close(cleanupDelete)
-	time.Sleep(20 * time.Millisecond)
-	_, err = f.MapPort(context.Background(), TCP, 30001, "retry")
-	assert.ErrorContains(t, err, "still being cleaned up", "the port was released while the grace delete was still pending")
-	close(graceDelete)
-	require.Eventually(t, func() bool {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		return len(f.inflight) == 0
-	}, 2*time.Second, time.Millisecond)
+	start := time.Now()
+	err = w.AddPortMapping("", 30001, TCP, 30001, "192.168.1.10", true, "test", 3600)
+	assert.ErrorIs(t, err, errOutcomeUnknown)
+	assert.Error(t, w.DeletePortMapping("", 30001, TCP))
+	_, err = w.GetExternalIPAddress()
+	assert.Error(t, err)
+	assert.Less(t, time.Since(start), 2*time.Second, "a UPnP call waited on a gateway that never answered")
 }

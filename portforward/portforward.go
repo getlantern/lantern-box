@@ -14,7 +14,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	semconv "github.com/getlantern/semconv"
@@ -454,33 +453,22 @@ type addOp struct {
 
 // addLocked issues the AddPortMapping for m, the mapping it is for. The
 // caller that receives the result claims it (see claim) and deals with it.
-// A caller may stop waiting instead; then, whenever the add resolves, it
-// checks under f.mu whether m is the mapping tracked for its protocol. If not —
-// the add was abandoned, or UnmapPort tore m down meanwhile — and the add may
-// have created the mapping, it deletes it, leaving the port alone if the
-// Forwarder has since mapped it again.
+// A caller may stop waiting instead; then, when the add resolves, it checks
+// under f.mu whether m is the mapping tracked for its protocol. If not — the
+// add was abandoned, or UnmapPort tore m down meanwhile — and the add may have
+// created the mapping, it deletes it, leaving the port alone if the Forwarder
+// has since mapped it again. Every client bounds its calls (upnpCallTimeout,
+// pmpTimeout), so the add always resolves and this check always runs; a call
+// that runs out of time is an unknown outcome and gets the delete.
 //
-// An add that hasn't resolved after abandonedAddGrace gets a delete anyway,
-// if m isn't tracked by then, and another once it resolves. The port counts as
-// in flight until all that is done, and MapPort refuses it. f.mu must be held.
+// The port counts as in flight until all that is done, and MapPort refuses it.
+// f.mu must be held.
 func (f *Forwarder) addLocked(client igdClient, m *Mapping, description string) *addOp {
 	ch := make(chan error, 1)
 	op := &addOp{result: ch, key: portKey{m.Protocol, m.ExternalPort}}
 	f.holdLocked(op.key)
-	var resolved atomic.Bool
-	grace := time.AfterFunc(abandonedAddGrace, func() {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		if !resolved.Load() && f.untrackedLocked(m) {
-			// Holds the port until this delete returns, even if the add
-			// resolves and finishes its own cleanup first.
-			f.removeLocked(m, client, "an add the gateway never answered")
-		}
-	})
 	go func() {
 		err := client.AddPortMapping("", m.ExternalPort, m.Protocol, m.InternalPort, m.InternalIP, true, description, m.requested)
-		resolved.Store(true)
-		grace.Stop()
 		ch <- err
 		f.mu.Lock()
 		if op.handled {
@@ -551,10 +539,6 @@ func (f *Forwarder) renewTimeout() time.Duration {
 	}
 	return renewCallTimeout
 }
-
-// abandonedAddGrace is how long an add may go unresolved before its mapping,
-// if no longer tracked, is deleted anyway. A var only so tests can shorten it.
-var abandonedAddGrace = 2 * time.Minute
 
 // deleteUntracked deletes m's port on the gateway, waiting for the answer so
 // addLocked holds the port until the delete is done. Best effort: the only
@@ -839,6 +823,16 @@ func discoverIGDv1(ctx context.Context) (igdClient, error) {
 	return wanPPPv1Wrapper{c: clients[0]}, nil
 }
 
+// upnpCallTimeout bounds every UPnP SOAP call, so a gateway that accepts the
+// connection and never answers can't hold an add, or the port it is for,
+// forever. Longer than addCallTimeout, so callers normally stop waiting first.
+// A var only so tests can shorten it.
+var upnpCallTimeout = addCallTimeout + 15*time.Second
+
+func upnpCallContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), upnpCallTimeout)
+}
+
 // upnpOutcome marks an AddPortMapping error as an unknown outcome unless it is
 // a SOAP fault, the gateway's refusal. A transport or decoding error can come
 // after the gateway has acted on the request.
@@ -858,13 +852,19 @@ type wanIPv2Wrapper struct {
 }
 
 func (w wanIPv2Wrapper) AddPortMapping(remoteHost string, externalPort uint16, protocol string, internalPort uint16, internalClient string, enabled bool, description string, leaseDuration uint32) error {
-	return upnpOutcome(w.c.AddPortMapping(remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration))
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return upnpOutcome(w.c.AddPortMappingCtx(ctx, remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration))
 }
 func (w wanIPv2Wrapper) DeletePortMapping(remoteHost string, externalPort uint16, protocol string) error {
-	return w.c.DeletePortMapping(remoteHost, externalPort, protocol)
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.DeletePortMappingCtx(ctx, remoteHost, externalPort, protocol)
 }
 func (w wanIPv2Wrapper) GetExternalIPAddress() (string, error) {
-	return w.c.GetExternalIPAddress()
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.GetExternalIPAddressCtx(ctx)
 }
 
 type wanIPv1Wrapper struct {
@@ -872,13 +872,19 @@ type wanIPv1Wrapper struct {
 }
 
 func (w wanIPv1Wrapper) AddPortMapping(remoteHost string, externalPort uint16, protocol string, internalPort uint16, internalClient string, enabled bool, description string, leaseDuration uint32) error {
-	return upnpOutcome(w.c.AddPortMapping(remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration))
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return upnpOutcome(w.c.AddPortMappingCtx(ctx, remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration))
 }
 func (w wanIPv1Wrapper) DeletePortMapping(remoteHost string, externalPort uint16, protocol string) error {
-	return w.c.DeletePortMapping(remoteHost, externalPort, protocol)
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.DeletePortMappingCtx(ctx, remoteHost, externalPort, protocol)
 }
 func (w wanIPv1Wrapper) GetExternalIPAddress() (string, error) {
-	return w.c.GetExternalIPAddress()
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.GetExternalIPAddressCtx(ctx)
 }
 
 type wanPPPv1Wrapper struct {
@@ -886,13 +892,19 @@ type wanPPPv1Wrapper struct {
 }
 
 func (w wanPPPv1Wrapper) AddPortMapping(remoteHost string, externalPort uint16, protocol string, internalPort uint16, internalClient string, enabled bool, description string, leaseDuration uint32) error {
-	return upnpOutcome(w.c.AddPortMapping(remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration))
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return upnpOutcome(w.c.AddPortMappingCtx(ctx, remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration))
 }
 func (w wanPPPv1Wrapper) DeletePortMapping(remoteHost string, externalPort uint16, protocol string) error {
-	return w.c.DeletePortMapping(remoteHost, externalPort, protocol)
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.DeletePortMappingCtx(ctx, remoteHost, externalPort, protocol)
 }
 func (w wanPPPv1Wrapper) GetExternalIPAddress() (string, error) {
-	return w.c.GetExternalIPAddress()
+	ctx, cancel := upnpCallContext()
+	defer cancel()
+	return w.c.GetExternalIPAddressCtx(ctx)
 }
 
 var (
