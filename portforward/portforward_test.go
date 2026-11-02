@@ -28,6 +28,7 @@ type fakeIGD struct {
 	extIPErr    error
 	extIP       string
 	addBlock    chan struct{} // if non-nil, AddPortMapping blocks on receive
+	deleteBlock chan struct{} // if non-nil, DeletePortMapping blocks on receive, after recording
 	lastAdd     mappingArgs
 	lastDelete  deleteArgs
 	// adds and deletes are the protocol of every call, in order.
@@ -78,6 +79,9 @@ func (f *fakeIGD) DeletePortMapping(_ string, externalPort uint16, protocol stri
 	}
 	f.mu.Unlock()
 	f.deleteCalls.Add(1)
+	if f.deleteBlock != nil {
+		<-f.deleteBlock
+	}
 	return err
 }
 
@@ -668,7 +672,8 @@ func TestForwarder_RemapAfterUnmap_Renews(t *testing.T) {
 // mapping of the same port.
 func TestForwarder_SettlingPortIsRefusedUntilCleanedUp(t *testing.T) {
 	release := make(chan struct{})
-	c := &fakeIGD{addBlock: release}
+	deleteDone := make(chan struct{})
+	c := &fakeIGD{addBlock: release, deleteBlock: deleteDone}
 	f := newTestForwarder(t, c)
 	ctx, cancel := context.WithCancel(context.Background())
 	res := make(chan error, 1)
@@ -685,6 +690,12 @@ func TestForwarder_SettlingPortIsRefusedUntilCleanedUp(t *testing.T) {
 
 	close(release)
 	require.Eventually(t, func() bool { return c.deleteCalls.Load() == 1 }, 2*time.Second, time.Millisecond)
+	// The cleanup delete is still running: the port stays refused.
+	time.Sleep(20 * time.Millisecond)
+	_, err = f.MapPort(context.Background(), UDP, 41641, "retry")
+	assert.ErrorContains(t, err, "still being cleaned up", "the port was released before the cleanup delete returned")
+
+	close(deleteDone)
 	require.Eventually(t, func() bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()
