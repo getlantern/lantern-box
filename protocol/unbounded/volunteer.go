@@ -55,6 +55,7 @@ type Volunteer struct {
 	rtcOpt        *UBClientcore.WebRTCOptions
 	egOpt         *UBClientcore.EgressOptions
 	statsInterval time.Duration
+	bandwidth     byteRate
 
 	stats volunteerStats
 
@@ -131,6 +132,20 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 	rtcOpt.TargetCountries = opts.TargetCountries
 	rtcOpt.OnSTUNPreflight = v.stunPreflight
 
+	bandwidth, err := parseRate(opts.BandwidthLimit)
+	if err != nil {
+		return nil, fmt.Errorf("unbounded volunteer: bandwidth_limit: %w", err)
+	}
+	if bandwidth > 0 {
+		// broflake opens the volunteer's WebRTC sockets, and its STUN check's, on this Net.
+		limited, err := newLimitedNet(bandwidth)
+		if err != nil {
+			return nil, fmt.Errorf("unbounded volunteer: bandwidth_limit: %w", err)
+		}
+		rtcOpt.Net = limited
+	}
+	v.bandwidth = bandwidth
+
 	egOpt := UBClientcore.NewDefaultEgressOptions()
 	egOpt.Addr = opts.EgressAddr
 	setStringIfNonEmpty(&egOpt.Endpoint, opts.EgressEndpoint)
@@ -178,6 +193,7 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 		"max_peers", v.bfOpt.CTableSize,
 		"target_countries", v.rtcOpt.TargetCountries,
 		"nat_fail_timeout", v.rtcOpt.NATFailTimeout,
+		"bandwidth_limit", v.bandwidth.String(),
 	)
 	if v.statsInterval > 0 {
 		ctx, cancel := context.WithCancel(context.Background())

@@ -111,6 +111,11 @@ type UnboundedVolunteerOptions struct {
 	BusBufferSz int    `json:"bus_buffer_sz,omitempty"`
 	Netstated   string `json:"netstated,omitempty"`
 
+	// BandwidthLimit caps the node's WebRTC traffic with censored users, in each direction, such
+	// as "20mbit", "5Mbps" or "2MB/s": a lowercase b means bits, an uppercase B bytes. It applies
+	// to all peers together. Empty or "0" means no limit.
+	BandwidthLimit string `json:"bandwidth_limit,omitempty"`
+
 	// STUNServers is the pool the volunteer samples STUN servers from. Required: a volunteer
 	// without a working STUN server gets no server reflexive candidate and can't serve.
 	STUNServers   []string `json:"stun_servers,omitempty"`

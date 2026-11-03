@@ -54,6 +54,7 @@ func TestNewVolunteer_RequiresDiscoveryEgressAndSTUN(t *testing.T) {
 		"error_backoff": func(o *option.UnboundedVolunteerOptions) { o.ErrorBackoff = -1 },
 		"egress_conn":   func(o *option.UnboundedVolunteerOptions) { o.EgressConnectTimeout = -1 },
 		"egress_back":   func(o *option.UnboundedVolunteerOptions) { o.EgressErrorBackoff = -1 },
+		"bandwidth":     func(o *option.UnboundedVolunteerOptions) { o.BandwidthLimit = "fast" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			opts := validVolunteerOptions()
@@ -86,6 +87,23 @@ func TestNewVolunteer_MapsOptions(t *testing.T) {
 	assert.EqualValues(t, 40, v.rtcOpt.Tuning.ICEMaxBindingRequests)
 	assert.Equal(t, defaultStatsInterval, v.statsInterval)
 	assert.NotNil(t, v.rtcOpt.OnSTUNPreflight, "STUN check failures must reach the operator's log")
+}
+
+// A bandwidth limit gives broflake a rate-limited Net for the volunteer's WebRTC and STUN
+// sockets, at the limit in each direction. Without one, broflake uses the host's stack.
+func TestNewVolunteer_BandwidthLimit(t *testing.T) {
+	opts := validVolunteerOptions()
+	opts.BandwidthLimit = "20mbit"
+	v := newTestVolunteer(t, opts)
+	ln, ok := v.rtcOpt.Net.(*limitedNet)
+	require.True(t, ok, "Net is %T, want *limitedNet", v.rtcOpt.Net)
+	assert.Equal(t, 2_500_000.0, float64(ln.tx.Limit()))
+	assert.Equal(t, 2_500_000.0, float64(ln.rx.Limit()))
+	assert.Equal(t, byteRate(2_500_000), v.bandwidth)
+
+	assert.Nil(t, newTestVolunteer(t, validVolunteerOptions()).rtcOpt.Net)
+	opts.BandwidthLimit = "0"
+	assert.Nil(t, newTestVolunteer(t, opts).rtcOpt.Net, `"0" means no limit`)
 }
 
 func TestNewVolunteer_DefaultTablesMatch(t *testing.T) {
@@ -197,6 +215,7 @@ func TestVolunteerServiceSendsGenesis(t *testing.T) {
 			"egress_addr": "ws://127.0.0.1:1",
 			"stun_servers": [%q],
 			"max_peers": 1,
+			"bandwidth_limit": "20mbit",
 			"stats_interval": -1
 		}]
 	}`, freddieURL.String(), "stun:"+stunAddr)))
