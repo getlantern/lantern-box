@@ -306,3 +306,127 @@ func TestLimitedNetWaitRechecksAStaleDeadline(t *testing.T) {
 		t.Fatalf("write timed out on a deadline that had been extended: %v", err)
 	}
 }
+
+// Receiving through two limited sockets on one Net takes about the time the
+// shared receive limit implies, once the burst is spent.
+func TestLimitedNetShapesReadsAcrossSockets(t *testing.T) {
+	const limit = byteRate(256 * 1024)
+	ln, err := newLimitedNet(limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receivers []transport.UDPConn
+	for range 2 {
+		c, err := ln.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		receivers = append(receivers, c)
+	}
+	sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+
+	const packet = 8 * 1024
+	const perSocket = 12 // 192 KiB in all, three times the 64 KiB burst
+	for i := 0; i < perSocket; i++ {
+		for _, r := range receivers {
+			if _, err := sender.WriteTo(make([]byte, packet), r.LocalAddr()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	start := time.Now()
+	errs := make(chan error, len(receivers))
+	for _, r := range receivers {
+		go func() {
+			buf := make([]byte, packet)
+			if err := r.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				errs <- err
+				return
+			}
+			for i := 0; i < perSocket; i++ {
+				if _, _, err := r.ReadFrom(buf); err != nil {
+					errs <- err
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+	for range receivers {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	elapsed := time.Since(start)
+	total := 2 * perSocket * packet
+	want := time.Duration(float64(total-newLimiter(limit).Burst()) / float64(limit) * float64(time.Second))
+	if elapsed < want*7/10 {
+		t.Fatalf("received %d bytes in %v; the shared limit should have taken at least %v", total, elapsed, want)
+	}
+	if elapsed > want*3 {
+		t.Fatalf("received %d bytes in %v; far slower than the limit's %v", total, elapsed, want)
+	}
+}
+
+// A read whose receive wait is interrupted, by its socket closing or its
+// deadline moving to now, still returns the datagram it already has.
+func TestLimitedNetInterruptedReadKeepsTheDatagram(t *testing.T) {
+	for name, interrupt := range map[string]func(transport.UDPConn){
+		"close":    func(c transport.UDPConn) { c.Close() },
+		"deadline": func(c transport.UDPConn) { _ = c.SetReadDeadline(time.Now()) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ln, err := newLimitedNet(64 * 1024)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c, err := ln.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sender.Close()
+			buf := make([]byte, 8*1024)
+			// Spend the receive burst, then send one more datagram.
+			for got := 0; got < minBurst; got += len(buf) {
+				if _, err := sender.WriteTo(buf, c.LocalAddr()); err != nil {
+					t.Fatal(err)
+				}
+				if _, _, err := c.ReadFrom(buf); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := sender.WriteTo([]byte("last"), c.LocalAddr()); err != nil {
+				t.Fatal(err)
+			}
+			type result struct {
+				n   int
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				n, _, err := c.ReadFrom(buf)
+				done <- result{n, err}
+			}()
+			time.Sleep(50 * time.Millisecond) // the read is now waiting on the limiter
+			interrupt(c)
+			select {
+			case r := <-done:
+				if r.err != nil || string(buf[:r.n]) != "last" {
+					t.Fatalf("read returned %q, %v; want the datagram", buf[:r.n], r.err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("the read kept waiting after it was interrupted")
+			}
+		})
+	}
+}
