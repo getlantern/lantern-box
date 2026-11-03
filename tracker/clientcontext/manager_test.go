@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/bufio/deadline"
 	"github.com/sagernet/sing/common/debug"
 	M "github.com/sagernet/sing/common/metadata"
@@ -501,7 +502,7 @@ func TestStreamReaderBypassesDeadlineReader(t *testing.T) {
 	require.NoError(t, conn.SetReadDeadline(time.Time{}))
 	// The deadline reader's read goroutine hands over its result before it
 	// signals that it is done.
-	require.Eventually(t, conn.(replaceableReader).ReaderReplaceable, 5*time.Second, time.Millisecond)
+	require.Eventually(t, conn.(*deadline.Conn).ReaderReplaceable, 5*time.Second, time.Millisecond)
 	go client.Write([]byte("cd"))
 	_, err = io.ReadFull(s, b)
 	require.NoError(t, err)
@@ -549,4 +550,109 @@ func TestStreamReaderHonorsLaterDeadline(t *testing.T) {
 	_, err = io.ReadFull(c, b)
 	require.NoError(t, err)
 	assert.Equal(t, "cd", string(b))
+}
+
+// A deadline set before the bypass stays on the deadline reader, so a read it
+// times out is still resumed once the deadline is cleared.
+func TestStreamReaderResumesTimedOutReadBeforeBypass(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &readConn{Conn: deadline.NewConn(server)}
+	c.reader = &streamReader{c: c}
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(20*time.Millisecond)))
+	b := make([]byte, 2)
+	_, err := c.Read(b)
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+
+	require.NoError(t, c.SetReadDeadline(time.Time{}))
+	go client.Write([]byte("ab"))
+	_, err = io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "ab", string(b))
+}
+
+// Sniffed bytes cached above the deadline reader are read first, and reads
+// bypass both once the cache is drained.
+func TestStreamReaderBypassesCachedDeadlineConn(t *testing.T) {
+	if debug.Enabled {
+		t.Skip("sing's debug build wraps the deadline reader, which keeps it")
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	cached := buf.New()
+	cached.WriteString("xy")
+	d := deadline.NewConn(server).(*deadline.Conn)
+	c := &readConn{Conn: bufio.NewCachedConn(d, cached)}
+	s := &streamReader{c: c}
+	c.reader = s
+
+	b := make([]byte, 2)
+	_, err := io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "xy", string(b))
+
+	// The cache is dropped by the read after it drains, which still goes
+	// through the deadline reader.
+	go client.Write([]byte("ab"))
+	_, err = io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "ab", string(b))
+
+	require.Eventually(t, d.ReaderReplaceable, 5*time.Second, time.Millisecond)
+	go client.Write([]byte("cd"))
+	_, err = io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "cd", string(b))
+	assert.NotNil(t, s.upstream, "reads bypass the drained cache and the deadline reader")
+}
+
+// When the head read times out behind the deadline reader, its read stays in
+// flight; the stream after a late frame still arrives once, in order, through
+// small reads that cross the switch past the deadline reader.
+func TestReadInfoTimeoutBehindDeadlineConn(t *testing.T) {
+	const payload = "USER alice\r\nPASS secret\r\n"
+	for _, tt := range []struct {
+		name  string
+		after []string
+		want  string
+	}{
+		{name: "late frame", after: []string{"CLIENT", "INFO2 " + testInfoJSON, payload[:5], payload[5:]}, want: payload},
+		{name: "no frame", after: []string{payload[:3], payload[3:]}, want: payload},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setReadInfoTimeout(t, 30*time.Millisecond)
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+
+			c := &readConn{Conn: deadline.NewConn(server)}
+			info, err := readInfoWithin(t, c)
+			require.NoError(t, err)
+			require.Zero(t, info)
+
+			go func() {
+				for _, part := range tt.after {
+					if _, err := client.Write([]byte(part)); err != nil {
+						return
+					}
+				}
+				client.Close()
+			}()
+			var got []byte
+			small := make([]byte, 3)
+			for {
+				n, err := c.Read(small)
+				got = append(got, small[:n]...)
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.want, string(got))
+		})
+	}
 }
