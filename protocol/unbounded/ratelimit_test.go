@@ -407,6 +407,11 @@ func TestLimitedNetInterruptedReadKeepsTheDatagram(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			// Hooked only now, so it signals the final read's wait.
+			waiting := make(chan struct{})
+			var once sync.Once
+			afterDeadlineRead = func() { once.Do(func() { close(waiting) }) }
+			t.Cleanup(func() { afterDeadlineRead = nil })
 			last := make([]byte, len(buf))
 			copy(last, "last")
 			if _, err := sender.WriteTo(last, c.LocalAddr()); err != nil {
@@ -422,9 +427,11 @@ func TestLimitedNetInterruptedReadKeepsTheDatagram(t *testing.T) {
 				done <- result{n, err}
 			}()
 			select {
+			case <-waiting:
 			case r := <-done:
 				t.Fatalf("the read returned (%d, %v) without waiting on the limiter", r.n, r.err)
-			case <-time.After(200 * time.Millisecond):
+			case <-time.After(5 * time.Second):
+				t.Fatal("the read never reached the limiter")
 			}
 			interrupt(c)
 			select {
