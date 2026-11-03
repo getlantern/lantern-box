@@ -33,7 +33,15 @@ func TestDestinationCountry(t *testing.T) {
 	assert.Equal(t, "DE", destinationCountry(lookup, M.ParseSocksaddr("1.2.3.4:443"), nil), "an IP destination is looked up directly")
 	assert.Equal(t, "DE", destinationCountry(lookup, M.ParseSocksaddr("[::ffff:1.2.3.4]:443"), nil), "a 4-in-6 address is looked up as IPv4")
 	assert.Equal(t, "US", destinationCountry(lookup, M.ParseSocksaddr("example.com:443"), []netip.Addr{netip.MustParseAddr("5.6.7.8")}),
-		"a domain routing resolved counts under its first address")
+		"a domain routing resolved counts under its addresses' country")
+	assert.Equal(t, "US", destinationCountry(lookup, M.ParseSocksaddr("example.com:443"),
+		[]netip.Addr{netip.MustParseAddr("5.6.7.8"), netip.MustParseAddr("5.6.7.8")}))
+	assert.Empty(t, destinationCountry(lookup, M.ParseSocksaddr("cdn.example:443"),
+		[]netip.Addr{netip.MustParseAddr("5.6.7.8"), netip.MustParseAddr("1.2.3.4")}),
+		"addresses in different countries leave the country unknown, since any of them may be dialed")
+	assert.Empty(t, destinationCountry(countryByIP{"1.2.3.4": ""}, M.ParseSocksaddr("example.com:443"),
+		[]netip.Addr{netip.MustParseAddr("5.6.7.8"), netip.MustParseAddr("1.2.3.4")}),
+		"an address GeoIP can't place leaves the country unknown")
 	assert.Empty(t, destinationCountry(lookup, M.ParseSocksaddr("example.com:443"), nil), "an unresolved domain is not looked up")
 	assert.Empty(t, destinationCountry(lookup, M.Socksaddr{}, nil), "an empty destination has no country")
 }

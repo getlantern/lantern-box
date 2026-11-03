@@ -27,15 +27,22 @@ type destinationLookupRequest struct {
 // an independent lookup would send the domain to the system resolver, which
 // is not the resolver sing-box dials through when the config sets one (a
 // residential peer resolves over DoH), and could pick a different address.
-// Its country is known only when a route "resolve" action ran before routing.
+// Its country is known only when a route "resolve" action ran before routing,
+// and then only when every resolved address is in the same country: the
+// outbound may connect to any of them, and a CDN's can span countries.
 func destinationCountry(lookup geo.CountryLookup, dest M.Socksaddr, addrs []netip.Addr) string {
-	switch {
-	case dest.IsIP():
+	if dest.IsIP() {
 		return countryOf(lookup, dest.Addr)
-	case len(addrs) > 0:
-		return countryOf(lookup, addrs[0])
 	}
-	return ""
+	country := ""
+	for i, addr := range addrs {
+		c := countryOf(lookup, addr)
+		if c == "" || (i > 0 && c != country) {
+			return ""
+		}
+		country = c
+	}
+	return country
 }
 
 func countryOf(lookup geo.CountryLookup, addr netip.Addr) string {
