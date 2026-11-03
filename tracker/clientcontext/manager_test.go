@@ -753,3 +753,23 @@ func TestStreamReaderKeepsSetDeadline(t *testing.T) {
 		t.Fatal("the read ignored the deadline")
 	}
 }
+
+// A read deadline set with SetDeadline can be extended with SetReadDeadline.
+func TestSetReadDeadlineExtendsSetDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &readConn{Conn: deadline.NewConn(server)}
+	c.reader = &streamReader{c: c}
+	require.NoError(t, c.SetDeadline(time.Now().Add(20*time.Millisecond)))
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(time.Hour)))
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		client.Write([]byte("ab"))
+	}()
+	b := make([]byte, 2)
+	_, err := io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "ab", string(b))
+}

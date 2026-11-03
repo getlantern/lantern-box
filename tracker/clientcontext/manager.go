@@ -190,14 +190,14 @@ func (c *readConn) SetReadDeadline(t time.Time) error {
 	return err
 }
 
-// SetDeadline sets t for writes and, as SetReadDeadline does, for reads. sing's
-// deadline conn passes SetDeadline straight to the connection under it, so the
-// deadline reader is set here too, which keeps reads from switching past it
-// while t is set.
+// SetDeadline sets t for writes and, as SetReadDeadline does, for reads.
+// sing's deadline conn would pass the read deadline straight to the connection
+// under it, where SetReadDeadline could no longer change it, so the read and
+// write deadlines are set separately.
 func (c *readConn) SetDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
 	defer c.deadlineMu.Unlock()
-	err := errors.Join(c.Conn.SetDeadline(t), c.Conn.SetReadDeadline(t))
+	err := errors.Join(c.Conn.SetWriteDeadline(t), c.Conn.SetReadDeadline(t))
 	if c.bypassed != nil {
 		err = errors.Join(err, c.bypassed.SetReadDeadline(t))
 	}
