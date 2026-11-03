@@ -269,8 +269,8 @@ github.com/gaukas/wazerofs v0.1.0 h1:wIkW1bAxSnpaaVkQ5LOb1tm1BXdVap3eKjJpVWIqt2E
 github.com/gaukas/wazerofs v0.1.0/go.mod h1:+JECB9Fwt0taPqSgHckG9lmT3tcoVK+9VJozTsq9UlI=
 github.com/getlantern/algeneva v0.0.0-20260731172949-952f13725b7b h1:3wQsYZSl/UvtjfVZL4GilBWSIlOPLvtRueHxUM0GD4w=
 github.com/getlantern/algeneva v0.0.0-20260731172949-952f13725b7b/go.mod h1:PrNR8tMXO26YNs8K9653XCUH7u2Kv4OdfFC3Ke1GsX0=
-github.com/getlantern/broflake v0.0.0-20261031023630-d3b5e0b34b68 h1:dB9/uchWa2TP0nymr67rY0bMUOx5tMh7ZZl7h4ge1ZY=
-github.com/getlantern/broflake v0.0.0-20261031023630-d3b5e0b34b68/go.mod h1:wIe3Pq0VMMADBiKdW2MUV0EW6veThHMeKuJFvmcGPc4=
+github.com/getlantern/broflake v0.0.0-20261103013533-7904ee7e70b5 h1:/A2MbMk/Zr8bTyEV4oKUeAj0W53UCXJNBdGpdgNCzyA=
+github.com/getlantern/broflake v0.0.0-20261103013533-7904ee7e70b5/go.mod h1:iGEs6cTs8TvXiVbtT10ovU2OvxgcwZoBR2DJl99vgmw=
 github.com/getlantern/context v0.0.0-20190109183933-c447772a6520/go.mod h1:L+mq6/vvYHKjCX2oez0CgEAJmbq1fbb/oNJIWQkBybY=
 github.com/getlantern/context v0.0.0-20220418194847-3d5e7a086201 h1:oEZYEpZo28Wdx+5FZo4aU7JFXu0WG/4wJWese5reQSA=
 github.com/getlantern/context v0.0.0-20220418194847-3d5e7a086201/go.mod h1:Y9WZUHEb+mpra02CbQ/QczLUe6f0Dezxaw5DCJlJQGo=
@@ -456,6 +456,8 @@ github.com/insomniacslk/dhcp v0.0.0-20260220084031-5adc3eb26f91 h1:u9i04mGE3iliB
 github.com/insomniacslk/dhcp v0.0.0-20260220084031-5adc3eb26f91/go.mod h1:qfvBmyDNp+/liLEYWRvqny/PEz9hGe2Dz833eXILSmo=
 github.com/jackpal/go-nat-pmp v1.0.2 h1:KzKSgb7qkJvOUTqYl9/Hg/me3pWgBmERKrTGD7BdWus=
 github.com/jackpal/go-nat-pmp v1.0.2/go.mod h1:QPH045xvCAeXUZOxsnwmrtiCoxIr9eob+4orBN1SBKc=
+github.com/jackpal/gateway v1.2.0 h1:euPRe4t7JfTaqC5Lr78HXl2wSHo54XndTtiAcIxkb5g=
+github.com/jackpal/gateway v1.2.0/go.mod h1:/jchvRi4HukAqV24da70iaBMFcSrX3rNWdR5K9VHd0A=
 github.com/jellydator/ttlcache/v3 v3.4.1 h1:bOdXmXiycyK6E6Qjyuj5vl+/vU3SCOoDs8a86NbHjAQ=
 github.com/jellydator/ttlcache/v3 v3.4.1/go.mod h1:j7LO12PNghFg5+0v9budMAT4rDK4JY969jb9vOdOBBk=
 github.com/jsimonetti/rtnetlink v1.4.1 h1:JfD4jthWBqZMEffc5RjgmlzpYttAVw1sdnmiNaPO3hE=
