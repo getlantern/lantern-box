@@ -730,3 +730,26 @@ func TestStreamReaderUnderAppendConnWithoutReader(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "ab", string(b))
 }
+
+// A deadline set with SetDeadline before the bypass still times out the read,
+// rather than being cleared when reads switch past the deadline reader.
+func TestStreamReaderKeepsSetDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &readConn{Conn: deadline.NewConn(server)}
+	c.reader = &streamReader{c: c}
+	require.NoError(t, c.SetDeadline(time.Now().Add(20*time.Millisecond)))
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Read(make([]byte, 2))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read ignored the deadline")
+	}
+}
