@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio/deadline"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
@@ -454,4 +455,49 @@ func TestReadPacketDrop(t *testing.T) {
 		assert.Equal(t, headroom, buffer.Start())
 		assert.Equal(t, "datagram", string(buffer.Bytes()))
 	})
+}
+
+// Behind sing-box's deadline reader, the stream after the head still arrives
+// unaltered, with or without a frame.
+func TestReadInfoBehindDeadlineConn(t *testing.T) {
+	for _, stream := range []string{clientInfoPrefix + testInfoJSON + testRequest, testRequest} {
+		client, server := net.Pipe()
+		go func() {
+			client.Write([]byte(stream))
+			client.Write([]byte("more"))
+			client.Close()
+		}()
+
+		c := &readConn{Conn: deadline.NewConn(server), reader: server}
+		_, err := readInfoWithin(t, c)
+		require.NoError(t, err)
+		rest, err := io.ReadAll(c)
+		require.NoError(t, err)
+		assert.Equal(t, testRequest+"more", string(rest))
+		server.Close()
+	}
+}
+
+// Reads bypass the deadline reader only once it has no deadline and no read in
+// flight, and then reach the connection it wraps directly.
+func TestStreamReaderBypassesDeadlineReader(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	conn := deadline.NewConn(server)
+	s := &streamReader{conn: conn}
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Hour)))
+	go client.Write([]byte("ab"))
+	b := make([]byte, 2)
+	_, err := io.ReadFull(s, b)
+	require.NoError(t, err)
+	assert.Nil(t, s.upstream, "a deadline is set")
+
+	require.NoError(t, conn.SetReadDeadline(time.Time{}))
+	go client.Write([]byte("cd"))
+	_, err = io.ReadFull(s, b)
+	require.NoError(t, err)
+	assert.Equal(t, "cd", string(b))
+	assert.NotNil(t, s.upstream, "no deadline and no read in flight")
 }

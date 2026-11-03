@@ -215,13 +215,14 @@ func (c *readConn) readInfo() (ClientInfo, error) {
 // strips a frame, or restores head as ordinary traffic.
 func (c *readConn) consumeHead(head []byte) (ClientInfo, error) {
 	marker, ack := matchMarker(head)
+	stream := &streamReader{conn: c.Conn}
 	if marker == "" {
-		c.reader = io.MultiReader(bytes.NewReader(head), c.Conn)
+		c.reader = io.MultiReader(bytes.NewReader(head), stream)
 		return ClientInfo{}, nil
 	}
 
 	var info ClientInfo
-	reader := io.MultiReader(bytes.NewReader(head[len(marker):]), c.Conn)
+	reader := io.MultiReader(bytes.NewReader(head[len(marker):]), stream)
 	dec := json.NewDecoder(reader)
 	if err := dec.Decode(&info); err != nil {
 		// The marker and part of the frame are already consumed; fail the
@@ -240,6 +241,37 @@ func (c *readConn) consumeHead(head []byte) (ClientInfo, error) {
 		}
 	}
 	return info, nil
+}
+
+// replaceableReader is a reader that copy loops may bypass, reading
+// UpstreamReader instead, while ReaderReplaceable reports true. sing's deadline
+// reader is one: it is replaceable when no deadline is set and no read is in
+// flight.
+type replaceableReader interface {
+	ReaderReplaceable() bool
+	UpstreamReader() any
+}
+
+// streamReader reads the stream after its head. Nothing sets a read deadline
+// on the connection once readInfo returns, so as soon as sing-box's deadline
+// reader is replaceable, reads bypass it. That reader runs each read on a new
+// goroutine with a buffer the size of the read, held until data arrives, so on
+// a mostly idle proxy it costs a goroutine and a buffer per connection.
+type streamReader struct {
+	conn     net.Conn
+	upstream io.Reader
+}
+
+func (s *streamReader) Read(b []byte) (int, error) {
+	if s.upstream == nil {
+		if r, ok := s.conn.(replaceableReader); ok && r.ReaderReplaceable() {
+			s.upstream, _ = r.UpstreamReader().(io.Reader)
+		}
+		if s.upstream == nil {
+			return s.conn.Read(b)
+		}
+	}
+	return s.upstream.Read(b)
 }
 
 // readHead reads from r after head until the bytes read either start with a
