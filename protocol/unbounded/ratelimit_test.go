@@ -4,10 +4,12 @@ import (
 	"errors"
 	"net"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pion/transport/v5"
+	"github.com/pion/transport/v5/stdnet"
 )
 
 // Sending through a limited socket must take about the time the limit
@@ -140,5 +142,108 @@ func TestLimitedNetWaitsAreInterruptible(t *testing.T) {
 	}
 	if time.Since(start) > 3*time.Second {
 		t.Fatal("deadline did not interrupt the limiter wait")
+	}
+}
+
+// spentLimitedConn is a limited socket whose shared write bucket is empty, at
+// 64 KiB/s, with a sink to write to.
+func spentLimitedConn(t *testing.T) (transport.UDPConn, net.Addr) {
+	t.Helper()
+	ln, err := newLimitedNet(64 * 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sink.Close() })
+	c, err := ln.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	for sent := 0; sent < minBurst; sent += 8 * 1024 {
+		if _, err := c.WriteTo(make([]byte, 8*1024), sink.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return c, sink.LocalAddr()
+}
+
+// Extending the deadline while a write waits on the limiter lets the write
+// finish, as it would for the socket's own I/O.
+func TestLimitedNetWaitFollowsAnExtendedDeadline(t *testing.T) {
+	c, sink := spentLimitedConn(t)
+	if err := c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.WriteTo(make([]byte, 8*1024), sink) // ~125ms of tokens
+		done <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if err := c.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("write failed after its deadline was extended: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("write never finished")
+	}
+}
+
+// Setting the deadline to now while a write waits aborts it at once, which is
+// how pion's UDP mux unblocks a stuck write.
+func TestLimitedNetWaitAbortsOnADeadlineSetToNow(t *testing.T) {
+	c, sink := spentLimitedConn(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.WriteTo(make([]byte, 8*1024), sink)
+		done <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	if err := c.SetWriteDeadline(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("write returned %v, want os.ErrDeadlineExceeded", err)
+		}
+		if waited := time.Since(start); waited > 50*time.Millisecond {
+			t.Fatalf("write took %v to see its deadline", waited)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("write kept waiting past a deadline set to now")
+	}
+}
+
+// Interface lookups take a fresh snapshot each time, so a long-lived Net sees
+// network changes.
+func TestLimitedNetInterfacesAreFresh(t *testing.T) {
+	ln, err := newLimitedNet(64 * 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var made atomic.Int32
+	prev := newStdNet
+	newStdNet = func() (*stdnet.Net, error) {
+		made.Add(1)
+		return prev()
+	}
+	t.Cleanup(func() { newStdNet = prev })
+	for range 2 {
+		if _, err := ln.Interfaces(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if made.Load() != 2 {
+		t.Fatalf("made %d snapshots for 2 lookups, want 2", made.Load())
 	}
 }

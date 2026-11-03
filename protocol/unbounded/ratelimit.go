@@ -2,7 +2,6 @@ package unbounded
 
 import (
 	"context"
-	"errors"
 	"net"
 	"os"
 	"sync"
@@ -59,6 +58,36 @@ func newLimiter(bytesPerSec byteRate) *rate.Limiter {
 	return rate.NewLimiter(rate.Limit(bytesPerSec), burst)
 }
 
+// stdnet.Net captures the host's interfaces when it is created, and pion made
+// a fresh one per peer connection. This Net lives as long as the volunteer, so
+// it answers interface lookups from a fresh snapshot each time, or new
+// connections would miss host candidates after a network change.
+var newStdNet = stdnet.NewNet
+
+func (n *limitedNet) Interfaces() ([]*transport.Interface, error) {
+	fresh, err := newStdNet()
+	if err != nil {
+		return nil, err
+	}
+	return fresh.Interfaces()
+}
+
+func (n *limitedNet) InterfaceByIndex(index int) (*transport.Interface, error) {
+	fresh, err := newStdNet()
+	if err != nil {
+		return nil, err
+	}
+	return fresh.InterfaceByIndex(index)
+}
+
+func (n *limitedNet) InterfaceByName(name string) (*transport.Interface, error) {
+	fresh, err := newStdNet()
+	if err != nil {
+		return nil, err
+	}
+	return fresh.InterfaceByName(name)
+}
+
 func (n *limitedNet) ListenUDP(network string, laddr *net.UDPAddr) (transport.UDPConn, error) {
 	c, err := n.Net.ListenUDP(network, laddr)
 	if err != nil {
@@ -89,6 +118,8 @@ func (n *limitedNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transpo
 // connLimits is one socket's view of the shared limiters. A wait on a spent
 // bucket ends when the socket is closed or its deadline passes, so a closed
 // socket does not hold its goroutine and buffers for the rest of the wait.
+// Like the socket's own I/O, a pending wait follows deadline changes: pion's
+// UDP mux aborts a blocked write by setting the write deadline to now.
 type connLimits struct {
 	tx *rate.Limiter
 	rx *rate.Limiter
@@ -96,40 +127,99 @@ type connLimits struct {
 	closed context.Context
 	close  context.CancelFunc
 
-	mu            sync.Mutex
-	readDeadline  time.Time
-	writeDeadline time.Time
+	mu    sync.Mutex
+	read  deadline
+	write deadline
+}
+
+// deadline is one direction's deadline, and a channel closed when it changes.
+type deadline struct {
+	at      time.Time
+	changed chan struct{}
+}
+
+func (d *deadline) set(t time.Time) {
+	d.at = t
+	close(d.changed)
+	d.changed = make(chan struct{})
 }
 
 func newConnLimits(tx, rx *rate.Limiter) *connLimits {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &connLimits{tx: tx, rx: rx, closed: ctx, close: cancel}
+	return &connLimits{
+		tx: tx, rx: rx, closed: ctx, close: cancel,
+		read:  deadline{changed: make(chan struct{})},
+		write: deadline{changed: make(chan struct{})},
+	}
 }
 
 func (l *connLimits) setDeadline(read, write bool, t time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if read {
-		l.readDeadline = t
+		l.read.set(t)
 	}
 	if write {
-		l.writeDeadline = t
+		l.write.set(t)
 	}
 }
 
-// waitCtx is the context a limiter wait runs under: cancelled on close and
-// bounded by the direction's deadline, if any.
-func (l *connLimits) waitCtx(write bool) (context.Context, context.CancelFunc) {
+func (l *connLimits) deadlineOf(write bool) deadline {
 	l.mu.Lock()
-	deadline := l.readDeadline
+	defer l.mu.Unlock()
 	if write {
-		deadline = l.writeDeadline
+		return l.write
 	}
-	l.mu.Unlock()
-	if deadline.IsZero() {
-		return context.WithCancel(l.closed)
+	return l.read
+}
+
+// wait takes n tokens from lim, blocking until they are available. It returns
+// net.ErrClosed if the socket closes first, or os.ErrDeadlineExceeded if the
+// direction's deadline, as it stands at any point during the wait, passes
+// first; either way the tokens go back.
+func (l *connLimits) wait(lim *rate.Limiter, n int, write bool) error {
+	r := lim.ReserveN(time.Now(), n)
+	if !r.OK() {
+		return nil
 	}
-	return context.WithDeadline(l.closed, deadline)
+	ready := time.Now().Add(r.Delay())
+	for {
+		d := l.deadlineOf(write)
+		if time.Until(ready) <= 0 {
+			return nil
+		}
+		if !d.at.IsZero() && !time.Now().Before(d.at) {
+			r.Cancel()
+			return os.ErrDeadlineExceeded
+		}
+		readyTimer := time.NewTimer(time.Until(ready))
+		var expired <-chan time.Time
+		var deadlineTimer *time.Timer
+		if !d.at.IsZero() {
+			deadlineTimer = time.NewTimer(time.Until(d.at))
+			expired = deadlineTimer.C
+		}
+		var err error
+		done := true
+		select {
+		case <-readyTimer.C:
+		case <-l.closed.Done():
+			r.Cancel()
+			err = net.ErrClosed
+		case <-expired:
+			r.Cancel()
+			err = os.ErrDeadlineExceeded
+		case <-d.changed:
+			done = false
+		}
+		readyTimer.Stop()
+		if deadlineTimer != nil {
+			deadlineTimer.Stop()
+		}
+		if done {
+			return err
+		}
+	}
 }
 
 // waitTx blocks until n bytes may be sent. A datagram larger than the burst
@@ -139,12 +229,7 @@ func (l *connLimits) waitTx(n int) error {
 	if n > l.tx.Burst() {
 		return nil
 	}
-	ctx, cancel := l.waitCtx(true)
-	defer cancel()
-	if err := l.tx.WaitN(ctx, n); err != nil {
-		return waitErr(l.closed, err)
-	}
-	return nil
+	return l.wait(l.tx, n, true)
 }
 
 // tookRx charges n received bytes, blocking the reader if the budget is
@@ -154,20 +239,7 @@ func (l *connLimits) tookRx(n int) {
 	if n <= 0 || n > l.rx.Burst() {
 		return
 	}
-	ctx, cancel := l.waitCtx(false)
-	defer cancel()
-	_ = l.rx.WaitN(ctx, n)
-}
-
-// waitErr maps an interrupted limiter wait to the error the socket would
-// have returned itself. Oversized requests never reach WaitN, so it fails
-// only for a closed socket or a deadline, whether the deadline passed during
-// the wait or the limiter saw up front that the wait would overrun it.
-func waitErr(closed context.Context, err error) error {
-	if closed.Err() != nil || errors.Is(err, context.Canceled) {
-		return net.ErrClosed
-	}
-	return os.ErrDeadlineExceeded
+	_ = l.wait(l.rx, n, false)
 }
 
 // limitedUDPConn applies the shared limiters to every read and write path of
