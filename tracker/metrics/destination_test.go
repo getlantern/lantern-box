@@ -2,13 +2,16 @@ package metrics
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/netip"
 	"testing"
 	"testing/synctest"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	sdkotel "go.opentelemetry.io/otel"
@@ -104,5 +107,96 @@ func TestProxyDestinationIO(t *testing.T) {
 		}
 		assert.Equal(t, map[string]int64{"DE": 5, "IR": 5, "n/a": 5}, bytesByDestination,
 			"an IP destination and a resolved domestic domain count under their country, an unresolved domain under n/a")
+	})
+}
+
+func TestIsDestination(t *testing.T) {
+	ip := attributes{destination: M.ParseSocksaddr("5.6.7.8:443")}
+	assert.True(t, ip.isDestination(M.ParseSocksaddr("5.6.7.8:8443")), "another port on the same IP")
+	assert.True(t, ip.isDestination(M.ParseSocksaddr("[::ffff:5.6.7.8]:443")), "the same IP mapped to IPv6")
+	assert.False(t, ip.isDestination(M.ParseSocksaddr("1.2.3.4:443")))
+	assert.True(t, ip.isDestination(M.Socksaddr{}), "a packet without an address changes nothing")
+
+	domain := attributes{
+		destination:          M.ParseSocksaddr("bank.example.ir:443"),
+		destinationAddresses: []netip.Addr{netip.MustParseAddr("5.6.7.8")},
+	}
+	assert.True(t, domain.isDestination(M.ParseSocksaddr("bank.example.ir:443")))
+	assert.True(t, domain.isDestination(M.ParseSocksaddr("5.6.7.8:443")), "a reply from the address the domain resolved to")
+	assert.False(t, domain.isDestination(M.ParseSocksaddr("other.example:443")))
+	assert.False(t, domain.isDestination(M.ParseSocksaddr("1.2.3.4:443")))
+}
+
+// scriptedPacketConn reads the packets it holds, each from its address, and
+// discards writes.
+type scriptedPacketConn struct {
+	N.PacketConn
+	packets []scriptedPacket
+}
+
+type scriptedPacket struct {
+	from    string
+	payload string
+}
+
+func (c *scriptedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	if len(c.packets) == 0 {
+		return M.Socksaddr{}, io.EOF
+	}
+	p := c.packets[0]
+	c.packets = c.packets[1:]
+	_, _ = buffer.WriteString(p.payload)
+	return M.ParseSocksaddr(p.from), nil
+}
+
+func (c *scriptedPacketConn) Close() error { return nil }
+
+func TestProxyDestinationIOMixedUDPDestinations(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reader := metric.NewManualReader()
+		sdkotel.SetMeterProvider(metric.NewMeterProvider(metric.WithReader(reader)))
+		SetupMetricsManager(countryByIP{"1.2.3.4": "DE"}, "")
+		defer stopLookupWorkers()
+
+		ctx := context.Background()
+		tracker := NewTracker(ctx)
+		defer tracker.Close()
+
+		conn := &scriptedPacketConn{packets: []scriptedPacket{
+			{from: "5.6.7.8:443", payload: "abc"},
+			{from: "1.2.3.4:443", payload: "defgh"},
+			{from: "5.6.7.8:443", payload: "ij"},
+		}}
+		tracked := tracker.RoutedPacketConnection(ctx, infoPacketConn{PacketConn: conn, info: testInfo},
+			adapter.InboundContext{Destination: M.ParseSocksaddr("5.6.7.8:443")}, nil, nil)
+		synctest.Wait()
+		for range 3 {
+			buffer := buf.New()
+			_, err := tracked.ReadPacket(buffer)
+			buffer.Release()
+			require.NoError(t, err)
+			// The IO loop picks a report's attribute set when it handles it,
+			// so a report still queued when the association turns mixed counts
+			// as n/a too. Let each one land first.
+			synctest.Wait()
+		}
+		synctest.Wait()
+
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, reader.Collect(ctx, &rm))
+		bytesByDestination := map[string]int64{}
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				if m.Name != "proxy.destination.io" {
+					continue
+				}
+				for _, dp := range m.Data.(metricdata.Sum[int64]).DataPoints {
+					v, _ := dp.Attributes.Value("proxy.destination_country")
+					bytesByDestination[v.AsString()] += dp.Value
+				}
+			}
+		}
+		assert.Equal(t, map[string]int64{"IR": 3, "n/a": 7}, bytesByDestination,
+			"bytes count under the destination's country until a packet goes elsewhere, then under n/a")
 	})
 }

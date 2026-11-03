@@ -62,6 +62,8 @@ func destinationLookupWorker(ch <-chan destinationLookupRequest, lookup geo.Coun
 // country lookup does. A dropped lookup leaves the country n/a.
 func requestDestinationCountry(attrs *attributes, metadata adapter.InboundContext) {
 	attrs.destinationCountry.Store(ccNa)
+	attrs.destination = metadata.Destination
+	attrs.destinationAddresses = metadata.DestinationAddresses
 	if metrics.destinationLookupC == nil {
 		return
 	}
@@ -73,6 +75,42 @@ func requestDestinationCountry(attrs *attributes, metadata adapter.InboundContex
 	}:
 	default:
 	}
+}
+
+// notePacketDestination records the address of a packet in a packet
+// connection. A UDP association can send to many destinations, while its
+// country was looked up for the first, so once a packet goes elsewhere the
+// association's bytes count as n/a from then on. The IO loop picks a report's
+// set when it handles the report, so bytes still queued at that moment count
+// as n/a too: the error only ever moves bytes to n/a, never to a wrong country.
+func (a *attributes) notePacketDestination(dest M.Socksaddr) {
+	if a.destinationMixed.Load() || a.isDestination(dest) {
+		return
+	}
+	a.destinationMixed.Store(true)
+}
+
+// isDestination reports whether dest is the connection's destination: the
+// same domain, the same IP, or one of the addresses routing resolved the
+// domain to (replies come from the resolved address). Ports are ignored, as
+// they don't change the country.
+func (a *attributes) isDestination(dest M.Socksaddr) bool {
+	if dest.IsFqdn() {
+		return a.destination.IsFqdn() && dest.Fqdn == a.destination.Fqdn
+	}
+	if !dest.IsIP() {
+		return true
+	}
+	addr := dest.Addr.Unmap()
+	if a.destination.IsIP() && a.destination.Addr.Unmap() == addr {
+		return true
+	}
+	for _, resolved := range a.destinationAddresses {
+		if resolved.Unmap() == addr {
+			return true
+		}
+	}
+	return false
 }
 
 // destinationAttrSet is a cached proxy.destination.io attribute set and the
@@ -94,6 +132,9 @@ func (a *attributes) destinationIOSet(d ioAttr) attribute.Set {
 	}
 	country, _ := a.country.Load().(string)
 	destination, _ := a.destinationCountry.Load().(string)
+	if a.destinationMixed.Load() {
+		destination = ccNa
+	}
 	if c := a.destinationSets[i].Load(); c != nil && c.country == country && c.destination == destination {
 		return c.set
 	}
