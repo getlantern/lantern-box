@@ -656,3 +656,35 @@ func TestReadInfoTimeoutBehindDeadlineConn(t *testing.T) {
 		})
 	}
 }
+
+// Bytes cached in a reader that a wrapper reads through, rather than in the
+// wrapper itself, are delivered before reads bypass the deadline reader.
+func TestStreamReaderDrainsCachedReaderUnderAppendConn(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	cached := buf.New()
+	cached.WriteString(clientInfoPrefix + testInfoJSON + "xyz")
+	d := deadline.NewConn(server)
+	c := &readConn{Conn: bufio.NewAppendConn(d, bufio.NewExtendedReader(bufio.NewCachedReader(d, cached)), nil)}
+	info, err := readInfoWithin(t, c)
+	require.NoError(t, err)
+	assert.Equal(t, testInfo, info)
+
+	go func() {
+		client.Write([]byte("abc"))
+		client.Close()
+	}()
+	var got []byte
+	small := make([]byte, 2)
+	for {
+		n, err := c.Read(small)
+		got = append(got, small[:n]...)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+	assert.Equal(t, "xyzabc", string(got))
+}

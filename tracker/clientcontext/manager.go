@@ -286,8 +286,10 @@ func (s *streamReader) Read(b []byte) (int, error) {
 func (s *streamReader) bypass() bool {
 	s.c.deadlineMu.Lock()
 	defer s.c.deadlineMu.Unlock()
-	d := deadlineConnUnder(s.c.Conn)
-	if d == nil || !d.ReaderReplaceable() {
+	// CastReader walks only wrappers that can be bypassed now, such as a
+	// drained cache of sniffed bytes, as sing's own copy loop does.
+	d, ok := N.CastReader[*deadline.Conn](s.c.Conn)
+	if !ok || !d.ReaderReplaceable() {
 		return false
 	}
 	upstream, ok := d.UpstreamReader().(io.Reader)
@@ -301,24 +303,6 @@ func (s *streamReader) bypass() bool {
 	s.upstream = upstream
 	s.c.bypassed = raw
 	return true
-}
-
-// deadlineConnUnder returns sing's deadline conn under conn, if every wrapper
-// above it, such as the cache of sniffed bytes, can be bypassed now.
-func deadlineConnUnder(conn any) *deadline.Conn {
-	for {
-		if d, ok := conn.(*deadline.Conn); ok {
-			return d
-		}
-		r, ok := conn.(interface {
-			ReaderReplaceable() bool
-			Upstream() any
-		})
-		if !ok || !r.ReaderReplaceable() {
-			return nil
-		}
-		conn = r.Upstream()
-	}
 }
 
 // readHead reads from r after head until the bytes read either start with a
