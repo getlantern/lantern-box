@@ -289,3 +289,20 @@ func TestLimitedNetDeadlineUpdatesAreAtomic(t *testing.T) {
 		}
 	}
 }
+
+// A deadline extended after a wait read it, but before the wait acted on it,
+// is honoured: the wait doesn't time out on the old value.
+func TestLimitedNetWaitRechecksAStaleDeadline(t *testing.T) {
+	c, sink := spentLimitedConn(t)
+	if err := c.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	afterDeadlineRead = func() {
+		once.Do(func() { _ = c.SetWriteDeadline(time.Now().Add(5 * time.Second)) })
+	}
+	t.Cleanup(func() { afterDeadlineRead = nil })
+	if _, err := c.WriteTo(make([]byte, 8*1024), sink); err != nil {
+		t.Fatalf("write timed out on a deadline that had been extended: %v", err)
+	}
+}

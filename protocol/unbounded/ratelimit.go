@@ -182,6 +182,16 @@ func (l *connLimits) deadlineOf(write bool) deadline {
 	return l.read
 }
 
+// unchanged reports whether the direction's deadline is still d, so a timeout
+// read from d may be committed: a setter may have moved it since.
+func (l *connLimits) unchanged(write bool, d deadline) bool {
+	return l.deadlineOf(write).changed == d.changed
+}
+
+// afterDeadlineRead, if set, runs in wait right after it reads the deadline.
+// Tests use it to move the deadline at that point.
+var afterDeadlineRead func()
+
 // wait takes n tokens from lim, blocking until they are available. It returns
 // net.ErrClosed if the socket closes first, or os.ErrDeadlineExceeded if the
 // direction's deadline, as it stands at any point during the wait, passes
@@ -194,10 +204,16 @@ func (l *connLimits) wait(lim *rate.Limiter, n int, write bool) error {
 	ready := time.Now().Add(r.Delay())
 	for {
 		d := l.deadlineOf(write)
+		if afterDeadlineRead != nil {
+			afterDeadlineRead()
+		}
 		if time.Until(ready) <= 0 {
 			return nil
 		}
 		if !d.at.IsZero() && !time.Now().Before(d.at) {
+			if !l.unchanged(write, d) {
+				continue
+			}
 			r.Cancel()
 			return os.ErrDeadlineExceeded
 		}
@@ -216,8 +232,12 @@ func (l *connLimits) wait(lim *rate.Limiter, n int, write bool) error {
 			r.Cancel()
 			err = net.ErrClosed
 		case <-expired:
-			r.Cancel()
-			err = os.ErrDeadlineExceeded
+			if l.unchanged(write, d) {
+				r.Cancel()
+				err = os.ErrDeadlineExceeded
+			} else {
+				done = false
+			}
 		case <-d.changed:
 			done = false
 		}
