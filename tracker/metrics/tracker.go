@@ -3,10 +3,12 @@ package metrics
 import (
 	"context"
 	"net"
+	"net/netip"
 	"sync/atomic"
 
 	semconv "github.com/getlantern/semconv"
 	"github.com/sagernet/sing-box/adapter"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -69,6 +71,7 @@ func trackIOLoop(ctx context.Context, reportC <-chan report) {
 			return
 		case r := <-reportC:
 			metrics.ProxyIO.Add(context.Background(), int64(r.n), metric.WithAttributeSet(r.attrs.ioSet(r.direction)))
+			metrics.destinationIO.Add(context.Background(), int64(r.n), metric.WithAttributeSet(r.attrs.destinationIOSet(r.direction)))
 		}
 	}
 }
@@ -183,6 +186,16 @@ type attributes struct {
 	// Building a set sorts and deduplicates its attributes, which is too
 	// costly to repeat on every read and write.
 	ioSets [2]atomic.Pointer[ioAttrSet]
+	// destinationCountry is the destination's country (string), n/a until
+	// looked up; destinationSets caches the proxy.destination.io sets.
+	destinationCountry atomic.Value
+	destinationSets    [2]atomic.Pointer[destinationAttrSet]
+	// destination and destinationAddresses are the connection's destination as
+	// routed, and destinationMixed is set once a packet connection sends to
+	// another one (notePacketDestination).
+	destination          M.Socksaddr
+	destinationAddresses []netip.Addr
+	destinationMixed     atomic.Bool
 }
 
 // ioAttrSet is a cached proxy.io attribute set and the lookup results it was
@@ -258,5 +271,6 @@ func metadataToAttributes(metadata adapter.InboundContext) *attributes {
 		default:
 		}
 	}
+	requestDestinationCountry(attrs, metadata)
 	return attrs
 }
