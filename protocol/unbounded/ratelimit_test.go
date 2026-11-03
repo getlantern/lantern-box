@@ -381,7 +381,9 @@ func TestLimitedNetInterruptedReadKeepsTheDatagram(t *testing.T) {
 		"deadline": func(c transport.UDPConn) { _ = c.SetReadDeadline(time.Now()) },
 	} {
 		t.Run(name, func(t *testing.T) {
-			ln, err := newLimitedNet(64 * 1024)
+			// At 1 KiB/s an 8 KiB datagram past the burst takes about 8s of
+			// tokens, so the read is certain to be waiting when interrupted.
+			ln, err := newLimitedNet(1024)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -405,7 +407,9 @@ func TestLimitedNetInterruptedReadKeepsTheDatagram(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, err := sender.WriteTo([]byte("last"), c.LocalAddr()); err != nil {
+			last := make([]byte, len(buf))
+			copy(last, "last")
+			if _, err := sender.WriteTo(last, c.LocalAddr()); err != nil {
 				t.Fatal(err)
 			}
 			type result struct {
@@ -417,14 +421,18 @@ func TestLimitedNetInterruptedReadKeepsTheDatagram(t *testing.T) {
 				n, _, err := c.ReadFrom(buf)
 				done <- result{n, err}
 			}()
-			time.Sleep(50 * time.Millisecond) // the read is now waiting on the limiter
+			select {
+			case r := <-done:
+				t.Fatalf("the read returned (%d, %v) without waiting on the limiter", r.n, r.err)
+			case <-time.After(200 * time.Millisecond):
+			}
 			interrupt(c)
 			select {
 			case r := <-done:
-				if r.err != nil || string(buf[:r.n]) != "last" {
-					t.Fatalf("read returned %q, %v; want the datagram", buf[:r.n], r.err)
+				if r.err != nil || r.n != len(last) || string(buf[:4]) != "last" {
+					t.Fatalf("read returned %d bytes starting %q, %v; want the datagram", r.n, buf[:4], r.err)
 				}
-			case <-time.After(3 * time.Second):
+			case <-time.After(time.Second):
 				t.Fatal("the read kept waiting after it was interrupted")
 			}
 		})
