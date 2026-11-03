@@ -272,6 +272,9 @@ func (c *readConn) consumeHead(head []byte) (ClientInfo, error) {
 type streamReader struct {
 	c        *readConn
 	upstream io.Reader
+	// keep is set once the connection under the deadline reader is found not
+	// to support read deadlines, so reads must keep using the deadline reader.
+	keep bool
 }
 
 func (s *streamReader) Read(b []byte) (int, error) {
@@ -282,14 +285,16 @@ func (s *streamReader) Read(b []byte) (int, error) {
 }
 
 // bypass switches reads past the deadline reader if nothing above or in it
-// holds data or a pending read and no deadline is set.
+// holds data or a pending read, no deadline is set, and the connection under
+// it supports read deadlines itself.
 func (s *streamReader) bypass() bool {
+	if s.keep {
+		return false
+	}
 	s.c.deadlineMu.Lock()
 	defer s.c.deadlineMu.Unlock()
-	// CastReader walks only wrappers that can be bypassed now, such as a
-	// drained cache of sniffed bytes, as sing's own copy loop does.
-	d, ok := N.CastReader[*deadline.Conn](s.c.Conn)
-	if !ok || !d.ReaderReplaceable() {
+	d := deadlineConnUnder(s.c.Conn)
+	if d == nil || !d.ReaderReplaceable() {
 		return false
 	}
 	upstream, ok := d.UpstreamReader().(io.Reader)
@@ -297,12 +302,39 @@ func (s *streamReader) bypass() bool {
 		return false
 	}
 	raw, ok := d.Upstream().(net.Conn)
-	if !ok {
+	// Clearing an unset deadline changes nothing on a connection that supports
+	// deadlines; HTTP/2 and gRPC streams, which rely on the deadline reader,
+	// reject it.
+	if !ok || raw.SetReadDeadline(time.Time{}) != nil {
+		s.keep = true
 		return false
 	}
 	s.upstream = upstream
 	s.c.bypassed = raw
 	return true
+}
+
+// deadlineConnUnder walks conn's wrappers that can be bypassed now, such as a
+// drained cache of sniffed bytes, down to sing's deadline conn. It follows the
+// same path as sing's N.CastReader, which panics on a wrapper with no reader.
+func deadlineConnUnder(conn any) *deadline.Conn {
+	for conn != nil {
+		if d, ok := conn.(*deadline.Conn); ok {
+			return d
+		}
+		if r, ok := conn.(N.ReaderWithUpstream); !ok || !r.ReaderReplaceable() {
+			return nil
+		}
+		switch u := conn.(type) {
+		case N.WithUpstreamReader:
+			conn = u.UpstreamReader()
+		case common.WithUpstream:
+			conn = u.Upstream()
+		default:
+			return nil
+		}
+	}
+	return nil
 }
 
 // readHead reads from r after head until the bytes read either start with a

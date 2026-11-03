@@ -688,3 +688,45 @@ func TestStreamReaderDrainsCachedReaderUnderAppendConn(t *testing.T) {
 	}
 	assert.Equal(t, "xyzabc", string(got))
 }
+
+// noDeadlineConn rejects read deadlines, as sing-box's HTTP/2 and gRPC stream
+// conns do.
+type noDeadlineConn struct{ net.Conn }
+
+func (noDeadlineConn) SetReadDeadline(time.Time) error { return os.ErrInvalid }
+
+// A connection that cannot take read deadlines itself keeps the deadline
+// reader, so read deadlines still work on it.
+func TestStreamReaderKeepsDeadlineReaderWithoutNativeDeadlines(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &readConn{Conn: deadline.NewConn(noDeadlineConn{server})}
+	s := &streamReader{c: c}
+	c.reader = s
+	go client.Write([]byte("ab"))
+	b := make([]byte, 2)
+	_, err := io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Nil(t, s.upstream, "the deadline reader is kept")
+
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(20*time.Millisecond)))
+	_, err = c.Read(b)
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+}
+
+// A wrapper that reads through no separate reader does not stop reads.
+func TestStreamReaderUnderAppendConnWithoutReader(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &readConn{Conn: bufio.NewAppendConn(deadline.NewConn(server), nil, nil)}
+	c.reader = &streamReader{c: c}
+	go client.Write([]byte("ab"))
+	b := make([]byte, 2)
+	_, err := io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "ab", string(b))
+}
