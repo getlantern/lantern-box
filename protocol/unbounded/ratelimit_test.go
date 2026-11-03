@@ -508,3 +508,23 @@ func TestLimitedNetFailedWritesSpendNoTokens(t *testing.T) {
 		})
 	}
 }
+
+// A deadline extended after the check before reserving read it, but before
+// the check acted on it, is honoured too.
+func TestLimitedNetEarlyCheckRechecksAStaleDeadline(t *testing.T) {
+	c, sink := spentLimitedConn(t)
+	if err := c.SetWriteDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	afterEarlyDeadlineRead = func() {
+		once.Do(func() {
+			time.Sleep(50 * time.Millisecond)
+			_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		})
+	}
+	t.Cleanup(func() { afterEarlyDeadlineRead = nil })
+	if _, err := c.WriteTo(make([]byte, 8*1024), sink); err != nil {
+		t.Fatalf("write timed out on a deadline that had been extended: %v", err)
+	}
+}

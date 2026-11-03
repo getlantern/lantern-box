@@ -194,9 +194,10 @@ func (l *connLimits) unchanged(write bool, d deadline) bool {
 	return l.deadlineOf(write).changed == d.changed
 }
 
-// afterDeadlineRead, if set, runs in wait right after it reads the deadline.
-// Tests use it to move the deadline at that point.
-var afterDeadlineRead func()
+// afterDeadlineRead and afterEarlyDeadlineRead, if set, run in wait right
+// after it reads the deadline, in its loop and in its check before reserving.
+// Tests use them to move the deadline at that point.
+var afterDeadlineRead, afterEarlyDeadlineRead func()
 
 // wait takes n tokens from lim, blocking until they are available. It returns
 // net.ErrClosed if the socket closes first, or os.ErrDeadlineExceeded if the
@@ -208,8 +209,17 @@ func (l *connLimits) wait(lim *rate.Limiter, n int, write bool) error {
 	if l.closed.Err() != nil {
 		return net.ErrClosed
 	}
-	if d := l.deadlineOf(write); !d.at.IsZero() && !time.Now().Before(d.at) {
-		return os.ErrDeadlineExceeded
+	for {
+		d := l.deadlineOf(write)
+		if afterEarlyDeadlineRead != nil {
+			afterEarlyDeadlineRead()
+		}
+		if d.at.IsZero() || time.Now().Before(d.at) {
+			break
+		}
+		if l.unchanged(write, d) {
+			return os.ErrDeadlineExceeded
+		}
 	}
 	r := lim.ReserveN(time.Now(), n)
 	if !r.OK() {
