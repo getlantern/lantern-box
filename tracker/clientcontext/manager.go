@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -167,6 +168,22 @@ type readConn struct {
 	reader  io.Reader
 	info    ClientInfo
 	readErr error
+	// hasDeadline is set while a caller has a read deadline set, which sends
+	// reads back through sing-box's deadline reader.
+	hasDeadline atomic.Bool
+}
+
+// SetReadDeadline applies t to reads that start after it. A read already
+// blocked past sing-box's deadline reader is not interrupted by t.
+func (c *readConn) SetReadDeadline(t time.Time) error {
+	c.hasDeadline.Store(!t.IsZero())
+	return c.Conn.SetReadDeadline(t)
+}
+
+// SetDeadline applies t as SetReadDeadline does for reads.
+func (c *readConn) SetDeadline(t time.Time) error {
+	c.hasDeadline.Store(!t.IsZero())
+	return c.Conn.SetDeadline(t)
 }
 
 func (c *readConn) Read(b []byte) (n int, err error) {
@@ -215,7 +232,7 @@ func (c *readConn) readInfo() (ClientInfo, error) {
 // strips a frame, or restores head as ordinary traffic.
 func (c *readConn) consumeHead(head []byte) (ClientInfo, error) {
 	marker, ack := matchMarker(head)
-	stream := &streamReader{conn: c.Conn}
+	stream := &streamReader{c: c}
 	if marker == "" {
 		c.reader = io.MultiReader(bytes.NewReader(head), stream)
 		return ClientInfo{}, nil
@@ -252,23 +269,29 @@ type replaceableReader interface {
 	UpstreamReader() any
 }
 
-// streamReader reads the stream after its head. Nothing sets a read deadline
-// on the connection once readInfo returns, so as soon as sing-box's deadline
-// reader is replaceable, reads bypass it. That reader runs each read on a new
-// goroutine with a buffer the size of the read, held until data arrives, so on
-// a mostly idle proxy it costs a goroutine and a buffer per connection.
+// streamReader reads the stream after its head. Once sing-box's deadline
+// reader is replaceable, reads bypass it unless a caller sets a read deadline.
+// That reader runs each read on a new goroutine with a buffer the size of the
+// read, held until data arrives, so on a mostly idle proxy it costs a goroutine
+// and a buffer per connection.
 type streamReader struct {
-	conn     net.Conn
+	c        *readConn
 	upstream io.Reader
 }
 
 func (s *streamReader) Read(b []byte) (int, error) {
+	if s.c.hasDeadline.Load() {
+		// A read that times out leaves the deadline reader's read in flight, so
+		// reads resume past it only once it is replaceable again.
+		s.upstream = nil
+		return s.c.Conn.Read(b)
+	}
 	if s.upstream == nil {
-		if r, ok := s.conn.(replaceableReader); ok && r.ReaderReplaceable() {
+		if r, ok := s.c.Conn.(replaceableReader); ok && r.ReaderReplaceable() {
 			s.upstream, _ = r.UpstreamReader().(io.Reader)
 		}
 		if s.upstream == nil {
-			return s.conn.Read(b)
+			return s.c.Conn.Read(b)
 		}
 	}
 	return s.upstream.Read(b)

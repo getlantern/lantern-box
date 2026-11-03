@@ -485,7 +485,7 @@ func TestStreamReaderBypassesDeadlineReader(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 	conn := deadline.NewConn(server)
-	s := &streamReader{conn: conn}
+	s := &streamReader{c: &readConn{Conn: conn}}
 
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Hour)))
 	go client.Write([]byte("ab"))
@@ -503,4 +503,30 @@ func TestStreamReaderBypassesDeadlineReader(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "cd", string(b))
 	assert.NotNil(t, s.upstream, "no deadline and no read in flight")
+}
+
+// A read deadline set through the connection after the bypass applies to later
+// reads, which go back through the deadline reader.
+func TestStreamReaderHonorsLaterDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	go client.Write([]byte("ab"))
+
+	c := &readConn{Conn: deadline.NewConn(server)}
+	c.reader = &streamReader{c: c}
+	b := make([]byte, 2)
+	_, err := io.ReadFull(c, b)
+	require.NoError(t, err)
+	require.NotNil(t, c.reader.(*streamReader).upstream, "reads bypass the deadline reader")
+
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(20*time.Millisecond)))
+	_, err = c.Read(b)
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+
+	require.NoError(t, c.SetReadDeadline(time.Time{}))
+	go client.Write([]byte("cd"))
+	_, err = io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "cd", string(b))
 }
