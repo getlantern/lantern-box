@@ -495,6 +495,9 @@ func TestStreamReaderBypassesDeadlineReader(t *testing.T) {
 	assert.Nil(t, s.upstream, "a deadline is set")
 
 	require.NoError(t, conn.SetReadDeadline(time.Time{}))
+	// The deadline reader's read goroutine hands over its result before it
+	// signals that it is done.
+	require.Eventually(t, conn.(replaceableReader).ReaderReplaceable, 5*time.Second, time.Millisecond)
 	go client.Write([]byte("cd"))
 	_, err = io.ReadFull(s, b)
 	require.NoError(t, err)
