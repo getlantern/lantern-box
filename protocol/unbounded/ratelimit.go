@@ -130,6 +130,10 @@ type connLimits struct {
 	mu    sync.Mutex
 	read  deadline
 	write deadline
+
+	// setMu serializes deadline updates across the limiter's copy and the
+	// socket's, so concurrent setters can't leave the two disagreeing.
+	setMu sync.Mutex
 }
 
 // deadline is one direction's deadline, and a channel closed when it changes.
@@ -153,15 +157,20 @@ func newConnLimits(tx, rx *rate.Limiter) *connLimits {
 	}
 }
 
-func (l *connLimits) setDeadline(read, write bool, t time.Time) {
+// setDeadline sets the deadline for read, write or both, on the limiter's
+// copy and, through set, on the socket, as one update.
+func (l *connLimits) setDeadline(read, write bool, t time.Time, set func(time.Time) error) error {
+	l.setMu.Lock()
+	defer l.setMu.Unlock()
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if read {
 		l.read.set(t)
 	}
 	if write {
 		l.write.set(t)
 	}
+	l.mu.Unlock()
+	return set(t)
 }
 
 func (l *connLimits) deadlineOf(write bool) deadline {
@@ -256,18 +265,15 @@ func (c *limitedUDPConn) Close() error {
 }
 
 func (c *limitedUDPConn) SetDeadline(t time.Time) error {
-	c.limits.setDeadline(true, true, t)
-	return c.UDPConn.SetDeadline(t)
+	return c.limits.setDeadline(true, true, t, c.UDPConn.SetDeadline)
 }
 
 func (c *limitedUDPConn) SetReadDeadline(t time.Time) error {
-	c.limits.setDeadline(true, false, t)
-	return c.UDPConn.SetReadDeadline(t)
+	return c.limits.setDeadline(true, false, t, c.UDPConn.SetReadDeadline)
 }
 
 func (c *limitedUDPConn) SetWriteDeadline(t time.Time) error {
-	c.limits.setDeadline(false, true, t)
-	return c.UDPConn.SetWriteDeadline(t)
+	return c.limits.setDeadline(false, true, t, c.UDPConn.SetWriteDeadline)
 }
 
 func (c *limitedUDPConn) Read(b []byte) (int, error) {
@@ -335,18 +341,15 @@ func (c *limitedPacketConn) Close() error {
 }
 
 func (c *limitedPacketConn) SetDeadline(t time.Time) error {
-	c.limits.setDeadline(true, true, t)
-	return c.PacketConn.SetDeadline(t)
+	return c.limits.setDeadline(true, true, t, c.PacketConn.SetDeadline)
 }
 
 func (c *limitedPacketConn) SetReadDeadline(t time.Time) error {
-	c.limits.setDeadline(true, false, t)
-	return c.PacketConn.SetReadDeadline(t)
+	return c.limits.setDeadline(true, false, t, c.PacketConn.SetReadDeadline)
 }
 
 func (c *limitedPacketConn) SetWriteDeadline(t time.Time) error {
-	c.limits.setDeadline(false, true, t)
-	return c.PacketConn.SetWriteDeadline(t)
+	return c.limits.setDeadline(false, true, t, c.PacketConn.SetWriteDeadline)
 }
 
 func (c *limitedPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {

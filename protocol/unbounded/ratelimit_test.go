@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -245,5 +246,46 @@ func TestLimitedNetInterfacesAreFresh(t *testing.T) {
 	}
 	if made.Load() != 2 {
 		t.Fatalf("made %d snapshots for 2 lookups, want 2", made.Load())
+	}
+}
+
+// slowDeadlineConn records the last write deadline set on it, pausing first so
+// concurrent setters interleave.
+type slowDeadlineConn struct {
+	transport.UDPConn
+	mu   sync.Mutex
+	last time.Time
+}
+
+func (c *slowDeadlineConn) SetWriteDeadline(t time.Time) error {
+	time.Sleep(time.Millisecond)
+	c.mu.Lock()
+	c.last = t
+	c.mu.Unlock()
+	return nil
+}
+
+// Concurrent deadline setters leave the limiter's deadline and the socket's
+// the same, whichever finishes last.
+func TestLimitedNetDeadlineUpdatesAreAtomic(t *testing.T) {
+	for range 20 {
+		inner := &slowDeadlineConn{}
+		c := &limitedUDPConn{UDPConn: inner, limits: newConnLimits(newLimiter(1<<20), newLimiter(1<<20))}
+		var wg sync.WaitGroup
+		base := time.Now()
+		for i := range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_ = c.SetWriteDeadline(base.Add(time.Duration(i) * time.Second))
+			}()
+		}
+		wg.Wait()
+		inner.mu.Lock()
+		socket := inner.last
+		inner.mu.Unlock()
+		if limiter := c.limits.deadlineOf(true).at; !limiter.Equal(socket) {
+			t.Fatalf("limiter's write deadline %v, socket's %v", limiter, socket)
+		}
 	}
 }
