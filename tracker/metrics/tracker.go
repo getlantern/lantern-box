@@ -68,25 +68,7 @@ func trackIOLoop(ctx context.Context, reportC <-chan report) {
 		case <-ctx.Done():
 			return
 		case r := <-reportC:
-			attrs := append(r.attrs.AsSlice(),
-				semconv.NetworkIODirectionKey.String(string(r.direction)),
-			)
-			if r.attrs.client != nil {
-				attrs = append(attrs,
-					semconv.ClientDeviceIDKey.String(r.attrs.client.DeviceID),
-				)
-			}
-			// Left off when unknown, so a proxy without the ISP database
-			// emits exactly the series it did before.
-			if n := r.attrs.network.Load(); n != nil {
-				if n.asn != "" {
-					attrs = append(attrs, semconv.ClientAsnKey.String(n.asn))
-				}
-				if n.isp != "" {
-					attrs = append(attrs, semconv.ClientISPKey.String(n.isp))
-				}
-			}
-			metrics.ProxyIO.Add(context.Background(), int64(r.n), metric.WithAttributes(attrs...))
+			metrics.ProxyIO.Add(context.Background(), int64(r.n), metric.WithAttributeSet(r.attrs.ioSet(r.direction)))
 		}
 	}
 }
@@ -197,6 +179,49 @@ type attributes struct {
 	country atomic.Value                  // string
 	network atomic.Pointer[clientNetwork] // proxy.io only; nil until looked up
 	client  *clientcontext.ClientInfo
+	// ioSets caches the proxy.io attribute set for each direction (rx, tx).
+	// Building a set sorts and deduplicates its attributes, which is too
+	// costly to repeat on every read and write.
+	ioSets [2]atomic.Pointer[ioAttrSet]
+}
+
+// ioAttrSet is a cached proxy.io attribute set and the lookup results it was
+// built from. The country and network are filled in asynchronously after the
+// connection starts, so a set built before they land is rebuilt once they do.
+type ioAttrSet struct {
+	country string
+	network *clientNetwork
+	set     attribute.Set
+}
+
+// ioSet returns the proxy.io attribute set for direction d.
+func (a *attributes) ioSet(d ioAttr) attribute.Set {
+	i := 0
+	if d == tx {
+		i = 1
+	}
+	country, _ := a.country.Load().(string)
+	network := a.network.Load()
+	if c := a.ioSets[i].Load(); c != nil && c.country == country && c.network == network {
+		return c.set
+	}
+	attrs := append(a.AsSlice(), semconv.NetworkIODirectionKey.String(string(d)))
+	if a.client != nil {
+		attrs = append(attrs, semconv.ClientDeviceIDKey.String(a.client.DeviceID))
+	}
+	// Left off when unknown, so a proxy without the ISP database
+	// emits exactly the series it did before.
+	if network != nil {
+		if network.asn != "" {
+			attrs = append(attrs, semconv.ClientAsnKey.String(network.asn))
+		}
+		if network.isp != "" {
+			attrs = append(attrs, semconv.ClientISPKey.String(network.isp))
+		}
+	}
+	set := attribute.NewSet(attrs...)
+	a.ioSets[i].Store(&ioAttrSet{country: country, network: network, set: set})
+	return set
 }
 
 func (a *attributes) AsSlice() []attribute.KeyValue {
