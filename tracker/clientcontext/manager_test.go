@@ -505,8 +505,9 @@ func TestStreamReaderBypassesDeadlineReader(t *testing.T) {
 	assert.NotNil(t, s.upstream, "no deadline and no read in flight")
 }
 
-// A read deadline set through the connection after the bypass applies to later
-// reads, which go back through the deadline reader.
+// A read deadline set through the connection after the bypass still applies,
+// both to a read already blocked and to later reads, and clearing it resumes
+// the stream.
 func TestStreamReaderHonorsLaterDeadline(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
@@ -520,7 +521,19 @@ func TestStreamReaderHonorsLaterDeadline(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, c.reader.(*streamReader).upstream, "reads bypass the deadline reader")
 
+	blocked := make(chan error, 1)
+	go func() {
+		_, err := c.Read(b)
+		blocked <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
 	require.NoError(t, c.SetReadDeadline(time.Now().Add(20*time.Millisecond)))
+	select {
+	case err := <-blocked:
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the deadline did not interrupt a blocked read")
+	}
 	_, err = c.Read(b)
 	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 
