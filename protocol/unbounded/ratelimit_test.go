@@ -294,12 +294,16 @@ func TestLimitedNetDeadlineUpdatesAreAtomic(t *testing.T) {
 // is honoured: the wait doesn't time out on the old value.
 func TestLimitedNetWaitRechecksAStaleDeadline(t *testing.T) {
 	c, sink := spentLimitedConn(t)
-	if err := c.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+	if err := c.SetWriteDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
+	// Once the wait has read the 30ms deadline, let it pass, then extend it.
 	var once sync.Once
 	afterDeadlineRead = func() {
-		once.Do(func() { _ = c.SetWriteDeadline(time.Now().Add(5 * time.Second)) })
+		once.Do(func() {
+			time.Sleep(50 * time.Millisecond)
+			_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		})
 	}
 	t.Cleanup(func() { afterDeadlineRead = nil })
 	if _, err := c.WriteTo(make([]byte, 8*1024), sink); err != nil {
@@ -332,23 +336,22 @@ func TestLimitedNetShapesReadsAcrossSockets(t *testing.T) {
 
 	const packet = 8 * 1024
 	const perSocket = 12 // 192 KiB in all, three times the 64 KiB burst
-	for i := 0; i < perSocket; i++ {
-		for _, r := range receivers {
-			if _, err := sender.WriteTo(make([]byte, packet), r.LocalAddr()); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
 	start := time.Now()
 	errs := make(chan error, len(receivers))
 	for _, r := range receivers {
 		go func() {
+			// One datagram in flight per socket, so nothing depends on the
+			// host's receive buffer size.
 			buf := make([]byte, packet)
 			if err := r.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 				errs <- err
 				return
 			}
 			for i := 0; i < perSocket; i++ {
+				if _, err := sender.WriteTo(make([]byte, packet), r.LocalAddr()); err != nil {
+					errs <- err
+					return
+				}
 				if _, _, err := r.ReadFrom(buf); err != nil {
 					errs <- err
 					return
@@ -468,5 +471,40 @@ func TestLimitedNetLeavesMulticastSocketsUnwrapped(t *testing.T) {
 	defer unicast.Close()
 	if _, ok := unicast.(*limitedUDPConn); !ok {
 		t.Fatalf("unicast socket is %T, want it limited", unicast)
+	}
+}
+
+// A write on a closed socket, or past its deadline, fails without spending
+// tokens other sockets share.
+func TestLimitedNetFailedWritesSpendNoTokens(t *testing.T) {
+	ln, err := newLimitedNet(64 * 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := ln.(*limitedNet).tx
+	sink, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+	for name, spoil := range map[string]func(transport.UDPConn){
+		"closed":  func(c transport.UDPConn) { c.Close() },
+		"expired": func(c transport.UDPConn) { _ = c.SetWriteDeadline(time.Now().Add(-time.Second)) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := ln.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			spoil(c)
+			before := tx.Tokens()
+			if _, err := c.WriteTo(make([]byte, 8*1024), sink.LocalAddr()); err == nil {
+				t.Fatal("the write succeeded")
+			}
+			if after := tx.Tokens(); after < before-1 {
+				t.Fatalf("a failed write spent %.0f tokens", before-after)
+			}
+		})
 	}
 }

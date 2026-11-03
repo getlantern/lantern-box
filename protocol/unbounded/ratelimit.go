@@ -203,6 +203,14 @@ var afterDeadlineRead func()
 // direction's deadline, as it stands at any point during the wait, passes
 // first; either way the tokens go back.
 func (l *connLimits) wait(lim *rate.Limiter, n int, write bool) error {
+	// A socket that's closed or past its deadline will fail the I/O anyway,
+	// so it mustn't spend tokens other sockets share.
+	if l.closed.Err() != nil {
+		return net.ErrClosed
+	}
+	if d := l.deadlineOf(write); !d.at.IsZero() && !time.Now().Before(d.at) {
+		return os.ErrDeadlineExceeded
+	}
 	r := lim.ReserveN(time.Now(), n)
 	if !r.OK() {
 		return nil
