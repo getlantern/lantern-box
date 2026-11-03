@@ -13,6 +13,7 @@ import (
 
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio/deadline"
+	"github.com/sagernet/sing/common/debug"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
@@ -481,6 +482,9 @@ func TestReadInfoBehindDeadlineConn(t *testing.T) {
 // Reads bypass the deadline reader only once it has no deadline and no read in
 // flight, and then reach the connection it wraps directly.
 func TestStreamReaderBypassesDeadlineReader(t *testing.T) {
+	if debug.Enabled {
+		t.Skip("sing's debug build wraps the deadline reader, which keeps it")
+	}
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -509,6 +513,9 @@ func TestStreamReaderBypassesDeadlineReader(t *testing.T) {
 // both to a read already blocked and to later reads, and clearing it resumes
 // the stream.
 func TestStreamReaderHonorsLaterDeadline(t *testing.T) {
+	if debug.Enabled {
+		t.Skip("sing's debug build wraps the deadline reader, which keeps it")
+	}
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
