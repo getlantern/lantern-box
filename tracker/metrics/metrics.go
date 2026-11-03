@@ -178,9 +178,8 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 			go countryLookupWorker(metrics.countryLookupC, metrics.countryLookup, metrics.ispLookup)
 		}
 		metrics.destinationLookupC = make(chan destinationLookupRequest, 256)
-		countries := newDestinationCountries(metrics.countryLookup, destinationResolver)
 		for range destinationLookupWorkers {
-			go destinationLookupWorker(metrics.destinationLookupC, countries)
+			go destinationLookupWorker(metrics.destinationLookupC, metrics.countryLookup)
 		}
 	}
 

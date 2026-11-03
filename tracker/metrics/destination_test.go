@@ -2,12 +2,10 @@ package metrics
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/netip"
 	"testing"
 	"testing/synctest"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
@@ -29,61 +27,15 @@ func (c countryByIP) CountryCode(ip net.IP) string {
 	return "IR"
 }
 
-// fakeResolver answers from hosts, counting lookups. A host it doesn't list
-// fails to resolve.
-type fakeResolver struct {
-	hosts   map[string]string
-	lookups map[string]int
-}
-
-func (r *fakeResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
-	if r.lookups == nil {
-		r.lookups = map[string]int{}
-	}
-	r.lookups[host]++
-	ip, ok := r.hosts[host]
-	if !ok {
-		return nil, errors.New("no such host")
-	}
-	return []netip.Addr{netip.MustParseAddr(ip)}, nil
-}
-
 func TestDestinationCountry(t *testing.T) {
 	lookup := countryByIP{"1.2.3.4": "DE", "5.6.7.8": "US"}
-	resolver := &fakeResolver{hosts: map[string]string{"example.com": "5.6.7.8"}}
-	d := newDestinationCountries(lookup, resolver)
 
-	assert.Equal(t, "DE", d.country(M.ParseSocksaddr("1.2.3.4:443"), nil), "an IP destination is looked up directly")
-	assert.Equal(t, "DE", d.country(M.ParseSocksaddr("[::ffff:1.2.3.4]:443"), nil), "a 4-in-6 address is looked up as IPv4")
-	assert.Equal(t, "US", d.country(M.ParseSocksaddr("example.org:443"), []netip.Addr{netip.MustParseAddr("5.6.7.8")}),
-		"addresses routing resolved are used without another lookup")
-	assert.Zero(t, resolver.lookups["example.org"])
-
-	assert.Equal(t, "US", d.country(M.ParseSocksaddr("example.com:443"), nil), "a domain is resolved")
-	assert.Equal(t, "US", d.country(M.ParseSocksaddr("example.com:80"), nil))
-	assert.Equal(t, 1, resolver.lookups["example.com"], "a domain's country is cached")
-
-	assert.Empty(t, d.country(M.ParseSocksaddr("dead.example:443"), nil), "an unresolvable domain has no country")
-	assert.Empty(t, d.country(M.ParseSocksaddr("dead.example:443"), nil))
-	assert.Equal(t, 1, resolver.lookups["dead.example"], "a failed resolution is cached too")
-
-	assert.Empty(t, d.country(M.Socksaddr{}, nil), "an empty destination has no country")
-}
-
-func TestDestinationCountryCacheExpires(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		resolver := &fakeResolver{hosts: map[string]string{"example.com": "1.2.3.4"}}
-		d := newDestinationCountries(countryByIP{"1.2.3.4": "DE"}, resolver)
-
-		d.country(M.ParseSocksaddr("example.com:443"), nil)
-		time.Sleep(destinationCacheTTL - time.Second)
-		d.country(M.ParseSocksaddr("example.com:443"), nil)
-		assert.Equal(t, 1, resolver.lookups["example.com"], "still cached inside the TTL")
-
-		time.Sleep(2 * time.Second)
-		d.country(M.ParseSocksaddr("example.com:443"), nil)
-		assert.Equal(t, 2, resolver.lookups["example.com"], "resolved again once the TTL passes")
-	})
+	assert.Equal(t, "DE", destinationCountry(lookup, M.ParseSocksaddr("1.2.3.4:443"), nil), "an IP destination is looked up directly")
+	assert.Equal(t, "DE", destinationCountry(lookup, M.ParseSocksaddr("[::ffff:1.2.3.4]:443"), nil), "a 4-in-6 address is looked up as IPv4")
+	assert.Equal(t, "US", destinationCountry(lookup, M.ParseSocksaddr("example.com:443"), []netip.Addr{netip.MustParseAddr("5.6.7.8")}),
+		"a domain routing resolved counts under its first address")
+	assert.Empty(t, destinationCountry(lookup, M.ParseSocksaddr("example.com:443"), nil), "an unresolved domain is not looked up")
+	assert.Empty(t, destinationCountry(lookup, M.Socksaddr{}, nil), "an empty destination has no country")
 }
 
 func TestProxyDestinationIO(t *testing.T) {
@@ -91,22 +43,21 @@ func TestProxyDestinationIO(t *testing.T) {
 		reader := metric.NewManualReader()
 		sdkotel.SetMeterProvider(metric.NewMeterProvider(metric.WithReader(reader)))
 
-		prevResolver := destinationResolver
-		destinationResolver = &fakeResolver{hosts: map[string]string{"bank.example.ir": "5.6.7.8"}}
 		SetupMetricsManager(countryByIP{"1.2.3.4": "DE"}, "")
-		defer func() {
-			stopLookupWorkers()
-			destinationResolver = prevResolver
-		}()
+		defer stopLookupWorkers()
 
 		ctx := context.Background()
 		tracker := NewTracker(ctx)
 		defer tracker.Close()
 
-		for _, dest := range []string{"1.2.3.4:443", "bank.example.ir:443"} {
+		for _, metadata := range []adapter.InboundContext{
+			{Destination: M.ParseSocksaddr("1.2.3.4:443")},
+			// A domain a route "resolve" action resolved before routing.
+			{Destination: M.ParseSocksaddr("bank.example.ir:443"), DestinationAddresses: []netip.Addr{netip.MustParseAddr("5.6.7.8")}},
+			{Destination: M.ParseSocksaddr("unresolved.example:443")},
+		} {
 			client, server := net.Pipe()
-			tracked := tracker.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo},
-				adapter.InboundContext{Destination: M.ParseSocksaddr(dest)}, nil, nil)
+			tracked := tracker.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, metadata, nil, nil)
 			// Let the workers resolve the client and destination before any
 			// bytes are counted.
 			synctest.Wait()
@@ -143,7 +94,7 @@ func TestProxyDestinationIO(t *testing.T) {
 				}
 			}
 		}
-		assert.Equal(t, map[string]int64{"DE": 5, "IR": 5}, bytesByDestination,
-			"an IP destination and a resolved domestic domain each count under their country")
+		assert.Equal(t, map[string]int64{"DE": 5, "IR": 5, "n/a": 5}, bytesByDestination,
+			"an IP destination and a resolved domestic domain count under their country, an unresolved domain under n/a")
 	})
 }
