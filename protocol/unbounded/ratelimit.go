@@ -93,6 +93,12 @@ func (n *limitedNet) ListenUDP(network string, laddr *net.UDPAddr) (transport.UD
 	if err != nil {
 		return nil, err
 	}
+	if laddr != nil && laddr.IP.IsMulticast() {
+		// Only pion's mDNS listens on a multicast address, and x/net, which
+		// it reads that socket through, accepts only a *net.UDPConn. Its
+		// traffic is a few small packets, so it goes unlimited.
+		return c, nil
+	}
 	return &limitedUDPConn{UDPConn: c, limits: newConnLimits(n.tx, n.rx)}, nil
 }
 

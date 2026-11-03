@@ -445,3 +445,28 @@ func TestLimitedNetInterruptedReadKeepsTheDatagram(t *testing.T) {
 		})
 	}
 }
+
+// A socket on a multicast address, which only pion's mDNS opens, is the host's
+// own: x/net reads it only as a *net.UDPConn. Every other socket is limited.
+func TestLimitedNetLeavesMulticastSocketsUnwrapped(t *testing.T) {
+	ln, err := newLimitedNet(64 * 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mdns, err := ln.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251)})
+	if err != nil {
+		t.Skipf("can't listen on a multicast address here: %v", err)
+	}
+	defer mdns.Close()
+	if _, ok := mdns.(*net.UDPConn); !ok {
+		t.Fatalf("multicast socket is %T, want *net.UDPConn", mdns)
+	}
+	unicast, err := ln.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unicast.Close()
+	if _, ok := unicast.(*limitedUDPConn); !ok {
+		t.Fatalf("unicast socket is %T, want it limited", unicast)
+	}
+}
