@@ -26,7 +26,7 @@ func TestTokenBucketWithdrawnWaitsLeaveNoDebt(t *testing.T) {
 		t.Fatal("the bucket refilled implausibly fast")
 	}
 	defer b.cancel(later)
-	if _, wait := b.poll(later); wait > time.Duration(1.1*n/rate*float64(time.Second)) {
+	if _, wait, _ := b.poll(later); wait > time.Duration(1.1*n/rate*float64(time.Second)) {
 		t.Fatalf("a later request waits %v, as if withdrawn waits were still charged; want about %v",
 			wait, time.Duration(n/rate*float64(time.Second)))
 	}
@@ -46,13 +46,13 @@ func TestTokenBucketGrantsInOrder(t *testing.T) {
 	b.tokens = 1024 // enough for small, not big
 	b.last = time.Now()
 	b.mu.Unlock()
-	if granted, _ := b.poll(small); granted {
+	if granted, _, _ := b.poll(small); granted {
 		t.Fatal("a small request was granted ahead of a larger one queued before it")
 	}
 	b.mu.Lock()
 	b.tokens = 4*1024 + 1
 	b.mu.Unlock()
-	if granted, _ := b.poll(small); !granted {
+	if granted, _, _ := b.poll(small); !granted {
 		t.Fatal("once the head was covered, the waiters behind it weren't granted")
 	}
 	select {
@@ -79,5 +79,37 @@ func TestTokenBucketWithdrawnGrantIsRefunded(t *testing.T) {
 	b.cancel(w)
 	if got := b.Tokens() - before; got < 1023 {
 		t.Fatalf("withdrawing a granted waiter refunded %.0f tokens, want 1024", got)
+	}
+}
+
+// When a waiter ahead withdraws, those behind it recompute when they'll be
+// granted, rather than sleeping out the time the withdrawn demand would have
+// taken.
+func TestTokenBucketWithdrawalWakesTheWaitersBehind(t *testing.T) {
+	b := newTokenBucket(1024, 8*1024)
+	b.take(8 * 1024)
+	ahead := newConnLimits(b, b)
+	behind := newConnLimits(b, b)
+	aheadDone := make(chan error, 1)
+	go func() { aheadDone <- ahead.wait(b, 8*1024, true) }() // ~8s of tokens
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	behindDone := make(chan error, 1)
+	go func() { behindDone <- behind.wait(b, 1024, true) }() // ~1s more, behind it
+	time.Sleep(100 * time.Millisecond)
+	ahead.close()
+	if err := <-aheadDone; err == nil {
+		t.Fatal("the withdrawn wait succeeded")
+	}
+	select {
+	case err := <-behindDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waited := time.Since(start); waited > 3*time.Second {
+			t.Fatalf("the waiter behind took %v, as if the withdrawn demand still stood", waited)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiter behind slept out the withdrawn demand")
 	}
 }

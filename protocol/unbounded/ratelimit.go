@@ -236,7 +236,7 @@ func (l *connLimits) wait(b *tokenBucket, n int, write bool) error {
 			b.cancel(w)
 			return os.ErrDeadlineExceeded
 		}
-		granted, wait := b.poll(w)
+		granted, wait, changed := b.poll(w)
 		if granted {
 			return nil
 		}
@@ -253,6 +253,9 @@ func (l *connLimits) wait(b *tokenBucket, n int, write bool) error {
 		case <-w.ready:
 		case <-wakeTimer.C:
 			// Time to refill and grant again.
+			done = false
+		case <-changed:
+			// Tokens came back or a waiter ahead left: recompute.
 			done = false
 		case <-l.closed.Done():
 			b.cancel(w)
@@ -285,6 +288,16 @@ func (l *connLimits) waitTx(n int) error {
 		return nil
 	}
 	return l.wait(l.tx, n, true)
+}
+
+// refundTx puts back the tokens waitTx took for n bytes whose write then
+// failed, whether the socket rejected it or closed or timed out just after the
+// grant.
+func (l *connLimits) refundTx(n int) {
+	if n > l.tx.Burst() {
+		return
+	}
+	l.tx.refund(n)
 }
 
 // tookRx charges n received bytes, blocking the reader if the budget is
@@ -350,28 +363,44 @@ func (c *limitedUDPConn) Write(b []byte) (int, error) {
 	if err := c.limits.waitTx(len(b)); err != nil {
 		return 0, err
 	}
-	return c.UDPConn.Write(b)
+	n, err := c.UDPConn.Write(b)
+	if err != nil {
+		c.limits.refundTx(len(b))
+	}
+	return n, err
 }
 
 func (c *limitedUDPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if err := c.limits.waitTx(len(b)); err != nil {
 		return 0, err
 	}
-	return c.UDPConn.WriteTo(b, addr)
+	n, err := c.UDPConn.WriteTo(b, addr)
+	if err != nil {
+		c.limits.refundTx(len(b))
+	}
+	return n, err
 }
 
 func (c *limitedUDPConn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
 	if err := c.limits.waitTx(len(b)); err != nil {
 		return 0, err
 	}
-	return c.UDPConn.WriteToUDP(b, addr)
+	n, err := c.UDPConn.WriteToUDP(b, addr)
+	if err != nil {
+		c.limits.refundTx(len(b))
+	}
+	return n, err
 }
 
 func (c *limitedUDPConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (int, int, error) {
 	if err := c.limits.waitTx(len(b)); err != nil {
 		return 0, 0, err
 	}
-	return c.UDPConn.WriteMsgUDP(b, oob, addr)
+	n, oobn, err := c.UDPConn.WriteMsgUDP(b, oob, addr)
+	if err != nil {
+		c.limits.refundTx(len(b))
+	}
+	return n, oobn, err
 }
 
 // limitedPacketConn is the plain net.PacketConn variant for sockets stdnet
@@ -408,5 +437,9 @@ func (c *limitedPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if err := c.limits.waitTx(len(b)); err != nil {
 		return 0, err
 	}
-	return c.PacketConn.WriteTo(b, addr)
+	n, err := c.PacketConn.WriteTo(b, addr)
+	if err != nil {
+		c.limits.refundTx(len(b))
+	}
+	return n, err
 }

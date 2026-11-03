@@ -20,6 +20,9 @@ type tokenBucket struct {
 	tokens  float64
 	last    time.Time
 	waiters list.List // of *bucketWaiter, oldest first
+	// changed is closed, and replaced, whenever tokens come back or a waiter
+	// leaves, so the waiters left can recompute when they'll be granted.
+	changed chan struct{}
 }
 
 type bucketWaiter struct {
@@ -31,7 +34,7 @@ type bucketWaiter struct {
 }
 
 func newTokenBucket(rate float64, burst int) *tokenBucket {
-	return &tokenBucket{rate: rate, burst: float64(burst), tokens: float64(burst), last: time.Now()}
+	return &tokenBucket{rate: rate, burst: float64(burst), tokens: float64(burst), last: time.Now(), changed: make(chan struct{})}
 }
 
 // Burst is the most tokens the bucket holds, and so the largest request it can
@@ -88,14 +91,14 @@ func (b *tokenBucket) take(n int) *bucketWaiter {
 
 // poll refills the bucket and grants what it can. It reports whether w has
 // been granted, and if not, how long until the bucket could cover w and every
-// waiter ahead of it.
-func (b *tokenBucket) poll(w *bucketWaiter) (bool, time.Duration) {
+// waiter ahead of it, and a channel closed if that changes sooner.
+func (b *tokenBucket) poll(w *bucketWaiter) (bool, time.Duration, <-chan struct{}) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.refillLocked(time.Now())
 	b.grantLocked()
 	if w.granted {
-		return true, 0
+		return true, 0, nil
 	}
 	need := -b.tokens
 	for e := b.waiters.Front(); e != nil; e = e.Next() {
@@ -104,7 +107,7 @@ func (b *tokenBucket) poll(w *bucketWaiter) (bool, time.Duration) {
 			break
 		}
 	}
-	return false, time.Duration(need / b.rate * float64(time.Second))
+	return false, time.Duration(need / b.rate * float64(time.Second)), b.changed
 }
 
 // cancel withdraws w: out of the queue if it's still waiting, or its tokens
@@ -120,4 +123,21 @@ func (b *tokenBucket) cancel(w *bucketWaiter) {
 		b.waiters.Remove(w.elem)
 	}
 	b.grantLocked()
+	b.notifyLocked()
+}
+
+// refund puts back n tokens granted for I/O that then failed, so unsent bytes
+// cost nothing.
+func (b *tokenBucket) refund(n int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.refillLocked(time.Now())
+	b.tokens = min(b.burst, b.tokens+float64(n))
+	b.grantLocked()
+	b.notifyLocked()
+}
+
+func (b *tokenBucket) notifyLocked() {
+	close(b.changed)
+	b.changed = make(chan struct{})
 }

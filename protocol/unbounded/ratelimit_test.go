@@ -528,3 +528,22 @@ func TestLimitedNetEarlyCheckRechecksAStaleDeadline(t *testing.T) {
 		t.Fatalf("write timed out on a deadline that had been extended: %v", err)
 	}
 }
+
+// failingConn is a socket whose writes fail.
+type failingConn struct{ transport.UDPConn }
+
+func (failingConn) WriteTo([]byte, net.Addr) (int, error) { return 0, errors.New("write failed") }
+
+// Tokens granted for a write that then fails go back, so unsent bytes cost
+// the other sockets nothing.
+func TestLimitedNetFailedWriteIsRefunded(t *testing.T) {
+	tx := newTokenBucket(1024, 64*1024)
+	c := &limitedUDPConn{UDPConn: failingConn{}, limits: newConnLimits(tx, newTokenBucket(1024, 64*1024))}
+	before := tx.Tokens()
+	if _, err := c.WriteTo(make([]byte, 8*1024), &net.UDPAddr{}); err == nil {
+		t.Fatal("the write succeeded")
+	}
+	if after := tx.Tokens(); after < before-1 {
+		t.Fatalf("a failed write kept %.0f tokens", before-after)
+	}
+}
