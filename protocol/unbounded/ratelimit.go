@@ -9,10 +9,9 @@ import (
 
 	"github.com/pion/transport/v5"
 	"github.com/pion/transport/v5/stdnet"
-	"golang.org/x/time/rate"
 )
 
-// minBurst keeps WaitN satisfiable for the largest UDP datagram and smooths
+// minBurst keeps every UDP datagram within what the bucket can grant and smooths
 // the limiter at low rates.
 const minBurst = 64 * 1024
 
@@ -32,8 +31,8 @@ const burstFraction = 10
 // whole process, not per peer.
 type limitedNet struct {
 	*stdnet.Net
-	tx *rate.Limiter
-	rx *rate.Limiter
+	tx *tokenBucket
+	rx *tokenBucket
 }
 
 // newLimitedNet returns a transport.Net that caps UDP traffic at bytesPerSec
@@ -50,12 +49,12 @@ func newLimitedNet(bytesPerSec byteRate) (transport.Net, error) {
 	}, nil
 }
 
-func newLimiter(bytesPerSec byteRate) *rate.Limiter {
+func newLimiter(bytesPerSec byteRate) *tokenBucket {
 	burst := int(bytesPerSec) / burstFraction
 	if burst < minBurst {
 		burst = minBurst
 	}
-	return rate.NewLimiter(rate.Limit(bytesPerSec), burst)
+	return newTokenBucket(float64(bytesPerSec), burst)
 }
 
 // stdnet.Net captures the host's interfaces when it is created, and pion made
@@ -127,8 +126,8 @@ func (n *limitedNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transpo
 // Like the socket's own I/O, a pending wait follows deadline changes: pion's
 // UDP mux aborts a blocked write by setting the write deadline to now.
 type connLimits struct {
-	tx *rate.Limiter
-	rx *rate.Limiter
+	tx *tokenBucket
+	rx *tokenBucket
 
 	closed context.Context
 	close  context.CancelFunc
@@ -154,7 +153,7 @@ func (d *deadline) set(t time.Time) {
 	d.changed = make(chan struct{})
 }
 
-func newConnLimits(tx, rx *rate.Limiter) *connLimits {
+func newConnLimits(tx, rx *tokenBucket) *connLimits {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &connLimits{
 		tx: tx, rx: rx, closed: ctx, close: cancel,
@@ -199,11 +198,11 @@ func (l *connLimits) unchanged(write bool, d deadline) bool {
 // Tests use them to move the deadline at that point.
 var afterDeadlineRead, afterEarlyDeadlineRead func()
 
-// wait takes n tokens from lim, blocking until they are available. It returns
+// wait takes n tokens from b, blocking until they are granted. It returns
 // net.ErrClosed if the socket closes first, or os.ErrDeadlineExceeded if the
 // direction's deadline, as it stands at any point during the wait, passes
-// first; either way the tokens go back.
-func (l *connLimits) wait(lim *rate.Limiter, n int, write bool) error {
+// first; either way the wait is withdrawn and costs no tokens.
+func (l *connLimits) wait(b *tokenBucket, n int, write bool) error {
 	// A socket that's closed or past its deadline will fail the I/O anyway,
 	// so it mustn't spend tokens other sockets share.
 	if l.closed.Err() != nil {
@@ -221,27 +220,27 @@ func (l *connLimits) wait(lim *rate.Limiter, n int, write bool) error {
 			return os.ErrDeadlineExceeded
 		}
 	}
-	r := lim.ReserveN(time.Now(), n)
-	if !r.OK() {
+	w := b.take(n)
+	if w == nil {
 		return nil
 	}
-	ready := time.Now().Add(r.Delay())
 	for {
 		d := l.deadlineOf(write)
 		if afterDeadlineRead != nil {
 			afterDeadlineRead()
 		}
-		if time.Until(ready) <= 0 {
-			return nil
-		}
 		if !d.at.IsZero() && !time.Now().Before(d.at) {
 			if !l.unchanged(write, d) {
 				continue
 			}
-			r.Cancel()
+			b.cancel(w)
 			return os.ErrDeadlineExceeded
 		}
-		readyTimer := time.NewTimer(time.Until(ready))
+		granted, wait := b.poll(w)
+		if granted {
+			return nil
+		}
+		wakeTimer := time.NewTimer(wait)
 		var expired <-chan time.Time
 		var deadlineTimer *time.Timer
 		if !d.at.IsZero() {
@@ -251,13 +250,16 @@ func (l *connLimits) wait(lim *rate.Limiter, n int, write bool) error {
 		var err error
 		done := true
 		select {
-		case <-readyTimer.C:
+		case <-w.ready:
+		case <-wakeTimer.C:
+			// Time to refill and grant again.
+			done = false
 		case <-l.closed.Done():
-			r.Cancel()
+			b.cancel(w)
 			err = net.ErrClosed
 		case <-expired:
 			if l.unchanged(write, d) {
-				r.Cancel()
+				b.cancel(w)
 				err = os.ErrDeadlineExceeded
 			} else {
 				done = false
@@ -265,7 +267,7 @@ func (l *connLimits) wait(lim *rate.Limiter, n int, write bool) error {
 		case <-d.changed:
 			done = false
 		}
-		readyTimer.Stop()
+		wakeTimer.Stop()
 		if deadlineTimer != nil {
 			deadlineTimer.Stop()
 		}
@@ -277,7 +279,7 @@ func (l *connLimits) wait(lim *rate.Limiter, n int, write bool) error {
 
 // waitTx blocks until n bytes may be sent. A datagram larger than the burst
 // can never be admitted, so it is sent without waiting rather than erroring.
-// An interrupted wait releases its reservation and reports why.
+// An interrupted wait costs no tokens and reports why.
 func (l *connLimits) waitTx(n int) error {
 	if n > l.tx.Burst() {
 		return nil
