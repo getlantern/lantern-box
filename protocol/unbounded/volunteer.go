@@ -12,6 +12,7 @@ import (
 	"time"
 
 	UBClientcore "github.com/getlantern/broflake/clientcore"
+	UBCommon "github.com/getlantern/broflake/common"
 	"github.com/sagernet/sing-box/adapter"
 	boxService "github.com/sagernet/sing-box/adapter/service"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -130,6 +131,9 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 	}
 	rtcOpt.STUNBatch = randomSTUNBatch(opts.STUNServers)
 	rtcOpt.TargetCountries = opts.TargetCountries
+	// freddie counts outcomes for each kind of volunteer, so a lantern-box
+	// node can be compared with the apps and the browser widget.
+	rtcOpt.VolunteerKind = UBCommon.VolunteerKindServer
 	rtcOpt.OnSTUNPreflight = v.stunPreflight
 
 	bandwidth, err := parseRate(opts.BandwidthLimit)

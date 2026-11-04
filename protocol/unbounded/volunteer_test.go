@@ -84,6 +84,8 @@ func TestNewVolunteer_MapsOptions(t *testing.T) {
 	assert.Equal(t, "/ws", v.egOpt.Endpoint)
 	assert.EqualValues(t, 3, v.rtcOpt.STUNBatchSize)
 	assert.Equal(t, []string{"CN", "IR"}, v.rtcOpt.TargetCountries)
+	assert.Equal(t, common.VolunteerKindServer, v.rtcOpt.VolunteerKind, "freddie must count a node as a server volunteer")
+	assert.False(t, v.rtcOpt.VolunteerMapped, "no port is mapped yet")
 	assert.EqualValues(t, 40, v.rtcOpt.Tuning.ICEMaxBindingRequests)
 	assert.Equal(t, defaultStatsInterval, v.statsInterval)
 	assert.NotNil(t, v.rtcOpt.OnSTUNPreflight, "STUN check failures must reach the operator's log")

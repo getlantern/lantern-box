@@ -28,7 +28,7 @@ replace github.com/sagernet/gvisor => github.com/sagernet/gvisor v0.0.0-20250811
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/getlantern/algeneva v0.0.0-20260731172949-952f13725b7b
-	github.com/getlantern/broflake v0.0.0-20261103013533-7904ee7e70b5
+	github.com/getlantern/broflake v0.0.0-20261103231447-95bcbce067ee
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260520145825-958775d51395
 	github.com/getlantern/samizdat v0.0.3-0.20261031023545-1248df926631
