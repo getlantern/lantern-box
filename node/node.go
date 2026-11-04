@@ -131,7 +131,10 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: requestTimeout}
+		// No client-wide timeout: each request has its own deadline, and
+		// verify, which waits on lantern-cloud dialing back, needs longer than
+		// the rest.
+		httpClient = &http.Client{}
 	}
 	n := &node{
 		cfg: cfg,

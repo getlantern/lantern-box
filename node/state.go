@@ -66,8 +66,8 @@ func loadState(dir string) (state, error) {
 	if err != nil {
 		return state{}, fmt.Errorf("marshal state: %w", err)
 	}
-	// Written whole and renamed into place, so a crash can't leave a partial
-	// file that loses the device ID.
+	// Written whole, synced and renamed into place, so a crash or power loss
+	// can't leave a partial file that loses the device ID.
 	tmp, err := os.CreateTemp(dir, stateFile+".*")
 	if err != nil {
 		return state{}, fmt.Errorf("create state file: %w", err)
@@ -77,11 +77,21 @@ func loadState(dir string) (state, error) {
 		_ = tmp.Close()
 		return state{}, fmt.Errorf("write state file: %w", err)
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return state{}, fmt.Errorf("write state file: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return state{}, fmt.Errorf("write state file: %w", err)
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return state{}, fmt.Errorf("save %s: %w", path, err)
+	}
+	// Syncing the directory makes the rename durable too. Not every platform
+	// can sync a directory, so a failure only costs that.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return s, nil
 }
