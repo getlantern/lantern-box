@@ -252,7 +252,7 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 	internalIP, err := f.localIPLocked()
 	if err != nil {
 		slog.Warn("portforward: could not determine the local address to map to",
-			"controlled", f.localIPControl != nil, "err", err)
+			"portforward.local_ip_protected", f.localIPControl != nil, "err", err)
 		return nil, fmt.Errorf("determine local ip: %w", errors.Join(ErrNoLocalIP, err))
 	}
 
