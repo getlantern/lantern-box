@@ -72,12 +72,12 @@ changelog:
 
 release:
   replace_existing_artifacts: true
-  # Only a fleet release (see auto-tag.yaml) may become GitHub's latest
-  # release, which is what lantern-cloud rolls the proxy fleet to. Any other
-  # release, including one built without FLEET_RELEASE set, stays off it.
-  # A fleet release leaves the choice to GitHub, so re-running an old tag's
-  # release can't make it latest.
-  make_latest: '{{ if ne (envOrDefault "FLEET_RELEASE" "false") "true" }}false{{ end }}'
+  # Only a fleet release (see auto-tag.yaml) becomes GitHub's latest release,
+  # which is what lantern-cloud rolls the proxy fleet to. Any other release,
+  # including one built without FLEET_RELEASE set, stays off it. Set
+  # explicitly either way: GitHub only picks latest by itself for a release
+  # it's publishing, so a fleet run on an existing release must ask.
+  make_latest: '{{ if eq (envOrDefault "FLEET_RELEASE" "false") "true" }}true{{ else }}false{{ end }}'
 
 nfpms:
   - id: lantern-box

@@ -88,5 +88,6 @@ jobs:
         run: |
           gh workflow run release.yaml --ref "$RELEASE_REF" -f fleet="$FLEET"
           # The versioned sing-box image that lantern-cloud pins triangle
-          # backends to. A GITHUB_TOKEN tag push doesn't trigger push.yaml.
-          gh workflow run push.yaml --ref "$RELEASE_REF"
+          # backends to, and for a fleet release sing-box:latest. A
+          # GITHUB_TOKEN tag push doesn't trigger push.yaml.
+          gh workflow run push.yaml --ref "$RELEASE_REF" -f fleet="$FLEET"
