@@ -125,7 +125,7 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 		rtcOpt.NATFailTimeout = natFail
 	}
 	if len(ignored) > 0 {
-		lg.WarnContext(ctx, "unbounded volunteer: ignoring unknown or invalid tuning options", "ignored", ignored)
+		lg.WarnContext(ctx, "unbounded volunteer: ignoring unknown or invalid tuning options", "ignored", strings.Join(ignored, ","))
 	}
 	if opts.STUNBatchSize > 0 {
 		rtcOpt.STUNBatchSize = uint32(opts.STUNBatchSize)
