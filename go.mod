@@ -6,6 +6,10 @@ go 1.26.10
 
 replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.13.20-0.20261019115333-624aa48e0252
 
+// v0.2.8 plus pooled shadowaead chunk buffers: upstream holds two ~64 KB
+// buffers per ss2022 connection for its whole life, even while idle.
+replace github.com/sagernet/sing-shadowsocks => github.com/getlantern/sing-shadowsocks v0.2.8-lantern.3
+
 // replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4
 
 replace github.com/tetratelabs/wazero => github.com/getlantern/wazero v1.11.0-water.1
