@@ -198,16 +198,20 @@ func (p *mappedPortPool) establish(ctx context.Context, req mappedPortRequest) (
 		if err == nil {
 			return
 		}
-		_ = conn.Close()
-		if mapper != nil {
-			// In the background: the attempt's time is spent, and a gateway that
-			// answered the add will most likely answer this.
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
-				defer cancel()
-				_ = mapper.UnmapPort(ctx)
-			}()
+		if mapper == nil {
+			_ = conn.Close()
+			return
 		}
+		// In the background: the attempt's time is spent, and a gateway that
+		// answered the add will most likely answer this. The socket holds the
+		// port until the mapping is gone, so no later attempt can map the same
+		// port only to have this delete it.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
+			defer cancel()
+			_ = mapper.UnmapPort(ctx)
+			_ = conn.Close()
+		}()
 	}()
 
 	udpAddr, ok := conn.LocalAddr().(*net.UDPAddr)
@@ -278,21 +282,24 @@ func (p *mappedPortPool) release(m *mappedPort) {
 	if p.current == m {
 		p.current = nil
 	}
-	// Under mu, so an acquirer that comes next finds a manual port free.
-	_ = m.mux.Close()
 	p.mu.Unlock()
 
+	// The mux, and with it the socket, holds the port until the mapping is
+	// gone, so no acquirer can map the same port only to have this delete it.
 	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
 	defer cancel()
 	_ = m.mapper.UnmapPort(ctx)
+	_ = m.mux.Close()
 }
 
 // listenMappedUDP binds the mapped socket on port, or a random one if port is
 // 0, kept off the VPN tunnel the way rtcNet.ListenUDP keeps pion's sockets off
-// it. Wildcard, since the mapping names whichever address portforward finds.
+// it. Wildcard, since the mapping names whichever address portforward finds,
+// and dual-stack: pion gathers host candidates only on the mux once there is
+// one, so an IPv4-only socket would lose every IPv6 host candidate.
 func listenMappedUDP(ctx context.Context, port uint16) (net.PacketConn, error) {
 	lc := net.ListenConfig{Control: bindEgressToPhysicalInterface(ctx)}
-	return lc.ListenPacket(ctx, "udp4", net.JoinHostPort("0.0.0.0", strconv.Itoa(int(port))))
+	return lc.ListenPacket(ctx, "udp", net.JoinHostPort("", strconv.Itoa(int(port))))
 }
 
 var cgnat = netip.MustParsePrefix("100.64.0.0/10")

@@ -39,6 +39,8 @@ type fakeMapper struct {
 	unmapped     atomic.Int32
 	unmappedOnce chan struct{}
 	once         sync.Once
+	// onUnmap, if set, runs as UnmapPort starts.
+	onUnmap func()
 }
 
 func newFakeMapper() *fakeMapper {
@@ -64,6 +66,9 @@ func (f *fakeMapper) MapPort(_ context.Context, protocol string, internalPort ui
 func (f *fakeMapper) StartRenewal(context.Context) { f.renewals.Add(1) }
 
 func (f *fakeMapper) UnmapPort(context.Context) error {
+	if f.onUnmap != nil {
+		f.onUnmap()
+	}
 	f.unmapped.Add(1)
 	f.once.Do(func() { close(f.unmappedOnce) })
 	return nil
@@ -200,8 +205,11 @@ func TestMappedPort_LastReleaseUnmapsAndCloses(t *testing.T) {
 	assert.Zero(t, fm.unmapped.Load(), "another holder still uses the mapping")
 	assert.False(t, tp.conn(0).closed.Load(), "another holder still uses the socket")
 
+	var closedAtUnmap atomic.Bool
+	fm.onUnmap = func() { closedAtUnmap.Store(tp.conn(0).closed.Load()) }
 	tp.release(b)
 	assert.EqualValues(t, 1, fm.unmapped.Load(), "the last release removes the mapping")
+	assert.False(t, closedAtUnmap.Load(), "the socket holds the port until the mapping is gone")
 	assert.True(t, tp.conn(0).closed.Load(), "the last release closes the socket")
 
 	c := tp.acquire(context.Background(), mappedPortRequest{})
@@ -304,6 +312,8 @@ func TestMappedPort_UnusableMappingYieldsNone(t *testing.T) {
 			fm.externalIP = tc.ip
 			fm.portOffset = tc.portOffset
 			tp := newTestPool(t, func(context.Context) (portMapper, error) { return fm, nil })
+			var closedAtUnmap atomic.Bool
+			fm.onUnmap = func() { closedAtUnmap.Store(tp.conn(0).closed.Load()) }
 
 			assert.Nil(t, tp.acquire(context.Background(), mappedPortRequest{}))
 			select {
@@ -311,7 +321,8 @@ func TestMappedPort_UnusableMappingYieldsNone(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("the mapping was not removed")
 			}
-			assert.True(t, tp.conn(0).closed.Load(), "the socket is closed")
+			assert.False(t, closedAtUnmap.Load(), "the socket holds the port until the mapping is gone")
+			assert.Eventually(t, tp.conn(0).closed.Load, 5*time.Second, 10*time.Millisecond, "the socket is closed")
 			assert.Zero(t, fm.renewals.Load(), "no renewal for a mapping that isn't used")
 		})
 	}
@@ -519,4 +530,21 @@ func TestOutbound_CloseLeavesRTCOptForLingeringWorkers(t *testing.T) {
 		// Workers may still run after Stop returns.
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// The mapped socket is dual-stack: pion gathers host candidates only on the
+// mux, so an IPv4-only socket would cost every IPv6 host candidate.
+func TestListenMappedUDP_DualStack(t *testing.T) {
+	v6, err := net.ListenPacket("udp6", "[::1]:0")
+	if err != nil {
+		t.Skip("no IPv6 on this host")
+	}
+	v6.Close()
+	pc, err := listenMappedUDP(context.Background(), 0)
+	require.NoError(t, err)
+	defer pc.Close()
+	addr, ok := pc.LocalAddr().(*net.UDPAddr)
+	require.True(t, ok)
+	assert.Nil(t, addr.IP.To4(), "bound to %v, want the IPv6 wildcard", addr.IP)
+	assert.True(t, addr.IP.IsUnspecified(), "bound to %v, want the IPv6 wildcard", addr.IP)
 }
