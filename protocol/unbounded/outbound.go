@@ -96,6 +96,16 @@ type Outbound struct {
 	// gated on a follow-up that adds a re-pairing API in broflake. See
 	// watchdog.go for the trip heuristic.
 	watchdog *dialWatchdog
+
+	// ctx is the box's context, kept for Start: the mapped port's socket is
+	// kept off the tunnel through the NetworkManager it carries.
+	ctx         context.Context
+	manualPort  uint16
+	stunServers []string
+	mappedPorts *mappedPortPool
+	// mappedPort, if Start got one, carries this outbound's host candidates.
+	// Released in Close, once the widget using it has stopped.
+	mappedPort *mappedPort
 }
 
 // tlsProvider carries the inputs needed to generate a TLS config lazily at
@@ -194,6 +204,10 @@ func NewOutbound(
 			ca:         opts.EgressCA,
 			serverName: opts.EgressServerName,
 		},
+		ctx:         ctx,
+		manualPort:  lbAdapter.UnboundedManualPortFromContext(ctx),
+		stunServers: append([]string(nil), opts.STUNServers...),
+		mappedPorts: sharedMappedPorts,
 	}
 	o.uot = &uot.Client{
 		Dialer:  (*uotDialer)(o),
@@ -227,14 +241,20 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 		return fmt.Errorf("unbounded: build TLS config: %w", err)
 	}
 
+	// Before NewBroflake, whose consumer slots read rtcOpt as they build their
+	// peer connections.
+	o.acquireMappedPort()
+
 	bfConn, ui, err := UBClientcore.NewBroflake(o.bfOpt, o.rtcOpt, o.egOpt)
 	if err != nil {
+		o.releaseMappedPort()
 		return fmt.Errorf("unbounded: start broflake: %w", err)
 	}
 	o.logger.InfoContext(startCtx, "unbounded broflake built", "elapsed", time.Since(startedAt))
 	ql, err := UBClientcore.NewQUICLayer(bfConn, tlsConf)
 	if err != nil {
 		ui.Stop()
+		o.releaseMappedPort()
 		return fmt.Errorf("unbounded: start QUIC layer: %w", err)
 	}
 
@@ -261,7 +281,36 @@ func (o *Outbound) Close() error {
 	if o.ql != nil {
 		o.ql.Close()
 	}
+	o.releaseMappedPort()
 	return nil
+}
+
+// acquireMappedPort has the outbound's host candidates carried on the shared
+// mapped port and advertised at the router's address, if a mapping can be had.
+// Otherwise the outbound runs on STUN alone, as it always has.
+func (o *Outbound) acquireMappedPort() {
+	m := o.mappedPorts.acquire(o.ctx, mappedPortRequest{
+		manualPort:  o.manualPort,
+		stunServers: o.stunServers,
+		net:         o.rtcOpt.Net,
+		logger:      o.logger,
+	})
+	if m == nil {
+		return
+	}
+	o.mappedPort = m
+	o.rtcOpt.ICEUDPMux = m.mux
+	o.rtcOpt.ICEUDPMuxExternalIP = m.externalIP
+}
+
+func (o *Outbound) releaseMappedPort() {
+	if o.mappedPort == nil {
+		return
+	}
+	o.rtcOpt.ICEUDPMux = nil
+	o.rtcOpt.ICEUDPMuxExternalIP = ""
+	o.mappedPorts.release(o.mappedPort)
+	o.mappedPort = nil
 }
 
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
