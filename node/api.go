@@ -81,8 +81,10 @@ func (a *api) register(ctx context.Context, req registerRequest) (*registerRespo
 	if err := a.do(ctx, "/peer/register", req, &resp); err != nil {
 		return nil, fmt.Errorf("register: %w", err)
 	}
-	if resp.RouteID == "" || resp.ServerConfig == "" {
-		return nil, errors.New("register: response has no route or config")
+	// A response without a config still names the route, so start can
+	// deregister it once launch refuses the config.
+	if resp.RouteID == "" {
+		return nil, errors.New("register: response has no route")
 	}
 	return &resp, nil
 }
@@ -108,6 +110,30 @@ func (a *api) deregister(ctx context.Context, routeID string) error {
 		return fmt.Errorf("deregister: %w", err)
 	}
 	return nil
+}
+
+// sameOrigin returns a copy of c that follows redirects only within the
+// request's scheme and host. Every request carries the device ID, which
+// authorizes deregistering the node's route, so a redirect must not hand it to
+// another host or downgrade it to plain HTTP. c's own redirect policy still
+// applies within the origin.
+func sameOrigin(c *http.Client) *http.Client {
+	cp := *c
+	next := c.CheckRedirect
+	cp.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		first := via[0].URL
+		if req.URL.Scheme != first.Scheme || req.URL.Host != first.Host {
+			return fmt.Errorf("refusing redirect to another origin: %s", req.URL.Redacted())
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return &cp
 }
 
 func (a *api) do(ctx context.Context, path string, body, out any) error {

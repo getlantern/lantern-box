@@ -50,6 +50,8 @@ type fakeCloud struct {
 	// connection when the status is -1.
 	registerFails func(n int) int
 	config        string
+	// noConfig answers registrations with a route but no config.
+	noConfig bool
 }
 
 func (f *fakeCloud) handler(w http.ResponseWriter, r *http.Request) {
@@ -78,7 +80,11 @@ func (f *fakeCloud) handler(w http.ResponseWriter, r *http.Request) {
 		if f.routes == 0 || f.newRouteIDs {
 			f.routes++
 		}
-		_ = json.NewEncoder(w).Encode(registerResponse{RouteID: fmt.Sprintf("route-%d", f.routes), ServerConfig: f.config, HeartbeatIntervalSeconds: 150})
+		config := f.config
+		if f.noConfig {
+			config = ""
+		}
+		_ = json.NewEncoder(w).Encode(registerResponse{RouteID: fmt.Sprintf("route-%d", f.routes), ServerConfig: config, HeartbeatIntervalSeconds: 150})
 	case "/v1/peer/verify":
 		if f.verifyStatus != 0 {
 			w.WriteHeader(f.verifyStatus)
@@ -337,6 +343,65 @@ func TestRotationStartsOverWhenUncertain(t *testing.T) {
 			assert.Zero(t, open)
 		})
 	}
+}
+
+// Refused rotations closer together than heartbeats don't hold the heartbeats
+// off, which would let the route expire.
+func TestRefusedRotationsKeepHeartbeating(t *testing.T) {
+	cloud := &fakeCloud{t: t, registerFails: func(n int) int {
+		if n > 1 {
+			return http.StatusTooManyRequests
+		}
+		return 0
+	}}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{RotationInterval: 20 * time.Millisecond})
+	n.heartbeatOverride = 100 * time.Millisecond
+	stop := runNode(t, n)
+	require.Eventually(t, func() bool {
+		_, _, heartbeats, _ := cloud.snapshot()
+		return len(heartbeats) >= 2
+	}, 5*time.Second, 10*time.Millisecond)
+	stop()
+}
+
+// A registration answered with a route but no config is deregistered.
+func TestStartDeregistersARouteWithoutConfig(t *testing.T) {
+	cloud := &fakeCloud{t: t, noConfig: true}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{})
+	_, err := n.start(box.BaseContext())
+	require.ErrorContains(t, err, "no config")
+	_, _, _, deregistered := cloud.snapshot()
+	assert.Equal(t, []string{"route-1"}, deregistered)
+	started, _ := boxes.state()
+	assert.Zero(t, started)
+}
+
+// The API client follows a redirect within lantern-cloud's origin, and
+// refuses one to another host, which would receive the device ID.
+func TestAPIRedirectsStayInOrigin(t *testing.T) {
+	var elsewhere atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		elsewhere.Add(1)
+	}))
+	t.Cleanup(other.Close)
+	var target string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/peer/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("/v1/moved/peer/heartbeat", func(w http.ResponseWriter, r *http.Request) {})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	a := &api{httpClient: sameOrigin(srv.Client()), baseURL: srv.URL + "/v1", deviceID: "device-1"}
+
+	target = "/v1/moved/peer/heartbeat"
+	require.NoError(t, a.heartbeat(context.Background(), "route-1", 0))
+
+	target = other.URL + "/peer/heartbeat"
+	require.ErrorContains(t, a.heartbeat(context.Background(), "route-1", 0), "another origin")
+	assert.Zero(t, elsewhere.Load(), "the other host never sees the request")
 }
 
 // Limits the volunteer service would refuse are refused before the node

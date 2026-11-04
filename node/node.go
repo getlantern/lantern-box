@@ -135,7 +135,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	n := &node{
 		cfg: cfg,
-		api: &api{httpClient: httpClient, baseURL: cfg.APIURL, deviceID: st.DeviceID,
+		api: &api{httpClient: sameOrigin(httpClient), baseURL: cfg.APIURL, deviceID: st.DeviceID,
 			userID: cfg.UserID, featureOverrides: cfg.FeatureOverrides, version: cfg.Version},
 		port:     st.Port,
 		newBox:   newSingBox,
@@ -210,6 +210,9 @@ func (n *node) register(ctx context.Context) (*registerResponse, error) {
 // launch starts a box for a registered route and verifies it. On failure the
 // box is closed, but the route is the caller's to deregister.
 func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, error) {
+	if resp.ServerConfig == "" {
+		return nil, errors.New("register: response has no config")
+	}
 	options, volunteer, err := applyOperatorLimits(ctx, resp.ServerConfig, n.cfg.MaxPeers, n.cfg.BandwidthLimit)
 	if err != nil {
 		return nil, err
@@ -272,8 +275,13 @@ func (n *node) serve(ctx context.Context, s *session) {
 				}
 				return
 			}
+			// A refused rotation keeps s, and its heartbeats stay on schedule:
+			// rotations closer together than heartbeats would otherwise
+			// starve them until the route expired.
+			if next != s {
+				heartbeat.Reset(next.heartbeat)
+			}
 			s = next
-			heartbeat.Reset(s.heartbeat)
 			rotate.Reset(n.rotation)
 		}
 	}
