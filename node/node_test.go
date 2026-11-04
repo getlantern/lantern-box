@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/sagernet/sing-box/option"
 	sjson "github.com/sagernet/sing/common/json"
 	"github.com/stretchr/testify/assert"
@@ -38,10 +39,17 @@ type fakeCloud struct {
 	heartbeats   []heartbeatRequest
 	deregistered []string
 	routes       int
+	// newRouteIDs gives every registration a new route ID. Otherwise, like
+	// lantern-cloud, a node registering the same port gets the same one.
+	newRouteIDs bool
 	// verifyStatus and heartbeatStatus, when set, are answered instead of 200.
 	verifyStatus    int
 	heartbeatStatus int
-	config          string
+	// registerFails, when set, decides from the registration's number,
+	// counting from 1, whether it fails: with a status, or by dropping the
+	// connection when the status is -1.
+	registerFails func(n int) int
+	config        string
 }
 
 func (f *fakeCloud) handler(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +62,22 @@ func (f *fakeCloud) handler(w http.ResponseWriter, r *http.Request) {
 		var req registerRequest
 		require.NoError(f.t, json.NewDecoder(r.Body).Decode(&req))
 		f.registers = append(f.registers, req)
-		f.routes++
+		if f.registerFails != nil {
+			switch status := f.registerFails(len(f.registers)); status {
+			case 0:
+			case -1:
+				conn, _, err := w.(http.Hijacker).Hijack()
+				require.NoError(f.t, err)
+				_ = conn.Close()
+				return
+			default:
+				w.WriteHeader(status)
+				return
+			}
+		}
+		if f.routes == 0 || f.newRouteIDs {
+			f.routes++
+		}
 		_ = json.NewEncoder(w).Encode(registerResponse{RouteID: fmt.Sprintf("route-%d", f.routes), ServerConfig: f.config, HeartbeatIntervalSeconds: 150})
 	case "/v1/peer/verify":
 		if f.verifyStatus != 0 {
@@ -217,10 +240,36 @@ func TestNodeRegistersAgainWhenRouteIsLost(t *testing.T) {
 	assert.False(t, boxes.overlap.Load(), "the old box closes before the new one starts")
 }
 
-// Rotation registers a new route, closes the old box before starting the new
-// one on the same port, and deregisters the old route.
+// Rotation registers the node's route again, which lantern-cloud keys by
+// address and port so its ID stays the same, and restarts the box: the old
+// one closes before the new one takes the port, and the route, still live, is
+// not deregistered.
 func TestNodeRotates(t *testing.T) {
 	cloud := &fakeCloud{t: t}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{RotationInterval: 50 * time.Millisecond})
+	n.heartbeatOverride = time.Hour
+	stop := runNode(t, n)
+	require.Eventually(t, func() bool {
+		started, _ := boxes.state()
+		return started >= 3
+	}, 5*time.Second, 10*time.Millisecond)
+	_, registers, _, deregistered := cloud.snapshot()
+	assert.GreaterOrEqual(t, len(registers), 3)
+	assert.Empty(t, deregistered, "rotation keeps the route it registered again")
+	stop()
+
+	_, _, _, deregistered = cloud.snapshot()
+	assert.Equal(t, []string{"route-1"}, deregistered, "only shutdown deregisters it")
+	assert.False(t, boxes.overlap.Load(), "the old box closes before the new one starts")
+	_, open := boxes.state()
+	assert.Zero(t, open)
+}
+
+// If lantern-cloud hands out a new route ID on rotation, the old route is no
+// longer this node's to serve, and is deregistered.
+func TestNodeRotatesToANewRoute(t *testing.T) {
+	cloud := &fakeCloud{t: t, newRouteIDs: true}
 	boxes := &fakeBoxes{}
 	n := newTestNode(t, cloud, boxes, Config{RotationInterval: 50 * time.Millisecond})
 	n.heartbeatOverride = time.Hour
@@ -230,13 +279,81 @@ func TestNodeRotates(t *testing.T) {
 		return len(deregistered) >= 1
 	}, 5*time.Second, 10*time.Millisecond)
 	stop()
+	_, _, _, deregistered := cloud.snapshot()
+	assert.Equal(t, "route-1", deregistered[0])
+	assert.False(t, boxes.overlap.Load())
+}
 
-	_, registers, _, deregistered := cloud.snapshot()
-	assert.GreaterOrEqual(t, len(registers), 2)
-	assert.Equal(t, "route-1", deregistered[0], "the old route goes once the new one serves")
-	assert.False(t, boxes.overlap.Load(), "the old box closes before the new one starts")
+// When lantern-cloud refuses a rotation's registration, nothing changed on its
+// side, so the node keeps serving the route it has.
+func TestRotationKeepsServingWhenRefused(t *testing.T) {
+	cloud := &fakeCloud{t: t, registerFails: func(n int) int {
+		if n > 1 {
+			return http.StatusServiceUnavailable
+		}
+		return 0
+	}}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{RotationInterval: 30 * time.Millisecond})
+	n.heartbeatOverride = time.Hour
+	stop := runNode(t, n)
+	require.Eventually(t, func() bool {
+		_, registers, _, _ := cloud.snapshot()
+		return len(registers) >= 3
+	}, 5*time.Second, 10*time.Millisecond)
+	started, open := boxes.state()
+	_, _, _, deregistered := cloud.snapshot()
+	stop()
+	assert.Equal(t, 1, started, "the box keeps running")
+	assert.Equal(t, 1, open)
+	assert.Empty(t, deregistered)
+}
+
+// When a rotation's registration fails without an answer, lantern-cloud may
+// have switched the route to credentials the box doesn't have, so the node
+// closes it, deregisters, and starts over.
+func TestRotationStartsOverWhenUncertain(t *testing.T) {
+	cloud := &fakeCloud{t: t, registerFails: func(n int) int {
+		if n == 2 {
+			return -1
+		}
+		return 0
+	}}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{RotationInterval: time.Hour})
+	n.heartbeatOverride = time.Hour
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	s, err := n.start(ctx)
+	require.NoError(t, err)
+	next, err := n.rotate(ctx, s)
+	require.Error(t, err)
+	assert.Nil(t, next)
+	_, _, _, deregistered := cloud.snapshot()
+	assert.Equal(t, []string{"route-1"}, deregistered)
 	_, open := boxes.state()
 	assert.Zero(t, open)
+}
+
+// Limits the volunteer service would refuse are refused before the node
+// registers or builds a box.
+func TestRunRefusesBadLimits(t *testing.T) {
+	err := Run(box.BaseContext(), Config{StateDir: t.TempDir(), BandwidthLimit: "lots"})
+	assert.ErrorContains(t, err, "bandwidth limit")
+	err = Run(box.BaseContext(), Config{StateDir: t.TempDir(), MaxPeers: -1})
+	assert.ErrorContains(t, err, "max peers")
+}
+
+// A second node on the same state directory stops before registering.
+func TestRunRefusesASharedStateDir(t *testing.T) {
+	dir := t.TempDir()
+	lock := flock.New(filepath.Join(dir, "node.lock"))
+	locked, err := lock.TryLock()
+	require.NoError(t, err)
+	require.True(t, locked)
+	defer func() { _ = lock.Unlock() }()
+	err = Run(box.BaseContext(), Config{StateDir: dir, APIURL: "http://127.0.0.1:1"})
+	assert.ErrorContains(t, err, "another lantern-box serve")
 }
 
 // A route lantern-cloud can't verify is deregistered and its box closed, and

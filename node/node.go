@@ -7,12 +7,16 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/gofrs/flock"
 	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -20,6 +24,7 @@ import (
 
 	C "github.com/getlantern/lantern-box/constant"
 	LO "github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/protocol/unbounded"
 	"github.com/getlantern/lantern-box/tracker/peerconn"
 )
 
@@ -47,9 +52,6 @@ type Config struct {
 	// Port, when set, replaces the port kept in StateDir, for an operator who
 	// forwards a specific port.
 	Port uint16
-	// ExternalIP, when set, is the address lantern-cloud hands to clients.
-	// Otherwise it uses the address the node's requests come from.
-	ExternalIP string
 	// UserID is the operator's Lantern user ID, which the unbounded feature
 	// flag can enroll.
 	UserID string
@@ -98,6 +100,29 @@ type node struct {
 // error only when the node can't start at all, such as when its state can't
 // be read; lantern-cloud and box failures are logged and retried.
 func Run(ctx context.Context, cfg Config) error {
+	if cfg.MaxPeers < 0 {
+		return fmt.Errorf("max peers must not be negative, got %d", cfg.MaxPeers)
+	}
+	// Checked here because a box that fails to build can leave its inbound's
+	// port bound, so every retry would then fail.
+	if err := unbounded.ValidateBandwidthLimit(cfg.BandwidthLimit); err != nil {
+		return fmt.Errorf("bandwidth limit: %w", err)
+	}
+	// Two nodes sharing a state directory would register the same route and
+	// replace each other's credentials.
+	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", cfg.StateDir, err)
+	}
+	lock := flock.New(filepath.Join(cfg.StateDir, "node.lock"))
+	locked, err := lock.TryLock()
+	if err != nil {
+		return fmt.Errorf("lock %s: %w", cfg.StateDir, err)
+	}
+	if !locked {
+		return fmt.Errorf("another lantern-box serve is using %s", cfg.StateDir)
+	}
+	defer func() { _ = lock.Unlock() }()
+
 	st, err := loadState(cfg.StateDir)
 	if err != nil {
 		return fmt.Errorf("load node state: %w", err)
@@ -170,7 +195,6 @@ func (n *node) register(ctx context.Context) (*registerResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	return n.api.register(ctx, registerRequest{
-		ExternalIP:             n.cfg.ExternalIP,
 		ExternalPort:           n.port,
 		InternalPort:           n.port,
 		ServePool:              true,
@@ -250,20 +274,33 @@ func (n *node) serve(ctx context.Context, s *session) {
 	}
 }
 
-// rotate replaces s with a freshly registered route. The new route is
-// registered while s still serves, but the box has to close before the new
-// one can take the port. If registering fails, s keeps serving. If the new
-// box or its verify fails, both routes are deregistered and the error
-// returned, and the caller starts over.
+// rotate registers s's route again for fresh credentials and settings, and
+// restarts the box with them. lantern-cloud keys routes by address and port,
+// so the route ID normally stays the same; a different one means the old
+// route is no longer this node's to serve, and it is deregistered.
+//
+// If lantern-cloud refuses the registration, s keeps serving. If the request
+// failed some other way, lantern-cloud may have switched the route to new
+// credentials the box doesn't have, so nothing is kept. Otherwise the box has
+// to close before the new one can take the port. On error nothing is left
+// running or registered, and the caller starts over.
 func (n *node) rotate(ctx context.Context, s *session) (*session, error) {
 	resp, err := n.register(ctx)
 	if err != nil {
-		log.Warn("node: rotate: ", err, "; keeping route ", s.routeID)
-		return s, nil
+		var ae *apiError
+		if errors.As(err, &ae) {
+			log.Warn("node: rotate: ", err, "; keeping route ", s.routeID)
+			return s, nil
+		}
+		_ = s.box.Close()
+		n.deregister(s.routeID)
+		return nil, err
 	}
 	_ = s.box.Close()
+	if resp.RouteID != s.routeID {
+		n.deregister(s.routeID)
+	}
 	next, err := n.launch(ctx, resp)
-	n.deregister(s.routeID)
 	if err != nil {
 		n.deregister(resp.RouteID)
 		return nil, err

@@ -19,7 +19,6 @@ func init() {
 	serveCmd.Flags().String("api-url", "https://df.iantem.io/api/v1", "lantern-cloud API base URL")
 	serveCmd.Flags().String("state-dir", "", "Directory keeping the node's device ID and port (default: lantern-box under the user's config directory)")
 	serveCmd.Flags().Uint16("port", 0, "Port for the node's inbound, in place of the random one chosen on first run; forward it if the node is behind a router")
-	serveCmd.Flags().String("external-ip", "", "Public IP clients reach the node at (default: the address lantern-cloud sees the node's requests come from)")
 	serveCmd.Flags().String("user-id", "", "Your Lantern user ID, which can enroll this node")
 	serveCmd.Flags().Int("max-peers", 0, "How many censored users the Unbounded volunteer serves at once (default: lantern-box's)")
 	serveCmd.Flags().String("bandwidth-limit", "", "Cap on the Unbounded volunteer's traffic in each direction, such as 10mbit or 2MB/s (default: none)")
@@ -42,7 +41,6 @@ var serveCmd = &cobra.Command{
 		for _, err := range []error{
 			getString(f.GetString, "api-url", &cfg.APIURL),
 			getString(f.GetString, "state-dir", &cfg.StateDir),
-			getString(f.GetString, "external-ip", &cfg.ExternalIP),
 			getString(f.GetString, "user-id", &cfg.UserID),
 			getString(f.GetString, "bandwidth-limit", &cfg.BandwidthLimit),
 		} {

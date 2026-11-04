@@ -35,6 +35,7 @@ require (
 	github.com/getlantern/semconv v0.0.0-20261103162524-c0c2ac0e0a3e
 	github.com/getlantern/twiddle v0.0.0-20260914204124-f698a0d67d2f
 	github.com/gobwas/ws v1.4.0
+	github.com/gofrs/flock v0.13.1
 	github.com/hashicorp/yamux v0.1.2
 	github.com/huin/goupnp v1.3.0
 	github.com/jackpal/gateway v1.2.0
