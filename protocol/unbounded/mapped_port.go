@@ -90,7 +90,10 @@ type mappedPortPool struct {
 	current *mappedPort
 	// pending is closed when the attempt in flight ends, so concurrent
 	// acquirers wait for it rather than start their own.
-	pending  chan struct{}
+	pending chan struct{}
+	// retiring is closed once the last release has deleted the old mapping and
+	// closed its socket, so a new attempt doesn't find its port still bound.
+	retiring chan struct{}
 	failedAt time.Time
 }
 
@@ -137,6 +140,15 @@ func (p *mappedPortPool) acquire(parent context.Context, req mappedPortRequest) 
 		if !p.failedAt.IsZero() && p.now().Sub(p.failedAt) < p.retryAfter {
 			p.mu.Unlock()
 			return nil
+		}
+		if wait := p.retiring; wait != nil {
+			p.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return nil
+			}
 		}
 		if wait := p.pending; wait != nil {
 			p.mu.Unlock()
@@ -198,7 +210,9 @@ func (p *mappedPortPool) establish(ctx context.Context, req mappedPortRequest) (
 		if err == nil {
 			return
 		}
-		if mapper == nil {
+		// A manual forward's UnmapPort does nothing, so close its socket now:
+		// an acquirer woken next binds the same port.
+		if mapper == nil || req.manualPort != 0 {
 			_ = conn.Close()
 			return
 		}
@@ -282,6 +296,8 @@ func (p *mappedPortPool) release(m *mappedPort) {
 	if p.current == m {
 		p.current = nil
 	}
+	retired := make(chan struct{})
+	p.retiring = retired
 	p.mu.Unlock()
 
 	// The mux, and with it the socket, holds the port until the mapping is
@@ -290,6 +306,11 @@ func (p *mappedPortPool) release(m *mappedPort) {
 	defer cancel()
 	_ = m.mapper.UnmapPort(ctx)
 	_ = m.mux.Close()
+
+	p.mu.Lock()
+	p.retiring = nil
+	close(retired)
+	p.mu.Unlock()
 }
 
 // listenMappedUDP binds the mapped socket on port, or a random one if port is

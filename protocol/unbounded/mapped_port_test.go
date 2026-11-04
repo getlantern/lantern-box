@@ -548,3 +548,75 @@ func TestListenMappedUDP_DualStack(t *testing.T) {
 	assert.Nil(t, addr.IP.To4(), "bound to %v, want the IPv6 wildcard", addr.IP)
 	assert.True(t, addr.IP.IsUnspecified(), "bound to %v, want the IPv6 wildcard", addr.IP)
 }
+
+// manualTestPool is a pool whose manual forwarder is fm and whose STUN lookup
+// is stun, on a free port.
+func manualTestPool(t *testing.T, fm *fakeMapper, stun func(context.Context) (string, error)) (*testPool, uint16) {
+	t.Helper()
+	tp := newTestPool(t, func(context.Context) (portMapper, error) {
+		t.Error("gateway discovery used despite a manual port")
+		return nil, errors.New("unexpected")
+	})
+	fm.externalIP = ""
+	tp.manual = func(uint16) portMapper { return fm }
+	tp.stunIP = func(ctx context.Context, _ net.PacketConn, _ []string) (string, error) { return stun(ctx) }
+	return tp, freeUDPPort(t)
+}
+
+// A manual-port attempt cut short by its outbound closing frees the port before
+// waking the next acquirer, which can then bind it.
+func TestMappedPort_CanceledManualAttemptFreesPort(t *testing.T) {
+	fm := newFakeMapper()
+	var calls atomic.Int32
+	tp, port := manualTestPool(t, fm, func(ctx context.Context) (string, error) {
+		if calls.Add(1) == 1 {
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		return testPublicIP, nil
+	})
+	req := mappedPortRequest{manualPort: port, stunServers: []string{"stun:example.com:3478"}}
+
+	parent, cancel := context.WithCancel(context.Background())
+	first := make(chan *mappedPort, 1)
+	go func() { first <- tp.acquire(parent, req) }()
+	require.Eventually(t, func() bool { return calls.Load() == 1 }, 5*time.Second, time.Millisecond)
+	second := make(chan *mappedPort, 1)
+	go func() { second <- tp.acquire(context.Background(), req) }()
+	cancel()
+
+	assert.Nil(t, <-first)
+	m := <-second
+	require.NotNil(t, m, "the waiting acquirer could not bind the port the canceled attempt held")
+	tp.release(m)
+}
+
+// An acquirer that comes while the last release is still removing the mapping
+// waits for its socket to close, rather than fail to bind the manual port and
+// remember that failure.
+func TestMappedPort_AcquireWaitsForRetiringMapping(t *testing.T) {
+	fm := newFakeMapper()
+	tp, port := manualTestPool(t, fm, func(context.Context) (string, error) { return testPublicIP, nil })
+	req := mappedPortRequest{manualPort: port, stunServers: []string{"stun:example.com:3478"}}
+
+	m := tp.acquire(context.Background(), req)
+	require.NotNil(t, m)
+	unmapping, proceed := make(chan struct{}), make(chan struct{})
+	fm.onUnmap = func() {
+		close(unmapping)
+		<-proceed
+	}
+	go tp.release(m)
+	<-unmapping
+
+	next := make(chan *mappedPort, 1)
+	go func() { next <- tp.acquire(context.Background(), req) }()
+	time.Sleep(50 * time.Millisecond)
+	fm.onUnmap = nil
+	close(proceed)
+
+	n := <-next
+	require.NotNil(t, n, "the acquirer failed while the old mapping was retiring")
+	assert.NotSame(t, m, n)
+	tp.release(n)
+}
