@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -195,7 +196,8 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 		"discovery_srv", v.rtcOpt.DiscoverySrv,
 		"egress_addr", v.egOpt.Addr,
 		"max_peers", v.bfOpt.CTableSize,
-		"target_countries", v.rtcOpt.TargetCountries,
+		// sing-box's logger formats only strings, numbers, errors and Stringers, and panics on a slice.
+		"target_countries", strings.Join(v.rtcOpt.TargetCountries, ","),
 		"nat_fail_timeout", v.rtcOpt.NATFailTimeout,
 		"bandwidth_limit", v.bandwidth.String(),
 	)

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -207,8 +208,9 @@ func TestVolunteerServiceSendsGenesis(t *testing.T) {
 	freddieURL.Host = net.JoinHostPort("localhost", freddieURL.Port())
 
 	ctx := newVolunteerBoxContext(t)
+	// Logged at info, as a node logs by default, so the service's start-up log line is formatted.
 	opts, err := json.UnmarshalExtendedContext[sbOption.Options](ctx, []byte(fmt.Sprintf(`{
-		"log": {"disabled": true},
+		"log": {"level": "info", "output": %q},
 		"dns": {"strategy": "ipv4_only"},
 		"services": [{
 			"type": "unbounded",
@@ -218,9 +220,10 @@ func TestVolunteerServiceSendsGenesis(t *testing.T) {
 			"stun_servers": [%q],
 			"max_peers": 1,
 			"bandwidth_limit": "20mbit",
-			"stats_interval": -1
+			"stats_interval": -1,
+			"target_countries": ["CN", "IR"]
 		}]
-	}`, freddieURL.String(), "stun:"+stunAddr)))
+	}`, filepath.Join(t.TempDir(), "box.log"), freddieURL.String(), "stun:"+stunAddr)))
 	require.NoError(t, err)
 	b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
 	require.NoError(t, err)
