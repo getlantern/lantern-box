@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	semconv "github.com/getlantern/semconv"
@@ -27,6 +28,10 @@ import (
 // should treat this as "this network can't host a peer proxy" and surface it
 // to the user rather than retry indefinitely.
 var ErrNoPortForwarding = errors.New("no port forwarding available")
+
+// ErrNoLocalIP is returned by MapPort when it can't tell which LAN address to
+// map to.
+var ErrNoLocalIP = errors.New("could not determine the local address to map to")
 
 // Protocols a mapping can carry, as UPnP IGD names them.
 const (
@@ -97,6 +102,21 @@ type Forwarder struct {
 	// cleaned up after (see addLocked). MapPort refuses a port with any, so a
 	// stale add's cleanup can't remove a new mapping of the same port.
 	inflight map[portKey]int
+	// localIPControl, if set, is the socket control for the dial that finds the
+	// LAN address to map to. See SetLocalIPControl.
+	localIPControl func(network, address string, c syscall.RawConn) error
+}
+
+// SetLocalIPControl has MapPort find the LAN address to map to through a dial
+// whose socket fn controls, such as one bound to the physical interface while a
+// VPN tunnel holds the default route. Unbound, that dial would report the
+// tunnel's own address. With fn set, a failed dial fails MapPort rather than
+// fall back to scanning interfaces, which can pick the tunnel's interface too.
+// Call it before MapPort.
+func (f *Forwarder) SetLocalIPControl(fn func(network, address string, c syscall.RawConn) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.localIPControl = fn
 }
 
 type portKey struct {
@@ -229,10 +249,11 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 		return nil, err
 	}
 
-	internalIP, err := localIP()
+	internalIP, err := f.localIPLocked()
 	if err != nil {
-		slog.Warn("portforward: could not determine the local address to map to", "err", err)
-		return nil, fmt.Errorf("determine local ip: %w", err)
+		slog.Warn("portforward: could not determine the local address to map to",
+			"controlled", f.localIPControl != nil, "err", err)
+		return nil, fmt.Errorf("determine local ip: %w", errors.Join(ErrNoLocalIP, err))
 	}
 
 	const requestedLease uint32 = 3600
@@ -724,14 +745,27 @@ func (f *Forwarder) ExternalIP(ctx context.Context) (string, error) {
 // non-default IPv4 routing tables. UPnP IGD itself is IPv4 in IGDv1 and
 // almost always IPv4 in IGDv2, so we only consider IPv4 addresses.
 func localIP() (string, error) {
-	if ip, err := localIPByDial(); err == nil {
+	if ip, err := localIPByDial(&net.Dialer{}); err == nil {
 		return ip, nil
 	}
 	return localIPByInterfaceScan()
 }
 
-func localIPByDial() (string, error) {
-	conn, err := net.Dial("udp", "8.8.8.8:53")
+// localIPLocked is localIP through f's local IP control, if it has one. Called
+// with f.mu held.
+func (f *Forwarder) localIPLocked() (string, error) {
+	if f.localIPControl == nil {
+		return localIP()
+	}
+	return localIPByDial(&net.Dialer{Control: f.localIPControl})
+}
+
+// localIPProbeAddr is where localIPByDial "dials". A var only so tests can
+// make the dial fail.
+var localIPProbeAddr = "8.8.8.8:53"
+
+func localIPByDial(d *net.Dialer) (string, error) {
+	conn, err := d.Dial("udp", localIPProbeAddr)
 	if err != nil {
 		return "", fmt.Errorf("dial udp for local ip: %w", err)
 	}

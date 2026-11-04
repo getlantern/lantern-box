@@ -3,6 +3,7 @@ package unbounded
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"sync"
@@ -420,4 +421,20 @@ func TestStunExternalIP(t *testing.T) {
 	n, _, err := conn.ReadFrom(buf)
 	require.NoError(t, err, "a read after the query must not hit the query's deadline")
 	assert.Equal(t, "late", string(buf[:n]))
+}
+
+func TestMappedPort_LocalIPFailureIsItsOwnStage(t *testing.T) {
+	fm := newFakeMapper()
+	fm.mapErr = fmt.Errorf("determine local ip: %w", portforward.ErrNoLocalIP)
+	tp := newTestPool(t, func(context.Context) (portMapper, error) { return fm, nil })
+
+	m, stage, err := tp.establish(context.Background(), mappedPortRequest{})
+	assert.Nil(t, m)
+	require.ErrorIs(t, err, portforward.ErrNoLocalIP)
+	assert.Equal(t, "local_ip", stage)
+	assert.True(t, tp.conn(0).closed.Load(), "the socket is closed")
+
+	fm.mapErr = portforward.ErrNoPortForwarding
+	_, stage, _ = tp.establish(context.Background(), mappedPortRequest{})
+	assert.Equal(t, "map", stage, "other mapping failures stay under map")
 }

@@ -104,6 +104,11 @@ func newMappedPortPool() *mappedPortPool {
 			if err != nil {
 				return nil, err
 			}
+			// While the tunnel is up, an unbound dial reports the TUN's address,
+			// and the gateway would forward the port to it.
+			if ctl := bindEgressToPhysicalInterface(ctx); ctl != nil {
+				f.SetLocalIPControl(ctl)
+			}
 			return f, nil
 		},
 		manual: func(port uint16) portMapper {
@@ -221,6 +226,9 @@ func (p *mappedPortPool) establish(ctx context.Context, req mappedPortRequest) (
 		}
 	}
 	mapping, err := m.MapPort(ctx, portforward.UDP, port, mappedPortDescription)
+	if errors.Is(err, portforward.ErrNoLocalIP) {
+		return nil, "local_ip", err
+	}
 	if err != nil {
 		return nil, "map", err
 	}
