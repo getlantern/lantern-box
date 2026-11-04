@@ -130,7 +130,7 @@ func NewOutbound(
 	tuning, ignored := parseTuning(opts.Tuning)
 	rtcOpt.Tuning = tuning
 	if len(ignored) > 0 {
-		lg.WarnContext(ctx, "unbounded: ignoring unknown or invalid tuning options", "ignored", ignored)
+		lg.WarnContext(ctx, "unbounded: ignoring unknown or invalid tuning options", "ignored", strings.Join(ignored, ","))
 	}
 	setDurationSeconds(&rtcOpt.Patience, opts.Patience)
 	setDurationSeconds(&rtcOpt.ErrorBackoff, opts.ErrorBackoff)

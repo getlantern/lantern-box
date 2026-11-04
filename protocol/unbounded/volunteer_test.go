@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/pion/stun/v4"
 	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/adapter/outbound"
 	boxService "github.com/sagernet/sing-box/adapter/service"
 	"github.com/sagernet/sing-box/include"
 	sblog "github.com/sagernet/sing-box/log"
@@ -207,8 +209,9 @@ func TestVolunteerServiceSendsGenesis(t *testing.T) {
 	freddieURL.Host = net.JoinHostPort("localhost", freddieURL.Port())
 
 	ctx := newVolunteerBoxContext(t)
+	// Logged at info, as a node logs by default, so the service's start-up log line is formatted.
 	opts, err := json.UnmarshalExtendedContext[sbOption.Options](ctx, []byte(fmt.Sprintf(`{
-		"log": {"disabled": true},
+		"log": {"level": "info", "output": %q},
 		"dns": {"strategy": "ipv4_only"},
 		"services": [{
 			"type": "unbounded",
@@ -218,9 +221,10 @@ func TestVolunteerServiceSendsGenesis(t *testing.T) {
 			"stun_servers": [%q],
 			"max_peers": 1,
 			"bandwidth_limit": "20mbit",
-			"stats_interval": -1
+			"stats_interval": -1,
+			"target_countries": ["CN", "IR"]
 		}]
-	}`, freddieURL.String(), "stun:"+stunAddr)))
+	}`, filepath.Join(t.TempDir(), "box.log"), freddieURL.String(), "stun:"+stunAddr)))
 	require.NoError(t, err)
 	b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
 	require.NoError(t, err)
@@ -268,4 +272,36 @@ func startTestSTUNServer(t *testing.T) string {
 		}
 	}()
 	return conn.LocalAddr().String()
+}
+
+// Building the volunteer service and the outbound with tuning they don't know logs a warning
+// naming what was ignored. A box logging at trace formats it with sing-box's logger, which
+// panics on arguments it can't format, so the warning must pass only ones it can.
+func TestUnknownTuningLogsWithoutPanicking(t *testing.T) {
+	ctx := newVolunteerBoxContext(t)
+	reg, ok := service.FromContext[adapter.OutboundRegistry](ctx).(*outbound.Registry)
+	require.True(t, ok)
+	RegisterOutbound(reg)
+	opts, err := json.UnmarshalExtendedContext[sbOption.Options](ctx, []byte(fmt.Sprintf(`{
+		"log": {"level": "trace", "output": %q},
+		"outbounds": [{
+			"type": "unbounded",
+			"tag": "unbounded-out",
+			"discovery_srv": "https://freddie.invalid",
+			"egress_addr": "wss://egress.invalid",
+			"tuning": {"bogus": "1"}
+		}],
+		"services": [{
+			"type": "unbounded",
+			"tag": "volunteer",
+			"discovery_srv": "https://freddie.invalid",
+			"egress_addr": "wss://egress.invalid",
+			"stun_servers": ["stun:127.0.0.1:9"],
+			"tuning": {"bogus": "1"}
+		}]
+	}`, filepath.Join(t.TempDir(), "box.log"))))
+	require.NoError(t, err)
+	b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
+	require.NoError(t, err)
+	require.NoError(t, b.Close())
 }

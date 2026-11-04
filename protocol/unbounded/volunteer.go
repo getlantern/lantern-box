@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -124,7 +125,7 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 		rtcOpt.NATFailTimeout = natFail
 	}
 	if len(ignored) > 0 {
-		lg.WarnContext(ctx, "unbounded volunteer: ignoring unknown or invalid tuning options", "ignored", ignored)
+		lg.WarnContext(ctx, "unbounded volunteer: ignoring unknown or invalid tuning options", "ignored", strings.Join(ignored, ","))
 	}
 	if opts.STUNBatchSize > 0 {
 		rtcOpt.STUNBatchSize = uint32(opts.STUNBatchSize)
@@ -195,7 +196,8 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 		"discovery_srv", v.rtcOpt.DiscoverySrv,
 		"egress_addr", v.egOpt.Addr,
 		"max_peers", v.bfOpt.CTableSize,
-		"target_countries", v.rtcOpt.TargetCountries,
+		// sing-box's logger formats only strings, numbers, errors and Stringers, and panics on a slice.
+		"target_countries", strings.Join(v.rtcOpt.TargetCountries, ","),
 		"nat_fail_timeout", v.rtcOpt.NATFailTimeout,
 		"bandwidth_limit", v.bandwidth.String(),
 	)
