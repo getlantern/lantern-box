@@ -284,12 +284,12 @@ func TestNodeRotatesToANewRoute(t *testing.T) {
 	assert.False(t, boxes.overlap.Load())
 }
 
-// When lantern-cloud refuses a rotation's registration, nothing changed on its
-// side, so the node keeps serving the route it has.
+// When lantern-cloud refuses a rotation's registration with a 4xx, nothing
+// changed on its side, so the node keeps serving the route it has.
 func TestRotationKeepsServingWhenRefused(t *testing.T) {
 	cloud := &fakeCloud{t: t, registerFails: func(n int) int {
 		if n > 1 {
-			return http.StatusServiceUnavailable
+			return http.StatusTooManyRequests
 		}
 		return 0
 	}}
@@ -309,30 +309,34 @@ func TestRotationKeepsServingWhenRefused(t *testing.T) {
 	assert.Empty(t, deregistered)
 }
 
-// When a rotation's registration fails without an answer, lantern-cloud may
-// have switched the route to credentials the box doesn't have, so the node
-// closes it, deregisters, and starts over.
+// When a rotation's registration fails without a definite answer, a dropped
+// connection or a 5xx, lantern-cloud may have switched the route to
+// credentials the box doesn't have, so the node closes it, deregisters, and
+// starts over.
 func TestRotationStartsOverWhenUncertain(t *testing.T) {
-	cloud := &fakeCloud{t: t, registerFails: func(n int) int {
-		if n == 2 {
-			return -1
-		}
-		return 0
-	}}
-	boxes := &fakeBoxes{}
-	n := newTestNode(t, cloud, boxes, Config{RotationInterval: time.Hour})
-	n.heartbeatOverride = time.Hour
-	ctx, cancel := context.WithCancel(box.BaseContext())
-	defer cancel()
-	s, err := n.start(ctx)
-	require.NoError(t, err)
-	next, err := n.rotate(ctx, s)
-	require.Error(t, err)
-	assert.Nil(t, next)
-	_, _, _, deregistered := cloud.snapshot()
-	assert.Equal(t, []string{"route-1"}, deregistered)
-	_, open := boxes.state()
-	assert.Zero(t, open)
+	for name, failure := range map[string]int{"dropped": -1, "bad gateway": http.StatusBadGateway} {
+		t.Run(name, func(t *testing.T) {
+			cloud := &fakeCloud{t: t, registerFails: func(n int) int {
+				if n == 2 {
+					return failure
+				}
+				return 0
+			}}
+			boxes := &fakeBoxes{}
+			n := newTestNode(t, cloud, boxes, Config{RotationInterval: time.Hour})
+			ctx, cancel := context.WithCancel(box.BaseContext())
+			defer cancel()
+			s, err := n.start(ctx)
+			require.NoError(t, err)
+			next, err := n.rotate(ctx, s)
+			require.Error(t, err)
+			assert.Nil(t, next)
+			_, _, _, deregistered := cloud.snapshot()
+			assert.Equal(t, []string{"route-1"}, deregistered)
+			_, open := boxes.state()
+			assert.Zero(t, open)
+		})
+	}
 }
 
 // Limits the volunteer service would refuse are refused before the node

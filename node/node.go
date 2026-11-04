@@ -7,6 +7,8 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -146,7 +148,10 @@ func Run(ctx context.Context, cfg Config) error {
 	if n.rotation <= 0 {
 		n.rotation = DefaultRotationInterval
 	}
-	log.Info("node: device ", st.DeviceID, ", port ", n.port, ", state in ", cfg.StateDir)
+	// The device ID authorizes deregistering the node's route, so only a
+	// fingerprint of it is logged.
+	sum := sha256.Sum256([]byte(st.DeviceID))
+	log.Info("node: device ", hex.EncodeToString(sum[:4]), ", port ", n.port, ", state in ", cfg.StateDir)
 	return n.run(ctx)
 }
 
@@ -279,16 +284,17 @@ func (n *node) serve(ctx context.Context, s *session) {
 // so the route ID normally stays the same; a different one means the old
 // route is no longer this node's to serve, and it is deregistered.
 //
-// If lantern-cloud refuses the registration, s keeps serving. If the request
-// failed some other way, lantern-cloud may have switched the route to new
-// credentials the box doesn't have, so nothing is kept. Otherwise the box has
+// If lantern-cloud refuses the registration with a 4xx, s keeps serving. If
+// the request failed some other way, including a 5xx a gateway can return
+// after lantern-cloud committed, the route may now advertise credentials the
+// box doesn't have, so nothing is kept. Otherwise the box has
 // to close before the new one can take the port. On error nothing is left
 // running or registered, and the caller starts over.
 func (n *node) rotate(ctx context.Context, s *session) (*session, error) {
 	resp, err := n.register(ctx)
 	if err != nil {
 		var ae *apiError
-		if errors.As(err, &ae) {
+		if errors.As(err, &ae) && ae.status < http.StatusInternalServerError {
 			log.Warn("node: rotate: ", err, "; keeping route ", s.routeID)
 			return s, nil
 		}
