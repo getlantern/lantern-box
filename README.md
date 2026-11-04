@@ -725,9 +725,9 @@ go test -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acm
 
 ### Releases
 
-Every merge to `main` that changes the binary is tagged as the next patch release, and the proxy fleet follows GitHub's latest release, so lantern-cloud hot-swaps every box onto it.
+Every merge to `main` that changes the binary is tagged as the next patch release and published, so clients can depend on it. The proxy fleet follows GitHub's latest release: lantern-cloud hot-swaps every box onto it.
 
-A change that only matters to clients, such as a bump of a library only the client side uses, doesn't need that rollout. Label its PR `client-only` before merging: the release is still tagged and published, so clients can depend on it, but it isn't marked latest (nor pushed as `getlantern/lantern-box:latest`), and the fleet stays put. The next normal release carries the change to the fleet, or run `gh release edit vX.Y.Z --latest` to roll it out deliberately.
+By default a release doesn't roll the fleet: it isn't marked latest, nor pushed as `getlantern/lantern-box:latest`. To roll the fleet onto a change, label its PR `release` before merging. To roll out a release already published, run `gh release edit vX.Y.Z --latest`, or run the release workflow on its tag with `fleet` set.
 
 ## License
 
