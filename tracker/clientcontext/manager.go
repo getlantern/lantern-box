@@ -19,6 +19,7 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
+	"github.com/sagernet/sing/common/bufio/deadline"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -167,6 +168,40 @@ type readConn struct {
 	reader  io.Reader
 	info    ClientInfo
 	readErr error
+	// deadlineMu orders SetReadDeadline against streamReader choosing to
+	// bypass sing-box's deadline reader, and guards bypassed.
+	deadlineMu sync.Mutex
+	// bypassed is the connection under the deadline reader once reads bypass
+	// it, so read deadlines must also be set there.
+	bypassed net.Conn
+}
+
+// SetReadDeadline sets t on the connection and, once reads bypass sing-box's
+// deadline reader, on the connection under it, so t also interrupts bypassed
+// reads. A deadline that interrupts a bypassed read mid-chunk ends the stream:
+// the next chunk fails authentication, so no corrupted data is delivered.
+func (c *readConn) SetReadDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	err := c.Conn.SetReadDeadline(t)
+	if c.bypassed != nil {
+		err = errors.Join(err, c.bypassed.SetReadDeadline(t))
+	}
+	return err
+}
+
+// SetDeadline sets t for writes and, as SetReadDeadline does, for reads.
+// sing's deadline conn would pass the read deadline straight to the connection
+// under it, where SetReadDeadline could no longer change it, so the read and
+// write deadlines are set separately.
+func (c *readConn) SetDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	err := errors.Join(c.Conn.SetWriteDeadline(t), c.Conn.SetReadDeadline(t))
+	if c.bypassed != nil {
+		err = errors.Join(err, c.bypassed.SetReadDeadline(t))
+	}
+	return err
 }
 
 func (c *readConn) Read(b []byte) (n int, err error) {
@@ -215,13 +250,14 @@ func (c *readConn) readInfo() (ClientInfo, error) {
 // strips a frame, or restores head as ordinary traffic.
 func (c *readConn) consumeHead(head []byte) (ClientInfo, error) {
 	marker, ack := matchMarker(head)
+	stream := &streamReader{c: c}
 	if marker == "" {
-		c.reader = io.MultiReader(bytes.NewReader(head), c.Conn)
+		c.reader = io.MultiReader(bytes.NewReader(head), stream)
 		return ClientInfo{}, nil
 	}
 
 	var info ClientInfo
-	reader := io.MultiReader(bytes.NewReader(head[len(marker):]), c.Conn)
+	reader := io.MultiReader(bytes.NewReader(head[len(marker):]), stream)
 	dec := json.NewDecoder(reader)
 	if err := dec.Decode(&info); err != nil {
 		// The marker and part of the frame are already consumed; fail the
@@ -240,6 +276,79 @@ func (c *readConn) consumeHead(head []byte) (ClientInfo, error) {
 		}
 	}
 	return info, nil
+}
+
+// streamReader reads the stream after its head. Once sing-box's deadline
+// reader and every wrapper above it can be bypassed, reads go to the reader it
+// wraps for good. That reader runs each read on a new goroutine with a buffer
+// the size of the read, held until data arrives, so on a mostly idle proxy it
+// costs a goroutine and a buffer per connection.
+type streamReader struct {
+	c        *readConn
+	upstream io.Reader
+	// keep is set once the connection under the deadline reader is found not
+	// to support read deadlines, so reads must keep using the deadline reader.
+	keep bool
+}
+
+func (s *streamReader) Read(b []byte) (int, error) {
+	if s.upstream == nil && !s.bypass() {
+		return s.c.Conn.Read(b)
+	}
+	return s.upstream.Read(b)
+}
+
+// bypass switches reads past the deadline reader if nothing above or in it
+// holds data or a pending read, no deadline is set, and the connection under
+// it supports read deadlines itself.
+func (s *streamReader) bypass() bool {
+	if s.keep {
+		return false
+	}
+	s.c.deadlineMu.Lock()
+	defer s.c.deadlineMu.Unlock()
+	d := deadlineConnUnder(s.c.Conn)
+	if d == nil || !d.ReaderReplaceable() {
+		return false
+	}
+	upstream, ok := d.UpstreamReader().(io.Reader)
+	if !ok {
+		return false
+	}
+	raw, ok := d.Upstream().(net.Conn)
+	// Clearing an unset deadline changes nothing on a connection that supports
+	// deadlines; HTTP/2 and gRPC streams, which rely on the deadline reader,
+	// reject it.
+	if !ok || raw.SetReadDeadline(time.Time{}) != nil {
+		s.keep = true
+		return false
+	}
+	s.upstream = upstream
+	s.c.bypassed = raw
+	return true
+}
+
+// deadlineConnUnder walks conn's wrappers that can be bypassed now, such as a
+// drained cache of sniffed bytes, down to sing's deadline conn. It follows the
+// same path as sing's N.CastReader, which panics on a wrapper with no reader.
+func deadlineConnUnder(conn any) *deadline.Conn {
+	for conn != nil {
+		if d, ok := conn.(*deadline.Conn); ok {
+			return d
+		}
+		if r, ok := conn.(N.ReaderWithUpstream); !ok || !r.ReaderReplaceable() {
+			return nil
+		}
+		switch u := conn.(type) {
+		case N.WithUpstreamReader:
+			conn = u.UpstreamReader()
+		case common.WithUpstream:
+			conn = u.Upstream()
+		default:
+			return nil
+		}
+	}
+	return nil
 }
 
 // readHead reads from r after head until the bytes read either start with a
