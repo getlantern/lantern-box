@@ -275,10 +275,11 @@ func (n *node) serve(ctx context.Context, s *session) {
 				}
 				return
 			}
-			// A refused rotation keeps s, and its heartbeats stay on schedule:
-			// rotations closer together than heartbeats would otherwise
-			// starve them until the route expired.
-			if next != s {
+			// The heartbeat schedule carries over to the new session unless
+			// its interval changed: rotations closer together than heartbeats
+			// would otherwise starve them, and lantern-cloud would never hear
+			// the node's client count.
+			if next.heartbeat != s.heartbeat {
 				heartbeat.Reset(next.heartbeat)
 			}
 			s = next

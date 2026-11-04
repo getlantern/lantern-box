@@ -365,6 +365,21 @@ func TestRefusedRotationsKeepHeartbeating(t *testing.T) {
 	stop()
 }
 
+// Successful rotations closer together than heartbeats don't hold them off
+// either, so lantern-cloud still hears the node's client count.
+func TestFastRotationsKeepHeartbeating(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{RotationInterval: 20 * time.Millisecond})
+	n.heartbeatOverride = 100 * time.Millisecond
+	stop := runNode(t, n)
+	require.Eventually(t, func() bool {
+		_, _, heartbeats, _ := cloud.snapshot()
+		return len(heartbeats) >= 2
+	}, 5*time.Second, 10*time.Millisecond)
+	stop()
+}
+
 // A registration answered with a route but no config is deregistered.
 func TestStartDeregistersARouteWithoutConfig(t *testing.T) {
 	cloud := &fakeCloud{t: t, noConfig: true}
