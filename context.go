@@ -3,15 +3,41 @@ package box
 import (
 	"context"
 
+	sbox "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/experimental/libbox"
 	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing/service"
 
 	"github.com/getlantern/lantern-box/protocol"
 )
 
 // Context returns a context with all sing-box and lantern-box registries.
 func Context(ctx context.Context) context.Context {
-	ctx = include.Context(ctx)
+	return ContextWithDNSTransport(ctx, nil)
+}
+
+// ContextWithDNSTransport returns [Context], with `local` DNS servers resolved through the
+// [libbox.LocalDNSTransport] of platformInterface when it provides one, unless ctx already
+// carries a DNS transport registry. Unlike [BaseContextWithDNSTransport], it derives from ctx
+// and installs no file manager.
+func ContextWithDNSTransport(ctx context.Context, platformInterface PlatformInterface) context.Context {
+	var dnsRegistry adapter.DNSTransportRegistry = include.DNSTransportRegistry()
+	if platformInterface != nil {
+		if transport := platformInterface.LocalDNSTransport(); transport != nil {
+			dnsRegistry = service.FromContext[adapter.DNSTransportRegistry](
+				libbox.BaseContext(&platformAdapter{transport: transport}),
+			)
+		}
+	}
+	ctx = sbox.Context(ctx,
+		include.InboundRegistry(),
+		include.OutboundRegistry(),
+		include.EndpointRegistry(),
+		dnsRegistry,
+		include.ServiceRegistry(),
+		include.CertificateProviderRegistry(),
+	)
 	return protocol.RegisterProtocols(ctx)
 }
 
@@ -29,20 +55,20 @@ func BaseContext() context.Context {
 func BaseContextWithDNSTransport(platformInterface PlatformInterface) context.Context {
 	var pi libbox.PlatformInterface
 	if platformInterface != nil {
-		pi = &platformAdapter{pltIfc: platformInterface}
+		if transport := platformInterface.LocalDNSTransport(); transport != nil {
+			pi = &platformAdapter{transport: transport}
+		}
 	}
-	ctx := libbox.BaseContext(pi)
-	return protocol.RegisterProtocols(ctx)
+	return protocol.RegisterProtocols(libbox.BaseContext(pi))
 }
 
-// platformAdapter is a helper to adapt PlatformInterface to libbox.PlatformInterface and satisfy
-// libbox.BaseContext, which only uses LocalDNSTransport. This avoids misleading callers into thinking
-// they need to implement the full libbox.PlatformInterface when only LocalDNSTransport is required.
+// platformAdapter satisfies libbox.PlatformInterface for libbox.BaseContext, which calls only
+// LocalDNSTransport; any other method panics on the nil embedded interface.
 type platformAdapter struct {
 	libbox.PlatformInterface
-	pltIfc PlatformInterface
+	transport libbox.LocalDNSTransport
 }
 
 func (p *platformAdapter) LocalDNSTransport() libbox.LocalDNSTransport {
-	return p.pltIfc.LocalDNSTransport()
+	return p.transport
 }
