@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -12,6 +14,8 @@ import (
 	"time"
 
 	"github.com/pion/stun/v4"
+	sbAdapter "github.com/sagernet/sing-box/adapter"
+	sblog "github.com/sagernet/sing-box/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -330,11 +334,39 @@ func TestIsPublicIPv4(t *testing.T) {
 	assert.False(t, isPublicIPv4(""))
 }
 
+// newMappingTestOutbound builds an outbound on ctx and, if ctx enabled port
+// mapping, points it at tp instead of the process-wide pool.
+func newMappingTestOutbound(t *testing.T, ctx context.Context, tp *testPool) *Outbound {
+	t.Helper()
+	out, err := NewOutbound(ctx, nil, nil, "unbounded", option.UnboundedOutboundOptions{STUNServers: []string{"stun:a:1"}})
+	require.NoError(t, err)
+	o := out.(*Outbound)
+	if o.mappedPorts != nil {
+		require.Same(t, sharedMappedPorts, o.mappedPorts, "outbounds share the process-wide mapping")
+		o.mappedPorts = tp.mappedPortPool
+	}
+	return o
+}
+
 func TestOutbound_MappedPort(t *testing.T) {
+	t.Run("off without the context value", func(t *testing.T) {
+		tp := newTestPool(t, func(context.Context) (portMapper, error) {
+			t.Error("gateway reached without the embedder enabling mapping")
+			return newFakeMapper(), nil
+		})
+		o := newMappingTestOutbound(t, context.Background(), tp)
+		assert.Nil(t, o.mappedPorts, "the outbound holds no pool")
+
+		o.acquireMappedPort()
+		assert.Zero(t, tp.gatewayCalls.Load())
+		assert.Nil(t, o.rtcOpt.ICEUDPMux)
+		assert.Empty(t, o.rtcOpt.ICEUDPMuxExternalIP)
+		require.NoError(t, o.Close())
+	})
+
 	t.Run("failure leaves rtcOpt unset", func(t *testing.T) {
 		tp := newTestPool(t, func(context.Context) (portMapper, error) { return nil, portforward.ErrNoPortForwarding })
-		o := newTestOutbound(t, context.Background(), "unbounded")
-		o.mappedPorts = tp.mappedPortPool
+		o := newMappingTestOutbound(t, lbAdapter.ContextWithUnboundedPortMapping(context.Background(), 0), tp)
 
 		o.acquireMappedPort()
 		assert.EqualValues(t, 1, tp.gatewayCalls.Load(), "the outbound tried")
@@ -343,31 +375,45 @@ func TestOutbound_MappedPort(t *testing.T) {
 		require.NoError(t, o.Close())
 	})
 
-	t.Run("success sets rtcOpt and Close releases", func(t *testing.T) {
+	t.Run("port 0 asks the gateway, and Close releases", func(t *testing.T) {
 		fm := newFakeMapper()
 		tp := newTestPool(t, func(context.Context) (portMapper, error) { return fm, nil })
-		ctx := lbAdapter.ContextWithUnboundedManualPort(context.Background(), 0)
-		out, err := NewOutbound(ctx, nil, nil, "unbounded", option.UnboundedOutboundOptions{STUNServers: []string{"stun:a:1"}})
-		require.NoError(t, err)
-		o := out.(*Outbound)
-		o.mappedPorts = tp.mappedPortPool
+		o := newMappingTestOutbound(t, lbAdapter.ContextWithUnboundedPortMapping(context.Background(), 0), tp)
 
 		o.acquireMappedPort()
+		assert.EqualValues(t, 1, tp.gatewayCalls.Load())
 		require.NotNil(t, o.rtcOpt.ICEUDPMux)
 		assert.Equal(t, testPublicIP, o.rtcOpt.ICEUDPMuxExternalIP)
 
 		require.NoError(t, o.Close())
 		assert.EqualValues(t, 1, fm.unmapped.Load(), "Close releases the outbound's hold")
-		assert.Nil(t, o.rtcOpt.ICEUDPMux)
+		assert.True(t, tp.conn(0).closed.Load())
 		require.NoError(t, o.Close(), "a second Close releases nothing more")
 		assert.EqualValues(t, 1, fm.unmapped.Load())
 	})
 
-	t.Run("manual port comes from the context", func(t *testing.T) {
-		ctx := lbAdapter.ContextWithUnboundedManualPort(context.Background(), 40123)
-		o := newTestOutbound(t, ctx, "unbounded")
-		assert.Equal(t, uint16(40123), o.manualPort)
-		assert.Same(t, sharedMappedPorts, o.mappedPorts, "outbounds share the process-wide mapping")
+	t.Run("a manual port uses the manual forwarder", func(t *testing.T) {
+		tp := newTestPool(t, func(context.Context) (portMapper, error) {
+			t.Error("gateway discovery used despite a manual port")
+			return nil, errors.New("unexpected")
+		})
+		port := freeUDPPort(t)
+		manual := newFakeMapper()
+		manual.externalIP = ""
+		var manualPort uint16
+		tp.manual = func(p uint16) portMapper {
+			manualPort = p
+			return manual
+		}
+		tp.stunIP = func(context.Context, net.PacketConn, []string) (string, error) { return testPublicIP, nil }
+		o := newMappingTestOutbound(t, lbAdapter.ContextWithUnboundedPortMapping(context.Background(), port), tp)
+
+		o.acquireMappedPort()
+		assert.Equal(t, port, manualPort)
+		assert.Equal(t, port, <-tp.listenPorts)
+		require.NotNil(t, o.rtcOpt.ICEUDPMux)
+		assert.Zero(t, tp.gatewayCalls.Load())
+		require.NoError(t, o.Close())
 	})
 }
 
@@ -437,4 +483,40 @@ func TestMappedPort_LocalIPFailureIsItsOwnStage(t *testing.T) {
 	fm.mapErr = portforward.ErrNoPortForwarding
 	_, stage, _ = tp.establish(context.Background(), mappedPortRequest{})
 	assert.Equal(t, "map", stage, "other mapping failures stay under map")
+}
+
+// broflake's workers read rtcOpt's mux fields as they build peer connections,
+// and can outlive ui.Stop, so Close must not write them. Run with -race. The
+// overlap is a matter of timing, so it is tried several times.
+func TestOutbound_CloseLeavesRTCOptForLingeringWorkers(t *testing.T) {
+	discovery := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			<-r.Context().Done()
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(discovery.Close)
+
+	for range 8 {
+		fm := newFakeMapper()
+		tp := newTestPool(t, func(context.Context) (portMapper, error) { return fm, nil })
+		ctx := lbAdapter.ContextWithUnboundedPortMapping(context.Background(), 0)
+		out, err := NewOutbound(ctx, nil, sblog.NewNOPFactory().Logger(), "unbounded", option.UnboundedOutboundOptions{
+			DiscoverySrv:                  discovery.URL,
+			InsecureDoNotVerifyClientCert: true,
+		})
+		require.NoError(t, err)
+		o := out.(*Outbound)
+		o.mappedPorts = tp.mappedPortPool
+		require.NoError(t, o.Start(sbAdapter.StartStatePostStart))
+		require.NotNil(t, o.rtcOpt.ICEUDPMux, "Start took the mapping")
+
+		// At once, while the consumer's workers are still building their first
+		// peer connections.
+		require.NoError(t, o.Close())
+		assert.EqualValues(t, 1, fm.unmapped.Load(), "Close released the mapping")
+		// Workers may still run after Stop returns.
+		time.Sleep(100 * time.Millisecond)
+	}
 }

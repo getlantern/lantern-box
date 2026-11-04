@@ -102,6 +102,8 @@ type Outbound struct {
 	ctx         context.Context
 	manualPort  uint16
 	stunServers []string
+	// mappedPorts is nil unless the embedder enabled port mapping on the
+	// context.
 	mappedPorts *mappedPortPool
 	// mappedPort, if Start got one, carries this outbound's host candidates.
 	// Released in Close, once the widget using it has stopped.
@@ -205,9 +207,11 @@ func NewOutbound(
 			serverName: opts.EgressServerName,
 		},
 		ctx:         ctx,
-		manualPort:  lbAdapter.UnboundedManualPortFromContext(ctx),
 		stunServers: append([]string(nil), opts.STUNServers...),
-		mappedPorts: sharedMappedPorts,
+	}
+	if manualPort, enabled := lbAdapter.UnboundedPortMappingFromContext(ctx); enabled {
+		o.manualPort = manualPort
+		o.mappedPorts = sharedMappedPorts
 	}
 	o.uot = &uot.Client{
 		Dialer:  (*uotDialer)(o),
@@ -289,6 +293,9 @@ func (o *Outbound) Close() error {
 // mapped port and advertised at the router's address, if a mapping can be had.
 // Otherwise the outbound runs on STUN alone, as it always has.
 func (o *Outbound) acquireMappedPort() {
+	if o.mappedPorts == nil {
+		return
+	}
 	m := o.mappedPorts.acquire(o.ctx, mappedPortRequest{
 		manualPort:  o.manualPort,
 		stunServers: o.stunServers,
@@ -307,8 +314,10 @@ func (o *Outbound) releaseMappedPort() {
 	if o.mappedPort == nil {
 		return
 	}
-	o.rtcOpt.ICEUDPMux = nil
-	o.rtcOpt.ICEUDPMuxExternalIP = ""
+	// rtcOpt keeps pointing at the mux: broflake's workers read it as they
+	// build peer connections and can outlive ui.Stop, and a closed outbound is
+	// never started again. A worker that reaches the closed mux gets no
+	// muxed host candidate.
 	o.mappedPorts.release(o.mappedPort)
 	o.mappedPort = nil
 }
