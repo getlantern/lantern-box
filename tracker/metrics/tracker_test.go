@@ -218,6 +218,67 @@ func TestDeviceConnectedSpan(t *testing.T) {
 	assert.Equal(t, "10.0", attrs["client.version"])
 }
 
+// The expirable LRU runs a cleanup goroutine that never exits, which synctest
+// reports as a deadlock, so this test uses a short real TTL.
+func TestDeviceSpanGate(t *testing.T) {
+	g := newDeviceSpanGate(2, 50*time.Millisecond)
+	assert.True(t, g.first("a"), "a device's first connection emits")
+	assert.False(t, g.first("a"), "its later connections don't")
+	assert.True(t, g.first("b"), "each device is tracked separately")
+
+	time.Sleep(100 * time.Millisecond)
+	assert.True(t, g.first("a"), "a device emits again once its entry expires")
+
+	g = newDeviceSpanGate(2, time.Hour)
+	assert.True(t, g.first("a"))
+	assert.True(t, g.first("b"))
+	assert.True(t, g.first("c"), "past the size bound the least recent is forgotten")
+	assert.True(t, g.first("a"), "a forgotten device emits again")
+	assert.False(t, g.first("c"), "a recent device is still remembered")
+}
+
+// Repeated connections from one device emit device_id.connected once.
+func TestDeviceConnectedSpanOncePerDevice(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	prevTP := sdkotel.GetTracerProvider()
+	sdkotel.SetTracerProvider(tp)
+	prevGate := deviceSpans
+	deviceSpans = newDeviceSpanGate(deviceSpanMaxDevices, deviceSpanTTL)
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+		sdkotel.SetTracerProvider(prevTP)
+		deviceSpans = prevGate
+	})
+
+	tracker := NewTracker(context.Background())
+	defer tracker.Close()
+	route := func(deviceID string) {
+		t.Helper()
+		client, server := net.Pipe()
+		t.Cleanup(func() { client.Close(); server.Close() })
+		info := clientcontext.ClientInfo{DeviceID: deviceID, Platform: "android"}
+		tracker.RoutedConnection(context.Background(), infoConn{Conn: server, info: info}, adapter.InboundContext{}, nil, nil)
+	}
+	route("dev-1")
+	route("dev-1")
+	route("dev-1")
+	route("dev-2")
+
+	var devices []string
+	for _, s := range exporter.GetSpans() {
+		if s.Name != "device_id.connected" {
+			continue
+		}
+		for _, a := range s.Attributes {
+			if a.Key == "client.device_id" {
+				devices = append(devices, a.Value.AsString())
+			}
+		}
+	}
+	assert.Equal(t, []string{"dev-1", "dev-2"}, devices)
+}
+
 // Connections without client info are not tracked, so neither metrics nor the
 // device span are recorded for them.
 func TestUntracked(t *testing.T) {

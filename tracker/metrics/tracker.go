@@ -4,9 +4,12 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	semconv "github.com/getlantern/semconv"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -76,6 +79,43 @@ func trackIOLoop(ctx context.Context, reportC <-chan report) {
 	}
 }
 
+const (
+	// deviceSpanTTL is how long a device's first connection suppresses the
+	// device_id.connected span for its later connections.
+	deviceSpanTTL = time.Hour
+	// deviceSpanMaxDevices bounds the devices remembered; past it the least
+	// recently seen are forgotten, and their next connection emits again.
+	deviceSpanMaxDevices = 65536
+)
+
+// deviceSpans lets the device_id.connected span through once per device per
+// deviceSpanTTL. The span marks a device's initial connection, which the API
+// correlates with its proxy assignment; emitting it on every connection sent
+// the collector one span per connection (~1,600/s on a busy phost), almost all
+// of which were discarded downstream.
+var deviceSpans = newDeviceSpanGate(deviceSpanMaxDevices, deviceSpanTTL)
+
+type deviceSpanGate struct {
+	mu   sync.Mutex
+	seen *expirable.LRU[string, struct{}]
+}
+
+func newDeviceSpanGate(size int, ttl time.Duration) *deviceSpanGate {
+	return &deviceSpanGate{seen: expirable.NewLRU[string, struct{}](size, nil, ttl)}
+}
+
+// first reports whether deviceID has not been seen within the TTL, and records
+// it, so concurrent first connections from one device emit a single span.
+func (g *deviceSpanGate) first(deviceID string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.seen.Contains(deviceID) {
+		return false
+	}
+	g.seen.Add(deviceID, struct{}{})
+	return true
+}
+
 // emitDeviceConnectedSpan emits a correlation span for a
 // device_id's connection to the proxy, to be correlated with the
 // client's API proxy assignment to assess connectivity success rate
@@ -118,7 +158,9 @@ func connected(ctx context.Context, conn any, metadata adapter.InboundContext) (
 	}
 	attrs := metadataToAttributes(metadata)
 	attrs.client = &info
-	emitDeviceConnectedSpan(ctx, info)
+	if deviceSpans.first(info.DeviceID) {
+		emitDeviceConnectedSpan(ctx, info)
+	}
 	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return attrs, true
 }
