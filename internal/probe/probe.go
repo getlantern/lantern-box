@@ -10,13 +10,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing/common"
 	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
 
 	lAdapter "github.com/getlantern/lantern-box/adapter"
@@ -33,8 +32,11 @@ var ErrUnusableInput = errors.New("unusable probe input")
 // receipt, success also means the handler was reached. The connection is closed
 // before Run returns.
 //
-// The reported duration spans the handshake and the request, plus the dial for
-// an outbound that does not defer its handshake to first use.
+// The reported duration runs from the moment the request has been written to
+// the end of the response body: one round trip through the outbound to the
+// target. Connection setup (the dial, any proxy or TLS handshake, and a
+// handshake the outbound defers to the first write) is excluded, so outbounds
+// that establish connections differently are timed alike.
 //
 // out's DialContext must return once ctx is cancelled or its deadline passes;
 // Run returns no sooner than that dial does.
@@ -66,17 +68,17 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	probeCtx, cancel := context.WithTimeout(lAdapter.ContextWithProbe(ctx), timeout)
 	defer cancel()
 
-	start := time.Now()
 	conn, err := out.DialContext(probeCtx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
 	if err != nil {
 		return 0, fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
-	if earlyConn, ok := common.Cast[N.EarlyConn](conn); ok && earlyConn.NeedHandshake() {
-		start = time.Now()
-	}
 
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
+	var start time.Time
+	traceCtx := httptrace.WithClientTrace(probeCtx, &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { start = time.Now() },
+	})
+	req, err := http.NewRequestWithContext(traceCtx, http.MethodGet, probeURL, nil)
 	if err != nil {
 		return 0, fmt.Errorf("new request: %w", err)
 	}

@@ -185,11 +185,14 @@ type earlyConn struct{ net.Conn }
 
 func (earlyConn) NeedHandshake() bool { return true }
 
-func TestRun_DelayExcludesTheDialWhenTheHandshakeIsDeferred(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+func TestRun_DelayExcludesConnectionSetupForEveryOutbound(t *testing.T) {
+	const serverCost = 100 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverCost)
+	}))
 	defer srv.Close()
 	addr := strings.TrimPrefix(srv.URL, "http://")
-	const dialCost = 250 * time.Millisecond
+	const dialCost = 400 * time.Millisecond
 
 	slowDial := func(wrap func(net.Conn) net.Conn) func(context.Context) (net.Conn, error) {
 		return func(ctx context.Context) (net.Conn, error) {
@@ -202,15 +205,17 @@ func TestRun_DelayExcludesTheDialWhenTheHandshakeIsDeferred(t *testing.T) {
 		}
 	}
 
-	deferred := &stubOutbound{dial: slowDial(func(c net.Conn) net.Conn { return earlyConn{c} })}
-	delay, err := Run(context.Background(), deferred, srv.URL, 5*time.Second)
-	require.NoError(t, err)
-	assert.Less(t, delay, dialCost, "the timer restarts once a dial has only queued the handshake")
-
-	eager := &stubOutbound{dial: slowDial(func(c net.Conn) net.Conn { return c })}
-	delay, err = Run(context.Background(), eager, srv.URL, 5*time.Second)
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, delay, dialCost, "a conn that handshook while dialing is timed from before it")
+	for name, wrap := range map[string]func(net.Conn) net.Conn{
+		"deferred handshake": func(c net.Conn) net.Conn { return earlyConn{c} },
+		"handshake in dial":  func(c net.Conn) net.Conn { return c },
+	} {
+		t.Run(name, func(t *testing.T) {
+			delay, err := Run(context.Background(), &stubOutbound{dial: slowDial(wrap)}, srv.URL, 5*time.Second)
+			require.NoError(t, err)
+			assert.GreaterOrEqual(t, delay, serverCost, "the request's round trip is timed")
+			assert.Less(t, delay, dialCost, "connection setup is not")
+		})
+	}
 }
 
 func TestRun_DerivesPortFromScheme(t *testing.T) {
