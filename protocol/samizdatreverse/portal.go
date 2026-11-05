@@ -3,6 +3,7 @@ package samizdatreverse
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"maps"
@@ -80,6 +81,11 @@ type Portal struct {
 	ln        net.Listener
 	serveDone chan struct{}
 	rebinds   atomic.Int32 // listener swaps by Rebind, for tests
+	sessSeq   atomic.Uint64
+	// beforePublish, when set, runs in a session handler after HTTP/2 has
+	// started and before the session is published. Tests use it to line up
+	// concurrent handlers.
+	beforePublish func()
 	// beforeListen, when set, runs just before each bind. Tests use it to
 	// take the port first.
 	beforeListen func(port uint16)
@@ -93,6 +99,10 @@ type Portal struct {
 type portalSession struct {
 	shortID [8]byte
 	cc      *http2.ClientConn
+	// seq orders sessions by arrival. confirmed is set once the helper has
+	// answered a ping, before the session is published, and never after.
+	seq       uint64
+	confirmed bool
 }
 
 // NewPortal creates a portal inbound. It listens only once Configure gives
@@ -266,6 +276,15 @@ func (p *Portal) configureLocked(cfg PortalConfig) ([]*portalSession, error) {
 		return stale, err
 	}
 
+	// samizdat only loads the certificate at the first handshake, so check
+	// it here, before anything that serves now is touched.
+	if len(cfg.PrivateKey) != 32 {
+		return nil, fmt.Errorf("%s: private key must be 32 bytes", constant.TypeSamizdatPortal)
+	}
+	if _, err := tls.X509KeyPair(cfg.CertPEM, cfg.KeyPEM); err != nil {
+		return nil, fmt.Errorf("%s: certificate: %w", constant.TypeSamizdatPortal, err)
+	}
+
 	ids := make([][8]byte, 0, len(cfg.Pairings))
 	for id := range cfg.Pairings {
 		ids = append(ids, id)
@@ -437,36 +456,12 @@ func (p *Portal) handleSession(ctx context.Context, conn net.Conn, shortID [8]by
 	}
 	defer cc.Close()
 
-	// A session only replaces a live one once the helper has answered a
-	// ping on it. The bridge races IPv6 against IPv4 with the same short ID
-	// and closes the loser without serving HTTP/2. Without this check, a
-	// loser whose handshake finished late would close the working session.
-	// With no live session, publish at once: that adds no latency to the
-	// first connect, and an unconfirmed session is still replaced by any
-	// later one that answers.
-	p.sessMu.Lock()
-	cur := p.sessions[tag]
-	p.sessMu.Unlock()
-	if cur != nil && cur.cc.CanTakeNewRequest() {
-		pingCtx, cancel := context.WithTimeout(ctx, p.confirmTimeout)
-		err := cc.Ping(pingCtx)
-		cancel()
-		if err != nil {
-			return
-		}
+	if p.beforePublish != nil {
+		p.beforePublish()
 	}
-
-	s := &portalSession{shortID: shortID, cc: cc}
-	p.sessMu.Lock()
-	if p.pairings[shortID] != tag {
-		p.sessMu.Unlock()
+	s := &portalSession{shortID: shortID, cc: cc, seq: p.sessSeq.Add(1)}
+	if !p.publish(ctx, tag, s) {
 		return
-	}
-	old := p.sessions[tag]
-	p.sessions[tag] = s
-	p.sessMu.Unlock()
-	if old != nil {
-		old.cc.Close()
 	}
 
 	select {
@@ -479,6 +474,53 @@ func (p *Portal) handleSession(ctx context.Context, conn net.Conn, shortID [8]by
 		delete(p.sessions, tag)
 	}
 	p.sessMu.Unlock()
+}
+
+// publish stores s as the session for tag and closes the one it replaces.
+// It reports false if s should be dropped instead.
+//
+// A session only replaces a live one once its helper has answered a ping.
+// The bridge races IPv6 against IPv4 with the same short ID and closes the
+// loser without serving HTTP/2, so an unconfirmed loser must never close a
+// working session. An empty slot is filled at once, which adds no latency
+// to the first connect. A session published that way is unconfirmed, and
+// any confirmed one replaces it. Between confirmed sessions the newer
+// arrival wins, so a confirmation that finishes late cannot undo a newer
+// reconnect. The check and the store share one hold of sessMu; the ping
+// runs outside it, and the slot is evaluated again afterwards.
+func (p *Portal) publish(ctx context.Context, tag string, s *portalSession) bool {
+	for {
+		p.sessMu.Lock()
+		if p.pairings[s.shortID] != tag {
+			p.sessMu.Unlock()
+			return false
+		}
+		cur := p.sessions[tag]
+		replace := cur == nil || !cur.cc.CanTakeNewRequest() ||
+			(s.confirmed && (!cur.confirmed || cur.seq < s.seq))
+		if replace {
+			p.sessions[tag] = s
+			p.sessMu.Unlock()
+			if cur != nil {
+				cur.cc.Close()
+			}
+			return true
+		}
+		if s.confirmed || (cur.confirmed && cur.seq > s.seq) {
+			// A newer confirmed session holds the slot.
+			p.sessMu.Unlock()
+			return false
+		}
+		p.sessMu.Unlock()
+
+		pingCtx, cancel := context.WithTimeout(ctx, p.confirmTimeout)
+		err := s.cc.Ping(pingCtx)
+		cancel()
+		if err != nil {
+			return false
+		}
+		s.confirmed = true
+	}
 }
 
 // closeNotifyConn closes done when the HTTP/2 client closes the connection,

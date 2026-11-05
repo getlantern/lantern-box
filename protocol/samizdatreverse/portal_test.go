@@ -605,3 +605,95 @@ func TestPortalEmptyConfigStopsRetries(t *testing.T) {
 	require.NoError(t, p.Rebind())
 	assert.Nil(t, p.Addr(), "Rebind restarted a portal configured with no pairings")
 }
+
+func TestPortalInvalidCertLeavesPortalServing(t *testing.T) {
+	k := newTestKeys(t)
+	idA, idB := newShortID(t), newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	port := freePort(t)
+	pairings := map[[8]byte]string{idA: tagA, idB: tagB}
+	require.NoError(t, p.Configure(k.config(port, pairings)))
+	addr := portalAddr(t, p)
+	doneA := helper(t, addr, k, idA, "a")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a" }, 5*time.Second, 50*time.Millisecond)
+
+	bad := k.config(port, pairings)
+	bad.CertPEM = []byte("-----BEGIN CERTIFICATE-----\ngarbage\n-----END CERTIFICATE-----\n")
+	require.Error(t, p.Configure(bad))
+	short := k.config(port, pairings)
+	short.PrivateKey = short.PrivateKey[:16]
+	require.Error(t, p.Configure(short))
+
+	assert.Equal(t, addr, portalAddr(t, p))
+	assert.Equal(t, "a", whoServes(p, tagA), "existing session broken by a rejected config")
+	select {
+	case <-doneA:
+		t.Fatal("a rejected config closed a live session")
+	default:
+	}
+	helper(t, addr, k, idB, "b")
+	require.Eventually(t, func() bool { return whoServes(p, tagB) == "b" }, 5*time.Second, 50*time.Millisecond)
+}
+
+// TestPortalConcurrentFirstSessions lines up two handlers for one tag on an
+// empty slot, as the bridge's IPv6/IPv4 race can, with only one serving
+// HTTP/2. Whichever is released first, the serving one must end up published
+// and stay.
+func TestPortalConcurrentFirstSessions(t *testing.T) {
+	for _, servingFirst := range []bool{true, false} {
+		name := "silent released first"
+		if servingFirst {
+			name = "serving released first"
+		}
+		t.Run(name, func(t *testing.T) {
+			k := newTestKeys(t)
+			id := newShortID(t)
+			p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+			p.confirmTimeout = 500 * time.Millisecond
+			arrived := make(chan chan struct{}, 2)
+			p.beforePublish = func() {
+				release := make(chan struct{})
+				arrived <- release
+				<-release
+			}
+			require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+			addr := portalAddr(t, p)
+
+			waitArrival := func() chan struct{} {
+				select {
+				case r := <-arrived:
+					return r
+				case <-time.After(5 * time.Second):
+					t.Fatal("handler did not reach publication")
+					return nil
+				}
+			}
+			silent := silentSession(t, addr, k, id)
+			releaseSilent := waitArrival()
+			serving := helper(t, addr, k, id, "serving")
+			releaseServing := waitArrival()
+
+			if servingFirst {
+				close(releaseServing)
+				require.Eventually(t, func() bool { _, ok := p.Session(tagA); return ok }, 5*time.Second, 10*time.Millisecond)
+				close(releaseSilent)
+			} else {
+				close(releaseSilent)
+				require.Eventually(t, func() bool { _, ok := p.Session(tagA); return ok }, 5*time.Second, 10*time.Millisecond)
+				close(releaseServing)
+			}
+
+			select {
+			case <-silent:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the silent session was kept")
+			}
+			require.Eventually(t, func() bool { return whoServes(p, tagA) == "serving" }, 5*time.Second, 50*time.Millisecond)
+			select {
+			case <-serving:
+				t.Fatal("the serving session was closed")
+			default:
+			}
+		})
+	}
+}
