@@ -101,6 +101,9 @@ type probeWaitMember struct {
 type probeWaiter struct {
 	source    string
 	evaluated bool
+	// counted is set when evaluation counted reachability rather than
+	// skipping it because the group closed, paused or changed network.
+	counted bool
 	// successes is non-nil only for a URLTest waiter, which collects
 	// successes and waits across network and pause changes.
 	successes  map[string]*probeOutcome
@@ -491,13 +494,20 @@ func (s *MutableAutoSelect) evaluateProbesLocked(waiter *probeWaiter) {
 	if s.isClosed() || s.paused() || s.waiterScopeChangedLocked(waiter) {
 		return
 	}
+	waiter.counted = true
 	reachable := 0
-	for tag, member := range waiter.members {
+	// The waiter's members decide when to stop waiting, but any current
+	// member counts, so one added or re-added meanwhile isn't overlooked.
+	for _, tag := range s.tags {
 		out, ok := s.members.Load(tag)
-		if !ok || s.stuckProbeLocked(out) {
+		state := s.probeMembers[tag]
+		if !ok || state == nil || state.outcome == nil || behaviorFor(out.Type()).lastResort || s.stuckProbeLocked(out) {
 			continue
 		}
-		if outcome := s.waiterOutcomeLocked(waiter, tag, member); outcome != nil && waiter.successWithinBudget(outcome) {
+		outcome := state.outcome
+		member, inSnapshot := waiter.members[tag]
+		acceptedFresh := inSnapshot && member.membershipID == state.membershipID && outcome == member.fresh
+		if (acceptedFresh || outcome.sequence > waiter.sequence) && s.outcomeCurrentLocked(tag, outcome) && waiter.successWithinBudget(outcome) {
 			reachable++
 		}
 	}
@@ -566,9 +576,9 @@ func (s *MutableAutoSelect) runLadder(target string, generation uint64) {
 		waiter.timer.Stop()
 	}
 	s.evaluateProbesLocked(waiter)
-	// A ladder cut short by a pause or network change evaluated nothing, so
-	// it mustn't hold off the next one.
-	if !s.isClosed() && !s.waiterScopeChangedLocked(waiter) {
+	// A ladder that skipped evaluation, or whose network has since changed,
+	// mustn't hold off the next one.
+	if waiter.counted && !s.waiterScopeChangedLocked(waiter) {
 		s.lastLadderAt.Store(time.Now().UnixNano())
 	}
 	s.ladderWaiter = nil

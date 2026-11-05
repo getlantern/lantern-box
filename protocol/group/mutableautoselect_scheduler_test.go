@@ -1095,3 +1095,71 @@ func TestSchedulerHardDemotedLastResortDoesNotSuppressExhaustion(t *testing.T) {
 		require.True(t, exhausted(s), "a hard-demoted last resort can't carry traffic")
 	})
 }
+
+func TestSchedulerCycleCountsMemberAddedWhileWaiting(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newSchedulerTest(t, "a")
+		b := &mockOutbound{tag: "b", dial: func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }}
+		s.outboundMgr = &mockOutboundManager{outbounds: map[string]A.Outbound{"b": b}}
+		release := make(chan struct{})
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			<-release
+			return nil, errors.New("down")
+		}
+		done := make(chan struct{})
+		go func() { s.runProbeCycle(); close(done) }()
+		synctest.Wait()
+		_, err := s.Add("b")
+		require.NoError(t, err)
+		synctest.Wait()
+		close(release)
+		<-done
+		require.False(t, exhausted(s), "a member added during the cycle succeeded")
+	})
+}
+
+func TestSchedulerLadderSkippedByPauseFlagLeavesCooldown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newSchedulerTest(t, "a")
+		ctx := pause.WithDefaultManager(s.ctx)
+		pm := &delayedPauseManager{Manager: service.FromContext[pause.Manager](ctx)}
+		s.ctx = service.ContextWith[pause.Manager](ctx, pm)
+		release := make(chan struct{})
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			<-release
+			return probeResponderConn(), nil
+		}
+		done := make(chan struct{})
+		go func() { s.runLadder("a", s.networkGeneration.Load()); close(done) }()
+		synctest.Wait()
+		// Paused, but the callback that advances the pause epoch hasn't run.
+		pm.networkPaused.Store(true)
+		close(release)
+		<-done
+		require.Zero(t, s.lastLadderAt.Load(), "a ladder that skipped evaluation sets no cooldown")
+	})
+}
+
+func TestSchedulerLadderEvaluatedBeforeNetworkChangeLeavesCooldown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newSchedulerTest(t, "a")
+		release := make(chan struct{})
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			<-release
+			return nil, errors.New("down")
+		}
+		done := make(chan struct{})
+		go func() { s.runLadder("a", s.networkGeneration.Load()); close(done) }()
+		synctest.Wait()
+		// The budget timer evaluates the ladder, then the network changes
+		// before runLadder resumes.
+		s.access.Lock()
+		s.evaluateProbesLocked(s.ladderWaiter)
+		s.access.Unlock()
+		s.InterfaceUpdated()
+		<-done
+		require.Zero(t, s.lastLadderAt.Load(), "a network change lifts the cooldown")
+		close(release)
+		synctest.Wait()
+	})
+}
