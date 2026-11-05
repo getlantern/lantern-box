@@ -2,11 +2,15 @@ package metrics
 
 import (
 	"context"
+	"hash/maphash"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	semconv "github.com/getlantern/semconv"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/sagernet/sing-box/adapter"
 	tun "github.com/sagernet/sing-tun"
 	M "github.com/sagernet/sing/common/metadata"
@@ -77,6 +81,51 @@ func trackIOLoop(ctx context.Context, reportC <-chan report) {
 	}
 }
 
+const (
+	// deviceSpanTTL is how long a device's first connection suppresses the
+	// device_id.connected span for its later connections.
+	deviceSpanTTL = time.Hour
+	// deviceSpanMaxDevices bounds the devices remembered; past it the least
+	// recently seen are forgotten, and their next connection emits again.
+	deviceSpanMaxDevices = 65536
+)
+
+// deviceSpans lets the device_id.connected span through once per device per
+// deviceSpanTTL. The span marks a device's initial connection, which the API
+// correlates with its proxy assignment; emitting it on every connection sent
+// the collector one span per connection (~1,600/s on a busy phost), almost all
+// of which were discarded downstream.
+var deviceSpans = newDeviceSpanGate(deviceSpanMaxDevices, deviceSpanTTL)
+
+// deviceSpanGate keys devices by a hash of their ID, because the ID comes from
+// the client: storing it as is would let long IDs grow each entry without
+// bound. A collision only suppresses one span.
+type deviceSpanGate struct {
+	mu   sync.Mutex
+	seed maphash.Seed
+	seen *expirable.LRU[uint64, struct{}]
+}
+
+func newDeviceSpanGate(size int, ttl time.Duration) *deviceSpanGate {
+	return &deviceSpanGate{seed: maphash.MakeSeed(), seen: expirable.NewLRU[uint64, struct{}](size, nil, ttl)}
+}
+
+// first reports whether deviceID has not been seen within the TTL, and records
+// it, so concurrent first connections from one device emit a single span. Get,
+// unlike Contains, treats an expired entry as absent before the background
+// cleanup removes it, and marks a returning device recently used (without
+// extending its TTL) so it is not the next one evicted.
+func (g *deviceSpanGate) first(deviceID string) bool {
+	key := maphash.String(g.seed, deviceID)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, seen := g.seen.Get(key); seen {
+		return false
+	}
+	g.seen.Add(key, struct{}{})
+	return true
+}
+
 // emitDeviceConnectedSpan emits a correlation span for a
 // device_id's connection to the proxy, to be correlated with the
 // client's API proxy assignment to assess connectivity success rate
@@ -119,7 +168,9 @@ func connected(ctx context.Context, conn any, metadata adapter.InboundContext) (
 	}
 	attrs := metadataToAttributes(metadata)
 	attrs.client = &info
-	emitDeviceConnectedSpan(ctx, info)
+	if deviceSpans.first(info.DeviceID) {
+		emitDeviceConnectedSpan(ctx, info)
+	}
 	metrics.conns.Add(context.Background(), 1, metric.WithAttributes(attrs.AsSlice()...))
 	return attrs, true
 }
