@@ -53,6 +53,9 @@ type Portal struct {
 	logger           log.ContextLogger
 	masqueradeDomain string
 	masqueradeAddr   string
+	// confirmTimeout bounds the ping a session must answer before it
+	// replaces a live one.
+	confirmTimeout time.Duration
 
 	// mu serializes Configure and Close and guards the fields below it. It
 	// is never taken by a session handler.
@@ -83,6 +86,7 @@ func NewPortal(ctx context.Context, router adapter.Router, logger log.ContextLog
 		logger:           logger,
 		masqueradeDomain: options.MasqueradeDomain,
 		masqueradeAddr:   options.MasqueradeAddr,
+		confirmTimeout:   5 * time.Second,
 		sessions:         make(map[string]*portalSession),
 	}, nil
 }
@@ -315,6 +319,25 @@ func (p *Portal) handleSession(ctx context.Context, conn net.Conn, shortID [8]by
 		return
 	}
 	defer cc.Close()
+
+	// A session only replaces a live one once the helper has answered a
+	// ping on it. The bridge races IPv6 against IPv4 with the same short ID
+	// and closes the loser without serving HTTP/2. Without this check, a
+	// loser whose handshake finished late would close the working session.
+	// With no live session, publish at once: that adds no latency to the
+	// first connect, and an unconfirmed session is still replaced by any
+	// later one that answers.
+	p.sessMu.Lock()
+	cur := p.sessions[tag]
+	p.sessMu.Unlock()
+	if cur != nil && cur.cc.CanTakeNewRequest() {
+		pingCtx, cancel := context.WithTimeout(ctx, p.confirmTimeout)
+		err := cc.Ping(pingCtx)
+		cancel()
+		if err != nil {
+			return
+		}
+	}
 
 	s := &portalSession{shortID: shortID, cc: cc}
 	p.sessMu.Lock()

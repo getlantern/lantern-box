@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -401,4 +402,84 @@ func TestPortalRebuildsAfterServeExits(t *testing.T) {
 	require.NoError(t, p.Configure(cfg))
 	helper(t, portalAddr(t, p), k, id, "a")
 	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a" }, 5*time.Second, 50*time.Millisecond)
+}
+
+// silentSession authenticates with id but never serves HTTP/2, like the
+// losing attempt of the bridge's dual-stack race. The returned channel
+// closes when the portal closes the conn.
+func silentSession(t *testing.T, addr string, k testKeys, id [8]byte) <-chan struct{} {
+	t.Helper()
+	c, err := samizdat.NewClient(samizdat.ClientConfig{ServerAddr: addr, ServerName: "localhost", PublicKey: k.pub, ShortID: id})
+	require.NoError(t, err)
+	t.Cleanup(func() { c.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := c.DialSession(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		io.Copy(io.Discard, conn)
+	}()
+	return done
+}
+
+func TestPortalUnconfirmedSessionDoesNotReplaceLive(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	p.confirmTimeout = 500 * time.Millisecond
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	addr := portalAddr(t, p)
+
+	first := helper(t, addr, k, id, "first")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "first" }, 5*time.Second, 50*time.Millisecond)
+
+	silent := silentSession(t, addr, k, id)
+	select {
+	case <-silent:
+	case <-time.After(5 * time.Second):
+		t.Fatal("portal kept a session that never answered its ping")
+	}
+	select {
+	case <-first:
+		t.Fatal("an unconfirmed session closed the live one")
+	default:
+	}
+	assert.Equal(t, "first", whoServes(p, tagA))
+
+	helper(t, addr, k, id, "second")
+	select {
+	case <-first:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a session that serves HTTP/2 did not replace the older one")
+	}
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "second" }, 5*time.Second, 50*time.Millisecond)
+}
+
+func TestPortalCloseDuringConfirmPing(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	p.confirmTimeout = time.Minute
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	addr := portalAddr(t, p)
+
+	helper(t, addr, k, id, "first")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "first" }, 5*time.Second, 50*time.Millisecond)
+	silent := silentSession(t, addr, k, id)
+	time.Sleep(200 * time.Millisecond) // let its handler reach the ping
+
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		p.Close()
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited on a handler blocked in its confirm ping")
+	}
+	<-silent
 }
