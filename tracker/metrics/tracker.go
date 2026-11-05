@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"hash/maphash"
 	"net"
 	"net/netip"
 	"sync"
@@ -95,24 +96,29 @@ const (
 // of which were discarded downstream.
 var deviceSpans = newDeviceSpanGate(deviceSpanMaxDevices, deviceSpanTTL)
 
+// deviceSpanGate keys devices by a hash of their ID, because the ID comes from
+// the client: storing it as is would let long IDs grow each entry without
+// bound. A collision only suppresses one span.
 type deviceSpanGate struct {
 	mu   sync.Mutex
-	seen *expirable.LRU[string, struct{}]
+	seed maphash.Seed
+	seen *expirable.LRU[uint64, struct{}]
 }
 
 func newDeviceSpanGate(size int, ttl time.Duration) *deviceSpanGate {
-	return &deviceSpanGate{seen: expirable.NewLRU[string, struct{}](size, nil, ttl)}
+	return &deviceSpanGate{seed: maphash.MakeSeed(), seen: expirable.NewLRU[uint64, struct{}](size, nil, ttl)}
 }
 
 // first reports whether deviceID has not been seen within the TTL, and records
 // it, so concurrent first connections from one device emit a single span.
 func (g *deviceSpanGate) first(deviceID string) bool {
+	key := maphash.String(g.seed, deviceID)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.seen.Contains(deviceID) {
+	if g.seen.Contains(key) {
 		return false
 	}
-	g.seen.Add(deviceID, struct{}{})
+	g.seen.Add(key, struct{}{})
 	return true
 }
 
