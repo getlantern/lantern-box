@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -179,17 +181,29 @@ func TestRun_ForwardsTraceparentFromQuery(t *testing.T) {
 	assert.Equal(t, tp, <-got)
 }
 
-// earlyConn reports a handshake that has not run yet, the way a lazily
-// connecting outbound's conn does.
-type earlyConn struct{ net.Conn }
+// firstWriteHandshakeConn blocks its first Write for cost, the way an outbound
+// that runs its handshake on first use does.
+type firstWriteHandshakeConn struct {
+	net.Conn
+	cost time.Duration
+	done atomic.Bool
+}
 
-func (earlyConn) NeedHandshake() bool { return true }
+func (c *firstWriteHandshakeConn) Write(b []byte) (int, error) {
+	if c.done.CompareAndSwap(false, true) {
+		time.Sleep(c.cost)
+	}
+	return c.Conn.Write(b)
+}
 
-func TestRun_DelayExcludesTheDialWhenTheHandshakeIsDeferred(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer srv.Close()
+func TestRun_DelayExcludesConnectionSetupForEveryOutbound(t *testing.T) {
+	const serverCost = 100 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverCost)
+	}))
+	t.Cleanup(srv.Close)
 	addr := strings.TrimPrefix(srv.URL, "http://")
-	const dialCost = 250 * time.Millisecond
+	const dialCost = 400 * time.Millisecond
 
 	slowDial := func(wrap func(net.Conn) net.Conn) func(context.Context) (net.Conn, error) {
 		return func(ctx context.Context) (net.Conn, error) {
@@ -202,15 +216,94 @@ func TestRun_DelayExcludesTheDialWhenTheHandshakeIsDeferred(t *testing.T) {
 		}
 	}
 
-	deferred := &stubOutbound{dial: slowDial(func(c net.Conn) net.Conn { return earlyConn{c} })}
-	delay, err := Run(context.Background(), deferred, srv.URL, 5*time.Second)
-	require.NoError(t, err)
-	assert.Less(t, delay, dialCost, "the timer restarts once a dial has only queued the handshake")
+	for name, wrap := range map[string]func(net.Conn) net.Conn{
+		"handshake on first write": func(c net.Conn) net.Conn {
+			return &firstWriteHandshakeConn{Conn: c, cost: dialCost}
+		},
+		"handshake in dial": func(c net.Conn) net.Conn { return c },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			delay, err := Run(context.Background(), &stubOutbound{dial: slowDial(wrap)}, srv.URL, 5*time.Second)
+			require.NoError(t, err)
+			// The server can begin its sleep before the request's Write returns,
+			// so the timed span may fall slightly short of serverCost.
+			assert.GreaterOrEqual(t, delay, serverCost/2, "the request's round trip is timed")
+			assert.Less(t, delay, dialCost, "connection setup is not")
+		})
+	}
+}
 
-	eager := &stubOutbound{dial: slowDial(func(c net.Conn) net.Conn { return c })}
-	delay, err = Run(context.Background(), eager, srv.URL, 5*time.Second)
+type rootPool struct {
+	adapter.CertificateStore
+	pool *x509.CertPool
+}
+
+func (r rootPool) Pool() *x509.CertPool { return r.pool }
+
+func TestRun_DelayIgnoresWritesAfterTheResponseBegins(t *testing.T) {
+	t.Parallel()
+	const serverCost = 300 * time.Millisecond
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverCost)
+		w.Header().Set("Connection", "close")
+	}))
+	defer srv.Close()
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+
+	var conns []*trackedConn
+	out := &stubOutbound{dial: dialerFor(strings.TrimPrefix(srv.URL, "https://"), &conns)}
+	ctx := service.ContextWith[adapter.CertificateStore](context.Background(), rootPool{pool: pool})
+
+	delay, err := Run(ctx, out, srv.URL, 5*time.Second)
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, delay, dialCost, "a conn that handshook while dialing is timed from before it")
+	// Short of serverCost by however late the request's Write returns.
+	assert.GreaterOrEqual(t, delay, serverCost/2, "a close_notify sent at body EOF does not restart the timer")
+}
+
+// slowReturnConn holds every Write for delay after the bytes are sent, so the
+// response can arrive while the request's Write has yet to return.
+type slowReturnConn struct {
+	net.Conn
+	delay time.Duration
+}
+
+func (c slowReturnConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	time.Sleep(c.delay)
+	return n, err
+}
+
+func TestRun_RequestWriteStillInFlightAtTheResponseCounts(t *testing.T) {
+	t.Parallel()
+	const serverCost = 100 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverCost)
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	const writeReturn = 400 * time.Millisecond
+
+	out := &stubOutbound{dial: func(ctx context.Context) (net.Conn, error) {
+		c, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return slowReturnConn{Conn: c, delay: writeReturn}, nil
+	}}
+
+	delay, err := Run(context.Background(), out, srv.URL, 5*time.Second)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, delay, serverCost, "a write returning after the response does not hide the server's time")
+	assert.Less(t, delay, writeReturn, "waiting for the write to return is not timed")
+}
+
+func TestWriteTimedConn_ResponseBeforeAnyWriteIsAnError(t *testing.T) {
+	c := newWriteTimedConn(nil)
+	c.freeze()
+	_, err := c.lastWrite(context.Background())
+	require.ErrorIs(t, err, errNoRequestWrite)
 }
 
 func TestRun_DerivesPortFromScheme(t *testing.T) {
