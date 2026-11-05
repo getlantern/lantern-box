@@ -425,7 +425,8 @@ func addrFree(err error) error {
 }
 
 // Session returns the HTTP/2 client of the live session for reverseTag, if
-// it can take a new stream.
+// it can take a new stream. The client is checked outside sessMu, as every
+// call into an HTTP/2 client must be.
 func (p *Portal) Session(reverseTag string) (*http2.ClientConn, bool) {
 	p.sessMu.Lock()
 	s := p.sessions[reverseTag]
@@ -490,13 +491,24 @@ func (p *Portal) handleSession(ctx context.Context, conn net.Conn, shortID [8]by
 // runs outside it, and the slot is evaluated again afterwards.
 func (p *Portal) publish(ctx context.Context, tag string, s *portalSession) bool {
 	for {
+		// cur.gone reads the HTTP/2 client's state, which can wait behind a
+		// write stalled on a helper that stopped reading. It runs outside
+		// sessMu, and the slot is checked again before acting on it.
+		p.sessMu.Lock()
+		cur := p.sessions[tag]
+		p.sessMu.Unlock()
+		curGone := cur != nil && cur.gone()
+
 		p.sessMu.Lock()
 		if p.pairings[s.shortID] != tag {
 			p.sessMu.Unlock()
 			return false
 		}
-		cur := p.sessions[tag]
-		replace := cur == nil || cur.gone() ||
+		if p.sessions[tag] != cur {
+			p.sessMu.Unlock()
+			continue
+		}
+		replace := cur == nil || curGone ||
 			(s.confirmed && (!cur.confirmed || cur.seq < s.seq))
 		if replace {
 			p.sessions[tag] = s
@@ -527,6 +539,8 @@ func (p *Portal) publish(ctx context.Context, tag string, s *portalSession) bool
 // its slot without confirming itself first. It deliberately ignores stream
 // capacity: a healthy session that has hit its concurrent-stream limit
 // cannot take a new request, but closing it would drop every tunnel on it.
+// It can block behind a stalled write, so it must not be called under a
+// portal lock.
 func (s *portalSession) gone() bool {
 	st := s.cc.State()
 	return st.Closed || st.Closing

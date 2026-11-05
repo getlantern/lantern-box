@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -818,4 +819,83 @@ func TestPortalSaturatedSessionIsNotGone(t *testing.T) {
 		t.Fatal("a confirmed candidate did not replace the busy session")
 	}
 	require.Eventually(t, func() bool { return whoServes(p, tagA) == "second" }, 5*time.Second, 50*time.Millisecond)
+}
+
+// stalledSession authenticates with id and then never reads, so the portal's
+// writes to it stall once the socket buffers fill.
+func stalledSession(t *testing.T, addr string, k testKeys, id [8]byte) {
+	t.Helper()
+	c, err := samizdat.NewClient(samizdat.ClientConfig{ServerAddr: addr, ServerName: "localhost", PublicKey: k.pub, ShortID: id})
+	require.NoError(t, err)
+	t.Cleanup(func() { c.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := c.DialSession(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+}
+
+func returnsWithin(d time.Duration, f func()) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f()
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+func TestPortalStalledWriteDoesNotBlockPortal(t *testing.T) {
+	k := newTestKeys(t)
+	idA, idB := newShortID(t), newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	arrivals := make(chan struct{}, 8)
+	p.beforePublish = func() { arrivals <- struct{}{} }
+	pairings := map[[8]byte]string{idA: tagA, idB: tagB}
+	require.NoError(t, p.Configure(k.config(0, pairings)))
+	addr := portalAddr(t, p)
+
+	helper(t, addr, k, idB, "b")
+	<-arrivals
+	require.Eventually(t, func() bool { return whoServes(p, tagB) == "b" }, 5*time.Second, 50*time.Millisecond)
+
+	// Session A's helper stops reading. A request with a huge header makes
+	// the portal's HTTP/2 client write until the socket is full, holding
+	// its write lock, which State also takes.
+	stalledSession(t, addr, k, idA)
+	<-arrivals
+	var ccA *http2.ClientConn
+	require.Eventually(t, func() bool {
+		var ok bool
+		ccA, ok = p.Session(tagA)
+		return ok
+	}, 5*time.Second, 20*time.Millisecond)
+	go func() {
+		req := &http.Request{
+			Method: http.MethodConnect,
+			URL:    &url.URL{Host: "example.com:443"},
+			Host:   "example.com:443",
+			Header: http.Header{"X-Big": {strings.Repeat("a", 8<<20)}},
+		}
+		if resp, err := ccA.RoundTrip(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	require.Eventually(t, func() bool { return !returnsWithin(200*time.Millisecond, func() { ccA.State() }) },
+		5*time.Second, 50*time.Millisecond, "the write to the stalled helper never blocked")
+
+	// A second session for tag A has to inspect A's state before it can
+	// publish, and blocks there.
+	helper(t, addr, k, idA, "a2")
+	<-arrivals
+	time.Sleep(300 * time.Millisecond)
+
+	assert.True(t, returnsWithin(3*time.Second, func() { assert.Equal(t, "b", whoServes(p, tagB)) }),
+		"Session for another tag blocked behind a stalled write")
+	assert.True(t, returnsWithin(3*time.Second, func() { assert.NoError(t, p.Configure(k.config(0, pairings))) }),
+		"Configure blocked behind a stalled write")
 }
