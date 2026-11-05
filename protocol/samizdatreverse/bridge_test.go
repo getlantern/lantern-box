@@ -1,6 +1,7 @@
 package samizdatreverse
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -404,6 +405,55 @@ func TestBridgeDestinationCloseEndsStream(t *testing.T) {
 	case b := <-got:
 		assert.Equal(t, "bye", string(b))
 	case <-time.After(5 * time.Second):
+		t.Fatal("the inviter did not see EOF after the destination closed")
+	}
+}
+
+func TestBridgeDestinationCloseDeliversEveryByte(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	newTestBridge(t, bridgeOptions(t, portalAddr(t, p), k, id), &dialRouter{})
+	require.Eventually(t, func() bool { _, ok := p.Session(tagA); return ok }, 5*time.Second, 20*time.Millisecond)
+
+	// Closing the stream the moment the destination is done must not cut
+	// off what is still buffered on its way down.
+	payload := make([]byte, 1<<20+12345)
+	_, err := rand.Read(payload)
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		c.Write(payload)
+		c.Close()
+	}()
+
+	o := newTestReverse(t, tagA, p)
+	conn, err := o.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr(ln.Addr().String()))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	type result struct {
+		b   []byte
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		b, err := io.ReadAll(conn)
+		got <- result{b, err}
+	}()
+	select {
+	case r := <-got:
+		require.NoError(t, r.err)
+		require.Len(t, r.b, len(payload))
+		require.True(t, bytes.Equal(payload, r.b), "the inviter received different bytes")
+	case <-time.After(15 * time.Second):
 		t.Fatal("the inviter did not see EOF after the destination closed")
 	}
 }

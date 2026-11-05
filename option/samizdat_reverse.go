@@ -2,8 +2,8 @@ package option
 
 import "github.com/sagernet/sing-box/option"
 
-// SamizdatPortalInboundOptions configures the portal inbound that accepts an
-// inviter's reverse samizdat sessions.
+// SamizdatPortalInboundOptions configures the inviter's portal inbound that
+// accepts the samizdat sessions helpers' bridges dial in.
 type SamizdatPortalInboundOptions struct {
 	MasqueradeDomain string `json:"masquerade_domain,omitempty"`
 	MasqueradeAddr   string `json:"masquerade_addr,omitempty"`
@@ -15,8 +15,8 @@ type SamizdatReverseOutboundOptions struct {
 	Portal string `json:"portal"` // the portal inbound's tag
 }
 
-// SamizdatBridgeInboundOptions configures the inviter-side bridge that dials
-// the helper's portal and serves the streams it receives.
+// SamizdatBridgeInboundOptions configures the helper-side bridge that dials
+// the inviter's portal and serves the streams it receives.
 type SamizdatBridgeInboundOptions struct {
 	option.DialerOptions
 	Addrs          []string `json:"addrs"`            // "ip:port", at most one IPv4 and one IPv6

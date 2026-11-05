@@ -1,6 +1,7 @@
-// Package samizdatreverse implements reverse direct mode: a helper's portal
-// inbound accepts samizdat sessions an inviter's bridge inbound dials out,
-// and the helper's reverse outbounds open streams back down those sessions.
+// Package samizdatreverse implements reverse direct mode: the inviter's
+// portal inbound accepts samizdat sessions that a helper's bridge inbound
+// dials out, and the inviter's reverse outbounds open streams down those
+// sessions, so the inviter's traffic exits from the helper.
 package samizdatreverse
 
 import (

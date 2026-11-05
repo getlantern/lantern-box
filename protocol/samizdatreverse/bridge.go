@@ -126,7 +126,9 @@ func NewBridge(ctx context.Context, router adapter.Router, logger log.ContextLog
 			ShortID:              b.shortID,
 			ServerCertSPKISHA256: pin,
 			Fingerprint:          options.Fingerprint,
-			TCPFragmentation:     true,
+			// On, as on lantern-box's samizdat outbound, whose
+			// disable_tcp_fragmentation defaults to false.
+			TCPFragmentation: true,
 			Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
 				return b.dial(ctx, network, address)
 			},
@@ -450,11 +452,13 @@ func (c *bridgeStream) Close() error {
 	return nil
 }
 
-// CloseWrite closes the whole stream. A server cannot end its response
-// while it still reads the request: net/http2 resets the stream when the
-// handler returns. Ending the stream when the destination is done sending
-// lets the inviter see EOF; leaving it open would hang a client that waits
-// for EOF before it ends its own side.
+// CloseWrite closes the whole stream. The HTTP/2 server cannot half-close:
+// it cannot end its response while it still reads the request, since
+// net/http2 resets the stream when the handler returns. Ending the stream
+// when the destination is done sending lets the inviter see EOF; leaving it
+// open would hang a client that waits for EOF before it ends its own side.
+// The cost is that anything the inviter uploads after the destination has
+// closed is dropped.
 func (c *bridgeStream) CloseWrite() error {
 	return c.Close()
 }
