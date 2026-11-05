@@ -11,6 +11,7 @@ import (
 	sdkotel "go.opentelemetry.io/otel"
 
 	"github.com/getlantern/geo"
+	semconv "github.com/getlantern/semconv"
 	"github.com/sagernet/sing-box/adapter"
 	N "github.com/sagernet/sing/common/network"
 	"go.opentelemetry.io/otel/attribute"
@@ -272,7 +273,7 @@ func TestDeviceConnectedSpanOncePerDevice(t *testing.T) {
 			continue
 		}
 		for _, a := range s.Attributes {
-			if a.Key == "client.device_id" {
+			if a.Key == semconv.ClientDeviceIDKey {
 				devices = append(devices, a.Value.AsString())
 			}
 		}
