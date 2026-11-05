@@ -266,6 +266,38 @@ func TestRun_DelayIgnoresWritesAfterTheResponseBegins(t *testing.T) {
 	assert.GreaterOrEqual(t, delay, serverCost, "a close_notify sent at body EOF does not restart the timer")
 }
 
+// slowReturnConn holds every Write for delay after the bytes are sent, so the
+// response can arrive while the request's Write has yet to return.
+type slowReturnConn struct {
+	net.Conn
+	delay time.Duration
+}
+
+func (c slowReturnConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	time.Sleep(c.delay)
+	return n, err
+}
+
+func TestRun_RequestWriteStillInFlightAtTheResponseCounts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	const writeReturn = 200 * time.Millisecond
+
+	out := &stubOutbound{dial: func(ctx context.Context) (net.Conn, error) {
+		c, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return slowReturnConn{Conn: c, delay: writeReturn}, nil
+	}}
+
+	delay, err := Run(context.Background(), out, srv.URL, 5*time.Second)
+	require.NoError(t, err)
+	assert.Less(t, delay, writeReturn, "the request write is timed from when it returned, not left unrecorded")
+}
+
 func TestRun_DerivesPortFromScheme(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

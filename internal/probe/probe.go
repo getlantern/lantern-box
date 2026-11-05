@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
@@ -34,10 +34,11 @@ var ErrUnusableInput = errors.New("unusable probe input")
 // before Run returns.
 //
 // The reported duration runs from the moment the request has been written to
-// the conn to the end of the response body: one round trip through the outbound to the
-// target. Connection setup (the dial, any proxy or TLS handshake, and a
-// handshake the outbound defers to the first write) is excluded, so outbounds
-// that establish connections differently are timed alike.
+// the conn to the end of the response body: one round trip through the
+// outbound to the target. Connection setup (the dial, any proxy or TLS
+// handshake, and a handshake the outbound defers to the first write) is
+// excluded, so outbounds that establish connections differently are timed
+// alike.
 //
 // out's DialContext must return once ctx is cancelled or its deadline passes;
 // Run returns no sooner than that dial does.
@@ -75,9 +76,9 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	}
 	defer conn.Close()
 
-	timed := &writeTimedConn{Conn: conn}
+	timed := newWriteTimedConn(conn)
 	traceCtx := httptrace.WithClientTrace(probeCtx, &httptrace.ClientTrace{
-		GotFirstResponseByte: func() { timed.frozen.Store(true) },
+		GotFirstResponseByte: timed.freeze,
 	})
 	req, err := http.NewRequestWithContext(traceCtx, http.MethodGet, probeURL, nil)
 	if err != nil {
@@ -109,28 +110,74 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	return time.Since(timed.lastWrite()), nil
+	start, err := timed.lastWrite(probeCtx)
+	if err != nil {
+		return 0, fmt.Errorf("await request write: %w", err)
+	}
+	return time.Since(start), nil
 }
 
-// writeTimedConn records when its most recent Write returned, until frozen at
-// the first response byte. For a bodyless GET the last write before the
-// response is the request itself, completed only once any handshake the
-// outbound runs on first write is done; freezing keeps later writes, such as a
-// TLS close_notify, from moving it.
+// writeTimedConn records when its most recent Write returned, counting only
+// writes that started before the first response byte. For a bodyless GET the
+// last of those is the request itself, completed only once any handshake the
+// outbound runs on first write is done. A write in flight when the response
+// arrives still counts; later writes, such as a TLS close_notify at body EOF,
+// do not.
 type writeTimedConn struct {
 	net.Conn
-	last   atomic.Int64
-	frozen atomic.Bool
+	mu       sync.Mutex
+	last     time.Time
+	frozen   bool
+	inFlight int
+	settled  chan struct{}
+}
+
+func newWriteTimedConn(conn net.Conn) *writeTimedConn {
+	return &writeTimedConn{Conn: conn, settled: make(chan struct{})}
 }
 
 func (c *writeTimedConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	counts := !c.frozen
+	if counts {
+		c.inFlight++
+	}
+	c.mu.Unlock()
 	n, err := c.Conn.Write(b)
-	if !c.frozen.Load() {
-		c.last.Store(time.Now().UnixNano())
+	if counts {
+		c.mu.Lock()
+		c.last = time.Now()
+		c.inFlight--
+		c.settleLocked()
+		c.mu.Unlock()
 	}
 	return n, err
 }
 
-func (c *writeTimedConn) lastWrite() time.Time {
-	return time.Unix(0, c.last.Load())
+func (c *writeTimedConn) freeze() {
+	c.mu.Lock()
+	if !c.frozen {
+		c.frozen = true
+		c.settleLocked()
+	}
+	c.mu.Unlock()
+}
+
+func (c *writeTimedConn) settleLocked() {
+	if c.frozen && c.inFlight == 0 {
+		close(c.settled)
+	}
+}
+
+// lastWrite waits for every counted write to return, then reports when the
+// last of them did.
+func (c *writeTimedConn) lastWrite(ctx context.Context) (time.Time, error) {
+	select {
+	case <-c.settled:
+	case <-ctx.Done():
+		return time.Time{}, ctx.Err()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.last, nil
 }
