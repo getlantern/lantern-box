@@ -185,6 +185,23 @@ type earlyConn struct{ net.Conn }
 
 func (earlyConn) NeedHandshake() bool { return true }
 
+// firstWriteHandshakeConn blocks its first Write for cost, the way an outbound
+// that runs its handshake on first use does.
+type firstWriteHandshakeConn struct {
+	net.Conn
+	cost time.Duration
+	done atomic.Bool
+}
+
+func (c *firstWriteHandshakeConn) NeedHandshake() bool { return !c.done.Load() }
+
+func (c *firstWriteHandshakeConn) Write(b []byte) (int, error) {
+	if c.done.CompareAndSwap(false, true) {
+		time.Sleep(c.cost)
+	}
+	return c.Conn.Write(b)
+}
+
 func TestRun_DelayExcludesConnectionSetupForEveryOutbound(t *testing.T) {
 	const serverCost = 100 * time.Millisecond
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -207,7 +224,10 @@ func TestRun_DelayExcludesConnectionSetupForEveryOutbound(t *testing.T) {
 
 	for name, wrap := range map[string]func(net.Conn) net.Conn{
 		"deferred handshake": func(c net.Conn) net.Conn { return earlyConn{c} },
-		"handshake in dial":  func(c net.Conn) net.Conn { return c },
+		"handshake on first write": func(c net.Conn) net.Conn {
+			return &firstWriteHandshakeConn{Conn: c, cost: dialCost}
+		},
+		"handshake in dial": func(c net.Conn) net.Conn { return c },
 	} {
 		t.Run(name, func(t *testing.T) {
 			delay, err := Run(context.Background(), &stubOutbound{dial: slowDial(wrap)}, srv.URL, 5*time.Second)

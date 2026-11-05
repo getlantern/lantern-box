@@ -10,8 +10,8 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
@@ -33,7 +33,7 @@ var ErrUnusableInput = errors.New("unusable probe input")
 // before Run returns.
 //
 // The reported duration runs from the moment the request has been written to
-// the end of the response body: one round trip through the outbound to the
+// the conn to the end of the response body: one round trip through the outbound to the
 // target. Connection setup (the dial, any proxy or TLS handshake, and a
 // handshake the outbound defers to the first write) is excluded, so outbounds
 // that establish connections differently are timed alike.
@@ -74,11 +74,8 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	}
 	defer conn.Close()
 
-	var start time.Time
-	traceCtx := httptrace.WithClientTrace(probeCtx, &httptrace.ClientTrace{
-		WroteRequest: func(httptrace.WroteRequestInfo) { start = time.Now() },
-	})
-	req, err := http.NewRequestWithContext(traceCtx, http.MethodGet, probeURL, nil)
+	timed := &writeTimedConn{Conn: conn}
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
 	if err != nil {
 		return 0, fmt.Errorf("new request: %w", err)
 	}
@@ -89,7 +86,7 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	client := http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return conn, nil
+				return timed, nil
 			},
 			TLSClientConfig: &tls.Config{
 				Time:    ntp.TimeFuncFromContext(probeCtx),
@@ -108,5 +105,23 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	return time.Since(start), nil
+	return time.Since(timed.lastWrite()), nil
+}
+
+// writeTimedConn records when its most recent Write returned. For a bodyless
+// GET the last write before the response is the request itself, completed only
+// once any handshake the outbound runs on first write is done.
+type writeTimedConn struct {
+	net.Conn
+	last atomic.Int64
+}
+
+func (c *writeTimedConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.last.Store(time.Now().UnixNano())
+	return n, err
+}
+
+func (c *writeTimedConn) lastWrite() time.Time {
+	return time.Unix(0, c.last.Load())
 }
