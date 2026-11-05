@@ -725,9 +725,20 @@ go test -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acm
 
 ### Releases
 
-Every merge to `main` that changes the binary is tagged as the next patch release, and the proxy fleet follows GitHub's latest release, so lantern-cloud hot-swaps every box onto it.
+Every merge to `main` that changes the binary is tagged as the next patch release and published, so clients can depend on it. The proxy fleet follows GitHub's latest release: lantern-cloud hot-swaps every box onto it.
 
-A change that only matters to clients, such as a bump of a library only the client side uses, doesn't need that rollout. Label its PR `client-only` before merging: the release is still tagged and published, so clients can depend on it, but it isn't marked latest (nor pushed as `getlantern/lantern-box:latest`), and the fleet stays put. The next normal release carries the change to the fleet, or run `gh release edit vX.Y.Z --latest` to roll it out deliberately.
+By default a release doesn't roll the fleet: it isn't marked latest, nor pushed as `getlantern/lantern-box:latest` or as the `sing-box:latest` image triangle backends run. A push to `main` builds `sing-box:main` instead. To roll the fleet onto a change, label its PR `release` before merging.
+
+To roll out a release already published, move the `latest` pointers onto its existing artifacts rather than rerunning the release workflows, which would rebuild and replace them. This works for any tag, including ones cut before the `release` label existed:
+
+```bash
+gh release edit vX.Y.Z --latest
+docker buildx imagetools create -t getlantern/lantern-box:latest getlantern/lantern-box:vX.Y.Z
+docker buildx imagetools create -t us-docker.pkg.dev/lantern-cloud/containers/sing-box:latest \
+  us-docker.pkg.dev/lantern-cloud/containers/sing-box:vX.Y.Z
+```
+
+The last command needs push access to lantern-cloud's Artifact Registry (`gcloud auth configure-docker us-docker.pkg.dev`).
 
 ## License
 

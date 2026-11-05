@@ -35,6 +35,7 @@ func (c *PacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, er
 	if err != nil {
 		return dest, err
 	}
+	c.attrs.notePacketDestination(dest)
 	if buffer.Len() > 0 {
 		c.rxBytes.Add(int64(buffer.Len()))
 		c.tracker.TrackIO(rx, buffer.Len(), c.attrs)
@@ -44,6 +45,7 @@ func (c *PacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, er
 
 // WritePacket overrides network.PacketConn's WritePacket method to track sent bytes.
 func (c *PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	c.attrs.notePacketDestination(destination)
 	if buffer.Len() > 0 {
 		c.tracker.TrackIO(tx, buffer.Len(), c.attrs)
 	}

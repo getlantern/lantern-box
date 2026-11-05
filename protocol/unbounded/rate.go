@@ -17,6 +17,13 @@ type byteRate uint64
 // does: a lowercase b, "bit" or "bps" means bits, an uppercase B or "byte"
 // means bytes. k, M and G multiply by 1000; Ki, Mi and Gi by 1024. "0" and
 // "" mean unlimited.
+// ValidateBandwidthLimit reports whether s is a bandwidth_limit the volunteer
+// service accepts, so a caller can refuse a bad one before building a box.
+func ValidateBandwidthLimit(s string) error {
+	_, err := parseRate(s)
+	return err
+}
+
 func parseRate(s string) (byteRate, error) {
 	s = strings.TrimSpace(s)
 	if s == "" || s == "0" {

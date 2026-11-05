@@ -6,6 +6,10 @@ go 1.26.10
 
 replace github.com/sagernet/sing-box => github.com/getlantern/sing-box-minimal v1.14.2-lantern.2
 
+// v0.2.8 plus pooled shadowaead chunk buffers: upstream holds two ~64 KB
+// buffers per ss2022 connection for its whole life, even while idle.
+replace github.com/sagernet/sing-shadowsocks => github.com/getlantern/sing-shadowsocks v0.2.8-lantern.3
+
 // replace github.com/sagernet/wireguard-go => github.com/getlantern/wireguard-go v0.0.1-beta.7.0.20251208214020-d78e69f1eff4
 
 replace github.com/tetratelabs/wazero => github.com/getlantern/wazero v1.11.0-water.1
@@ -24,13 +28,14 @@ replace github.com/sagernet/gvisor => github.com/sagernet/gvisor v0.0.0-20260727
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/getlantern/algeneva v0.0.0-20260731172949-952f13725b7b
-	github.com/getlantern/broflake v0.0.0-20261103013533-7904ee7e70b5
+	github.com/getlantern/broflake v0.0.0-20261103231447-95bcbce067ee
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260520145825-958775d51395
 	github.com/getlantern/samizdat v0.0.3-0.20261031023545-1248df926631
-	github.com/getlantern/semconv v0.0.0-20261009113645-6897603ca940
+	github.com/getlantern/semconv v0.0.0-20261103162524-c0c2ac0e0a3e
 	github.com/getlantern/twiddle v0.0.0-20260914204124-f698a0d67d2f
 	github.com/gobwas/ws v1.4.0
+	github.com/gofrs/flock v0.13.1
 	github.com/hashicorp/yamux v0.1.2
 	github.com/huin/goupnp v1.3.0
 	github.com/jackpal/gateway v1.2.0

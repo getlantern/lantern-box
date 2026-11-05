@@ -4,8 +4,8 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      client_only:
-        description: "Publish without marking the release latest, so the proxy fleet doesn't hot-swap to it"
+      fleet:
+        description: "Mark the release latest, so the proxy fleet hot-swaps to it"
         type: boolean
         default: false
 
@@ -55,7 +55,9 @@ jobs:
           GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           FURY_TOKEN: ${{ secrets.FURY_TOKEN }}
-          CLIENT_ONLY: ${{ inputs.client_only && 'true' || 'false' }}
+          # A tag push carries no inputs, so it releases without moving the
+          # fleet, as an unlabelled merge does.
+          FLEET_RELEASE: ${{ inputs.fleet && 'true' || 'false' }}
 
       # Under Reflog's Option B the packer image no longer bakes in a
       # specific lantern-box version — cloud-init installs the target
