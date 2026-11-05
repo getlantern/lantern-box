@@ -483,3 +483,65 @@ func TestPortalCloseDuringConfirmPing(t *testing.T) {
 	}
 	<-silent
 }
+
+func TestPortalRebindKeepsPortAndSessions(t *testing.T) {
+	k := newTestKeys(t)
+	idA, idB := newShortID(t), newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{idA: tagA, idB: tagB})))
+	addr := portalAddr(t, p)
+	doneA := helper(t, addr, k, idA, "a")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a" }, 5*time.Second, 50*time.Millisecond)
+
+	p.mu.Lock()
+	oldLn := p.ln
+	p.mu.Unlock()
+	require.NoError(t, p.Rebind())
+	p.mu.Lock()
+	newLn := p.ln
+	p.mu.Unlock()
+	assert.NotSame(t, oldLn, newLn, "Rebind kept the old listener")
+	assert.Equal(t, addr, portalAddr(t, p), "Rebind moved the port")
+	assert.EqualValues(t, 1, p.rebinds.Load())
+
+	assert.Equal(t, "a", whoServes(p, tagA), "Rebind dropped a live session")
+	select {
+	case <-doneA:
+		t.Fatal("Rebind closed a live session")
+	default:
+	}
+	helper(t, addr, k, idB, "b")
+	require.Eventually(t, func() bool { return whoServes(p, tagB) == "b" }, 5*time.Second, 50*time.Millisecond)
+
+	require.NoError(t, p.Close())
+	require.NoError(t, p.Rebind(), "Rebind after Close is a no-op")
+}
+
+func TestPortalInterfaceUpdatedDebouncesRebind(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	p.rebindDelay = 200 * time.Millisecond
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	addr := portalAddr(t, p)
+
+	for range 5 {
+		p.InterfaceUpdated()
+	}
+	require.Eventually(t, func() bool { return p.rebinds.Load() == 1 }, 5*time.Second, 20*time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
+	assert.EqualValues(t, 1, p.rebinds.Load(), "a burst of updates rebound more than once")
+
+	assert.Equal(t, addr, portalAddr(t, p))
+	helper(t, addr, k, id, "a")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a" }, 5*time.Second, 50*time.Millisecond)
+}
+
+func TestPortalInterfaceUpdatedWhenStopped(t *testing.T) {
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	p.rebindDelay = 10 * time.Millisecond
+	p.InterfaceUpdated()
+	time.Sleep(100 * time.Millisecond)
+	assert.Nil(t, p.Addr())
+	assert.EqualValues(t, 0, p.rebinds.Load())
+}

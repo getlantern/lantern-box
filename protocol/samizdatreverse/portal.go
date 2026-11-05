@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -56,6 +57,12 @@ type Portal struct {
 	// confirmTimeout bounds the ping a session must answer before it
 	// replaces a live one.
 	confirmTimeout time.Duration
+	// rebindDelay is how long InterfaceUpdated waits for further updates
+	// before it rebinds, so a burst of updates causes one rebind.
+	rebindDelay time.Duration
+
+	rebindMu    sync.Mutex
+	rebindTimer *time.Timer
 
 	// mu serializes Configure and Close and guards the fields below it. It
 	// is never taken by a session handler.
@@ -65,6 +72,7 @@ type Portal struct {
 	server    *samizdat.Server
 	ln        net.Listener
 	serveDone chan struct{}
+	rebinds   atomic.Int32 // listener swaps by Rebind, for tests
 
 	// sessMu guards pairings and sessions. It is never held while blocking.
 	sessMu   sync.Mutex
@@ -87,6 +95,7 @@ func NewPortal(ctx context.Context, router adapter.Router, logger log.ContextLog
 		masqueradeDomain: options.MasqueradeDomain,
 		masqueradeAddr:   options.MasqueradeAddr,
 		confirmTimeout:   5 * time.Second,
+		rebindDelay:      time.Second,
 		sessions:         make(map[string]*portalSession),
 	}, nil
 }
@@ -96,8 +105,100 @@ func (p *Portal) Start(stage adapter.StartStage) error {
 	return nil
 }
 
+var _ adapter.InterfaceUpdateListener = (*Portal)(nil)
+
+// InterfaceUpdated implements adapter.InterfaceUpdateListener. sing-box's
+// network manager calls it on every inbound when the default interface
+// changes. The listener was bound to the interface that was the default
+// when it was created, so the portal rebinds after updates stop arriving
+// for rebindDelay. It returns at once: the caller is the network monitor.
+func (p *Portal) InterfaceUpdated() {
+	p.rebindMu.Lock()
+	defer p.rebindMu.Unlock()
+	if p.rebindTimer == nil {
+		p.rebindTimer = time.AfterFunc(p.rebindDelay, p.rebindAfterUpdate)
+		return
+	}
+	p.rebindTimer.Reset(p.rebindDelay)
+}
+
+func (p *Portal) rebindAfterUpdate() {
+	if err := p.Rebind(); err != nil {
+		p.logger.Error(constant.TypeSamizdatPortal, ": rebind after a network change: ", err)
+	}
+}
+
+// Rebind replaces the portal's listener with a new one on the same port,
+// bound to the current default interface. The samizdat server and its
+// sessions are kept: only accepting moves to the new listener. If the server
+// had stopped serving, it is rebuilt from the current configuration. If the
+// new bind fails, the portal stops and the error is returned; the next
+// Configure starts it again. Rebind does nothing when the portal is not
+// serving or is closed.
+func (p *Portal) Rebind() error {
+	p.mu.Lock()
+	stale, err := p.rebindLocked()
+	p.mu.Unlock()
+	closeSessions(stale)
+	return err
+}
+
+func (p *Portal) rebindLocked() ([]*portalSession, error) {
+	if p.closed || p.server == nil {
+		return nil, nil
+	}
+	if !p.serving() {
+		return p.configureLocked(p.cfg)
+	}
+	// Keep the port the listener actually has, so a portal configured with
+	// port 0 stays reachable where its helpers were told it is.
+	port := uint16(p.ln.Addr().(*net.TCPAddr).Port)
+	p.ln.Close()
+	<-p.serveDone
+	ln, err := p.listen(port)
+	if err != nil {
+		stale := p.setPairings(nil)
+		stopErr := p.stopLocked()
+		p.cfg = PortalConfig{}
+		return stale, errors.Join(err, stopErr)
+	}
+	p.startServe(p.server, ln)
+	p.rebinds.Add(1)
+	return nil, nil
+}
+
+// listen binds the portal's dual-stack listener on port.
+func (p *Portal) listen(port uint16) (net.Listener, error) {
+	lc := net.ListenConfig{Control: physnet.ListenControl(p.ctx)}
+	ln, err := lc.Listen(p.ctx, "tcp", net.JoinHostPort("::", strconv.Itoa(int(port))))
+	if err != nil {
+		return nil, fmt.Errorf("%s: listen: %w", constant.TypeSamizdatPortal, addrFree(err))
+	}
+	return ln, nil
+}
+
+// startServe runs server on ln and records both. p.mu must be held.
+func (p *Portal) startServe(server *samizdat.Server, ln net.Listener) {
+	p.server = server
+	p.ln = ln
+	done := make(chan struct{})
+	p.serveDone = done
+	go func() {
+		defer close(done)
+		// net.ErrClosed means Rebind or Close closed the listener.
+		if err := server.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
+			p.logger.Error(constant.TypeSamizdatPortal, " stopped serving: ", addrFree(err))
+		}
+	}()
+}
+
 // Close stops the portal and ends every session. Configure fails after it.
 func (p *Portal) Close() error {
+	p.rebindMu.Lock()
+	if p.rebindTimer != nil {
+		p.rebindTimer.Stop()
+	}
+	p.rebindMu.Unlock()
 	p.mu.Lock()
 	p.closed = true
 	stale := p.setPairings(nil)
@@ -194,11 +295,10 @@ func (p *Portal) configureLocked(cfg PortalConfig) ([]*portalSession, error) {
 		stop()
 	}
 
-	lc := net.ListenConfig{Control: physnet.ListenControl(p.ctx)}
-	ln, err := lc.Listen(p.ctx, "tcp", net.JoinHostPort("::", strconv.Itoa(int(cfg.ListenPort))))
+	ln, err := p.listen(cfg.ListenPort)
 	if err != nil {
 		server.Close()
-		return stale, errors.Join(stopErr, fmt.Errorf("%s: listen: %w", constant.TypeSamizdatPortal, addrFree(err)))
+		return stale, errors.Join(stopErr, err)
 	}
 	if portChange {
 		stop()
@@ -206,16 +306,7 @@ func (p *Portal) configureLocked(cfg PortalConfig) ([]*portalSession, error) {
 
 	newStale := p.setPairings(cfg.Pairings)
 	p.cfg = cfg
-	p.server = server
-	p.ln = ln
-	done := make(chan struct{})
-	p.serveDone = done
-	go func() {
-		defer close(done)
-		if err := server.Serve(ln); err != nil {
-			p.logger.Error(constant.TypeSamizdatPortal, " stopped serving: ", addrFree(err))
-		}
-	}()
+	p.startServe(server, ln)
 	return append(stale, newStale...), stopErr
 }
 
