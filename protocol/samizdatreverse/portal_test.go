@@ -256,9 +256,8 @@ func TestPortalRebindsOnPortChange(t *testing.T) {
 	id := newShortID(t)
 	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
 
-	portA := freePort(t)
-	require.NoError(t, p.Configure(k.config(portA, map[[8]byte]string{id: tagA})))
-	addrA := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(portA)))
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	addrA := portalAddr(t, p)
 	c, err := net.DialTimeout("tcp", addrA, 2*time.Second)
 	require.NoError(t, err)
 	c.Close()
@@ -271,4 +270,135 @@ func TestPortalRebindsOnPortChange(t *testing.T) {
 	addrB := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(portB)))
 	helper(t, addrB, k, id, "b")
 	require.Eventually(t, func() bool { return whoServes(p, tagA) == "b" }, 5*time.Second, 50*time.Millisecond)
+}
+
+func TestPortalFailedRebindKeepsOldPort(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	addr := portalAddr(t, p)
+	helper(t, addr, k, id, "a")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a" }, 5*time.Second, 50*time.Millisecond)
+
+	busy, err := net.Listen("tcp", "[::]:0")
+	require.NoError(t, err)
+	defer busy.Close()
+	busyPort := uint16(busy.Addr().(*net.TCPAddr).Port)
+
+	require.Error(t, p.Configure(k.config(busyPort, map[[8]byte]string{id: tagA})))
+	assert.Equal(t, addr, portalAddr(t, p))
+	assert.Equal(t, "a", whoServes(p, tagA), "old session must survive a failed rebind")
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	require.NoError(t, err, "old port stopped accepting")
+	c.Close()
+}
+
+func TestPortalEpochShortIDsShareOneSlot(t *testing.T) {
+	k := newTestKeys(t)
+	prev, cur, next := newShortID(t), newShortID(t), newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{prev: tagA, cur: tagA, next: tagA})))
+	addr := portalAddr(t, p)
+
+	first := helper(t, addr, k, prev, "prev")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "prev" }, 5*time.Second, 50*time.Millisecond)
+
+	second := helper(t, addr, k, cur, "cur")
+	select {
+	case <-first:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a session under another epoch's ID did not replace the older one")
+	}
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "cur" }, 5*time.Second, 50*time.Millisecond)
+
+	// The epoch rolls: prev leaves, a new next arrives. cur's session stays.
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{cur: tagA, next: tagA, newShortID(t): tagA})))
+	assert.Equal(t, "cur", whoServes(p, tagA))
+	select {
+	case <-second:
+		t.Fatal("rolling the epoch closed the current session")
+	default:
+	}
+}
+
+func TestPortalCloseEndsEverything(t *testing.T) {
+	k := newTestKeys(t)
+	idA, idB := newShortID(t), newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{idA: tagA, idB: tagB})))
+	addr := portalAddr(t, p)
+	doneA := helper(t, addr, k, idA, "a")
+	doneB := helper(t, addr, k, idB, "b")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a" && whoServes(p, tagB) == "b" }, 5*time.Second, 50*time.Millisecond)
+
+	require.NoError(t, p.Close())
+	for _, done := range []<-chan struct{}{doneA, doneB} {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close left a session open")
+		}
+	}
+	_, ok := p.Session(tagA)
+	assert.False(t, ok)
+	assert.Nil(t, p.Addr())
+	_, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	assert.Error(t, err, "listener still accepts after Close")
+	assert.Error(t, p.Configure(k.config(0, map[[8]byte]string{idA: tagA})))
+}
+
+func TestPortalKeyRotationSamePort(t *testing.T) {
+	k1, k2 := newTestKeys(t), newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	port := freePort(t)
+	require.NoError(t, p.Configure(k1.config(port, map[[8]byte]string{id: tagA})))
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))
+	old := helper(t, addr, k1, id, "old")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "old" }, 5*time.Second, 50*time.Millisecond)
+
+	require.NoError(t, p.Configure(k2.config(port, map[[8]byte]string{id: tagA})))
+	select {
+	case <-old:
+	case <-time.After(5 * time.Second):
+		t.Fatal("key rotation left the old session open")
+	}
+	assert.Equal(t, addr, portalAddr(t, p))
+
+	c, err := samizdat.NewClient(samizdat.ClientConfig{ServerAddr: addr, ServerName: "localhost", PublicKey: k1.pub, ShortID: id})
+	require.NoError(t, err)
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if conn, err := c.DialSession(ctx); err == nil {
+		conn.Close()
+		t.Fatal("old key still authenticates")
+	}
+
+	helper(t, addr, k2, id, "new")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "new" }, 5*time.Second, 50*time.Millisecond)
+}
+
+func TestPortalRebuildsAfterServeExits(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	cfg := k.config(0, map[[8]byte]string{id: tagA})
+	require.NoError(t, p.Configure(cfg))
+
+	// Make Serve fail on its own, as an Accept error would.
+	p.mu.Lock()
+	ln, done := p.ln, p.serveDone
+	p.mu.Unlock()
+	require.NoError(t, ln.Close())
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not exit")
+	}
+
+	require.NoError(t, p.Configure(cfg))
+	helper(t, portalAddr(t, p), k, id, "a")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a" }, 5*time.Second, 50*time.Millisecond)
 }

@@ -95,10 +95,12 @@ func (p *Portal) Start(stage adapter.StartStage) error {
 // Close stops the portal and ends every session. Configure fails after it.
 func (p *Portal) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.closed = true
-	p.setPairings(nil)
-	return p.stopLocked()
+	stale := p.setPairings(nil)
+	err := p.stopLocked()
+	p.mu.Unlock()
+	closeSessions(stale)
+	return err
 }
 
 // Addr returns the address the portal listens on, or nil when it is not
@@ -116,20 +118,32 @@ func (p *Portal) Addr() net.Addr {
 // certificate replaces the server and listener. A change of pairings alone
 // keeps them, ends the sessions of pairings that are gone and stops their
 // short IDs from authenticating. No pairings at all stops the portal.
-// Configuring the current configuration again changes nothing.
+// Configuring the current configuration again changes nothing, unless the
+// server has stopped serving on its own, in which case it is rebuilt.
+//
+// When the port changes, the new port is bound before the old server stops,
+// so a failed bind returns an error and leaves the old configuration
+// serving. A key or certificate change on the same port has to stop the old
+// server first, so a failed bind there leaves the portal stopped.
 func (p *Portal) Configure(cfg PortalConfig) error {
 	cfg.Pairings = maps.Clone(cfg.Pairings)
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	stale, err := p.configureLocked(cfg)
+	p.mu.Unlock()
+	closeSessions(stale)
+	return err
+}
+
+func (p *Portal) configureLocked(cfg PortalConfig) ([]*portalSession, error) {
 	if p.closed {
-		return errors.New(constant.TypeSamizdatPortal + ": closed")
+		return nil, errors.New(constant.TypeSamizdatPortal + ": closed")
 	}
 
 	if len(cfg.Pairings) == 0 {
-		p.setPairings(nil)
+		stale := p.setPairings(nil)
 		err := p.stopLocked()
 		p.cfg = PortalConfig{}
-		return err
+		return stale, err
 	}
 
 	ids := make([][8]byte, 0, len(cfg.Pairings))
@@ -137,13 +151,16 @@ func (p *Portal) Configure(cfg PortalConfig) error {
 		ids = append(ids, id)
 	}
 
-	if p.server != nil && p.cfg.sameServer(cfg) {
-		p.setPairings(cfg.Pairings)
+	if p.server != nil && p.cfg.sameServer(cfg) && p.serving() {
+		// Pairings first, so a newly added ID resolves to its tag by the
+		// time samizdat accepts it. SetShortIDs only fails on an empty set,
+		// which was ruled out above.
+		stale := p.setPairings(cfg.Pairings)
 		if err := p.server.SetShortIDs(ids); err != nil {
-			return fmt.Errorf("%s: %w", constant.TypeSamizdatPortal, err)
+			return stale, fmt.Errorf("%s: %w", constant.TypeSamizdatPortal, err)
 		}
 		p.cfg = cfg
-		return nil
+		return stale, nil
 	}
 
 	server, err := samizdat.NewServer(samizdat.ServerConfig{
@@ -156,21 +173,34 @@ func (p *Portal) Configure(cfg PortalConfig) error {
 		SessionHandler:   p.handleSession,
 	})
 	if err != nil {
-		return fmt.Errorf("%s: %w", constant.TypeSamizdatPortal, err)
+		return nil, fmt.Errorf("%s: %w", constant.TypeSamizdatPortal, err)
 	}
 
-	p.setPairings(nil)
-	stopErr := p.stopLocked()
-	p.cfg = PortalConfig{}
+	var stale []*portalSession
+	var stopErr error
+	stop := func() {
+		stale = p.setPairings(nil)
+		stopErr = p.stopLocked()
+		p.cfg = PortalConfig{}
+	}
+	// The old listener must go first only when it holds the port the new
+	// one needs.
+	portChange := p.ln == nil || cfg.ListenPort != p.cfg.ListenPort
+	if !portChange {
+		stop()
+	}
 
 	lc := net.ListenConfig{Control: physnet.ListenControl(p.ctx)}
 	ln, err := lc.Listen(p.ctx, "tcp", net.JoinHostPort("::", strconv.Itoa(int(cfg.ListenPort))))
 	if err != nil {
 		server.Close()
-		return errors.Join(stopErr, fmt.Errorf("%s: listen: %w", constant.TypeSamizdatPortal, err))
+		return stale, errors.Join(stopErr, fmt.Errorf("%s: listen: %w", constant.TypeSamizdatPortal, addrFree(err)))
+	}
+	if portChange {
+		stop()
 	}
 
-	p.setPairings(cfg.Pairings)
+	newStale := p.setPairings(cfg.Pairings)
 	p.cfg = cfg
 	p.server = server
 	p.ln = ln
@@ -179,10 +209,21 @@ func (p *Portal) Configure(cfg PortalConfig) error {
 	go func() {
 		defer close(done)
 		if err := server.Serve(ln); err != nil {
-			p.logger.Error(constant.TypeSamizdatPortal, " stopped serving: ", err)
+			p.logger.Error(constant.TypeSamizdatPortal, " stopped serving: ", addrFree(err))
 		}
 	}()
-	return stopErr
+	return append(stale, newStale...), stopErr
+}
+
+// serving reports whether the current server's Serve loop is still running.
+// p.mu must be held.
+func (p *Portal) serving() bool {
+	select {
+	case <-p.serveDone:
+		return false
+	default:
+		return true
+	}
 }
 
 // stopLocked closes the server and listener, which ends every session, and
@@ -194,12 +235,17 @@ func (p *Portal) stopLocked() error {
 	err := p.server.Close()
 	<-p.serveDone
 	p.server, p.ln, p.serveDone = nil, nil, nil
-	return err
+	if errors.Is(err, net.ErrClosed) {
+		// The listener had already failed, and Serve has said so.
+		return nil
+	}
+	return addrFree(err)
 }
 
-// setPairings makes pairings the accepted pairings and closes every session
-// whose short ID is no longer paired with the tag it was stored under.
-func (p *Portal) setPairings(pairings map[[8]byte]string) {
+// setPairings makes pairings the accepted pairings. It removes every session
+// whose short ID is no longer paired with the tag it was stored under and
+// returns them for the caller to close once it has released p.mu.
+func (p *Portal) setPairings(pairings map[[8]byte]string) []*portalSession {
 	var stale []*portalSession
 	p.sessMu.Lock()
 	p.pairings = pairings
@@ -210,9 +256,32 @@ func (p *Portal) setPairings(pairings map[[8]byte]string) {
 		}
 	}
 	p.sessMu.Unlock()
-	for _, s := range stale {
-		s.cc.Close()
+	return stale
+}
+
+// closeSessions closes sessions in parallel: closing a TLS conn whose peer
+// has stopped reading can block on its close_notify for seconds.
+func closeSessions(sessions []*portalSession) {
+	var wg sync.WaitGroup
+	for _, s := range sessions {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.cc.Close()
+		}()
 	}
+	wg.Wait()
+}
+
+// addrFree strips the addresses a *net.OpError carries, keeping its
+// operation and cause, so the error can be logged or returned without
+// naming a peer.
+func addrFree(err error) error {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Err != nil {
+		return fmt.Errorf("%s: %w", opErr.Op, opErr.Err)
+	}
+	return err
 }
 
 // Session returns the HTTP/2 client of the live session for reverseTag, if
@@ -241,7 +310,8 @@ func (p *Portal) handleSession(ctx context.Context, conn net.Conn, shortID [8]by
 	wc := &closeNotifyConn{Conn: conn, done: make(chan struct{})}
 	cc, err := (&http2.Transport{ReadIdleTimeout: 30 * time.Second, PingTimeout: 30 * time.Second}).NewClientConn(wc)
 	if err != nil {
-		p.logger.Debug(constant.TypeSamizdatPortal, ": starting HTTP/2 on session: ", err)
+		// err can be a *net.OpError naming the helper's address.
+		p.logger.Debug(constant.TypeSamizdatPortal, ": could not start HTTP/2 on a session")
 		return
 	}
 	defer cc.Close()
