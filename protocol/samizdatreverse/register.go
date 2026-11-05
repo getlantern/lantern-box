@@ -18,18 +18,13 @@ import (
 
 // RegisterInbounds registers the portal and bridge inbounds.
 func RegisterInbounds(registry *inbound.Registry) {
-	inbound.Register[option.SamizdatPortalInboundOptions](registry, constant.TypeSamizdatPortal, NewPortalInbound)
+	inbound.Register[option.SamizdatPortalInboundOptions](registry, constant.TypeSamizdatPortal, NewPortal)
 	inbound.Register[option.SamizdatBridgeInboundOptions](registry, constant.TypeSamizdatBridge, NewBridgeInbound)
 }
 
 // RegisterOutbound registers the reverse outbound.
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.SamizdatReverseOutboundOptions](registry, constant.TypeSamizdatReverse, NewReverseOutbound)
-}
-
-// NewPortalInbound creates a portal inbound.
-func NewPortalInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SamizdatPortalInboundOptions) (adapter.Inbound, error) {
-	return nil, errors.New(constant.TypeSamizdatPortal + ": not implemented")
 }
 
 // NewBridgeInbound creates a bridge inbound.
