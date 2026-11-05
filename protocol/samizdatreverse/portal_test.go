@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -696,4 +697,125 @@ func TestPortalConcurrentFirstSessions(t *testing.T) {
 			}
 		})
 	}
+}
+
+type flushEach struct{ w http.ResponseWriter }
+
+func (f flushEach) Write(b []byte) (int, error) {
+	n, err := f.w.Write(b)
+	f.w.(http.Flusher).Flush()
+	return n, err
+}
+
+// echoHelper is a helper whose HTTP/2 server allows maxStreams concurrent
+// streams and echoes each CONNECT's body back until the portal closes it.
+func echoHelper(t *testing.T, addr string, k testKeys, id [8]byte, maxStreams uint32) <-chan struct{} {
+	t.Helper()
+	c, err := samizdat.NewClient(samizdat.ClientConfig{ServerAddr: addr, ServerName: "localhost", PublicKey: k.pub, ShortID: id})
+	require.NoError(t, err)
+	t.Cleanup(func() { c.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := c.DialSession(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&http2.Server{MaxConcurrentStreams: maxStreams}).ServeConn(conn, &http2.ServeConnOpts{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			io.Copy(flushEach{w}, r.Body)
+		})})
+	}()
+	return done
+}
+
+// openEcho opens a CONNECT stream on cc and returns a function that sends a
+// message on it and checks the echo.
+func openEcho(t *testing.T, cc *http2.ClientConn) func(msg string) error {
+	t.Helper()
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.Close() })
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Host: "example.com:443"},
+		Host:   "example.com:443",
+		Header: http.Header{},
+		Body:   pr,
+	}
+	resp, err := cc.RoundTrip(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { resp.Body.Close() })
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	return func(msg string) error {
+		if _, err := pw.Write([]byte(msg)); err != nil {
+			return err
+		}
+		buf := make([]byte, len(msg))
+		got := make(chan error, 1)
+		go func() {
+			_, err := io.ReadFull(resp.Body, buf)
+			got <- err
+		}()
+		select {
+		case err := <-got:
+			if err != nil {
+				return err
+			}
+		case <-time.After(3 * time.Second):
+			return errors.New("echo timed out")
+		}
+		if string(buf) != msg {
+			return errors.New("echo mismatch")
+		}
+		return nil
+	}
+}
+
+func TestPortalSaturatedSessionIsNotGone(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	p.confirmTimeout = 500 * time.Millisecond
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	addr := portalAddr(t, p)
+
+	busy := echoHelper(t, addr, k, id, 2)
+	var cc *http2.ClientConn
+	require.Eventually(t, func() bool {
+		var ok bool
+		cc, ok = p.Session(tagA)
+		return ok
+	}, 5*time.Second, 20*time.Millisecond)
+	streams := []func(string) error{openEcho(t, cc), openEcho(t, cc)}
+	for _, echo := range streams {
+		require.NoError(t, echo("before"))
+	}
+	require.Eventually(t, func() bool { return !cc.CanTakeNewRequest() }, 5*time.Second, 20*time.Millisecond,
+		"session never reached its stream limit")
+
+	silent := silentSession(t, addr, k, id)
+	select {
+	case <-silent:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the silent candidate was kept")
+	}
+	select {
+	case <-busy:
+		t.Fatal("a silent candidate closed a busy session")
+	default:
+	}
+	assert.False(t, cc.State().Closed)
+	for _, echo := range streams {
+		require.NoError(t, echo("after"), "a tunnel on the busy session broke")
+	}
+
+	helper(t, addr, k, id, "second")
+	select {
+	case <-busy:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a confirmed candidate did not replace the busy session")
+	}
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "second" }, 5*time.Second, 50*time.Millisecond)
 }

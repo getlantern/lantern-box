@@ -496,7 +496,7 @@ func (p *Portal) publish(ctx context.Context, tag string, s *portalSession) bool
 			return false
 		}
 		cur := p.sessions[tag]
-		replace := cur == nil || !cur.cc.CanTakeNewRequest() ||
+		replace := cur == nil || cur.gone() ||
 			(s.confirmed && (!cur.confirmed || cur.seq < s.seq))
 		if replace {
 			p.sessions[tag] = s
@@ -521,6 +521,15 @@ func (p *Portal) publish(ctx context.Context, tag string, s *portalSession) bool
 		}
 		s.confirmed = true
 	}
+}
+
+// gone reports whether s is closed or shutting down, so a newcomer may take
+// its slot without confirming itself first. It deliberately ignores stream
+// capacity: a healthy session that has hit its concurrent-stream limit
+// cannot take a new request, but closing it would drop every tunnel on it.
+func (s *portalSession) gone() bool {
+	st := s.cc.State()
+	return st.Closed || st.Closing
 }
 
 // closeNotifyConn closes done when the HTTP/2 client closes the connection,
