@@ -144,7 +144,8 @@ func (p *Portal) InterfaceUpdated() {
 
 func (p *Portal) rebindAfterUpdate() {
 	if err := p.Rebind(); err != nil {
-		p.logger.Error(constant.TypeSamizdatPortal, ": rebind after a network change: ", err)
+		// addrFree keeps the listen port and addresses out of the log.
+		p.logger.Error(constant.TypeSamizdatPortal, ": rebind after a network change failed, will retry on the next one: ", addrFree(err))
 	}
 }
 

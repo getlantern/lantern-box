@@ -566,7 +566,9 @@ func TestPortalFailedRebindRetriesOnNextUpdate(t *testing.T) {
 		blocker, err = net.Listen("tcp", net.JoinHostPort("::", strconv.Itoa(port)))
 		require.NoError(t, err)
 	}
-	require.Error(t, p.Rebind())
+	err := p.Rebind()
+	require.Error(t, err)
+	assert.NotContains(t, addrFree(err).Error(), strconv.Itoa(port), "rebind error carries the port")
 	assert.Nil(t, p.Addr(), "portal claims to serve after a failed rebind")
 	_, ok := p.Session(tagA)
 	assert.False(t, ok)
