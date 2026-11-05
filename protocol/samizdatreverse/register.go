@@ -31,8 +31,3 @@ func RegisterOutbound(registry *outbound.Registry) {
 func NewBridgeInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SamizdatBridgeInboundOptions) (adapter.Inbound, error) {
 	return nil, errors.New(constant.TypeSamizdatBridge + ": not implemented")
 }
-
-// NewReverseOutbound creates a reverse outbound.
-func NewReverseOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SamizdatReverseOutboundOptions) (adapter.Outbound, error) {
-	return nil, errors.New(constant.TypeSamizdatReverse + ": not implemented")
-}
