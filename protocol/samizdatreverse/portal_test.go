@@ -545,3 +545,63 @@ func TestPortalInterfaceUpdatedWhenStopped(t *testing.T) {
 	assert.Nil(t, p.Addr())
 	assert.EqualValues(t, 0, p.rebinds.Load())
 }
+
+func TestPortalFailedRebindRetriesOnNextUpdate(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	p.rebindDelay = 50 * time.Millisecond
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	addr := portalAddr(t, p)
+	port := p.Addr().(*net.TCPAddr).Port
+
+	// Take the port in the gap between Rebind closing the old listener and
+	// binding the new one, as another process could.
+	var blocker net.Listener
+	p.beforeListen = func(uint16) {
+		p.beforeListen = nil
+		var err error
+		blocker, err = net.Listen("tcp", net.JoinHostPort("::", strconv.Itoa(port)))
+		require.NoError(t, err)
+	}
+	require.Error(t, p.Rebind())
+	assert.Nil(t, p.Addr(), "portal claims to serve after a failed rebind")
+	_, ok := p.Session(tagA)
+	assert.False(t, ok)
+
+	require.NoError(t, blocker.Close())
+	p.InterfaceUpdated()
+	require.Eventually(t, func() bool { return p.Addr() != nil }, 5*time.Second, 20*time.Millisecond)
+	assert.Equal(t, addr, portalAddr(t, p), "portal came back on another port")
+	helper(t, addr, k, id, "a")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a" }, 5*time.Second, 50*time.Millisecond)
+}
+
+func TestPortalRebindAfterServeExitKeepsPort(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	addr := portalAddr(t, p)
+
+	p.mu.Lock()
+	ln, done := p.ln, p.serveDone
+	p.mu.Unlock()
+	require.NoError(t, ln.Close())
+	<-done
+
+	require.NoError(t, p.Rebind())
+	assert.Equal(t, addr, portalAddr(t, p), "a port-0 portal moved to a new port")
+	helper(t, addr, k, id, "a")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a" }, 5*time.Second, 50*time.Millisecond)
+}
+
+func TestPortalEmptyConfigStopsRetries(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	require.NoError(t, p.Configure(k.config(0, nil)))
+	require.NoError(t, p.Rebind())
+	assert.Nil(t, p.Addr(), "Rebind restarted a portal configured with no pairings")
+}

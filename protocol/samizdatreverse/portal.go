@@ -66,13 +66,23 @@ type Portal struct {
 
 	// mu serializes Configure and Close and guards the fields below it. It
 	// is never taken by a session handler.
-	mu        sync.Mutex
-	closed    bool
-	cfg       PortalConfig
+	mu     sync.Mutex
+	closed bool
+	// cfg is the configuration the portal wants to serve. It stays set
+	// while the portal is down after a failed bind, so a later Rebind or
+	// Configure can bring it back. It is empty only when nothing is wanted.
+	cfg PortalConfig
+	// port is the port the portal last served on. A rebuild of a
+	// configuration with ListenPort 0 binds it again, so helpers keep
+	// reaching the portal where they were told it is.
+	port      uint16
 	server    *samizdat.Server
 	ln        net.Listener
 	serveDone chan struct{}
 	rebinds   atomic.Int32 // listener swaps by Rebind, for tests
+	// beforeListen, when set, runs just before each bind. Tests use it to
+	// take the port first.
+	beforeListen func(port uint16)
 
 	// sessMu guards pairings and sessions. It is never held while blocking.
 	sessMu   sync.Mutex
@@ -130,11 +140,12 @@ func (p *Portal) rebindAfterUpdate() {
 
 // Rebind replaces the portal's listener with a new one on the same port,
 // bound to the current default interface. The samizdat server and its
-// sessions are kept: only accepting moves to the new listener. If the server
-// had stopped serving, it is rebuilt from the current configuration. If the
-// new bind fails, the portal stops and the error is returned; the next
-// Configure starts it again. Rebind does nothing when the portal is not
-// serving or is closed.
+// sessions are kept: only accepting moves to the new listener. If the portal
+// is down, because its server stopped serving or an earlier bind failed, it
+// is rebuilt from the wanted configuration on the port it last served on. If
+// the bind fails, the portal stays down, keeps that configuration and
+// returns the error, and the next Rebind or Configure tries again. Rebind
+// does nothing when no configuration is wanted or the portal is closed.
 func (p *Portal) Rebind() error {
 	p.mu.Lock()
 	stale, err := p.rebindLocked()
@@ -144,22 +155,19 @@ func (p *Portal) Rebind() error {
 }
 
 func (p *Portal) rebindLocked() ([]*portalSession, error) {
-	if p.closed || p.server == nil {
+	if p.closed || len(p.cfg.Pairings) == 0 {
 		return nil, nil
 	}
-	if !p.serving() {
+	if p.server == nil || !p.serving() {
 		return p.configureLocked(p.cfg)
 	}
-	// Keep the port the listener actually has, so a portal configured with
-	// port 0 stays reachable where its helpers were told it is.
-	port := uint16(p.ln.Addr().(*net.TCPAddr).Port)
 	p.ln.Close()
 	<-p.serveDone
-	ln, err := p.listen(port)
+	ln, err := p.listen(p.port)
 	if err != nil {
+		// Down, but p.cfg and p.port are kept for the next attempt.
 		stale := p.setPairings(nil)
 		stopErr := p.stopLocked()
-		p.cfg = PortalConfig{}
 		return stale, errors.Join(err, stopErr)
 	}
 	p.startServe(p.server, ln)
@@ -169,6 +177,9 @@ func (p *Portal) rebindLocked() ([]*portalSession, error) {
 
 // listen binds the portal's dual-stack listener on port.
 func (p *Portal) listen(port uint16) (net.Listener, error) {
+	if p.beforeListen != nil {
+		p.beforeListen(port)
+	}
 	lc := net.ListenConfig{Control: physnet.ListenControl(p.ctx)}
 	ln, err := lc.Listen(p.ctx, "tcp", net.JoinHostPort("::", strconv.Itoa(int(port))))
 	if err != nil {
@@ -181,6 +192,7 @@ func (p *Portal) listen(port uint16) (net.Listener, error) {
 func (p *Portal) startServe(server *samizdat.Server, ln net.Listener) {
 	p.server = server
 	p.ln = ln
+	p.port = uint16(ln.Addr().(*net.TCPAddr).Port)
 	done := make(chan struct{})
 	p.serveDone = done
 	go func() {
@@ -203,6 +215,7 @@ func (p *Portal) Close() error {
 	p.closed = true
 	stale := p.setPairings(nil)
 	err := p.stopLocked()
+	p.cfg, p.port = PortalConfig{}, 0
 	p.mu.Unlock()
 	closeSessions(stale)
 	return err
@@ -229,7 +242,9 @@ func (p *Portal) Addr() net.Addr {
 // When the port changes, the new port is bound before the old server stops,
 // so a failed bind returns an error and leaves the old configuration
 // serving. A key or certificate change on the same port has to stop the old
-// server first, so a failed bind there leaves the portal stopped.
+// server first, so a failed bind there leaves the portal down with cfg
+// wanted, and Rebind or Configure tries again. ListenPort 0 binds the port
+// the portal last served on, if any, and otherwise any free port.
 func (p *Portal) Configure(cfg PortalConfig) error {
 	cfg.Pairings = maps.Clone(cfg.Pairings)
 	p.mu.Lock()
@@ -247,7 +262,7 @@ func (p *Portal) configureLocked(cfg PortalConfig) ([]*portalSession, error) {
 	if len(cfg.Pairings) == 0 {
 		stale := p.setPairings(nil)
 		err := p.stopLocked()
-		p.cfg = PortalConfig{}
+		p.cfg, p.port = PortalConfig{}, 0
 		return stale, err
 	}
 
@@ -281,26 +296,37 @@ func (p *Portal) configureLocked(cfg PortalConfig) ([]*portalSession, error) {
 		return nil, fmt.Errorf("%s: %w", constant.TypeSamizdatPortal, err)
 	}
 
+	bindPort := cfg.ListenPort
+	if bindPort == 0 {
+		bindPort = p.port
+	}
 	var stale []*portalSession
 	var stopErr error
 	stop := func() {
 		stale = p.setPairings(nil)
 		stopErr = p.stopLocked()
-		p.cfg = PortalConfig{}
 	}
-	// The old listener must go first only when it holds the port the new
-	// one needs.
-	portChange := p.ln == nil || cfg.ListenPort != p.cfg.ListenPort
-	if !portChange {
+	// A running server holding a different port keeps serving until the new
+	// one is bound, so a failed bind leaves it as it was. One holding the
+	// same port must go first, and so must one whose Serve loop has exited
+	// (it may still hold its listener and has nothing worth keeping).
+	running := p.server != nil && p.serving()
+	if p.server != nil && (!running || bindPort == p.port) {
 		stop()
+		running = false
 	}
 
-	ln, err := p.listen(cfg.ListenPort)
+	ln, err := p.listen(bindPort)
 	if err != nil {
 		server.Close()
+		if !running {
+			// Nothing is serving. Keep cfg wanted so Rebind or Configure
+			// can bring the portal back.
+			p.cfg = cfg
+		}
 		return stale, errors.Join(stopErr, err)
 	}
-	if portChange {
+	if running {
 		stop()
 	}
 
