@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"sync/atomic"
 	"time"
@@ -75,7 +76,10 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	defer conn.Close()
 
 	timed := &writeTimedConn{Conn: conn}
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
+	traceCtx := httptrace.WithClientTrace(probeCtx, &httptrace.ClientTrace{
+		GotFirstResponseByte: func() { timed.frozen.Store(true) },
+	})
+	req, err := http.NewRequestWithContext(traceCtx, http.MethodGet, probeURL, nil)
 	if err != nil {
 		return 0, fmt.Errorf("new request: %w", err)
 	}
@@ -108,17 +112,22 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	return time.Since(timed.lastWrite()), nil
 }
 
-// writeTimedConn records when its most recent Write returned. For a bodyless
-// GET the last write before the response is the request itself, completed only
-// once any handshake the outbound runs on first write is done.
+// writeTimedConn records when its most recent Write returned, until frozen at
+// the first response byte. For a bodyless GET the last write before the
+// response is the request itself, completed only once any handshake the
+// outbound runs on first write is done; freezing keeps later writes, such as a
+// TLS close_notify, from moving it.
 type writeTimedConn struct {
 	net.Conn
-	last atomic.Int64
+	last   atomic.Int64
+	frozen atomic.Bool
 }
 
 func (c *writeTimedConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
-	c.last.Store(time.Now().UnixNano())
+	if !c.frozen.Load() {
+		c.last.Store(time.Now().UnixNano())
+	}
 	return n, err
 }
 

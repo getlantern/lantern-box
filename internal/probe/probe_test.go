@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -236,6 +238,32 @@ func TestRun_DelayExcludesConnectionSetupForEveryOutbound(t *testing.T) {
 			assert.Less(t, delay, dialCost, "connection setup is not")
 		})
 	}
+}
+
+type rootPool struct {
+	adapter.CertificateStore
+	pool *x509.CertPool
+}
+
+func (r rootPool) Pool() *x509.CertPool { return r.pool }
+
+func TestRun_DelayIgnoresWritesAfterTheResponseBegins(t *testing.T) {
+	const serverCost = 300 * time.Millisecond
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverCost)
+		w.Header().Set("Connection", "close")
+	}))
+	defer srv.Close()
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+
+	var conns []*trackedConn
+	out := &stubOutbound{dial: dialerFor(strings.TrimPrefix(srv.URL, "https://"), &conns)}
+	ctx := service.ContextWith[adapter.CertificateStore](context.Background(), rootPool{pool: pool})
+
+	delay, err := Run(ctx, out, srv.URL, 5*time.Second)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, delay, serverCost, "a close_notify sent at body EOF does not restart the timer")
 }
 
 func TestRun_DerivesPortFromScheme(t *testing.T) {
