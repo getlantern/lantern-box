@@ -110,12 +110,15 @@ func newDeviceSpanGate(size int, ttl time.Duration) *deviceSpanGate {
 }
 
 // first reports whether deviceID has not been seen within the TTL, and records
-// it, so concurrent first connections from one device emit a single span.
+// it, so concurrent first connections from one device emit a single span. Get,
+// unlike Contains, treats an expired entry as absent before the background
+// cleanup removes it, and marks a returning device recently used (without
+// extending its TTL) so it is not the next one evicted.
 func (g *deviceSpanGate) first(deviceID string) bool {
 	key := maphash.String(g.seed, deviceID)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.seen.Contains(key) {
+	if _, seen := g.seen.Get(key); seen {
 		return false
 	}
 	g.seen.Add(key, struct{}{})

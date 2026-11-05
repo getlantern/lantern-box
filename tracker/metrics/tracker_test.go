@@ -232,9 +232,10 @@ func TestDeviceSpanGate(t *testing.T) {
 	g = newDeviceSpanGate(2, time.Hour)
 	assert.True(t, g.first("a"))
 	assert.True(t, g.first("b"))
-	assert.True(t, g.first("c"), "past the size bound the least recent is forgotten")
-	assert.True(t, g.first("a"), "a forgotten device emits again")
-	assert.False(t, g.first("c"), "a recent device is still remembered")
+	assert.False(t, g.first("a"), "a returning device is suppressed and becomes recently used")
+	assert.True(t, g.first("c"), "past the size bound the least recently used (b) is forgotten")
+	assert.False(t, g.first("a"), "a device seen since b is still remembered")
+	assert.True(t, g.first("b"), "the forgotten device emits again")
 }
 
 // Repeated connections from one device emit device_id.connected once.
