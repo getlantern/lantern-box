@@ -176,6 +176,9 @@ func (c *writeTimedConn) settleLocked() {
 	}
 }
 
+// errNoRequestWrite is returned when the response began before any write.
+var errNoRequestWrite = errors.New("response began before the request was written")
+
 // lastWrite waits for every counted write to return, then reports when the
 // last of them did.
 func (c *writeTimedConn) lastWrite(ctx context.Context) (time.Time, error) {
@@ -186,5 +189,8 @@ func (c *writeTimedConn) lastWrite(ctx context.Context) (time.Time, error) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.last.IsZero() {
+		return time.Time{}, errNoRequestWrite
+	}
 	return c.last, nil
 }

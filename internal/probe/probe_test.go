@@ -302,6 +302,13 @@ func TestRun_RequestWriteStillInFlightAtTheResponseCounts(t *testing.T) {
 	assert.Less(t, delay, writeReturn, "waiting for the write to return is not timed")
 }
 
+func TestWriteTimedConn_ResponseBeforeAnyWriteIsAnError(t *testing.T) {
+	c := newWriteTimedConn(nil)
+	c.freeze()
+	_, err := c.lastWrite(context.Background())
+	require.ErrorIs(t, err, errNoRequestWrite)
+}
+
 func TestRun_DerivesPortFromScheme(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
