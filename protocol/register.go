@@ -25,6 +25,7 @@ import (
 	"github.com/getlantern/lantern-box/protocol/outline"
 	"github.com/getlantern/lantern-box/protocol/reflex"
 	"github.com/getlantern/lantern-box/protocol/samizdat"
+	"github.com/getlantern/lantern-box/protocol/samizdatreverse"
 	"github.com/getlantern/lantern-box/protocol/twiddle"
 	"github.com/getlantern/lantern-box/protocol/unbounded"
 	"github.com/getlantern/lantern-box/protocol/water"
@@ -101,6 +102,7 @@ func registerInbounds(registry *inbound.Registry) {
 	meek.RegisterInbound(registry)
 	reflex.RegisterInbound(registry)
 	samizdat.RegisterInbound(registry)
+	samizdatreverse.RegisterInbounds(registry)
 	twiddle.RegisterInbound(registry)
 	water.RegisterInbound(registry)
 }
@@ -113,6 +115,7 @@ func registerOutbounds(registry *outbound.Registry) {
 	outline.RegisterOutbound(registry)
 	reflex.RegisterOutbound(registry)
 	samizdat.RegisterOutbound(registry)
+	samizdatreverse.RegisterOutbound(registry)
 	twiddle.RegisterOutbound(registry)
 	unbounded.RegisterOutbound(registry)
 	water.RegisterOutbound(registry)
