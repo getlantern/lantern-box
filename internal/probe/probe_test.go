@@ -280,10 +280,13 @@ func (c slowReturnConn) Write(b []byte) (int, error) {
 }
 
 func TestRun_RequestWriteStillInFlightAtTheResponseCounts(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	const serverCost = 100 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverCost)
+	}))
 	defer srv.Close()
 	addr := strings.TrimPrefix(srv.URL, "http://")
-	const writeReturn = 200 * time.Millisecond
+	const writeReturn = 400 * time.Millisecond
 
 	out := &stubOutbound{dial: func(ctx context.Context) (net.Conn, error) {
 		c, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
@@ -295,7 +298,8 @@ func TestRun_RequestWriteStillInFlightAtTheResponseCounts(t *testing.T) {
 
 	delay, err := Run(context.Background(), out, srv.URL, 5*time.Second)
 	require.NoError(t, err)
-	assert.Less(t, delay, writeReturn, "the request write is timed from when it returned, not left unrecorded")
+	assert.GreaterOrEqual(t, delay, serverCost, "a write returning after the response does not hide the server's time")
+	assert.Less(t, delay, writeReturn, "waiting for the write to return is not timed")
 }
 
 func TestRun_DerivesPortFromScheme(t *testing.T) {

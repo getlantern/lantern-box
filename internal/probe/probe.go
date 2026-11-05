@@ -109,20 +109,22 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+	end := time.Now()
 
 	start, err := timed.lastWrite(probeCtx)
 	if err != nil {
 		return 0, fmt.Errorf("await request write: %w", err)
 	}
-	return time.Since(start), nil
+	return end.Sub(start), nil
 }
 
 // writeTimedConn records when its most recent Write returned, counting only
 // writes that started before the first response byte. For a bodyless GET the
 // last of those is the request itself, completed only once any handshake the
-// outbound runs on first write is done. A write in flight when the response
-// arrives still counts; later writes, such as a TLS close_notify at body EOF,
-// do not.
+// outbound runs on first write is done. Later writes, such as a TLS
+// close_notify at body EOF, do not count. A write still in flight when the
+// response arrives counts from when it started, since its return says nothing
+// about when its bytes left.
 type writeTimedConn struct {
 	net.Conn
 	mu       sync.Mutex
@@ -143,10 +145,15 @@ func (c *writeTimedConn) Write(b []byte) (int, error) {
 		c.inFlight++
 	}
 	c.mu.Unlock()
+	called := time.Now()
 	n, err := c.Conn.Write(b)
 	if counts {
 		c.mu.Lock()
-		c.last = time.Now()
+		if c.frozen {
+			c.last = called
+		} else {
+			c.last = time.Now()
+		}
 		c.inFlight--
 		c.settleLocked()
 		c.mu.Unlock()
