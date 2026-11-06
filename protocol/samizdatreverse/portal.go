@@ -481,37 +481,27 @@ func (p *Portal) handleSession(ctx context.Context, conn net.Conn, shortID [8]by
 // publish stores s as the session for tag and closes the one it replaces.
 // It reports false if s should be dropped instead.
 //
-// A session only replaces a live one once its helper has answered a ping.
-// The bridge races IPv6 against IPv4 with the same short ID and closes the
-// loser without serving HTTP/2, so an unconfirmed loser must never close a
-// working session. An empty slot is filled at once, which adds no latency
-// to the first connect. A session published that way is unconfirmed, and
-// any confirmed one replaces it. Between confirmed sessions the newer
+// An empty slot is filled at once, which adds no latency to the first
+// connect. A session published that way is unconfirmed. When the slot is
+// taken, s must first answer a ping before it can replace the occupant: the
+// bridge races IPv6 against IPv4 with the same short ID and closes the loser
+// without serving HTTP/2, so an unconfirmed loser must never close a working
+// session. The occupant is never inspected. Its HTTP/2 client can be stuck
+// behind a write to a helper that stopped reading, and a confirmed
+// replacement is exactly what restores traffic then. A confirmed s replaces
+// an unconfirmed or older occupant. Between confirmed sessions the newer
 // arrival wins, so a confirmation that finishes late cannot undo a newer
-// reconnect. The check and the store share one hold of sessMu; the ping
+// reconnect. Only fields of the sessions are read under sessMu; the ping
 // runs outside it, and the slot is evaluated again afterwards.
 func (p *Portal) publish(ctx context.Context, tag string, s *portalSession) bool {
 	for {
-		// cur.gone reads the HTTP/2 client's state, which can wait behind a
-		// write stalled on a helper that stopped reading. It runs outside
-		// sessMu, and the slot is checked again before acting on it.
-		p.sessMu.Lock()
-		cur := p.sessions[tag]
-		p.sessMu.Unlock()
-		curGone := cur != nil && cur.gone()
-
 		p.sessMu.Lock()
 		if p.pairings[s.shortID] != tag {
 			p.sessMu.Unlock()
 			return false
 		}
-		if p.sessions[tag] != cur {
-			p.sessMu.Unlock()
-			continue
-		}
-		replace := cur == nil || curGone ||
-			(s.confirmed && (!cur.confirmed || cur.seq < s.seq))
-		if replace {
+		cur := p.sessions[tag]
+		if cur == nil || (s.confirmed && (!cur.confirmed || cur.seq < s.seq)) {
 			p.sessions[tag] = s
 			p.sessMu.Unlock()
 			if cur != nil {
@@ -534,17 +524,6 @@ func (p *Portal) publish(ctx context.Context, tag string, s *portalSession) bool
 		}
 		s.confirmed = true
 	}
-}
-
-// gone reports whether s is closed or shutting down, so a newcomer may take
-// its slot without confirming itself first. It deliberately ignores stream
-// capacity: a healthy session that has hit its concurrent-stream limit
-// cannot take a new request, but closing it would drop every tunnel on it.
-// It can block behind a stalled write, so it must not be called under a
-// portal lock.
-func (s *portalSession) gone() bool {
-	st := s.cc.State()
-	return st.Closed || st.Closing
 }
 
 // closeNotifyConn closes done when the HTTP/2 client closes the connection,

@@ -890,14 +890,17 @@ func TestPortalStalledWriteDoesNotBlockPortal(t *testing.T) {
 	require.Eventually(t, func() bool { return !returnsWithin(200*time.Millisecond, func() { ccA.State() }) },
 		5*time.Second, 50*time.Millisecond, "the write to the stalled helper never blocked")
 
-	// A second session for tag A has to inspect A's state before it can
-	// publish, and blocks there.
+	// A second, healthy session for tag A arrives while A's write is stuck.
 	helper(t, addr, k, idA, "a2")
 	<-arrivals
-	time.Sleep(300 * time.Millisecond)
 
 	assert.True(t, returnsWithin(3*time.Second, func() { assert.Equal(t, "b", whoServes(p, tagB)) }),
 		"Session for another tag blocked behind a stalled write")
 	assert.True(t, returnsWithin(3*time.Second, func() { assert.NoError(t, p.Configure(k.config(0, pairings))) }),
 		"Configure blocked behind a stalled write")
+
+	// The replacement confirms itself without waiting on the stalled client,
+	// takes the slot and restores traffic for tag A.
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a2" }, 10*time.Second, 50*time.Millisecond,
+		"a healthy replacement for a stalled session never took over")
 }
