@@ -130,9 +130,12 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 	if err == nil {
 		metrics.duration = duration
 	}
-	// Track per-session download goodput (received bytes per second of connection
-	// lifetime), recorded once at close for any session that moved >0 bytes over a
-	// >0 duration (see recordGoodput; no byte floor). The bandit experiment
+	// Track per-session goodput, recorded once at close. Samples with
+	// network.io.direction='receive' are bytes received from the client per
+	// second of connection lifetime, for any session that moved >0 bytes over a
+	// >0 duration (see recordGoodput; no byte floor). Samples with 'transmit'
+	// are bytes sent to the client per second of active sending, for sessions
+	// that sent at least 1 MiB (see recordDownloadGoodput). The bandit experiment
 	// evaluator slices this by three QUERYABLE POINT attributes — "track"
 	// (the bare key, not the "proxy.track" resource attr), geo.country.iso_code,
 	// and network.io.direction='receive' — to compare a challenger track's
@@ -144,7 +147,7 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 	// spelling for consistency within this package's metrics.
 	goodput, err := meter.Float64Histogram("proxy.session.goodput",
 		metric.WithUnit("bytes/s"),
-		metric.WithDescription("Per-session download goodput: received bytes per second of connection lifetime"),
+		metric.WithDescription("Per-session goodput: for network.io.direction=receive, bytes received from the client per second of connection lifetime; for transmit, bytes sent to the client per second of active sending, for sessions that sent at least 1 MiB"),
 		metric.WithExplicitBucketBoundaries(goodputBucketBoundaries...))
 	if err == nil {
 		metrics.sessionGoodput = goodput

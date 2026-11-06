@@ -13,7 +13,12 @@ type Conn struct {
 	tracker   *MetricsTracker
 	startTime time.Time
 	rxBytes   atomic.Int64
-	closed    atomic.Bool
+	// txBytes, firstTx and lastTx (unix nanoseconds) measure what the proxy
+	// sent the client, for download goodput (see recordDownloadGoodput).
+	txBytes atomic.Int64
+	firstTx atomic.Int64
+	lastTx  atomic.Int64
+	closed  atomic.Bool
 }
 
 // NewConn creates a new Conn instance.
@@ -40,6 +45,10 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 func (c *Conn) Write(b []byte) (n int, err error) {
 	n, err = c.Conn.Write(b)
 	if n > 0 {
+		now := time.Now().UnixNano()
+		c.firstTx.CompareAndSwap(0, now)
+		c.lastTx.Store(now)
+		c.txBytes.Add(int64(n))
 		c.tracker.TrackIO(tx, n, c.attrs)
 	}
 	return
@@ -52,6 +61,7 @@ func (c *Conn) Close() error {
 		duration := time.Since(c.startTime).Milliseconds()
 		c.tracker.Leave(duration, c.attrs)
 		c.tracker.recordGoodput(c.rxBytes.Load(), duration, c.attrs)
+		c.tracker.recordDownloadGoodput(c.txBytes.Load(), c.lastTx.Load()-c.firstTx.Load(), c.attrs)
 	}
 	return c.Conn.Close()
 }
