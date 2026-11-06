@@ -6,12 +6,11 @@ import (
 
 	"github.com/pion/transport/v5"
 	"github.com/pion/transport/v5/stdnet"
-	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing/common/control"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/service"
+
+	"github.com/getlantern/lantern-box/protocol/internal/physnet"
 )
 
 // rtcNet is a pion transport.Net backed by a sing-box N.Dialer. Every pion
@@ -73,7 +72,7 @@ func (n *rtcNet) ListenPacket(network, address string) (net.PacketConn, error) {
 // IP_BOUND_IF (macOS/iOS) / SO_BINDTODEVICE (Linux/Android).
 func (n *rtcNet) ListenUDP(network string, laddr *net.UDPAddr) (transport.UDPConn, error) {
 	lc := net.ListenConfig{
-		Control: bindEgressToPhysicalInterface(n.ctx),
+		Control: physnet.ListenControl(n.ctx),
 	}
 	addr := ""
 	if laddr != nil {
@@ -93,34 +92,6 @@ func (n *rtcNet) ListenUDP(network string, laddr *net.UDPAddr) (transport.UDPCon
 		}
 	}
 	return udpConn, nil
-}
-
-// bindEgressToPhysicalInterface returns a net.ListenConfig.Control
-// function that force-binds newly-created sockets to the platform's
-// default physical interface. When no NetworkManager is registered on
-// ctx (tests, standalone sing-box without the tunnel wrapper), it's a
-// no-op — the socket follows the routing table like a plain
-// net.ListenUDP.
-//
-// Implementation-wise we borrow the same ProtectFunc /
-// AutoDetectInterfaceFunc hooks sing-box's default dialer uses, but we
-// apply them UNCONDITIONALLY whenever a NetworkManager is present —
-// not gated on networkManager.AutoDetectInterface() the way
-// sing-box/common/dialer/default.go:NewDefault is. This is
-// intentional: pion's ICE host-candidate gathering fails if sockets
-// aren't kept off the TUN we're serving, even when the user hasn't
-// explicitly set auto_detect_interface on the outbound. Gating on
-// AutoDetectInterface() would reintroduce the "NAT failure, aborting!"
-// regression this override exists to fix.
-func bindEgressToPhysicalInterface(ctx context.Context) control.Func {
-	nm := service.FromContext[adapter.NetworkManager](ctx)
-	if nm == nil {
-		return nil
-	}
-	if pf := nm.ProtectFunc(); pf != nil {
-		return pf
-	}
-	return nm.AutoDetectInterfaceFunc()
 }
 
 func (n *rtcNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.TCPConn, error) {

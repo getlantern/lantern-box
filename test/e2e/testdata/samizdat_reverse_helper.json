@@ -1,0 +1,15 @@
+{
+	"log": {"disabled": true},
+	"inbounds": [
+		{
+			"type": "samizdat-bridge",
+			"tag": "samizdat-bridge",
+			"addrs": ["127.0.0.1:PORTAL_PORT"],
+			"public_key": "PUBLIC_KEY",
+			"short_id": "SHORT_ID",
+			"server_name": "localhost",
+			"cert_spki_sha256": "CERT_PIN"
+		}
+	],
+	"outbounds": [{"type": "direct", "tag": "direct"}]
+}
