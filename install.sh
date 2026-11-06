@@ -41,6 +41,14 @@ node_args_given() {
 	[ "${LANTERN_NODE_ARGS+set}" = set ]
 }
 
+# LANTERN_USER_ID was how a node was enrolled before anyone could run one. Say
+# where the flag goes now rather than drop it silently.
+warn_user_id() {
+	if [ -n "${LANTERN_USER_ID:-}" ]; then
+		say "LANTERN_USER_ID isn't needed any more and was ignored. To send it anyway, put --user-id $LANTERN_USER_ID in LANTERN_NODE_ARGS."
+	fi
+}
+
 install_macos() {
 	has brew || die "install Homebrew from https://brew.sh first, then run this again"
 	brew install getlantern/tap/lantern-box
@@ -56,7 +64,8 @@ install_macos() {
 	# it isn't running.
 	brew services restart lantern-box
 	say "The Lantern node is running. Check it with: brew services info lantern-box"
-	say "Its settings are in $prefix/etc/lantern-node.args."
+	say "To give it flags, put them in $prefix/etc/lantern-node.args and run: brew services restart lantern-box"
+	warn_user_id
 }
 
 latest_tag() {
@@ -150,6 +159,7 @@ install_linux() {
 	as_root systemctl restart lantern-node.service
 	say "The Lantern node is running. Check it with: systemctl status lantern-node"
 	say "Its logs: journalctl -u lantern-node -f"
+	warn_user_id
 }
 
 case $(uname -s) in

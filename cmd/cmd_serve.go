@@ -19,7 +19,7 @@ func init() {
 	serveCmd.Flags().String("api-url", "https://df.iantem.io/api/v1", "lantern-cloud API base URL")
 	serveCmd.Flags().String("state-dir", "", "Directory keeping the node's device ID and port (default: lantern-box under the user's config directory)")
 	serveCmd.Flags().Uint16("port", 0, "Port for the node's inbound, in place of the random one chosen on first run; forward it if the node is behind a router")
-	serveCmd.Flags().String("user-id", "", "Your Lantern user ID, which can enroll this node")
+	serveCmd.Flags().String("user-id", "", "Your Lantern user ID, sent when the node registers (not needed to run one)")
 	serveCmd.Flags().Int("max-peers", 0, "How many censored users the Unbounded volunteer serves at once (default: lantern-box's)")
 	serveCmd.Flags().String("bandwidth-limit", "", "Cap on the Unbounded volunteer's traffic in each direction, such as 10mbit or 2MB/s (default: none)")
 	serveCmd.Flags().Duration("rotation-interval", node.DefaultRotationInterval, "How often to register again, for fresh credentials and settings")
