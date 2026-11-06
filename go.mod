@@ -40,6 +40,7 @@ require (
 	github.com/hashicorp/yamux v0.1.2
 	github.com/huin/goupnp v1.3.0
 	github.com/jackpal/gateway v1.2.0
+	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/pion/stun/v4 v4.0.1
 	github.com/pion/transport/v5 v5.1.1
 	github.com/refraction-networking/water v0.7.1-alpha
@@ -47,6 +48,7 @@ require (
 	github.com/sagernet/sing-box v1.13.19
 	github.com/sagernet/sing-quic v0.6.4-0.20260803041914-d83826c306d7
 	github.com/spf13/cobra v1.10.2
+	github.com/spf13/pflag v1.0.9
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.40.0
 	github.com/tetratelabs/wazero v1.11.0
@@ -295,7 +297,6 @@ require (
 	github.com/sorairolake/lzip-go v0.3.8 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/spf13/afero v1.15.0 // indirect
-	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
 	github.com/tailscale/certstore v0.1.1-0.20231202035212-d3fa0460f47e // indirect
 	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55 // indirect
