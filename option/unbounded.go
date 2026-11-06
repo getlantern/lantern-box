@@ -137,4 +137,14 @@ type UnboundedVolunteerOptions struct {
 	// StatsInterval is how often the node logs what it served, in seconds. Zero means 60; a
 	// negative value turns the line off.
 	StatsInterval int `json:"stats_interval,omitempty"`
+
+	// MappedUDPPort, if set, is a local UDP port the volunteer carries its WebRTC host traffic on:
+	// one the node has mapped on its router, keeping the port number. The volunteer also echoes
+	// lantern-cloud's probes on it (see the unbounded package's SetUDPProbeToken), so the node can
+	// show lantern-cloud the mapping reaches it from outside.
+	MappedUDPPort uint16 `json:"mapped_udp_port,omitempty"`
+	// MappedExternalIP is the IPv4 address MappedUDPPort is reachable at from outside. Set it only
+	// once the mapping is verified: the volunteer then offers consumers that address and reports
+	// itself to freddie as mapped. Requires MappedUDPPort.
+	MappedExternalIP string `json:"mapped_external_ip,omitempty"`
 }

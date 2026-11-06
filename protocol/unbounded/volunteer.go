@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 
 	UBClientcore "github.com/getlantern/broflake/clientcore"
 	UBCommon "github.com/getlantern/broflake/common"
+	"github.com/pion/ice/v4"
 	"github.com/sagernet/sing-box/adapter"
 	boxService "github.com/sagernet/sing-box/adapter/service"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -58,11 +60,14 @@ type Volunteer struct {
 	egOpt         *UBClientcore.EgressOptions
 	statsInterval time.Duration
 	bandwidth     byteRate
+	// mappedPort is MappedUDPPort, whose socket Start opens and Close closes.
+	mappedPort uint16
 
 	stats volunteerStats
 
 	mu     sync.Mutex
 	ui     *UBClientcore.UIImpl
+	mux    io.Closer
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -91,6 +96,15 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 		// fires at once.
 		if v < 0 {
 			return nil, fmt.Errorf("unbounded volunteer: %s must not be negative, got %d", name, v)
+		}
+	}
+
+	if opts.MappedExternalIP != "" {
+		if opts.MappedUDPPort == 0 {
+			return nil, errors.New("unbounded volunteer: mapped_external_ip needs mapped_udp_port")
+		}
+		if ip := net.ParseIP(opts.MappedExternalIP); ip == nil || ip.To4() == nil {
+			return nil, fmt.Errorf("unbounded volunteer: mapped_external_ip must be an IPv4 address, got %q", opts.MappedExternalIP)
 		}
 	}
 
@@ -136,6 +150,11 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 	// node can be compared with the apps and the browser widget.
 	rtcOpt.VolunteerKind = UBCommon.VolunteerKindServer
 	rtcOpt.OnSTUNPreflight = v.stunPreflight
+	v.mappedPort = opts.MappedUDPPort
+	if opts.MappedExternalIP != "" {
+		rtcOpt.ICEUDPMuxExternalIP = opts.MappedExternalIP
+		rtcOpt.VolunteerMapped = true
+	}
 
 	bandwidth, err := parseRate(opts.BandwidthLimit)
 	if err != nil {
@@ -187,8 +206,19 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 		return fmt.Errorf("unbounded volunteer: build signaling dialer: %w", err)
 	}
 	v.rtcOpt.HTTPClient = signalingClient(v.ctx, signalingDialer, v.insecureDiscoveryCert)
+	if v.mappedPort != 0 {
+		mux, err := v.listenMapped()
+		if err != nil {
+			return err
+		}
+		v.rtcOpt.ICEUDPMux, v.mux = mux, mux
+	}
 	_, ui, err := UBClientcore.NewBroflake(v.bfOpt, v.rtcOpt, v.egOpt)
 	if err != nil {
+		if v.mux != nil {
+			_ = v.mux.Close()
+			v.rtcOpt.ICEUDPMux, v.mux = nil, nil
+		}
 		return fmt.Errorf("unbounded volunteer: start broflake: %w", err)
 	}
 	v.ui = ui
@@ -200,6 +230,8 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 		"target_countries", strings.Join(v.rtcOpt.TargetCountries, ","),
 		"nat_fail_timeout", v.rtcOpt.NATFailTimeout,
 		"bandwidth_limit", v.bandwidth.String(),
+		"mapped_udp_port", int(v.mappedPort),
+		"mapped_external_ip", v.rtcOpt.ICEUDPMuxExternalIP,
 	)
 	if v.statsInterval > 0 {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -211,8 +243,8 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 
 func (v *Volunteer) Close() error {
 	v.mu.Lock()
-	ui, cancel, done := v.ui, v.cancel, v.done
-	v.ui, v.cancel, v.done = nil, nil, nil
+	ui, mux, cancel, done := v.ui, v.mux, v.cancel, v.done
+	v.ui, v.mux, v.cancel, v.done = nil, nil, nil, nil
 	v.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -221,7 +253,30 @@ func (v *Volunteer) Close() error {
 	if ui != nil {
 		ui.Stop()
 	}
+	// After broflake, which only stops using the mux as its workers wind down, and before the
+	// box returns, so a node's next box can take the port.
+	if mux != nil {
+		return mux.Close()
+	}
 	return nil
+}
+
+// listenMapped opens the mapped UDP port, on the bandwidth-limited Net when there is one so the
+// mapped traffic is limited too, and builds the ICE mux over it. Probes are answered below the
+// mux.
+func (v *Volunteer) listenMapped() (*ice.UDPMuxDefault, error) {
+	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: int(v.mappedPort)}
+	var conn net.PacketConn
+	var err error
+	if v.rtcOpt.Net != nil {
+		conn, err = v.rtcOpt.Net.ListenUDP("udp4", laddr)
+	} else {
+		conn, err = net.ListenUDP("udp4", laddr)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("unbounded volunteer: listen on mapped UDP port %d: %w", v.mappedPort, err)
+	}
+	return ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: probeEchoConn{conn}, Net: v.rtcOpt.Net}), nil
 }
 
 // stunPreflight logs STUN checks that fail. A node that can't reach any STUN server stops taking
