@@ -42,12 +42,12 @@ curl -fsSL https://raw.githubusercontent.com/getlantern/lantern-box/main/install
 
 ```bash
 docker run -d --name lantern-node --restart unless-stopped --network host \
-  -v lantern-node:/var/lib/lantern-node \
+  --stop-timeout 70 -v lantern-node:/var/lib/lantern-node \
   --entrypoint /usr/local/bin/lantern-box \
   getlantern/lantern-box:latest serve --register --state-dir /var/lib/lantern-node
 ```
 
-Host networking lets the node find your router and be reached on its port.
+Host networking lets the node find your router and be reached on its port. The longer stop timeout gives the node time to deregister and remove its port forward when it stops.
 
 **Anywhere else**, download a binary from [Releases](https://github.com/getlantern/lantern-box/releases) and run:
 
@@ -78,7 +78,7 @@ The node keeps its identity and port in `node.json` in its state directory: `/va
 | --- | --- | --- | --- |
 | Status | `brew services info lantern-box` | `systemctl status lantern-node` | `docker ps -f name=lantern-node` |
 | Logs | `tail -f $(brew --prefix)/var/log/lantern-node.log` | `journalctl -u lantern-node -f` | `docker logs -f lantern-node` |
-| Stop | `brew services stop lantern-box` | `sudo systemctl disable --now lantern-node` | `docker rm -f lantern-node` |
+| Stop | `brew services stop lantern-box` | `sudo systemctl disable --now lantern-node` | `docker stop lantern-node && docker rm lantern-node` |
 | Uninstall | `brew uninstall lantern-box` | `sudo apt remove lantern-box`, `sudo dnf remove lantern-box`, or remove `/usr/bin/lantern-box` and `/etc/systemd/system/lantern-node.service` | `docker volume rm lantern-node` |
 
 ## Quick Start: Run the Server

@@ -6,7 +6,9 @@
 #
 # Optional environment:
 #   LANTERN_USER_ID     your Lantern user ID, which can enroll this node
-#   LANTERN_NODE_ARGS   more `lantern-box serve` flags, such as "--bandwidth-limit 10mbit"
+#   LANTERN_NODE_ARGS   more `lantern-box serve` flags, such as "--bandwidth-limit 10mbit".
+#                       systemd splits them at whitespace and ignores quotes, so
+#                       no value can contain a space.
 #   LANTERN_BOX_VERSION a release tag such as v0.0.203 (default: the latest release)
 #
 # On Linux it installs the release's .deb or .rpm, or else its tarball, and
@@ -106,16 +108,10 @@ install_linux() {
 	[ "$got" = "$want" ] || die "$pkg doesn't match the release's checksum"
 
 	case $pkg in
-	*.deb) as_root apt-get install -y "$tmp/$pkg" ;;
-	*.rpm)
-		if has dnf; then
-			as_root dnf install -y "$tmp/$pkg"
-		elif has yum; then
-			as_root yum install -y "$tmp/$pkg"
-		else
-			as_root zypper --non-interactive install --allow-unsigned-rpm "$tmp/$pkg"
-		fi
-		;;
+	# Downgrades are allowed so LANTERN_BOX_VERSION can pin an older release.
+	*.deb) as_root apt-get install -y --allow-downgrades "$tmp/$pkg" ;;
+	# The package has no dependencies, so rpm needs no package manager.
+	*.rpm) as_root rpm -U --oldpackage --replacepkgs "$tmp/$pkg" ;;
 	*)
 		tar -xzf "$tmp/$pkg" -C "$tmp"
 		as_root install -m 0755 "$tmp/lantern-box" /usr/bin/lantern-box
@@ -126,7 +122,9 @@ install_linux() {
 	args=$(node_args)
 	if [ -n "$args" ]; then
 		as_root mkdir -p /etc/lantern-box
-		printf 'LANTERN_NODE_ARGS="%s"\n' "$args" | as_root tee /etc/lantern-box/node.env >/dev/null
+		# Escaped for the double-quoted value systemd's EnvironmentFile reads.
+		escaped=$(printf '%s' "$args" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+		printf 'LANTERN_NODE_ARGS="%s"\n' "$escaped" | as_root tee /etc/lantern-box/node.env >/dev/null
 	fi
 	as_root systemctl daemon-reload
 	as_root systemctl enable lantern-node.service
