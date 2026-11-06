@@ -12,7 +12,7 @@ func TestProbeTimeoutsMsDecodingNeverFailsTheConfig(t *testing.T) {
 	var opts MutableAutoSelectOutboundOptions
 	err := json.Unmarshal([]byte(`{
 		"outbounds": ["a"],
-		"probe_timeouts_ms": {"hysteria2x": 3000, "vless": -1, "tuic": 4294967296, "shadowsocks": "x", "samizdat": 2.5, "trojan": null, "wireguard": 1e400}
+		"probe_timeouts_ms": {"hysteria2x": 3000, "vless": -1, "tuic": 4294967296, "shadowsocks": "x", "samizdat": 2.5, "trojan": null, "wireguard": 1e400, "vmess": 3000.0000000000001, "hysteria2": 249.99999999999999, "tor": 3e3}
 	}`), &opts)
 	require.NoError(t, err, "a bad timeout costs only that entry")
 	assert.Equal(t, ProbeTimeoutsMs{"hysteria2x": 3000}, opts.ProbeTimeoutsMs)

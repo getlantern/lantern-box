@@ -2,7 +2,6 @@ package option
 
 import (
 	"encoding/json"
-	"math"
 
 	"github.com/sagernet/sing/common/json/badoption"
 )
@@ -137,8 +136,9 @@ type MutableAutoSelectOutboundOptions struct {
 // ProbeTimeoutsMs maps an outbound type to a probe timeout in milliseconds.
 // Decoding it never fails: the value comes from a server, and an entry the
 // client can't use must cost only that override, not the whole config.
-// Entries that aren't a whole number in uint32 range are dropped, and so is a
-// value that isn't an object.
+// Entries that aren't a plain integer in uint32 range are dropped, including
+// fractions and exponent forms such as 2.5, 3000.0 and 3e3, and so is a value
+// that isn't an object.
 type ProbeTimeoutsMs map[string]uint32
 
 func (p *ProbeTimeoutsMs) UnmarshalJSON(b []byte) error {
@@ -149,13 +149,13 @@ func (p *ProbeTimeoutsMs) UnmarshalJSON(b []byte) error {
 	}
 	out := make(ProbeTimeoutsMs, len(raw))
 	for typ, v := range raw {
-		var f *float64
-		if json.Unmarshal(v, &f) != nil || f == nil {
+		// Decoding into uint32 checks the JSON number's text exactly, so a
+		// fraction can't round to a whole number on the way in.
+		var ms *uint32
+		if json.Unmarshal(v, &ms) != nil || ms == nil {
 			continue
 		}
-		if *f >= 0 && *f <= math.MaxUint32 && *f == math.Trunc(*f) {
-			out[typ] = uint32(*f)
-		}
+		out[typ] = *ms
 	}
 	*p = out
 	return nil
