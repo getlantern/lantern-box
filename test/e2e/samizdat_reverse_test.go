@@ -145,6 +145,35 @@ func TestSamizdatReverseThroughHelper(t *testing.T) {
 	// may beat the session.
 	requireThrough(10*time.Second, "no request made it through the helper")
 
+	// A UDP echo origin: the reply proves the datagram crossed the reverse
+	// outbound's UoT and the bridge's router and came back.
+	echo, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { echo.Close() })
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := echo.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = echo.WriteTo(buf[:n], addr)
+		}
+	}()
+	pc, err := client.ListenPacket(context.Background(), M.ParseSocksaddr(echo.LocalAddr().String()))
+	require.NoError(t, err, "SOCKS5 UDP associate")
+	require.NoError(t, pc.SetDeadline(time.Now().Add(10*time.Second)))
+	target := M.ParseSocksaddr(echo.LocalAddr().String()).UDPAddr()
+	for i, payload := range [][]byte{[]byte("first datagram"), make([]byte, 1200)} {
+		_, err = pc.WriteTo(payload, target)
+		require.NoErrorf(t, err, "datagram %d", i+1)
+		buf := make([]byte, 2048)
+		n, _, err := pc.ReadFrom(buf)
+		require.NoErrorf(t, err, "datagram %d reply", i+1)
+		require.Equal(t, payload, buf[:n])
+	}
+	require.NoError(t, pc.Close())
+
 	// With the helper gone the reverse outbound has no session and refuses
 	// at once, rather than leaving the request to hang.
 	require.NoError(t, helperBox.Close())
