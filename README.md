@@ -21,8 +21,8 @@ Anyone in a country without internet censorship can run one. There's no sign-up.
 **macOS, or Linux with Homebrew:**
 
 ```bash
-brew install getlantern/tap/lantern-box
-brew services start lantern-box
+brew install getlantern/tap/lamplighter
+brew services start lamplighter
 ```
 
 **Linux** (Debian, Ubuntu, Fedora, RHEL 8+, openSUSE or any other with systemd 235 or later, on amd64 or arm64):
@@ -74,21 +74,21 @@ The node listens on a random TCP port, chosen on first run and kept. At home it 
 How you set them depends on how the node runs:
 
 - **systemd:** run `install.sh` again with `LANTERN_NODE_ARGS`, or set `LANTERN_NODE_ARGS="..."` in `/etc/lantern-box/node.env` and run `sudo systemctl restart lantern-node`.
-- **Homebrew:** put them in `$(brew --prefix)/etc/lantern-node.args` and run `brew services restart lantern-box`.
+- **Homebrew:** put them in `$(brew --prefix)/etc/lamplighter.args` and run `brew services restart lamplighter`.
 - **Docker:** stop and remove the container, then run it again with them after `--state-dir /var/lib/lantern-node`.
 
 They're split at whitespace and quotes are ignored, so no value can contain a space.
 
-The node keeps its identity and port in `node.json` in its state directory: `/var/lib/lantern-node` for the systemd service, `$(brew --prefix)/var/lantern-node` for Homebrew, and `lantern-box` in your user config directory otherwise. To start over as a new node on a new port, stop the node and delete it.
+The node keeps its identity and port in `node.json` in its state directory: `/var/lib/lantern-node` for the systemd service, `$(brew --prefix)/var/lamplighter` for Homebrew, and `lantern-box` in your user config directory otherwise. To start over as a new node on a new port, stop the node and delete it.
 
 ### Managing the node
 
 | | Homebrew | systemd | Docker |
 | --- | --- | --- | --- |
-| Status | `brew services info lantern-box` | `systemctl status lantern-node` | `docker ps -f name=lantern-node` |
-| Logs | `tail -f $(brew --prefix)/var/log/lantern-node.log` | `journalctl -u lantern-node -f` | `docker logs -f lantern-node` |
-| Stop | `brew services stop lantern-box` | `sudo systemctl disable --now lantern-node` | `docker stop lantern-node && docker rm lantern-node` |
-| Uninstall | `brew uninstall lantern-box`, then delete `$(brew --prefix)/etc/lantern-node.args` and `$(brew --prefix)/var/log/lantern-node.log` | `sudo apt remove lantern-box`, `sudo dnf remove lantern-box`, or remove `/usr/bin/lantern-box` and `/etc/systemd/system/lantern-node.service`; then delete `/etc/lantern-box/node.env` | `docker volume rm lantern-node` |
+| Status | `brew services info lamplighter` | `systemctl status lantern-node` | `docker ps -f name=lantern-node` |
+| Logs | `tail -f $(brew --prefix)/var/log/lamplighter.log` | `journalctl -u lantern-node -f` | `docker logs -f lantern-node` |
+| Stop | `brew services stop lamplighter` | `sudo systemctl disable --now lantern-node` | `docker stop lantern-node && docker rm lantern-node` |
+| Uninstall | `brew uninstall lamplighter`, then delete `$(brew --prefix)/etc/lamplighter.args` and `$(brew --prefix)/var/log/lamplighter.log` | `sudo apt remove lantern-box`, `sudo dnf remove lantern-box`, or remove `/usr/bin/lantern-box` and `/etc/systemd/system/lantern-node.service`; then delete `/etc/lantern-box/node.env` | `docker volume rm lantern-node` |
 
 ## Quick Start: Run the Server
 
@@ -806,7 +806,7 @@ go test -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acm
 
 Every merge to `main` that changes the binary is tagged as the next patch release and published, so clients can depend on it. The proxy fleet follows GitHub's latest release: lantern-cloud hot-swaps every box onto it.
 
-Lantern nodes (Lamplighter) follow their own channel: the `lantern-box` formula in [getlantern/homebrew-tap](https://github.com/getlantern/homebrew-tap), which `install.sh` also reads. Only a merged PR labelled `release-lamplighter` updates it. A PR can carry both labels, to update the fleet and nodes together.
+Lantern nodes (Lamplighter) follow their own channel: the `lamplighter` formula in [getlantern/homebrew-tap](https://github.com/getlantern/homebrew-tap), which `install.sh` also reads. Only a merged PR labelled `release-lamplighter` updates it. A PR can carry both labels, to update the fleet and nodes together.
 
 By default a release doesn't roll the fleet: it isn't marked latest, nor pushed as `getlantern/lantern-box:latest` or as the `sing-box:latest` image triangle backends run. A push to `main` builds `sing-box:main` instead. To roll the fleet onto a change, label its PR `release` before merging.
 
