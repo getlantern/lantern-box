@@ -1218,3 +1218,60 @@ func TestPortalMasqueradeWithPreviousIdentity(t *testing.T) {
 		t.Fatal("Close left a masqueraded conn open")
 	}
 }
+
+func routingCount(p *Portal) int {
+	p.routeMu.Lock()
+	defer p.routeMu.Unlock()
+	return len(p.routing)
+}
+
+// TestPortalFailedHandshakesLeaveNothingTracked sends connections that never
+// complete a ClientHello: closed at once, garbage, a truncated record, and
+// silence until the hello timeout. None may stay in the routing map.
+func TestPortalFailedHandshakesLeaveNothingTracked(t *testing.T) {
+	old := helloTimeout
+	helloTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { helloTimeout = old })
+
+	k := newTestKeys(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{newShortID(t): tagA})))
+	addr := portalAddr(t, p)
+
+	payloads := [][]byte{
+		nil,                              // EOF
+		[]byte("GET / HTTP/1.1\r\n\r\n"), // not a handshake record
+		{22, 3, 1, 0xff, 0xff},           // record too large
+		{22, 3, 1, 0, 100, 1, 2, 3},      // truncated record, then EOF
+	}
+	for range 25 {
+		for _, payload := range payloads {
+			c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+			require.NoError(t, err)
+			if payload != nil {
+				_, err = c.Write(payload)
+				require.NoError(t, err)
+			}
+			c.Close()
+		}
+	}
+	// Silent until the hello timeout closes them.
+	var silent []net.Conn
+	for range 10 {
+		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		require.NoError(t, err)
+		silent = append(silent, c)
+	}
+	t.Cleanup(func() {
+		for _, c := range silent {
+			c.Close()
+		}
+	})
+	require.Eventually(t, func() bool { return routingCount(p) == 0 }, 5*time.Second, 20*time.Millisecond,
+		"failed handshakes left connections tracked")
+	for _, c := range silent {
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, err := c.Read(make([]byte, 1))
+		assert.ErrorIs(t, err, io.EOF, "a silent conn outlived the hello timeout")
+	}
+}

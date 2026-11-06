@@ -15,11 +15,12 @@ import (
 	samizdat "github.com/getlantern/samizdat"
 )
 
+// helloTimeout bounds how long the portal waits for a connection's
+// ClientHello before it closes the connection, as samizdat's own server
+// does. A var so tests can shorten it.
+var helloTimeout = 10 * time.Second
+
 const (
-	// helloTimeout bounds how long the portal waits for a connection's
-	// ClientHello before it closes the connection, as samizdat's own server
-	// does.
-	helloTimeout = 10 * time.Second
 	// masqueradeDialTimeout and masqueradeMaxDuration are samizdat's
 	// defaults for its masquerade.
 	masqueradeDialTimeout = 10 * time.Second
@@ -229,35 +230,33 @@ func (p *Portal) startServe(ln net.Listener) {
 // authenticates under none is masqueraded, as samizdat's server would.
 func (p *Portal) route(conn net.Conn) {
 	defer p.routeWG.Done()
-	conn.SetReadDeadline(time.Now().Add(helloTimeout))
-	record, err := readHelloRecord(conn)
-	conn.SetReadDeadline(time.Time{})
-	r := p.routes.Load()
-	var id *identity
-	if err == nil && r != nil {
-		id = r.pick(record[5:], time.Now())
-	}
-	p.routeMu.Lock()
-	// A stop that closed conn has also dropped it, and it must not be
-	// handed on. A masqueraded conn stays tracked for as long as it runs.
-	_, tracked := p.routing[conn]
-	if id != nil || !tracked {
-		delete(p.routing, conn)
-	}
-	p.routeMu.Unlock()
-	switch {
-	case err != nil || !tracked || r == nil:
-		conn.Close()
-	case id != nil:
-		if !id.ln.deliver(&replayConn{Conn: conn, buf: record}) {
-			conn.Close()
-		}
-	default:
-		p.masquerade(r.stop, conn, record)
+	// conn stays tracked, so a stop can close it, until route returns,
+	// whichever way that is: a masqueraded conn for as long as it runs.
+	defer func() {
 		p.routeMu.Lock()
 		delete(p.routing, conn)
 		p.routeMu.Unlock()
+	}()
+	conn.SetReadDeadline(time.Now().Add(helloTimeout))
+	record, err := readHelloRecord(conn)
+	conn.SetReadDeadline(time.Time{})
+	p.routeMu.Lock()
+	// A stop that closed conn has also dropped it, and it must not be
+	// handed on.
+	_, tracked := p.routing[conn]
+	p.routeMu.Unlock()
+	r := p.routes.Load()
+	if err != nil || !tracked || r == nil {
+		conn.Close()
+		return
 	}
+	if id := r.pick(record[5:], time.Now()); id != nil {
+		if !id.ln.deliver(&replayConn{Conn: conn, buf: record}) {
+			conn.Close()
+		}
+		return
+	}
+	p.masquerade(r.stop, conn, record)
 }
 
 // masquerade relays conn to the masquerade origin, starting with the
