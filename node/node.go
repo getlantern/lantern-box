@@ -113,8 +113,8 @@ type node struct {
 	// maps to port, which can differ from it, or port itself without a
 	// mapping. Zero means port.
 	externalPort uint16
-	// mappedIP is the local address the router forwards to.
-	mappedIP string
+	// mapped says the router forwards the port to the node.
+	mapped bool
 	// newMapper finds the router to map the port on. Nil maps nothing.
 	newMapper func(ctx context.Context) (portMapper, error)
 	newBox    boxFactory
@@ -206,14 +206,8 @@ func (n *node) run(ctx context.Context) error {
 				log.Warn("node: remove router mapping: ", err)
 			}
 		}()
-		// The router forwards to one local address. On macOS and the BSDs a
-		// program can listen on that address beside the check on all
-		// addresses above, and would get the forwarded connections, so check
-		// it too; stopping removes the mapping.
-		if n.mappedIP != "" {
-			if err := portFreeOn(n.mappedIP, n.port); err != nil {
-				return err
-			}
+		if err := n.checkPort(); err != nil {
+			return err
 		}
 	}
 
@@ -283,7 +277,7 @@ func (n *node) mapPort(ctx context.Context) portMapper {
 		return nil
 	}
 	n.externalPort = mapping.ExternalPort
-	n.mappedIP = mapping.InternalIP
+	n.mapped = true
 	m.StartRenewal(ctx)
 	log.Info("node: the router maps TCP port ", mapping.ExternalPort, " to port ", n.port, " (", mapping.Method, ")")
 	return m
@@ -291,6 +285,35 @@ func (n *node) mapPort(ctx context.Context) portMapper {
 
 // errPortInUse is a node's port already taken by another program.
 var errPortInUse = errors.New("the node's port is in use by another program; choose another with --port")
+
+// checkPort reports errPortInUse if another program listens on the node's
+// port. With a mapping it checks every local IPv4 address as well as all of
+// them: the router forwards to one of them, which needn't be the one
+// portforward reports (NAT-PMP forwards to whichever faces the gateway), and
+// on macOS and the BSDs a program can listen on a single address beside a
+// check on all of them.
+func (n *node) checkPort() error {
+	if err := portFree(n.port); err != nil {
+		return err
+	}
+	if !n.mapped {
+		return nil
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return fmt.Errorf("list local addresses: %w", err)
+	}
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok || ipn.IP.To4() == nil {
+			continue
+		}
+		if err := portFreeOn(ipn.IP.String(), n.port); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // portFree reports errPortInUse if something already listens on port.
 func portFree(port uint16) error { return portFreeOn("", port) }
@@ -367,9 +390,14 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 	if !volunteer {
 		log.Warn("node: lantern-cloud sent no Unbounded volunteer service, so this node serves only its inbound")
 	}
+	// Before every box: between boxes the port is free for another program
+	// to take, and the router would forward to it.
+	if err := n.checkPort(); err != nil {
+		return nil, err
+	}
 	b, err := n.newBox(ctx, options)
 	if err != nil {
-		if addrInUse(err) {
+		if addrInUse(err) && strings.Contains(err.Error(), ":"+strconv.Itoa(int(n.port))) {
 			err = fmt.Errorf("%w: %w", errPortInUse, err)
 		}
 		return nil, fmt.Errorf("start box: %w", err)

@@ -686,7 +686,7 @@ func TestNodeStopsWhenItsPortIsTaken(t *testing.T) {
 	cloud := &fakeCloud{t: t}
 	n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
 	n.newBox = func(context.Context, string) (boxService, error) {
-		return nil, &net.OpError{Op: "listen", Net: "tcp", Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
+		return nil, &net.OpError{Op: "listen", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4zero, Port: int(n.port)}, Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
 	}
 	mapper := &fakeMapper{external: 40001}
 	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
@@ -722,7 +722,7 @@ func TestNodeStopsWhenItsPortIsTakenAtRotation(t *testing.T) {
 	var builds atomic.Int32
 	n.newBox = func(ctx context.Context, options string) (boxService, error) {
 		if builds.Add(1) > 1 {
-			return nil, &net.OpError{Op: "listen", Net: "tcp", Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
+			return nil, &net.OpError{Op: "listen", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4zero, Port: int(n.port)}, Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
 		}
 		return boxes.factory(ctx, options)
 	}
@@ -777,4 +777,60 @@ func TestNodeServesWithItsMappedAddressFree(t *testing.T) {
 		return len(hb) >= 1
 	}, 5*time.Second, 10*time.Millisecond)
 	stop()
+}
+
+// A box that fails to bind some other port is retried, not treated as the
+// node's port being taken: the message to choose another --port would be
+// wrong, and the conflict may pass.
+func TestNodeRetriesABindFailureOnAnotherPort(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
+	other := n.port + 1
+	n.newBox = func(context.Context, string) (boxService, error) {
+		return nil, &net.OpError{Op: "listen", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4zero, Port: int(other)}, Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
+	}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	done := make(chan error, 1)
+	go func() { done <- n.run(ctx) }()
+	require.Eventually(t, func() bool {
+		_, registers, _, _ := cloud.snapshot()
+		return len(registers) >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("the node stopped: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	cancel()
+	require.NoError(t, <-done)
+}
+
+// A program that takes the mapped port on one of the node's addresses between
+// boxes stops the node at its next box, removing the mapping.
+func TestNodeChecksItsPortBeforeEachBox(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{RotationInterval: 100 * time.Millisecond})
+	n.heartbeatOverride = time.Hour
+	mapper := &fakeMapper{external: 40001}
+	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
+	done := make(chan error, 1)
+	go func() { done <- n.run(box.BaseContext()) }()
+	require.Eventually(t, func() bool {
+		started, _ := boxes.state()
+		return started >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(n.port))))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errPortInUse)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the node rotated onto a port another program took")
+	}
+	mapper.mu.Lock()
+	defer mapper.mu.Unlock()
+	assert.True(t, mapper.unmapped)
 }
