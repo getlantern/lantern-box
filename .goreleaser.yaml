@@ -206,12 +206,17 @@ brews:
     # node upgraded from it keeps its identity, port and flags.
     post_install: |
       { var/"lantern-node" => var/"lamplighter", etc/"lantern-node.args" => etc/"lamplighter.args" }.each do |old, new|
-        old.rename(new) if old.exist? && !new.exist?
+        # exist? follows symlinks, so a dangling one would look absent.
+        next unless old.exist? || old.symlink?
+        next if new.exist? || new.symlink?
+
+        old.rename(new)
       end
     # brew services can't pass flags, so the service reads them from
-    # etc/lamplighter.args, which install.sh writes, split at whitespace as
-    # systemd splits the Linux unit's LANTERN_NODE_ARGS: set -f stops the
-    # shell from expanding them as file patterns. A missing file means no
+    # etc/lamplighter.args, which install.sh writes, split at whitespace.
+    # Unlike systemd with the Linux unit's LANTERN_NODE_ARGS, it doesn't
+    # interpret quotes, so no value there can contain a space or a quote.
+    # set -f stops the shell from expanding them as file patterns. A missing file means no
     # flags. One that can't be read, a dangling symlink included, fails the
     # start with cat's error in the log, and keep_alive retries it, so the node
     # never runs without the flags its operator set.

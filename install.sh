@@ -8,9 +8,10 @@
 #   LANTERN_NODE_ARGS   more `lantern-box serve` flags, such as "--bandwidth-limit 10mbit".
 #                       Set, they replace any flags set before, so give all you
 #                       want, or set it empty to clear them. Unset, as when you
-#                       rerun this to upgrade, the flags set before stay. They're
-#                       split at whitespace and quotes are ignored, so no value
-#                       can contain a space.
+#                       rerun this to upgrade, the flags set before stay. On
+#                       Linux, systemd respects quotes in them; Homebrew's
+#                       service doesn't, so there no value can contain a space
+#                       or a quote.
 #   LANTERN_BOX_VERSION a release tag such as v0.0.203 (default: the latest
 #                       Lamplighter release, which the Homebrew formula names)
 #
