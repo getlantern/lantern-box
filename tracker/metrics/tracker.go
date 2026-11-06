@@ -207,6 +207,36 @@ func (t *MetricsTracker) recordGoodput(rxBytes, durationMs int64, attrs *attribu
 		return
 	}
 	goodput := float64(rxBytes) / (float64(durationMs) / 1000.0)
+	metrics.sessionGoodput.Record(context.Background(), goodput, metric.WithAttributes(goodputAttrs(rx, attrs)...))
+}
+
+// downloadGoodputMinBytes is the least a session must send the client for a
+// download goodput sample. A write returns once its bytes are buffered, in the
+// protocol layers and the kernel's send buffer (several MiB once autotuned),
+// so a session not much larger than those buffers reads faster than it was
+// delivered; past them, writes wait on delivery and the rate follows it.
+// Shapers also commonly let a connection burst at full speed before holding
+// it to a lower rate, and a session that ends inside the burst says nothing
+// about the rate a sustained download gets.
+const downloadGoodputMinBytes = 8 << 20
+
+// recordDownloadGoodput records the session's download goodput: bytes the proxy
+// sent the client per second from the start of its first write to the end of
+// its last, so idle time
+// before and after (a keepalive, a multiplexed session waiting for requests)
+// doesn't dilute it. It goes in the same histogram as recordGoodput, as
+// network.io.direction='transmit', and only for sessions that sent at least
+// downloadGoodputMinBytes; consumers filtering on 'receive' see no change.
+func (t *MetricsTracker) recordDownloadGoodput(txBytes, windowNs int64, attrs *attributes) {
+	if txBytes < downloadGoodputMinBytes || windowNs <= 0 {
+		return
+	}
+	goodput := float64(txBytes) / (float64(windowNs) / float64(time.Second))
+	metrics.sessionGoodput.Record(context.Background(), goodput, metric.WithAttributes(goodputAttrs(tx, attrs)...))
+}
+
+// goodputAttrs returns the goodput sample's attributes for direction d.
+func goodputAttrs(d ioAttr, attrs *attributes) []attribute.KeyValue {
 	// Copy into a slice sized for the extra elements rather than appending onto
 	// AsSlice()'s result in place, so we never share a backing array with a
 	// concurrent reporter.
@@ -214,7 +244,7 @@ func (t *MetricsTracker) recordGoodput(rxBytes, durationMs int64, attrs *attribu
 	a := make([]attribute.KeyValue, 0, len(base)+2)
 	a = append(a, base...)
 	a = append(a,
-		semconv.NetworkIODirectionKey.String(string(rx)),
+		semconv.NetworkIODirectionKey.String(string(d)),
 		// The evaluator filters `track IN [...]` and groups by `track` on the
 		// bare, literal point-attribute key "track" (lantern-cloud
 		// GoodputByStratum: filter + queryScalar groupKeys{"track", ...} +
@@ -225,7 +255,7 @@ func (t *MetricsTracker) recordGoodput(rxBytes, durationMs int64, attrs *attribu
 		// (Mirrors http-proxy #675's attribute.String("track", ...).)
 		attribute.String("track", metrics.track),
 	)
-	metrics.sessionGoodput.Record(context.Background(), goodput, metric.WithAttributes(a...))
+	return a
 }
 
 type attributes struct {
