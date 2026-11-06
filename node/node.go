@@ -113,6 +113,8 @@ type node struct {
 	// maps to port, which can differ from it, or port itself without a
 	// mapping. Zero means port.
 	externalPort uint16
+	// mappedIP is the local address the router forwards to.
+	mappedIP string
 	// newMapper finds the router to map the port on. Nil maps nothing.
 	newMapper func(ctx context.Context) (portMapper, error)
 	newBox    boxFactory
@@ -187,11 +189,14 @@ func Run(ctx context.Context, cfg Config) error {
 func (n *node) run(ctx context.Context) error {
 	peerconn.SetListener(n.clients.listen)
 	defer peerconn.SetListener(nil)
-	// Before asking the router to forward the port, which would otherwise
-	// open whatever else listens on it to the internet.
-	if err := portFree(n.port); err != nil {
+	// The node holds its port before asking the router to forward it, and
+	// whenever no box has it, so the mapping never reaches another program.
+	hold := &portHold{port: n.port}
+	if err := hold.take(); err != nil {
 		return err
 	}
+	// Deferred first, so it runs after the mapping is removed.
+	defer hold.release()
 	if m := n.mapPort(ctx); m != nil {
 		defer func() {
 			uctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
@@ -201,9 +206,21 @@ func (n *node) run(ctx context.Context) error {
 			}
 		}()
 	}
+	// The router forwards to one local address, and on some systems a program
+	// can bind that address and port beside a hold on all addresses, taking
+	// the forwarded connections. Holding that exact address too stops it.
+	if n.mappedIP != "" {
+		if err := hold.pin(n.mappedIP); err != nil {
+			return err
+		}
+	}
+	n.newBox = hold.around(n.newBox)
 
 	retry := minRetry
 	for {
+		if hold.isLost() {
+			return fmt.Errorf("port %d: %w", n.port, errPortInUse)
+		}
 		s, err := n.start(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -266,6 +283,7 @@ func (n *node) mapPort(ctx context.Context) portMapper {
 		return nil
 	}
 	n.externalPort = mapping.ExternalPort
+	n.mappedIP = mapping.InternalIP
 	m.StartRenewal(ctx)
 	log.Info("node: the router maps TCP port ", mapping.ExternalPort, " to port ", n.port, " (", mapping.Method, ")")
 	return m
@@ -274,20 +292,132 @@ func (n *node) mapPort(ctx context.Context) portMapper {
 // errPortInUse is a node's port already taken by another program.
 var errPortInUse = errors.New("the node's port is in use by another program; choose another with --port")
 
-// portFree reports errPortInUse if something already listens on port.
-func portFree(port uint16) error {
-	ln, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(int(port))))
-	if err != nil {
-		if addrInUse(err) {
-			return fmt.Errorf("port %d: %w", port, errPortInUse)
-		}
-		return fmt.Errorf("check port %d: %w", port, err)
-	}
-	return ln.Close()
+// portHold keeps a node's port while no box has it: a listener that closes
+// every connection it's given. The box takes the port from it on start and
+// gives it back on close.
+type portHold struct {
+	port uint16
+
+	mu sync.Mutex
+	// pinned are local addresses held as well as all of them.
+	pinned []string
+	lns    []net.Listener
+	lost   bool
 }
 
+// take binds the port on all addresses and on each pinned one. Failing to,
+// for any reason, means the node can't vouch for what the router forwards
+// to, so it reports errPortInUse.
+func (h *portHold) take() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.lns != nil {
+		return nil
+	}
+	for _, host := range append([]string{""}, h.pinned...) {
+		if err := h.listenLocked(host); err != nil {
+			h.releaseLocked()
+			h.lost = true
+			return err
+		}
+	}
+	return nil
+}
+
+// pin holds the port on host too, from now on.
+func (h *portHold) pin(host string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pinned = append(h.pinned, host)
+	if h.lns == nil {
+		return nil
+	}
+	if err := h.listenLocked(host); err != nil {
+		h.lost = true
+		return err
+	}
+	return nil
+}
+
+func (h *portHold) listenLocked(host string) error {
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(int(h.port))))
+	if err != nil {
+		return fmt.Errorf("hold port %d on %q: %w: %w", h.port, host, errPortInUse, err)
+	}
+	h.lns = append(h.lns, ln)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	return nil
+}
+
+// release unbinds the port, for a box to take it.
+func (h *portHold) release() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.releaseLocked()
+}
+
+func (h *portHold) releaseLocked() {
+	for _, ln := range h.lns {
+		_ = ln.Close()
+	}
+	h.lns = nil
+}
+
+// isLost reports whether another program took the port while it was free.
+func (h *portHold) isLost() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lost
+}
+
+// around hands the port to each box newBox starts, and takes it back when the
+// box closes or fails to start.
+func (h *portHold) around(newBox boxFactory) boxFactory {
+	return func(ctx context.Context, options string) (boxService, error) {
+		h.release()
+		b, err := newBox(ctx, options)
+		if err != nil {
+			if hErr := h.take(); hErr != nil {
+				return nil, fmt.Errorf("%w (start box: %w)", hErr, err)
+			}
+			return nil, err
+		}
+		return &heldBox{boxService: b, hold: h}, nil
+	}
+}
+
+// heldBox gives its port back to the hold when it closes.
+type heldBox struct {
+	boxService
+	hold *portHold
+	once sync.Once
+}
+
+func (b *heldBox) Close() error {
+	err := b.boxService.Close()
+	b.once.Do(func() {
+		if hErr := b.hold.take(); hErr != nil {
+			log.Error("node: ", hErr)
+		}
+	})
+	return err
+}
+
+// wsaeaddrinuse is Windows' "address in use", which syscall.EADDRINUSE isn't
+// there.
+const wsaeaddrinuse = syscall.Errno(10048)
+
 func addrInUse(err error) bool {
-	return errors.Is(err, syscall.EADDRINUSE) || strings.Contains(err.Error(), "address already in use")
+	return errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, wsaeaddrinuse) ||
+		strings.Contains(err.Error(), "address already in use")
 }
 
 // clientPort is the port clients reach the node at.
