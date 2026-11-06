@@ -184,7 +184,10 @@ brews:
     repository:
       owner: getlantern
       name: homebrew-tap
-      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
+      # Only .Env works here: the token field's templates lack envOrDefault.
+      # release.yaml always sets it, empty when the secret is missing, which
+      # skip_upload catches.
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     skip_upload: '{{ if and (eq (envOrDefault "LAMPLIGHTER_RELEASE" "false") "true") (ne (envOrDefault "HOMEBREW_TAP_TOKEN" "") "") }}false{{ else }}true{{ end }}'
     directory: Formula
     homepage: "https://github.com/getlantern/lantern-box"
