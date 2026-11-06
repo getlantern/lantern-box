@@ -32,6 +32,13 @@ type URLOverrideSetter interface {
 	SetURLOverrides(overrides map[string]string)
 }
 
+// ProbeTimeoutSetter is implemented by outbound groups whose per-protocol probe
+// timeouts can be replaced at runtime. See
+// option.MutableAutoSelectOutboundOptions.ProbeTimeoutsMs.
+type ProbeTimeoutSetter interface {
+	SetProbeTimeouts(timeoutsMs map[string]uint32)
+}
+
 // OutboundChecker is implemented by outbound groups that support on-demand URL testing.
 type OutboundChecker interface {
 	CheckOutbounds()

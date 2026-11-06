@@ -23,6 +23,9 @@ type registerRequest struct {
 	// RunsUnboundedVolunteer says this lantern-box has the unbounded volunteer
 	// service, so the config may include it.
 	RunsUnboundedVolunteer bool `json:"runs_unbounded_volunteer"`
+	// ReportsNetstatedAsync says the volunteer reports to netstated off its
+	// forwarding path, so the config may name netstated.
+	ReportsNetstatedAsync bool `json:"reports_netstated_async"`
 }
 
 type registerResponse struct {

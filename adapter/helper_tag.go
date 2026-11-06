@@ -47,3 +47,35 @@ func RedactHelperTags(s string) string {
 	}
 	return helperTagRE.ReplaceAllLiteralString(s, "helper")
 }
+
+// ReverseTagSuffix marks the reverse outbound a client builds for a helper:
+// the helper's tag plus this suffix. A reverse tag is as much a pseudonym of
+// the pairing as the helper tag it derives from, and RedactHelperTags
+// redacts it too.
+const ReverseTagSuffix = "-r"
+
+// ReverseHelperTag returns the reverse outbound tag for helperTag, or "" if
+// helperTag is not a helper tag.
+func ReverseHelperTag(helperTag string) string {
+	if !IsHelperTag(helperTag) {
+		return ""
+	}
+	return helperTag + ReverseTagSuffix
+}
+
+// IsReverseHelperTag reports whether tag is, in full, a helper tag followed
+// by ReverseTagSuffix.
+func IsReverseHelperTag(tag string) bool {
+	_, ok := HelperTagOfReverse(tag)
+	return ok
+}
+
+// HelperTagOfReverse returns the helper tag a reverse helper tag derives
+// from, and false if tag is not a reverse helper tag.
+func HelperTagOfReverse(tag string) (string, bool) {
+	helperTag, ok := strings.CutSuffix(tag, ReverseTagSuffix)
+	if !ok || !IsHelperTag(helperTag) {
+		return "", false
+	}
+	return helperTag, true
+}

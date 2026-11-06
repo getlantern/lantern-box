@@ -1,6 +1,10 @@
 package option
 
-import "github.com/sagernet/sing/common/json/badoption"
+import (
+	"encoding/json"
+
+	"github.com/sagernet/sing/common/json/badoption"
+)
 
 type FallbackOutboundOptions struct {
 	// Primary and Fallback are the tags of the primary and fallback outbounds.
@@ -28,9 +32,15 @@ type MutableAutoSelectOutboundOptions struct {
 	URL          string            `json:"url,omitempty"`
 	URLOverrides map[string]string `json:"url_overrides,omitempty"`
 
+	// ProbeTimeoutsMs overrides the probe timeout, in milliseconds, for
+	// members of the given outbound types, e.g. {"hysteria2x": 3000}. A type
+	// not listed, or a value outside 250 to 60000, keeps its built-in
+	// timeout. SetProbeTimeouts replaces the set at runtime.
+	ProbeTimeoutsMs ProbeTimeoutsMs `json:"probe_timeouts_ms,omitempty"`
+
 	// SwitchToleranceMs is the minimum delay improvement (in ms) a
 	// candidate must have over the current selection before the group
-	// switches on delay. Default 300.
+	// switches on delay. Default 100.
 	SwitchToleranceMs uint32 `json:"switch_tolerance_ms,omitempty"`
 
 	// SwitchTolerancePercent is the minimum delay improvement, as a
@@ -81,21 +91,20 @@ type MutableAutoSelectOutboundOptions struct {
 	// after IdleThresholdSeconds without use instead of slowing down.
 	IdleIntervalSeconds uint32 `json:"idle_interval_seconds,omitempty"`
 
-	// IdleThresholdSeconds is how long the group may go without a dial,
-	// listen, or data-plane traffic before background probing stops. The
-	// next dial or listen restarts it, starting a full probe in the
-	// background if the group was idle longer than BackgroundIntervalSeconds
-	// or the network changed meanwhile. Default 900 (15 min).
+	// IdleThresholdSeconds bounds inactivity before periodic probing stops.
+	// The next use immediately requests probes for members without a fresh
+	// outcome. Default 900.
 	IdleThresholdSeconds uint32 `json:"idle_threshold_seconds,omitempty"`
 
-	// LadderTotalBudgetSeconds is the total budget the reconnection ladder
-	// has before emitting the exhaustion signal. Default 10.
+	// LadderTotalBudgetSeconds bounds a ladder evaluation once its first
+	// slot is available. Expiration leaves probes running. Default 15.
 	LadderTotalBudgetSeconds uint32 `json:"ladder_total_budget_seconds,omitempty"`
 
 	// LadderCooldownSeconds is the minimum time after a ladder run before
 	// another can fire. A ladder runs when a dial or listen fails on the
 	// selected member and on its fast-failover alternate, or has no
-	// alternate. Default 60.
+	// alternate. An interface update lifts the cooldown unless another
+	// arrived within the previous LadderCooldownSeconds. Default 60.
 	LadderCooldownSeconds uint32 `json:"ladder_cooldown_seconds,omitempty"`
 
 	// ConfirmedFailureSwitchCooldownSeconds is the minimum time between
@@ -119,6 +128,36 @@ type MutableAutoSelectOutboundOptions struct {
 	// true; set false to count failures from every wrapped conn.
 	DemoteOnlySelectedTag *bool `json:"demote_only_selected_tag,omitempty"`
 
-	// ProbeConcurrency caps parallel member probes per batch. Default 6.
+	// ProbeConcurrency caps concurrent probes of ordinary members across the
+	// group; last-resort and failure-confirmation probes don't count toward
+	// it. Default 6.
 	ProbeConcurrency uint32 `json:"probe_concurrency,omitempty"`
+}
+
+// ProbeTimeoutsMs maps an outbound type to a probe timeout in milliseconds.
+// Decoding it never fails: the value comes from a server, and an entry the
+// client can't use must cost only that override, not the whole config.
+// Entries that aren't a plain integer in uint32 range are dropped, including
+// fractions and exponent forms such as 2.5, 3000.0 and 3e3, and so is a value
+// that isn't an object.
+type ProbeTimeoutsMs map[string]uint32
+
+func (p *ProbeTimeoutsMs) UnmarshalJSON(b []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		*p = nil
+		return nil
+	}
+	out := make(ProbeTimeoutsMs, len(raw))
+	for typ, v := range raw {
+		// Decoding into uint32 checks the JSON number's text exactly, so a
+		// fraction can't round to a whole number on the way in.
+		var ms *uint32
+		if json.Unmarshal(v, &ms) != nil || ms == nil {
+			continue
+		}
+		out[typ] = *ms
+	}
+	*p = out
+	return nil
 }

@@ -15,7 +15,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -26,6 +30,7 @@ import (
 
 	C "github.com/getlantern/lantern-box/constant"
 	LO "github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/portforward"
 	"github.com/getlantern/lantern-box/protocol/unbounded"
 	"github.com/getlantern/lantern-box/tracker/peerconn"
 )
@@ -43,6 +48,10 @@ const (
 	requestTimeout           = 30 * time.Second
 	minRetry                 = 15 * time.Second
 	maxRetry                 = 5 * time.Minute
+	// portMappingTimeout bounds finding the router and asking it to map the
+	// node's port, so a node with no router to ask, such as a VPS, starts
+	// without much delay.
+	portMappingTimeout = 30 * time.Second
 )
 
 // Config configures a node.
@@ -66,6 +75,10 @@ type Config struct {
 	// RotationInterval is how often the node registers again. Zero means
 	// DefaultRotationInterval.
 	RotationInterval time.Duration
+	// SkipPortMapping stops the node asking its router, through UPnP, NAT-PMP
+	// or PCP, to forward its TCP port, for an operator who forwards it by hand
+	// or has nothing to forward.
+	SkipPortMapping bool
 	// Version is reported to lantern-cloud.
 	Version    string
 	HTTPClient *http.Client
@@ -86,13 +99,26 @@ type session struct {
 	heartbeat time.Duration
 }
 
+// portMapper is the part of portforward.Forwarder a node uses.
+type portMapper interface {
+	MapPort(ctx context.Context, protocol string, internalPort uint16, description string) (*portforward.Mapping, error)
+	StartRenewal(ctx context.Context)
+	UnmapPort(ctx context.Context) error
+}
+
 type node struct {
-	cfg      Config
-	api      *api
-	port     uint16
-	newBox   boxFactory
-	clients  *clientCounter
-	rotation time.Duration
+	cfg  Config
+	api  *api
+	port uint16
+	// externalPort is the port clients reach the node at: the one the router
+	// maps to port, which can differ from it, or port itself without a
+	// mapping. Zero means port.
+	externalPort uint16
+	// newMapper finds the router to map the port on. Nil maps nothing.
+	newMapper func(ctx context.Context) (portMapper, error)
+	newBox    boxFactory
+	clients   *clientCounter
+	rotation  time.Duration
 	// heartbeatOverride replaces lantern-cloud's interval in tests.
 	heartbeatOverride time.Duration
 }
@@ -151,6 +177,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if n.rotation <= 0 {
 		n.rotation = DefaultRotationInterval
 	}
+	n.newMapper = mapperFor(cfg)
 	// The device ID authorizes deregistering the node's route, so only a
 	// fingerprint of it is logged.
 	sum := sha256.Sum256([]byte(st.DeviceID))
@@ -161,6 +188,27 @@ func Run(ctx context.Context, cfg Config) error {
 func (n *node) run(ctx context.Context) error {
 	peerconn.SetListener(n.clients.listen)
 	defer peerconn.SetListener(nil)
+	// Before asking the router to forward the port, which would otherwise
+	// open whatever else listens on it to the internet. Like Share My
+	// Connection, the node doesn't hold the port while it isn't serving: a
+	// program that took this random port in between would be reached through
+	// the mapping until the node's next box, whose check stops the node and
+	// removes the mapping.
+	if err := n.checkPort(); err != nil {
+		return err
+	}
+	if m := n.mapPort(ctx); m != nil {
+		defer func() {
+			uctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+			defer cancel()
+			if err := m.UnmapPort(uctx); err != nil {
+				log.Warn("node: remove router mapping: ", err)
+			}
+		}()
+		if err := n.checkPort(); err != nil {
+			return err
+		}
+	}
 
 	retry := minRetry
 	for {
@@ -168,6 +216,11 @@ func (n *node) run(ctx context.Context) error {
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
+			}
+			// Another program has taken the port, and retrying would keep
+			// the router forwarding to it. Stopping removes the mapping.
+			if errors.Is(err, errPortInUse) {
+				return err
 			}
 			log.Error("node: ", err, "; retrying in ", retry)
 			if !sleep(ctx, retry) {
@@ -177,7 +230,9 @@ func (n *node) run(ctx context.Context) error {
 			continue
 		}
 		retry = minRetry
-		n.serve(ctx, s)
+		if err := n.serve(ctx, s); errors.Is(err, errPortInUse) && ctx.Err() == nil {
+			return err
+		}
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -199,14 +254,140 @@ func (n *node) start(ctx context.Context) (*session, error) {
 	return s, nil
 }
 
+// mapPort asks the node's router to forward a TCP port to its inbound, so
+// clients can reach a node at home, and keeps the mapping renewed. It returns
+// nil, and the node is reached on its own port, when there's no router to ask
+// or it refuses: a node on a public address, or one whose operator forwards
+// the port by hand, needs no mapping.
+func (n *node) mapPort(ctx context.Context) portMapper {
+	if n.newMapper == nil {
+		return nil
+	}
+	mctx, cancel := context.WithTimeout(ctx, portMappingTimeout)
+	defer cancel()
+	m, err := n.newMapper(mctx)
+	if err != nil {
+		log.Info("node: no router to map port ", n.port, " on (", err, "), so clients must reach it directly")
+		return nil
+	}
+	mapping, err := m.MapPort(mctx, portforward.TCP, n.port, "Lantern node")
+	if err != nil {
+		log.Warn("node: the router didn't map port ", n.port, " (", err, "), so clients must reach it directly")
+		return nil
+	}
+	n.externalPort = mapping.ExternalPort
+	m.StartRenewal(ctx)
+	log.Info("node: the router maps TCP port ", mapping.ExternalPort, " to port ", n.port, " (", mapping.Method, ")")
+	return m
+}
+
+// errPortInUse is a node's port already taken by another program.
+var errPortInUse = errors.New("the node's port is in use by another program; choose another with --port")
+
+// checkPort reports errPortInUse if another program listens on the node's
+// port. It checks every local IPv4 address as well as all of them: a router
+// forwards to one of them, which needn't be the one portforward reports
+// (NAT-PMP forwards to whichever faces the gateway), and on macOS and the
+// BSDs a program can listen on a single address beside a check on all of
+// them.
+func (n *node) checkPort() error {
+	if err := portFree(n.port); err != nil {
+		return err
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return fmt.Errorf("list local addresses: %w", err)
+	}
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok || ipn.IP.To4() == nil {
+			continue
+		}
+		// Only another listener counts: an address that can't be bound at
+		// all, such as one Windows is still checking for duplicates, has
+		// nothing on it to forward to.
+		if err := portFreeOn(ipn.IP.String(), n.port); errors.Is(err, errPortInUse) {
+			return err
+		}
+	}
+	return nil
+}
+
+// portFree reports errPortInUse if something already listens on port.
+func portFree(port uint16) error { return portFreeOn("", port) }
+
+// portFreeOn reports errPortInUse if something already listens on host's
+// port, or on all addresses' when host is empty.
+func portFreeOn(host string, port uint16) error {
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	if err != nil {
+		if addrInUse(err) {
+			return fmt.Errorf("port %d: %w", port, errPortInUse)
+		}
+		return fmt.Errorf("check port %d: %w", port, err)
+	}
+	return ln.Close()
+}
+
+// bindsPort reports whether err is about binding port: from the address of
+// the net.OpError it wraps if there is one, otherwise from its text, matching
+// the whole port number.
+func bindsPort(err error, port uint16) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Addr != nil {
+		if tcp, ok := opErr.Addr.(*net.TCPAddr); ok {
+			return tcp.Port == int(port)
+		}
+	}
+	// Bracketed IPv6 addresses can hold the port's digits, as in [fd00:443::1].
+	text := regexp.MustCompile(`\[[^\]]*\]`).ReplaceAllString(err.Error(), "[]")
+	return regexp.MustCompile(`:` + strconv.Itoa(int(port)) + `(\D|$)`).MatchString(text)
+}
+
+// wsaeaddrinuse is Windows' "address in use", which syscall.EADDRINUSE isn't
+// there.
+const wsaeaddrinuse = syscall.Errno(10048)
+
+func addrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, wsaeaddrinuse) ||
+		strings.Contains(err.Error(), "address already in use")
+}
+
+// clientPort is the port clients reach the node at.
+func (n *node) clientPort() uint16 {
+	if n.externalPort != 0 {
+		return n.externalPort
+	}
+	return n.port
+}
+
+// mapperFor is how a node with cfg finds its router, or nil to map nothing.
+func mapperFor(cfg Config) func(context.Context) (portMapper, error) {
+	if cfg.SkipPortMapping {
+		return nil
+	}
+	return newPortForwarder
+}
+
+// newPortForwarder returns a nil interface, not a nil *Forwarder, when there's
+// no router to ask.
+func newPortForwarder(ctx context.Context) (portMapper, error) {
+	f, err := portforward.NewForwarder(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
 func (n *node) register(ctx context.Context) (*registerResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	return n.api.register(ctx, registerRequest{
-		ExternalPort:           n.port,
+		ExternalPort:           n.clientPort(),
 		InternalPort:           n.port,
 		ServePool:              true,
 		RunsUnboundedVolunteer: true,
+		ReportsNetstatedAsync:  true,
 	})
 }
 
@@ -223,15 +404,23 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 	if !volunteer {
 		log.Warn("node: lantern-cloud sent no Unbounded volunteer service, so this node serves only its inbound")
 	}
+	// Before every box: between boxes the port is free for another program
+	// to take, and the router would forward to it.
+	if err := n.checkPort(); err != nil {
+		return nil, err
+	}
 	b, err := n.newBox(ctx, options)
 	if err != nil {
+		if addrInUse(err) && bindsPort(err, n.port) {
+			err = fmt.Errorf("%w: %w", errPortInUse, err)
+		}
 		return nil, fmt.Errorf("start box: %w", err)
 	}
 	vctx, cancel := context.WithTimeout(ctx, verifyTimeout)
 	defer cancel()
 	if err := n.api.verify(vctx, resp.RouteID); err != nil {
 		_ = b.Close()
-		return nil, fmt.Errorf("%w (is port %d reachable from the internet?)", err, n.port)
+		return nil, fmt.Errorf("%w (is TCP port %d reachable from the internet?)", err, n.clientPort())
 	}
 	heartbeat := time.Duration(resp.HeartbeatIntervalSeconds) * time.Second
 	if heartbeat <= 0 {
@@ -245,8 +434,9 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 }
 
 // serve heartbeats and rotates s until ctx is done or the route is lost. It
-// returns with nothing running; on ctx done it has deregistered too.
-func (n *node) serve(ctx context.Context, s *session) {
+// returns with nothing running; on ctx done it has deregistered too. The
+// error is a rotation's that failed, for run to judge.
+func (n *node) serve(ctx context.Context, s *session) error {
 	heartbeat := time.NewTicker(s.heartbeat)
 	defer heartbeat.Stop()
 	rotate := time.NewTimer(n.rotation)
@@ -257,7 +447,7 @@ func (n *node) serve(ctx context.Context, s *session) {
 			_ = s.box.Close()
 			n.deregister(s.routeID)
 			log.Info("node: stopped")
-			return
+			return nil
 		case <-heartbeat.C:
 			hctx, cancel := context.WithTimeout(ctx, requestTimeout)
 			err := n.api.heartbeat(hctx, s.routeID, n.clients.count())
@@ -265,7 +455,7 @@ func (n *node) serve(ctx context.Context, s *session) {
 			if isNotFound(err) {
 				log.Warn("node: lantern-cloud dropped route ", s.routeID, ", registering again")
 				_ = s.box.Close()
-				return
+				return nil
 			}
 			if err != nil && ctx.Err() == nil {
 				log.Warn("node: ", err)
@@ -276,7 +466,7 @@ func (n *node) serve(ctx context.Context, s *session) {
 				if ctx.Err() == nil {
 					log.Error("node: rotate: ", err)
 				}
-				return
+				return err
 			}
 			// The heartbeat schedule carries over to the new session unless
 			// its interval changed: rotations closer together than heartbeats

@@ -2,8 +2,10 @@ package metrics
 
 import (
 	"context"
+	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -618,4 +620,164 @@ func extractAttrs(rm metricdata.ResourceMetrics, name string) map[string]any {
 		}
 	}
 	return nil
+}
+
+// goodputByDirection returns the count and sum of goodput samples whose
+// network.io.direction is dir.
+func goodputByDirection(rm metricdata.ResourceMetrics, dir ioAttr) (uint64, float64) {
+	var count uint64
+	var sum float64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "proxy.session.goodput" {
+				continue
+			}
+			d, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				continue
+			}
+			for _, dp := range d.DataPoints {
+				if v, ok := dp.Attributes.Value(semconv.NetworkIODirectionKey); ok && v.AsString() == string(dir) {
+					count += dp.Count
+					sum += dp.Sum
+				}
+			}
+		}
+	}
+	return count, sum
+}
+
+// sendToClient writes chunks to the client through a tracked server conn,
+// sleeping pause of virtual time between them, with idle time before the first
+// and after the last, and returns the reader once the client has drained them.
+func sendToClient(t *testing.T, mt *MetricsTracker, chunks [][]byte, pause time.Duration) net.Conn {
+	t.Helper()
+	ctx := context.Background()
+	client, server := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+	tracked := mt.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
+
+	total := 0
+	for _, c := range chunks {
+		total += len(c)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.CopyN(io.Discard, client, int64(total))
+	}()
+
+	time.Sleep(5 * time.Second) // idle before the first write
+	for i, c := range chunks {
+		if i > 0 {
+			time.Sleep(pause)
+		}
+		_, err := tracked.Write(c)
+		require.NoError(t, err)
+	}
+	<-done
+	time.Sleep(5 * time.Second) // idle after the last write
+	synctest.Wait()
+	return tracked
+}
+
+func TestSessionDownloadGoodput_ActiveWindowOnly(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reader := metric.NewManualReader()
+		sdkotel.SetMeterProvider(metric.NewMeterProvider(metric.WithReader(reader)))
+		SetupMetricsManager(geo.NoLookup{}, "challenger-01")
+		mt := NewTracker(context.Background())
+		defer mt.Close()
+
+		const chunk = 4 << 20
+		tracked := sendToClient(t, mt, [][]byte{make([]byte, chunk), make([]byte, chunk)}, 2*time.Second)
+		require.NoError(t, tracked.Close())
+		synctest.Wait()
+
+		var rm metricdata.ResourceMetrics
+		reader.Collect(context.Background(), &rm)
+		count, sum := goodputByDirection(rm, tx)
+		require.Equal(t, uint64(1), count, "one download sample")
+		// 8 MiB over the 2s between first and last write; the 10s of idle
+		// around them would otherwise cut it to a sixth.
+		assert.InDelta(t, float64(2*chunk)/2, sum, float64(2*chunk)/2*0.05)
+		rxCount, _ := goodputByDirection(rm, rx)
+		assert.Zero(t, rxCount, "nothing was received from the client")
+	})
+}
+
+func TestSessionDownloadGoodput_SmallSessionNotRecorded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reader := metric.NewManualReader()
+		sdkotel.SetMeterProvider(metric.NewMeterProvider(metric.WithReader(reader)))
+		SetupMetricsManager(geo.NoLookup{}, "")
+		mt := NewTracker(context.Background())
+		defer mt.Close()
+
+		tracked := sendToClient(t, mt, [][]byte{make([]byte, 256<<10), make([]byte, 256<<10)}, time.Second)
+		require.NoError(t, tracked.Close())
+		synctest.Wait()
+
+		var rm metricdata.ResourceMetrics
+		reader.Collect(context.Background(), &rm)
+		count, _ := goodputByDirection(rm, tx)
+		assert.Zero(t, count, "a session under downloadGoodputMinBytes may end inside a shaper's burst")
+	})
+}
+
+func TestSessionDownloadGoodput_SingleBlockingWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reader := metric.NewManualReader()
+		sdkotel.SetMeterProvider(metric.NewMeterProvider(metric.WithReader(reader)))
+		SetupMetricsManager(geo.NoLookup{}, "")
+		mt := NewTracker(context.Background())
+		defer mt.Close()
+
+		ctx := context.Background()
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		tracked := mt.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
+
+		// The client drains 8 MiB at 64 KiB per 100ms, so the one write that
+		// carries it blocks for ~12.8s.
+		const total = 8 << 20
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			buf := make([]byte, 64<<10)
+			for got := 0; got < total; {
+				n, err := client.Read(buf)
+				if err != nil {
+					return
+				}
+				if got += n; got < total {
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
+		}()
+		_, err := tracked.Write(make([]byte, total))
+		require.NoError(t, err)
+		<-drained
+		require.NoError(t, tracked.Close())
+		synctest.Wait()
+
+		var rm metricdata.ResourceMetrics
+		reader.Collect(ctx, &rm)
+		count, sum := goodputByDirection(rm, tx)
+		require.Equal(t, uint64(1), count, "a single write past the floor is still sampled")
+		// ~8 MiB over ~12.7s of blocking, not over zero.
+		assert.InDelta(t, float64(total)/12.7, sum, float64(total)/12.7*0.05)
+	})
+}
+
+func TestDownloadWindowSpansOutOfOrderWrites(t *testing.T) {
+	var first, last atomic.Int64
+	// Write A runs 1–5 and write B 3–4; B finishes first.
+	storeMin(&first, 3)
+	storeMax(&last, 4)
+	storeMin(&first, 1)
+	storeMax(&last, 5)
+	assert.Equal(t, int64(1), first.Load(), "the window opens at the earliest start")
+	assert.Equal(t, int64(5), last.Load(), "and closes at the latest return")
 }

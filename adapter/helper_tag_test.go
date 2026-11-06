@@ -50,3 +50,17 @@ func BenchmarkRedactHelperTagsNoMatch(b *testing.B) {
 		_ = RedactHelperTags(s)
 	}
 }
+
+func TestReverseHelperTag(t *testing.T) {
+	h := "helper-0123456789ab"
+	r := ReverseHelperTag(h)
+	assert.Equal(t, "helper-0123456789ab-r", r)
+	assert.True(t, IsReverseHelperTag(r))
+	assert.False(t, IsHelperTag(r))
+	assert.False(t, IsReverseHelperTag(h))
+	got, ok := HelperTagOfReverse(r)
+	assert.True(t, ok)
+	assert.Equal(t, h, got)
+	assert.Equal(t, "", ReverseHelperTag("direct"))
+	assert.NotContains(t, RedactHelperTags("dial "+r+" failed"), "0123456789ab")
+}

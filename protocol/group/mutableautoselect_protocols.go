@@ -22,10 +22,6 @@ type protocolBehavior struct {
 	// a probe wave, and rank in their own tier below every clean or
 	// soft-demoted member.
 	lastResort bool
-	// substituteDelay, when non-zero, replaces the measured probe delay
-	// for ranking. Set for protocols whose handshake jitter makes RTT
-	// meaningless (samizdat).
-	substituteDelay time.Duration
 }
 
 func behaviorFor(outboundType string) protocolBehavior {

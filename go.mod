@@ -28,10 +28,10 @@ replace github.com/sagernet/gvisor => github.com/sagernet/gvisor v0.0.0-20260727
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/getlantern/algeneva v0.0.0-20260731172949-952f13725b7b
-	github.com/getlantern/broflake v0.0.0-20261103231447-95bcbce067ee
+	github.com/getlantern/broflake v0.0.0-20261105225934-93b5d37705d3
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260520145825-958775d51395
-	github.com/getlantern/samizdat v0.0.3-0.20261031023545-1248df926631
+	github.com/getlantern/samizdat v0.0.3-0.20261105225205-38715c2d5ab6
 	github.com/getlantern/semconv v0.0.0-20261103162524-c0c2ac0e0a3e
 	github.com/getlantern/twiddle v0.0.0-20260914204124-f698a0d67d2f
 	github.com/gobwas/ws v1.4.0
@@ -63,6 +63,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.41.0
 	golang.getoutline.org/sdk v0.0.21
 	golang.getoutline.org/sdk/x v0.1.0
+	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0
 	gopkg.in/ini.v1 v1.67.1
 	gopkg.in/yaml.v3 v3.0.1
@@ -361,7 +362,6 @@ require (
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/mod v0.37.0 // indirect
-	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/term v0.45.0 // indirect

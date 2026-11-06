@@ -3,13 +3,17 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -22,6 +26,7 @@ import (
 	box "github.com/getlantern/lantern-box"
 	C "github.com/getlantern/lantern-box/constant"
 	LO "github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/portforward"
 	"github.com/getlantern/lantern-box/tracker/peerconn"
 )
 
@@ -162,7 +167,7 @@ func newTestNode(t *testing.T, cloud *fakeCloud, boxes *fakeBoxes, cfg Config) *
 		cfg: cfg,
 		api: &api{httpClient: srv.Client(), baseURL: srv.URL + "/v1", deviceID: "device-1",
 			userID: cfg.UserID, featureOverrides: cfg.FeatureOverrides, version: "v9"},
-		port:              24680,
+		port:              testPort(t),
 		newBox:            boxes.factory,
 		clients:           newClientCounter(),
 		rotation:          time.Hour,
@@ -212,7 +217,7 @@ func TestNodeServes(t *testing.T) {
 	assert.Equal(t, []string{"/v1/peer/register", "/v1/peer/verify", "/v1/peer/heartbeat"}, calls[:3])
 	assert.Equal(t, "/v1/peer/deregister", calls[len(calls)-1])
 	require.Len(t, registers, 1)
-	assert.Equal(t, registerRequest{ExternalPort: 24680, InternalPort: 24680, ServePool: true, RunsUnboundedVolunteer: true}, registers[0])
+	assert.Equal(t, registerRequest{ExternalPort: n.port, InternalPort: n.port, ServePool: true, RunsUnboundedVolunteer: true, ReportsNetstatedAsync: true}, registers[0])
 	assert.Equal(t, heartbeatRequest{RouteID: "route-1", ActiveClients: 2}, heartbeats[0], "two distinct client IPs")
 	assert.Equal(t, []string{"route-1"}, deregistered)
 
@@ -541,4 +546,305 @@ func TestNewSingBoxRunsVolunteer(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("box did not close")
 	}
+}
+
+// fakeMapper stands in for the router: it grants external, or fails with
+// mapErr.
+type fakeMapper struct {
+	external   uint16
+	internalIP string
+	mapErr     error
+
+	mu       sync.Mutex
+	mapped   []uint16
+	renewing bool
+	unmapped bool
+}
+
+func (f *fakeMapper) MapPort(_ context.Context, protocol string, internalPort uint16, _ string) (*portforward.Mapping, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if protocol != portforward.TCP {
+		return nil, fmt.Errorf("unexpected protocol %s", protocol)
+	}
+	f.mapped = append(f.mapped, internalPort)
+	if f.mapErr != nil {
+		return nil, f.mapErr
+	}
+	return &portforward.Mapping{ExternalPort: f.external, InternalPort: internalPort, InternalIP: f.internalIP, Protocol: protocol, Method: "UPnP"}, nil
+}
+
+func (f *fakeMapper) StartRenewal(context.Context) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renewing = true
+}
+
+func (f *fakeMapper) UnmapPort(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unmapped = true
+	return nil
+}
+
+// A node at home asks its router to forward its TCP port, registers the port
+// the router grants, which can differ from its own, keeps the mapping renewed,
+// and removes it when it stops.
+func TestNodeMapsItsPort(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{})
+	mapper := &fakeMapper{external: 40001}
+	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
+
+	stop := runNode(t, n)
+	require.Eventually(t, func() bool {
+		_, _, hb, _ := cloud.snapshot()
+		return len(hb) >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+	stop()
+
+	_, registers, _, _ := cloud.snapshot()
+	require.NotEmpty(t, registers)
+	assert.Equal(t, uint16(40001), registers[0].ExternalPort, "clients reach the port the router maps")
+	assert.Equal(t, n.port, registers[0].InternalPort, "the inbound listens on the node's own port")
+	mapper.mu.Lock()
+	defer mapper.mu.Unlock()
+	assert.Equal(t, []uint16{n.port}, mapper.mapped)
+	assert.True(t, mapper.renewing, "the mapping is kept renewed")
+	assert.True(t, mapper.unmapped, "the mapping is removed when the node stops")
+}
+
+// With no router to ask, or one that refuses, the node registers its own port
+// and serves as before.
+func TestNodeServesWithoutAMapping(t *testing.T) {
+	for name, newMapper := range map[string]func(context.Context) (portMapper, error){
+		"no router":      func(context.Context) (portMapper, error) { return nil, errors.New("no gateway") },
+		"router refuses": func(context.Context) (portMapper, error) { return &fakeMapper{mapErr: errors.New("conflict")}, nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cloud := &fakeCloud{t: t}
+			n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
+			n.newMapper = newMapper
+			stop := runNode(t, n)
+			require.Eventually(t, func() bool {
+				_, _, hb, _ := cloud.snapshot()
+				return len(hb) >= 1
+			}, 5*time.Second, 10*time.Millisecond)
+			stop()
+			_, registers, _, _ := cloud.snapshot()
+			require.NotEmpty(t, registers)
+			assert.Equal(t, n.port, registers[0].ExternalPort)
+			assert.Equal(t, n.port, registers[0].InternalPort)
+		})
+	}
+}
+
+// --no-port-mapping leaves the router alone; otherwise the node asks it.
+func TestMapperFor(t *testing.T) {
+	assert.Nil(t, mapperFor(Config{SkipPortMapping: true}))
+	assert.NotNil(t, mapperFor(Config{}))
+	assert.Nil(t, (&node{}).mapPort(context.Background()), "with no mapper nothing is mapped")
+}
+
+// testPort is a TCP port free on this machine.
+func testPort(t *testing.T) uint16 {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := uint16(ln.Addr().(*net.TCPAddr).Port)
+	require.NoError(t, ln.Close())
+	return port
+}
+
+// A node whose port another program listens on stops before asking the
+// router, which would otherwise open that program to the internet.
+func TestNodeWontMapAPortInUse(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
+	ln, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(int(n.port))))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	mapper := &fakeMapper{external: 40001}
+	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
+
+	ctx, cancel := context.WithTimeout(box.BaseContext(), 3*time.Second)
+	defer cancel()
+	err = n.run(ctx)
+	require.ErrorIs(t, err, errPortInUse)
+	mapper.mu.Lock()
+	defer mapper.mu.Unlock()
+	assert.Empty(t, mapper.mapped, "the router was never asked")
+	calls, _, _, _ := cloud.snapshot()
+	assert.Empty(t, calls, "nothing was registered")
+}
+
+// If the box can't start because another program has taken the port since,
+// the node stops, removing the mapping, rather than keep the router
+// forwarding to that program.
+func TestNodeStopsWhenItsPortIsTaken(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
+	n.newBox = func(context.Context, string) (boxService, error) {
+		return nil, &net.OpError{Op: "listen", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4zero, Port: int(n.port)}, Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
+	}
+	mapper := &fakeMapper{external: 40001}
+	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
+
+	done := make(chan error, 1)
+	go func() { done <- n.run(box.BaseContext()) }()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errPortInUse)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the node kept retrying with the port taken")
+	}
+	mapper.mu.Lock()
+	defer mapper.mu.Unlock()
+	assert.True(t, mapper.unmapped, "the mapping is removed")
+	_, _, _, deregistered := cloud.snapshot()
+	assert.Equal(t, []string{"route-1"}, deregistered)
+}
+
+// A rotation whose box can't bind the port because another program has it
+// stops the node, removing the mapping, even while registration keeps
+// failing, rather than keep the router forwarding to that program.
+func TestNodeStopsWhenItsPortIsTakenAtRotation(t *testing.T) {
+	cloud := &fakeCloud{t: t, registerFails: func(n int) int {
+		if n > 2 {
+			return http.StatusServiceUnavailable
+		}
+		return 0
+	}}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{RotationInterval: 50 * time.Millisecond})
+	n.heartbeatOverride = time.Hour
+	var builds atomic.Int32
+	n.newBox = func(ctx context.Context, options string) (boxService, error) {
+		if builds.Add(1) > 1 {
+			return nil, &net.OpError{Op: "listen", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4zero, Port: int(n.port)}, Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
+		}
+		return boxes.factory(ctx, options)
+	}
+	mapper := &fakeMapper{external: 40001}
+	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
+
+	done := make(chan error, 1)
+	go func() { done <- n.run(box.BaseContext()) }()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errPortInUse)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the node kept going with its port taken")
+	}
+	mapper.mu.Lock()
+	defer mapper.mu.Unlock()
+	assert.True(t, mapper.unmapped, "the mapping is removed")
+}
+
+// A program already listening on the exact address the router forwards to
+// stops the node, which removes the mapping: on some systems it can coexist
+// with the check on all addresses.
+func TestNodeWontForwardToAProgramOnTheMappedAddress(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(n.port))))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	mapper := &fakeMapper{external: 40001, internalIP: "127.0.0.1"}
+	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
+
+	ctx, cancel := context.WithTimeout(box.BaseContext(), 3*time.Second)
+	defer cancel()
+	require.ErrorIs(t, n.run(ctx), errPortInUse)
+	mapper.mu.Lock()
+	defer mapper.mu.Unlock()
+	assert.Empty(t, mapper.mapped, "the router is never asked")
+	calls, _, _, _ := cloud.snapshot()
+	assert.Empty(t, calls, "nothing was registered")
+}
+
+// A mapped node with its address free serves as usual.
+func TestNodeServesWithItsMappedAddressFree(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
+	n.newMapper = func(context.Context) (portMapper, error) {
+		return &fakeMapper{external: 40001, internalIP: "127.0.0.1"}, nil
+	}
+	stop := runNode(t, n)
+	require.Eventually(t, func() bool {
+		_, _, hb, _ := cloud.snapshot()
+		return len(hb) >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+	stop()
+}
+
+// A box that fails to bind some other port is retried, not treated as the
+// node's port being taken: the message to choose another --port would be
+// wrong, and the conflict may pass.
+func TestNodeRetriesABindFailureOnAnotherPort(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
+	other := n.port + 1
+	n.newBox = func(context.Context, string) (boxService, error) {
+		return nil, &net.OpError{Op: "listen", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4zero, Port: int(other)}, Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
+	}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	done := make(chan error, 1)
+	go func() { done <- n.run(ctx) }()
+	require.Eventually(t, func() bool {
+		_, registers, _, _ := cloud.snapshot()
+		return len(registers) >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("the node stopped: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	cancel()
+	require.NoError(t, <-done)
+}
+
+// A program that takes the mapped port on one of the node's addresses between
+// boxes stops the node at its next box, removing the mapping.
+func TestNodeChecksItsPortBeforeEachBox(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{RotationInterval: 100 * time.Millisecond})
+	n.heartbeatOverride = time.Hour
+	mapper := &fakeMapper{external: 40001}
+	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
+	done := make(chan error, 1)
+	go func() { done <- n.run(box.BaseContext()) }()
+	require.Eventually(t, func() bool {
+		started, _ := boxes.state()
+		return started >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(n.port))))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errPortInUse)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the node rotated onto a port another program took")
+	}
+	mapper.mu.Lock()
+	defer mapper.mu.Unlock()
+	assert.True(t, mapper.unmapped)
+}
+
+func TestBindsPort(t *testing.T) {
+	op := func(port int) error {
+		return fmt.Errorf("start: %w", &net.OpError{Op: "listen", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4zero, Port: port}, Err: os.NewSyscallError("bind", syscall.EADDRINUSE)})
+	}
+	assert.True(t, bindsPort(op(443), 443))
+	assert.False(t, bindsPort(op(4430), 443), "a port that starts with the node's isn't it")
+	assert.True(t, bindsPort(errors.New("listen tcp 0.0.0.0:443: bind: address already in use"), 443))
+	assert.False(t, bindsPort(errors.New("listen tcp 0.0.0.0:4430: bind: address already in use"), 443))
+	assert.True(t, bindsPort(errors.New("listen tcp [::]:443"), 443))
+	assert.False(t, bindsPort(errors.New("listen tcp [fd00:443::1]:30001: bind: address already in use"), 443),
+		"digits inside an IPv6 address aren't the port")
+	assert.True(t, bindsPort(errors.New("listen tcp [fd00:443::1]:443: bind: address already in use"), 443))
 }
