@@ -113,6 +113,8 @@ type node struct {
 	// maps to port, which can differ from it, or port itself without a
 	// mapping. Zero means port.
 	externalPort uint16
+	// mappedIP is the local address the router forwards to.
+	mappedIP string
 	// newMapper finds the router to map the port on. Nil maps nothing.
 	newMapper func(ctx context.Context) (portMapper, error)
 	newBox    boxFactory
@@ -204,6 +206,15 @@ func (n *node) run(ctx context.Context) error {
 				log.Warn("node: remove router mapping: ", err)
 			}
 		}()
+		// The router forwards to one local address. On macOS and the BSDs a
+		// program can listen on that address beside the check on all
+		// addresses above, and would get the forwarded connections, so check
+		// it too; stopping removes the mapping.
+		if n.mappedIP != "" {
+			if err := portFreeOn(n.mappedIP, n.port); err != nil {
+				return err
+			}
+		}
 	}
 
 	retry := minRetry
@@ -272,6 +283,7 @@ func (n *node) mapPort(ctx context.Context) portMapper {
 		return nil
 	}
 	n.externalPort = mapping.ExternalPort
+	n.mappedIP = mapping.InternalIP
 	m.StartRenewal(ctx)
 	log.Info("node: the router maps TCP port ", mapping.ExternalPort, " to port ", n.port, " (", mapping.Method, ")")
 	return m
@@ -281,8 +293,12 @@ func (n *node) mapPort(ctx context.Context) portMapper {
 var errPortInUse = errors.New("the node's port is in use by another program; choose another with --port")
 
 // portFree reports errPortInUse if something already listens on port.
-func portFree(port uint16) error {
-	ln, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(int(port))))
+func portFree(port uint16) error { return portFreeOn("", port) }
+
+// portFreeOn reports errPortInUse if something already listens on host's
+// port, or on all addresses' when host is empty.
+func portFreeOn(host string, port uint16) error {
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
 	if err != nil {
 		if addrInUse(err) {
 			return fmt.Errorf("port %d: %w", port, errPortInUse)

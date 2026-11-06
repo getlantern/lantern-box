@@ -551,8 +551,9 @@ func TestNewSingBoxRunsVolunteer(t *testing.T) {
 // fakeMapper stands in for the router: it grants external, or fails with
 // mapErr.
 type fakeMapper struct {
-	external uint16
-	mapErr   error
+	external   uint16
+	internalIP string
+	mapErr     error
 
 	mu       sync.Mutex
 	mapped   []uint16
@@ -570,7 +571,7 @@ func (f *fakeMapper) MapPort(_ context.Context, protocol string, internalPort ui
 	if f.mapErr != nil {
 		return nil, f.mapErr
 	}
-	return &portforward.Mapping{ExternalPort: f.external, InternalPort: internalPort, Protocol: protocol, Method: "UPnP"}, nil
+	return &portforward.Mapping{ExternalPort: f.external, InternalPort: internalPort, InternalIP: f.internalIP, Protocol: protocol, Method: "UPnP"}, nil
 }
 
 func (f *fakeMapper) StartRenewal(context.Context) {
@@ -739,4 +740,41 @@ func TestNodeStopsWhenItsPortIsTakenAtRotation(t *testing.T) {
 	mapper.mu.Lock()
 	defer mapper.mu.Unlock()
 	assert.True(t, mapper.unmapped, "the mapping is removed")
+}
+
+// A program already listening on the exact address the router forwards to
+// stops the node, which removes the mapping: on some systems it can coexist
+// with the check on all addresses.
+func TestNodeWontForwardToAProgramOnTheMappedAddress(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(n.port))))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	mapper := &fakeMapper{external: 40001, internalIP: "127.0.0.1"}
+	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
+
+	ctx, cancel := context.WithTimeout(box.BaseContext(), 3*time.Second)
+	defer cancel()
+	require.ErrorIs(t, n.run(ctx), errPortInUse)
+	mapper.mu.Lock()
+	defer mapper.mu.Unlock()
+	assert.Equal(t, len(mapper.mapped) > 0, mapper.unmapped, "a mapping made is removed")
+	calls, _, _, _ := cloud.snapshot()
+	assert.Empty(t, calls, "nothing was registered")
+}
+
+// A mapped node with its address free serves as usual.
+func TestNodeServesWithItsMappedAddressFree(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
+	n.newMapper = func(context.Context) (portMapper, error) {
+		return &fakeMapper{external: 40001, internalIP: "127.0.0.1"}, nil
+	}
+	stop := runNode(t, n)
+	require.Eventually(t, func() bool {
+		_, _, hb, _ := cloud.snapshot()
+		return len(hb) >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+	stop()
 }
