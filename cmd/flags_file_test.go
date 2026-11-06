@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,10 +72,27 @@ func TestFlagsFileCommentsAndLineEndings(t *testing.T) {
 	assert.Equal(t, "a #b", api, "an escaped space keeps the # in the word")
 }
 
-func TestFlagsFileLosesToCommandLine(t *testing.T) {
-	path := writeFlagsFile(t, "--max-peers 5 --state-dir /from/file")
-	fs := serveFlagsWith(t, "--register", "--max-peers", "3", "--state-dir", "/from/cli")
+// A line ending in a backslash continues onto the next, as in a shell, and a
+// comment on that next line is still a comment.
+func TestFlagsFileContinuation(t *testing.T) {
+	path := writeFlagsFile(t, "--max-peers \\\n5 \\\n# five peers\n--user-id x\n")
+	fs := serveFlagsWith(t, "--register")
 	require.NoError(t, applyFlagsFile(fs, path))
+	peers, _ := fs.GetInt("max-peers")
+	user, _ := fs.GetString("user-id")
+	assert.Equal(t, 5, peers)
+	assert.Equal(t, "x", user)
+}
+
+func TestFlagsFileLosesToCommandLine(t *testing.T) {
+	path := writeFlagsFile(t, "--max-peers 5 --state-dir /from/file --state-dir /again")
+	fs := serveFlagsWith(t, "--register", "--max-peers", "3", "--state-dir", "/from/cli")
+	var notices strings.Builder
+	flagsFileNotices = &notices
+	t.Cleanup(func() { flagsFileNotices = os.Stderr })
+	require.NoError(t, applyFlagsFile(fs, path))
+	assert.Equal(t, 1, strings.Count(notices.String(), "ignoring --state-dir"), "noted once: %q", notices.String())
+	assert.Equal(t, 1, strings.Count(notices.String(), "ignoring --max-peers"))
 
 	peers, _ := fs.GetInt("max-peers")
 	dir, _ := fs.GetString("state-dir")

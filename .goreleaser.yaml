@@ -213,8 +213,9 @@ brews:
     # brew services can't pass flags, so lantern-box reads them from
     # etc/lamplighter.args, which install.sh writes (serve --flags-file: quoted
     # as in a shell, nothing expanded; a missing file means no flags, and one
-    # that can't be read stops the node). Values can be quoted, and the service
-    # shows as lantern-box, not sh, in macOS's Login Items.
+    # that can't be read stops the node). Values can be quoted, the service
+    # shows as lantern-box in macOS's Login Items, and with no shell in
+    # between, launchd's stop signal goes straight to it for a clean shutdown.
     service: |
       run [opt_bin/"lantern-box", "serve", "--register", "--state-dir", var/"lamplighter", "--flags-file", etc/"lamplighter.args"]
       keep_alive true

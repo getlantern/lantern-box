@@ -12,6 +12,10 @@ import (
 	"github.com/spf13/pflag"
 )
 
+// flagsFileNotices is where applyFlagsFile reports flags it ignores. A
+// variable so tests can read it.
+var flagsFileNotices io.Writer = os.Stderr
+
 // applyFlagsFile sets serve's flags from the file at path, for each one the
 // command line didn't set. The file holds flags as a shell would quote them,
 // with # comments, on one line or several. Nothing in it is expanded or run.
@@ -29,7 +33,8 @@ func applyFlagsFile(cmdFlags *pflag.FlagSet, path string) error {
 		}
 		return fmt.Errorf("read flags file: %w", err)
 	}
-	words, err := shellquote.Split(stripComments(strings.ReplaceAll(string(data), "\r", "")))
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	words, err := shellquote.Split(stripComments(strings.TrimSuffix(text, "\r")))
 	if err != nil {
 		return fmt.Errorf("flags file %s: %w", path, err)
 	}
@@ -54,9 +59,13 @@ func applyFlagsFile(cmdFlags *pflag.FlagSet, path string) error {
 	if extra := fileFlags.Args(); len(extra) > 0 {
 		return fmt.Errorf("flags file %s: %q isn't a flag", path, extra[0])
 	}
+	noted := map[string]bool{}
 	for _, s := range settings {
 		if cmdFlags.Changed(s.name) {
-			fmt.Fprintf(os.Stderr, "flags file %s: ignoring --%s, which the command line sets\n", path, s.name)
+			if !noted[s.name] {
+				noted[s.name] = true
+				fmt.Fprintf(flagsFileNotices, "flags file %s: ignoring --%s, which the command line sets\n", path, s.name)
+			}
 			continue
 		}
 		if err := cmdFlags.Set(s.name, s.value); err != nil {
@@ -96,6 +105,11 @@ func stripComments(s string) string {
 				b.WriteByte('\n')
 			}
 			wordStart = true
+			continue
+		case c == '\\' && i+1 < len(s) && s[i+1] == '\n':
+			// A line continuation, which go-shellquote drops too: it neither
+			// ends nor starts a word.
+			i++
 			continue
 		case c == '\\' && i+1 < len(s):
 			// An escaped character, even a space, is part of a word.
