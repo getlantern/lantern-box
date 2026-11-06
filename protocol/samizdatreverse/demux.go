@@ -35,8 +35,10 @@ const (
 // masquerade of their own.
 //
 // An identity the configuration no longer names is retired: it stops taking
-// connections, but its live sessions go on until they end, and it closes
-// once the last has.
+// connections, but the ones it has go on until they end, and it closes once
+// the last has. A connection counts from the moment the portal admits it,
+// before its handshake, until it closes, so retiring never cuts off a
+// handshake that is about to become a session.
 type identity struct {
 	privateKey, certPEM, keyPEM []byte
 	publicKey                   []byte
@@ -44,8 +46,11 @@ type identity struct {
 	ln                          *connListener
 	serveDone                   chan struct{}
 
-	mu        sync.Mutex
-	live      int // sessions in the portal's handler
+	mu sync.Mutex
+	// live counts the connections admitted and not yet closed. Admission
+	// and retirement both happen under mu, so nothing is admitted once
+	// retire has decided to close.
+	live      int
 	retired   bool
 	closed    bool
 	closeOnce sync.Once
@@ -67,15 +72,11 @@ func (p *Portal) newIdentity(privateKey, certPEM, keyPEM []byte, ids [][8]byte) 
 		serveDone:  make(chan struct{}),
 	}
 	id.server, err = samizdat.NewServer(samizdat.ServerConfig{
-		PrivateKey: privateKey,
-		ShortIDs:   ids,
-		CertPEM:    certPEM,
-		KeyPEM:     keyPEM,
-		SessionHandler: func(ctx context.Context, conn net.Conn, shortID [8]byte) {
-			id.enter()
-			defer id.leave()
-			p.handleSession(ctx, conn, shortID)
-		},
+		PrivateKey:     privateKey,
+		ShortIDs:       ids,
+		CertPEM:        certPEM,
+		KeyPEM:         keyPEM,
+		SessionHandler: p.handleSession,
 	})
 	if err != nil {
 		return nil, err
@@ -102,32 +103,41 @@ func (id *identity) authenticates(sessionID []byte) bool {
 	return err == nil && ok
 }
 
-func (id *identity) enter() {
+// admit counts conn against id and returns it wrapped to be handed to id's
+// server, with record to be read again first. Closing the wrapper releases
+// the count. It returns nil, counting nothing, once id is retired.
+func (id *identity) admit(conn net.Conn, record []byte) *admittedConn {
 	id.mu.Lock()
+	defer id.mu.Unlock()
+	if id.retired {
+		return nil
+	}
 	id.live++
-	id.mu.Unlock()
+	return &admittedConn{replayConn: replayConn{Conn: conn, buf: record}, id: id}
 }
 
-func (id *identity) leave() {
+// release ends the count of one admitted connection.
+func (id *identity) release() {
 	id.mu.Lock()
 	id.live--
 	idle := id.retired && id.live == 0
 	id.mu.Unlock()
 	if idle {
-		// Close waits for this session's handler, which is still running.
+		// Close waits for the server's handler of the connection that was
+		// just closed, which may be the caller.
 		go id.close()
 	}
 }
 
-// retire stops id taking connections. It closes id at once if no session is
-// live, and otherwise when the last one ends. It reports whether id is still
-// open.
+// retire stops id admitting connections. It closes id at once if no
+// admitted connection is open, and otherwise when the last one closes. Its
+// listener stays open until then, so a connection admitted just before can
+// still be handed over. It reports whether id is still open.
 func (id *identity) retire() bool {
 	id.mu.Lock()
 	id.retired = true
 	idle := id.live == 0
 	id.mu.Unlock()
-	id.ln.Close()
 	if idle {
 		id.close()
 		return false
@@ -251,8 +261,17 @@ func (p *Portal) route(conn net.Conn) {
 		return
 	}
 	if id := r.pick(record[5:], time.Now()); id != nil {
-		if !id.ln.deliver(&replayConn{Conn: conn, buf: record}) {
+		ac := id.admit(conn, record)
+		if ac == nil {
+			// Retired since the routes were read.
 			conn.Close()
+			return
+		}
+		if p.afterAdmit != nil {
+			p.afterAdmit()
+		}
+		if !id.ln.deliver(ac) {
+			ac.Close()
 		}
 		return
 	}
@@ -338,6 +357,21 @@ func readHelloRecord(conn net.Conn) ([]byte, error) {
 		return nil, err
 	}
 	return record, nil
+}
+
+// admittedConn is a connection an identity has admitted. Its first Close
+// releases the identity's count. samizdat closes every connection it
+// accepts when it is done with it, session or not.
+type admittedConn struct {
+	replayConn
+	id   *identity
+	once sync.Once
+}
+
+func (c *admittedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.id.release)
+	return err
 }
 
 // replayConn returns buf to its first reads, then reads from Conn.

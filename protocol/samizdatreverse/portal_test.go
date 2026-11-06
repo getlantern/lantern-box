@@ -1,6 +1,7 @@
 package samizdatreverse
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -1274,4 +1275,89 @@ func TestPortalFailedHandshakesLeaveNothingTracked(t *testing.T) {
 		_, err := c.Read(make([]byte, 1))
 		assert.ErrorIs(t, err, io.EOF, "a silent conn outlived the hello timeout")
 	}
+}
+
+// TestPortalRetireKeepsAdmittedHandshake retires an identity after it has
+// admitted a connection and before the connection reaches its server, when
+// it holds no session. The handshake must complete and its session stay.
+func TestPortalRetireKeepsAdmittedHandshake(t *testing.T) {
+	k1, k2 := newTestKeys(t), newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	pairings := map[[8]byte]string{id: tagA}
+	require.NoError(t, p.Configure(k1.config(0, pairings)))
+	addr := portalAddr(t, p)
+
+	admitted, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	p.afterAdmit = func() {
+		once.Do(func() {
+			close(admitted)
+			<-release
+		})
+	}
+	dialed := make(chan *samizdat.Client, 1)
+	conns := make(chan net.Conn, 1)
+	go func() {
+		c, err := samizdat.NewClient(samizdat.ClientConfig{ServerAddr: addr, ServerName: "localhost", PublicKey: k1.pub, ShortID: id})
+		if err != nil {
+			close(conns)
+			return
+		}
+		dialed <- c
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		conn, err := c.DialSession(ctx)
+		if err != nil {
+			close(conns)
+			return
+		}
+		conns <- conn
+	}()
+	select {
+	case <-admitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection was never admitted")
+	}
+	t.Cleanup(func() { (<-dialed).Close() })
+
+	// k1 holds no session yet, only the admitted handshake.
+	require.NoError(t, p.Configure(k2.config(0, pairings)))
+	assert.Equal(t, 1, retiredCount(p), "the identity closed under an admitted handshake")
+	close(release)
+
+	conn, ok := <-conns
+	require.True(t, ok, "the admitted handshake was cut off by retirement")
+	t.Cleanup(func() { conn.Close() })
+	go (&http2.Server{}).ServeConn(conn, &http2.ServeConnOpts{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Helper", "old")
+		w.WriteHeader(http.StatusOK)
+	})})
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "old" }, 5*time.Second, 50*time.Millisecond)
+
+	// Once that session ends, the retired identity closes.
+	conn.Close()
+	require.Eventually(t, func() bool { return retiredCount(p) == 0 }, 5*time.Second, 20*time.Millisecond)
+	assert.False(t, authenticates(t, addr, k1, id), "a retired identity took a new session")
+}
+
+// TestPortalRejectsPreviousKeyClampedToCurrent uses a previous key that
+// differs from the current one only in bits X25519 clamps away, so both
+// make the same public key.
+func TestPortalRejectsPreviousKeyClampedToCurrent(t *testing.T) {
+	k1, k2 := newTestKeys(t), newTestKeys(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	pairings := map[[8]byte]string{newShortID(t): tagA}
+
+	for _, flip := range []struct{ byte, mask int }{{0, 0x07}, {31, 0x80}, {31, 0x40}} {
+		clamped := bytes.Clone(k2.priv)
+		clamped[flip.byte] ^= byte(flip.mask)
+		require.False(t, bytes.Equal(clamped, k2.priv))
+		require.Equal(t, x25519Public(k2.priv), x25519Public(clamped), "the flipped bits are not clamped")
+
+		prev := withPrevious(k2.config(0, pairings), k1, time.Now().Add(time.Minute))
+		prev.Previous.PrivateKey = clamped
+		assert.Error(t, p.Configure(prev), "a previous key clamped to the current one was accepted")
+	}
+	require.NoError(t, p.Configure(withPrevious(k2.config(0, pairings), k1, time.Now().Add(time.Minute))))
 }

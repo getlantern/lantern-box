@@ -3,6 +3,7 @@ package samizdatreverse
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -103,6 +104,10 @@ type Portal struct {
 	// beforeListen, when set, runs just before each bind. Tests use it to
 	// take the port first.
 	beforeListen func(port uint16)
+	// afterAdmit, when set, runs in the accept path after an identity has
+	// admitted a connection and before the connection is handed to it.
+	// Tests use it to retire the identity in between.
+	afterAdmit func()
 
 	// routes is what the accept path reads to pick an identity. It is nil
 	// while the portal is down.
@@ -307,9 +312,11 @@ func (p *Portal) configureLocked(cfg PortalConfig) ([]*portalSession, error) {
 		if err := checkIdentity("previous ", prev.PrivateKey, prev.CertPEM, prev.KeyPEM); err != nil {
 			return nil, err
 		}
-		if bytes.Equal(prev.PrivateKey, cfg.PrivateKey) {
-			// The current identity would take every session meant for it.
-			return nil, fmt.Errorf("%s: previous private key is the current one", constant.TypeSamizdatPortal)
+		// X25519 clamps the key, so different bytes can make the same
+		// public key, under which the current identity would take every
+		// session meant for the previous one.
+		if bytes.Equal(x25519Public(prev.PrivateKey), x25519Public(cfg.PrivateKey)) {
+			return nil, fmt.Errorf("%s: previous key is the current one", constant.TypeSamizdatPortal)
 		}
 	}
 
@@ -411,8 +418,9 @@ func (p *Portal) reidentifyLocked(cfg PortalConfig, ids [][8]byte) ([]*portalSes
 	// samizdat accepts it.
 	stale := p.setPairings(cfg.Pairings)
 	p.cur = cur
-	// The new routes are published before anything is retired, so nothing
-	// is routed to a retired identity from here on.
+	// The new routes are published before anything is retired. An accept
+	// path still holding the old ones finds a retired identity refusing
+	// admission.
 	p.setPrevLocked(prev, cfg.Previous)
 	for _, id := range held {
 		if id != nil && id != cur && id != prev {
@@ -441,6 +449,16 @@ func checkIdentity(which string, privateKey, certPEM, keyPEM []byte) error {
 		return fmt.Errorf("%s: %scertificate: %w", constant.TypeSamizdatPortal, which, err)
 	}
 	return nil
+}
+
+// x25519Public returns the public key of a 32-byte X25519 private key.
+func x25519Public(privateKey []byte) []byte {
+	priv, err := ecdh.X25519().NewPrivateKey(privateKey)
+	if err != nil {
+		// Only a wrong length fails, and checkIdentity has ruled that out.
+		return nil
+	}
+	return priv.PublicKey().Bytes()
 }
 
 // setPrevLocked makes id the previous identity, taking new sessions until
