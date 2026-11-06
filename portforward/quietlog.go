@@ -72,12 +72,14 @@ var (
 // goes whole: a URL ("http://[fdab::]:5000/ctl"), a bracketed or
 // ::-compressed IPv6 address, a hostname such as router.lan, or ip:port. The
 // words around it stay, so the error keeps its kind ("connection refused",
-// "no such host", "status <n>").
+// "no such host", "status <n>"). The word after "lookup" is always a host,
+// so a single-label name such as "router" goes too.
 func redactText(s string) string {
 	fields := strings.Fields(s)
 	for i, f := range fields {
 		if strings.Contains(f, "://") || strings.ContainsAny(f, "[]") ||
-			strings.Contains(f, "::") || endpointRE.MatchString(f) {
+			strings.Contains(f, "::") || endpointRE.MatchString(f) ||
+			(i > 0 && fields[i-1] == "lookup") {
 			fields[i] = "<addr>"
 		}
 	}

@@ -146,6 +146,7 @@ func TestRedactTextEndpoints(t *testing.T) {
 	for in, want := range map[string]string{
 		`Post "http://[fdab::]:5000/ctl": connection refused`:                          "Post <addr> connection refused",
 		`Post "http://router.lan:5000/ctl": dial tcp: lookup router.lan: no such host`: "Post <addr> dial tcp: lookup <addr> no such host",
+		"dial tcp: lookup fritzbox: no such host":                                      "dial tcp: lookup <addr> no such host",
 		"dial udp fdab:: : network is unreachable":                                     "dial udp <addr> : network is unreachable",
 		"read udp [fe80::1%en0]:5351: i/o timeout":                                     "read udp <addr> i/o timeout",
 		"dial tcp ::1: connection refused":                                             "dial tcp <addr> connection refused",
@@ -154,7 +155,7 @@ func TestRedactTextEndpoints(t *testing.T) {
 	} {
 		got := redactText(in)
 		assert.Equal(t, want, got, "redacting %q", in)
-		for _, leak := range []string{"fdab", "router.lan", "fe80", "192.168", "5000", "5351", "3000"} {
+		for _, leak := range []string{"fdab", "router.lan", "fritzbox", "fe80", "192.168", "5000", "5351", "3000"} {
 			assert.NotContains(t, got, leak)
 		}
 	}
