@@ -139,7 +139,12 @@ func TestFlagsFileErrors(t *testing.T) {
 
 	t.Run("dangling symlink", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "lamplighter.args")
-		require.NoError(t, os.Symlink(filepath.Join(t.TempDir(), "gone"), path))
+		if err := os.Symlink(filepath.Join(t.TempDir(), "gone"), path); err != nil {
+			if runtime.GOOS == "windows" {
+				t.Skipf("can't create a symlink without the privilege for it: %v", err)
+			}
+			require.NoError(t, err)
+		}
 		assert.Error(t, applyFlagsFile(serveFlagsWith(t), path))
 	})
 
