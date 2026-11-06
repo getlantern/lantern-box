@@ -217,7 +217,7 @@ func TestNodeServes(t *testing.T) {
 	assert.Equal(t, []string{"/v1/peer/register", "/v1/peer/verify", "/v1/peer/heartbeat"}, calls[:3])
 	assert.Equal(t, "/v1/peer/deregister", calls[len(calls)-1])
 	require.Len(t, registers, 1)
-	assert.Equal(t, registerRequest{ExternalPort: n.port, InternalPort: n.port, ServePool: true, RunsUnboundedVolunteer: true}, registers[0])
+	assert.Equal(t, registerRequest{ExternalPort: n.port, InternalPort: n.port, ServePool: true, RunsUnboundedVolunteer: true, ReportsNetstatedAsync: true}, registers[0])
 	assert.Equal(t, heartbeatRequest{RouteID: "route-1", ActiveClients: 2}, heartbeats[0], "two distinct client IPs")
 	assert.Equal(t, []string{"route-1"}, deregistered)
 
