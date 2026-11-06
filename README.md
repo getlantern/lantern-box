@@ -16,7 +16,7 @@ There are three ways to use lantern-box:
 
 A Lantern node helps people in censored countries reach the open internet. It registers with Lantern, which sends it a proxy config and fresh credentials every hour, and Lantern's apps send users to it. A node in an uncensored country also runs an [Unbounded](https://github.com/getlantern/unbounded) volunteer, which relays for users over WebRTC.
 
-Nodes are in a limited rollout: Lantern accepts a node once it has enrolled it, by its IP address or your Lantern user ID.
+Anyone in a country without internet censorship can run one. There's no sign-up.
 
 **macOS, or Linux with Homebrew:**
 
@@ -38,7 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/getlantern/lantern-box/main/install
   LANTERN_NODE_ARGS="--bandwidth-limit 10mbit" sh
 ```
 
-They replace any flags set before, so give all you want each time, and none to clear them.
+Setting `LANTERN_NODE_ARGS` replaces any flags set before, so give all you want, or set it empty to clear them. Run without it, as to upgrade, the installer keeps them.
 
 **Docker** (Linux, amd64):
 
@@ -88,7 +88,7 @@ The node keeps its identity and port in `node.json` in its state directory: `/va
 | Status | `brew services info lantern-box` | `systemctl status lantern-node` | `docker ps -f name=lantern-node` |
 | Logs | `tail -f $(brew --prefix)/var/log/lantern-node.log` | `journalctl -u lantern-node -f` | `docker logs -f lantern-node` |
 | Stop | `brew services stop lantern-box` | `sudo systemctl disable --now lantern-node` | `docker stop lantern-node && docker rm lantern-node` |
-| Uninstall | `brew uninstall lantern-box` | `sudo apt remove lantern-box`, `sudo dnf remove lantern-box`, or remove `/usr/bin/lantern-box` and `/etc/systemd/system/lantern-node.service` | `docker volume rm lantern-node` |
+| Uninstall | `brew uninstall lantern-box`, then delete `$(brew --prefix)/etc/lantern-node.args` | `sudo apt remove lantern-box`, `sudo dnf remove lantern-box`, or remove `/usr/bin/lantern-box` and `/etc/systemd/system/lantern-node.service`; then delete `/etc/lantern-box/node.env` | `docker volume rm lantern-node` |
 
 ## Quick Start: Run the Server
 

@@ -200,9 +200,11 @@ brews:
       bin.install "lantern-box"
     # brew services can't pass flags, so the service reads them from
     # etc/lantern-node.args, which install.sh writes, split at whitespace as
-    # systemd splits the Linux unit's LANTERN_NODE_ARGS.
+    # systemd splits the Linux unit's LANTERN_NODE_ARGS: set -f stops the
+    # shell from expanding them as file patterns. A missing file means no
+    # flags; one that can't be read stops the node, with cat's error in its log.
     service: |
-      run ["/bin/sh", "-c", "exec \"$0\" serve --register --state-dir \"$1\" $(cat \"$2\" 2>/dev/null)", opt_bin/"lantern-box", var/"lantern-node", etc/"lantern-node.args"]
+      run ["/bin/sh", "-c", "set -f; a=; if [ -e \"$2\" ]; then a=$(cat \"$2\") || exit 1; fi; exec \"$0\" serve --register --state-dir \"$1\" $a", opt_bin/"lantern-box", var/"lantern-node", etc/"lantern-node.args"]
       keep_alive true
       log_path var/"log/lantern-node.log"
       error_log_path var/"log/lantern-node.log"
