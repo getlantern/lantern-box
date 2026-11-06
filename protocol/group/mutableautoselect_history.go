@@ -68,17 +68,12 @@ type localHistory struct {
 
 func newLocalHistory() *localHistory { return &localHistory{} }
 
-// outcomeAt returns the most recent probe outcome time, or zero if unset.
-func (h *localHistory) outcomeAt() time.Time {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.lastOutcomeAt
-}
-
-func (h *localHistory) clearOutcomeAt() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.lastOutcomeAt = time.Time{}
+func (h *localHistory) recordProbe(success bool, delayMs uint32, now time.Time) {
+	if success {
+		h.recordProbeSuccess(delayMs, now)
+	} else {
+		h.recordProbeFailure(now)
+	}
 }
 
 // recordProbeSuccess updates the probe scalars on a successful probe.
@@ -145,12 +140,11 @@ func (h *localHistory) userFailureCount(now time.Time, window time.Duration) uin
 	return uint32(len(h.userFailures))
 }
 
-func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay uint32, lastAt time.Time, consec uint32, userFails []adapter.UserFailure, gated bool) {
+func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay uint32, consec uint32, userFails []adapter.UserFailure, gated bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.userFailures = pruneUserFailures(h.userFailures, now, window)
 	lastDelay = h.lastSuccessDelayMs
-	lastAt = h.lastOutcomeAt
 	consec = h.consecutiveFailures
 	gated = !h.recoveryGateStartedAt.IsZero()
 	if len(h.userFailures) > 0 {

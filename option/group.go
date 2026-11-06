@@ -40,7 +40,7 @@ type MutableAutoSelectOutboundOptions struct {
 
 	// SwitchToleranceMs is the minimum delay improvement (in ms) a
 	// candidate must have over the current selection before the group
-	// switches on delay. Default 300.
+	// switches on delay. Default 100.
 	SwitchToleranceMs uint32 `json:"switch_tolerance_ms,omitempty"`
 
 	// SwitchTolerancePercent is the minimum delay improvement, as a
@@ -91,21 +91,20 @@ type MutableAutoSelectOutboundOptions struct {
 	// after IdleThresholdSeconds without use instead of slowing down.
 	IdleIntervalSeconds uint32 `json:"idle_interval_seconds,omitempty"`
 
-	// IdleThresholdSeconds is how long the group may go without a dial,
-	// listen, or data-plane traffic before background probing stops. The
-	// next dial or listen restarts it, starting a full probe in the
-	// background if the group was idle longer than BackgroundIntervalSeconds
-	// or the network changed meanwhile. Default 900 (15 min).
+	// IdleThresholdSeconds bounds inactivity before periodic probing stops.
+	// The next use immediately requests probes for members without a fresh
+	// outcome. Default 900.
 	IdleThresholdSeconds uint32 `json:"idle_threshold_seconds,omitempty"`
 
-	// LadderTotalBudgetSeconds is the total budget the reconnection ladder
-	// has before emitting the exhaustion signal. Default 10.
+	// LadderTotalBudgetSeconds bounds a ladder evaluation once its first
+	// slot is available. Expiration leaves probes running. Default 15.
 	LadderTotalBudgetSeconds uint32 `json:"ladder_total_budget_seconds,omitempty"`
 
 	// LadderCooldownSeconds is the minimum time after a ladder run before
 	// another can fire. A ladder runs when a dial or listen fails on the
 	// selected member and on its fast-failover alternate, or has no
-	// alternate. Default 60.
+	// alternate. An interface update lifts the cooldown unless another
+	// arrived within the previous LadderCooldownSeconds. Default 60.
 	LadderCooldownSeconds uint32 `json:"ladder_cooldown_seconds,omitempty"`
 
 	// ConfirmedFailureSwitchCooldownSeconds is the minimum time between
@@ -129,7 +128,9 @@ type MutableAutoSelectOutboundOptions struct {
 	// true; set false to count failures from every wrapped conn.
 	DemoteOnlySelectedTag *bool `json:"demote_only_selected_tag,omitempty"`
 
-	// ProbeConcurrency caps parallel member probes per batch. Default 6.
+	// ProbeConcurrency caps concurrent probes of ordinary members across the
+	// group; last-resort and failure-confirmation probes don't count toward
+	// it. Default 6.
 	ProbeConcurrency uint32 `json:"probe_concurrency,omitempty"`
 }
 

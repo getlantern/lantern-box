@@ -21,7 +21,6 @@ import (
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 	"github.com/stretchr/testify/assert"
@@ -34,7 +33,7 @@ import (
 )
 
 // Type returns m.typeName so tests can drive behaviorFor branches
-// (substituteDelay, excluded). Empty typeName keeps the default.
+// (excluded, last resort). Empty typeName keeps the default.
 func (m *mockOutbound) Type() string { return m.typeName }
 
 // newTestMUR builds a minimal MutableAutoSelect populated with the given
@@ -66,11 +65,14 @@ func newTestMUR(t *testing.T, tags ...string) (*MutableAutoSelect, map[string]*m
 		history:      adapter.NewAutoSelectHistoryStorage(),
 		exhaustionCh: make(chan struct{}, 1),
 	}
+	s.initProbeState()
+	t.Cleanup(func() { s.Close() })
 	obs := make(map[string]*mockOutbound, len(tags))
 	for _, tag := range tags {
 		ob := &mockOutbound{tag: tag}
 		obs[tag] = ob
 		s.members.Store(tag, sbAdapter.Outbound(ob))
+		s.addProbeMemberLocked(tag)
 	}
 	return s, obs
 }
@@ -83,14 +85,6 @@ func recordSuccess(s *MutableAutoSelect, tag string, delay uint32) time.Time {
 	h := s.historyForLocked(tag)
 	h.recordProbeSuccess(delay, now)
 	return now
-}
-
-func jobTags(jobs []probeJob) []string {
-	tags := make([]string, len(jobs))
-	for i, j := range jobs {
-		tags[i] = j.outbound.Tag()
-	}
-	return tags
 }
 
 func TestPruneUserFailures(t *testing.T) {
@@ -186,10 +180,10 @@ func TestLocalHistory_ConsecutiveFailuresResetOnSuccess(t *testing.T) {
 	now := time.Now()
 	h.recordProbeFailure(now)
 	h.recordProbeFailure(now.Add(time.Second))
-	_, _, consec, _, _ := h.snapshot(now, time.Hour)
+	_, consec, _, _ := h.snapshot(now, time.Hour)
 	assert.Equal(t, uint32(2), consec, "two failures should accumulate")
 	h.recordProbeSuccess(100, now.Add(2*time.Second))
-	_, _, consec, _, _ = h.snapshot(now, time.Hour)
+	_, consec, _, _ = h.snapshot(now, time.Hour)
 	assert.Equal(t, uint32(0), consec, "success should reset consecutive failures")
 }
 
@@ -201,7 +195,7 @@ func TestLocalHistory_FailureDoesNotClearLastSuccessDelay(t *testing.T) {
 	now := time.Now()
 	h.recordProbeSuccess(150, now)
 	h.recordProbeFailure(now.Add(time.Second))
-	lastDelay, _, consec, _, _ := h.snapshot(now, time.Hour)
+	lastDelay, consec, _, _ := h.snapshot(now, time.Hour)
 	assert.Equal(t, uint32(150), lastDelay, "lastSuccessDelay must survive a subsequent failure")
 	assert.Equal(t, uint32(1), consec, "consecutive failures bump")
 }
@@ -305,7 +299,7 @@ func TestHydrateLocalHistory_DropsAgedUserFailures(t *testing.T) {
 		UpdatedAt: now.Add(-time.Minute),
 	}
 	h := hydrateLocalHistory(persisted, now, 5*time.Minute)
-	lastDelay, _, _, userFails, _ := h.snapshot(now, 5*time.Minute)
+	lastDelay, _, userFails, _ := h.snapshot(now, 5*time.Minute)
 	assert.Equal(t, uint32(120), lastDelay)
 	assert.Len(t, userFails, 1, "stale user-failure timestamp must be dropped on hydrate")
 }
@@ -352,23 +346,21 @@ func TestBehaviorFor_UnboundedIsLastResort(t *testing.T) {
 	assert.Equal(t, 60*time.Second, beh.probeTimeout)
 }
 
-func TestRank_SwitchPenaltyOnlyAppliesToRealSeeded(t *testing.T) {
-	// A kindUnknown candidate (no probe yet) must never be boosted —
-	// the boost compares its delay against its peers' best, but its
-	// own delay is 0 (sentinel for "no data"), not a real measurement.
-	// Without the kindRealSeeded gate, the limit would double off a
-	// synthetic 0-vs-real comparison.
+func TestRank_SwitchPenaltyOnlyAppliesToMeasured(t *testing.T) {
+	// An unmeasured candidate (no probe yet) must never be boosted: its
+	// delay is the 0 "no data" sentinel, so comparing it with its peers'
+	// best would double the limit off a 0-vs-real comparison.
 	s, _ := newTestMUR(t, "fast-real", "unknown-mid", "slow-real")
 	recordSuccess(s, "fast-real", 100) // 100ms — fastest, would be boosted
 	recordSuccess(s, "slow-real", 990) // 990ms — the much-slower alternative
-	// "unknown-mid" intentionally has no probe success — kindUnknown.
+	// "unknown-mid" intentionally has no probe success, so it is unmeasured.
 
 	// Three user-failures on each — enough to trip the base limit.
 	addUserFailureN(s, "fast-real", int(s.hist.consecutiveFailLimit))
 	addUserFailureN(s, "unknown-mid", int(s.hist.consecutiveFailLimit))
 
 	s.access.Lock()
-	ranked := s.rankLocked(time.Now(), time.Time{})
+	ranked := s.rankLocked(time.Now())
 	s.access.Unlock()
 
 	var fast, unknown rankedCandidate
@@ -399,7 +391,7 @@ func userFailures(s *MutableAutoSelect, tag string) ([]adapter.UserFailure, bool
 	if !ok {
 		return nil, false
 	}
-	_, _, _, uf, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
+	_, _, uf, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
 	return uf, true
 }
 
@@ -414,7 +406,7 @@ func addUserFailureN(s *MutableAutoSelect, tag string, n int) {
 	}
 }
 
-func TestSelectFor_ThreeTierFallback(t *testing.T) {
+func TestSelectOutbound_ThreeTierFallback(t *testing.T) {
 	tests := []struct {
 		name    string
 		setup   func(s *MutableAutoSelect)
@@ -452,7 +444,7 @@ func TestSelectFor_ThreeTierFallback(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _ := newTestMUR(t, "a", "b")
 			tt.setup(s)
-			got, err := s.selectFor("tcp")
+			got, _, err := s.selectOutbound("tcp", "")
 			require.NoError(t, err)
 			require.NotNil(t, got)
 			assert.Equal(t, tt.wantTag, got.Tag())
@@ -460,7 +452,7 @@ func TestSelectFor_ThreeTierFallback(t *testing.T) {
 	}
 }
 
-func TestSelectFor_SwitchTolerance(t *testing.T) {
+func TestSelectOutbound_SwitchTolerance(t *testing.T) {
 	tests := []struct {
 		name       string
 		alphaDelay uint32
@@ -482,7 +474,7 @@ func TestSelectFor_SwitchTolerance(t *testing.T) {
 			recordSuccess(s, "alpha", tt.alphaDelay)
 			recordSuccess(s, "beta", tt.betaDelay)
 			s.stickyTag.tcp.Store("alpha")
-			got, err := s.selectFor("tcp")
+			got, _, err := s.selectOutbound("tcp", "")
 			require.NoError(t, err)
 			require.NotNil(t, got)
 			assert.Equal(t, tt.want, got.Tag(), tt.commentary)
@@ -490,34 +482,34 @@ func TestSelectFor_SwitchTolerance(t *testing.T) {
 	}
 }
 
-func TestSelectFor_ForcedSwitchWhenStickyNotInPool(t *testing.T) {
+func TestSelectOutbound_ForcedSwitchWhenStickyNotInPool(t *testing.T) {
 	s, _ := newTestMUR(t, "alpha", "beta")
 	recordSuccess(s, "beta", 120)
 	addUserFailureN(s, "alpha", int(s.hist.consecutiveFailLimit))
 	s.stickyTag.tcp.Store("alpha")
 
-	got, err := s.selectFor("tcp")
+	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "beta", got.Tag(),
 		"sticky alpha demoted to hard tier; clean beta wins the forced switch")
 }
 
-func TestSelectFor_RecordsStickyAfterPick(t *testing.T) {
+func TestSelectOutbound_RecordsStickyAfterPick(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	recordSuccess(s, "a", 50)
-	_, err := s.selectFor("tcp")
+	_, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	assert.Equal(t, "a", loadString(&s.stickyTag.tcp))
 }
 
-func TestSelectForExcluding_SkipsTargetAndDoesNotMutateSticky(t *testing.T) {
+func TestSelectOutboundExcluding_SkipsTargetAndDoesNotMutateSticky(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	recordSuccess(s, "a", 30)
 	recordSuccess(s, "b", 50)
 	s.stickyTag.tcp.Store("a")
 
-	got, err := s.selectForExcluding("tcp", "a")
+	got, _, err := s.selectOutbound("tcp", "a")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Tag(), "fast-failover must skip the excluded tag")
@@ -525,10 +517,10 @@ func TestSelectForExcluding_SkipsTargetAndDoesNotMutateSticky(t *testing.T) {
 		"a fast-failover pick must not poison the sticky tag")
 }
 
-func TestSelectForExcluding_NoAlternateReturnsError(t *testing.T) {
+func TestSelectOutboundExcluding_NoAlternateReturnsError(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	recordSuccess(s, "a", 50)
-	got, err := s.selectForExcluding("tcp", "a")
+	got, _, err := s.selectOutbound("tcp", "a")
 	assert.Error(t, err)
 	assert.Nil(t, got)
 }
@@ -562,54 +554,9 @@ func TestAdd_DoesNotDuplicateAlreadyListedTag(t *testing.T) {
 	assert.Equal(t, []string{"a"}, s.All())
 }
 
-func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
-	tests := []struct {
-		name      string
-		overrides map[string]string
-	}{
-		{"changed", map[string]string{"a": "https://override.example/a?token=2", "b": "https://override.example/b"}},
-		{"partial", map[string]string{"a": "https://override.example/a?token=2"}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s, _ := newTestMUR(t, "a", "b")
-			s.urlOverrides = map[string]string{"a": "https://override.example/a?token=1", "b": "https://override.example/b"}
-			recordSuccess(s, "a", 100)
-			recordSuccess(s, "b", 200)
-			s.hist.userFailureDedupeWindow = 0
-			for range s.hist.consecutiveFailLimit {
-				s.recordUserFailure("a", adapter.UserFailureNoResponse)
-			}
-			s.access.Lock()
-			s.historyForLocked("a").startRecoveryGate(time.Now())
-			s.access.Unlock()
-
-			s.SetURLOverrides(tt.overrides)
-			assert.Equal(t, "https://override.example/b", s.probeURLForLocked("b"), "an omitted or unchanged override is kept")
-
-			h, ok := s.peekHistoryLocked("a")
-			require.True(t, ok, "a changed override keeps the member's history")
-			delay, at, _, uf, gated := h.snapshot(time.Now(), s.hist.userFailureWindow)
-			assert.Equal(t, uint32(100), delay)
-			assert.True(t, at.IsZero(), "the probe outcome is marked stale")
-			assert.Len(t, uf, int(s.hist.consecutiveFailLimit))
-			assert.True(t, gated)
-			persisted := s.history.Load("a")
-			require.NotNil(t, persisted)
-			assert.True(t, persisted.HardDemoted)
-			assert.True(t, persisted.LastOutcomeAt.IsZero())
-
-			s.access.Lock()
-			jobs := s.collectProbeJobsLocked(time.Now(), nil, false)
-			s.access.Unlock()
-			require.Len(t, jobs, 1, "only the changed member is due for a freshness-filtered probe")
-			assert.Equal(t, "a", jobs[0].outbound.Tag())
-		})
-	}
-}
-
 func TestRemove_DeletesURLOverride(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
+	withPauseManager(s).NetworkPause()
 	s.SetURLOverrides(map[string]string{"a": "https://override.example/a", "b": "https://override.example/b"})
 
 	n, err := s.Remove("a")
@@ -618,57 +565,28 @@ func TestRemove_DeletesURLOverride(t *testing.T) {
 	assert.Equal(t, map[string]string{"b": "https://override.example/b"}, s.urlOverrides)
 }
 
-func TestSetURLOverrides_MarksPersistedOnlyEntryStale(t *testing.T) {
-	s, _ := newTestMUR(t, "a")
-	now := time.Now()
-	s.history.Store("a", &adapter.TagHistory{LastSuccessDelayMs: 100, LastOutcomeAt: now, UpdatedAt: now})
-
-	s.SetURLOverrides(map[string]string{"a": "https://override.example/a?token=2"})
-
-	persisted := s.history.Load("a")
-	require.NotNil(t, persisted)
-	assert.True(t, persisted.LastOutcomeAt.IsZero())
-	assert.Equal(t, uint32(100), persisted.LastSuccessDelayMs)
-	assert.Equal(t, now, persisted.UpdatedAt, "the entry keeps its original age")
-
-	s.access.Lock()
-	s.hydrateHistoryLocked("a")
-	jobs := s.collectProbeJobsLocked(time.Now(), nil, false)
-	s.access.Unlock()
-	require.Len(t, jobs, 1, "a hydrated entry is due for a probe of the new URL")
-}
-
 func TestSetURLOverrides_KeepsSelectionOffFailedMember(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
+	withPauseManager(s).NetworkPause()
 	s.urlOverrides = map[string]string{"a": "https://override.example/a?token=1", "b": "https://override.example/b?token=1"}
 	recordSuccess(s, "a", 100)
 	recordSuccess(s, "b", 200)
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.consecutiveFailLimit {
-		s.recordUserFailure("a", adapter.UserFailureNoResponse)
+		s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load())
 	}
-	o, err := s.selectFor("tcp")
+	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.Equal(t, "b", o.Tag())
 
 	s.SetURLOverrides(map[string]string{"a": "https://override.example/a?token=2", "b": "https://override.example/b?token=2"})
 	// The refresh's re-probe passes even though a's user traffic fails.
-	s.recordProbeOutcome("a", true, 10)
-	s.recordProbeOutcome("b", true, 500)
+	seedProbe(s, "a", true, 10)
+	seedProbe(s, "b", true, 500)
 
-	o, err = s.selectFor("tcp")
+	o, _, err = s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	assert.Equal(t, "b", o.Tag(), "a config refresh must not restore a hard-demoted member")
-}
-
-func TestRank_ExcludesEntriesBeforeCycleStart(t *testing.T) {
-	s, _ := newTestMUR(t, "a")
-	recordSuccess(s, "a", 100)
-	cycleStart := time.Now().Add(time.Second)
-	s.access.Lock()
-	ranked := s.rankLocked(time.Now().Add(2*time.Second), cycleStart)
-	s.access.Unlock()
-	assert.Empty(t, ranked, "entries before cycleStart must not appear in the ranked set")
 }
 
 type stallConn struct{ net.Conn }
@@ -786,7 +704,7 @@ func (stallPacketConn) SetWriteDeadline(time.Time) error          { return nil }
 
 func TestFullProbe_DoesNotSignalExhaustionWhenClosed(t *testing.T) {
 	for name, run := range map[string]func(*MutableAutoSelect){
-		"ladder":           func(s *MutableAutoSelect) { s.runLadder("") },
+		"ladder":           func(s *MutableAutoSelect) { s.runLadder("", s.networkGeneration.Load()) },
 		"background cycle": (*MutableAutoSelect).runProbeCycle,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -811,7 +729,7 @@ func TestRecordProbeOutcome_Persists(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _ := newTestMUR(t, "a")
-			s.recordProbeOutcome("a", tt.success, tt.delayMs)
+			seedProbe(s, "a", tt.success, tt.delayMs)
 			got := s.history.Load("a")
 			require.NotNil(t, got)
 			assert.Equal(t, tt.wantDelayMs, got.LastSuccessDelayMs)
@@ -830,34 +748,35 @@ func TestAutoSelectHistoryStorage_StoreAfterCloseDoesNotPanic(t *testing.T) {
 	assert.Nil(t, store.Load("a"))
 }
 
-func TestRecordProbeOutcome_DropsOutcomesForRemovedTag(t *testing.T) {
-	// A probe goroutine that started before Remove must not resurrect
-	// the in-memory history entry or restore a deleted entry in the
-	// persistence store.
-	s, _ := newTestMUR(t, "a")
-	mgr := &mockOutboundManager{outbounds: map[string]sbAdapter.Outbound{
-		"a": &mockOutbound{tag: "a"},
-	}}
-	s.outboundMgr = mgr
+func TestLateProbeAfterRemoveRecordsNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newSchedulerTest(t, "a")
+		seedProbe(s, "a", true, 100)
+		release := make(chan struct{})
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			<-release
+			return probeResponderConn(), nil
+		}
+		requestTestProbes(s, []string{"a"}, probeForced)
+		synctest.Wait()
+		_, err := s.Remove("a")
+		require.NoError(t, err)
+		require.Nil(t, s.history.Load("a"))
 
-	s.recordProbeOutcome("a", true, 100)
-	require.NotNil(t, s.history.Load("a"))
-	_, err := s.Remove("a")
-	require.NoError(t, err)
-	require.Nil(t, s.history.Load("a"))
-
-	s.recordProbeOutcome("a", true, 200)
-	s.access.Lock()
-	_, exists := s.peekHistoryLocked("a")
-	s.access.Unlock()
-	assert.False(t, exists, "recordProbeOutcome must not resurrect history for a non-member tag")
-	assert.Nil(t, s.history.Load("a"))
+		close(release)
+		synctest.Wait()
+		s.access.Lock()
+		_, exists := s.peekHistoryLocked("a")
+		s.access.Unlock()
+		assert.False(t, exists, "a probe that outlives Remove must not bring back history")
+		assert.Nil(t, s.history.Load("a"))
+	})
 }
 
 func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	assert.True(t, s.recordUserFailure("a", adapter.UserFailureDial), "first call must persist")
-	assert.False(t, s.recordUserFailure("a", adapter.UserFailureStall), "immediate burst must return false (deduped)")
+	assert.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load()), "first call must persist")
+	assert.False(t, s.recordUserFailure("a", adapter.UserFailureStall, s.networkGeneration.Load()), "immediate burst must return false (deduped)")
 	s.access.Lock()
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
@@ -865,7 +784,7 @@ func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	assert.Equal(t, uint32(1), h.userFailureCount(time.Now(), s.hist.userFailureWindow),
 		"successive calls within dedupe window must collapse")
 
-	assert.False(t, s.recordUserFailure("nonexistent", adapter.UserFailureDial), "non-member must return false")
+	assert.False(t, s.recordUserFailure("nonexistent", adapter.UserFailureDial, s.networkGeneration.Load()), "non-member must return false")
 	s.access.Lock()
 	_, exists := s.peekHistoryLocked("nonexistent")
 	s.access.Unlock()
@@ -878,7 +797,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// one. (Spec change from earlier "one-shot hard demote.")
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1,
@@ -890,7 +809,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureReset)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -900,7 +819,7 @@ func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 
 func TestRecordUserFailure_AttributesDialKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	require.True(t, s.recordUserFailure("a", adapter.UserFailureDial))
+	require.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load()))
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -920,7 +839,7 @@ func TestRecordUserFailure_SoftDemotedStickyStillLosesOnDelay(t *testing.T) {
 	// failures land deterministically without depending on wall time.
 	addUserFailureN(s, "a", int(s.hist.softFailLimit))
 
-	got, err := s.selectFor("tcp")
+	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Tag(),
@@ -937,7 +856,7 @@ func TestRecordUserFailure_SoftDemotedStickyKeptOverSlowerPeer(t *testing.T) {
 
 	addUserFailureN(s, "a", int(s.hist.softFailLimit))
 
-	got, err := s.selectFor("tcp")
+	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "a", got.Tag(),
@@ -956,7 +875,7 @@ func TestRecordUserFailure_HardDemotedStickyDropsRegardlessOfDelay(t *testing.T)
 
 	addUserFailureN(s, "a", int(s.hist.consecutiveFailLimit))
 
-	got, err := s.selectFor("tcp")
+	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Tag(),
@@ -972,13 +891,13 @@ func TestRecordUserFailure_RetentionBoundedBySoftLimit(t *testing.T) {
 	s.stickyTag.tcp.Store("a")
 
 	addUserFailureN(s, "a", int(s.hist.softFailLimit))
-	got, err := s.selectFor("tcp")
+	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.Equal(t, "a", got.Tag(),
 		"retention must absorb the failure count that trips the soft demote")
 
 	addUserFailureN(s, "a", 1)
-	got, err = s.selectFor("tcp")
+	got, _, err = s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	assert.Equal(t, "b", got.Tag(),
 		"one failure past softFailLimit must release the sticky regardless of speed")
@@ -989,7 +908,7 @@ func TestApplyStickiness_DepartedStickyFallsToBest(t *testing.T) {
 	recordSuccess(s, "b", 100)
 	s.stickyTag.tcp.Store("gone")
 
-	got, err := s.selectFor("tcp")
+	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Tag(),
@@ -1034,7 +953,7 @@ func TestSplitHealthyFor_KeepsSoftWhenCleanIsOtherNetwork(t *testing.T) {
 	assert.Equal(t, "both-soft", udpPool[0].tag)
 }
 
-func TestSelectFor_PerNetworkPool(t *testing.T) {
+func TestSelectOutbound_PerNetworkPool(t *testing.T) {
 	s, _ := newTestMUR(t, "tcp-only", "both-soft")
 	tcpOnly := &mockOutbound{tag: "tcp-only", networks: []string{"tcp"}}
 	bothSoft := &mockOutbound{tag: "both-soft", networks: []string{"tcp", "udp"}}
@@ -1044,18 +963,18 @@ func TestSelectFor_PerNetworkPool(t *testing.T) {
 	recordSuccess(s, "both-soft", 50)
 	addUserFailureN(s, "both-soft", int(s.hist.softFailLimit))
 
-	tcp, err := s.selectFor("tcp")
+	tcp, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.NotNil(t, tcp)
 	assert.Equal(t, "tcp-only", tcp.Tag())
 
-	udp, err := s.selectFor("udp")
+	udp, _, err := s.selectOutbound("udp", "")
 	require.NoError(t, err)
 	require.NotNil(t, udp)
 	assert.Equal(t, "both-soft", udp.Tag())
 }
 
-func TestSelectFor_PreservesStickyAfterUnrelatedRemove(t *testing.T) {
+func TestSelectOutbound_PreservesStickyAfterUnrelatedRemove(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b", "c")
 	recordSuccess(s, "a", 200)
 	recordSuccess(s, "b", 150)
@@ -1064,13 +983,13 @@ func TestSelectFor_PreservesStickyAfterUnrelatedRemove(t *testing.T) {
 	_, err := s.Remove("b")
 	require.NoError(t, err)
 
-	got, err := s.selectFor("tcp")
+	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "c", got.Tag())
 }
 
-func TestSelectFor_RepicksWhenStickyGone(t *testing.T) {
+func TestSelectOutbound_RepicksWhenStickyGone(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b", "c")
 	recordSuccess(s, "a", 100)
 	recordSuccess(s, "b", 50)
@@ -1079,14 +998,14 @@ func TestSelectFor_RepicksWhenStickyGone(t *testing.T) {
 	_, err := s.Remove("b")
 	require.NoError(t, err)
 
-	got, err := s.selectFor("tcp")
+	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Contains(t, []string{"a", "c"}, got.Tag())
 	assert.NotEqual(t, "b", loadString(&s.stickyTag.tcp))
 }
 
-func TestSelectFor_PrefersLowestSeededDelay(t *testing.T) {
+func TestSelectOutbound_PrefersLowestSeededDelay(t *testing.T) {
 	seed := func(delay uint32) *adapter.TagHistory {
 		return &adapter.TagHistory{
 			LastSuccessDelayMs: delay,
@@ -1104,26 +1023,22 @@ func TestSelectFor_PrefersLowestSeededDelay(t *testing.T) {
 	}
 	s.access.Unlock()
 
-	got, err := s.selectFor("tcp")
+	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "c", got.Tag())
 	assert.Same(t, sbAdapter.Outbound(obs["c"]), got)
 }
 
-func TestSelectFor_FallsBackToTagOrderWithoutSeed(t *testing.T) {
+func TestSelectOutbound_FallsBackToTagOrderWithoutSeed(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b", "c")
-	got, err := s.selectFor("tcp")
+	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "a", got.Tag())
 }
 
 func TestHydrate_DropsStaleSnapshot(t *testing.T) {
-	// Persisted snapshots older than maxPersistedAge are dropped on
-	// hydrate — a bandit-driven candidate set typically rotates every
-	// 60 s – 15 min, so an hour-old entry usually describes a member
-	// that no longer exists.
 	s, _ := newTestMUR(t, "a")
 	stale := &adapter.TagHistory{
 		LastSuccessDelayMs: 100,
@@ -1461,9 +1376,8 @@ func TestFullProbe_ExhaustionSignalWhenAllFail(t *testing.T) {
 		run  func(*MutableAutoSelect)
 		want bool
 	}{
-		{"ladder signals", func(s *MutableAutoSelect) { s.runLadder("a") }, true},
+		{"ladder signals", func(s *MutableAutoSelect) { s.runLadder("a", s.networkGeneration.Load()) }, true},
 		{"background cycle signals", (*MutableAutoSelect).runProbeCycle, true},
-		{"network-change or wake probe stays silent", (*MutableAutoSelect).reprobe, false},
 	}
 	// Prior success must not suppress exhaustion when every current probe fails.
 	for _, seedPriorSuccess := range []bool{false, true} {
@@ -1492,7 +1406,7 @@ func TestFullProbe_StaysSilentWhenAMemberSucceeds(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	for name, run := range map[string]func(*MutableAutoSelect){
-		"ladder":           func(s *MutableAutoSelect) { s.runLadder("dead") },
+		"ladder":           func(s *MutableAutoSelect) { s.runLadder("dead", s.networkGeneration.Load()) },
 		"background cycle": (*MutableAutoSelect).runProbeCycle,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1514,35 +1428,6 @@ func TestFullProbe_StaysSilentWhenAMemberSucceeds(t *testing.T) {
 	}
 }
 
-func TestProbeReachableLocked_CountsReachableMembers(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	t.Cleanup(srv.Close)
-
-	s, obs := newTestMUR(t, "dead", "live1", "live2")
-	s.defaultURL = "http://probe.test/"
-	for _, tag := range []string{"dead", "live1", "live2"} {
-		recordSuccess(s, tag, 100)
-	}
-	obs["dead"].dial = denyDial
-	liveDial := func(ctx context.Context) (net.Conn, error) {
-		var d net.Dialer
-		return d.DialContext(ctx, "tcp", srv.Listener.Addr().String())
-	}
-	obs["live1"].dial = liveDial
-	obs["live2"].dial = liveDial
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	s.probeMu.Lock()
-	reachable, total, current := s.probeReachableLocked(ctx, "test")
-	s.probeMu.Unlock()
-
-	assert.True(t, current)
-	assert.Equal(t, 2, reachable)
-	assert.Equal(t, 3, total)
-	assert.False(t, exhausted(s))
-}
-
 func TestExhaustionSignal_CoalescesPendingSignal(t *testing.T) {
 	s, obs := newTestMUR(t, "a")
 	s.defaultURL = "http://probe.test/"
@@ -1551,7 +1436,7 @@ func TestExhaustionSignal_CoalescesPendingSignal(t *testing.T) {
 	s.exhaustionCh <- struct{}{}
 	require.Equal(t, 1, len(s.exhaustionCh))
 
-	s.runLadder("a")
+	s.runLadder("a", s.networkGeneration.Load())
 
 	select {
 	case <-s.ExhaustionSignal():
@@ -1590,141 +1475,8 @@ func TestRunLadder_NoStep1Retry(t *testing.T) {
 	s.defaultURL = "http://probe.test/"
 	obs["a"].On("DialContext").Return(nil, errors.New("dial denied"))
 
-	s.runLadder("a")
+	s.runLadder("a", s.networkGeneration.Load())
 	obs["a"].AssertNumberOfCalls(t, "DialContext", 1)
-}
-
-func TestInterfaceUpdated_TriggersReprobe(t *testing.T) {
-	s, obs := newTestMUR(t, "a")
-	s.defaultURL = "http://probe.test/"
-	s.probing = true
-	dialed := make(chan struct{}, 1)
-	obs["a"].On("DialContext").Run(func(mock.Arguments) {
-		select {
-		case dialed <- struct{}{}:
-		default:
-		}
-	}).Return(nil, errors.New("dial denied"))
-
-	s.InterfaceUpdated()
-
-	select {
-	case <-dialed:
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "InterfaceUpdated did not trigger a probe of member a")
-	}
-	s.probeMu.Lock()
-	s.probeMu.Unlock()
-	obs["a"].AssertNumberOfCalls(t, "DialContext", 1)
-}
-
-func TestCollectProbeJobs_FreshnessFilter(t *testing.T) {
-	s, _ := newTestMUR(t, "fresh", "stale")
-	now := time.Now()
-	s.historyForLocked("fresh").recordProbeSuccess(100, now)
-	s.historyForLocked("stale").recordProbeSuccess(100, now.Add(-2*probeFreshnessWindow))
-
-	s.access.Lock()
-	defer s.access.Unlock()
-
-	forced := s.collectProbeJobsLocked(now, nil, true)
-	assert.ElementsMatch(t, []string{"fresh", "stale"}, jobTags(forced),
-		"force=true probes every member regardless of freshness")
-
-	filtered := s.collectProbeJobsLocked(now, nil, false)
-	assert.Equal(t, []string{"stale"}, jobTags(filtered),
-		"force=false skips members probed within the freshness window")
-}
-
-func TestRunExternalProbe_SkipsFreshMembers(t *testing.T) {
-	s, obs := newTestMUR(t, "fresh", "stale")
-	s.defaultURL = "http://probe.test/"
-	obs["fresh"].On("DialContext").Return(nil, errors.New("dial denied"))
-	obs["stale"].On("DialContext").Return(nil, errors.New("dial denied"))
-	s.historyForLocked("fresh").recordProbeSuccess(100, time.Now())
-	s.historyForLocked("stale").recordProbeSuccess(100, time.Now().Add(-2*probeFreshnessWindow))
-
-	s.runExternalProbe(nil)
-
-	obs["fresh"].AssertNumberOfCalls(t, "DialContext", 0)
-	obs["stale"].AssertNumberOfCalls(t, "DialContext", 1)
-}
-
-func TestAdd_ProbesNewMembers(t *testing.T) {
-	s, _ := newTestMUR(t)
-	s.defaultURL = "http://probe.test/"
-	newOb := &mockOutbound{tag: "new"}
-	dialed := make(chan struct{}, 1)
-	newOb.On("DialContext").Run(func(mock.Arguments) {
-		select {
-		case dialed <- struct{}{}:
-		default:
-		}
-	}).Return(nil, errors.New("dial denied"))
-	s.outboundMgr = &mockOutboundManager{outbounds: map[string]sbAdapter.Outbound{"new": newOb}}
-
-	n, err := s.Add("new")
-	require.NoError(t, err)
-	require.Equal(t, 1, n)
-
-	select {
-	case <-dialed:
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "Add did not trigger a probe of the new member")
-	}
-	s.externalProbeMu.Lock()
-	s.externalProbeMu.Unlock()
-	newOb.AssertNumberOfCalls(t, "DialContext", 1)
-}
-
-func TestRunExternalProbe_DropsWhenInternalRunning(t *testing.T) {
-	s, obs := newTestMUR(t, "a")
-	s.defaultURL = "http://probe.test/"
-	obs["a"].On("DialContext").Return(nil, errors.New("dial denied"))
-
-	// External probes drop while an internal cycle holds probeMu.
-	s.probeMu.Lock()
-	defer s.probeMu.Unlock()
-
-	s.runExternalProbe(nil)
-	obs["a"].AssertNumberOfCalls(t, "DialContext", 0)
-}
-
-func TestRunExternalProbe_DropsWhenAnotherExternalRunning(t *testing.T) {
-	s, obs := newTestMUR(t, "a")
-	s.defaultURL = "http://probe.test/"
-	obs["a"].On("DialContext").Return(nil, errors.New("dial denied"))
-
-	s.externalProbeMu.Lock()
-	defer s.externalProbeMu.Unlock()
-
-	s.runExternalProbe(nil)
-	obs["a"].AssertNumberOfCalls(t, "DialContext", 0)
-}
-
-func TestProbeAll_CanceledBatchDoesNotRecordOutcome(t *testing.T) {
-	// A probe whose batch ctx is canceled mid-flight (group shutdown or
-	// ladder budget) must not record a failure that would spuriously demote
-	// a member that simply didn't finish in time.
-	s, obs := newTestMUR(t, "a")
-	s.defaultURL = "http://probe.test/"
-
-	ctx, cancel := context.WithCancel(context.Background())
-	obs["a"].On("DialContext").Run(func(mock.Arguments) {
-		cancel()
-	}).Return(nil, errors.New("dial denied"))
-
-	seed := time.Now().Add(-time.Hour)
-	s.historyForLocked("a").recordProbeSuccess(50, seed)
-
-	s.access.Lock()
-	jobs := s.collectProbeJobsLocked(time.Now(), nil, true)
-	s.access.Unlock()
-	s.probeAll(ctx, jobs, nil)
-
-	obs["a"].AssertNumberOfCalls(t, "DialContext", 1)
-	assert.Equal(t, seed, s.historyForLocked("a").outcomeAt(),
-		"canceled batch must not overwrite the seeded outcome")
 }
 
 // stuckDial returns a dial that ignores its ctx and blocks until the returned
@@ -1739,14 +1491,6 @@ func stuckDial(t *testing.T) (func(context.Context) (net.Conn, error), func()) {
 	}, release
 }
 
-// probeJobsFor collects forced probe jobs for tags, or all members when none
-// are given.
-func probeJobsFor(s *MutableAutoSelect, tags ...string) []probeJob {
-	s.access.Lock()
-	defer s.access.Unlock()
-	return s.collectProbeJobsLocked(time.Now(), tags, true)
-}
-
 func requireReturnsWithin(t *testing.T, d time.Duration, fn func(), msg string) {
 	t.Helper()
 	done := make(chan struct{})
@@ -1758,144 +1502,6 @@ func requireReturnsWithin(t *testing.T, d time.Duration, fn func(), msg string) 
 	case <-done:
 	case <-time.After(d):
 		t.Fatal(msg)
-	}
-}
-
-func TestProbeAll_StopsWaitingWhenCtxEndsDuringStuckDial(t *testing.T) {
-	s, obs := newTestMUR(t, "a")
-	s.defaultURL = "http://probe.test/"
-	dial, release := stuckDial(t)
-	obs["a"].dial = dial
-	seed := time.Now().Add(-time.Hour)
-	s.historyForLocked("a").recordProbeSuccess(50, seed)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	jobs := probeJobsFor(s)
-	requireReturnsWithin(t, 5*time.Second, func() { s.probeAll(ctx, jobs, nil) },
-		"probeAll must not wait past ctx for a dial that ignores it")
-
-	assert.Equal(t, seed, s.historyForLocked("a").outcomeAt(),
-		"a probe abandoned at batch cancellation is not member evidence")
-	assert.Empty(t, probeJobsFor(s), "a member with an abandoned probe still running must not be probed again")
-
-	release()
-	require.Eventually(t, func() bool { return len(probeJobsFor(s)) == 1 },
-		2*time.Second, 10*time.Millisecond, "the member must be probed again once its stuck dial returns")
-}
-
-func TestProbeAll_WatchdogFailsStuckDial(t *testing.T) {
-	orig := probeBound
-	probeBound = func(protocolBehavior) time.Duration { return 50 * time.Millisecond }
-	t.Cleanup(func() { probeBound = orig })
-
-	s, obs := newTestMUR(t, "a")
-	s.defaultURL = "http://probe.test/"
-	dial, release := stuckDial(t)
-	obs["a"].dial = dial
-
-	jobs := probeJobsFor(s)
-	requireReturnsWithin(t, 5*time.Second, func() { s.probeAll(context.Background(), jobs, nil) },
-		"probeAll must not wait past probeBound for a dial that ignores its ctx")
-
-	h, ok := s.peekHistoryLocked("a")
-	require.True(t, ok, "an overrunning probe must be recorded")
-	_, _, consec, _, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
-	assert.Equal(t, uint32(1), consec, "an overrunning probe must count as failed")
-	assert.Empty(t, probeJobsFor(s), "a member with an abandoned probe still running must not be probed again")
-
-	release()
-	require.Eventually(t, func() bool { return len(probeJobsFor(s)) == 1 },
-		2*time.Second, 10*time.Millisecond, "the member must be probed again once its stuck dial returns")
-}
-
-func TestProbeAll_AbandonedProbeDoesNotSkipReplacementUnderSameTag(t *testing.T) {
-	s, obs := newTestMUR(t, "a")
-	s.defaultURL = "http://probe.test/"
-	dial, _ := stuckDial(t)
-	obs["a"].dial = dial
-
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	jobs := probeJobsFor(s)
-	requireReturnsWithin(t, 5*time.Second, func() { s.probeAll(ctx, jobs, nil) },
-		"probeAll must not wait past ctx for a dial that ignores it")
-	require.Empty(t, probeJobsFor(s))
-
-	_, err := s.Remove("a")
-	require.NoError(t, err)
-	replacement := &mockOutbound{tag: "a"}
-	s.access.Lock()
-	s.members.Store("a", sbAdapter.Outbound(replacement))
-	s.tags = append(s.tags, "a")
-	s.access.Unlock()
-
-	jobs = probeJobsFor(s)
-	require.Len(t, jobs, 1, "a replacement under the same tag must be probed despite the old member's stuck dial")
-	assert.Same(t, replacement, jobs[0].outbound)
-}
-
-func TestRunLadder_ReleasesProbeMuWithinBudgetDespiteStuckDial(t *testing.T) {
-	s, obs := newTestMUR(t, "a")
-	s.defaultURL = "http://probe.test/"
-	dial, _ := stuckDial(t)
-	obs["a"].dial = dial
-
-	requireReturnsWithin(t, 5*time.Second, func() { s.runLadder("a") },
-		"runLadder must not hold probeMu past its budget for a dial that ignores ctx")
-	require.True(t, s.probeMu.TryLock(), "runLadder must release probeMu")
-	s.probeMu.Unlock()
-}
-
-type fakePauseManager struct {
-	pause.Manager
-	registered atomic.Uint32
-}
-
-func (f *fakePauseManager) IsPaused() bool { return false }
-
-func (f *fakePauseManager) RegisterCallback(pause.Callback) *list.Element[pause.Callback] {
-	f.registered.Add(1)
-	return &list.Element[pause.Callback]{}
-}
-
-func (f *fakePauseManager) UnregisterCallback(*list.Element[pause.Callback]) {}
-
-func TestRunBackgroundLoop_RegistersWithPauseManager(t *testing.T) {
-	pm := &fakePauseManager{}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ctx = service.ContextWith[pause.Manager](ctx, pm)
-	s, _ := newTestMUR(t, "a")
-	s.ctx = ctx
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		s.runBackgroundLoop(false)
-	}()
-	require.Eventually(t, func() bool { return pm.registered.Load() == 1 },
-		2*time.Second, 10*time.Millisecond)
-	cancel()
-	<-done
-}
-
-func TestRunBackgroundLoop_NoPauseManagerIsNoOp(t *testing.T) {
-	s, _ := newTestMUR(t, "a")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	s.ctx = ctx
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		s.runBackgroundLoop(false)
-	}()
-	time.Sleep(10 * time.Millisecond)
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "runBackgroundLoop did not exit after ctx cancel")
 	}
 }
 
@@ -1942,6 +1548,7 @@ func exhausted(s *MutableAutoSelect) bool {
 
 func withPauseManager(s *MutableAutoSelect) pause.Manager {
 	s.ctx = pause.WithDefaultManager(s.ctx)
+	s.registerProbePauseCallback()
 	return service.FromContext[pause.Manager](s.ctx)
 }
 
@@ -1980,14 +1587,14 @@ func TestKeepAlive_UseKeepsProbing(t *testing.T) {
 	})
 }
 
-func TestKeepAlive_RestartProbesOnlyAfterInterval(t *testing.T) {
+func TestKeepAlive_RestartRequestsFreshEvidence(t *testing.T) {
 	tests := []struct {
 		name     string
 		lastUsed time.Duration
 		want     int32
 	}{
 		{"idle longer than the interval", 2 * time.Minute, 1},
-		{"used within the interval", 30 * time.Second, 0},
+		{"used within the interval", 30 * time.Second, 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2017,38 +1624,14 @@ func TestKeepAlive_RestartSkipsProbeWhilePaused(t *testing.T) {
 
 		pm.NetworkWake()
 		synctest.Wait()
-		assert.Zero(t, dials.Load(), "a wake alone leaves the probe to the network reset after it")
+		assert.EqualValues(t, 1, dials.Load(), "wake dispatches pending work")
 
 		s.InterfaceUpdated()
 		synctest.Wait()
-		assert.EqualValues(t, 1, dials.Load(), "the network reset after the wake probes")
+		assert.EqualValues(t, 2, dials.Load(), "the network reset forces a new probe")
 	})
 }
 
-func TestReprobeTriggers_WaitForProbeInFlight(t *testing.T) {
-	tests := []struct {
-		name    string
-		trigger func(*MutableAutoSelect)
-	}{
-		{"restart", keepAlive},
-		{"network change", func(s *MutableAutoSelect) {
-			s.probing = true
-			s.InterfaceUpdated()
-		}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s, dials := newIdleTestMUR(t)
-			s.probeMu.Lock()
-			tt.trigger(s)
-			time.Sleep(50 * time.Millisecond)
-			assert.Zero(t, dials.Load())
-			s.probeMu.Unlock()
-			require.Eventually(t, func() bool { return dials.Load() == 1 }, 2*time.Second, 5*time.Millisecond,
-				"the probe must run once the in-flight batch finishes, not drop")
-		})
-	}
-}
 func TestInterfaceUpdated_IdleDefersProbeToNextUse(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, dials := newIdleTestMUR(t)
@@ -2133,22 +1716,6 @@ func TestKeepAlive_DataActivityKeepsProbing(t *testing.T) {
 	})
 }
 
-func TestReprobe_SkipsIfPausedWhileWaiting(t *testing.T) {
-	s, dials := newIdleTestMUR(t)
-	pm := withPauseManager(s)
-	s.probing = true
-	s.probeMu.Lock()
-	s.InterfaceUpdated()
-	require.Eventually(t, s.reprobePending.Load, 2*time.Second, 5*time.Millisecond)
-	pm.NetworkPause()
-	s.probeMu.Unlock()
-
-	require.Eventually(t, func() bool { return !s.reprobePending.Load() }, 2*time.Second, 5*time.Millisecond)
-	s.probeMu.Lock()
-	s.probeMu.Unlock()
-	assert.Zero(t, dials.Load(), "a pause during the wait must stop the queued probe")
-}
-
 func TestInterfaceUpdated_SkipsWhilePaused(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, dials := newIdleTestMUR(t)
@@ -2164,9 +1731,11 @@ func TestInterfaceUpdated_SkipsWhilePaused(t *testing.T) {
 		assert.EqualValues(t, 1, dials.Load(), "a network reset while paused must not probe")
 
 		pm.DeviceWake()
+		synctest.Wait()
+		require.EqualValues(t, 2, dials.Load())
 		s.InterfaceUpdated()
 		synctest.Wait()
-		assert.EqualValues(t, 2, dials.Load())
+		assert.EqualValues(t, 3, dials.Load())
 	})
 }
 
@@ -2205,7 +1774,7 @@ func TestRunLadder_KeepsCooldown(t *testing.T) {
 	s.cfg.ladderCooldown = 5 * time.Minute
 	last := time.Now().Add(-2 * time.Minute).UnixNano()
 	s.lastLadderAt.Store(last)
-	s.runLadder("a")
+	s.runLadder("a", s.networkGeneration.Load())
 	assert.Equal(t, last, s.lastLadderAt.Load())
 }
 
@@ -2254,24 +1823,6 @@ func TestKeepAlive_NoProbeWhileNetworkStillPaused(t *testing.T) {
 	})
 }
 
-func TestReprobe_CollapsesWaitingCalls(t *testing.T) {
-	s, dials := newIdleTestMUR(t)
-	s.probeMu.Lock()
-	go s.reprobe()
-	require.Eventually(t, s.reprobePending.Load, 2*time.Second, 5*time.Millisecond)
-	// Both return at once: the waiting reprobe starts after this batch too.
-	s.reprobe()
-	s.reprobe()
-	s.probeMu.Unlock()
-	require.Eventually(t, func() bool { return dials.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
-	time.Sleep(50 * time.Millisecond)
-	assert.EqualValues(t, 1, dials.Load(), "calls waiting behind the same batch collapse into one probe")
-
-	// Once that probe holds the lock, a new call queues one more.
-	s.reprobe()
-	assert.EqualValues(t, 2, dials.Load())
-}
-
 func TestNetworkChangeMidProbe_DiscardsExhaustion(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2279,7 +1830,7 @@ func TestNetworkChangeMidProbe_DiscardsExhaustion(t *testing.T) {
 	}{
 		{"background cycle", (*MutableAutoSelect).runProbeCycle},
 		// The second ladder also shows the discarded one started no cooldown.
-		{"ladder", func(s *MutableAutoSelect) { s.runLadder("a") }},
+		{"ladder", func(s *MutableAutoSelect) { s.runLadder("a", s.networkGeneration.Load()) }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2334,7 +1885,7 @@ func TestMakeHooks_IgnoresFailureFromUnselectedTag(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("b")
 
-	s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
 
 	s.access.Lock()
 	_, ok := s.peekHistoryLocked("a")
@@ -2350,7 +1901,7 @@ func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("a")
 
-	s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the udp selection must still be chargeable")
@@ -2362,7 +1913,7 @@ func TestMakeHooks_UnselectedGateDisabledByConfig(t *testing.T) {
 	s.cfg.demoteOnlySelected = false
 	s.stickyTag.tcp.Store("b")
 
-	s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the gate must be defeatable for rollback")
@@ -2371,11 +1922,11 @@ func TestMakeHooks_UnselectedGateDisabledByConfig(t *testing.T) {
 
 func TestMakeHooks_ChargesFallbackRouteEvenWhenUnselected(t *testing.T) {
 	// Fast-failover conns are fresh traffic and remain chargeable even though
-	// selectForExcluding does not make them sticky.
+	// selecting an alternate does not make it sticky.
 	s, _ := newTestMUR(t, "a", "b")
 	s.stickyTag.tcp.Store("a")
 
-	s.makeHooks("b", "tcp", fallbackRoute).onFailure(adapter.UserFailureReset)
+	s.makeHooks("b", "tcp", fallbackRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset)
 
 	uf, ok := userFailures(s, "b")
 	require.True(t, ok, "a fallback-route conn must stay chargeable")
@@ -2419,7 +1970,7 @@ func TestApplyStickiness_UnmeasuredStickyLosesToMeasuredPeer(t *testing.T) {
 	s.stickyTag.tcp.Store("a")
 	addUserFailureN(s, "a", int(s.hist.softFailLimit))
 
-	got, err := s.selectFor("tcp")
+	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Tag(),
@@ -2479,10 +2030,242 @@ func TestMakeHooks_FailureDoesNotRunLadder(t *testing.T) {
 		obs["a"].dial = denyDial
 		obs["b"].dial = denyDial
 		s.stickyTag.tcp.Store("a")
-		s.makeHooks("a", "tcp", primaryRoute).onFailure(adapter.UserFailureReset)
+		s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset)
 		synctest.Wait()
 		assert.Zero(t, s.lastLadderAt.Load(), "a data-plane failure must not re-probe every member")
 	})
+}
+
+// seedProbe records an outcome for tag as a probe of its current URL on the
+// current network would.
+func seedProbe(s *MutableAutoSelect, tag string, success bool, delayMs uint32) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	out, ok := s.members.Load(tag)
+	if !ok {
+		return
+	}
+	s.recordProbeOutcomeLocked(tag, &probeOutcome{
+		success:    success,
+		delayMs:    delayMs,
+		generation: s.networkGeneration.Load(),
+		url:        s.probeURLForLocked(tag),
+		lastResort: behaviorFor(out.Type()).lastResort,
+	})
+}
+
+func switchAfterConfirmedFailure(s *MutableAutoSelect, failedTag, replacementTag string) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.trySwitchAfterConfirmedFailureLocked(failedTag, replacementTag)
+}
+
+func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
+	tests := []struct {
+		name      string
+		overrides map[string]string
+	}{
+		{"changed", map[string]string{"a": "https://override.example/a?token=2", "b": "https://override.example/b"}},
+		{"partial", map[string]string{"a": "https://override.example/a?token=2"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _ := newTestMUR(t, "a", "b")
+			withPauseManager(s).NetworkPause()
+			s.urlOverrides = map[string]string{"a": "https://override.example/a?token=1", "b": "https://override.example/b"}
+			recordSuccess(s, "a", 100)
+			recordSuccess(s, "b", 200)
+			s.hist.userFailureDedupeWindow = 0
+			for range s.hist.consecutiveFailLimit {
+				s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load())
+			}
+			s.access.Lock()
+			s.historyForLocked("a").startRecoveryGate(time.Now())
+			s.access.Unlock()
+
+			seedProbe(s, "a", true, 100)
+			seedProbe(s, "b", true, 200)
+			s.SetURLOverrides(tt.overrides)
+			assert.Equal(t, "https://override.example/b", s.probeURLForLocked("b"), "an omitted or unchanged override is kept")
+
+			h, ok := s.peekHistoryLocked("a")
+			require.True(t, ok, "a changed override keeps the member's history")
+			delay, _, uf, gated := h.snapshot(time.Now(), s.hist.userFailureWindow)
+			assert.Equal(t, uint32(100), delay)
+			assert.Len(t, uf, int(s.hist.consecutiveFailLimit))
+			assert.True(t, gated)
+			persisted := s.history.Load("a")
+			require.NotNil(t, persisted)
+			assert.True(t, persisted.HardDemoted)
+			assert.False(t, s.hasFreshProbeOutcomeLocked("a", time.Now()), "the probe outcome is stale")
+			assert.True(t, s.hasFreshProbeOutcomeLocked("b", time.Now()), "an unchanged URL keeps its outcome")
+
+			require.Equal(t, probeForced, s.probeMembers["a"].need)
+
+		})
+	}
+}
+
+func TestSetURLOverrides_KeepsPersistedOnlyEntry(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	withPauseManager(s).NetworkPause()
+	now := time.Now()
+	s.history.Store("a", &adapter.TagHistory{LastSuccessDelayMs: 100, LastOutcomeAt: now, UpdatedAt: now})
+
+	s.SetURLOverrides(map[string]string{"a": "https://override.example/a?token=2"})
+
+	persisted := s.history.Load("a")
+	require.NotNil(t, persisted)
+	assert.Equal(t, uint32(100), persisted.LastSuccessDelayMs)
+	assert.Equal(t, now, persisted.UpdatedAt, "the entry keeps its original age")
+
+	require.Equal(t, probeForced, s.probeMembers["a"].need)
+}
+
+func TestStartFailureUnregistersPauseCallback(t *testing.T) {
+	ctx := pause.WithDefaultManager(t.Context())
+	ctx = service.ContextWith[sbAdapter.OutboundManager](ctx, &mockOutboundManager{})
+	out, err := NewMutableAutoSelect(ctx, nil, log.NewNOPFactory().Logger(), "auto",
+		option.MutableAutoSelectOutboundOptions{Outbounds: []string{"missing"}})
+	require.NoError(t, err)
+	s := out.(*MutableAutoSelect)
+	require.NotNil(t, s.pauseCallback)
+	require.Error(t, s.Start())
+	require.Nil(t, s.pauseCallback)
+}
+
+func TestBeatsOnDelay_DefaultTolerance(t *testing.T) {
+	cfg, _ := resolveMutableAutoSelectOptions(option.MutableAutoSelectOutboundOptions{})
+	s := &MutableAutoSelect{cfg: cfg}
+	assert.True(t, s.beatsOnDelay(60, 350))
+	assert.False(t, s.beatsOnDelay(50, 130), "an 80ms gain is under the absolute tolerance")
+	assert.False(t, s.beatsOnDelay(300, 400), "a 25% gain is under the percentage")
+}
+
+func TestDialContext_FailoverAfterNetworkChangeUsesCurrentGeneration(t *testing.T) {
+	t.Run("fallback conn failure counts", func(t *testing.T) {
+		s, obs := newTestMUR(t, "a", "b")
+		recordSuccess(s, "a", 10)
+		recordSuccess(s, "b", 20)
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			s.InterfaceUpdated()
+			return nil, errors.New("dial refused")
+		}
+		obs["b"].dial = func(context.Context) (net.Conn, error) {
+			return &failingConn{err: connResetErr(), failWrite: true}, nil
+		}
+
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		_, err = conn.Write([]byte("x"))
+		require.Error(t, err)
+
+		require.Eventually(t, func() bool {
+			uf, _ := userFailures(s, "b")
+			return len(uf) == 1
+		}, time.Second, 5*time.Millisecond, "the fallback conn belongs to the network it was dialed on")
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf, "the primary's failure belongs to the previous network")
+	})
+	t.Run("fallback dial failure counts and runs the ladder", func(t *testing.T) {
+		s, obs := newTestMUR(t, "a", "b")
+		recordSuccess(s, "a", 10)
+		recordSuccess(s, "b", 20)
+		var changed atomic.Bool
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			if !changed.Swap(true) {
+				s.InterfaceUpdated()
+			}
+			return nil, errors.New("dial refused")
+		}
+		obs["b"].dial = func(context.Context) (net.Conn, error) {
+			return nil, errors.New("dial refused")
+		}
+
+		_, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.Error(t, err)
+
+		uf, _ := userFailures(s, "b")
+		assert.Len(t, uf, 1)
+		require.Eventually(t, func() bool { return s.lastLadderAt.Load() != 0 },
+			time.Second, 5*time.Millisecond, "the ladder runs on the current network")
+	})
+}
+
+func TestListenPacket_FailoverAfterNetworkChangeUsesCurrentGeneration(t *testing.T) {
+	s, obs := newTestMUR(t, "a", "b")
+	recordSuccess(s, "a", 10)
+	recordSuccess(s, "b", 20)
+	obs["a"].On("ListenPacket").Run(func(mock.Arguments) {
+		s.InterfaceUpdated()
+	}).Return(nil, errors.New("listen refused")).Once()
+	obs["a"].On("ListenPacket").Return(nil, errors.New("listen refused"))
+	obs["b"].On("ListenPacket").Return(nil, errors.New("listen refused"))
+
+	_, err := s.ListenPacket(context.Background(), metadata.Socksaddr{})
+	require.Error(t, err)
+
+	uf, _ := userFailures(s, "b")
+	assert.Len(t, uf, 1)
+	require.Eventually(t, func() bool { return s.lastLadderAt.Load() != 0 },
+		time.Second, 5*time.Millisecond, "the ladder runs on the current network")
+}
+
+func TestStaleFailureWithoutAlternateRunsNoLadder(t *testing.T) {
+	for _, network := range []string{"tcp", "udp"} {
+		t.Run(network, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, obs := newTestMUR(t, "a")
+				recordSuccess(s, "a", 10)
+				networkChanged := func() { s.InterfaceUpdated() }
+				if network == "tcp" {
+					obs["a"].dial = func(context.Context) (net.Conn, error) {
+						networkChanged()
+						return nil, errors.New("dial refused")
+					}
+					_, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+					require.Error(t, err)
+				} else {
+					obs["a"].On("ListenPacket").Run(func(mock.Arguments) { networkChanged() }).
+						Return(nil, errors.New("listen refused"))
+					_, err := s.ListenPacket(context.Background(), metadata.Socksaddr{})
+					require.Error(t, err)
+				}
+				synctest.Wait()
+				assert.Zero(t, s.lastLadderAt.Load(), "a failure from the previous network starts no ladder")
+				assert.False(t, exhausted(s))
+			})
+		})
+	}
+}
+
+func TestCloseConcurrentWithPauseEvents(t *testing.T) {
+	for range 50 {
+		// Built without newTestMUR so that no cleanup Close can block behind a
+		// deadlocked one and hide the failure.
+		ctx := pause.WithDefaultManager(t.Context())
+		pm := service.FromContext[pause.Manager](ctx)
+		out, err := NewMutableAutoSelect(ctx, nil, log.NewNOPFactory().Logger(), "auto",
+			option.MutableAutoSelectOutboundOptions{})
+		require.NoError(t, err)
+		s := out.(*MutableAutoSelect)
+		var wg sync.WaitGroup
+		wg.Go(func() { s.Close() })
+		wg.Go(func() {
+			pm.DevicePause()
+			pm.NetworkPause()
+			pm.DeviceWake()
+			pm.NetworkWake()
+		})
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close and pause-callback delivery deadlocked")
+		}
+		require.Nil(t, s.pauseCallback)
+	}
 }
 
 func TestProbeTimeoutOverrides(t *testing.T) {

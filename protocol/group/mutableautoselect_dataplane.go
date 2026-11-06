@@ -32,18 +32,18 @@ type dataPlaneHooks struct {
 
 // makeHooks records chargeable failures and starts recovery. Only primary TCP
 // resets and unanswered writes trigger selection confirmation.
-func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind) dataPlaneHooks {
+func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind, generation uint64) dataPlaneHooks {
 	confirms := network == N.NetworkTCP && route == primaryRoute
 	return dataPlaneHooks{
 		onFailure: func(kind adapter.UserFailureKind) {
 			if !s.chargeable(outerTag, route) {
 				return
 			}
-			if !s.recordUserFailure(outerTag, kind) {
+			if !s.recordUserFailure(outerTag, kind, generation) {
 				return
 			}
 			if confirms && (kind == adapter.UserFailureReset || kind == adapter.UserFailureNoResponse) {
-				go s.confirmSelectedFailure(outerTag, "")
+				s.requestFailureConfirmation(outerTag, "", generation)
 			}
 		},
 		onError: func(err error, state dataPlaneIO, excused bool) {

@@ -133,9 +133,9 @@ func TestTrySwitchAfterConfirmedFailure(t *testing.T) {
 	}{
 		{"validated fallback", func(*MutableAutoSelect) {}, "b"},
 		{"current selection changed", func(s *MutableAutoSelect) { s.stickyTag.tcp.Store("c") }, ""},
-		{"newer probe passed", func(s *MutableAutoSelect) { s.recordProbeOutcome("a", true, 10) }, ""},
+		{"newer probe passed", func(s *MutableAutoSelect) { seedProbe(s, "a", true, 10) }, ""},
 		{"fallback failed its last probe", func(s *MutableAutoSelect) {
-			s.recordProbeOutcome("b", false, 0)
+			seedProbe(s, "b", false, 0)
 		}, "c"},
 		{"fallback never probed", func(s *MutableAutoSelect) {
 			s.access.Lock()
@@ -143,8 +143,8 @@ func TestTrySwitchAfterConfirmedFailure(t *testing.T) {
 			s.access.Unlock()
 		}, "c"},
 		{"no validated member", func(s *MutableAutoSelect) {
-			s.recordProbeOutcome("b", false, 0)
-			s.recordProbeOutcome("c", false, 0)
+			seedProbe(s, "b", false, 0)
+			seedProbe(s, "c", false, 0)
 		}, ""},
 		{"rate limited", func(s *MutableAutoSelect) {
 			s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = time.Now(), "c"
@@ -160,10 +160,10 @@ func TestTrySwitchAfterConfirmedFailure(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				s, _ := newConfirmationTestMUR(t, "a", "b", "c")
-				s.recordProbeOutcome("a", false, 0)
+				seedProbe(s, "a", false, 0)
 				tt.setup(s)
 				before := loadString(&s.stickyTag.tcp)
-				s.trySwitchAfterConfirmedFailure("a", "b")
+				switchAfterConfirmedFailure(s, "a", "b")
 
 				h, _ := s.peekHistoryLocked("a")
 				if tt.want != "" {
@@ -186,7 +186,7 @@ func TestRecoveryGate_SelectionAndClearing(t *testing.T) {
 		s.historyForLocked("a").startRecoveryGate(time.Now())
 		s.access.Unlock()
 
-		o, err := s.selectFor("tcp")
+		o, _, err := s.selectOutbound("tcp", "")
 		require.NoError(t, err)
 		assert.Equal(t, "b", o.Tag(), "a recovery gate overrides stickiness and lower delay")
 
@@ -195,26 +195,26 @@ func TestRecoveryGate_SelectionAndClearing(t *testing.T) {
 		s.access.Unlock()
 		s.members.Delete("b")
 		s.stickyTag.tcp.Store("")
-		o, err = s.selectFor("tcp")
+		o, _, err = s.selectOutbound("tcp", "")
 		require.NoError(t, err)
 		assert.Equal(t, "a", o.Tag(), "a gated member still serves when nothing else is available")
 
 		s.members.Store("b", obs["b"])
 		recordSuccess(s, "b", 200)
-		o, err = s.selectFor("tcp")
+		o, _, err = s.selectOutbound("tcp", "")
 		require.NoError(t, err)
 		assert.Equal(t, "b", o.Tag(), "the gated sticky yields when an ungated member returns")
 
 		h, _ := s.peekHistoryLocked("a")
 		time.Sleep(recoveryGateMinDuration - time.Second)
-		s.recordProbeOutcome("a", true, 10)
+		seedProbe(s, "a", true, 10)
 		assert.True(t, h.hasRecoveryGate(), "a probe success before the minimum duration does not clear the gate")
 		time.Sleep(time.Second)
-		s.recordProbeOutcome("a", false, 0)
+		seedProbe(s, "a", false, 0)
 		assert.True(t, h.hasRecoveryGate(), "elapsed time and failed probes do not clear the gate")
-		s.recordProbeOutcome("a", true, 10)
+		seedProbe(s, "a", true, 10)
 		assert.False(t, h.hasRecoveryGate(), "a probe success after the minimum duration clears the gate")
-		o, err = s.selectFor("tcp")
+		o, _, err = s.selectOutbound("tcp", "")
 		require.NoError(t, err)
 		assert.Equal(t, "a", o.Tag(), "a recovered member can win on delay again")
 	})
@@ -223,16 +223,16 @@ func TestRecoveryGate_SelectionAndClearing(t *testing.T) {
 func TestRecoveryGate_FallbackDemotionDoesNotRestoreFailedMember(t *testing.T) {
 	s, _ := newConfirmationTestMUR(t, "a", "b")
 	recordSuccess(s, "b", 200)
-	s.recordUserFailure("a", adapter.UserFailureDial)
-	s.recordProbeOutcome("a", false, 0)
-	s.trySwitchAfterConfirmedFailure("a", "b")
+	s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load())
+	seedProbe(s, "a", false, 0)
+	switchAfterConfirmedFailure(s, "a", "b")
 	require.Equal(t, "b", loadString(&s.stickyTag.tcp))
 
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.softFailLimit {
-		s.recordUserFailure("b", adapter.UserFailureStall)
+		s.recordUserFailure("b", adapter.UserFailureStall, s.networkGeneration.Load())
 	}
-	o, err := s.selectFor("tcp")
+	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	assert.Equal(t, "b", o.Tag())
 }
@@ -272,16 +272,16 @@ func TestSplitHealthyFor_RecoveryGate(t *testing.T) {
 func TestRecoveryGate_HardDemotedFallbackRestoresFailedMember(t *testing.T) {
 	s, _ := newConfirmationTestMUR(t, "a", "b")
 	recordSuccess(s, "b", 200)
-	s.recordUserFailure("a", adapter.UserFailureDial)
-	s.recordProbeOutcome("a", false, 0)
-	s.trySwitchAfterConfirmedFailure("a", "b")
+	s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load())
+	seedProbe(s, "a", false, 0)
+	switchAfterConfirmedFailure(s, "a", "b")
 	require.Equal(t, "b", loadString(&s.stickyTag.tcp))
 
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.consecutiveFailLimit {
-		s.recordUserFailure("b", adapter.UserFailureStall)
+		s.recordUserFailure("b", adapter.UserFailureStall, s.networkGeneration.Load())
 	}
-	o, err := s.selectFor("tcp")
+	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	assert.Equal(t, "a", o.Tag(), "a gated member that is not demoted serves before a hard-demoted fallback")
 }
@@ -289,13 +289,13 @@ func TestRecoveryGate_HardDemotedFallbackRestoresFailedMember(t *testing.T) {
 func TestRecoveryGate_FastFailover(t *testing.T) {
 	s, _ := newConfirmationTestMUR(t, "a", "b", "c")
 	s.historyForLocked("b").startRecoveryGate(time.Now())
-	o, err := s.selectForExcluding("tcp", "a")
+	o, _, err := s.selectOutbound("tcp", "a")
 	require.NoError(t, err)
 	assert.Equal(t, "c", o.Tag())
 	assert.Equal(t, "a", loadString(&s.stickyTag.tcp))
 
 	s.historyForLocked("c").startRecoveryGate(time.Now())
-	o, err = s.selectForExcluding("tcp", "a")
+	o, _, err = s.selectOutbound("tcp", "a")
 	require.NoError(t, err)
 	assert.Equal(t, "b", o.Tag(), "fast failover can use a gated member as a last resort")
 }
@@ -400,7 +400,7 @@ func TestMakeHooks_ConfirmsOnlyPrimaryTCPResetOrNoResponse(t *testing.T) {
 					return nil, errors.New("dial timeout")
 				}
 
-				s.makeHooks("a", tt.network, tt.route).onFailure(tt.kind)
+				s.makeHooks("a", tt.network, tt.route, s.networkGeneration.Load()).onFailure(tt.kind)
 				synctest.Wait()
 
 				uf, _ := userFailures(s, "a")
@@ -424,24 +424,24 @@ func TestTrySwitchAfterConfirmedFailure_ChoosesValidatedAlternate(t *testing.T) 
 		want  string
 	}{
 		{"best validated", func(*MutableAutoSelect) {}, "b"},
-		{"skips failed probe", func(s *MutableAutoSelect) { s.recordProbeOutcome("b", false, 0) }, "c"},
+		{"skips failed probe", func(s *MutableAutoSelect) { seedProbe(s, "b", false, 0) }, "c"},
 		{"skips gated", func(s *MutableAutoSelect) {
 			s.access.Lock()
 			s.historyForLocked("b").startRecoveryGate(time.Now())
 			s.access.Unlock()
 		}, "c"},
 		{"none validated", func(s *MutableAutoSelect) {
-			s.recordProbeOutcome("b", false, 0)
-			s.recordProbeOutcome("c", false, 0)
+			seedProbe(s, "b", false, 0)
+			seedProbe(s, "c", false, 0)
 		}, "a"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				s, _ := newConfirmationTestMUR(t, "a", "b", "c")
-				s.recordProbeOutcome("a", false, 0)
+				seedProbe(s, "a", false, 0)
 				tt.setup(s)
-				s.trySwitchAfterConfirmedFailure("a", "")
+				switchAfterConfirmedFailure(s, "a", "")
 				assert.Equal(t, tt.want, loadString(&s.stickyTag.tcp))
 			})
 		})
