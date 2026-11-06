@@ -108,6 +108,18 @@ install_linux() {
 	fi
 	[ "$got" = "$want" ] || die "$pkg doesn't match the release's checksum"
 
+	# Releases before the node service can't run as one, so refuse them
+	# before touching the installation.
+	case $pkg in
+	*.deb) contents=$(dpkg-deb -c "$tmp/$pkg") ;;
+	*.rpm) contents=$(rpm -qlp --nosignature "$tmp/$pkg") ;;
+	*) contents=$(tar -tzf "$tmp/$pkg") ;;
+	esac || die "couldn't list $pkg"
+	case $contents in
+	*lantern-node.service*) ;;
+	*) die "lantern-box $tag predates the lantern-node service. Pick a newer release." ;;
+	esac
+
 	case $pkg in
 	# Downgrades are allowed so LANTERN_BOX_VERSION can pin an older release.
 	*.deb) as_root apt-get install -y --allow-downgrades "$tmp/$pkg" ;;
