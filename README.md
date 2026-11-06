@@ -4,12 +4,82 @@ Lantern Box is a censorship circumvention proxy and client platform that's built
 
 The goal is to be as useful as possible to the censorship circumvention community. Operators are encouraged to run servers and hand configs to users. We contribute changes upstream whenever we can.
 
-There are two ways to use lantern-box:
+There are three ways to use lantern-box:
 
-1. **Run the server binary** -- deploy it on a VPS and hand JSON configs to users. You get every sing-box protocol plus the Lantern additions.
-2. **Import it as a Go library** -- integrate the protocols into your own tooling. One function call registers everything.
+1. **[Run a Lantern node](#run-a-lantern-node)** -- install it at home or on a VPS and it serves Lantern users, with its config from Lantern. Nothing to configure.
+2. **Run the server binary** -- deploy it on a VPS and hand JSON configs to users. You get every sing-box protocol plus the Lantern additions.
+3. **Import it as a Go library** -- integrate the protocols into your own tooling. One function call registers everything.
 
 ---
+
+## Run a Lantern node
+
+A Lantern node helps people in censored countries reach the open internet. It registers with Lantern, which sends it a proxy config and fresh credentials every hour, and Lantern's apps send users to it. A node in an uncensored country also runs an [Unbounded](https://github.com/getlantern/unbounded) volunteer, which relays for users over WebRTC.
+
+Nodes are in a limited rollout: Lantern accepts a node once it has enrolled it, by its IP address or your Lantern user ID.
+
+**macOS, or Linux with Homebrew:**
+
+```bash
+brew install getlantern/tap/lantern-box
+brew services start lantern-box
+```
+
+**Linux** (Debian, Ubuntu, Fedora, RHEL, openSUSE or any other with systemd, on amd64 or arm64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/getlantern/lantern-box/main/install.sh | sh
+```
+
+It installs the latest release's `.deb` or `.rpm`, or its tarball, after checking it against the release's checksums, and starts the `lantern-node` systemd service, which runs as an unprivileged user and starts on boot. Run it again to upgrade. To pass flags, set them first:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/getlantern/lantern-box/main/install.sh |
+  LANTERN_USER_ID=123456 LANTERN_NODE_ARGS="--bandwidth-limit 10mbit" sh
+```
+
+**Docker** (Linux, amd64):
+
+```bash
+docker run -d --name lantern-node --restart unless-stopped --network host \
+  -v lantern-node:/var/lib/lantern-node \
+  --entrypoint /usr/local/bin/lantern-box \
+  getlantern/lantern-box:latest serve --register --state-dir /var/lib/lantern-node
+```
+
+Host networking lets the node find your router and be reached on its port.
+
+**Anywhere else**, download a binary from [Releases](https://github.com/getlantern/lantern-box/releases) and run:
+
+```bash
+lantern-box serve --register
+```
+
+### Ports
+
+The node listens on a random TCP port, chosen on first run and kept. At home it asks your router to forward that port, over UPnP, NAT-PMP or PCP, and removes the forward when it stops. If your router doesn't support those, forward the port yourself and pass `--no-port-mapping`. On a VPS, open the port in its firewall. Lantern checks that it can reach the node before sending users to it. The node's log shows the port.
+
+### Options
+
+| Flag | What it does |
+| ---- | ------------ |
+| `--user-id` | Your Lantern user ID, which can enroll this node. |
+| `--bandwidth-limit` | Caps the Unbounded volunteer's traffic in each direction, such as `10mbit` or `2MB/s`. |
+| `--max-peers` | How many users the Unbounded volunteer serves at once. |
+| `--port` | Listen on this port instead of a random one. |
+| `--no-port-mapping` | Don't ask the router to forward the port. |
+| `--state-dir` | Where the node keeps its identity and port. |
+
+The node keeps its identity and port in `node.json` in its state directory: `/var/lib/lantern-node` for the systemd service, `$(brew --prefix)/var/lantern-node` for Homebrew, and `lantern-box` in your user config directory otherwise. To start over as a new node on a new port, stop the node and delete it.
+
+### Managing the node
+
+| | Homebrew | systemd | Docker |
+| --- | --- | --- | --- |
+| Status | `brew services info lantern-box` | `systemctl status lantern-node` | `docker ps -f name=lantern-node` |
+| Logs | `tail -f $(brew --prefix)/var/log/lantern-node.log` | `journalctl -u lantern-node -f` | `docker logs -f lantern-node` |
+| Stop | `brew services stop lantern-box` | `sudo systemctl disable --now lantern-node` | `docker rm -f lantern-node` |
+| Uninstall | `brew uninstall lantern-box` | `sudo apt remove lantern-box`, `sudo dnf remove lantern-box`, or remove `/usr/bin/lantern-box` and `/etc/systemd/system/lantern-node.service` | `docker volume rm lantern-node` |
 
 ## Quick Start: Run the Server
 
@@ -725,7 +795,7 @@ go test -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acm
 
 ### Releases
 
-Every merge to `main` that changes the binary is tagged as the next patch release and published, so clients can depend on it. The proxy fleet follows GitHub's latest release: lantern-cloud hot-swaps every box onto it.
+Every merge to `main` that changes the binary is tagged as the next patch release and published, so clients can depend on it. The proxy fleet follows GitHub's latest release: lantern-cloud hot-swaps every box onto it. So do Lantern nodes: `install.sh` installs the latest release, and only a fleet release updates the Homebrew formula in [getlantern/homebrew-tap](https://github.com/getlantern/homebrew-tap).
 
 By default a release doesn't roll the fleet: it isn't marked latest, nor pushed as `getlantern/lantern-box:latest` or as the `sing-box:latest` image triangle backends run. A push to `main` builds `sing-box:main` instead. To roll the fleet onto a change, label its PR `release` before merging.
 

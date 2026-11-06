@@ -34,6 +34,23 @@ configured container paths.
 
 The default command is `lantern-box run --config /config.json`.
 
+## Run a Lantern node
+
+A Lantern node gets its config from Lantern instead of a `config.json`. Run
+`serve --register` in place of the default command:
+
+```sh
+docker run -d --name lantern-node --restart unless-stopped --network host \
+  -v lantern-node:/var/lib/lantern-node \
+  --entrypoint /usr/local/bin/lantern-box \
+  getlantern/lantern-box:latest serve --register --state-dir /var/lib/lantern-node
+```
+
+Host networking lets the node ask your router to forward its port and be
+reached on it. The volume keeps the node's identity and port. See
+[Run a Lantern node](https://github.com/getlantern/lantern-box#run-a-lantern-node)
+for its options.
+
 ## Source
 
 - [Source code and issues](https://github.com/getlantern/lantern-box)
