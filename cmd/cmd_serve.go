@@ -23,6 +23,7 @@ func init() {
 	serveCmd.Flags().Int("max-peers", 0, "How many censored users the Unbounded volunteer serves at once (default: lantern-box's)")
 	serveCmd.Flags().String("bandwidth-limit", "", "Cap on the Unbounded volunteer's traffic in each direction, such as 10mbit or 2MB/s (default: none)")
 	serveCmd.Flags().Duration("rotation-interval", node.DefaultRotationInterval, "How often to register again, for fresh credentials and settings")
+	serveCmd.Flags().Bool("no-port-mapping", false, "Don't ask the router, through UPnP, NAT-PMP or PCP, to forward the node's TCP port")
 }
 
 var serveCmd = &cobra.Command{
@@ -56,6 +57,9 @@ var serveCmd = &cobra.Command{
 		}
 		if cfg.RotationInterval, err = f.GetDuration("rotation-interval"); err != nil {
 			return fmt.Errorf("get rotation-interval flag: %w", err)
+		}
+		if cfg.SkipPortMapping, err = f.GetBool("no-port-mapping"); err != nil {
+			return fmt.Errorf("get no-port-mapping flag: %w", err)
 		}
 		if cfg.StateDir == "" {
 			dir, err := os.UserConfigDir()
