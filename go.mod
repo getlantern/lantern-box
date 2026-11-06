@@ -40,6 +40,7 @@ require (
 	github.com/hashicorp/yamux v0.1.2
 	github.com/huin/goupnp v1.3.0
 	github.com/jackpal/gateway v1.2.0
+	github.com/miekg/dns v1.1.72
 	github.com/pion/stun/v4 v4.0.1
 	github.com/pion/transport/v5 v5.1.1
 	github.com/refraction-networking/water v0.7.1-alpha
@@ -210,7 +211,6 @@ require (
 	github.com/metacubex/utls v1.8.7 // indirect
 	github.com/mholt/acmez/v3 v3.1.6 // indirect
 	github.com/mholt/archives v0.1.5 // indirect
-	github.com/miekg/dns v1.1.72 // indirect
 	github.com/mikelolasagasti/xz v1.0.1 // indirect
 	github.com/minio/minlz v1.0.1 // indirect
 	github.com/minio/sha256-simd v1.0.0 // indirect
