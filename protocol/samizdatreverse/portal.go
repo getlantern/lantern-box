@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -21,8 +22,6 @@ import (
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/protocol/internal/physnet"
-
-	samizdat "github.com/getlantern/samizdat"
 )
 
 // PortalConfig is what the portal serves: where it listens, the samizdat
@@ -33,15 +32,22 @@ type PortalConfig struct {
 	CertPEM    []byte
 	KeyPEM     []byte
 	Pairings   map[[8]byte]string // accepted short ID -> reverse outbound tag
+	// Previous, if set, is an identity the portal also accepts new sessions
+	// under until Previous.Until, so that helpers still dialing with the
+	// identity the portal held before this one can reconnect while they
+	// learn the new one. Its key must differ from PrivateKey.
+	Previous *PreviousIdentity
 }
 
-// sameServer reports whether a and b can share one listener and server, so
-// that moving from one to the other only changes the accepted short IDs.
-func (a PortalConfig) sameServer(b PortalConfig) bool {
-	return a.ListenPort == b.ListenPort &&
-		bytes.Equal(a.PrivateKey, b.PrivateKey) &&
-		bytes.Equal(a.CertPEM, b.CertPEM) &&
-		bytes.Equal(a.KeyPEM, b.KeyPEM)
+// PreviousIdentity is a samizdat server identity the portal accepts new
+// sessions under for a while after it has moved to another.
+type PreviousIdentity struct {
+	PrivateKey []byte // X25519, 32 bytes
+	CertPEM    []byte
+	KeyPEM     []byte
+	// Until is when the portal stops accepting new sessions under the
+	// identity. Sessions it already holds under it go on.
+	Until time.Time
 }
 
 // Portal is the inbound on an inviter's device that helpers dial into. Each
@@ -76,9 +82,17 @@ type Portal struct {
 	// port is the port the portal last served on. A rebuild of a
 	// configuration with ListenPort 0 binds it again, so helpers keep
 	// reaching the portal where they were told it is.
-	port      uint16
-	server    *samizdat.Server
+	port uint16
+	// cur is the identity new sessions authenticate under, and prev, when
+	// set, one they may still authenticate under until prevUntil. retired
+	// holds identities that take no new sessions but still hold live ones.
+	// cur is nil exactly when ln is: while the portal is down.
+	cur, prev *identity
+	prevUntil time.Time
+	prevTimer *time.Timer
+	retired   []*identity
 	ln        net.Listener
+	// serveDone closes when the accept loop on ln exits.
 	serveDone chan struct{}
 	rebinds   atomic.Int32 // listener swaps by Rebind, for tests
 	sessSeq   atomic.Uint64
@@ -89,6 +103,15 @@ type Portal struct {
 	// beforeListen, when set, runs just before each bind. Tests use it to
 	// take the port first.
 	beforeListen func(port uint16)
+
+	// routes is what the accept path reads to pick an identity. It is nil
+	// while the portal is down.
+	routes atomic.Pointer[routes]
+	// routing holds the accepted connections whose ClientHello is still
+	// being read, so a stop can close them. routeWG counts route calls.
+	routeMu sync.Mutex
+	routing map[net.Conn]struct{}
+	routeWG sync.WaitGroup
 
 	// sessMu guards pairings and sessions. It is never held while blocking.
 	sessMu   sync.Mutex
@@ -116,6 +139,7 @@ func NewPortal(ctx context.Context, router adapter.Router, logger log.ContextLog
 		masqueradeAddr:   options.MasqueradeAddr,
 		confirmTimeout:   5 * time.Second,
 		rebindDelay:      time.Second,
+		routing:          make(map[net.Conn]struct{}),
 		sessions:         make(map[string]*portalSession),
 	}, nil
 }
@@ -150,9 +174,9 @@ func (p *Portal) rebindAfterUpdate() {
 }
 
 // Rebind replaces the portal's listener with a new one on the same port,
-// bound to the current default interface. The samizdat server and its
+// bound to the current default interface. The samizdat servers and their
 // sessions are kept: only accepting moves to the new listener. If the portal
-// is down, because its server stopped serving or an earlier bind failed, it
+// is down, because its listener stopped serving or an earlier bind failed, it
 // is rebuilt from the wanted configuration on the port it last served on. If
 // the bind fails, the portal stays down, keeps that configuration and
 // returns the error, and the next Rebind or Configure tries again. Rebind
@@ -169,7 +193,7 @@ func (p *Portal) rebindLocked() ([]*portalSession, error) {
 	if p.closed || len(p.cfg.Pairings) == 0 {
 		return nil, nil
 	}
-	if p.server == nil || !p.serving() {
+	if p.cur == nil || !p.serving() {
 		return p.configureLocked(p.cfg)
 	}
 	p.ln.Close()
@@ -181,7 +205,7 @@ func (p *Portal) rebindLocked() ([]*portalSession, error) {
 		stopErr := p.stopLocked()
 		return stale, errors.Join(err, stopErr)
 	}
-	p.startServe(p.server, ln)
+	p.startServe(ln)
 	p.rebinds.Add(1)
 	return nil, nil
 }
@@ -197,22 +221,6 @@ func (p *Portal) listen(port uint16) (net.Listener, error) {
 		return nil, fmt.Errorf("%s: listen: %w", constant.TypeSamizdatPortal, addrFree(err))
 	}
 	return ln, nil
-}
-
-// startServe runs server on ln and records both. p.mu must be held.
-func (p *Portal) startServe(server *samizdat.Server, ln net.Listener) {
-	p.server = server
-	p.ln = ln
-	p.port = uint16(ln.Addr().(*net.TCPAddr).Port)
-	done := make(chan struct{})
-	p.serveDone = done
-	go func() {
-		defer close(done)
-		// net.ErrClosed means Rebind or Close closed the listener.
-		if err := server.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
-			p.logger.Error(constant.TypeSamizdatPortal, " stopped serving: ", addrFree(err))
-		}
-	}()
 }
 
 // Close stops the portal and ends every session. Configure fails after it.
@@ -243,21 +251,31 @@ func (p *Portal) Addr() net.Addr {
 	return p.ln.Addr()
 }
 
-// Configure makes cfg the portal's configuration. A change of port, key or
-// certificate replaces the server and listener. A change of pairings alone
-// keeps them, ends the sessions of pairings that are gone and stops their
-// short IDs from authenticating. No pairings at all stops the portal.
-// Configuring the current configuration again changes nothing, unless the
-// server has stopped serving on its own, in which case it is rebuilt.
+// Configure makes cfg the portal's configuration. A change of pairings
+// alone keeps the listener and sessions, ends the sessions of pairings that
+// are gone and stops their short IDs from authenticating. No pairings at all
+// stops the portal. Configuring the current configuration again changes
+// nothing, unless the listener has stopped serving on its own, in which case
+// the portal is rebuilt.
 //
-// When the port changes, the new port is bound before the old server stops,
-// so a failed bind returns an error and leaves the old configuration
-// serving. A key or certificate change on the same port has to stop the old
-// server first, so a failed bind there leaves the portal down with cfg
-// wanted, and Rebind or Configure tries again. ListenPort 0 binds the port
-// the portal last served on, if any, and otherwise any free port.
+// A change of key or certificate on the same port keeps the listener. New
+// sessions authenticate under cfg's identity, and also under cfg.Previous
+// until its Until passes. An identity the portal stops taking new sessions
+// under keeps the sessions it holds until they end or their pairing is
+// removed, so rotating the key ends no session.
+//
+// A change of port replaces the listener and every identity, which ends
+// every session. The new port is bound before the old listener stops, so a
+// failed bind returns an error and leaves the old configuration serving. A
+// failed bind while the portal is down leaves it down with cfg wanted, and
+// Rebind or Configure tries again. ListenPort 0 binds the port the portal
+// last served on, if any, and otherwise any free port.
 func (p *Portal) Configure(cfg PortalConfig) error {
 	cfg.Pairings = maps.Clone(cfg.Pairings)
+	if cfg.Previous != nil {
+		prev := *cfg.Previous
+		cfg.Previous = &prev
+	}
 	p.mu.Lock()
 	stale, err := p.configureLocked(cfg)
 	p.mu.Unlock()
@@ -277,13 +295,22 @@ func (p *Portal) configureLocked(cfg PortalConfig) ([]*portalSession, error) {
 		return stale, err
 	}
 
-	// samizdat only loads the certificate at the first handshake, so check
-	// it here, before anything that serves now is touched.
-	if len(cfg.PrivateKey) != 32 {
-		return nil, fmt.Errorf("%s: private key must be 32 bytes", constant.TypeSamizdatPortal)
+	if cfg.Previous != nil && !time.Now().Before(cfg.Previous.Until) {
+		cfg.Previous = nil
 	}
-	if _, err := tls.X509KeyPair(cfg.CertPEM, cfg.KeyPEM); err != nil {
-		return nil, fmt.Errorf("%s: certificate: %w", constant.TypeSamizdatPortal, err)
+	// samizdat only loads a certificate at the first handshake, so check
+	// both identities here, before anything that serves now is touched.
+	if err := checkIdentity("", cfg.PrivateKey, cfg.CertPEM, cfg.KeyPEM); err != nil {
+		return nil, err
+	}
+	if prev := cfg.Previous; prev != nil {
+		if err := checkIdentity("previous ", prev.PrivateKey, prev.CertPEM, prev.KeyPEM); err != nil {
+			return nil, err
+		}
+		if bytes.Equal(prev.PrivateKey, cfg.PrivateKey) {
+			// The current identity would take every session meant for it.
+			return nil, fmt.Errorf("%s: previous private key is the current one", constant.TypeSamizdatPortal)
+		}
 	}
 
 	ids := make([][8]byte, 0, len(cfg.Pairings))
@@ -291,54 +318,44 @@ func (p *Portal) configureLocked(cfg PortalConfig) ([]*portalSession, error) {
 		ids = append(ids, id)
 	}
 
-	if p.server != nil && p.cfg.sameServer(cfg) && p.serving() {
-		// Pairings first, so a newly added ID resolves to its tag by the
-		// time samizdat accepts it. SetShortIDs only fails on an empty set,
-		// which was ruled out above.
-		stale := p.setPairings(cfg.Pairings)
-		if err := p.server.SetShortIDs(ids); err != nil {
-			return stale, fmt.Errorf("%s: %w", constant.TypeSamizdatPortal, err)
-		}
-		p.cfg = cfg
-		return stale, nil
-	}
-
-	server, err := samizdat.NewServer(samizdat.ServerConfig{
-		PrivateKey:       cfg.PrivateKey,
-		ShortIDs:         ids,
-		CertPEM:          cfg.CertPEM,
-		KeyPEM:           cfg.KeyPEM,
-		MasqueradeDomain: p.masqueradeDomain,
-		MasqueradeAddr:   p.masqueradeAddr,
-		SessionHandler:   p.handleSession,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", constant.TypeSamizdatPortal, err)
-	}
-
 	bindPort := cfg.ListenPort
 	if bindPort == 0 {
 		bindPort = p.port
 	}
+	running := p.cur != nil && p.serving()
+	if running && bindPort == p.port {
+		return p.reidentifyLocked(cfg, ids)
+	}
+
+	cur, err := p.newIdentity(cfg.PrivateKey, cfg.CertPEM, cfg.KeyPEM, ids)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", constant.TypeSamizdatPortal, err)
+	}
+	var prev *identity
+	if pi := cfg.Previous; pi != nil {
+		if prev, err = p.newIdentity(pi.PrivateKey, pi.CertPEM, pi.KeyPEM, ids); err != nil {
+			closeIdentities(cur)
+			return nil, fmt.Errorf("%s: previous identity: %w", constant.TypeSamizdatPortal, err)
+		}
+	}
+
 	var stale []*portalSession
 	var stopErr error
 	stop := func() {
 		stale = p.setPairings(nil)
 		stopErr = p.stopLocked()
 	}
-	// A running server holding a different port keeps serving until the new
-	// one is bound, so a failed bind leaves it as it was. One holding the
-	// same port must go first, and so must one whose Serve loop has exited
-	// (it may still hold its listener and has nothing worth keeping).
-	running := p.server != nil && p.serving()
-	if p.server != nil && (!running || bindPort == p.port) {
+	// A running portal on a different port keeps serving until the new
+	// port is bound, so a failed bind leaves it as it was. One whose accept
+	// loop has exited goes first: it may still hold its listener and has
+	// nothing worth keeping.
+	if p.cur != nil && !running {
 		stop()
-		running = false
 	}
 
 	ln, err := p.listen(bindPort)
 	if err != nil {
-		server.Close()
+		closeIdentities(cur, prev)
 		if !running {
 			// Nothing is serving. Keep cfg wanted so Rebind or Configure
 			// can bring the portal back.
@@ -352,13 +369,129 @@ func (p *Portal) configureLocked(cfg PortalConfig) ([]*portalSession, error) {
 
 	newStale := p.setPairings(cfg.Pairings)
 	p.cfg = cfg
-	p.startServe(server, ln)
+	p.cur = cur
+	p.setPrevLocked(prev, cfg.Previous)
+	p.startServe(ln)
 	return append(stale, newStale...), stopErr
 }
 
-// serving reports whether the current server's Serve loop is still running.
-// p.mu must be held.
+// reidentifyLocked moves a portal serving on the port cfg wants to cfg's
+// identities and pairings, keeping the listener. An identity cfg still
+// names keeps its server and sessions, whether it was current or previous
+// before. One it no longer names is retired. p.mu must be held.
+func (p *Portal) reidentifyLocked(cfg PortalConfig, ids [][8]byte) ([]*portalSession, error) {
+	held := []*identity{p.cur, p.prev}
+	var made []*identity
+	find := func(privateKey, certPEM, keyPEM []byte) (*identity, error) {
+		for _, id := range held {
+			if id != nil && id.is(privateKey, certPEM, keyPEM) {
+				return id, nil
+			}
+		}
+		id, err := p.newIdentity(privateKey, certPEM, keyPEM, ids)
+		if err != nil {
+			return nil, err
+		}
+		made = append(made, id)
+		return id, nil
+	}
+	cur, err := find(cfg.PrivateKey, cfg.CertPEM, cfg.KeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", constant.TypeSamizdatPortal, err)
+	}
+	var prev *identity
+	if pi := cfg.Previous; pi != nil {
+		if prev, err = find(pi.PrivateKey, pi.CertPEM, pi.KeyPEM); err != nil {
+			closeIdentities(made...)
+			return nil, fmt.Errorf("%s: previous identity: %w", constant.TypeSamizdatPortal, err)
+		}
+	}
+
+	// Pairings first, so a newly added ID resolves to its tag by the time
+	// samizdat accepts it.
+	stale := p.setPairings(cfg.Pairings)
+	p.cur = cur
+	// The new routes are published before anything is retired, so nothing
+	// is routed to a retired identity from here on.
+	p.setPrevLocked(prev, cfg.Previous)
+	for _, id := range held {
+		if id != nil && id != cur && id != prev {
+			p.retireLocked(id)
+		}
+	}
+	// SetShortIDs only fails on an empty set, which was ruled out above.
+	for _, id := range append([]*identity{cur, prev}, p.retired...) {
+		if id != nil && !slices.Contains(made, id) {
+			if err := id.server.SetShortIDs(ids); err != nil {
+				return stale, fmt.Errorf("%s: %w", constant.TypeSamizdatPortal, err)
+			}
+		}
+	}
+	p.cfg = cfg
+	return stale, nil
+}
+
+// checkIdentity checks a samizdat server identity. which names it in the
+// error.
+func checkIdentity(which string, privateKey, certPEM, keyPEM []byte) error {
+	if len(privateKey) != 32 {
+		return fmt.Errorf("%s: %sprivate key must be 32 bytes", constant.TypeSamizdatPortal, which)
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return fmt.Errorf("%s: %scertificate: %w", constant.TypeSamizdatPortal, which, err)
+	}
+	return nil
+}
+
+// setPrevLocked makes id the previous identity, taking new sessions until
+// pi.Until, and publishes the routes. A nil id clears it. p.mu must be held.
+func (p *Portal) setPrevLocked(id *identity, pi *PreviousIdentity) {
+	if p.prevTimer != nil {
+		p.prevTimer.Stop()
+		p.prevTimer = nil
+	}
+	p.prev, p.prevUntil = id, time.Time{}
+	if id != nil {
+		p.prevUntil = pi.Until
+		p.prevTimer = time.AfterFunc(time.Until(pi.Until), func() { p.expire(id) })
+	}
+	r := &routes{cur: p.cur, prev: p.prev, prevUntil: p.prevUntil}
+	if old := p.routes.Load(); old != nil {
+		r.stop, r.cancel = old.stop, old.cancel
+	} else {
+		r.stop, r.cancel = context.WithCancel(context.Background())
+	}
+	p.routes.Store(r)
+}
+
+// expire retires id once its time as the previous identity is up. The
+// accept path stops routing to it at that time on its own; this frees it.
+func (p *Portal) expire(id *identity) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// A Configure may have kept id as the previous identity for longer.
+	if p.closed || p.prev != id || time.Now().Before(p.prevUntil) {
+		return
+	}
+	p.setPrevLocked(nil, nil)
+	p.retireLocked(id)
+}
+
+// retireLocked retires id, keeping it while it holds sessions. p.mu must be
+// held.
+func (p *Portal) retireLocked(id *identity) {
+	p.retired = slices.DeleteFunc(p.retired, (*identity).isClosed)
+	if id.retire() {
+		p.retired = append(p.retired, id)
+	}
+}
+
+// serving reports whether the accept loop on the current listener is still
+// running. p.mu must be held.
 func (p *Portal) serving() bool {
+	if p.serveDone == nil {
+		return false
+	}
 	select {
 	case <-p.serveDone:
 		return false
@@ -367,17 +500,25 @@ func (p *Portal) serving() bool {
 	}
 }
 
-// stopLocked closes the server and listener, which ends every session, and
-// waits for them. p.mu must be held.
+// stopLocked closes the listener and every identity, which ends every
+// session, and waits for them. p.mu must be held.
 func (p *Portal) stopLocked() error {
-	if p.server == nil {
+	if p.cur == nil {
 		return nil
 	}
-	err := p.server.Close()
+	err := p.ln.Close()
 	<-p.serveDone
-	p.server, p.ln, p.serveDone = nil, nil, nil
+	p.stopRoutingLocked()
+	if p.prevTimer != nil {
+		p.prevTimer.Stop()
+		p.prevTimer = nil
+	}
+	p.routes.Store(nil)
+	closeIdentities(append([]*identity{p.cur, p.prev}, p.retired...)...)
+	p.cur, p.prev, p.prevUntil, p.retired = nil, nil, time.Time{}, nil
+	p.ln, p.serveDone = nil, nil
 	if errors.Is(err, net.ErrClosed) {
-		// The listener had already failed, and Serve has said so.
+		// The listener had already failed, and the accept loop has said so.
 		return nil
 	}
 	return addrFree(err)

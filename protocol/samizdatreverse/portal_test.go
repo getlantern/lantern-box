@@ -16,10 +16,13 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	sblog "github.com/sagernet/sing-box/log"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
@@ -362,12 +365,13 @@ func TestPortalKeyRotationSamePort(t *testing.T) {
 	require.Eventually(t, func() bool { return whoServes(p, tagA) == "old" }, 5*time.Second, 50*time.Millisecond)
 
 	require.NoError(t, p.Configure(k2.config(port, map[[8]byte]string{id: tagA})))
+	assert.Equal(t, addr, portalAddr(t, p))
+	assert.Equal(t, "old", whoServes(p, tagA), "key rotation ended the live session")
 	select {
 	case <-old:
-	case <-time.After(5 * time.Second):
-		t.Fatal("key rotation left the old session open")
+		t.Fatal("key rotation closed the live session")
+	default:
 	}
-	assert.Equal(t, addr, portalAddr(t, p))
 
 	c, err := samizdat.NewClient(samizdat.ClientConfig{ServerAddr: addr, ServerName: "localhost", PublicKey: k1.pub, ShortID: id})
 	require.NoError(t, err)
@@ -381,6 +385,13 @@ func TestPortalKeyRotationSamePort(t *testing.T) {
 
 	helper(t, addr, k2, id, "new")
 	require.Eventually(t, func() bool { return whoServes(p, tagA) == "new" }, 5*time.Second, 50*time.Millisecond)
+	select {
+	case <-old:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the new session did not replace the old one")
+	}
+	// The old identity held only that session, so it closes with it.
+	require.Eventually(t, func() bool { return retiredCount(p) == 0 }, 5*time.Second, 20*time.Millisecond)
 }
 
 func TestPortalRebuildsAfterServeExits(t *testing.T) {
@@ -903,4 +914,307 @@ func TestPortalStalledWriteDoesNotBlockPortal(t *testing.T) {
 	// takes the slot and restores traffic for tag A.
 	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a2" }, 10*time.Second, 50*time.Millisecond,
 		"a healthy replacement for a stalled session never took over")
+}
+
+// retiredCount returns how many retired identities the portal holds that
+// have not closed.
+func retiredCount(p *Portal) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, id := range p.retired {
+		if !id.isClosed() {
+			n++
+		}
+	}
+	return n
+}
+
+// withPrevious returns cfg with prev as its previous identity until until.
+func withPrevious(cfg PortalConfig, prev testKeys, until time.Time) PortalConfig {
+	cfg.Previous = &PreviousIdentity{PrivateKey: prev.priv, CertPEM: prev.cert, KeyPEM: prev.certKey, Until: until}
+	return cfg
+}
+
+// authenticates reports whether a samizdat client with k and id completes a
+// session with the portal at addr.
+func authenticates(t *testing.T, addr string, k testKeys, id [8]byte) bool {
+	t.Helper()
+	c, err := samizdat.NewClient(samizdat.ClientConfig{ServerAddr: addr, ServerName: "localhost", PublicKey: k.pub, ShortID: id})
+	require.NoError(t, err)
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := c.DialSession(ctx)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+func TestPortalPreviousIdentityDuringGrace(t *testing.T) {
+	k1, k2 := newTestKeys(t), newTestKeys(t)
+	idA, idB := newShortID(t), newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	pairings := map[[8]byte]string{idA: tagA, idB: tagB}
+	require.NoError(t, p.Configure(k1.config(0, pairings)))
+	addr := portalAddr(t, p)
+
+	require.NoError(t, p.Configure(withPrevious(k2.config(0, pairings), k1, time.Now().Add(time.Minute))))
+	assert.Equal(t, addr, portalAddr(t, p))
+
+	// Bridges pin the certificate of the identity they dial with, so each
+	// must be served its own identity's certificate.
+	newTestBridge(t, bridgeOptions(t, addr, k1, idA), &dialRouter{})
+	newTestBridge(t, bridgeOptions(t, addr, k2, idB), &dialRouter{})
+	require.Eventually(t, func() bool { _, ok := p.Session(tagA); return ok }, 5*time.Second, 20*time.Millisecond,
+		"a bridge with the previous identity did not connect during the grace period")
+	require.Eventually(t, func() bool { _, ok := p.Session(tagB); return ok }, 5*time.Second, 20*time.Millisecond,
+		"a bridge with the current identity did not connect")
+}
+
+func TestPortalPreviousIdentityRefusedAfterGrace(t *testing.T) {
+	k1, k2 := newTestKeys(t), newTestKeys(t)
+	id, probe := newShortID(t), newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	pairings := map[[8]byte]string{id: tagA, probe: tagB}
+	require.NoError(t, p.Configure(k1.config(0, pairings)))
+	addr := portalAddr(t, p)
+
+	until := time.Now().Add(time.Second)
+	require.NoError(t, p.Configure(withPrevious(k2.config(0, pairings), k1, until)))
+	assert.True(t, authenticates(t, addr, k1, probe), "previous identity refused during the grace period")
+	time.Sleep(time.Until(until))
+
+	assert.False(t, authenticates(t, addr, k1, probe), "previous identity accepted after the grace period")
+	opts := bridgeOptions(t, addr, k1, id)
+	newTestBridge(t, opts, &dialRouter{})
+	assert.Never(t, func() bool { _, ok := p.Session(tagA); return ok }, 2*time.Second, 50*time.Millisecond,
+		"a bridge with the previous identity connected after the grace period")
+	assert.True(t, authenticates(t, addr, k2, probe), "current identity refused")
+	p.mu.Lock()
+	assert.Nil(t, p.prev, "the expired identity is still previous")
+	p.mu.Unlock()
+
+	// Configuring it again after its time adds nothing.
+	require.NoError(t, p.Configure(withPrevious(k2.config(0, pairings), k1, until)))
+	assert.False(t, authenticates(t, addr, k1, probe), "an expired previous identity was accepted")
+}
+
+func TestPortalDroppingPreviousRefusesItKeepsSessions(t *testing.T) {
+	k1, k2 := newTestKeys(t), newTestKeys(t)
+	id, probe := newShortID(t), newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	pairings := map[[8]byte]string{id: tagA, probe: tagB}
+	require.NoError(t, p.Configure(withPrevious(k2.config(0, pairings), k1, time.Now().Add(time.Minute))))
+	addr := portalAddr(t, p)
+	old := helper(t, addr, k1, id, "old")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "old" }, 5*time.Second, 50*time.Millisecond)
+
+	// The inviter's routes are out with the new identity: it drops the old.
+	require.NoError(t, p.Configure(k2.config(0, pairings)))
+	assert.False(t, authenticates(t, addr, k1, probe), "a dropped previous identity was accepted")
+	assert.Equal(t, "old", whoServes(p, tagA), "dropping the previous identity ended its session")
+	select {
+	case <-old:
+		t.Fatal("dropping the previous identity closed its session")
+	default:
+	}
+	assert.Equal(t, 1, retiredCount(p))
+}
+
+func TestPortalLiveSessionSurvivesKeyRotation(t *testing.T) {
+	k1, k2, k3 := newTestKeys(t), newTestKeys(t), newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	pairings := map[[8]byte]string{id: tagA}
+	require.NoError(t, p.Configure(k1.config(0, pairings)))
+	addr := portalAddr(t, p)
+	newTestBridge(t, bridgeOptions(t, addr, k1, id), &dialRouter{})
+	require.Eventually(t, func() bool { _, ok := p.Session(tagA); return ok }, 5*time.Second, 20*time.Millisecond)
+	cc, _ := p.Session(tagA)
+	o := newTestReverse(t, tagA, p)
+	echo := tcpEcho(t)
+	roundTrip := func() {
+		t.Helper()
+		conn, err := o.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr(echo))
+		require.NoError(t, err)
+		defer conn.Close()
+		_, err = conn.Write([]byte("ping"))
+		require.NoError(t, err)
+		buf := make([]byte, 4)
+		_, err = io.ReadFull(conn, buf)
+		require.NoError(t, err)
+		assert.Equal(t, "ping", string(buf))
+	}
+	roundTrip()
+
+	// The first rotation keeps k1 as previous, the second retires it. Its
+	// session stays the portal's throughout.
+	require.NoError(t, p.Configure(withPrevious(k2.config(0, pairings), k1, time.Now().Add(time.Minute))))
+	got, ok := p.Session(tagA)
+	require.True(t, ok, "a key-only Configure ended the live session")
+	assert.Same(t, cc, got)
+	roundTrip()
+
+	require.NoError(t, p.Configure(withPrevious(k3.config(0, pairings), k2, time.Now().Add(time.Minute))))
+	got, ok = p.Session(tagA)
+	require.True(t, ok, "retiring the session's identity ended it")
+	assert.Same(t, cc, got)
+	roundTrip()
+	assert.Equal(t, addr, portalAddr(t, p))
+}
+
+func TestPortalRevocationClosesSessionsOfEveryIdentity(t *testing.T) {
+	k1, k2, k3 := newTestKeys(t), newTestKeys(t), newTestKeys(t)
+	idA, idB, idC := newShortID(t), newShortID(t), newShortID(t)
+	const tagC = "helper-cccccccccccc-r"
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	pairings := map[[8]byte]string{idA: tagA, idB: tagB, idC: tagC}
+	require.NoError(t, p.Configure(k1.config(0, pairings)))
+	addr := portalAddr(t, p)
+	doneA := helper(t, addr, k1, idA, "a")
+	require.NoError(t, p.Configure(withPrevious(k2.config(0, pairings), k1, time.Now().Add(time.Minute))))
+	require.NoError(t, p.Configure(withPrevious(k3.config(0, pairings), k2, time.Now().Add(time.Minute))))
+	// A is on the retired k1, B on the previous k2 and C on the current k3.
+	doneB := helper(t, addr, k2, idB, "b")
+	doneC := helper(t, addr, k3, idC, "c")
+	for tag, name := range map[string]string{tagA: "a", tagB: "b", tagC: "c"} {
+		require.Eventually(t, func() bool { return whoServes(p, tag) == name }, 5*time.Second, 50*time.Millisecond)
+	}
+
+	revoke := func(id [8]byte, tag string, done <-chan struct{}) {
+		t.Helper()
+		delete(pairings, id)
+		require.NoError(t, p.Configure(withPrevious(k3.config(0, pairings), k2, time.Now().Add(time.Minute))))
+		_, ok := p.Session(tag)
+		assert.False(t, ok)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a revoked pairing's session stayed open")
+		}
+		assert.False(t, authenticates(t, addr, k1, id))
+		assert.False(t, authenticates(t, addr, k2, id))
+		assert.False(t, authenticates(t, addr, k3, id))
+	}
+	revoke(idA, tagA, doneA)
+	revoke(idB, tagB, doneB)
+	assert.Equal(t, "c", whoServes(p, tagC))
+	revoke(idC, tagC, doneC)
+	assert.Nil(t, p.Addr(), "no pairings left, yet the portal serves")
+}
+
+func TestPortalRejectsBadPreviousIdentity(t *testing.T) {
+	k1, k2 := newTestKeys(t), newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	pairings := map[[8]byte]string{id: tagA}
+	require.NoError(t, p.Configure(k1.config(0, pairings)))
+	addr := portalAddr(t, p)
+	done := helper(t, addr, k1, id, "a")
+	require.Eventually(t, func() bool { return whoServes(p, tagA) == "a" }, 5*time.Second, 50*time.Millisecond)
+
+	until := time.Now().Add(time.Minute)
+	same := withPrevious(k2.config(0, pairings), k2, until)
+	require.Error(t, p.Configure(same), "a previous identity with the current key was accepted")
+	bad := withPrevious(k2.config(0, pairings), k1, until)
+	bad.Previous.CertPEM = []byte("-----BEGIN CERTIFICATE-----\ngarbage\n-----END CERTIFICATE-----\n")
+	require.Error(t, p.Configure(bad))
+	short := withPrevious(k2.config(0, pairings), k1, until)
+	short.Previous.PrivateKey = short.Previous.PrivateKey[:16]
+	require.Error(t, p.Configure(short))
+
+	assert.Equal(t, "a", whoServes(p, tagA), "a rejected config broke the live session")
+	select {
+	case <-done:
+		t.Fatal("a rejected config closed a live session")
+	default:
+	}
+	assert.False(t, authenticates(t, addr, k2, id), "a rejected config was applied")
+}
+
+func TestPortalPreviousIdentityWithPortChange(t *testing.T) {
+	k1, k2 := newTestKeys(t), newTestKeys(t)
+	id, probe := newShortID(t), newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	pairings := map[[8]byte]string{id: tagA, probe: tagB}
+	require.NoError(t, p.Configure(k1.config(0, pairings)))
+
+	port := freePort(t)
+	require.NoError(t, p.Configure(withPrevious(k2.config(port, pairings), k1, time.Now().Add(time.Minute))))
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))
+	assert.True(t, authenticates(t, addr, k1, probe), "previous identity refused on the new port")
+	assert.True(t, authenticates(t, addr, k2, probe), "current identity refused on the new port")
+}
+
+// TestPortalMasqueradeWithPreviousIdentity checks that a short ID neither
+// identity accepts is masqueraded on the accepted conn itself, so the
+// origin's close reaches the client at once, and that Close ends a
+// masquerade still running.
+func TestPortalMasqueradeWithPreviousIdentity(t *testing.T) {
+	masq, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer masq.Close()
+	var hold sync.Mutex
+	var held []net.Conn
+	closeFirst := true
+	go func() {
+		for {
+			c, err := masq.Accept()
+			if err != nil {
+				return
+			}
+			hold.Lock()
+			if closeFirst {
+				closeFirst = false
+				c.Close()
+			} else {
+				// Never answers or closes, like an origin waiting for more.
+				held = append(held, c)
+			}
+			hold.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		hold.Lock()
+		defer hold.Unlock()
+		for _, c := range held {
+			c.Close()
+		}
+	})
+
+	k1, k2 := newTestKeys(t), newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{MasqueradeDomain: "example.com", MasqueradeAddr: masq.Addr().String()})
+	pairings := map[[8]byte]string{id: tagA}
+	require.NoError(t, p.Configure(withPrevious(k2.config(0, pairings), k1, time.Now().Add(time.Minute))))
+	addr := portalAddr(t, p)
+
+	start := time.Now()
+	assert.False(t, authenticates(t, addr, k1, newShortID(t)))
+	assert.Less(t, time.Since(start), 2*time.Second, "the origin's close did not reach the client")
+
+	c, err := samizdat.NewClient(samizdat.ClientConfig{ServerAddr: addr, ServerName: "localhost", PublicKey: k2.pub, ShortID: newShortID(t)})
+	require.NoError(t, err)
+	defer c.Close()
+	dialed := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		conn, err := c.DialSession(ctx)
+		if err == nil {
+			conn.Close()
+		}
+		dialed <- err
+	}()
+	require.Eventually(t, func() bool { hold.Lock(); defer hold.Unlock(); return len(held) == 1 }, 5*time.Second, 20*time.Millisecond)
+	require.True(t, returnsWithin(5*time.Second, func() { p.Close() }), "Close waited on a masquerade")
+	select {
+	case err := <-dialed:
+		assert.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close left a masqueraded conn open")
+	}
 }
