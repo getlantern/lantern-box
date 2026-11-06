@@ -15,7 +15,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -184,6 +187,11 @@ func Run(ctx context.Context, cfg Config) error {
 func (n *node) run(ctx context.Context) error {
 	peerconn.SetListener(n.clients.listen)
 	defer peerconn.SetListener(nil)
+	// Before asking the router to forward the port, which would otherwise
+	// open whatever else listens on it to the internet.
+	if err := portFree(n.port); err != nil {
+		return err
+	}
 	if m := n.mapPort(ctx); m != nil {
 		defer func() {
 			uctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
@@ -200,6 +208,11 @@ func (n *node) run(ctx context.Context) error {
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
+			}
+			// Another program has taken the port, and retrying would keep
+			// the router forwarding to it. Stopping removes the mapping.
+			if errors.Is(err, errPortInUse) {
+				return err
 			}
 			log.Error("node: ", err, "; retrying in ", retry)
 			if !sleep(ctx, retry) {
@@ -258,6 +271,25 @@ func (n *node) mapPort(ctx context.Context) portMapper {
 	return m
 }
 
+// errPortInUse is a node's port already taken by another program.
+var errPortInUse = errors.New("the node's port is in use by another program; choose another with --port")
+
+// portFree reports errPortInUse if something already listens on port.
+func portFree(port uint16) error {
+	ln, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(int(port))))
+	if err != nil {
+		if addrInUse(err) {
+			return fmt.Errorf("port %d: %w", port, errPortInUse)
+		}
+		return fmt.Errorf("check port %d: %w", port, err)
+	}
+	return ln.Close()
+}
+
+func addrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) || strings.Contains(err.Error(), "address already in use")
+}
+
 // clientPort is the port clients reach the node at.
 func (n *node) clientPort() uint16 {
 	if n.externalPort != 0 {
@@ -310,6 +342,9 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 	}
 	b, err := n.newBox(ctx, options)
 	if err != nil {
+		if addrInUse(err) {
+			err = fmt.Errorf("%w: %w", errPortInUse, err)
+		}
 		return nil, fmt.Errorf("start box: %w", err)
 	}
 	vctx, cancel := context.WithTimeout(ctx, verifyTimeout)
