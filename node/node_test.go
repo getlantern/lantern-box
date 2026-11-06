@@ -704,3 +704,39 @@ func TestNodeStopsWhenItsPortIsTaken(t *testing.T) {
 	_, _, _, deregistered := cloud.snapshot()
 	assert.Equal(t, []string{"route-1"}, deregistered)
 }
+
+// A rotation whose box can't bind the port because another program has it
+// stops the node, removing the mapping, even while registration keeps
+// failing, rather than keep the router forwarding to that program.
+func TestNodeStopsWhenItsPortIsTakenAtRotation(t *testing.T) {
+	cloud := &fakeCloud{t: t, registerFails: func(n int) int {
+		if n > 2 {
+			return http.StatusServiceUnavailable
+		}
+		return 0
+	}}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{RotationInterval: 50 * time.Millisecond})
+	n.heartbeatOverride = time.Hour
+	var builds atomic.Int32
+	n.newBox = func(ctx context.Context, options string) (boxService, error) {
+		if builds.Add(1) > 1 {
+			return nil, &net.OpError{Op: "listen", Net: "tcp", Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
+		}
+		return boxes.factory(ctx, options)
+	}
+	mapper := &fakeMapper{external: 40001}
+	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
+
+	done := make(chan error, 1)
+	go func() { done <- n.run(box.BaseContext()) }()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errPortInUse)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the node kept going with its port taken")
+	}
+	mapper.mu.Lock()
+	defer mapper.mu.Unlock()
+	assert.True(t, mapper.unmapped, "the mapping is removed")
+}

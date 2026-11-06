@@ -226,7 +226,9 @@ func (n *node) run(ctx context.Context) error {
 			continue
 		}
 		retry = minRetry
-		n.serve(ctx, s)
+		if err := n.serve(ctx, s); errors.Is(err, errPortInUse) && ctx.Err() == nil {
+			return err
+		}
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -374,8 +376,9 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 }
 
 // serve heartbeats and rotates s until ctx is done or the route is lost. It
-// returns with nothing running; on ctx done it has deregistered too.
-func (n *node) serve(ctx context.Context, s *session) {
+// returns with nothing running; on ctx done it has deregistered too. The
+// error is a rotation's that failed, for run to judge.
+func (n *node) serve(ctx context.Context, s *session) error {
 	heartbeat := time.NewTicker(s.heartbeat)
 	defer heartbeat.Stop()
 	rotate := time.NewTimer(n.rotation)
@@ -386,7 +389,7 @@ func (n *node) serve(ctx context.Context, s *session) {
 			_ = s.box.Close()
 			n.deregister(s.routeID)
 			log.Info("node: stopped")
-			return
+			return nil
 		case <-heartbeat.C:
 			hctx, cancel := context.WithTimeout(ctx, requestTimeout)
 			err := n.api.heartbeat(hctx, s.routeID, n.clients.count())
@@ -394,7 +397,7 @@ func (n *node) serve(ctx context.Context, s *session) {
 			if isNotFound(err) {
 				log.Warn("node: lantern-cloud dropped route ", s.routeID, ", registering again")
 				_ = s.box.Close()
-				return
+				return nil
 			}
 			if err != nil && ctx.Err() == nil {
 				log.Warn("node: ", err)
@@ -405,7 +408,7 @@ func (n *node) serve(ctx context.Context, s *session) {
 				if ctx.Err() == nil {
 					log.Error("node: rotate: ", err)
 				}
-				return
+				return err
 			}
 			// The heartbeat schedule carries over to the new session unless
 			// its interval changed: rotations closer together than heartbeats
