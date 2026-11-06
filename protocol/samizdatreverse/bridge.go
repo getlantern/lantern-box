@@ -20,14 +20,12 @@ import (
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
 	sbopt "github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/route/rule"
 	M "github.com/sagernet/sing/common/metadata"
 	"golang.org/x/net/http2"
 
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/protocol/internal/uotrouter"
-	"github.com/getlantern/lantern-box/tracker/peerconn"
 
 	samizdat "github.com/getlantern/samizdat"
 )
@@ -53,6 +51,11 @@ const (
 // reversed: the portal opens CONNECT streams, and the bridge routes each as
 // an inbound connection, so the inviter's traffic exits from the helper. It
 // keeps one session up at a time, redialing with backoff when it ends.
+//
+// The bridge emits no peerconn events. The app that embeds it counts bridge
+// traffic with its own connection tracker, and peer share's peerconn
+// listener, which may run in the same process, must not count these streams
+// as anonymous pool traffic.
 type Bridge struct {
 	inbound.Adapter
 	ctx             context.Context
@@ -322,17 +325,11 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleConnection routes one CONNECT stream through the sing-box router and
 // blocks until it is done, since the stream ends when ServeHTTP returns.
-// Copied from protocol/samizdat/inbound.go (Inbound.handleConnection) with
-// the bridge's own short ID on the peerconn events, and without logging the
-// destination or routing errors, which can name it.
+// Adapted from protocol/samizdat/inbound.go (Inbound.handleConnection)
+// without its peerconn events and byte counting (see Bridge), and without
+// logging the destination or routing errors, which can name it.
 func (b *Bridge) handleConnection(ctx context.Context, conn net.Conn, destination string) {
-	// Bytes are counted only for a listener to read.
-	notify := peerconn.Acquire()
-	var bytes *peerconn.Counter
-	if notify != nil {
-		bytes = &peerconn.Counter{}
-	}
-	conn = &countingConn{wrapConn: wrapConn{Conn: conn}, bytes: bytes}
+	conn = &wrapConn{Conn: conn}
 
 	var metadata adapter.InboundContext
 	metadata.Inbound = b.Tag()
@@ -340,27 +337,9 @@ func (b *Bridge) handleConnection(ctx context.Context, conn net.Conn, destinatio
 	metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
 	metadata.Destination = M.ParseSocksaddr(destination)
 
-	// Acquired once so the close goes to the listener that saw the accept.
-	source := metadata.Source.String()
-	// Written by the routing callback and read by the deferred close, which
-	// can run without the callback having fired when shutdown times out.
-	var rejected atomic.Bool
-	if notify != nil {
-		shortID := b.shortID
-		notify(peerconn.Event{State: +1, Source: source, Destination: destination, Bytes: bytes, ShortID: shortID})
-		defer func() {
-			evt := peerconn.Event{State: -1, Source: source, Bytes: bytes, ShortID: shortID}
-			if rejected.Load() {
-				evt.Destination, evt.Rejected = destination, true
-			}
-			notify(evt)
-		}()
-	}
-
 	done := make(chan struct{})
 	b.router.RouteConnectionEx(ctx, conn, metadata, func(err error) {
 		if err != nil {
-			rejected.Store(rule.IsRejected(err))
 			b.logger.DebugContext(ctx, constant.TypeSamizdatBridge, ": a routed connection failed")
 		}
 		close(done)
@@ -384,30 +363,6 @@ func (b *Bridge) handleConnection(ctx context.Context, conn net.Conn, destinatio
 			b.logger.ErrorContext(ctx, constant.TypeSamizdatBridge, ": timed out waiting for a routed connection to finish")
 		}
 	}
-}
-
-// countingConn is wrapConn plus the inbound byte counter, as in
-// protocol/samizdat/conn.go: reads are bytes up from the inviter, writes bytes
-// down to it.
-type countingConn struct {
-	wrapConn
-	bytes *peerconn.Counter
-}
-
-func (c *countingConn) Read(b []byte) (int, error) {
-	n, err := c.wrapConn.Read(b)
-	if c.bytes != nil {
-		c.bytes.AddUp(n)
-	}
-	return n, err
-}
-
-func (c *countingConn) Write(b []byte) (int, error) {
-	n, err := c.wrapConn.Write(b)
-	if c.bytes != nil {
-		c.bytes.AddDown(n)
-	}
-	return n, err
 }
 
 // bridgeStream is a net.Conn over one CONNECT stream the bridge serves:

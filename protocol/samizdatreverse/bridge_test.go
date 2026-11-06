@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 type dialRouter struct {
 	mu     sync.Mutex
 	routed []adapter.InboundContext
+	closed atomic.Int32 // routed connections that have finished
 }
 
 func (r *dialRouter) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
@@ -60,6 +62,7 @@ func (r *dialRouter) RouteConnectionEx(ctx context.Context, conn net.Conn, metad
 		conn.Close()
 		up.Close()
 		onClose(nil)
+		r.closed.Add(1)
 		_ = err
 	}()
 }
@@ -159,23 +162,17 @@ func TestBridgeServesReverseDials(t *testing.T) {
 	assert.Equal(t, "bridge", md.Inbound)
 	assert.Equal(t, echo, md.Destination.String())
 
-	// The accept and close carry the bridge's short ID and the byte counts.
-	require.Eventually(t, func() bool {
-		evMu.Lock()
-		defer evMu.Unlock()
-		return len(events) == 2
-	}, 5*time.Second, 20*time.Millisecond)
+	// The bridge reports nothing to peerconn: radiance counts bridge bytes
+	// itself, and peer share's listener in the same process must not count
+	// them as pool traffic. The listener is live, as Acquire shows. Once the
+	// routed connection has finished, the bridge's handler returns at once,
+	// so a close event would follow within moments.
+	require.NotNil(t, peerconn.Acquire(), "test listener is not registered")
+	require.Eventually(t, func() bool { return router.closed.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	evMu.Lock()
 	defer evMu.Unlock()
-	assert.Equal(t, +1, events[0].State)
-	assert.Equal(t, echo, events[0].Destination)
-	assert.Equal(t, -1, events[1].State)
-	for _, evt := range events {
-		assert.Equal(t, id, evt.ShortID)
-	}
-	require.NotNil(t, events[1].Bytes)
-	assert.EqualValues(t, 10, events[1].Bytes.Up())
-	assert.EqualValues(t, 10, events[1].Bytes.Down())
+	assert.Empty(t, events, "the bridge emitted peerconn events")
 }
 
 func TestBridgeRejectsNonConnect(t *testing.T) {
