@@ -375,7 +375,13 @@ type bridgeStream struct {
 
 	mu        sync.Mutex // held across each write; shutdown takes it to wait one out
 	closed    atomic.Bool
+	writing   atomic.Bool // a Write is in w
 	closeOnce sync.Once
+
+	// lifeMu guards ended, which is set once the handler is about to return
+	// and w must no longer be touched. It is never held across a write.
+	lifeMu sync.Mutex
+	ended  bool
 }
 
 func (c *bridgeStream) Read(b []byte) (int, error) {
@@ -388,6 +394,10 @@ func (c *bridgeStream) Read(b []byte) (int, error) {
 func (c *bridgeStream) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// writing is set before closed is checked, and Close sets closed before
+	// it checks writing, so either this Write fails or Close sees it.
+	c.writing.Store(true)
+	defer c.writing.Store(false)
 	if c.closed.Load() {
 		return 0, net.ErrClosed
 	}
@@ -398,13 +408,39 @@ func (c *bridgeStream) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// Close stops reads and writes. The response ends when ServeHTTP returns.
+// Close stops reads and writes. A Write in progress is aborted: when the
+// inviter stops reading, HTTP/2 flow control can block it indefinitely, and
+// it holds mu, which the handler needs before it can return. Without a
+// Write in progress the stream is left to end normally when ServeHTTP
+// returns, so a relay that finished cleanly still ends with END_STREAM
+// rather than a reset.
 func (c *bridgeStream) Close() error {
+	c.closeReads()
+	if c.writing.Load() {
+		c.abortWrite()
+	}
+	return nil
+}
+
+func (c *bridgeStream) closeReads() {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
 		c.body.Close()
 	})
-	return nil
+}
+
+// abortWrite resets the stream, which fails a Write blocked in w. It does
+// nothing once the handler is returning, since w is invalid after that.
+func (c *bridgeStream) abortWrite() {
+	c.lifeMu.Lock()
+	defer c.lifeMu.Unlock()
+	if c.ended {
+		return
+	}
+	// A deadline in the past makes x/net's http2 server reset the stream at
+	// once. A ResponseWriter without deadlines leaves the write to end with
+	// the session.
+	_ = http.NewResponseController(c.w).SetWriteDeadline(time.Now())
 }
 
 // CloseWrite closes the whole stream. The HTTP/2 server cannot half-close:
@@ -413,15 +449,24 @@ func (c *bridgeStream) Close() error {
 // when the destination is done sending lets the inviter see EOF; leaving it
 // open would hang a client that waits for EOF before it ends its own side.
 // The cost is that anything the inviter uploads after the destination has
-// closed is dropped.
+// closed is dropped. Unlike Close it never aborts a write: the destination
+// is done, and what it sent still reaches the inviter.
 func (c *bridgeStream) CloseWrite() error {
-	return c.Close()
+	c.closeReads()
+	return nil
 }
 
-// shutdown marks the stream closed and waits for an in-flight write.
+// shutdown marks the stream closed and waits for an in-flight write,
+// aborting it first so the wait is bounded, then retires w.
 func (c *bridgeStream) shutdown() {
-	c.mu.Lock()
 	c.closed.Store(true)
+	if c.writing.Load() {
+		c.abortWrite()
+	}
+	c.mu.Lock()
+	c.lifeMu.Lock()
+	c.ended = true
+	c.lifeMu.Unlock()
 	c.mu.Unlock()
 }
 

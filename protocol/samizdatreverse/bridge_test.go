@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,13 +20,16 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/adapter/inbound"
 	sblog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
 
+	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/tracker/peerconn"
 	samizdat "github.com/getlantern/samizdat"
@@ -452,5 +456,105 @@ func TestBridgeDestinationCloseDeliversEveryByte(t *testing.T) {
 		require.True(t, bytes.Equal(payload, r.b), "the inviter received different bytes")
 	case <-time.After(15 * time.Second):
 		t.Fatal("the inviter did not see EOF after the destination closed")
+	}
+}
+
+// stallRouter writes to each routed conn until the writes stop making
+// progress, which happens once the inviter's flow-control window is full,
+// then fully closes the conn, as the router does when tearing a relay down.
+// writeEnded gets the error the stalled Write returned, or nil if it was
+// still blocked 5s after the Close.
+type stallRouter struct {
+	dialRouter
+	writeEnded chan error
+}
+
+func (r *stallRouter) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	go func() {
+		var progress atomic.Int64
+		writeErr := make(chan error, 1)
+		go func() {
+			buf := make([]byte, 32<<10)
+			for {
+				n, err := conn.Write(buf)
+				progress.Add(int64(n))
+				if err != nil {
+					writeErr <- err
+					return
+				}
+			}
+		}()
+		// Stalled once 300ms pass without a byte written.
+		last := int64(-1)
+		for cur := progress.Load(); cur != last; cur = progress.Load() {
+			last = cur
+			time.Sleep(300 * time.Millisecond)
+		}
+		conn.Close()
+		select {
+		case err := <-writeErr:
+			r.writeEnded <- err
+		case <-time.After(5 * time.Second):
+			r.writeEnded <- nil
+		}
+		onClose(nil)
+	}()
+}
+
+func TestBridgeCloseAbortsBlockedWrite(t *testing.T) {
+	router := &stallRouter{writeEnded: make(chan error, 1)}
+	b := &Bridge{
+		Adapter: inbound.NewAdapter(constant.TypeSamizdatBridge, "bridge"),
+		logger:  sblog.NewNOPFactory().Logger(),
+		router:  router,
+	}
+	returned := make(chan struct{})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(returned)
+		b.ServeHTTP(w, r)
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		(&http2.Server{}).ServeConn(c, &http2.ServeConnOpts{Handler: handler})
+	}()
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer raw.Close()
+	cc, err := (&http2.Transport{}).NewClientConn(raw)
+	require.NoError(t, err)
+	defer cc.Close()
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Host: "example.com:443"},
+		Host:   "example.com:443",
+		Header: http.Header{},
+		Body:   pr,
+	}
+	resp, err := cc.RoundTrip(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	// The inviter never reads the response body.
+
+	select {
+	case err := <-router.writeEnded:
+		require.Error(t, err, "a full Close left the stalled Write blocked")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the router's writes never stalled")
+	}
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the bridge's handler did not return after the stream was closed")
 	}
 }
