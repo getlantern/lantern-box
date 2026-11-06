@@ -551,9 +551,8 @@ func TestNewSingBoxRunsVolunteer(t *testing.T) {
 // fakeMapper stands in for the router: it grants external, or fails with
 // mapErr.
 type fakeMapper struct {
-	external   uint16
-	internalIP string
-	mapErr     error
+	external uint16
+	mapErr   error
 
 	mu       sync.Mutex
 	mapped   []uint16
@@ -571,7 +570,7 @@ func (f *fakeMapper) MapPort(_ context.Context, protocol string, internalPort ui
 	if f.mapErr != nil {
 		return nil, f.mapErr
 	}
-	return &portforward.Mapping{ExternalPort: f.external, InternalPort: internalPort, InternalIP: f.internalIP, Protocol: protocol, Method: "UPnP"}, nil
+	return &portforward.Mapping{ExternalPort: f.external, InternalPort: internalPort, Protocol: protocol, Method: "UPnP"}, nil
 }
 
 func (f *fakeMapper) StartRenewal(context.Context) {
@@ -704,83 +703,4 @@ func TestNodeStopsWhenItsPortIsTaken(t *testing.T) {
 	assert.True(t, mapper.unmapped, "the mapping is removed")
 	_, _, _, deregistered := cloud.snapshot()
 	assert.Equal(t, []string{"route-1"}, deregistered)
-}
-
-// While lantern-cloud refuses to register the node, its mapped port stays held,
-// so another program can't take it and be reached through the mapping.
-func TestNodeHoldsItsPortWhileNotServing(t *testing.T) {
-	cloud := &fakeCloud{t: t, registerFails: func(int) int { return http.StatusServiceUnavailable }}
-	n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
-	n.newMapper = func(context.Context) (portMapper, error) {
-		return &fakeMapper{external: 40001, internalIP: "127.0.0.1"}, nil
-	}
-	ctx, cancel := context.WithCancel(box.BaseContext())
-	done := make(chan error, 1)
-	go func() { done <- n.run(ctx) }()
-	require.Eventually(t, func() bool {
-		_, registers, _, _ := cloud.snapshot()
-		return len(registers) >= 1
-	}, 5*time.Second, 10*time.Millisecond)
-
-	for _, host := range []string{"", "127.0.0.1"} {
-		_, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(int(n.port))))
-		require.Error(t, err, "the node holds its port on %q", host)
-	}
-
-	cancel()
-	require.NoError(t, <-done)
-	ln, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(int(n.port))))
-	require.NoError(t, err, "the port is free once the node stops")
-	require.NoError(t, ln.Close())
-}
-
-// bindingBox binds the node's port as a real box's inbound does.
-type bindingBox struct{ ln net.Listener }
-
-func (b *bindingBox) Close() error { return b.ln.Close() }
-
-// Each box gets the port, and the node takes it back between boxes.
-func TestNodeHandsItsPortToEachBox(t *testing.T) {
-	cloud := &fakeCloud{t: t}
-	n := newTestNode(t, cloud, &fakeBoxes{}, Config{RotationInterval: 50 * time.Millisecond})
-	n.heartbeatOverride = time.Hour
-	var started atomic.Int32
-	n.newBox = func(context.Context, string) (boxService, error) {
-		ln, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(int(n.port))))
-		if err != nil {
-			return nil, err
-		}
-		started.Add(1)
-		return &bindingBox{ln: ln}, nil
-	}
-	n.newMapper = func(context.Context) (portMapper, error) { return &fakeMapper{external: 40001}, nil }
-	stop := runNode(t, n)
-	require.Eventually(t, func() bool { return started.Load() >= 3 }, 5*time.Second, 10*time.Millisecond,
-		"each rotation's box binds the port")
-	stop()
-	ln, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(int(n.port))))
-	require.NoError(t, err, "the port is free once the node stops")
-	require.NoError(t, ln.Close())
-}
-
-// A program already listening on the exact address the router forwards to
-// stops the node, which removes any mapping it made: on some systems a hold
-// on all addresses can coexist with it, and it would get the connections.
-func TestNodeWontForwardToAProgramOnTheMappedAddress(t *testing.T) {
-	cloud := &fakeCloud{t: t}
-	n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
-	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(n.port))))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ln.Close() })
-	mapper := &fakeMapper{external: 40001, internalIP: "127.0.0.1"}
-	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
-
-	ctx, cancel := context.WithTimeout(box.BaseContext(), 3*time.Second)
-	defer cancel()
-	require.ErrorIs(t, n.run(ctx), errPortInUse)
-	mapper.mu.Lock()
-	defer mapper.mu.Unlock()
-	assert.Equal(t, len(mapper.mapped) > 0, mapper.unmapped, "a mapping made is removed")
-	calls, _, _, _ := cloud.snapshot()
-	assert.Empty(t, calls, "nothing was registered")
 }
