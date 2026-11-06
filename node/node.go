@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -308,7 +309,10 @@ func (n *node) checkPort() error {
 		if !ok || ipn.IP.To4() == nil {
 			continue
 		}
-		if err := portFreeOn(ipn.IP.String(), n.port); err != nil {
+		// Only another listener counts: an address that can't be bound at
+		// all, such as one Windows is still checking for duplicates, has
+		// nothing on it to forward to.
+		if err := portFreeOn(ipn.IP.String(), n.port); errors.Is(err, errPortInUse) {
 			return err
 		}
 	}
@@ -329,6 +333,19 @@ func portFreeOn(host string, port uint16) error {
 		return fmt.Errorf("check port %d: %w", port, err)
 	}
 	return ln.Close()
+}
+
+// bindsPort reports whether err is about binding port: from the address of
+// the net.OpError it wraps if there is one, otherwise from its text, matching
+// the whole port number.
+func bindsPort(err error, port uint16) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Addr != nil {
+		if tcp, ok := opErr.Addr.(*net.TCPAddr); ok {
+			return tcp.Port == int(port)
+		}
+	}
+	return regexp.MustCompile(`:` + strconv.Itoa(int(port)) + `(\D|$)`).MatchString(err.Error())
 }
 
 // wsaeaddrinuse is Windows' "address in use", which syscall.EADDRINUSE isn't
@@ -397,7 +414,7 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 	}
 	b, err := n.newBox(ctx, options)
 	if err != nil {
-		if addrInUse(err) && strings.Contains(err.Error(), ":"+strconv.Itoa(int(n.port))) {
+		if addrInUse(err) && bindsPort(err, n.port) {
 			err = fmt.Errorf("%w: %w", errPortInUse, err)
 		}
 		return nil, fmt.Errorf("start box: %w", err)

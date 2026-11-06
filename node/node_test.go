@@ -834,3 +834,14 @@ func TestNodeChecksItsPortBeforeEachBox(t *testing.T) {
 	defer mapper.mu.Unlock()
 	assert.True(t, mapper.unmapped)
 }
+
+func TestBindsPort(t *testing.T) {
+	op := func(port int) error {
+		return fmt.Errorf("start: %w", &net.OpError{Op: "listen", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4zero, Port: port}, Err: os.NewSyscallError("bind", syscall.EADDRINUSE)})
+	}
+	assert.True(t, bindsPort(op(443), 443))
+	assert.False(t, bindsPort(op(4430), 443), "a port that starts with the node's isn't it")
+	assert.True(t, bindsPort(errors.New("listen tcp 0.0.0.0:443: bind: address already in use"), 443))
+	assert.False(t, bindsPort(errors.New("listen tcp 0.0.0.0:4430: bind: address already in use"), 443))
+	assert.True(t, bindsPort(errors.New("listen tcp [::]:443"), 443))
+}
