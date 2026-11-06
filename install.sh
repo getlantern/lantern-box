@@ -5,10 +5,13 @@
 #   curl -fsSL https://raw.githubusercontent.com/getlantern/lantern-box/main/install.sh | sh
 #
 # Optional environment:
-#   LANTERN_USER_ID     your Lantern user ID, which can enroll this node
 #   LANTERN_NODE_ARGS   more `lantern-box serve` flags, such as "--bandwidth-limit 10mbit".
-#                       systemd splits them at whitespace and ignores quotes, so
-#                       no value can contain a space.
+#                       Set, they replace any flags set before, so give all you
+#                       want, or set it empty to clear them. Unset, as when you
+#                       rerun this to upgrade, the flags set before stay. On
+#                       Linux, systemd respects quotes in them; Homebrew's
+#                       service doesn't, so a value there can't contain a space
+#                       or a quote.
 #   LANTERN_BOX_VERSION a release tag such as v0.0.203 (default: the latest
 #                       Lamplighter release, which the Homebrew formula names)
 #
@@ -33,32 +36,58 @@ as_root() {
 	fi
 }
 
-node_args() {
-	args=${LANTERN_NODE_ARGS:-}
+# Reports whether LANTERN_NODE_ARGS is set, even to empty, which is what
+# decides whether to replace the node's saved flags.
+node_args_given() {
+	[ "${LANTERN_NODE_ARGS+set}" = set ]
+}
+
+# LANTERN_USER_ID was how a node was enrolled before anyone could run one. Say
+# so rather than drop it silently.
+warn_user_id() {
 	if [ -n "${LANTERN_USER_ID:-}" ]; then
-		args="--user-id $LANTERN_USER_ID${args:+ $args}"
+		say "LANTERN_USER_ID was ignored: nodes don't need enrolling. To send your user ID anyway, include --user-id $LANTERN_USER_ID in LANTERN_NODE_ARGS with the rest of your flags."
 	fi
-	printf '%s' "$args"
 }
 
 install_macos() {
 	has brew || die "install Homebrew from https://brew.sh first, then run this again"
-	brew install getlantern/tap/lantern-box
-	args=$(node_args)
-	if [ -n "$args" ]; then
-		say "brew services runs the node with default flags. To pass \"$args\", run instead:"
-		say "  lantern-box serve --register $args"
-		return
+	# The formula was called lantern-box. Stop and remove it first: the two
+	# conflict, and its running service would hold the lock on the state
+	# directory that lamplighter's post_install moves to var/lamplighter.
+	if brew list --formula lantern-box >/dev/null 2>&1; then
+		say "Replacing the lantern-box formula with lamplighter, keeping the node's identity."
+		brew services stop lantern-box >/dev/null 2>&1 || true
+		brew uninstall lantern-box
 	fi
-	brew services start lantern-box
-	say "The Lantern node is running. Check it with: brew services info lantern-box"
+	brew install getlantern/tap/lamplighter
+	prefix=$(brew --prefix) || die "couldn't find Homebrew's prefix"
+	[ -n "$prefix" ] || die "couldn't find Homebrew's prefix"
+	# The formula's service reads its flags from here, since brew services
+	# can't pass them.
+	if node_args_given; then
+		mkdir -p "$prefix/etc"
+		printf '%s\n' "$LANTERN_NODE_ARGS" >"$prefix/etc/lamplighter.args"
+	fi
+	# Restarting picks up an upgrade and new flags, and starts the service if
+	# it isn't running.
+	brew services restart lamplighter
+	say "The Lantern node is running. Check it with: brew services info lamplighter"
+	if node_args_given && [ -n "$LANTERN_NODE_ARGS" ]; then
+		say "Its flags are saved in $prefix/etc/lamplighter.args."
+	elif node_args_given; then
+		say "Its flags are cleared."
+	else
+		say "To give it flags, put them in $prefix/etc/lamplighter.args and run: brew services restart lamplighter"
+	fi
+	warn_user_id
 }
 
 latest_tag() {
 	# Lamplighter releases are the ones the Homebrew formula names, so Linux
 	# and Homebrew installs get the same version. GitHub's latest release is
 	# the proxy fleet's, which can differ.
-	formula="https://raw.githubusercontent.com/getlantern/homebrew-tap/main/Formula/lantern-box.rb"
+	formula="https://raw.githubusercontent.com/getlantern/homebrew-tap/main/Formula/lamplighter.rb"
 	text=$(curl -fsSL "$formula") ||
 		die "couldn't read the latest Lamplighter release from $formula. Set LANTERN_BOX_VERSION to a release tag."
 	version=$(printf '%s\n' "$text" | sed -n 's/^  version "\([0-9][0-9.]*\)"$/\1/p' | head -n 1)
@@ -134,11 +163,10 @@ install_linux() {
 		;;
 	esac
 
-	args=$(node_args)
-	if [ -n "$args" ]; then
+	if node_args_given; then
 		as_root mkdir -p /etc/lantern-box
 		# Escaped for the double-quoted value systemd's EnvironmentFile reads.
-		escaped=$(printf '%s' "$args" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+		escaped=$(printf '%s' "$LANTERN_NODE_ARGS" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
 		printf 'LANTERN_NODE_ARGS="%s"\n' "$escaped" | as_root tee /etc/lantern-box/node.env >/dev/null
 	fi
 	as_root systemctl daemon-reload
@@ -146,6 +174,7 @@ install_linux() {
 	as_root systemctl restart lantern-node.service
 	say "The Lantern node is running. Check it with: systemctl status lantern-node"
 	say "Its logs: journalctl -u lantern-node -f"
+	warn_user_id
 }
 
 case $(uname -s) in
