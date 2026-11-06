@@ -114,8 +114,6 @@ type node struct {
 	// maps to port, which can differ from it, or port itself without a
 	// mapping. Zero means port.
 	externalPort uint16
-	// mapped says the router forwards the port to the node.
-	mapped bool
 	// newMapper finds the router to map the port on. Nil maps nothing.
 	newMapper func(ctx context.Context) (portMapper, error)
 	newBox    boxFactory
@@ -194,9 +192,9 @@ func (n *node) run(ctx context.Context) error {
 	// open whatever else listens on it to the internet. Like Share My
 	// Connection, the node doesn't hold the port while it isn't serving: a
 	// program that took this random port in between would be reached through
-	// the mapping until the node's next box failed to bind it, which stops
-	// the node and removes the mapping.
-	if err := portFree(n.port); err != nil {
+	// the mapping until the node's next box, whose check stops the node and
+	// removes the mapping.
+	if err := n.checkPort(); err != nil {
 		return err
 	}
 	if m := n.mapPort(ctx); m != nil {
@@ -278,7 +276,6 @@ func (n *node) mapPort(ctx context.Context) portMapper {
 		return nil
 	}
 	n.externalPort = mapping.ExternalPort
-	n.mapped = true
 	m.StartRenewal(ctx)
 	log.Info("node: the router maps TCP port ", mapping.ExternalPort, " to port ", n.port, " (", mapping.Method, ")")
 	return m
@@ -288,17 +285,14 @@ func (n *node) mapPort(ctx context.Context) portMapper {
 var errPortInUse = errors.New("the node's port is in use by another program; choose another with --port")
 
 // checkPort reports errPortInUse if another program listens on the node's
-// port. With a mapping it checks every local IPv4 address as well as all of
-// them: the router forwards to one of them, which needn't be the one
-// portforward reports (NAT-PMP forwards to whichever faces the gateway), and
-// on macOS and the BSDs a program can listen on a single address beside a
-// check on all of them.
+// port. It checks every local IPv4 address as well as all of them: a router
+// forwards to one of them, which needn't be the one portforward reports
+// (NAT-PMP forwards to whichever faces the gateway), and on macOS and the
+// BSDs a program can listen on a single address beside a check on all of
+// them.
 func (n *node) checkPort() error {
 	if err := portFree(n.port); err != nil {
 		return err
-	}
-	if !n.mapped {
-		return nil
 	}
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
@@ -345,7 +339,9 @@ func bindsPort(err error, port uint16) bool {
 			return tcp.Port == int(port)
 		}
 	}
-	return regexp.MustCompile(`:` + strconv.Itoa(int(port)) + `(\D|$)`).MatchString(err.Error())
+	// Bracketed IPv6 addresses can hold the port's digits, as in [fd00:443::1].
+	text := regexp.MustCompile(`\[[^\]]*\]`).ReplaceAllString(err.Error(), "[]")
+	return regexp.MustCompile(`:` + strconv.Itoa(int(port)) + `(\D|$)`).MatchString(text)
 }
 
 // wsaeaddrinuse is Windows' "address in use", which syscall.EADDRINUSE isn't

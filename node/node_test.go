@@ -759,7 +759,7 @@ func TestNodeWontForwardToAProgramOnTheMappedAddress(t *testing.T) {
 	require.ErrorIs(t, n.run(ctx), errPortInUse)
 	mapper.mu.Lock()
 	defer mapper.mu.Unlock()
-	assert.Equal(t, len(mapper.mapped) > 0, mapper.unmapped, "a mapping made is removed")
+	assert.Empty(t, mapper.mapped, "the router is never asked")
 	calls, _, _, _ := cloud.snapshot()
 	assert.Empty(t, calls, "nothing was registered")
 }
@@ -844,4 +844,7 @@ func TestBindsPort(t *testing.T) {
 	assert.True(t, bindsPort(errors.New("listen tcp 0.0.0.0:443: bind: address already in use"), 443))
 	assert.False(t, bindsPort(errors.New("listen tcp 0.0.0.0:4430: bind: address already in use"), 443))
 	assert.True(t, bindsPort(errors.New("listen tcp [::]:443"), 443))
+	assert.False(t, bindsPort(errors.New("listen tcp [fd00:443::1]:30001: bind: address already in use"), 443),
+		"digits inside an IPv6 address aren't the port")
+	assert.True(t, bindsPort(errors.New("listen tcp [fd00:443::1]:443: bind: address already in use"), 443))
 }
