@@ -61,12 +61,13 @@ jobs:
             echo "::error file=README.docker.md::Docker Hub description is $bytes bytes; the limit is 25000."
             exit 1
           fi
+      # Outside the checkout, which GoReleaser needs to be clean.
       - uses: actions/download-artifact@v4
         with:
           name: lantern-box-darwin
-          path: build/
+          path: ${{ runner.temp }}/darwin
       - name: Make the macOS binaries executable
-        run: chmod +x build/lantern-box-darwin-*
+        run: chmod +x "$RUNNER_TEMP"/darwin/lantern-box-darwin-*
       - uses: actions/setup-go@v6
         with:
           go-version-file: "go.mod"
@@ -97,6 +98,7 @@ jobs:
           # fleet, as an unlabelled merge does.
           FLEET_RELEASE: ${{ inputs.fleet && 'true' || 'false' }}
           LAMPLIGHTER_RELEASE: ${{ inputs.lamplighter && 'true' || 'false' }}
+          DARWIN_BUILD_DIR: ${{ runner.temp }}/darwin
 
       # Under Reflog's Option B the packer image no longer bakes in a
       # specific lantern-box version — cloud-init installs the target

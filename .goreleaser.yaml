@@ -60,7 +60,9 @@ builds:
     binary: lantern-box
 
   # The macOS binaries need cgo (the Outline SDK's DNS lookups), so
-  # release.yaml builds them on a macOS runner into build/.
+  # release.yaml builds them on a macOS runner and hands them over in
+  # DARWIN_BUILD_DIR, outside the checkout: GoReleaser refuses to release
+  # from a tree with untracked files.
   - id: darwin
     builder: prebuilt
     goos:
@@ -71,7 +73,7 @@ builds:
     goamd64:
       - v1
     prebuilt:
-      path: build/lantern-box-{{ .Os }}-{{ .Arch }}
+      path: '{{ envOrDefault "DARWIN_BUILD_DIR" "build" }}/lantern-box-{{ .Os }}-{{ .Arch }}'
     binary: lantern-box
 
 archives:
