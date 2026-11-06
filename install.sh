@@ -110,8 +110,10 @@ install_linux() {
 	case $pkg in
 	# Downgrades are allowed so LANTERN_BOX_VERSION can pin an older release.
 	*.deb) as_root apt-get install -y --allow-downgrades "$tmp/$pkg" ;;
-	# The package has no dependencies, so rpm needs no package manager.
-	*.rpm) as_root rpm -U --oldpackage --replacepkgs "$tmp/$pkg" ;;
+	# The package has no dependencies, so rpm needs no package manager. It's
+	# unsigned, so rpm can't check a signature, which newer Fedora enforces,
+	# but it matched the release's checksum above.
+	*.rpm) as_root rpm -U --oldpackage --replacepkgs --nosignature "$tmp/$pkg" ;;
 	*)
 		tar -xzf "$tmp/$pkg" -C "$tmp"
 		as_root install -m 0755 "$tmp/lantern-box" /usr/bin/lantern-box
