@@ -51,6 +51,26 @@ func TestFlagsFileSetsFlags(t *testing.T) {
 	assert.Equal(t, 30*time.Minute, rotation)
 }
 
+// Comments are cut where a shell would cut them, and Windows line endings
+// don't end up in values.
+func TestFlagsFileCommentsAndLineEndings(t *testing.T) {
+	path := writeFlagsFile(t, "--max-peers 5  # five peers\r\n"+
+		"--user-id \"tag #1\"\r\n"+
+		"--bandwidth-limit 10mbit#not-a-comment\r\n"+
+		"--api-url a\\ #b\r\n")
+	fs := serveFlagsWith(t, "--register")
+	require.NoError(t, applyFlagsFile(fs, path))
+
+	peers, _ := fs.GetInt("max-peers")
+	user, _ := fs.GetString("user-id")
+	limit, _ := fs.GetString("bandwidth-limit")
+	api, _ := fs.GetString("api-url")
+	assert.Equal(t, 5, peers, "a trailing comment and a CRLF are dropped")
+	assert.Equal(t, "tag #1", user, "a # inside quotes is kept")
+	assert.Equal(t, "10mbit#not-a-comment", limit, "a # inside a word is kept")
+	assert.Equal(t, "a #b", api, "an escaped space keeps the # in the word")
+}
+
 func TestFlagsFileLosesToCommandLine(t *testing.T) {
 	path := writeFlagsFile(t, "--max-peers 5 --state-dir /from/file")
 	fs := serveFlagsWith(t, "--register", "--max-peers", "3", "--state-dir", "/from/cli")
