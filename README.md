@@ -77,7 +77,7 @@ How you set them depends on how the node runs:
 - **Homebrew:** put them in `$(brew --prefix)/etc/lamplighter.args` and run `brew services restart lamplighter`.
 - **Docker:** stop and remove the container, then run it again with them after `--state-dir /var/lib/lantern-node`.
 
-On Linux, systemd splits them at whitespace and respects quotes. The Homebrew file is only split at whitespace, so there no value can contain a space or a quote.
+On Linux, systemd splits them at whitespace and respects quotes. The Homebrew file is only split at whitespace, so a value there can't contain a space or a quote.
 
 The node keeps its identity and port in `node.json` in its state directory: `/var/lib/lantern-node` for the systemd service, `$(brew --prefix)/var/lamplighter` for Homebrew, and `lantern-box` in your user config directory otherwise. To start over as a new node on a new port, stop the node and delete it.
 

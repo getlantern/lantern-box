@@ -202,24 +202,22 @@ brews:
       bin.install "lantern-box"
       bin.install_symlink bin/"lantern-box" => "lamplighter"
     # The formula was named lantern-box, with the node's state in
-    # var/lantern-node and its flags in etc/lantern-node.args. Move them, so a
-    # node upgraded from it keeps its identity, port and flags.
+    # var/lantern-node. Move it, so a node upgraded from it keeps its identity
+    # and port. That formula never had a flags file.
     post_install: |
-      { var/"lantern-node" => var/"lamplighter", etc/"lantern-node.args" => etc/"lamplighter.args" }.each do |old, new|
-        # exist? follows symlinks, so a dangling one would look absent.
-        next unless old.exist? || old.symlink?
-        next if new.exist? || new.symlink?
-
-        old.rename(new)
-      end
+      (var/"lantern-node").rename(var/"lamplighter") if (var/"lantern-node").directory? && !(var/"lamplighter").exist?
+    # Both install bin/lantern-box, so installing one over the other fails up
+    # front rather than at the link step.
+    conflicts:
+      - lantern-box
     # brew services can't pass flags, so the service reads them from
     # etc/lamplighter.args, which install.sh writes, split at whitespace.
     # Unlike systemd with the Linux unit's LANTERN_NODE_ARGS, it doesn't
-    # interpret quotes, so no value there can contain a space or a quote.
-    # set -f stops the shell from expanding them as file patterns. A missing file means no
-    # flags. One that can't be read, a dangling symlink included, fails the
-    # start with cat's error in the log, and keep_alive retries it, so the node
-    # never runs without the flags its operator set.
+    # interpret quotes, so a value there can't contain a space or a quote.
+    # set -f stops the shell from expanding them as file patterns. A missing
+    # file means no flags. One that can't be read, a dangling symlink included,
+    # fails the start with cat's error in the log, and keep_alive retries it, so
+    # the node never runs without the flags its operator set.
     service: |
       run ["/bin/sh", "-c", "set -f; a=; if [ -e \"$2\" ] || [ -L \"$2\" ]; then a=$(cat \"$2\") || exit 1; fi; exec \"$0\" serve --register --state-dir \"$1\" $a", opt_bin/"lantern-box", var/"lamplighter", etc/"lamplighter.args"]
       keep_alive true

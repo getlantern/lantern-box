@@ -10,7 +10,7 @@
 #                       want, or set it empty to clear them. Unset, as when you
 #                       rerun this to upgrade, the flags set before stay. On
 #                       Linux, systemd respects quotes in them; Homebrew's
-#                       service doesn't, so there no value can contain a space
+#                       service doesn't, so a value there can't contain a space
 #                       or a quote.
 #   LANTERN_BOX_VERSION a release tag such as v0.0.203 (default: the latest
 #                       Lamplighter release, which the Homebrew formula names)
