@@ -1,5 +1,6 @@
 /data/
 /dist/
+/build/
 **/.DS_Store
 cmd/cmd
 cmd/*.mmdb

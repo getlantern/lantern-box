@@ -36,17 +36,22 @@ jobs:
       # Every merge is tagged and published, so clients can depend on it, but
       # only a merged PR labelled `release` rolls the proxy fleet:
       # lantern-cloud's hot-swap follows GitHub's latest release, and only
-      # that release is marked latest. Looked up before tagging so a failed
-      # lookup leaves nothing half-released.
-      - name: Check for release label
+      # that release is marked latest. Likewise only a PR labelled
+      # `release-lamplighter` updates Lamplighter nodes, through the Homebrew
+      # formula that install.sh also reads. Looked up before tagging so a
+      # failed lookup leaves nothing half-released.
+      - name: Check for release labels
         id: labels
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          fleet=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
-            --jq '[.[] | select(.merged_at != null) | .labels[].name] | any(. == "release")')
+          labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq '[.[] | select(.merged_at != null) | .labels[].name]')
+          fleet=$(jq 'any(. == "release")' <<< "$labels")
+          lamplighter=$(jq 'any(. == "release-lamplighter")' <<< "$labels")
           echo "fleet=$fleet" >> "$GITHUB_OUTPUT"
-          echo "fleet release: $fleet"
+          echo "lamplighter=$lamplighter" >> "$GITHUB_OUTPUT"
+          echo "fleet release: $fleet, lamplighter release: $lamplighter"
 
       - name: Bump patch version and tag
         id: tag
@@ -85,8 +90,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_REF: ${{ steps.tag.outputs.next }}
           FLEET: ${{ steps.labels.outputs.fleet }}
+          LAMPLIGHTER: ${{ steps.labels.outputs.lamplighter }}
         run: |
-          gh workflow run release.yaml --ref "$RELEASE_REF" -f fleet="$FLEET"
+          gh workflow run release.yaml --ref "$RELEASE_REF" -f fleet="$FLEET" -f lamplighter="$LAMPLIGHTER"
           # The versioned sing-box image that lantern-cloud pins triangle
           # backends to, and for a fleet release sing-box:latest. A
           # GITHUB_TOKEN tag push doesn't trigger push.yaml.

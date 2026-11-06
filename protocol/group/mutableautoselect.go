@@ -73,10 +73,13 @@ type MutableAutoSelect struct {
 	members      isync.TypedMap[string, A.Outbound]
 	urlOverrides map[string]string
 	defaultURL   string
-	histories    map[string]*localHistory
-	cfg          mutableAutoSelectConfig
-	hist         historyParams
-	history      adapter.AutoSelectHistoryStorage
+	// probeTimeouts overrides behaviorFor's probe timeout by outbound type.
+	// SetProbeTimeouts writes it without access held, so it is swapped whole.
+	probeTimeouts atomic.Pointer[map[string]time.Duration]
+	histories     map[string]*localHistory
+	cfg           mutableAutoSelectConfig
+	hist          historyParams
+	history       adapter.AutoSelectHistoryStorage
 
 	// Scratch buffers reused across calls by rankLocked and splitHealthyForLocked
 	// to avoid per-dial allocation; guarded by access, which their callers hold
@@ -241,7 +244,42 @@ func NewMutableAutoSelect(ctx context.Context, _ A.Router, logger log.ContextLog
 	}
 	out.initProbeState()
 	out.registerProbePauseCallback()
+	out.SetProbeTimeouts(options.ProbeTimeoutsMs)
 	return out, nil
+}
+
+// Probe timeout overrides outside these bounds are ignored: shorter fails a
+// healthy member before a handshake can finish, longer holds up a probe wave.
+const (
+	minProbeTimeoutOverride = 250 * time.Millisecond
+	maxProbeTimeoutOverride = 60 * time.Second
+)
+
+// SetProbeTimeouts replaces the per-protocol probe timeout overrides; see
+// option.MutableAutoSelectOutboundOptions.ProbeTimeoutsMs. Probes already
+// running keep the timeout they started with.
+func (s *MutableAutoSelect) SetProbeTimeouts(timeoutsMs map[string]uint32) {
+	overrides := make(map[string]time.Duration, len(timeoutsMs))
+	for typ, ms := range timeoutsMs {
+		d := time.Duration(ms) * time.Millisecond
+		if d < minProbeTimeoutOverride || d > maxProbeTimeoutOverride {
+			s.logger.WarnContext(s.ctx, "ignoring probe timeout override for ", typ, ": ", d)
+			continue
+		}
+		overrides[typ] = d
+	}
+	s.probeTimeouts.Store(&overrides)
+}
+
+// behavior is behaviorFor with the group's probe timeout overrides applied.
+func (s *MutableAutoSelect) behavior(outboundType string) protocolBehavior {
+	beh := behaviorFor(outboundType)
+	if p := s.probeTimeouts.Load(); p != nil {
+		if d, ok := (*p)[outboundType]; ok && !beh.excludeFromPool {
+			beh.probeTimeout = d
+		}
+	}
+	return beh
 }
 
 func resolveHistoryStorage(ctx context.Context) adapter.AutoSelectHistoryStorage {
@@ -876,7 +914,7 @@ func (s *MutableAutoSelect) rankLocked(now time.Time) []rankedCandidate {
 		if !ok {
 			continue
 		}
-		beh := behaviorFor(o.Type())
+		beh := s.behavior(o.Type())
 		if beh.excludeFromPool {
 			continue
 		}

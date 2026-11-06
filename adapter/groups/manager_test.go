@@ -672,3 +672,48 @@ func (m *mockAddReplacerGroup) Replace(tags ...string) (int, error) {
 	m.replaced = append(m.replaced, tags...)
 	return len(tags), nil
 }
+
+type mockProbeTimeoutGroup struct {
+	lbAdapter.MutableOutboundGroup
+	timeouts map[string]uint32
+}
+
+func (m *mockProbeTimeoutGroup) SetProbeTimeouts(timeoutsMs map[string]uint32) {
+	m.timeouts = timeoutsMs
+}
+
+func TestSetProbeTimeouts(t *testing.T) {
+	logger := log.NewNOPFactory().Logger()
+	newMgr := func(groups map[string]lbAdapter.MutableOutboundGroup) *MutableGroupManager {
+		return &MutableGroupManager{
+			groups: groups,
+			removalQueue: newRemovalQueue(
+				logger, &mockOutboundManager{}, &mockEndpointManager{}, &mockConnectionManager{},
+				pollInterval, forceAfter,
+			),
+		}
+	}
+
+	t.Run("delegates to ProbeTimeoutSetter group", func(t *testing.T) {
+		mock := &mockProbeTimeoutGroup{}
+		timeouts := map[string]uint32{"hysteria2x": 3000}
+		require.NoError(t, newMgr(map[string]lbAdapter.MutableOutboundGroup{"auto": mock}).SetProbeTimeouts("auto", timeouts))
+		assert.Equal(t, timeouts, mock.timeouts)
+	})
+
+	t.Run("error when group not found", func(t *testing.T) {
+		err := newMgr(map[string]lbAdapter.MutableOutboundGroup{}).SetProbeTimeouts("missing", nil)
+		assert.ErrorContains(t, err, "not found")
+	})
+
+	t.Run("error when group does not support probe timeouts", func(t *testing.T) {
+		err := newMgr(map[string]lbAdapter.MutableOutboundGroup{"plain": &mockPlainGroup{}}).SetProbeTimeouts("plain", nil)
+		assert.ErrorContains(t, err, "does not support probe timeouts")
+	})
+
+	t.Run("error when manager is closed", func(t *testing.T) {
+		mgr := newMgr(map[string]lbAdapter.MutableOutboundGroup{"auto": &mockProbeTimeoutGroup{}})
+		mgr.closed.Store(true)
+		assert.ErrorIs(t, mgr.SetProbeTimeouts("auto", nil), ErrIsClosed)
+	})
+}

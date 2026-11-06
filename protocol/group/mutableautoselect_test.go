@@ -2267,3 +2267,33 @@ func TestCloseConcurrentWithPauseEvents(t *testing.T) {
 		require.Nil(t, s.pauseCallback)
 	}
 }
+
+func TestProbeTimeoutOverrides(t *testing.T) {
+	out, err := NewMutableAutoSelect(context.Background(), nil, log.NewNOPFactory().Logger(), "g",
+		option.MutableAutoSelectOutboundOptions{ProbeTimeoutsMs: map[string]uint32{
+			lConst.TypeHysteria2X: 3000,
+			C.TypeShadowsocks:     100,    // under the floor
+			lConst.TypeSamizdat:   120000, // over the ceiling
+		}})
+	require.NoError(t, err)
+	s := out.(*MutableAutoSelect)
+
+	assert.Equal(t, 3*time.Second, s.behavior(lConst.TypeHysteria2X).probeTimeout, "the override replaces the built-in 1.5s")
+	assert.Equal(t, behaviorFor(C.TypeShadowsocks).probeTimeout, s.behavior(C.TypeShadowsocks).probeTimeout,
+		"an override below the floor is ignored")
+	assert.Equal(t, behaviorFor(lConst.TypeSamizdat).probeTimeout, s.behavior(lConst.TypeSamizdat).probeTimeout,
+		"an override above the ceiling is ignored")
+	assert.Equal(t, behaviorFor(C.TypeVLESS).probeTimeout, s.behavior(C.TypeVLESS).probeTimeout,
+		"an unlisted type keeps its built-in timeout")
+
+	s.SetProbeTimeouts(map[string]uint32{C.TypeVLESS: 4000})
+	assert.Equal(t, behaviorFor(lConst.TypeHysteria2X).probeTimeout, s.behavior(lConst.TypeHysteria2X).probeTimeout,
+		"SetProbeTimeouts replaces the set, so a type it drops reverts to its default")
+	assert.Equal(t, 4*time.Second, s.behavior(C.TypeVLESS).probeTimeout)
+
+	s.SetProbeTimeouts(nil)
+	assert.Equal(t, behaviorFor(C.TypeVLESS).probeTimeout, s.behavior(C.TypeVLESS).probeTimeout)
+
+	tor := s.behavior(C.TypeTor)
+	assert.True(t, tor.excludeFromPool, "an override never brings an excluded type into the pool")
+}

@@ -149,7 +149,7 @@ func (s *MutableAutoSelect) requestProbesLocked(tags []string, need probeNeed, o
 		if !ok {
 			continue
 		}
-		beh := behaviorFor(out.Type())
+		beh := s.behavior(out.Type())
 		if beh.excludeFromPool || (ordinaryOnly && beh.lastResort) {
 			continue
 		}
@@ -200,7 +200,7 @@ func (s *MutableAutoSelect) dispatchProbesLocked() {
 		if !ok {
 			continue
 		}
-		beh := behaviorFor(out.Type())
+		beh := s.behavior(out.Type())
 		if beh.excludeFromPool {
 			state.need = probeNotNeeded
 			continue
@@ -401,7 +401,7 @@ func (s *MutableAutoSelect) newProbeWaiterLocked(filtered bool) *probeWaiter {
 		if !ok {
 			continue
 		}
-		beh := behaviorFor(out.Type())
+		beh := s.behavior(out.Type())
 		state := s.probeMembers[tag]
 		if beh.excludeFromPool || beh.lastResort || state == nil {
 			continue
@@ -501,7 +501,7 @@ func (s *MutableAutoSelect) evaluateProbesLocked(waiter *probeWaiter) {
 	for _, tag := range s.tags {
 		out, ok := s.members.Load(tag)
 		state := s.probeMembers[tag]
-		if !ok || state == nil || state.outcome == nil || behaviorFor(out.Type()).lastResort || s.stuckProbeLocked(out) {
+		if !ok || state == nil || state.outcome == nil || s.behavior(out.Type()).lastResort || s.stuckProbeLocked(out) {
 			continue
 		}
 		outcome := state.outcome
@@ -648,7 +648,7 @@ func (s *MutableAutoSelect) requestFailureConfirmation(tag, replacement string, 
 		return
 	}
 	out, ok := s.members.Load(tag)
-	if !ok || behaviorFor(out.Type()).excludeFromPool || probe.ValidateURL(s.probeURLForLocked(tag)) != nil {
+	if !ok || s.behavior(out.Type()).excludeFromPool || probe.ValidateURL(s.probeURLForLocked(tag)) != nil {
 		return
 	}
 	s.requestProbesLocked([]string{tag}, probeForced, false)
