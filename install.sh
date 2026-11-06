@@ -70,7 +70,14 @@ install_linux() {
 	*) die "unsupported CPU $(uname -m): lantern-box ships for amd64 and arm64" ;;
 	esac
 	has curl || die "install curl first"
-	has systemctl || die "this installer needs systemd. Download a release from https://github.com/$repo/releases and run: lantern-box serve --register"
+	manual="Download a release from https://github.com/$repo/releases and run: lantern-box serve --register"
+	has systemctl || die "this installer needs systemd. $manual"
+	# The lantern-node unit's DynamicUser and StateDirectory need systemd 235.
+	systemd=$(systemctl --version | awk 'NR == 1 { print $2 }')
+	case $systemd in
+	'' | *[!0-9]*) die "couldn't read the systemd version. $manual" ;;
+	esac
+	[ "$systemd" -ge 235 ] || die "this installer needs systemd 235 or later, not $systemd. $manual"
 
 	tag=${LANTERN_BOX_VERSION:-$(latest_tag)}
 	version=${tag#v}

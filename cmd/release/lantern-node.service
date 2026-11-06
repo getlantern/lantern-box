@@ -8,6 +8,9 @@ After=network-online.target nss-lookup.target
 # A node needs no privileges: it listens on a high port and maps it on the
 # router over UPnP, NAT-PMP or PCP. CAP_NET_BIND_SERVICE only matters if the
 # operator picks a port below 1024 with --port.
+# Needs systemd 235 or later. StateDirectory creates /var/lib/lantern-node,
+# named in ExecStart rather than through $STATE_DIRECTORY, which only systemd
+# 240 sets.
 DynamicUser=yes
 StateDirectory=lantern-node
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -16,7 +19,7 @@ NoNewPrivileges=yes
 # Extra serve flags, such as LANTERN_NODE_ARGS="--user-id 123 --bandwidth-limit 10mbit".
 # The leading dash makes the file optional.
 EnvironmentFile=-/etc/lantern-box/node.env
-ExecStart=/usr/bin/lantern-box serve --register --state-dir ${STATE_DIRECTORY} $LANTERN_NODE_ARGS
+ExecStart=/usr/bin/lantern-box serve --register --state-dir /var/lib/lantern-node $LANTERN_NODE_ARGS
 Restart=always
 RestartSec=30s
 LimitNOFILE=infinity

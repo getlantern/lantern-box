@@ -25,7 +25,7 @@ brew install getlantern/tap/lantern-box
 brew services start lantern-box
 ```
 
-**Linux** (Debian, Ubuntu, Fedora, RHEL, openSUSE or any other with systemd, on amd64 or arm64):
+**Linux** (Debian, Ubuntu, Fedora, RHEL 8+, openSUSE or any other with systemd 235 or later, on amd64 or arm64):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/getlantern/lantern-box/main/install.sh | sh
