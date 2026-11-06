@@ -26,6 +26,7 @@ import (
 
 	C "github.com/getlantern/lantern-box/constant"
 	LO "github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/portforward"
 	"github.com/getlantern/lantern-box/protocol/unbounded"
 	"github.com/getlantern/lantern-box/tracker/peerconn"
 )
@@ -43,6 +44,10 @@ const (
 	requestTimeout           = 30 * time.Second
 	minRetry                 = 15 * time.Second
 	maxRetry                 = 5 * time.Minute
+	// portMappingTimeout bounds finding the router and asking it to map the
+	// node's port, so a node with no router to ask, such as a VPS, starts
+	// without much delay.
+	portMappingTimeout = 30 * time.Second
 )
 
 // Config configures a node.
@@ -66,6 +71,10 @@ type Config struct {
 	// RotationInterval is how often the node registers again. Zero means
 	// DefaultRotationInterval.
 	RotationInterval time.Duration
+	// SkipPortMapping stops the node asking its router, through UPnP, NAT-PMP
+	// or PCP, to forward its TCP port, for an operator who forwards it by hand
+	// or has nothing to forward.
+	SkipPortMapping bool
 	// Version is reported to lantern-cloud.
 	Version    string
 	HTTPClient *http.Client
@@ -86,13 +95,26 @@ type session struct {
 	heartbeat time.Duration
 }
 
+// portMapper is the part of portforward.Forwarder a node uses.
+type portMapper interface {
+	MapPort(ctx context.Context, protocol string, internalPort uint16, description string) (*portforward.Mapping, error)
+	StartRenewal(ctx context.Context)
+	UnmapPort(ctx context.Context) error
+}
+
 type node struct {
-	cfg      Config
-	api      *api
-	port     uint16
-	newBox   boxFactory
-	clients  *clientCounter
-	rotation time.Duration
+	cfg  Config
+	api  *api
+	port uint16
+	// externalPort is the port clients reach the node at: the one the router
+	// maps to port, which can differ from it, or port itself without a
+	// mapping. Zero means port.
+	externalPort uint16
+	// newMapper finds the router to map the port on. Nil maps nothing.
+	newMapper func(ctx context.Context) (portMapper, error)
+	newBox    boxFactory
+	clients   *clientCounter
+	rotation  time.Duration
 	// heartbeatOverride replaces lantern-cloud's interval in tests.
 	heartbeatOverride time.Duration
 }
@@ -151,6 +173,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if n.rotation <= 0 {
 		n.rotation = DefaultRotationInterval
 	}
+	n.newMapper = mapperFor(cfg)
 	// The device ID authorizes deregistering the node's route, so only a
 	// fingerprint of it is logged.
 	sum := sha256.Sum256([]byte(st.DeviceID))
@@ -161,6 +184,15 @@ func Run(ctx context.Context, cfg Config) error {
 func (n *node) run(ctx context.Context) error {
 	peerconn.SetListener(n.clients.listen)
 	defer peerconn.SetListener(nil)
+	if m := n.mapPort(ctx); m != nil {
+		defer func() {
+			uctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+			defer cancel()
+			if err := m.UnmapPort(uctx); err != nil {
+				log.Warn("node: remove router mapping: ", err)
+			}
+		}()
+	}
 
 	retry := minRetry
 	for {
@@ -199,11 +231,64 @@ func (n *node) start(ctx context.Context) (*session, error) {
 	return s, nil
 }
 
+// mapPort asks the node's router to forward a TCP port to its inbound, so
+// clients can reach a node at home, and keeps the mapping renewed. It returns
+// nil, and the node is reached on its own port, when there's no router to ask
+// or it refuses: a node on a public address, or one whose operator forwards
+// the port by hand, needs no mapping.
+func (n *node) mapPort(ctx context.Context) portMapper {
+	if n.newMapper == nil {
+		return nil
+	}
+	mctx, cancel := context.WithTimeout(ctx, portMappingTimeout)
+	defer cancel()
+	m, err := n.newMapper(mctx)
+	if err != nil {
+		log.Info("node: no router to map port ", n.port, " on (", err, "), so clients must reach it directly")
+		return nil
+	}
+	mapping, err := m.MapPort(mctx, portforward.TCP, n.port, "Lantern node")
+	if err != nil {
+		log.Warn("node: the router didn't map port ", n.port, " (", err, "), so clients must reach it directly")
+		return nil
+	}
+	n.externalPort = mapping.ExternalPort
+	m.StartRenewal(ctx)
+	log.Info("node: the router maps TCP port ", mapping.ExternalPort, " to port ", n.port, " (", mapping.Method, ")")
+	return m
+}
+
+// clientPort is the port clients reach the node at.
+func (n *node) clientPort() uint16 {
+	if n.externalPort != 0 {
+		return n.externalPort
+	}
+	return n.port
+}
+
+// mapperFor is how a node with cfg finds its router, or nil to map nothing.
+func mapperFor(cfg Config) func(context.Context) (portMapper, error) {
+	if cfg.SkipPortMapping {
+		return nil
+	}
+	return newPortForwarder
+}
+
+// newPortForwarder returns a nil interface, not a nil *Forwarder, when there's
+// no router to ask.
+func newPortForwarder(ctx context.Context) (portMapper, error) {
+	f, err := portforward.NewForwarder(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
 func (n *node) register(ctx context.Context) (*registerResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	return n.api.register(ctx, registerRequest{
-		ExternalPort:           n.port,
+		ExternalPort:           n.clientPort(),
 		InternalPort:           n.port,
 		ServePool:              true,
 		RunsUnboundedVolunteer: true,
@@ -231,7 +316,7 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 	defer cancel()
 	if err := n.api.verify(vctx, resp.RouteID); err != nil {
 		_ = b.Close()
-		return nil, fmt.Errorf("%w (is port %d reachable from the internet?)", err, n.port)
+		return nil, fmt.Errorf("%w (is TCP port %d reachable from the internet?)", err, n.clientPort())
 	}
 	heartbeat := time.Duration(resp.HeartbeatIntervalSeconds) * time.Second
 	if heartbeat <= 0 {

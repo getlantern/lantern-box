@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,7 @@ import (
 	box "github.com/getlantern/lantern-box"
 	C "github.com/getlantern/lantern-box/constant"
 	LO "github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/portforward"
 	"github.com/getlantern/lantern-box/tracker/peerconn"
 )
 
@@ -541,4 +543,102 @@ func TestNewSingBoxRunsVolunteer(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("box did not close")
 	}
+}
+
+// fakeMapper stands in for the router: it grants external, or fails with
+// mapErr.
+type fakeMapper struct {
+	external uint16
+	mapErr   error
+
+	mu       sync.Mutex
+	mapped   []uint16
+	renewing bool
+	unmapped bool
+}
+
+func (f *fakeMapper) MapPort(_ context.Context, protocol string, internalPort uint16, _ string) (*portforward.Mapping, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if protocol != portforward.TCP {
+		return nil, fmt.Errorf("unexpected protocol %s", protocol)
+	}
+	f.mapped = append(f.mapped, internalPort)
+	if f.mapErr != nil {
+		return nil, f.mapErr
+	}
+	return &portforward.Mapping{ExternalPort: f.external, InternalPort: internalPort, Protocol: protocol, Method: "UPnP"}, nil
+}
+
+func (f *fakeMapper) StartRenewal(context.Context) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renewing = true
+}
+
+func (f *fakeMapper) UnmapPort(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unmapped = true
+	return nil
+}
+
+// A node at home asks its router to forward its TCP port, registers the port
+// the router grants, which can differ from its own, keeps the mapping renewed,
+// and removes it when it stops.
+func TestNodeMapsItsPort(t *testing.T) {
+	cloud := &fakeCloud{t: t}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{})
+	mapper := &fakeMapper{external: 40001}
+	n.newMapper = func(context.Context) (portMapper, error) { return mapper, nil }
+
+	stop := runNode(t, n)
+	require.Eventually(t, func() bool {
+		_, _, hb, _ := cloud.snapshot()
+		return len(hb) >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+	stop()
+
+	_, registers, _, _ := cloud.snapshot()
+	require.NotEmpty(t, registers)
+	assert.Equal(t, uint16(40001), registers[0].ExternalPort, "clients reach the port the router maps")
+	assert.Equal(t, uint16(24680), registers[0].InternalPort, "the inbound listens on the node's own port")
+	mapper.mu.Lock()
+	defer mapper.mu.Unlock()
+	assert.Equal(t, []uint16{24680}, mapper.mapped)
+	assert.True(t, mapper.renewing, "the mapping is kept renewed")
+	assert.True(t, mapper.unmapped, "the mapping is removed when the node stops")
+}
+
+// With no router to ask, or one that refuses, the node registers its own port
+// and serves as before.
+func TestNodeServesWithoutAMapping(t *testing.T) {
+	for name, newMapper := range map[string]func(context.Context) (portMapper, error){
+		"no router":      func(context.Context) (portMapper, error) { return nil, errors.New("no gateway") },
+		"router refuses": func(context.Context) (portMapper, error) { return &fakeMapper{mapErr: errors.New("conflict")}, nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cloud := &fakeCloud{t: t}
+			n := newTestNode(t, cloud, &fakeBoxes{}, Config{})
+			n.newMapper = newMapper
+			stop := runNode(t, n)
+			require.Eventually(t, func() bool {
+				_, _, hb, _ := cloud.snapshot()
+				return len(hb) >= 1
+			}, 5*time.Second, 10*time.Millisecond)
+			stop()
+			_, registers, _, _ := cloud.snapshot()
+			require.NotEmpty(t, registers)
+			assert.Equal(t, uint16(24680), registers[0].ExternalPort)
+			assert.Equal(t, uint16(24680), registers[0].InternalPort)
+		})
+	}
+}
+
+// --no-port-mapping leaves the router alone; otherwise the node asks it.
+func TestMapperFor(t *testing.T) {
+	assert.Nil(t, mapperFor(Config{SkipPortMapping: true}))
+	assert.NotNil(t, mapperFor(Config{}))
+	assert.Nil(t, (&node{}).mapPort(context.Background()), "with no mapper nothing is mapped")
 }
