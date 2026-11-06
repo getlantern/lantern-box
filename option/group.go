@@ -1,6 +1,10 @@
 package option
 
-import "github.com/sagernet/sing/common/json/badoption"
+import (
+	"encoding/json"
+
+	"github.com/sagernet/sing/common/json/badoption"
+)
 
 type FallbackOutboundOptions struct {
 	// Primary and Fallback are the tags of the primary and fallback outbounds.
@@ -27,6 +31,12 @@ type MutableAutoSelectOutboundOptions struct {
 	Outbounds    []string          `json:"outbounds"`
 	URL          string            `json:"url,omitempty"`
 	URLOverrides map[string]string `json:"url_overrides,omitempty"`
+
+	// ProbeTimeoutsMs overrides the probe timeout, in milliseconds, for
+	// members of the given outbound types, e.g. {"hysteria2x": 3000}. A type
+	// not listed, or a value outside 250 to 60000, keeps its built-in
+	// timeout. SetProbeTimeouts replaces the set at runtime.
+	ProbeTimeoutsMs ProbeTimeoutsMs `json:"probe_timeouts_ms,omitempty"`
 
 	// SwitchToleranceMs is the minimum delay improvement (in ms) a
 	// candidate must have over the current selection before the group
@@ -121,4 +131,32 @@ type MutableAutoSelectOutboundOptions struct {
 
 	// ProbeConcurrency caps parallel member probes per batch. Default 6.
 	ProbeConcurrency uint32 `json:"probe_concurrency,omitempty"`
+}
+
+// ProbeTimeoutsMs maps an outbound type to a probe timeout in milliseconds.
+// Decoding it never fails: the value comes from a server, and an entry the
+// client can't use must cost only that override, not the whole config.
+// Entries that aren't a plain integer in uint32 range are dropped, including
+// fractions and exponent forms such as 2.5, 3000.0 and 3e3, and so is a value
+// that isn't an object.
+type ProbeTimeoutsMs map[string]uint32
+
+func (p *ProbeTimeoutsMs) UnmarshalJSON(b []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		*p = nil
+		return nil
+	}
+	out := make(ProbeTimeoutsMs, len(raw))
+	for typ, v := range raw {
+		// Decoding into uint32 checks the JSON number's text exactly, so a
+		// fraction can't round to a whole number on the way in.
+		var ms *uint32
+		if json.Unmarshal(v, &ms) != nil || ms == nil {
+			continue
+		}
+		out[typ] = *ms
+	}
+	*p = out
+	return nil
 }
