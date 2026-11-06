@@ -414,6 +414,9 @@ func startSession(ctx context.Context) bool {
 
 func (c *admittedConn) Close() error {
 	err := c.Conn.Close()
+	// A conn closed before it became a session no longer needs its timer,
+	// which would otherwise hold it until the timeout.
+	c.timer.Stop()
 	c.once.Do(c.id.release)
 	return err
 }
