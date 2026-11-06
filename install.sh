@@ -52,6 +52,14 @@ warn_user_id() {
 
 install_macos() {
 	has brew || die "install Homebrew from https://brew.sh first, then run this again"
+	# The formula was called lantern-box. Stop and remove it first: the two
+	# conflict, and its running service would hold the lock on the state
+	# directory that lamplighter's post_install moves to var/lamplighter.
+	if brew list --formula lantern-box >/dev/null 2>&1; then
+		say "Replacing the lantern-box formula with lamplighter, keeping the node's identity."
+		brew services stop lantern-box >/dev/null 2>&1 || true
+		brew uninstall lantern-box
+	fi
 	brew install getlantern/tap/lamplighter
 	prefix=$(brew --prefix) || die "couldn't find Homebrew's prefix"
 	[ -n "$prefix" ] || die "couldn't find Homebrew's prefix"

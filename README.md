@@ -25,6 +25,8 @@ brew install getlantern/tap/lamplighter
 brew services start lamplighter
 ```
 
+The formula used to be called `lantern-box`. If you installed that one, run `brew services stop lantern-box && brew uninstall lantern-box` first. The new formula moves the node's state over, so it keeps its identity and port. `install.sh` does this for you.
+
 **Linux** (Debian, Ubuntu, Fedora, RHEL 8+, openSUSE or any other with systemd 235 or later, on amd64 or arm64):
 
 ```bash
@@ -88,7 +90,7 @@ The node keeps its identity and port in `node.json` in its state directory: `/va
 | Status | `brew services info lamplighter` | `systemctl status lantern-node` | `docker ps -f name=lantern-node` |
 | Logs | `tail -f $(brew --prefix)/var/log/lamplighter.log` | `journalctl -u lantern-node -f` | `docker logs -f lantern-node` |
 | Stop | `brew services stop lamplighter` | `sudo systemctl disable --now lantern-node` | `docker stop lantern-node && docker rm lantern-node` |
-| Uninstall | `brew uninstall lamplighter`, then delete `$(brew --prefix)/etc/lamplighter.args` and `$(brew --prefix)/var/log/lamplighter.log`, and `$(brew --prefix)/var/lamplighter` to forget the node | `sudo apt remove lantern-box`, `sudo dnf remove lantern-box`, or remove `/usr/bin/lantern-box` and `/etc/systemd/system/lantern-node.service`; then delete `/etc/lantern-box/node.env`, and `/var/lib/private/lantern-node` and `/var/lib/lantern-node` to forget the node | `docker volume rm lantern-node` |
+| Uninstall | `brew uninstall lamplighter`, then delete `$(brew --prefix)/etc/lamplighter.args` and `$(brew --prefix)/var/log/lamplighter.log`, and `$(brew --prefix)/var/lamplighter` (or `var/lantern-node`, from the old formula) to forget the node | `sudo apt remove lantern-box`, `sudo dnf remove lantern-box`, or remove `/usr/bin/lantern-box` and `/etc/systemd/system/lantern-node.service`; then delete `/etc/lantern-box/node.env`, and `/var/lib/private/lantern-node` and `/var/lib/lantern-node` to forget the node | `docker volume rm lantern-node` |
 
 ## Quick Start: Run the Server
 
