@@ -46,8 +46,11 @@ install_macos() {
 	brew install getlantern/tap/lantern-box
 	args=$(node_args)
 	if [ -n "$args" ]; then
-		say "brew services runs the node with default flags. To pass \"$args\", run instead:"
-		say "  lantern-box serve --register $args"
+		# brew services can't pass flags, so the node runs in the foreground,
+		# from the service's state directory so it keeps its identity and port.
+		say "brew services can't pass flags. To run the node with \"$args\", run:"
+		say "  lantern-box serve --register --state-dir \"$(brew --prefix)/var/lantern-node\" $args"
+		say "It runs while that terminal is open. Without flags, brew services start lantern-box runs it at login."
 		return
 	fi
 	brew services start lantern-box
