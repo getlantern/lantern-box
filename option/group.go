@@ -1,6 +1,11 @@
 package option
 
-import "github.com/sagernet/sing/common/json/badoption"
+import (
+	"encoding/json"
+	"math"
+
+	"github.com/sagernet/sing/common/json/badoption"
+)
 
 type FallbackOutboundOptions struct {
 	// Primary and Fallback are the tags of the primary and fallback outbounds.
@@ -32,7 +37,7 @@ type MutableAutoSelectOutboundOptions struct {
 	// members of the given outbound types, e.g. {"hysteria2x": 3000}. A type
 	// not listed, or a value outside 250 to 60000, keeps its built-in
 	// timeout. SetProbeTimeouts replaces the set at runtime.
-	ProbeTimeoutsMs map[string]uint32 `json:"probe_timeouts_ms,omitempty"`
+	ProbeTimeoutsMs ProbeTimeoutsMs `json:"probe_timeouts_ms,omitempty"`
 
 	// SwitchToleranceMs is the minimum delay improvement (in ms) a
 	// candidate must have over the current selection before the group
@@ -127,4 +132,27 @@ type MutableAutoSelectOutboundOptions struct {
 
 	// ProbeConcurrency caps parallel member probes per batch. Default 6.
 	ProbeConcurrency uint32 `json:"probe_concurrency,omitempty"`
+}
+
+// ProbeTimeoutsMs maps an outbound type to a probe timeout in milliseconds.
+// Decoding it never fails: the value comes from a server, and an entry the
+// client can't use must cost only that override, not the whole config.
+// Entries that aren't a whole number in uint32 range are dropped, and so is a
+// value that isn't an object.
+type ProbeTimeoutsMs map[string]uint32
+
+func (p *ProbeTimeoutsMs) UnmarshalJSON(b []byte) error {
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		*p = nil
+		return nil
+	}
+	out := make(ProbeTimeoutsMs, len(raw))
+	for typ, v := range raw {
+		if f, ok := v.(float64); ok && f >= 0 && f <= math.MaxUint32 && f == math.Trunc(f) {
+			out[typ] = uint32(f)
+		}
+	}
+	*p = out
+	return nil
 }
