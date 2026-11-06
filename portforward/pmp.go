@@ -6,9 +6,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackpal/gateway"
@@ -119,7 +119,13 @@ type mapFunc func(protocol string, internalPort, externalPort uint16, lifetime u
 type pmpMappings struct {
 	mu      sync.Mutex
 	granted map[pcpKey]uint32
+	// quiet, when set, is the owning Forwarder's quiet-logs switch.
+	quiet *atomic.Bool
 }
+
+// setQuiet shares the owning Forwarder's quiet-logs switch. Called once, before
+// any mapping is added.
+func (s *pmpMappings) setQuiet(q *atomic.Bool) { s.quiet = q }
 
 type pcpKey struct {
 	protocol     string
@@ -139,21 +145,21 @@ func (s *pmpMappings) add(method string, mapPort mapFunc, protocol string, inter
 		// mapping is already tracked, and teardown removes it.
 		if !renewing && errors.Is(err, errOutcomeUnknown) {
 			if _, _, err := mapPort(protocol, internalPort, externalPort, 0); err != nil {
-				slog.Warn("portforward: could not remove a mapping whose answer was lost", "method", method, "err", err)
+				logWarn(s.quiet != nil && s.quiet.Load(), "portforward: could not remove a mapping whose answer was lost", "method", method, "err", err)
 			}
 		}
 		return err
 	}
 	if got != externalPort {
 		if _, _, err := mapPort(protocol, internalPort, got, 0); err != nil {
-			slog.Warn("portforward: could not remove a mapping on the wrong port", "method", method, "err", err)
+			logWarn(s.quiet != nil && s.quiet.Load(), "portforward: could not remove a mapping on the wrong port", "method", method, "err", err)
 		}
 		s.forget(k)
 		return fmt.Errorf("%s: gateway assigned external port %d, not %d", method, got, externalPort)
 	}
 	if !renewing && granted < minGrantedLease {
 		if _, _, err := mapPort(protocol, internalPort, externalPort, 0); err != nil {
-			slog.Warn("portforward: could not remove a mapping with too short a lease", "method", method, "err", err)
+			logWarn(s.quiet != nil && s.quiet.Load(), "portforward: could not remove a mapping with too short a lease", "method", method, "err", err)
 		}
 		return fmt.Errorf("%s: gateway granted a lease of only %ds", method, granted)
 	}

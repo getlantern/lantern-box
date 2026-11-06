@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	semconv "github.com/getlantern/semconv"
@@ -105,6 +106,8 @@ type Forwarder struct {
 	// localIPControl, if set, is the socket control for the dial that finds the
 	// LAN address to map to. See SetLocalIPControl.
 	localIPControl control.Func
+	// quiet drops addresses and ports from log lines. See SetQuietLogs.
+	quiet atomic.Bool
 }
 
 // SetLocalIPControl has MapPort find the LAN address to map to through a dial
@@ -141,8 +144,9 @@ type portKey struct {
 // discarded after the probe; it holds no goroutines or sockets that need
 // explicit cleanup, so a subsequent NewForwarder call can re-discover
 // without coordination.
-func ProbeUPnP(ctx context.Context) bool {
-	_, err := NewForwarder(ctx)
+func ProbeUPnP(ctx context.Context, opts ...Option) bool {
+	o := applyOptions(opts)
+	_, err := NewForwarder(ctx, opts...)
 	if err != nil {
 		// NewForwarder logs the specifics; these lines exist so the probe's own
 		// verdict is greppable. A bare bool at the call site cannot say whether
@@ -154,13 +158,13 @@ func ProbeUPnP(ctx context.Context) bool {
 		// peer" states a capability verdict the probe did not reach — which is
 		// the kind of thing an operator acts on once and does not revisit.
 		if ctx.Err() != nil {
-			slog.Info("portforward: UPnP probe was canceled or timed out; capability unknown", "err", err)
+			logInfo(o.quiet, "portforward: UPnP probe was canceled or timed out; capability unknown", "err", err)
 		} else {
-			slog.Info("portforward: UPnP probe found no gateway; this network cannot host a peer", "err", err)
+			logInfo(o.quiet, "portforward: UPnP probe found no gateway; this network cannot host a peer", "err", err)
 		}
 		return false
 	}
-	slog.Info("portforward: UPnP probe succeeded")
+	logInfo(o.quiet, "portforward: UPnP probe succeeded")
 	return true
 }
 
@@ -174,7 +178,8 @@ func ProbeUPnP(ctx context.Context) bool {
 // a usable gateway. If ctx was canceled or its deadline expired during
 // discovery, the ctx error is returned verbatim so callers can distinguish
 // "this network can't host a peer" from "we ran out of time, retry later".
-func NewForwarder(ctx context.Context) (*Forwarder, error) {
+func NewForwarder(ctx context.Context, opts ...Option) (*Forwarder, error) {
+	o := applyOptions(opts)
 	// Both discovery errors were previously discarded by the `err == nil &&
 	// c != nil` guards, which made a failure indistinguishable from "this
 	// network has no gateway" — and the success path logs the method it chose
@@ -183,31 +188,42 @@ func NewForwarder(ctx context.Context) (*Forwarder, error) {
 	// be unreachable.
 	cp, method, errPMP := discoverPMP(ctx, nil)
 	if errPMP == nil {
-		slog.Info("portforward: gateway discovered", "method", method)
-		return &Forwarder{client: cp, method: method}, nil
+		logInfo(o.quiet, "portforward: gateway discovered", "method", method)
+		return newForwarder(cp, method, o), nil
 	}
 	c2, err2 := discoverIGDv2(ctx)
 	if err2 == nil && c2 != nil {
-		slog.Info("portforward: gateway discovered", "method", "upnp-igd2", "pmp_err", errPMP)
-		return &Forwarder{client: c2, method: "upnp-igd2"}, nil
+		logInfo(o.quiet, "portforward: gateway discovered", "method", "upnp-igd2", "pmp_err", errPMP)
+		return newForwarder(c2, "upnp-igd2", o), nil
 	}
 	c1, err1 := discoverIGDv1(ctx)
 	if err1 == nil && c1 != nil {
-		slog.Info("portforward: gateway discovered", "method", "upnp-igd1",
+		logInfo(o.quiet, "portforward: gateway discovered", "method", "upnp-igd1",
 			// Worth knowing: a router that answers v1 but not v2 is common, and
 			// it is also the shape of a gateway with a partial UPnP stack.
 			"igd2_err", errOrAbsent(err2, c2), "pmp_err", errPMP)
-		return &Forwarder{client: c1, method: "upnp-igd1"}, nil
+		return newForwarder(c1, "upnp-igd1", o), nil
 	}
 
 	if err := ctx.Err(); err != nil {
-		slog.Warn("portforward: gateway discovery was canceled or timed out",
+		logWarn(o.quiet, "portforward: gateway discovery was canceled or timed out",
 			"err", err, "pmp_err", errPMP, "igd2_err", errOrAbsent(err2, c2), "igd1_err", errOrAbsent(err1, c1))
 		return nil, err
 	}
-	slog.Warn("portforward: no gateway found; this network cannot host a peer",
+	logWarn(o.quiet, "portforward: no gateway found; this network cannot host a peer",
 		"pmp_err", errPMP, "igd2_err", errOrAbsent(err2, c2), "igd1_err", errOrAbsent(err1, c1))
 	return nil, ErrNoPortForwarding
+}
+
+// newForwarder wraps a discovered client. A PCP or NAT-PMP client logs from
+// inside its mapping code, so it shares the Forwarder's quiet switch.
+func newForwarder(client igdClient, method string, o options) *Forwarder {
+	f := &Forwarder{client: client, method: method}
+	f.quiet.Store(o.quiet)
+	if q, ok := client.(interface{ setQuiet(*atomic.Bool) }); ok {
+		q.setQuiet(&f.quiet)
+	}
+	return f
 }
 
 // errOrAbsent renders a discovery outcome for a log field. A nil error with a
@@ -251,7 +267,7 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 
 	internalIP, err := f.localIPLocked()
 	if err != nil {
-		slog.Warn("portforward: could not determine the local address to map to",
+		f.logWarn("portforward: could not determine the local address to map to",
 			"portforward.local_ip_protected", f.localIPControl != nil, "err", err)
 		return nil, fmt.Errorf("determine local ip: %w", errors.Join(ErrNoLocalIP, err))
 	}
@@ -282,12 +298,12 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 		// f.mu is held throughout, so the goroutine can't have dealt with it.
 		f.claim(op)
 	case <-ctx.Done():
-		slog.Warn("portforward: caller gave up while the gateway was adding the mapping; removing it once the add resolves",
+		f.logWarn("portforward: caller gave up while the gateway was adding the mapping; removing it once the add resolves",
 			protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort, "err", ctx.Err())
 		return nil, fmt.Errorf("add port mapping: %w", ctx.Err())
 	case <-time.After(addCallTimeout):
 		err = fmt.Errorf("add port mapping timed out after %s", addCallTimeout)
-		slog.Warn("portforward: gateway did not answer in time; removing any mapping it creates once the add resolves",
+		f.logWarn("portforward: gateway did not answer in time; removing any mapping it creates once the add resolves",
 			protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
 			"internal_ip", internalIP, "method", f.method, "err", err)
 		// Still the "this network can't host a peer" sentinel: the caller has
@@ -297,7 +313,7 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 	if ctxErr := ctx.Err(); ctxErr != nil && mayHaveLanded(err) {
 		// The add resolved just as the caller gave up. Remove what it may have
 		// created — otherwise it survives with no Forwarder tracking it.
-		slog.Warn("portforward: caller gave up while the gateway was accepting the mapping; removing it",
+		f.logWarn("portforward: caller gave up while the gateway was accepting the mapping; removing it",
 			protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort, "err", ctxErr)
 		f.removeLocked(m, client, "caller gave up while the gateway was accepting it")
 		return nil, fmt.Errorf("add port mapping: %w", ctxErr)
@@ -311,12 +327,12 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 		// Propagate ctx cancellation/deadline verbatim so callers can retry
 		// rather than treating it as a permanent "this network won't work".
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			slog.Warn("portforward: adding the mapping was canceled or timed out",
+			f.logWarn("portforward: adding the mapping was canceled or timed out",
 				protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
 				"internal_ip", internalIP, "method", f.method, "err", ctxErr)
 			return nil, fmt.Errorf("add port mapping: %w", ctxErr)
 		}
-		slog.Warn("portforward: gateway refused the mapping",
+		f.logWarn("portforward: gateway refused the mapping",
 			protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
 			"internal_ip", internalIP, "method", f.method, "err", err)
 		// Per the ErrNoPortForwarding docstring, a gateway refusing to map a
@@ -348,7 +364,7 @@ func (f *Forwarder) MapPort(ctx context.Context, protocol string, internalPort u
 	// the port and address we asked for — the two facts needed to check the
 	// router's own table — were nowhere in the log. That is exactly the shape of
 	// a 422 "could not connect to peer port".
-	slog.Info("portforward: mapping added",
+	f.logInfo("portforward: mapping added",
 		protocolAttr(protocol), "external_port", externalPort, "internal_port", internalPort,
 		"internal_ip", internalIP, "method", f.method,
 		"requested_lease_s", requestedLease, "granted_lease_s", int(m.LeaseDuration/time.Second))
@@ -566,11 +582,11 @@ func (f *Forwarder) renewTimeout() time.Duration {
 // remaining recourse is the router's own lease expiry.
 func (f *Forwarder) deleteUntracked(m *Mapping, client igdClient, why string) {
 	if err := client.DeletePortMapping("", m.ExternalPort, m.Protocol); err != nil {
-		slog.Warn("portforward: could not remove an untracked mapping",
+		f.logWarn("portforward: could not remove an untracked mapping",
 			"err", err, protocolAttr(m.Protocol), "external_port", m.ExternalPort, "why", why)
 		return
 	}
-	slog.Info("portforward: removed an untracked mapping",
+	f.logInfo("portforward: removed an untracked mapping",
 		protocolAttr(m.Protocol), "external_port", m.ExternalPort, "why", why)
 }
 
@@ -672,10 +688,10 @@ func (f *Forwarder) renew(m *Mapping, client igdClient, teardowns uint64) bool {
 		received = true
 		confirmed = addErr == nil
 		if addErr != nil {
-			slog.Warn("portforward: lease renewal failed", "err", addErr, protocolAttr(m.Protocol), "external_port", m.ExternalPort)
+			f.logWarn("portforward: lease renewal failed", "err", addErr, protocolAttr(m.Protocol), "external_port", m.ExternalPort)
 		}
 	case <-time.After(f.renewTimeout()):
-		slog.Warn("portforward: lease renewal timed out; it is removed if teardown runs before it resolves",
+		f.logWarn("portforward: lease renewal timed out; it is removed if teardown runs before it resolves",
 			protocolAttr(m.Protocol), "external_port", m.ExternalPort, "timeout", f.renewTimeout())
 	}
 
@@ -725,12 +741,12 @@ func (f *Forwarder) ExternalIP(ctx context.Context) (string, error) {
 		return nil
 	})
 	if err != nil {
-		slog.Warn("portforward: gateway would not report its external address",
+		f.logWarn("portforward: gateway would not report its external address",
 			"method", f.method, "err", err)
 		return "", fmt.Errorf("get external ip: %w", err)
 	}
 	if ip == "" {
-		slog.Warn("portforward: gateway reported an empty external address", "method", f.method)
+		f.logWarn("portforward: gateway reported an empty external address", "method", f.method)
 		return "", fmt.Errorf("gateway returned empty external ip")
 	}
 	return ip, nil
