@@ -59,8 +59,29 @@ builds:
       - with_clash_api
     binary: lantern-box
 
+  # The macOS binaries need cgo (the Outline SDK's DNS lookups), so
+  # release.yaml builds them on a macOS runner into build/.
+  - id: darwin
+    builder: prebuilt
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    goamd64:
+      - v1
+    prebuilt:
+      path: build/lantern-box-{{ .Os }}-{{ .Arch }}
+    binary: lantern-box
+
 archives:
   - formats: ["tar.gz"]
+    # The node unit lets install.sh set up a tarball install as a service.
+    files:
+      - LICENSE
+      - README.md
+      - src: cmd/release/lantern-node.service
+        strip_parent: true
 
 changelog:
   sort: asc
@@ -97,6 +118,8 @@ nfpms:
         dst: /usr/lib/systemd/system/lantern-box.service
       - src: cmd/release/lantern-box@.service
         dst: /usr/lib/systemd/system/lantern-box@.service
+      - src: cmd/release/lantern-node.service
+        dst: /usr/lib/systemd/system/lantern-node.service
       - src: LICENSE
         dst: /usr/share/doc/lantern-box/LICENSE
 
@@ -146,3 +169,39 @@ dockerhub:
     full_description:
       from_file:
         path: ./README.docker.md
+
+# Operators install lantern-box with `brew install getlantern/tap/lantern-box`
+# and run it as a node with `brew services start lantern-box`. A formula, not
+# a cask, so that brew services can run it and macOS doesn't quarantine it.
+# The formula is the Lamplighter release channel: only a Lamplighter release
+# (see auto-tag.yaml) updates it, and install.sh installs the version it names.
+# It's also skipped while HOMEBREW_TAP_TOKEN is unset, so a missing token can't
+# fail a release.
+brews:
+  - name: lantern-box
+    repository:
+      owner: getlantern
+      name: homebrew-tap
+      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
+    skip_upload: '{{ if and (eq (envOrDefault "LAMPLIGHTER_RELEASE" "false") "true") (ne (envOrDefault "HOMEBREW_TAP_TOKEN" "") "") }}false{{ else }}true{{ end }}'
+    directory: Formula
+    homepage: "https://github.com/getlantern/lantern-box"
+    description: "Run a Lantern node: a censorship circumvention proxy configured by Lantern"
+    license: "GPL-3.0-or-later"
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    install: |
+      bin.install "lantern-box"
+    service: |
+      run [opt_bin/"lantern-box", "serve", "--register", "--state-dir", var/"lantern-node"]
+      keep_alive true
+      log_path var/"log/lantern-node.log"
+      error_log_path var/"log/lantern-node.log"
+    caveats: |
+      To run lantern-box as a Lantern node, now and at login:
+        brew services start lantern-box
+      Or run it in the foreground, with extra flags such as --user-id:
+        lantern-box serve --register --state-dir #{var}/lantern-node
+    test: |
+      assert_match "Lantern node", shell_output("#{bin}/lantern-box serve --help")

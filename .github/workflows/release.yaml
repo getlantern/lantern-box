@@ -8,6 +8,10 @@ on:
         description: "Mark the release latest, so the proxy fleet hot-swaps to it"
         type: boolean
         default: false
+      lamplighter:
+        description: "Publish the Homebrew formula, so Lamplighter nodes install and upgrade to it"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -15,7 +19,34 @@ permissions:
   actions: write
 
 jobs:
+  # The macOS binaries need cgo, so they're built on macOS and handed to
+  # GoReleaser as prebuilt binaries (.goreleaser.yaml's darwin build).
+  macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - name: Build
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          for arch in amd64 arm64; do
+            CGO_ENABLED=1 GOOS=darwin GOARCH=$arch go build -v -trimpath \
+              -ldflags "-X github.com/sagernet/sing-box/constant.Version=$version -s -w -buildid=" \
+              -tags with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api \
+              -o build/lantern-box-darwin-$arch ./cmd
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lantern-box-darwin
+          path: build/
+          if-no-files-found: error
+          retention-days: 1
+
   release:
+    needs: macos
     runs-on:
       group: large-runners
     steps:
@@ -30,6 +61,12 @@ jobs:
             echo "::error file=README.docker.md::Docker Hub description is $bytes bytes; the limit is 25000."
             exit 1
           fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: lantern-box-darwin
+          path: build/
+      - name: Make the macOS binaries executable
+        run: chmod +x build/lantern-box-darwin-*
       - uses: actions/setup-go@v6
         with:
           go-version-file: "go.mod"
@@ -55,9 +92,11 @@ jobs:
           GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           FURY_TOKEN: ${{ secrets.FURY_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           # A tag push carries no inputs, so it releases without moving the
           # fleet, as an unlabelled merge does.
           FLEET_RELEASE: ${{ inputs.fleet && 'true' || 'false' }}
+          LAMPLIGHTER_RELEASE: ${{ inputs.lamplighter && 'true' || 'false' }}
 
       # Under Reflog's Option B the packer image no longer bakes in a
       # specific lantern-box version — cloud-init installs the target
