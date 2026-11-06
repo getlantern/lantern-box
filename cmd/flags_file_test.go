@@ -100,6 +100,20 @@ func TestFlagsFileLosesToCommandLine(t *testing.T) {
 	assert.Equal(t, "/from/cli", dir)
 }
 
+// A flag repeated in the file keeps its last value, as on a command line, and
+// isn't mistaken for one the command line set.
+func TestFlagsFileRepeatedFlag(t *testing.T) {
+	path := writeFlagsFile(t, "--max-peers 5 --max-peers 3")
+	fs := serveFlagsWith(t, "--register")
+	var notices strings.Builder
+	flagsFileNotices = &notices
+	t.Cleanup(func() { flagsFileNotices = os.Stderr })
+	require.NoError(t, applyFlagsFile(fs, path))
+	peers, _ := fs.GetInt("max-peers")
+	assert.Equal(t, 3, peers)
+	assert.Empty(t, notices.String())
+}
+
 func TestFlagsFileMissingMeansNone(t *testing.T) {
 	fs := serveFlagsWith(t, "--register")
 	require.NoError(t, applyFlagsFile(fs, filepath.Join(t.TempDir(), "absent")))

@@ -59,9 +59,13 @@ func applyFlagsFile(cmdFlags *pflag.FlagSet, path string) error {
 	if extra := fileFlags.Args(); len(extra) > 0 {
 		return fmt.Errorf("flags file %s: %q isn't a flag", path, extra[0])
 	}
+	// Which flags the command line set, taken before any file value lands, so
+	// a flag repeated in the file keeps its last value, as on a command line.
+	fromCommandLine := map[string]bool{}
+	cmdFlags.Visit(func(f *pflag.Flag) { fromCommandLine[f.Name] = true })
 	noted := map[string]bool{}
 	for _, s := range settings {
-		if cmdFlags.Changed(s.name) {
+		if fromCommandLine[s.name] {
 			if !noted[s.name] {
 				noted[s.name] = true
 				fmt.Fprintf(flagsFileNotices, "flags file %s: ignoring --%s, which the command line sets\n", path, s.name)
