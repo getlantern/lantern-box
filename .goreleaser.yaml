@@ -201,6 +201,13 @@ brews:
     install: |
       bin.install "lantern-box"
       bin.install_symlink bin/"lantern-box" => "lamplighter"
+    # The formula was named lantern-box, with the node's state in
+    # var/lantern-node and its flags in etc/lantern-node.args. Move them, so a
+    # node upgraded from it keeps its identity, port and flags.
+    post_install: |
+      { var/"lantern-node" => var/"lamplighter", etc/"lantern-node.args" => etc/"lamplighter.args" }.each do |old, new|
+        old.rename(new) if old.exist? && !new.exist?
+      end
     # brew services can't pass flags, so the service reads them from
     # etc/lamplighter.args, which install.sh writes, split at whitespace as
     # systemd splits the Linux unit's LANTERN_NODE_ARGS: set -f stops the

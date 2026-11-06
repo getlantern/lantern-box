@@ -45,7 +45,7 @@ node_args_given() {
 # so rather than drop it silently.
 warn_user_id() {
 	if [ -n "${LANTERN_USER_ID:-}" ]; then
-		say "LANTERN_USER_ID isn't used any more: nodes don't need enrolling."
+		say "LANTERN_USER_ID was ignored: nodes don't need enrolling. To send your user ID anyway, include --user-id $LANTERN_USER_ID in LANTERN_NODE_ARGS with the rest of your flags."
 	fi
 }
 
@@ -64,8 +64,10 @@ install_macos() {
 	# it isn't running.
 	brew services restart lamplighter
 	say "The Lantern node is running. Check it with: brew services info lamplighter"
-	if node_args_given; then
+	if node_args_given && [ -n "$LANTERN_NODE_ARGS" ]; then
 		say "Its flags are saved in $prefix/etc/lamplighter.args."
+	elif node_args_given; then
+		say "Its flags are cleared."
 	else
 		say "To give it flags, put them in $prefix/etc/lamplighter.args and run: brew services restart lamplighter"
 	fi
@@ -76,14 +78,9 @@ latest_tag() {
 	# Lamplighter releases are the ones the Homebrew formula names, so Linux
 	# and Homebrew installs get the same version. GitHub's latest release is
 	# the proxy fleet's, which can differ.
-	# The formula was named lantern-box until v0.0.209, and this script is
-	# served from main, which can be ahead of the tap.
-	tap="https://raw.githubusercontent.com/getlantern/homebrew-tap/main/Formula"
-	formula="$tap/lamplighter.rb"
-	text=$(curl -fsSL "$formula" 2>/dev/null) || {
-		formula="$tap/lantern-box.rb"
-		text=$(curl -fsSL "$formula")
-	} || die "couldn't read the latest Lamplighter release from $tap. Set LANTERN_BOX_VERSION to a release tag."
+	formula="https://raw.githubusercontent.com/getlantern/homebrew-tap/main/Formula/lamplighter.rb"
+	text=$(curl -fsSL "$formula") ||
+		die "couldn't read the latest Lamplighter release from $formula. Set LANTERN_BOX_VERSION to a release tag."
 	version=$(printf '%s\n' "$text" | sed -n 's/^  version "\([0-9][0-9.]*\)"$/\1/p' | head -n 1)
 	[ -n "$version" ] || die "couldn't find a version in $formula. Set LANTERN_BOX_VERSION to a release tag."
 	printf 'v%s' "$version"
