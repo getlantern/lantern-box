@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -688,7 +689,7 @@ func TestSessionDownloadGoodput_ActiveWindowOnly(t *testing.T) {
 		mt := NewTracker(context.Background())
 		defer mt.Close()
 
-		const chunk = 1 << 20
+		const chunk = 4 << 20
 		tracked := sendToClient(t, mt, [][]byte{make([]byte, chunk), make([]byte, chunk)}, 2*time.Second)
 		require.NoError(t, tracked.Close())
 		synctest.Wait()
@@ -697,8 +698,8 @@ func TestSessionDownloadGoodput_ActiveWindowOnly(t *testing.T) {
 		reader.Collect(context.Background(), &rm)
 		count, sum := goodputByDirection(rm, tx)
 		require.Equal(t, uint64(1), count, "one download sample")
-		// 2 MiB over the 2s between first and last write; the 10s of idle
-		// around them would otherwise cut it to ~175 kB/s.
+		// 8 MiB over the 2s between first and last write; the 10s of idle
+		// around them would otherwise cut it to a sixth.
 		assert.InDelta(t, float64(2*chunk)/2, sum, float64(2*chunk)/2*0.05)
 		rxCount, _ := goodputByDirection(rm, rx)
 		assert.Zero(t, rxCount, "nothing was received from the client")
@@ -738,9 +739,9 @@ func TestSessionDownloadGoodput_SingleBlockingWrite(t *testing.T) {
 		defer server.Close()
 		tracked := mt.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
 
-		// The client drains 2 MiB at 64 KiB per 100ms, so the one write that
-		// carries it blocks for ~3.2s.
-		const total = 2 << 20
+		// The client drains 8 MiB at 64 KiB per 100ms, so the one write that
+		// carries it blocks for ~12.8s.
+		const total = 8 << 20
 		drained := make(chan struct{})
 		go func() {
 			defer close(drained)
@@ -764,8 +765,19 @@ func TestSessionDownloadGoodput_SingleBlockingWrite(t *testing.T) {
 		var rm metricdata.ResourceMetrics
 		reader.Collect(ctx, &rm)
 		count, sum := goodputByDirection(rm, tx)
-		require.Equal(t, uint64(1), count, "a single write of at least 1 MiB is still sampled")
-		// ~2 MiB over ~3.1s of blocking, not over zero.
-		assert.InDelta(t, float64(total)/3.1, sum, float64(total)/3.1*0.1)
+		require.Equal(t, uint64(1), count, "a single write past the floor is still sampled")
+		// ~8 MiB over ~12.7s of blocking, not over zero.
+		assert.InDelta(t, float64(total)/12.7, sum, float64(total)/12.7*0.05)
 	})
+}
+
+func TestDownloadWindowSpansOutOfOrderWrites(t *testing.T) {
+	var first, last atomic.Int64
+	// Write A runs 1–5 and write B 3–4; B finishes first.
+	storeMin(&first, 3)
+	storeMax(&last, 4)
+	storeMin(&first, 1)
+	storeMax(&last, 5)
+	assert.Equal(t, int64(1), first.Load(), "the window opens at the earliest start")
+	assert.Equal(t, int64(5), last.Load(), "and closes at the latest return")
 }

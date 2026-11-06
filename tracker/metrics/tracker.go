@@ -211,10 +211,14 @@ func (t *MetricsTracker) recordGoodput(rxBytes, durationMs int64, attrs *attribu
 }
 
 // downloadGoodputMinBytes is the least a session must send the client for a
-// download goodput sample. Shapers commonly let a connection burst at full
-// speed before holding it to a lower rate, and a session that ends inside that
-// burst says nothing about the rate a sustained download gets.
-const downloadGoodputMinBytes = 1 << 20
+// download goodput sample. A write returns once its bytes are buffered, in the
+// protocol layers and the kernel's send buffer (several MiB once autotuned),
+// so a session not much larger than those buffers reads faster than it was
+// delivered; past them, writes wait on delivery and the rate follows it.
+// Shapers also commonly let a connection burst at full speed before holding
+// it to a lower rate, and a session that ends inside the burst says nothing
+// about the rate a sustained download gets.
+const downloadGoodputMinBytes = 8 << 20
 
 // recordDownloadGoodput records the session's download goodput: bytes the proxy
 // sent the client per second from the start of its first write to the end of
