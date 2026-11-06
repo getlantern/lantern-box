@@ -31,7 +31,7 @@ brew services start lantern-box
 curl -fsSL https://raw.githubusercontent.com/getlantern/lantern-box/main/install.sh | sh
 ```
 
-It installs the latest release's `.deb` or `.rpm`, or its tarball, after checking it against the release's checksums, and starts the `lantern-node` systemd service, which runs as an unprivileged user and starts on boot. Run it again to upgrade. To pass flags, set them first:
+It installs the latest Lamplighter release's `.deb` or `.rpm`, or its tarball, after checking it against the release's checksums, and starts the `lantern-node` systemd service, which runs as an unprivileged user and starts on boot. Run it again to upgrade. To pass flags, set them first:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/getlantern/lantern-box/main/install.sh |
@@ -795,7 +795,9 @@ go test -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acm
 
 ### Releases
 
-Every merge to `main` that changes the binary is tagged as the next patch release and published, so clients can depend on it. The proxy fleet follows GitHub's latest release: lantern-cloud hot-swaps every box onto it. So do Lantern nodes: `install.sh` installs the latest release, and only a fleet release updates the Homebrew formula in [getlantern/homebrew-tap](https://github.com/getlantern/homebrew-tap).
+Every merge to `main` that changes the binary is tagged as the next patch release and published, so clients can depend on it. The proxy fleet follows GitHub's latest release: lantern-cloud hot-swaps every box onto it.
+
+Lantern nodes (Lamplighter) follow their own channel: the `lantern-box` formula in [getlantern/homebrew-tap](https://github.com/getlantern/homebrew-tap), which `install.sh` also reads. Only a merged PR labelled `release-lamplighter` updates it. A PR can carry both labels, to update the fleet and nodes together.
 
 By default a release doesn't roll the fleet: it isn't marked latest, nor pushed as `getlantern/lantern-box:latest` or as the `sing-box:latest` image triangle backends run. A push to `main` builds `sing-box:main` instead. To roll the fleet onto a change, label its PR `release` before merging.
 

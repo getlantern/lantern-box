@@ -9,7 +9,8 @@
 #   LANTERN_NODE_ARGS   more `lantern-box serve` flags, such as "--bandwidth-limit 10mbit".
 #                       systemd splits them at whitespace and ignores quotes, so
 #                       no value can contain a space.
-#   LANTERN_BOX_VERSION a release tag such as v0.0.203 (default: the latest release)
+#   LANTERN_BOX_VERSION a release tag such as v0.0.203 (default: the latest
+#                       Lamplighter release, which the Homebrew formula names)
 #
 # On Linux it installs the release's .deb or .rpm, or else its tarball, and
 # enables the lantern-node systemd service. On macOS it uses Homebrew.
@@ -54,15 +55,15 @@ install_macos() {
 }
 
 latest_tag() {
-	# The latest release is the one the proxy fleet runs. Following the
-	# redirect avoids the GitHub API and its rate limit.
-	url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$repo/releases/latest") ||
-		die "couldn't find the latest release"
-	tag=${url##*/}
-	case $tag in
-	v[0-9]*) printf '%s' "$tag" ;;
-	*) die "unexpected latest release URL: $url" ;;
-	esac
+	# Lamplighter releases are the ones the Homebrew formula names, so Linux
+	# and Homebrew installs get the same version. GitHub's latest release is
+	# the proxy fleet's, which can differ.
+	formula="https://raw.githubusercontent.com/getlantern/homebrew-tap/main/Formula/lantern-box.rb"
+	text=$(curl -fsSL "$formula") ||
+		die "couldn't read the latest Lamplighter release from $formula. Set LANTERN_BOX_VERSION to a release tag."
+	version=$(printf '%s\n' "$text" | sed -n 's/^  version "\([0-9][0-9.]*\)"$/\1/p' | head -n 1)
+	[ -n "$version" ] || die "couldn't find a version in $formula. Set LANTERN_BOX_VERSION to a release tag."
+	printf 'v%s' "$version"
 }
 
 install_linux() {

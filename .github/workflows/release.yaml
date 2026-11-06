@@ -8,6 +8,10 @@ on:
         description: "Mark the release latest, so the proxy fleet hot-swaps to it"
         type: boolean
         default: false
+      lamplighter:
+        description: "Publish the Homebrew formula, so Lamplighter nodes install and upgrade to it"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -92,6 +96,7 @@ jobs:
           # A tag push carries no inputs, so it releases without moving the
           # fleet, as an unlabelled merge does.
           FLEET_RELEASE: ${{ inputs.fleet && 'true' || 'false' }}
+          LAMPLIGHTER_RELEASE: ${{ inputs.lamplighter && 'true' || 'false' }}
 
       # Under Reflog's Option B the packer image no longer bakes in a
       # specific lantern-box version — cloud-init installs the target
