@@ -198,15 +198,19 @@ brews:
       email: bot@goreleaser.com
     install: |
       bin.install "lantern-box"
+    # brew services can't pass flags, so the service reads them from
+    # etc/lantern-node.args, which install.sh writes, split at whitespace as
+    # systemd splits the Linux unit's LANTERN_NODE_ARGS.
     service: |
-      run [opt_bin/"lantern-box", "serve", "--register", "--state-dir", var/"lantern-node"]
+      run ["/bin/sh", "-c", "exec \"$0\" serve --register --state-dir \"$1\" $(cat \"$2\" 2>/dev/null)", opt_bin/"lantern-box", var/"lantern-node", etc/"lantern-node.args"]
       keep_alive true
       log_path var/"log/lantern-node.log"
       error_log_path var/"log/lantern-node.log"
     caveats: |
       To run lantern-box as a Lantern node, now and at login:
         brew services start lantern-box
-      Or run it in the foreground, with extra flags such as --user-id:
-        lantern-box serve --register --state-dir #{var}/lantern-node
+      To pass flags such as --bandwidth-limit 10mbit, put them in
+        #{etc}/lantern-node.args
+      and run: brew services restart lantern-box
     test: |
       assert_match "Lantern node", shell_output("#{bin}/lantern-box serve --help")

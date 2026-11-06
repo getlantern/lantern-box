@@ -7,8 +7,9 @@
 # Optional environment:
 #   LANTERN_USER_ID     your Lantern user ID, which can enroll this node
 #   LANTERN_NODE_ARGS   more `lantern-box serve` flags, such as "--bandwidth-limit 10mbit".
-#                       systemd splits them at whitespace and ignores quotes, so
-#                       no value can contain a space.
+#                       They replace any set before, so give all you want each
+#                       time, and none to clear them. They're split at whitespace
+#                       and quotes are ignored, so no value can contain a space.
 #   LANTERN_BOX_VERSION a release tag such as v0.0.203 (default: the latest
 #                       Lamplighter release, which the Homebrew formula names)
 #
@@ -44,17 +45,18 @@ node_args() {
 install_macos() {
 	has brew || die "install Homebrew from https://brew.sh first, then run this again"
 	brew install getlantern/tap/lantern-box
-	args=$(node_args)
-	if [ -n "$args" ]; then
-		# brew services can't pass flags, so the node runs in the foreground,
-		# from the service's state directory so it keeps its identity and port.
-		say "brew services can't pass flags. To run the node with \"$args\", run:"
-		say "  lantern-box serve --register --state-dir \"$(brew --prefix)/var/lantern-node\" $args"
-		say "It runs while that terminal is open. Without flags, brew services start lantern-box runs it at login."
-		return
-	fi
-	brew services start lantern-box
+	prefix=$(brew --prefix) || die "couldn't find Homebrew's prefix"
+	[ -n "$prefix" ] || die "couldn't find Homebrew's prefix"
+	# The formula's service reads its flags from here, since brew services
+	# can't pass them. Written every time, so a run without flags clears them.
+	mkdir -p "$prefix/etc"
+	node_args >"$prefix/etc/lantern-node.args"
+	echo >>"$prefix/etc/lantern-node.args"
+	# Restarting picks up an upgrade and new flags, and starts the service if
+	# it isn't running.
+	brew services restart lantern-box
 	say "The Lantern node is running. Check it with: brew services info lantern-box"
+	say "Its settings are in $prefix/etc/lantern-node.args."
 }
 
 latest_tag() {
@@ -137,13 +139,11 @@ install_linux() {
 		;;
 	esac
 
-	args=$(node_args)
-	if [ -n "$args" ]; then
-		as_root mkdir -p /etc/lantern-box
-		# Escaped for the double-quoted value systemd's EnvironmentFile reads.
-		escaped=$(printf '%s' "$args" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
-		printf 'LANTERN_NODE_ARGS="%s"\n' "$escaped" | as_root tee /etc/lantern-box/node.env >/dev/null
-	fi
+	# Written every time, so a run without flags clears earlier ones.
+	as_root mkdir -p /etc/lantern-box
+	# Escaped for the double-quoted value systemd's EnvironmentFile reads.
+	escaped=$(node_args | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+	printf 'LANTERN_NODE_ARGS="%s"\n' "$escaped" | as_root tee /etc/lantern-box/node.env >/dev/null
 	as_root systemctl daemon-reload
 	as_root systemctl enable lantern-node.service
 	as_root systemctl restart lantern-node.service

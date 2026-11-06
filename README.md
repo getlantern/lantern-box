@@ -35,8 +35,10 @@ It installs the latest Lamplighter release's `.deb` or `.rpm`, or its tarball, a
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/getlantern/lantern-box/main/install.sh |
-  LANTERN_USER_ID=123456 LANTERN_NODE_ARGS="--bandwidth-limit 10mbit" sh
+  LANTERN_NODE_ARGS="--bandwidth-limit 10mbit" sh
 ```
+
+They replace any flags set before, so give all you want each time, and none to clear them.
 
 **Docker** (Linux, amd64):
 
@@ -63,12 +65,19 @@ The node listens on a random TCP port, chosen on first run and kept. At home it 
 
 | Flag | What it does |
 | ---- | ------------ |
-| `--user-id` | Your Lantern user ID, which can enroll this node. |
 | `--bandwidth-limit` | Caps the Unbounded volunteer's traffic in each direction, such as `10mbit` or `2MB/s`. |
 | `--max-peers` | How many users the Unbounded volunteer serves at once. |
 | `--port` | Listen on this port instead of a random one. |
 | `--no-port-mapping` | Don't ask the router to forward the port. |
 | `--state-dir` | Where the node keeps its identity and port. |
+
+How you set them depends on how the node runs:
+
+- **systemd:** run `install.sh` again with `LANTERN_NODE_ARGS`, or set `LANTERN_NODE_ARGS="..."` in `/etc/lantern-box/node.env` and run `sudo systemctl restart lantern-node`.
+- **Homebrew:** put them in `$(brew --prefix)/etc/lantern-node.args` and run `brew services restart lantern-box`.
+- **Docker:** stop and remove the container, then run it again with them after `--state-dir /var/lib/lantern-node`.
+
+They're split at whitespace and quotes are ignored, so no value can contain a space.
 
 The node keeps its identity and port in `node.json` in its state directory: `/var/lib/lantern-node` for the systemd service, `$(brew --prefix)/var/lantern-node` for Homebrew, and `lantern-box` in your user config directory otherwise. To start over as a new node on a new port, stop the node and delete it.
 
