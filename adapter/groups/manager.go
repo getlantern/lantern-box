@@ -261,6 +261,26 @@ func (m *MutableGroupManager) SetURLOverrides(group string, overrides map[string
 	return nil
 }
 
+// SetProbeTimeouts replaces the per-protocol probe timeouts of the specified
+// group. The group must implement [adapter.ProbeTimeoutSetter].
+func (m *MutableGroupManager) SetProbeTimeouts(group string, timeoutsMs map[string]uint32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed.Load() {
+		return ErrIsClosed
+	}
+	outGroup, ok := m.groups[group]
+	if !ok {
+		return fmt.Errorf("group %q not found", group)
+	}
+	setter, ok := outGroup.(adapter.ProbeTimeoutSetter)
+	if !ok {
+		return fmt.Errorf("group %q does not support probe timeouts", group)
+	}
+	setter.SetProbeTimeouts(timeoutsMs)
+	return nil
+}
+
 // CheckOutbounds triggers an immediate URL test cycle on the specified group.
 // The group must implement [adapter.OutboundChecker].
 func (m *MutableGroupManager) CheckOutbounds(group string) error {

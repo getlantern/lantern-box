@@ -28,6 +28,12 @@ type MutableAutoSelectOutboundOptions struct {
 	URL          string            `json:"url,omitempty"`
 	URLOverrides map[string]string `json:"url_overrides,omitempty"`
 
+	// ProbeTimeoutsMs overrides the probe timeout, in milliseconds, for
+	// members of the given outbound types, e.g. {"hysteria2x": 3000}. A type
+	// not listed, or a value outside 250 to 60000, keeps its built-in
+	// timeout. SetProbeTimeouts replaces the set at runtime.
+	ProbeTimeoutsMs map[string]uint32 `json:"probe_timeouts_ms,omitempty"`
+
 	// SwitchToleranceMs is the minimum delay improvement (in ms) a
 	// candidate must have over the current selection before the group
 	// switches on delay. Default 300.
