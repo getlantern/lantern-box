@@ -42,10 +42,10 @@ node_args_given() {
 }
 
 # LANTERN_USER_ID was how a node was enrolled before anyone could run one. Say
-# where the flag goes now rather than drop it silently.
+# so rather than drop it silently.
 warn_user_id() {
 	if [ -n "${LANTERN_USER_ID:-}" ]; then
-		say "LANTERN_USER_ID isn't needed any more and was ignored. To send it anyway, put --user-id $LANTERN_USER_ID in LANTERN_NODE_ARGS."
+		say "LANTERN_USER_ID isn't used any more: nodes don't need enrolling."
 	fi
 }
 
@@ -64,7 +64,11 @@ install_macos() {
 	# it isn't running.
 	brew services restart lantern-box
 	say "The Lantern node is running. Check it with: brew services info lantern-box"
-	say "To give it flags, put them in $prefix/etc/lantern-node.args and run: brew services restart lantern-box"
+	if node_args_given; then
+		say "Its flags are saved in $prefix/etc/lantern-node.args."
+	else
+		say "To give it flags, put them in $prefix/etc/lantern-node.args and run: brew services restart lantern-box"
+	fi
 	warn_user_id
 }
 

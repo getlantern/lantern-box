@@ -88,7 +88,7 @@ The node keeps its identity and port in `node.json` in its state directory: `/va
 | Status | `brew services info lantern-box` | `systemctl status lantern-node` | `docker ps -f name=lantern-node` |
 | Logs | `tail -f $(brew --prefix)/var/log/lantern-node.log` | `journalctl -u lantern-node -f` | `docker logs -f lantern-node` |
 | Stop | `brew services stop lantern-box` | `sudo systemctl disable --now lantern-node` | `docker stop lantern-node && docker rm lantern-node` |
-| Uninstall | `brew uninstall lantern-box`, then delete `$(brew --prefix)/etc/lantern-node.args`, and `$(brew --prefix)/var/lantern-node` to forget the node | `sudo apt remove lantern-box`, `sudo dnf remove lantern-box`, or remove `/usr/bin/lantern-box` and `/etc/systemd/system/lantern-node.service`; then delete `/etc/lantern-box`, and `/var/lib/private/lantern-node` to forget the node | `docker volume rm lantern-node` |
+| Uninstall | `brew uninstall lantern-box`, then delete `$(brew --prefix)/etc/lantern-node.args` and `$(brew --prefix)/var/log/lantern-node.log` | `sudo apt remove lantern-box`, `sudo dnf remove lantern-box`, or remove `/usr/bin/lantern-box` and `/etc/systemd/system/lantern-node.service`; then delete `/etc/lantern-box/node.env` | `docker volume rm lantern-node` |
 
 ## Quick Start: Run the Server
 
