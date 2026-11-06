@@ -590,6 +590,9 @@ func (p *Portal) Session(reverseTag string) (*http2.ClientConn, bool) {
 // the session, publishes it under the pairing's tag, and holds it until the
 // session or its connection ends.
 func (p *Portal) handleSession(ctx context.Context, conn net.Conn, shortID [8]byte) {
+	if !startSession(ctx) {
+		return
+	}
 	p.sessMu.Lock()
 	tag, ok := p.pairings[shortID]
 	p.sessMu.Unlock()

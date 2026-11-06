@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/getlantern/lantern-box/constant"
@@ -19,6 +20,13 @@ import (
 // ClientHello before it closes the connection, as samizdat's own server
 // does. A var so tests can shorten it.
 var helloTimeout = 10 * time.Second
+
+// handshakeTimeout bounds how long an admitted connection may take to
+// become a session. samizdat clears the read deadline before its TLS
+// handshake, so without it a peer that sends an authenticated ClientHello
+// and then stalls stays counted, and keeps a retired identity open, for as
+// long as it likes. A var so tests can shorten it.
+var handshakeTimeout = 30 * time.Second
 
 const (
 	// masqueradeDialTimeout and masqueradeMaxDuration are samizdat's
@@ -105,7 +113,9 @@ func (id *identity) authenticates(sessionID []byte) bool {
 
 // admit counts conn against id and returns it wrapped to be handed to id's
 // server, with record to be read again first. Closing the wrapper releases
-// the count. It returns nil, counting nothing, once id is retired.
+// the count. Unless the connection becomes a session within
+// handshakeTimeout, it is closed. It returns nil, counting nothing, once id
+// is retired.
 func (id *identity) admit(conn net.Conn, record []byte) *admittedConn {
 	id.mu.Lock()
 	defer id.mu.Unlock()
@@ -113,7 +123,15 @@ func (id *identity) admit(conn net.Conn, record []byte) *admittedConn {
 		return nil
 	}
 	id.live++
-	return &admittedConn{replayConn: replayConn{Conn: conn, buf: record}, id: id}
+	ac := &admittedConn{replayConn: replayConn{Conn: conn, buf: record}, id: id}
+	ac.timer = time.AfterFunc(handshakeTimeout, func() {
+		if ac.state.CompareAndSwap(admittedPending, admittedTimedOut) {
+			// samizdat's handshake fails and it closes ac, which releases
+			// the count.
+			conn.Close()
+		}
+	})
+	return ac
 }
 
 // release ends the count of one admitted connection.
@@ -366,6 +384,32 @@ type admittedConn struct {
 	replayConn
 	id   *identity
 	once sync.Once
+	// state is admittedPending until the connection becomes a session or
+	// its handshake times out, whichever comes first.
+	state atomic.Int32
+	timer *time.Timer
+}
+
+const (
+	admittedPending int32 = iota
+	admittedSession
+	admittedTimedOut
+)
+
+// startSession disarms the handshake timeout. It reports false if the
+// timeout has already closed the connection.
+func (c *admittedConn) startSession() bool {
+	c.timer.Stop()
+	return c.state.CompareAndSwap(admittedPending, admittedSession)
+}
+
+// startSession disarms the handshake timeout of the connection a session
+// handler's ctx carries. It reports false if the timeout has already closed
+// the connection.
+func startSession(ctx context.Context) bool {
+	raw, _ := samizdat.SessionConnFromContext(ctx)
+	ac, ok := raw.(*admittedConn)
+	return !ok || ac.startSession()
 }
 
 func (c *admittedConn) Close() error {

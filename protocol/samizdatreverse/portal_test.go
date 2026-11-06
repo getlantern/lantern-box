@@ -1361,3 +1361,67 @@ func TestPortalRejectsPreviousKeyClampedToCurrent(t *testing.T) {
 	}
 	require.NoError(t, p.Configure(withPrevious(k2.config(0, pairings), k1, time.Now().Add(time.Minute))))
 }
+
+// stalledHandshake sends a real client's authenticated ClientHello to addr
+// and then nothing more. It returns the connection to the portal.
+func stalledHandshake(t *testing.T, addr string, k testKeys, id [8]byte) net.Conn {
+	relay, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { relay.Close() })
+	c, err := samizdat.NewClient(samizdat.ClientConfig{ServerAddr: relay.Addr().String(), ServerName: "localhost", PublicKey: k.pub, ShortID: id})
+	require.NoError(t, err)
+	t.Cleanup(func() { c.Close() })
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if conn, err := c.DialSession(ctx); err == nil {
+			conn.Close()
+		}
+	}()
+	client, err := relay.Accept()
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close() })
+	client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	record, err := readHelloRecord(client)
+	require.NoError(t, err)
+	portal, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() { portal.Close() })
+	_, err = portal.Write(record)
+	require.NoError(t, err)
+	return portal
+}
+
+// TestPortalStalledHandshakeDoesNotHoldRetiredIdentity admits an
+// authenticated ClientHello whose sender then stalls, and retires its
+// identity. The handshake timeout must close the connection, and the
+// retired identity with it.
+func TestPortalStalledHandshakeDoesNotHoldRetiredIdentity(t *testing.T) {
+	old := handshakeTimeout
+	handshakeTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { handshakeTimeout = old })
+
+	k1, k2 := newTestKeys(t), newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	pairings := map[[8]byte]string{id: tagA}
+	require.NoError(t, p.Configure(k1.config(0, pairings)))
+	addr := portalAddr(t, p)
+
+	admitted := make(chan struct{})
+	var once sync.Once
+	p.afterAdmit = func() { once.Do(func() { close(admitted) }) }
+	conn := stalledHandshake(t, addr, k1, id)
+	select {
+	case <-admitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stalled handshake was never admitted")
+	}
+
+	require.NoError(t, p.Configure(k2.config(0, pairings)))
+	require.Eventually(t, func() bool { return retiredCount(p) == 0 }, 5*time.Second, 20*time.Millisecond,
+		"a stalled handshake held the retired identity open")
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err := io.Copy(io.Discard, conn)
+	assert.NoError(t, err, "the portal did not close the stalled connection")
+}
