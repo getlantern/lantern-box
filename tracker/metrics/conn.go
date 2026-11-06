@@ -13,8 +13,9 @@ type Conn struct {
 	tracker   *MetricsTracker
 	startTime time.Time
 	rxBytes   atomic.Int64
-	// txBytes, firstTx and lastTx (unix nanoseconds) measure what the proxy
-	// sent the client, for download goodput (see recordDownloadGoodput).
+	// txBytes, firstTx (when the first write started) and lastTx (when the
+	// last write returned), in unix nanoseconds, measure what the proxy sent
+	// the client, for download goodput (see recordDownloadGoodput).
 	txBytes atomic.Int64
 	firstTx atomic.Int64
 	lastTx  atomic.Int64
@@ -43,11 +44,14 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 
 // Write overrides net.Conn's Write method to track sent bytes.
 func (c *Conn) Write(b []byte) (n int, err error) {
+	// The window opens when the first write starts, not when it returns: a
+	// write to the client blocks while the client drains it, and that time
+	// moved the write's bytes.
+	start := time.Now().UnixNano()
 	n, err = c.Conn.Write(b)
 	if n > 0 {
-		now := time.Now().UnixNano()
-		c.firstTx.CompareAndSwap(0, now)
-		c.lastTx.Store(now)
+		c.firstTx.CompareAndSwap(0, start)
+		c.lastTx.Store(time.Now().UnixNano())
 		c.txBytes.Add(int64(n))
 		c.tracker.TrackIO(tx, n, c.attrs)
 	}

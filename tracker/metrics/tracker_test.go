@@ -723,3 +723,49 @@ func TestSessionDownloadGoodput_SmallSessionNotRecorded(t *testing.T) {
 		assert.Zero(t, count, "a session under downloadGoodputMinBytes may end inside a shaper's burst")
 	})
 }
+
+func TestSessionDownloadGoodput_SingleBlockingWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reader := metric.NewManualReader()
+		sdkotel.SetMeterProvider(metric.NewMeterProvider(metric.WithReader(reader)))
+		SetupMetricsManager(geo.NoLookup{}, "")
+		mt := NewTracker(context.Background())
+		defer mt.Close()
+
+		ctx := context.Background()
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		tracked := mt.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
+
+		// The client drains 2 MiB at 64 KiB per 100ms, so the one write that
+		// carries it blocks for ~3.2s.
+		const total = 2 << 20
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			buf := make([]byte, 64<<10)
+			for got := 0; got < total; {
+				n, err := client.Read(buf)
+				if err != nil {
+					return
+				}
+				if got += n; got < total {
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
+		}()
+		_, err := tracked.Write(make([]byte, total))
+		require.NoError(t, err)
+		<-drained
+		require.NoError(t, tracked.Close())
+		synctest.Wait()
+
+		var rm metricdata.ResourceMetrics
+		reader.Collect(ctx, &rm)
+		count, sum := goodputByDirection(rm, tx)
+		require.Equal(t, uint64(1), count, "a single write of at least 1 MiB is still sampled")
+		// ~2 MiB over ~3.1s of blocking, not over zero.
+		assert.InDelta(t, float64(total)/3.1, sum, float64(total)/3.1*0.1)
+	})
+}

@@ -217,7 +217,8 @@ func (t *MetricsTracker) recordGoodput(rxBytes, durationMs int64, attrs *attribu
 const downloadGoodputMinBytes = 1 << 20
 
 // recordDownloadGoodput records the session's download goodput: bytes the proxy
-// sent the client per second between its first and last write, so idle time
+// sent the client per second from the start of its first write to the end of
+// its last, so idle time
 // before and after (a keepalive, a multiplexed session waiting for requests)
 // doesn't dilute it. It goes in the same histogram as recordGoodput, as
 // network.io.direction='transmit', and only for sessions that sent at least
