@@ -136,8 +136,26 @@ func TestRedactLogArgsDiscoveryErrors(t *testing.T) {
 	})
 	require.Len(t, got, 7)
 	assert.Equal(t, "upnp-igd1", got[1], "non-error strings are kept")
-	assert.Equal(t, "Post http://<ip>:<n>/ctl: refused", got[3])
-	assert.Equal(t, "read udp <ip>:<n>-><ip>:<n>: timeout", got[5])
+	assert.Equal(t, "Post <addr> refused", got[3])
+	assert.Equal(t, "read udp <addr> timeout", got[5])
 	assert.Equal(t, protocolAttr(UDP), got[6])
 	assert.Equal(t, []any{"internal_port", 1}, redactLogArgs(false, []any{"internal_port", 1}), "loud mode passes args through")
+}
+
+func TestRedactTextEndpoints(t *testing.T) {
+	for in, want := range map[string]string{
+		`Post "http://[fdab::]:5000/ctl": connection refused`:                          "Post <addr> connection refused",
+		`Post "http://router.lan:5000/ctl": dial tcp: lookup router.lan: no such host`: "Post <addr> dial tcp: lookup <addr> no such host",
+		"dial udp fdab:: : network is unreachable":                                     "dial udp <addr> : network is unreachable",
+		"read udp [fe80::1%en0]:5351: i/o timeout":                                     "read udp <addr> i/o timeout",
+		"dial tcp ::1: connection refused":                                             "dial tcp <addr> connection refused",
+		"pcp: gateway assigned external port 30005, not 30004":                         "pcp: gateway assigned external port <n>, not <n>",
+		"http://192.168.1.1:5000/ctl: status 500":                                      "<addr> status <n>",
+	} {
+		got := redactText(in)
+		assert.Equal(t, want, got, "redacting %q", in)
+		for _, leak := range []string{"fdab", "router.lan", "fe80", "192.168", "5000", "5351", "3000"} {
+			assert.NotContains(t, got, leak)
+		}
+	}
 }

@@ -29,8 +29,8 @@ func applyOptions(opts []Option) options {
 
 // SetQuietLogs turns quiet logging on or off. When it is on, every log line
 // keeps its message and the kind of any error, but drops the mapped ports and
-// the LAN address, and masks any address or number inside error text (such
-// as a gateway's IP or a port in a router's refusal). It is off by default.
+// the LAN address, and masks any address, hostname, URL or number inside
+// error text (such as a gateway's IP or a port in a router's refusal). It is off by default.
 // To also quiet the discovery that finds the gateway, pass QuietLogs to
 // NewForwarder.
 func (f *Forwarder) SetQuietLogs(quiet bool) {
@@ -61,21 +61,31 @@ var quietDropKeys = map[string]bool{
 }
 
 var (
-	ipv4RE   = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
-	ipv6RE   = regexp.MustCompile(`(?i)\[?\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\b\]?`)
-	numberRE = regexp.MustCompile(`\d+`)
+	// endpointRE finds a token that joins two alphanumerics with '.' or ':',
+	// the shape of a hostname, an IPv4 or IPv6 address, or host:port.
+	endpointRE = regexp.MustCompile(`[0-9A-Za-z][.:][0-9A-Za-z:]`)
+	numberRE   = regexp.MustCompile(`[0-9]+`)
 )
 
-// redactText masks addresses, then every remaining number, which takes ports
-// with it, so an error keeps its wording but names no endpoint.
+// redactText masks every endpoint in s, then every remaining number, which
+// takes ports with it. It works token by token, so an endpoint in any form
+// goes whole: a URL ("http://[fdab::]:5000/ctl"), a bracketed or
+// ::-compressed IPv6 address, a hostname such as router.lan, or ip:port. The
+// words around it stay, so the error keeps its kind ("connection refused",
+// "no such host", "status <n>").
 func redactText(s string) string {
-	s = ipv4RE.ReplaceAllString(s, "<ip>")
-	s = ipv6RE.ReplaceAllString(s, "<ip>")
-	return numberRE.ReplaceAllString(s, "<n>")
+	fields := strings.Fields(s)
+	for i, f := range fields {
+		if strings.Contains(f, "://") || strings.ContainsAny(f, "[]") ||
+			strings.Contains(f, "::") || endpointRE.MatchString(f) {
+			fields[i] = "<addr>"
+		}
+	}
+	return numberRE.ReplaceAllString(strings.Join(fields, " "), "<n>")
 }
 
 // redactLogArgs returns args unchanged unless quiet. Quiet, it drops the
-// pairs in quietDropKeys and masks addresses and numbers in error values,
+// pairs in quietDropKeys and masks endpoints and numbers in error values,
 // including the string-valued "*_err" fields discovery logs. args are
 // slog's alternating keys and values, possibly mixed with slog.Attrs.
 func redactLogArgs(quiet bool, args []any) []any {
