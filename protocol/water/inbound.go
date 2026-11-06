@@ -76,7 +76,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}),
 	}
 
-	inbound.service = waterTransport.NewService(logger, adapter.NewUpstreamHandlerEx(adapter.InboundContext{}, inbound.newConnection, inbound.newPacketConnection))
+	inbound.service = waterTransport.NewService(logger, adapter.NewUpstreamHandler(adapter.InboundContext{}, inbound.newConnection, inbound.newPacketConnection))
 	tcpListener, err := inbound.listener.ListenTCP()
 	if err != nil {
 		return nil, err

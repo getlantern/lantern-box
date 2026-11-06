@@ -116,7 +116,7 @@ func TestSchedulerCanceledObjectRemainsBusyAcrossFlaps(t *testing.T) {
 		s.CheckOutbounds()
 		synctest.Wait()
 		for range 4 {
-			s.InterfaceUpdated()
+			s.InterfaceUpdated(context.Background())
 			s.stickyTag.tcp.Store("a")
 			s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
 			s.CheckOutbounds()
@@ -416,7 +416,7 @@ func TestSchedulerLastResortSurvivesNetworkChange(t *testing.T) {
 		obs["ub"].dial = func(context.Context) (net.Conn, error) { dials.Add(1); <-release; return probeResponderConn(), nil }
 		s.CheckOutbounds()
 		synctest.Wait()
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		synctest.Wait()
 		require.EqualValues(t, 1, dials.Load())
 		close(release)
@@ -544,7 +544,7 @@ func TestSchedulerURLTestSurvivesNetworkChangeWhileIdle(t *testing.T) {
 		go func() { result, _ := s.URLTest(t.Context()); done <- result }()
 		synctest.Wait()
 		require.False(t, s.probing)
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		synctest.Wait()
 		require.EqualValues(t, 2, dials.Load())
 		select {
@@ -795,7 +795,7 @@ func TestSchedulerWatchdogPreservesChangedScope(t *testing.T) {
 				s.CheckOutbounds()
 				synctest.Wait()
 				if change == "network" {
-					s.InterfaceUpdated()
+					s.InterfaceUpdated(context.Background())
 				} else {
 					s.SetURLOverrides(map[string]string{"a": "http://other.test/"})
 				}
@@ -891,7 +891,7 @@ func TestSchedulerInterfaceUpdatedRejectsStaleProbeOutcome(t *testing.T) {
 		}
 		requestTestProbes(s, []string{"a"}, probeForced)
 		synctest.Wait()
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		close(release)
 		synctest.Wait()
 		require.EqualValues(t, 2, dials.Load(), "the need survives the network change")
@@ -911,7 +911,7 @@ func TestSchedulerInterfaceUpdatedRejectsStaleUserFailure(t *testing.T) {
 	s.access.Unlock()
 	generation := s.networkGeneration.Load()
 	require.True(t, s.recordUserFailure("a", adapter.UserFailureStall, generation))
-	s.InterfaceUpdated()
+	s.InterfaceUpdated(context.Background())
 	require.NotEqual(t, generation, s.networkGeneration.Load())
 	require.False(t, s.recordUserFailure("a", adapter.UserFailureReset, generation))
 	require.Contains(t, s.histories, "a")
@@ -930,7 +930,7 @@ func TestSchedulerInterfaceUpdatedPreservesSelection(t *testing.T) {
 	s.lastConfirmedFailureSwitch.selectedTag = "a"
 	s.lastLadderAt.Store(at.UnixNano())
 	s.exhaustionCh <- struct{}{}
-	s.InterfaceUpdated()
+	s.InterfaceUpdated(context.Background())
 	require.NotEqual(t, generation, s.networkGeneration.Load())
 	require.Equal(t, "a", loadString(&s.stickyTag.tcp))
 	require.Equal(t, "a", loadString(&s.stickyTag.udp))
@@ -1019,17 +1019,17 @@ func TestSchedulerInterfaceFlapsDoNotLiftLadderCooldown(t *testing.T) {
 			s.lastLadderAt.Store(time.Now().UnixNano())
 		}
 		ladderRan()
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		require.Zero(t, s.lastLadderAt.Load(), "first update after a quiet period lifts the cooldown")
 		for range 3 {
 			ladderRan()
 			time.Sleep(30 * time.Second)
-			s.InterfaceUpdated()
+			s.InterfaceUpdated(context.Background())
 			require.NotZero(t, s.lastLadderAt.Load(), "a flap within ladderCooldown keeps the cooldown")
 		}
 		ladderRan()
 		time.Sleep(time.Minute)
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		require.Zero(t, s.lastLadderAt.Load(), "an update after a quiet ladderCooldown lifts it again")
 	})
 }
@@ -1156,7 +1156,7 @@ func TestSchedulerLadderEvaluatedBeforeNetworkChangeLeavesCooldown(t *testing.T)
 		s.access.Lock()
 		s.evaluateProbesLocked(s.ladderWaiter)
 		s.access.Unlock()
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		<-done
 		require.Zero(t, s.lastLadderAt.Load(), "a network change lifts the cooldown")
 		close(release)

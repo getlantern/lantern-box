@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewConnectionEx_HandshakeFailure(t *testing.T) {
+func TestNewConnection_HandshakeFailure(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
 
@@ -33,7 +33,7 @@ func TestNewConnectionEx_HandshakeFailure(t *testing.T) {
 
 	onCloseCalled := make(chan struct{})
 	// Must not panic; must close the original conn.
-	in.NewConnectionEx(context.Background(), client, adapter.InboundContext{}, func(err error) {
+	in.NewConnection(context.Background(), client, adapter.InboundContext{}, func(err error) {
 		close(onCloseCalled)
 	})
 
@@ -51,7 +51,7 @@ func TestNewConnectionEx_HandshakeFailure(t *testing.T) {
 // A request line whose path component contains only characters the parser strips (here "<") used
 // to leave findPath with an empty component and index out of range in the algeneva parser, killing
 // the whole process from a single unauthenticated connection.
-func TestNewConnectionEx_MalformedRequestLine(t *testing.T) {
+func TestNewConnection_MalformedRequestLine(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
 
@@ -66,7 +66,7 @@ func TestNewConnectionEx_MalformedRequestLine(t *testing.T) {
 	}
 
 	onCloseCalled := make(chan struct{})
-	in.NewConnectionEx(context.Background(), client, adapter.InboundContext{}, func(err error) {
+	in.NewConnection(context.Background(), client, adapter.InboundContext{}, func(err error) {
 		close(onCloseCalled)
 	})
 

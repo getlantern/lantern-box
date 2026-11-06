@@ -1626,7 +1626,7 @@ func TestKeepAlive_RestartSkipsProbeWhilePaused(t *testing.T) {
 		synctest.Wait()
 		assert.EqualValues(t, 1, dials.Load(), "wake dispatches pending work")
 
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		synctest.Wait()
 		assert.EqualValues(t, 2, dials.Load(), "the network reset forces a new probe")
 	})
@@ -1637,7 +1637,7 @@ func TestInterfaceUpdated_IdleDefersProbeToNextUse(t *testing.T) {
 		s, dials := newIdleTestMUR(t)
 		s.lastActive = time.Now()
 
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		synctest.Wait()
 		assert.Zero(t, dials.Load(), "an idle group must not probe on a network change")
 
@@ -1726,14 +1726,14 @@ func TestInterfaceUpdated_SkipsWhilePaused(t *testing.T) {
 
 		// sing-box resets the network on suspend as well as on resume.
 		pm.DevicePause()
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		synctest.Wait()
 		assert.EqualValues(t, 1, dials.Load(), "a network reset while paused must not probe")
 
 		pm.DeviceWake()
 		synctest.Wait()
 		require.EqualValues(t, 2, dials.Load())
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 		synctest.Wait()
 		assert.EqualValues(t, 3, dials.Load())
 	})
@@ -1847,7 +1847,7 @@ func TestNetworkChangeMidProbe_DiscardsExhaustion(t *testing.T) {
 
 				go tt.run(s)
 				time.Sleep(100 * time.Millisecond)
-				s.InterfaceUpdated()
+				s.InterfaceUpdated(context.Background())
 				time.Sleep(time.Second)
 				synctest.Wait()
 				assert.False(t, exhausted(s), "a probe that measured the old network must not signal exhaustion")
@@ -2148,7 +2148,7 @@ func TestDialContext_FailoverAfterNetworkChangeUsesCurrentGeneration(t *testing.
 		recordSuccess(s, "a", 10)
 		recordSuccess(s, "b", 20)
 		obs["a"].dial = func(context.Context) (net.Conn, error) {
-			s.InterfaceUpdated()
+			s.InterfaceUpdated(context.Background())
 			return nil, errors.New("dial refused")
 		}
 		obs["b"].dial = func(context.Context) (net.Conn, error) {
@@ -2174,7 +2174,7 @@ func TestDialContext_FailoverAfterNetworkChangeUsesCurrentGeneration(t *testing.
 		var changed atomic.Bool
 		obs["a"].dial = func(context.Context) (net.Conn, error) {
 			if !changed.Swap(true) {
-				s.InterfaceUpdated()
+				s.InterfaceUpdated(context.Background())
 			}
 			return nil, errors.New("dial refused")
 		}
@@ -2197,7 +2197,7 @@ func TestListenPacket_FailoverAfterNetworkChangeUsesCurrentGeneration(t *testing
 	recordSuccess(s, "a", 10)
 	recordSuccess(s, "b", 20)
 	obs["a"].On("ListenPacket").Run(func(mock.Arguments) {
-		s.InterfaceUpdated()
+		s.InterfaceUpdated(context.Background())
 	}).Return(nil, errors.New("listen refused")).Once()
 	obs["a"].On("ListenPacket").Return(nil, errors.New("listen refused"))
 	obs["b"].On("ListenPacket").Return(nil, errors.New("listen refused"))
@@ -2217,7 +2217,7 @@ func TestStaleFailureWithoutAlternateRunsNoLadder(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				s, obs := newTestMUR(t, "a")
 				recordSuccess(s, "a", 10)
-				networkChanged := func() { s.InterfaceUpdated() }
+				networkChanged := func() { s.InterfaceUpdated(context.Background()) }
 				if network == "tcp" {
 					obs["a"].dial = func(context.Context) (net.Conn, error) {
 						networkChanged()

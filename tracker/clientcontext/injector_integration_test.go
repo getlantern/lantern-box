@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -369,4 +370,8 @@ func (t *mockTracker) RoutedPacketConnection(ctx context.Context, conn N.PacketC
 		t.last.Store(&info)
 	}
 	return conn
+}
+
+func (t *mockTracker) RoutedFlow(ctx context.Context, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) tun.FlowTracker {
+	return nil
 }
