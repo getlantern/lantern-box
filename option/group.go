@@ -142,14 +142,15 @@ type MutableAutoSelectOutboundOptions struct {
 type ProbeTimeoutsMs map[string]uint32
 
 func (p *ProbeTimeoutsMs) UnmarshalJSON(b []byte) error {
-	var raw map[string]any
+	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
 		*p = nil
 		return nil
 	}
 	out := make(ProbeTimeoutsMs, len(raw))
 	for typ, v := range raw {
-		if f, ok := v.(float64); ok && f >= 0 && f <= math.MaxUint32 && f == math.Trunc(f) {
+		var f float64
+		if json.Unmarshal(v, &f) == nil && f >= 0 && f <= math.MaxUint32 && f == math.Trunc(f) {
 			out[typ] = uint32(f)
 		}
 	}
