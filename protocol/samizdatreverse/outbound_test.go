@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -314,4 +315,121 @@ func TestReverseHeaderTimeout(t *testing.T) {
 	_, err := o.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("127.0.0.1:9"))
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, time.Since(start), 5*time.Second)
+}
+
+// rawTCP digs the TCP conn out from under a samizdat session conn.
+func rawTCP(t *testing.T, c net.Conn) *net.TCPConn {
+	t.Helper()
+	for {
+		if tc, ok := c.(*net.TCPConn); ok {
+			return tc
+		}
+		u, ok := c.(interface{ NetConn() net.Conn })
+		require.True(t, ok, "cannot reach the TCP conn under %T", c)
+		c = u.NetConn()
+	}
+}
+
+func TestReverseSessionResetHidesAddresses(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	addr := portalAddr(t, p)
+
+	c, err := samizdat.NewClient(samizdat.ClientConfig{ServerAddr: addr, ServerName: "localhost", PublicKey: k.pub, ShortID: id})
+	require.NoError(t, err)
+	t.Cleanup(func() { c.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := c.DialSession(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	got := make(chan struct{}, 1)
+	go (&http2.Server{}).ServeConn(conn, &http2.ServeConnOpts{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- struct{}{}
+		<-r.Context().Done()
+	})})
+	require.Eventually(t, func() bool { _, ok := p.Session(tagA); return ok }, 5*time.Second, 20*time.Millisecond)
+
+	o := newTestReverse(t, tagA, p)
+	errc := make(chan error, 1)
+	go func() {
+		_, err := o.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("127.0.0.1:9"))
+		errc <- err
+	}()
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CONNECT never reached the helper")
+	}
+
+	// Reset the session's TCP connection while the CONNECT waits for its
+	// response headers.
+	tc := rawTCP(t, conn)
+	localPort := strconv.Itoa(tc.LocalAddr().(*net.TCPAddr).Port)
+	require.NoError(t, tc.SetLinger(0))
+	require.NoError(t, tc.Close())
+
+	select {
+	case err = <-errc:
+	case <-time.After(10 * time.Second):
+		t.Fatal("CONNECT did not fail after the session reset")
+	}
+	require.Error(t, err)
+	t.Logf("CONNECT error: %v", err)
+	_, portalPort, _ := net.SplitHostPort(addr)
+	for _, leak := range []string{"127.0.0.1", "[::", portalPort, localPort} {
+		assert.NotContains(t, err.Error(), leak, "CONNECT error names a session endpoint")
+	}
+}
+
+func TestReverseStreamResetHidesAddresses(t *testing.T) {
+	k := newTestKeys(t)
+	id := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{id: tagA})))
+	addr := portalAddr(t, p)
+
+	c, err := samizdat.NewClient(samizdat.ClientConfig{ServerAddr: addr, ServerName: "localhost", PublicKey: k.pub, ShortID: id})
+	require.NoError(t, err)
+	t.Cleanup(func() { c.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := c.DialSession(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	go (&http2.Server{}).ServeConn(conn, &http2.ServeConnOpts{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})})
+	require.Eventually(t, func() bool { _, ok := p.Session(tagA); return ok }, 5*time.Second, 20*time.Millisecond)
+
+	o := newTestReverse(t, tagA, p)
+	stream, err := o.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("127.0.0.1:9"))
+	require.NoError(t, err)
+	defer stream.Close()
+
+	tc := rawTCP(t, conn)
+	localPort := strconv.Itoa(tc.LocalAddr().(*net.TCPAddr).Port)
+	require.NoError(t, tc.SetLinger(0))
+	require.NoError(t, tc.Close())
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := stream.Read(make([]byte, 1))
+		readErr <- err
+	}()
+	select {
+	case err = <-readErr:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stream read did not fail after the session reset")
+	}
+	require.Error(t, err)
+	t.Logf("stream read error: %v", err)
+	_, portalPort, _ := net.SplitHostPort(addr)
+	for _, leak := range []string{"127.0.0.1", "[::", portalPort, localPort} {
+		assert.NotContains(t, err.Error(), leak, "stream error names a session endpoint")
+	}
 }

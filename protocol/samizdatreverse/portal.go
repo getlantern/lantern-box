@@ -414,17 +414,6 @@ func closeSessions(sessions []*portalSession) {
 	wg.Wait()
 }
 
-// addrFree strips the addresses a *net.OpError carries, keeping its
-// operation and cause, so the error can be logged or returned without
-// naming a peer.
-func addrFree(err error) error {
-	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Err != nil {
-		return fmt.Errorf("%s: %w", opErr.Op, opErr.Err)
-	}
-	return err
-}
-
 // Session returns the HTTP/2 client of the live session for reverseTag, if
 // it can take a new stream. The client is checked outside sessMu, as every
 // call into an HTTP/2 client must be.

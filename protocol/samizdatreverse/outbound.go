@@ -173,7 +173,9 @@ func (o *Outbound) connect(ctx context.Context, destination M.Socksaddr) (net.Co
 		if timerFired {
 			return nil, fmt.Errorf("samizdat-reverse: CONNECT: no response within %s: %w", connectTimeout, context.DeadlineExceeded)
 		}
-		return nil, fmt.Errorf("samizdat-reverse: CONNECT: %w", err)
+		// A session that fails mid-CONNECT returns the conn's *net.OpError,
+		// which names both ends of the session.
+		return nil, fmt.Errorf("samizdat-reverse: CONNECT: %w", addrFree(err))
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -252,7 +254,9 @@ type wrapConn struct {
 
 func (c *wrapConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	return n, baderror.WrapH2(err)
+	// A session that fails mid-stream surfaces its conn's *net.OpError,
+	// which names both ends of the session, and the router logs it.
+	return n, addrFree(baderror.WrapH2(err))
 }
 
 func (c *wrapConn) NeedAdditionalReadDeadline() bool {
