@@ -149,9 +149,12 @@ func (p *ProbeTimeoutsMs) UnmarshalJSON(b []byte) error {
 	}
 	out := make(ProbeTimeoutsMs, len(raw))
 	for typ, v := range raw {
-		var f float64
-		if json.Unmarshal(v, &f) == nil && f >= 0 && f <= math.MaxUint32 && f == math.Trunc(f) {
-			out[typ] = uint32(f)
+		var f *float64
+		if json.Unmarshal(v, &f) != nil || f == nil {
+			continue
+		}
+		if *f >= 0 && *f <= math.MaxUint32 && *f == math.Trunc(*f) {
+			out[typ] = uint32(*f)
 		}
 	}
 	*p = out
