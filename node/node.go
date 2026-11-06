@@ -387,6 +387,7 @@ func (n *node) register(ctx context.Context) (*registerResponse, error) {
 		InternalPort:           n.port,
 		ServePool:              true,
 		RunsUnboundedVolunteer: true,
+		ReportsNetstatedAsync:  true,
 	})
 }
 
