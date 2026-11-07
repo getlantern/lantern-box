@@ -17,7 +17,7 @@ import (
 func init() {
 	rootCmd.AddCommand(serveCmd)
 	defineServeFlags(serveCmd.Flags())
-	serveCmd.Flags().String("flags-file", "", "File of more serve flags, quoted as in a shell, which the command line overrides; a missing file means none")
+	serveCmd.Flags().String("flags-file", "", "File of more serve flags, separated by whitespace, with # comments; the command line overrides them, and a missing file means none")
 }
 
 // defineServeFlags defines the flags serve takes on its command line and in

@@ -34,7 +34,7 @@ func TestFlagsFileSetsFlags(t *testing.T) {
 	path := writeFlagsFile(t, `# Lamplighter flags
 --bandwidth-limit 10mbit --max-peers 5
 
---user-id "an operator" --no-port-mapping
+--user-id operator --no-port-mapping
 --rotation-interval=30m
 `)
 	fs := serveFlagsWith(t, "--register")
@@ -47,41 +47,27 @@ func TestFlagsFileSetsFlags(t *testing.T) {
 	rotation, _ := fs.GetDuration("rotation-interval")
 	assert.Equal(t, "10mbit", limit)
 	assert.Equal(t, 5, peers)
-	assert.Equal(t, "an operator", user, "a quoted value keeps its space")
+	assert.Equal(t, "operator", user)
 	assert.True(t, noMap)
 	assert.Equal(t, 30*time.Minute, rotation)
 }
 
-// Comments are cut where a shell would cut them, and Windows line endings
-// don't end up in values.
+// A word starting with # begins a comment to the end of its line, and
+// Windows line endings don't end up in values.
 func TestFlagsFileCommentsAndLineEndings(t *testing.T) {
-	path := writeFlagsFile(t, "--max-peers 5  # five peers\r\n"+
-		"--user-id \"tag #1\"\r\n"+
+	path := writeFlagsFile(t, "# Lamplighter\r\n"+
+		"--max-peers 5  # five peers\r\n"+
 		"--bandwidth-limit 10mbit#not-a-comment\r\n"+
-		"--api-url a\\ #b\r\n")
+		"--user-id operator\r\n")
 	fs := serveFlagsWith(t, "--register")
 	require.NoError(t, applyFlagsFile(fs, path))
 
 	peers, _ := fs.GetInt("max-peers")
-	user, _ := fs.GetString("user-id")
 	limit, _ := fs.GetString("bandwidth-limit")
-	api, _ := fs.GetString("api-url")
-	assert.Equal(t, 5, peers, "a trailing comment and a CRLF are dropped")
-	assert.Equal(t, "tag #1", user, "a # inside quotes is kept")
-	assert.Equal(t, "10mbit#not-a-comment", limit, "a # inside a word is kept")
-	assert.Equal(t, "a #b", api, "an escaped space keeps the # in the word")
-}
-
-// A line ending in a backslash continues onto the next, as in a shell, and a
-// comment on that next line is still a comment.
-func TestFlagsFileContinuation(t *testing.T) {
-	path := writeFlagsFile(t, "--max-peers \\\n5 \\\n# five peers\n--user-id x\n")
-	fs := serveFlagsWith(t, "--register")
-	require.NoError(t, applyFlagsFile(fs, path))
-	peers, _ := fs.GetInt("max-peers")
 	user, _ := fs.GetString("user-id")
-	assert.Equal(t, 5, peers)
-	assert.Equal(t, "x", user)
+	assert.Equal(t, 5, peers, "a trailing comment is dropped")
+	assert.Equal(t, "10mbit#not-a-comment", limit, "a # inside a word is kept")
+	assert.Equal(t, "operator", user, "a CRLF doesn't end up in a value")
 }
 
 func TestFlagsFileLosesToCommandLine(t *testing.T) {
@@ -125,11 +111,10 @@ func TestFlagsFileMissingMeansNone(t *testing.T) {
 // run without the flags its operator set.
 func TestFlagsFileErrors(t *testing.T) {
 	for name, contents := range map[string]string{
-		"unknown flag":       "--no-such-flag 1",
-		"positional word":    "--max-peers 5 stray",
-		"unterminated quote": `--user-id "unfinished`,
-		"bad value":          "--max-peers many",
-		"nested flags file":  "--flags-file /elsewhere",
+		"unknown flag":      "--no-such-flag 1",
+		"positional word":   "--max-peers 5 stray",
+		"bad value":         "--max-peers many",
+		"nested flags file": "--flags-file /elsewhere",
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := applyFlagsFile(serveFlagsWith(t), writeFlagsFile(t, contents))

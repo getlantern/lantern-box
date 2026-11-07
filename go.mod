@@ -40,7 +40,6 @@ require (
 	github.com/hashicorp/yamux v0.1.2
 	github.com/huin/goupnp v1.3.0
 	github.com/jackpal/gateway v1.2.0
-	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/pion/stun/v4 v4.0.1
 	github.com/pion/transport/v5 v5.1.1
 	github.com/refraction-networking/water v0.7.1-alpha

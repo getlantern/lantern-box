@@ -8,7 +8,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/kballard/go-shellquote"
 	"github.com/spf13/pflag"
 )
 
@@ -17,8 +16,9 @@ import (
 var flagsFileNotices io.Writer = os.Stderr
 
 // applyFlagsFile sets serve's flags from the file at path, for each one the
-// command line didn't set. The file holds flags as a shell would quote them,
-// with # comments, on one line or several. Nothing in it is expanded or run.
+// command line didn't set. The file holds flags separated by whitespace, on
+// one line or several, and a word starting with # begins a comment that runs
+// to the end of its line. There's no quoting, so no value can contain a space.
 //
 // A missing file means no flags. One that exists but can't be read, a
 // dangling symlink included, is an error, so the node never runs without the
@@ -33,10 +33,14 @@ func applyFlagsFile(cmdFlags *pflag.FlagSet, path string) error {
 		}
 		return fmt.Errorf("read flags file: %w", err)
 	}
-	text := strings.ReplaceAll(string(data), "\r\n", "\n")
-	words, err := shellquote.Split(stripComments(strings.TrimSuffix(text, "\r")))
-	if err != nil {
-		return fmt.Errorf("flags file %s: %w", path, err)
+	var words []string
+	for _, line := range strings.Split(string(data), "\n") {
+		for _, word := range strings.Fields(line) {
+			if strings.HasPrefix(word, "#") {
+				break
+			}
+			words = append(words, word)
+		}
 	}
 
 	// Parsed into a separate set with the same flags, which checks each value,
@@ -77,56 +81,4 @@ func applyFlagsFile(cmdFlags *pflag.FlagSet, path string) error {
 		}
 	}
 	return nil
-}
-
-// stripComments removes # comments from s, as a shell does: a # starting an
-// unquoted word begins a comment that runs to the end of its line, and a #
-// anywhere else, inside quotes or a word, is kept.
-func stripComments(s string) string {
-	var b strings.Builder
-	var quote byte
-	wordStart := true
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case quote == '\'':
-			if c == '\'' {
-				quote = 0
-			}
-		case quote == '"':
-			if c == '\\' && i+1 < len(s) {
-				b.WriteByte(c)
-				i++
-				c = s[i]
-			} else if c == '"' {
-				quote = 0
-			}
-		case c == '#' && wordStart:
-			for i < len(s) && s[i] != '\n' {
-				i++
-			}
-			if i < len(s) {
-				b.WriteByte('\n')
-			}
-			wordStart = true
-			continue
-		case c == '\\' && i+1 < len(s) && s[i+1] == '\n':
-			// A line continuation, which go-shellquote drops too: it neither
-			// ends nor starts a word.
-			i++
-			continue
-		case c == '\\' && i+1 < len(s):
-			// An escaped character, even a space, is part of a word.
-			b.WriteByte(c)
-			b.WriteByte(s[i+1])
-			i++
-			wordStart = false
-			continue
-		case c == '\'' || c == '"':
-			quote = c
-		}
-		b.WriteByte(c)
-		wordStart = quote == 0 && (c == ' ' || c == '\t' || c == '\n')
-	}
-	return b.String()
 }

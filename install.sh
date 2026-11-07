@@ -6,7 +6,7 @@
 #
 # Optional environment:
 #   LANTERN_NODE_ARGS   more `lantern-box serve` flags, such as "--bandwidth-limit 10mbit",
-#                       quoted as in a shell. Set, they replace any flags set
+#                       separated by spaces. Set, they replace any flags set
 #                       before, so give all you want, or set it empty to clear
 #                       them. Unset, as when you rerun this to upgrade, the flags
 #                       set before stay.
