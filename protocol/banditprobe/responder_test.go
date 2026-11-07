@@ -151,7 +151,7 @@ func TestServe_DeliveredForwardsCallbackWithClientParams(t *testing.T) {
 	resp, body, err := runProbe(t, r, server, client, probeTarget)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Len(t, body, testBodySize)
+	assertBodySize(t, body, testBodySize)
 
 	calls := rec.calls()
 	require.Len(t, calls, 1)
@@ -541,7 +541,7 @@ func TestServe_CompletedWriteWithoutSocketStateIsUnknown(t *testing.T) {
 	resp, body, err := runProbe(t, r, server, client, probeTarget)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Len(t, body, testBodySize)
+	assertBodySize(t, body, testBodySize)
 	calls := rec.calls()
 	require.Len(t, calls, 1)
 	assert.Equal(t, "unknown", calls[0].Get("verdict"))
@@ -573,7 +573,7 @@ func TestServe_PostWriteThrottleIsNotAStall(t *testing.T) {
 	errc := make(chan error, 1)
 	go func() { errc <- r.serve(context.Background(), conn) }()
 	_, body := probe(t, client, probeTarget)
-	assert.Len(t, body, testBodySize)
+	assertBodySize(t, body, testBodySize)
 	require.NoError(t, <-errc)
 	calls := rec.calls()
 	require.Len(t, calls, 1)
@@ -635,7 +635,7 @@ func TestServe_NonTCPConnReportsUnknown(t *testing.T) {
 	resp, body, err := runProbe(t, r, server, client, probeTarget)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Len(t, body, testBodySize)
+	assertBodySize(t, body, testBodySize)
 	calls := rec.calls()
 	require.Len(t, calls, 1)
 	assert.Equal(t, "unknown", calls[0].Get("verdict"))
@@ -979,7 +979,7 @@ func TestServe_ResponseFitsChunkLimitedInbound(t *testing.T) {
 	resp, body, err := runProbe(t, r, conn, client, probeTarget)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Len(t, body, defaultBodySize)
+	assertBodySize(t, body, defaultBodySize)
 	calls := rec.calls()
 	require.Len(t, calls, 1, "a probe through a chunk-limited inbound must be reported")
 	assert.Equal(t, "unknown", calls[0].Get("verdict"))
@@ -1004,5 +1004,70 @@ func TestServe_ShortWritesStillSendTheWholeResponse(t *testing.T) {
 	resp, body, err := runProbe(t, r, &shortWriteConn{Conn: server, limit: 1000}, client, probeTarget)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Len(t, body, defaultBodySize, "a short write must not drop the rest of a chunk")
+	assertBodySize(t, body, defaultBodySize, "a short write must not drop the rest of a chunk")
+}
+
+// assertBodySize checks that a response body is between size and half again
+// as long, the range body draws from.
+func assertBodySize(t *testing.T, body []byte, size int, msgAndArgs ...any) {
+	t.Helper()
+	assert.GreaterOrEqual(t, len(body), size, msgAndArgs...)
+	assert.LessOrEqual(t, len(body), size+size/2, msgAndArgs...)
+}
+
+func TestBody_LengthVaries(t *testing.T) {
+	r := newTestResponder(t, newCallbackRecorder(t), option.BanditProbeOutboundOptions{BodySize: defaultBodySize}, nil)
+	lengths := map[int]bool{}
+	for range 50 {
+		body := r.body()
+		assertBodySize(t, body, defaultBodySize)
+		lengths[len(body)] = true
+	}
+	assert.Greater(t, len(lengths), 1, "probe responses must not all share one length")
+}
+
+func TestBody_StaysInsideThePool(t *testing.T) {
+	size := bodyPoolSize - 10
+	r := newTestResponder(t, newCallbackRecorder(t), option.BanditProbeOutboundOptions{BodySize: size}, nil)
+	for range 50 {
+		body := r.body()
+		assert.GreaterOrEqual(t, len(body), size)
+		assert.LessOrEqual(t, len(body), bodyPoolSize)
+	}
+}
+
+// writeSizeConn records the size of each Write.
+type writeSizeConn struct {
+	net.Conn
+	mu    sync.Mutex
+	sizes []int
+}
+
+func (c *writeSizeConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	c.sizes = append(c.sizes, len(b))
+	c.mu.Unlock()
+	return c.Conn.Write(b)
+}
+
+func TestServe_FirstWriteJoinsHeaderAndBody(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{BodySize: defaultBodySize}, nil)
+	server, client := tcpPair(t)
+	conn := &writeSizeConn{Conn: server}
+
+	resp, body, err := runProbe(t, r, conn, client, probeTarget)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assertBodySize(t, body, defaultBodySize)
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	require.NotEmpty(t, conn.sizes)
+	assert.Equal(t, maxWriteChunk, conn.sizes[0], "the header must go out with the start of the body, not alone")
+	total := 0
+	for _, n := range conn.sizes {
+		assert.LessOrEqual(t, n, maxWriteChunk)
+		total += n
+	}
+	assert.Greater(t, total, len(body), "everything written is the header plus the body")
 }
