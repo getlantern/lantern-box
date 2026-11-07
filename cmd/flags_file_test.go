@@ -55,7 +55,7 @@ func TestFlagsFileSetsFlags(t *testing.T) {
 // A word starting with # begins a comment to the end of its line, and
 // Windows line endings don't end up in values.
 func TestFlagsFileCommentsAndLineEndings(t *testing.T) {
-	path := writeFlagsFile(t, "# Lamplighter\r\n"+
+	path := writeFlagsFile(t, "\uFEFF# Lamplighter\r\n"+
 		"--max-peers 5  # five peers\r\n"+
 		"--bandwidth-limit 10mbit#not-a-comment\r\n"+
 		"--user-id operator\r\n")
@@ -68,6 +68,8 @@ func TestFlagsFileCommentsAndLineEndings(t *testing.T) {
 	assert.Equal(t, 5, peers, "a trailing comment is dropped")
 	assert.Equal(t, "10mbit#not-a-comment", limit, "a # inside a word is kept")
 	assert.Equal(t, "operator", user, "a CRLF doesn't end up in a value")
+	// The byte-order mark at the start didn't stop the first line being a
+	// comment, or the require above would have failed.
 }
 
 func TestFlagsFileLosesToCommandLine(t *testing.T) {
@@ -111,10 +113,11 @@ func TestFlagsFileMissingMeansNone(t *testing.T) {
 // run without the flags its operator set.
 func TestFlagsFileErrors(t *testing.T) {
 	for name, contents := range map[string]string{
-		"unknown flag":      "--no-such-flag 1",
-		"positional word":   "--max-peers 5 stray",
-		"bad value":         "--max-peers many",
-		"nested flags file": "--flags-file /elsewhere",
+		"unknown flag":       "--no-such-flag 1",
+		"positional word":    "--max-peers 5 stray",
+		"bad value":          "--max-peers many",
+		"nested flags file":  "--flags-file /elsewhere",
+		"value on next line": "--user-id\n--no-port-mapping",
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := applyFlagsFile(serveFlagsWith(t), writeFlagsFile(t, contents))
