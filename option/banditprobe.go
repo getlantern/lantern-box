@@ -23,8 +23,10 @@ type BanditProbeOutboundOptions struct {
 	// callback carries the probe token and device ID across the open internet.
 	CallbackURL string `json:"callback_url"`
 
-	// BodySize is the number of random bytes sent back to the client. It has to
-	// exceed the point at which censors freeze a flow (default: 65536).
+	// BodySize is the least number of random bytes sent back to the client. It
+	// has to exceed the point at which censors freeze a flow (default: 65536).
+	// Each response adds a random amount of up to half again, so probe
+	// responses don't all share one length.
 	BodySize int `json:"body_size,omitempty"`
 
 	// StallTimeout is how long acknowledgements may stop advancing, with data
