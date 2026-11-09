@@ -114,7 +114,82 @@ func TestBatcherFallsBackToSingleCallbacks(t *testing.T) {
 	b.add(probeQuery("tok-1"), "", result{verdict: verdictDelivered})
 	b.add(probeQuery("tok-2"), "", result{verdict: verdictStalled})
 	b.close()
-	assert.Equal(t, []string{"tok-1", "tok-2"}, single.tokens)
+	assert.ElementsMatch(t, []string{"tok-1", "tok-2"}, single.tokens)
+}
+
+// A callback added after the batcher closed goes out on its own.
+func TestBatcherSendsLateCallbacksSingly(t *testing.T) {
+	rec, srv := newBatchRecorder(t, http.StatusOK)
+	single := &singleRecorder{}
+	b := testBatcher(t, srv.URL, time.Hour, 100, single)
+	b.close()
+	b.add(probeQuery("late"), "", result{verdict: verdictDelivered})
+	b.fallbacks.Wait()
+	assert.Equal(t, []string{"late"}, single.tokens)
+	assert.Empty(t, rec.batches)
+}
+
+// Single callbacks for a refused batch don't hold up the next batch.
+func TestBatcherKeepsBatchingWhileFallingBack(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	got := make(chan int, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		got <- n
+	}))
+	t.Cleanup(srv.Close)
+	release := make(chan struct{})
+	blocked := &singleRecorder{}
+	u, err := url.Parse(srv.URL + "/v1/bandit/callbacks")
+	require.NoError(t, err)
+	b := newBatcher(batchConfig{url: u, token: "fleet-token", interval: time.Hour, maxSize: 1},
+		http.DefaultClient, log.NewNOPFactory().Logger(), time.Now,
+		func(ctx context.Context, q url.Values, tp string, res result) error {
+			<-release
+			return blocked.send(ctx, q, tp, res)
+		})
+	defer func() {
+		close(release)
+		b.close()
+	}()
+
+	b.add(probeQuery("refused"), "", result{verdict: verdictDelivered})
+	require.Equal(t, 1, <-got)
+	b.add(probeQuery("next"), "", result{verdict: verdictDelivered})
+	select {
+	case n := <-got:
+		assert.Equal(t, 2, n, "the next batch went out while the fallback waited")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the next batch waited for the fallback")
+	}
+}
+
+// A batched callback carries callback_url's own parameters over the
+// client's, as a single callback does.
+func TestServe_BatchAppliesCallbackURLParams(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	batches, srv := newBatchRecorder(t, http.StatusOK)
+	r := newTestResponder(t, rec, option.BanditProbeOutboundOptions{CallbackURL: rec.srv.URL + "/v1/bandit/callback?cd=0"}, scriptedState(
+		sendState{acked: 100, unacked: 4000},
+		sendState{acked: 4100, unacked: 0},
+	))
+	u, err := url.Parse(srv.URL + "/v1/bandit/callbacks")
+	require.NoError(t, err)
+	r.batch = newBatcher(batchConfig{url: u, token: "fleet-token", interval: time.Hour, maxSize: 100},
+		srv.Client(), r.logger, r.now, r.sendCallback)
+	server, client := tcpPair(t)
+	_, _, err = runProbe(t, r, server, client, probeTarget)
+	require.NoError(t, err)
+	r.batch.close()
+	require.Len(t, batches.batches, 1)
+	assert.Zero(t, batches.batches[0][0].ClientQueueDelayMs, "callback_url's cd=0 overrides the client's cd=40")
 }
 
 func TestToBatchCallbackQueueTime(t *testing.T) {

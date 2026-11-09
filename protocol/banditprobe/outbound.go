@@ -70,8 +70,15 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 	// its host, off the VPN tunnel.
 	// An environment proxy may be named by hostname even when the callback
 	// host is an IP literal.
+	// The batch endpoint is dialed the same way, so its host counts too.
 	_, ipErr := netip.ParseAddr(cfg.callbackURL.Hostname())
-	callbackDialer, err := dialer.New(ctx, options.DialerOptions, ipErr != nil || options.UseProxyEnvironment)
+	resolve := ipErr != nil || options.UseProxyEnvironment
+	if cfg.batch.url != nil {
+		if _, err := netip.ParseAddr(cfg.batch.url.Hostname()); err != nil {
+			resolve = true
+		}
+	}
+	callbackDialer, err := dialer.New(ctx, options.DialerOptions, resolve)
 	if err != nil {
 		return nil, fmt.Errorf("banditprobe: callback dialer: %w", err)
 	}

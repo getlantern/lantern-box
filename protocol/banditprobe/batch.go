@@ -25,6 +25,12 @@ const (
 	// maxBatchBacklog bounds the callbacks held while batches fail, in
 	// batches of batchMaxSize.
 	maxBatchBacklog = 10
+	// fallbackConcurrency bounds the single callbacks a refused batch sends
+	// at once.
+	fallbackConcurrency = 16
+	// closeDrainTimeout bounds how long close waits for single callbacks
+	// still in flight.
+	closeDrainTimeout = callbackTimeout
 )
 
 // batchConfig configures sending callbacks in batches; a zero url sends
@@ -73,6 +79,12 @@ type batcher struct {
 	mu      sync.Mutex
 	pending []queuedCallback
 	dropped int
+	closed  bool
+
+	// fallbacks are single callbacks in flight, at most
+	// fallbackConcurrency at once (sem).
+	fallbacks sync.WaitGroup
+	sem       chan struct{}
 
 	kick chan struct{}
 	stop chan struct{}
@@ -83,14 +95,21 @@ func newBatcher(cfg batchConfig, client *http.Client, lg logger.ContextLogger, n
 	single func(context.Context, url.Values, string, result) error,
 ) *batcher {
 	b := &batcher{cfg: cfg, client: client, logger: lg, now: now, single: single,
+		sem:  make(chan struct{}, fallbackConcurrency),
 		kick: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{})}
 	go b.run()
 	return b
 }
 
-// add queues a callback for the next batch.
+// add queues a callback for the next batch, or sends it on its own once the
+// batcher has closed.
 func (b *batcher) add(query url.Values, traceparent string, res result) {
 	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		b.sendSingly([]queuedCallback{{query: query, traceparent: traceparent, res: res}})
+		return
+	}
 	if len(b.pending) >= b.cfg.maxSize*maxBatchBacklog {
 		b.dropped++
 		b.mu.Unlock()
@@ -123,10 +142,40 @@ func (b *batcher) run() {
 	}
 }
 
-// close sends what is waiting and stops the batcher.
+// close sends what is waiting and stops the batcher. A callback added later
+// goes out on its own. It waits up to closeDrainTimeout for single
+// callbacks in flight.
 func (b *batcher) close() {
+	b.mu.Lock()
+	b.closed = true
+	b.mu.Unlock()
 	close(b.stop)
 	<-b.done
+	drained := make(chan struct{})
+	go func() {
+		b.fallbacks.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(closeDrainTimeout):
+	}
+}
+
+// sendSingly sends cbs as single callbacks, fallbackConcurrency at a time,
+// without blocking the caller.
+func (b *batcher) sendSingly(cbs []queuedCallback) {
+	b.fallbacks.Add(len(cbs))
+	for _, cb := range cbs {
+		go func() {
+			defer b.fallbacks.Done()
+			b.sem <- struct{}{}
+			defer func() { <-b.sem }()
+			if err := b.single(context.Background(), cb.query, cb.traceparent, cb.res); err != nil {
+				b.logger.WarnContext(context.Background(), "bandit probe callback failed: ", err)
+			}
+		}()
+	}
 }
 
 // flush sends every waiting callback, maxSize to a batch.
@@ -145,11 +194,7 @@ func (b *batcher) flush() {
 		pending = pending[n:]
 		if err := b.send(ctx, batch); err != nil {
 			b.logger.WarnContext(ctx, "bandit probe callback batch failed, sending its ", len(batch), " callbacks singly: ", err)
-			for _, cb := range batch {
-				if err := b.single(ctx, cb.query, cb.traceparent, cb.res); err != nil {
-					b.logger.WarnContext(ctx, "bandit probe callback failed: ", err)
-				}
-			}
+			b.sendSingly(batch)
 		}
 	}
 }
