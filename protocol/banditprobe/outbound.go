@@ -68,8 +68,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 	// device also runs the Lantern VPN, only sing-box's dialer honours
 	// route.auto_detect_interface and keeps the callback, and the lookup of
 	// its host, off the VPN tunnel.
+	// An environment proxy may be named by hostname even when the callback
+	// host is an IP literal.
 	_, ipErr := netip.ParseAddr(cfg.callbackURL.Hostname())
-	callbackDialer, err := dialer.New(ctx, options.DialerOptions, ipErr != nil)
+	callbackDialer, err := dialer.New(ctx, options.DialerOptions, ipErr != nil || options.UseProxyEnvironment)
 	if err != nil {
 		return nil, fmt.Errorf("banditprobe: callback dialer: %w", err)
 	}

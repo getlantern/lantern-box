@@ -226,6 +226,35 @@ func TestNewOutbound_MinimalConfigWithoutDNS(t *testing.T) {
 	require.Len(t, rec.calls(), 1)
 }
 
+// With use_proxy_environment, the sing-box dialer resolves a proxy named by
+// hostname even when callback_url is an IP literal.
+func TestNewOutbound_ProxyHostnameWithIPCallback(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	_, port, err := net.SplitHostPort(rec.srv.Listener.Addr().String())
+	require.NoError(t, err)
+	proxy := &connectProxy{target: rec.srv.Listener.Addr().String()}
+	proxySrv := httptest.NewServer(proxy)
+	t.Cleanup(proxySrv.Close)
+	_, proxyPort, err := net.SplitHostPort(proxySrv.Listener.Addr().String())
+	require.NoError(t, err)
+
+	b := startBox(t, `{"log":{"disabled":true},
+	"outbounds":[{"type":"direct","tag":"direct"},
+	{"type":"banditprobe","tag":"bandit-probe","use_proxy_environment":true,"callback_url":"https://`+net.JoinHostPort("127.0.0.1", port)+`/v1/bandit/callback"}]}`)
+	r := boxResponder(t, b)
+	trustServer(t, r.httpClient, rec.srv)
+	// http.ProxyFromEnvironment reads the environment once per process, so
+	// the test names the proxy directly.
+	transport, ok := r.httpClient.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.NotNil(t, transport.Proxy, "use_proxy_environment must set a proxy function")
+	transport.Proxy = http.ProxyURL(&url.URL{Scheme: "http", Host: net.JoinHostPort("localhost", proxyPort)})
+
+	require.NoError(t, r.sendCallback(context.Background(), url.Values{"token": {"tok-1"}}, "", result{verdict: verdictDelivered}))
+	require.Len(t, rec.calls(), 1)
+	assert.Equal(t, []string{net.JoinHostPort("127.0.0.1", port)}, proxy.requested())
+}
+
 // The callback host is resolved by sing-box's DNS router, not the system
 // resolver: only the box's hosts server knows callbackHost.
 func TestNewOutbound_ResolvesCallbackThroughSingBoxDNS(t *testing.T) {
