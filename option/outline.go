@@ -9,10 +9,10 @@ import O "github.com/sagernet/sing-box/option"
 type OutboundOutlineOptions struct {
 	O.DialerOptions
 	O.ServerOptions
-	DNSResolvers []DNSEntryConfig `json:"dns,omitempty" yaml:"dns,omitempty"`
-	TLS          []string         `json:"tls,omitempty" yaml:"tls,omitempty"`
-	TestTimeout  string           `json:"test_timeout" yaml:"-"`
-	Domains      []string         `json:"domains" yaml:"-"`
+	DNSResolvers []DNSEntryConfig `json:"dns,omitempty"`
+	TLS          []string         `json:"tls,omitempty"`
+	TestTimeout  string           `json:"test_timeout"`
+	Domains      []string         `json:"domains"`
 }
 
 // DNSEntryConfig specifies a list of resolvers to test and they can be one of
