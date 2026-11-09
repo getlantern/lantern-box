@@ -25,9 +25,8 @@ const (
 	// maxBatchBacklog bounds the callbacks held while batches fail, in
 	// batches of batchMaxSize.
 	maxBatchBacklog = 10
-	// fallbackConcurrency bounds the single callbacks a refused batch sends
-	// at once.
-	fallbackConcurrency = 16
+	// fallbackWorkers send the single callbacks of refused batches.
+	fallbackWorkers = 16
 	// closeDrainTimeout bounds how long close waits for single callbacks
 	// still in flight.
 	closeDrainTimeout = callbackTimeout
@@ -81,10 +80,12 @@ type batcher struct {
 	dropped int
 	closed  bool
 
-	// fallbacks are single callbacks in flight, at most
-	// fallbackConcurrency at once (sem).
+	// fallback holds single callbacks for refused batches, which
+	// fallbackWorkers send. Only run enqueues, so fallbacks never grows
+	// once run has returned.
+	fallback  chan queuedCallback
 	fallbacks sync.WaitGroup
-	sem       chan struct{}
+	quit      chan struct{}
 
 	kick chan struct{}
 	stop chan struct{}
@@ -95,19 +96,25 @@ func newBatcher(cfg batchConfig, client *http.Client, lg logger.ContextLogger, n
 	single func(context.Context, url.Values, string, result) error,
 ) *batcher {
 	b := &batcher{cfg: cfg, client: client, logger: lg, now: now, single: single,
-		sem:  make(chan struct{}, fallbackConcurrency),
+		fallback: make(chan queuedCallback, cfg.maxSize*maxBatchBacklog), quit: make(chan struct{}),
 		kick: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{})}
+	for range fallbackWorkers {
+		go b.sendFallbacks()
+	}
 	go b.run()
 	return b
 }
 
-// add queues a callback for the next batch, or sends it on its own once the
-// batcher has closed.
+// add queues a callback for the next batch. Once the batcher has closed it
+// sends the callback itself, on the caller's goroutine, as an unbatched
+// responder does.
 func (b *batcher) add(query url.Values, traceparent string, res result) {
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
-		b.sendSingly([]queuedCallback{{query: query, traceparent: traceparent, res: res}})
+		if err := b.single(context.Background(), query, traceparent, res); err != nil {
+			b.logger.WarnContext(context.Background(), "bandit probe callback failed: ", err)
+		}
 		return
 	}
 	if len(b.pending) >= b.cfg.maxSize*maxBatchBacklog {
@@ -143,13 +150,15 @@ func (b *batcher) run() {
 }
 
 // close sends what is waiting and stops the batcher. A callback added later
-// goes out on its own. It waits up to closeDrainTimeout for single
-// callbacks in flight.
+// goes out on its own. It waits up to closeDrainTimeout for the single
+// callbacks of refused batches.
 func (b *batcher) close() {
 	b.mu.Lock()
 	b.closed = true
 	b.mu.Unlock()
 	close(b.stop)
+	// After done, run enqueues nothing more, so fallbacks can't grow while
+	// it is waited on.
 	<-b.done
 	drained := make(chan struct{})
 	go func() {
@@ -160,21 +169,39 @@ func (b *batcher) close() {
 	case <-drained:
 	case <-time.After(closeDrainTimeout):
 	}
+	close(b.quit)
 }
 
-// sendSingly sends cbs as single callbacks, fallbackConcurrency at a time,
-// without blocking the caller.
+// sendSingly queues cbs for fallbackWorkers to send as single callbacks,
+// dropping those that don't fit. Only run calls it.
 func (b *batcher) sendSingly(cbs []queuedCallback) {
-	b.fallbacks.Add(len(cbs))
+	dropped := 0
 	for _, cb := range cbs {
-		go func() {
-			defer b.fallbacks.Done()
-			b.sem <- struct{}{}
-			defer func() { <-b.sem }()
+		b.fallbacks.Add(1)
+		select {
+		case b.fallback <- cb:
+		default:
+			b.fallbacks.Done()
+			dropped++
+		}
+	}
+	if dropped > 0 {
+		b.logger.WarnContext(context.Background(), "bandit probe single callbacks backed up; dropped ", dropped, " callbacks")
+	}
+}
+
+// sendFallbacks sends queued single callbacks until the batcher quits.
+func (b *batcher) sendFallbacks() {
+	for {
+		select {
+		case cb := <-b.fallback:
 			if err := b.single(context.Background(), cb.query, cb.traceparent, cb.res); err != nil {
 				b.logger.WarnContext(context.Background(), "bandit probe callback failed: ", err)
 			}
-		}()
+			b.fallbacks.Done()
+		case <-b.quit:
+			return
+		}
 	}
 }
 

@@ -124,8 +124,7 @@ func TestBatcherSendsLateCallbacksSingly(t *testing.T) {
 	b := testBatcher(t, srv.URL, time.Hour, 100, single)
 	b.close()
 	b.add(probeQuery("late"), "", result{verdict: verdictDelivered})
-	b.fallbacks.Wait()
-	assert.Equal(t, []string{"late"}, single.tokens)
+	assert.Equal(t, []string{"late"}, single.tokens, "sent before add returns")
 	assert.Empty(t, rec.batches)
 }
 
