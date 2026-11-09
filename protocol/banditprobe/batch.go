@@ -81,11 +81,10 @@ type batcher struct {
 	closed  bool
 
 	// fallback holds single callbacks for refused batches, which
-	// fallbackWorkers send. Only run enqueues, so fallbacks never grows
-	// once run has returned.
+	// fallbackWorkers send until it is closed and empty. Only run sends to
+	// it, so close can close it once run has returned.
 	fallback  chan queuedCallback
 	fallbacks sync.WaitGroup
-	quit      chan struct{}
 
 	kick chan struct{}
 	stop chan struct{}
@@ -96,7 +95,7 @@ func newBatcher(cfg batchConfig, client *http.Client, lg logger.ContextLogger, n
 	single func(context.Context, url.Values, string, result) error,
 ) *batcher {
 	b := &batcher{cfg: cfg, client: client, logger: lg, now: now, single: single,
-		fallback: make(chan queuedCallback, cfg.maxSize*maxBatchBacklog), quit: make(chan struct{}),
+		fallback: make(chan queuedCallback, cfg.maxSize*maxBatchBacklog),
 		kick: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{})}
 	for range fallbackWorkers {
 		go b.sendFallbacks()
@@ -157,9 +156,10 @@ func (b *batcher) close() {
 	b.closed = true
 	b.mu.Unlock()
 	close(b.stop)
-	// After done, run enqueues nothing more, so fallbacks can't grow while
-	// it is waited on.
+	// After done, run sends nothing more: the workers send what is queued
+	// and exit, however long close waits for them.
 	<-b.done
+	close(b.fallback)
 	drained := make(chan struct{})
 	go func() {
 		b.fallbacks.Wait()
@@ -169,7 +169,6 @@ func (b *batcher) close() {
 	case <-drained:
 	case <-time.After(closeDrainTimeout):
 	}
-	close(b.quit)
 }
 
 // sendSingly queues cbs for fallbackWorkers to send as single callbacks,
@@ -190,18 +189,14 @@ func (b *batcher) sendSingly(cbs []queuedCallback) {
 	}
 }
 
-// sendFallbacks sends queued single callbacks until the batcher quits.
+// sendFallbacks sends queued single callbacks until the queue is closed and
+// empty.
 func (b *batcher) sendFallbacks() {
-	for {
-		select {
-		case cb := <-b.fallback:
-			if err := b.single(context.Background(), cb.query, cb.traceparent, cb.res); err != nil {
-				b.logger.WarnContext(context.Background(), "bandit probe callback failed: ", err)
-			}
-			b.fallbacks.Done()
-		case <-b.quit:
-			return
+	for cb := range b.fallback {
+		if err := b.single(context.Background(), cb.query, cb.traceparent, cb.res); err != nil {
+			b.logger.WarnContext(context.Background(), "bandit probe callback failed: ", err)
 		}
+		b.fallbacks.Done()
 	}
 }
 

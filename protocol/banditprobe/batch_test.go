@@ -3,6 +3,7 @@ package banditprobe
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -255,4 +256,35 @@ func TestServe_BatchesTheCallback(t *testing.T) {
 	assert.Equal(t, int64(40), cb.ClientQueueDelayMs)
 	assert.Equal(t, "delivered", cb.Verdict)
 	assert.Equal(t, uint64(4100), cb.AckedBytes)
+}
+
+// close returns after its drain timeout while slow single callbacks are
+// still queued; the workers then send every one and exit.
+func TestBatcherDrainsFallbacksAfterClose(t *testing.T) {
+	_, srv := newBatchRecorder(t, http.StatusServiceUnavailable)
+	release := make(chan struct{})
+	single := &singleRecorder{}
+	u, err := url.Parse(srv.URL + "/v1/bandit/callbacks")
+	require.NoError(t, err)
+	b := newBatcher(batchConfig{url: u, token: "fleet-token", interval: time.Hour, maxSize: 100},
+		http.DefaultClient, log.NewNOPFactory().Logger(), time.Now,
+		func(ctx context.Context, q url.Values, tp string, res result) error {
+			<-release
+			return single.send(ctx, q, tp, res)
+		})
+	n := fallbackWorkers + 5
+	for i := range n {
+		b.add(probeQuery(fmt.Sprintf("tok-%d", i)), "", result{verdict: verdictDelivered})
+	}
+	closed := make(chan struct{})
+	go func() {
+		b.close()
+		close(closed)
+	}()
+	close(release)
+	<-closed
+	b.fallbacks.Wait()
+	single.mu.Lock()
+	defer single.mu.Unlock()
+	assert.Len(t, single.tokens, n, "every queued single callback is sent")
 }
