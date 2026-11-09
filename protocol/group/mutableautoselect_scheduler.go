@@ -73,9 +73,13 @@ type probeAttempt struct {
 	outbound     A.Outbound
 	membershipID uint64
 	generation   uint64
-	url          string
-	deadline     time.Time
-	lastResort   bool
+	// environment is the network environment the probe measures, and the one
+	// its result is recorded under even when a last-resort result outlives
+	// it.
+	environment uint64
+	url         string
+	deadline    time.Time
+	lastResort  bool
 	// finalized is set once the attempt records an outcome or is canceled; it
 	// records nothing afterwards.
 	finalized bool
@@ -189,6 +193,8 @@ func (s *MutableAutoSelect) dispatchProbesLocked() {
 	if s.isClosed() || s.paused() {
 		return
 	}
+	// Every attempt records its result under the environment it starts on.
+	s.refreshEnvironmentLocked()
 	s.startLadderBudgetLocked()
 	now := time.Now()
 	for _, tag := range s.tags {
@@ -234,6 +240,7 @@ func (s *MutableAutoSelect) startProbeLocked(
 		outbound:     out,
 		membershipID: state.membershipID,
 		generation:   s.networkGeneration.Load(),
+		environment:  s.environment,
 		url:          s.probeURLForLocked(tag),
 		deadline:     time.Now().Add(probeBound(beh)),
 		lastResort:   beh.lastResort,
@@ -305,11 +312,14 @@ func (s *MutableAutoSelect) completeProbe(attempt *probeAttempt, success bool, d
 
 func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success bool, delayMs uint32) {
 	s.expireLadderLocked()
+	// A change found here advances the generation, so an ordinary probe
+	// measured on the previous network is invalid rather than recorded on it.
+	s.syncEnvironmentLocked()
 	if !s.validProbeLocked(attempt) {
 		return
 	}
 	state := s.probeMembers[attempt.tag]
-	outcome := s.recordProbeOutcomeLocked(attempt.tag, &probeOutcome{
+	outcome := s.recordProbeOutcomeLocked(attempt.tag, attempt.environment, &probeOutcome{
 		success:    success,
 		delayMs:    delayMs,
 		generation: attempt.generation,
@@ -340,13 +350,14 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 }
 
 // recordProbeOutcomeLocked sequences outcome, makes it tag's latest, and
-// records it in tag's history. tag must have probe state.
-func (s *MutableAutoSelect) recordProbeOutcomeLocked(tag string, outcome *probeOutcome) *probeOutcome {
+// records it in tag's history on network environment env. tag must have
+// probe state.
+func (s *MutableAutoSelect) recordProbeOutcomeLocked(tag string, env uint64, outcome *probeOutcome) *probeOutcome {
 	s.probeSequence++
 	outcome.sequence = s.probeSequence
 	outcome.completed = time.Now()
 	s.probeMembers[tag].outcome = outcome
-	s.mutateHistoryLocked(tag, func(h *localHistory, now time.Time) bool {
+	s.mutateHistoryLocked(tag, env, func(h *localHistory, now time.Time) bool {
 		h.recordProbe(outcome.success, outcome.delayMs, now)
 		return true
 	})
@@ -491,6 +502,9 @@ func (s *MutableAutoSelect) evaluateProbesLocked(waiter *probeWaiter) {
 		return
 	}
 	waiter.evaluated = true
+	// A network change not yet noticed puts the waiter out of scope rather
+	// than letting the previous network's results count.
+	s.syncEnvironmentLocked()
 	if s.isClosed() || s.paused() || s.waiterScopeChangedLocked(waiter) {
 		return
 	}
@@ -572,10 +586,11 @@ func (s *MutableAutoSelect) runLadder(target string, generation uint64) {
 	s.waitForProbes(s.ctx, waiter)
 	s.access.Lock()
 	defer s.access.Unlock()
+	s.evaluateProbesLocked(waiter)
+	// Evaluation can dispatch and arm the budget timer, so stop it after.
 	if waiter.timer != nil {
 		waiter.timer.Stop()
 	}
-	s.evaluateProbesLocked(waiter)
 	// A ladder that skipped evaluation, or whose network has since changed,
 	// mustn't hold off the next one.
 	if waiter.counted && !s.waiterScopeChangedLocked(waiter) {
@@ -590,6 +605,9 @@ func (s *MutableAutoSelect) runProbeCycle() {
 		s.access.Unlock()
 		return
 	}
+	// Pick up a network change first so the cycle's waiter isn't already out
+	// of scope when it starts.
+	s.refreshEnvironmentLocked()
 	waiter := s.newProbeWaiterLocked(true)
 	waiter.source = "cycle"
 	s.periodicWaiter = waiter
@@ -801,6 +819,7 @@ func (s *MutableAutoSelect) matchesGenerationLocked(generation uint64) bool {
 
 func (s *MutableAutoSelect) advanceNetworkLocked() {
 	s.networkGeneration.Add(1)
+	s.setEnvironmentLocked(s.liveEnvironment())
 	now := time.Now()
 	// Only the first update after a quiet ladderCooldown lifts the ladder
 	// cooldown, so a flapping interface can't rerun the ladder on every flap.

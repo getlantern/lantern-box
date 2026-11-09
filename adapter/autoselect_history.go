@@ -25,10 +25,14 @@ const (
 	UserFailureNoResponse UserFailureKind = "no_response"
 )
 
-// UserFailure stores when a user-traffic failure happened and what kind it was.
+// UserFailure stores when a user-traffic failure happened, what kind it was,
+// and whether it was TCP or UDP traffic.
 type UserFailure struct {
 	At   time.Time       `json:"at"`
 	Kind UserFailureKind `json:"kind,omitempty"`
+	// Network is "tcp" or "udp"; empty for failures recorded before
+	// failures were attributed to a network.
+	Network string `json:"network,omitempty"`
 }
 
 func normalizeUserFailureKind(kind UserFailureKind) UserFailureKind {
@@ -45,8 +49,7 @@ func normalizeUserFailureKind(kind UserFailureKind) UserFailureKind {
 func (u *UserFailure) UnmarshalJSON(data []byte) error {
 	var at time.Time
 	if err := json.Unmarshal(data, &at); err == nil {
-		u.At = at
-		u.Kind = UserFailureUnknown
+		*u = UserFailure{At: at, Kind: UserFailureUnknown}
 		return nil
 	}
 
@@ -68,6 +71,13 @@ func (u *UserFailure) UnmarshalJSON(data []byte) error {
 // sliding window. The two tracks are kept separate so a censor that
 // lets the probe URL through while dropping user traffic shows up as
 // elevated UserFailures with healthy probe scalars simultaneously.
+//
+// History is kept per network environment (see
+// [github.com/sagernet/sing-box/adapter.NetworkManager.NetworkEnvironment]).
+// The top-level fields describe the network the group was on when the
+// snapshot was taken; Networks holds every retained network, that one
+// included. A snapshot without Networks is treated as describing whichever
+// network is current when it is loaded.
 type TagHistory struct {
 	// LastSuccessDelayMs is the most recent successful probe RTT.
 	// 0 means "no successful probe yet".
@@ -84,8 +94,27 @@ type TagHistory struct {
 	UserFailures []UserFailure `json:"user_failures,omitempty"`
 	// HardDemoted reports whether the member has reached the hard-demote
 	// tier from its own recorded probe and user-traffic failures.
-	HardDemoted bool      `json:"hard_demoted,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	HardDemoted bool `json:"hard_demoted,omitempty"`
+	// UpdatedAt is when the current network's history last changed; zero if
+	// the member has none there.
+	UpdatedAt time.Time `json:"updated_at"`
+	// Networks is the history recorded on each network environment, keyed
+	// by its NetworkEnvironment hash. Key 0 is an unidentified network.
+	Networks map[uint64]*NetworkHistory `json:"networks,omitempty"`
+}
+
+// NetworkHistory is one member's selection history on a single network
+// environment. Fields shared with TagHistory mean the same as its top-level
+// fields.
+type NetworkHistory struct {
+	LastSuccessDelayMs uint32 `json:"last_success_delay_ms,omitempty"`
+	// LastSuccessAt is when LastSuccessDelayMs was measured.
+	LastSuccessAt       time.Time     `json:"last_success_at,omitempty"`
+	LastOutcomeAt       time.Time     `json:"last_outcome_at,omitempty"`
+	ConsecutiveFailures uint32        `json:"consecutive_failures,omitempty"`
+	UserFailures        []UserFailure `json:"user_failures,omitempty"`
+	HardDemoted         bool          `json:"hard_demoted,omitempty"`
+	UpdatedAt           time.Time     `json:"updated_at"`
 }
 
 // AutoSelectHistoryStorage is the store the MutableAutoSelect group
@@ -216,9 +245,26 @@ func cloneTagHistory(h *TagHistory) *TagHistory {
 		return nil
 	}
 	out := *h
-	if len(h.UserFailures) > 0 {
-		out.UserFailures = make([]UserFailure, len(h.UserFailures))
-		copy(out.UserFailures, h.UserFailures)
+	out.UserFailures = cloneUserFailures(h.UserFailures)
+	if h.Networks != nil {
+		out.Networks = make(map[uint64]*NetworkHistory, len(h.Networks))
+		for env, n := range h.Networks {
+			if n == nil {
+				continue
+			}
+			c := *n
+			c.UserFailures = cloneUserFailures(n.UserFailures)
+			out.Networks[env] = &c
+		}
 	}
 	return &out
+}
+
+func cloneUserFailures(failures []UserFailure) []UserFailure {
+	if len(failures) == 0 {
+		return nil
+	}
+	out := make([]UserFailure, len(failures))
+	copy(out, failures)
+	return out
 }
