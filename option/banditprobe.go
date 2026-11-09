@@ -43,4 +43,9 @@ type BanditProbeOutboundOptions struct {
 	// otherwise a stalled probe is counted as a success, whereas a dropped
 	// callback is counted as a failure.
 	ReportStalled bool `json:"report_stalled,omitempty"`
+
+	// UseProxyEnvironment sends the callback through the proxy named by
+	// HTTPS_PROXY and NO_PROXY, reached through the dialer above. Use it where
+	// the callback host refuses the proxy's own address.
+	UseProxyEnvironment bool `json:"use_proxy_environment,omitempty"`
 }

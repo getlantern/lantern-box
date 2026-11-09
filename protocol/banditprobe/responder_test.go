@@ -707,7 +707,7 @@ func TestSendCallback_DoesNotFollowRedirects(t *testing.T) {
 
 	cfg, err := newConfig(option.BanditProbeOutboundOptions{CallbackURL: api.URL + "/v1/bandit/callback"})
 	require.NoError(t, err)
-	client := newCallbackClient(N.SystemDialer)
+	client := newCallbackClient(N.SystemDialer, nil)
 	client.Transport = api.Client().Transport
 	r := &responder{cfg: cfg, httpClient: client, now: time.Now}
 

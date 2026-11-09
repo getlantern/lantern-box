@@ -68,8 +68,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 	// device also runs the Lantern VPN, only sing-box's dialer honours
 	// route.auto_detect_interface and keeps the callback, and the lookup of
 	// its host, off the VPN tunnel.
+	// An environment proxy may be named by hostname even when the callback
+	// host is an IP literal.
 	_, ipErr := netip.ParseAddr(cfg.callbackURL.Hostname())
-	callbackDialer, err := dialer.New(ctx, options.DialerOptions, ipErr != nil)
+	callbackDialer, err := dialer.New(ctx, options.DialerOptions, ipErr != nil || options.UseProxyEnvironment)
 	if err != nil {
 		return nil, fmt.Errorf("banditprobe: callback dialer: %w", err)
 	}
@@ -82,7 +84,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		logger:     lg,
 		pool:       pool,
 		readState:  readSendState,
-		httpClient: newCallbackClient(callbackDialer),
+		httpClient: newCallbackClient(callbackDialer, callbackProxy(options)),
 		now:        time.Now,
 	}
 	return &Outbound{
@@ -91,13 +93,22 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 	}, nil
 }
 
-// newCallbackClient dials the callback, host unresolved, through d. It ignores
-// proxy environment variables, which would route around d, and never follows
+// callbackProxy honours proxy environment variables only when the options ask
+// for it, since a proxy changes where the callback leaves from.
+func callbackProxy(options option.BanditProbeOutboundOptions) func(*http.Request) (*url.URL, error) {
+	if options.UseProxyEnvironment {
+		return http.ProxyFromEnvironment
+	}
+	return nil
+}
+
+// newCallbackClient dials the callback, host unresolved, through d, or through
+// the proxy that proxy picks, itself dialed through d. It never follows
 // redirects: a redirect could move the token, device ID and verdict off the
 // validated https callback_url.
-func newCallbackClient(d N.Dialer) *http.Client {
+func newCallbackClient(d N.Dialer, proxy func(*http.Request) (*url.URL, error)) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
+	transport.Proxy = proxy
 	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return d.DialContext(ctx, network, M.ParseSocksaddr(addr))
 	}
