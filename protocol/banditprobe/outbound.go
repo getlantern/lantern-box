@@ -87,6 +87,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		httpClient: newCallbackClient(callbackDialer, callbackProxy(options)),
 		now:        time.Now,
 	}
+	if cfg.batch.url != nil {
+		r.batch = newBatcher(cfg.batch, r.httpClient, lg, r.now, r.sendCallback)
+	}
 	return &Outbound{
 		Adapter:   outbound.NewAdapterWithDialerOptions(constant.TypeBanditProbe, tag, []string{N.NetworkTCP}, options.DialerOptions),
 		responder: r,
@@ -158,7 +161,19 @@ func newConfig(options option.BanditProbeOutboundOptions) (config, error) {
 	if cfg.maxWait > maxMaxWait {
 		return config{}, fmt.Errorf("banditprobe: max_wait %s exceeds %s", cfg.maxWait, maxMaxWait)
 	}
+	cfg.batch, err = newBatchConfig(options.BatchURL, options.BatchToken, time.Duration(options.BatchInterval), options.BatchMaxSize)
+	if err != nil {
+		return config{}, err
+	}
 	return cfg, nil
+}
+
+// Close sends the callbacks waiting for a batch.
+func (o *Outbound) Close() error {
+	if o.responder.batch != nil {
+		o.responder.batch.close()
+	}
+	return nil
 }
 
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {

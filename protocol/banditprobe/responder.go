@@ -38,6 +38,7 @@ type config struct {
 	stallTimeout  time.Duration
 	maxWait       time.Duration
 	reportStalled bool
+	batch         batchConfig
 }
 
 type result struct {
@@ -54,6 +55,8 @@ type responder struct {
 	readState  func(*net.TCPConn) (sendState, error)
 	httpClient *http.Client
 	now        func() time.Time
+	// batch, when set, sends callbacks in batches instead of one by one.
+	batch *batcher
 }
 
 func (r *responder) serve(ctx context.Context, conn net.Conn) error {
@@ -87,6 +90,10 @@ func (r *responder) serve(ctx context.Context, conn net.Conn) error {
 	r.logger.DebugContext(ctx, "bandit probe ", string(res.verdict), " drain=", res.drain, " acked=", res.acked,
 		" retrans=", res.state.retrans, " rtt=", res.state.rtt)
 	if res.verdict == verdictAborted || (res.verdict == verdictStalled && !r.cfg.reportStalled) {
+		return nil
+	}
+	if r.batch != nil {
+		r.batch.add(query, req.Header.Get("traceparent"), res)
 		return nil
 	}
 	if err := r.sendCallback(ctx, query, req.Header.Get("traceparent"), res); err != nil {
