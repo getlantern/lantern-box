@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -80,7 +81,7 @@ func TestCallbackClient_DialsThroughSingBoxDialer(t *testing.T) {
 
 	cfg, err := newConfig(option.BanditProbeOutboundOptions{CallbackURL: "https://" + net.JoinHostPort(callbackHost, port) + "/v1/bandit/callback"})
 	require.NoError(t, err)
-	client := newCallbackClient(dialer)
+	client := newCallbackClient(dialer, nil)
 	trustServer(t, client, rec.srv)
 	r := &responder{cfg: cfg, httpClient: client, now: time.Now}
 
@@ -97,15 +98,81 @@ func TestCallbackClient_IgnoresEnvironmentProxy(t *testing.T) {
 	rec := newCallbackRecorder(t)
 	dialer := &recordingDialer{target: rec.srv.Listener.Addr().String()}
 
-	cfg, err := newConfig(option.BanditProbeOutboundOptions{CallbackURL: "https://" + callbackHost + "/v1/bandit/callback"})
+	opts := option.BanditProbeOutboundOptions{CallbackURL: "https://" + callbackHost + "/v1/bandit/callback"}
+	cfg, err := newConfig(opts)
 	require.NoError(t, err)
-	client := newCallbackClient(dialer)
+	client := newCallbackClient(dialer, callbackProxy(opts))
 	trustServer(t, client, rec.srv)
 	r := &responder{cfg: cfg, httpClient: client, now: time.Now}
 
 	require.NoError(t, r.sendCallback(context.Background(), url.Values{"token": {"tok-1"}}, "", result{verdict: verdictDelivered}))
 	require.Len(t, rec.calls(), 1)
 	assert.Equal(t, callbackHost, dialer.destinations()[0].Fqdn)
+}
+
+func TestCallbackProxy_UseProxyEnvironment(t *testing.T) {
+	assert.NotNil(t, callbackProxy(option.BanditProbeOutboundOptions{UseProxyEnvironment: true}))
+}
+
+// connectProxy answers CONNECT requests by tunnelling to target, whatever
+// host was asked for, and records the requested hosts.
+type connectProxy struct {
+	target string
+	mu     sync.Mutex
+	hosts  []string
+}
+
+func (p *connectProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodConnect {
+		http.Error(w, "CONNECT only", http.StatusMethodNotAllowed)
+		return
+	}
+	p.mu.Lock()
+	p.hosts = append(p.hosts, r.Host)
+	p.mu.Unlock()
+	upstream, err := net.Dial("tcp", p.target)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer upstream.Close()
+	conn, _, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_, _ = conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	go func() { _, _ = io.Copy(upstream, conn) }()
+	_, _ = io.Copy(conn, upstream)
+}
+
+func (p *connectProxy) requested() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.hosts...)
+}
+
+func TestCallbackClient_ThroughProxyDialsProxyThroughSingBoxDialer(t *testing.T) {
+	rec := newCallbackRecorder(t)
+	proxy := &connectProxy{target: rec.srv.Listener.Addr().String()}
+	proxySrv := httptest.NewServer(proxy)
+	t.Cleanup(proxySrv.Close)
+	proxyURL, err := url.Parse(proxySrv.URL)
+	require.NoError(t, err)
+	dialer := &recordingDialer{target: proxySrv.Listener.Addr().String()}
+
+	cfg, err := newConfig(option.BanditProbeOutboundOptions{CallbackURL: "https://" + callbackHost + "/v1/bandit/callback"})
+	require.NoError(t, err)
+	client := newCallbackClient(dialer, http.ProxyURL(proxyURL))
+	trustServer(t, client, rec.srv)
+	r := &responder{cfg: cfg, httpClient: client, now: time.Now}
+
+	require.NoError(t, r.sendCallback(context.Background(), url.Values{"token": {"tok-1"}}, "", result{verdict: verdictDelivered}))
+	require.Len(t, rec.calls(), 1)
+	assert.Equal(t, []string{net.JoinHostPort(callbackHost, "443")}, proxy.requested(), "the proxy must be asked for the callback host, unresolved")
+	dialed := dialer.destinations()
+	require.NotEmpty(t, dialed)
+	assert.Equal(t, proxyURL.Host, dialed[0].String(), "the proxy itself must be dialed through the sing-box dialer")
 }
 
 // newBoxContext is a sing-box context with the banditprobe outbound
