@@ -106,6 +106,8 @@ func TestDialContextHost(t *testing.T) {
 			&adapter.InboundContext{Domain: "youtube.com"}, addr("dns.google:853"), "dns.google:853"},
 		{"hostname kept when the destination also has an IP", nil,
 			metadata.Socksaddr{Addr: netip.MustParseAddr("192.0.2.1"), Fqdn: "cdn.jsdelivr.net", Port: 443}, "cdn.jsdelivr.net:443"},
+		{"non-strict hostname still dialed", &adapter.InboundContext{Domain: "youtube.com"},
+			metadata.Socksaddr{Fqdn: "bücher.de", Port: 443}, "bücher.de:443"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := &recordingDialer{}
@@ -125,14 +127,17 @@ func TestDialContextHost(t *testing.T) {
 }
 
 func TestDialContextNoHost(t *testing.T) {
-	d := &recordingDialer{}
-	o := &Outbound{createDialer: func() (transport.StreamDialer, error) { return d, nil }}
+	var searches int
+	o := &Outbound{createDialer: func() (transport.StreamDialer, error) {
+		searches++
+		return &recordingDialer{}, nil
+	}}
 	_, err := o.DialContext(context.Background(), "tcp", metadata.Socksaddr{Port: 443})
 	if err == nil || errors.Is(err, errDialRefused) {
 		t.Fatalf("DialContext: got %v, want a no-host error before dialing", err)
 	}
-	if len(d.addrs) != 0 {
-		t.Fatalf("dialed %v with no host", d.addrs)
+	if searches != 0 {
+		t.Fatalf("ran %d strategy searches for a destination with no host", searches)
 	}
 }
 
