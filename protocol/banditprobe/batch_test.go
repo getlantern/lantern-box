@@ -274,17 +274,16 @@ func TestBatcherDrainsFallbacksAfterClose(t *testing.T) {
 			<-release
 			return single.send(ctx, q, tp, res)
 		})
+	b.closeTimeout = 100 * time.Millisecond
 	n := fallbackWorkers + 5
 	for i := range n {
 		b.add(probeQuery(fmt.Sprintf("tok-%d", i)), "", result{verdict: verdictDelivered})
 	}
-	closed := make(chan struct{})
-	go func() {
-		b.close()
-		close(closed)
-	}()
+	b.close()
+	single.mu.Lock()
+	assert.Empty(t, single.tokens, "close returned while every worker was blocked")
+	single.mu.Unlock()
 	close(release)
-	<-closed
 	b.fallbacks.Wait()
 	single.mu.Lock()
 	defer single.mu.Unlock()
