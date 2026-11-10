@@ -31,14 +31,6 @@ import (
 // has no live reversed session on the portal.
 var ErrNoSession = errors.New("samizdat-reverse: no session")
 
-// ErrQUICRefused is returned by a reverse outbound's UDP dials to port 443.
-// The helper's exit may admit only allowlisted hostnames, and QUIC carries
-// none we can rely on, so a browser would wait out a QUIC attempt the exit
-// rejects.
-// Refusing it here makes the browser fall back to TCP, which sends the
-// sniffed hostname.
-var ErrQUICRefused = errors.New("samizdat-reverse: QUIC refused")
-
 // connectTimeout bounds how long a CONNECT waits for its response headers.
 // It does not apply to the stream once established. A var so tests can
 // shorten it.
@@ -101,6 +93,7 @@ func (o *Outbound) session() (*http2.ClientConn, error) {
 }
 
 // DialContext opens a TCP stream, or a UoT stream for UDP, on the session.
+// UDP to port 443 goes to a black hole instead (see blackHole).
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	sent := sniffedDestination(ctx, destination)
 	ctx, metadata := adapter.ExtendContext(ctx)
@@ -112,7 +105,7 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		return o.connect(ctx, sent)
 	case N.NetworkUDP:
 		if destination.Port == 443 {
-			return nil, ErrQUICRefused
+			return newBlackHole(destination), nil
 		}
 		if _, err := o.session(); err != nil {
 			return nil, err
@@ -139,13 +132,14 @@ func sniffedDestination(ctx context.Context, destination M.Socksaddr) M.Socksadd
 	return M.Socksaddr{Fqdn: metadata.Domain, Port: destination.Port}
 }
 
-// ListenPacket opens a UoT packet connection on the session.
+// ListenPacket opens a UoT packet connection on the session, or a black
+// hole for port 443.
 func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
 	if destination.Port == 443 {
-		return nil, ErrQUICRefused
+		return newBlackHole(destination), nil
 	}
 	if _, err := o.session(); err != nil {
 		return nil, err
@@ -297,4 +291,122 @@ func (c *wrapConn) NeedAdditionalReadDeadline() bool {
 
 func (c *wrapConn) CloseWrite() error {
 	return N.CloseWrite(c.Conn)
+}
+
+// blackHole is the conn for UDP to port 443, which is QUIC: it never touches
+// the session, discards writes, and blocks reads until Close or a read
+// deadline. The helper's exit may admit only allowlisted hostnames, and
+// QUIC carries none we can rely on, so refusing it makes the browser fall
+// back to TCP, which carries the sniffed hostname. Dropping silently rather
+// than returning an error keeps a group from counting a policy decision as
+// a helper failure.
+type blackHole struct {
+	remote    M.Socksaddr
+	closed    chan struct{}
+	closeOnce sync.Once
+
+	mu            sync.Mutex
+	readDeadline  time.Time
+	writeDeadline time.Time
+	// readWake is closed and replaced whenever the read deadline changes,
+	// so a blocked read rechecks it.
+	readWake chan struct{}
+}
+
+var (
+	_ net.Conn       = (*blackHole)(nil)
+	_ net.PacketConn = (*blackHole)(nil)
+)
+
+func newBlackHole(remote M.Socksaddr) *blackHole {
+	return &blackHole{remote: remote, closed: make(chan struct{}), readWake: make(chan struct{})}
+}
+
+func (c *blackHole) Read([]byte) (int, error) { return 0, c.waitRead() }
+
+func (c *blackHole) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, c.waitRead() }
+
+func (c *blackHole) waitRead() error {
+	for {
+		c.mu.Lock()
+		deadline, wake := c.readDeadline, c.readWake
+		c.mu.Unlock()
+		select {
+		case <-c.closed:
+			return net.ErrClosed
+		default:
+		}
+		var timer *time.Timer
+		var expired <-chan time.Time
+		if !deadline.IsZero() {
+			d := time.Until(deadline)
+			if d <= 0 {
+				return os.ErrDeadlineExceeded
+			}
+			timer = time.NewTimer(d)
+			expired = timer.C
+		}
+		var err error
+		select {
+		case <-c.closed:
+			err = net.ErrClosed
+		case <-expired:
+			err = os.ErrDeadlineExceeded
+		case <-wake:
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (c *blackHole) Write(b []byte) (int, error) { return c.write(b) }
+
+func (c *blackHole) WriteTo(b []byte, _ net.Addr) (int, error) { return c.write(b) }
+
+func (c *blackHole) write(b []byte) (int, error) {
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+	c.mu.Lock()
+	deadline := c.writeDeadline
+	c.mu.Unlock()
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return 0, os.ErrDeadlineExceeded
+	}
+	return len(b), nil
+}
+
+func (c *blackHole) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *blackHole) LocalAddr() net.Addr  { return M.Socksaddr{} }
+func (c *blackHole) RemoteAddr() net.Addr { return c.remote }
+
+func (c *blackHole) SetDeadline(t time.Time) error {
+	c.SetReadDeadline(t)
+	return c.SetWriteDeadline(t)
+}
+
+func (c *blackHole) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.readDeadline = t
+	close(c.readWake)
+	c.readWake = make(chan struct{})
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *blackHole) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.writeDeadline = t
+	c.mu.Unlock()
+	return nil
 }

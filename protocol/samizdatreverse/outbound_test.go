@@ -508,26 +508,73 @@ func TestReverseListenPacketKeepsIP(t *testing.T) {
 	}
 }
 
-func TestReverseRefusesQUIC(t *testing.T) {
+func TestReverseBlackHolesQUIC(t *testing.T) {
 	got := make(chan string, 4)
 	p := portalWithSession(t, hostRecorder(got))
 	o := newTestReverse(t, tagA, p)
 	dest := M.ParseSocksaddr("10.11.12.13:443")
 
 	conn, err := o.DialContext(withDomain("example.com"), N.NetworkUDP, dest)
-	assert.ErrorIs(t, err, ErrQUICRefused)
-	assert.Nil(t, conn)
+	require.NoError(t, err)
+	defer conn.Close()
 	pc, err := o.ListenPacket(withDomain("example.com"), dest)
-	assert.ErrorIs(t, err, ErrQUICRefused)
-	assert.Nil(t, pc)
-	assert.NotContains(t, err.Error(), "10.11.12.13")
-	assert.NotContains(t, err.Error(), "example.com")
+	require.NoError(t, err)
+	defer pc.Close()
+	assert.Equal(t, dest.String(), conn.RemoteAddr().String())
+
+	n, err := conn.Write([]byte("initial"))
+	require.NoError(t, err)
+	assert.Equal(t, 7, n)
+	n, err = pc.WriteTo([]byte("initial"), dest.UDPAddr())
+	require.NoError(t, err)
+	assert.Equal(t, 7, n)
+
+	// A read times out at its deadline.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(50*time.Millisecond)))
+	_, err = conn.Read(make([]byte, 16))
+	var ne net.Error
+	require.ErrorAs(t, err, &ne)
+	assert.True(t, ne.Timeout())
+	require.NoError(t, pc.SetDeadline(time.Now().Add(50*time.Millisecond)))
+	_, _, err = pc.ReadFrom(make([]byte, 16))
+	require.ErrorAs(t, err, &ne)
+	assert.True(t, ne.Timeout())
+
+	// A read blocked without a deadline returns once the conn closes.
+	require.NoError(t, pc.SetDeadline(time.Time{}))
+	readErr := make(chan error, 1)
+	go func() {
+		_, _, err := pc.ReadFrom(make([]byte, 16))
+		readErr <- err
+	}()
+	select {
+	case err := <-readErr:
+		t.Fatalf("read returned before Close: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	require.NoError(t, pc.Close())
+	require.NoError(t, pc.Close())
+	select {
+	case err := <-readErr:
+		assert.ErrorIs(t, err, net.ErrClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("read still blocked after Close")
+	}
+	_, err = pc.WriteTo([]byte("late"), dest.UDPAddr())
+	assert.ErrorIs(t, err, net.ErrClosed)
 
 	select {
 	case host := <-got:
-		t.Fatalf("a refused dial reached the bridge: %s", host)
+		t.Fatalf("a black-holed dial reached the bridge: %s", host)
 	case <-time.After(300 * time.Millisecond):
 	}
+}
+
+func TestReverseBlackHolesQUICWithoutSession(t *testing.T) {
+	o := newTestReverse(t, tagA, nil)
+	pc, err := o.ListenPacket(context.Background(), M.ParseSocksaddr("10.11.12.13:443"))
+	require.NoError(t, err)
+	pc.Close()
 }
 
 func withDomain(domain string) context.Context {
