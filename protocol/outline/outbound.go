@@ -121,7 +121,7 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	switch {
 	case destination.IsDomain():
 		addr = metadata.Socksaddr{Fqdn: destination.Fqdn, Port: destination.Port}
-	case md.Domain != "":
+	case md.Domain != "" && destination.Addr.IsValid():
 		addr = metadata.Socksaddr{Fqdn: md.Domain, Port: destination.Port}
 	case destination.Addr.IsValid():
 		addr = destination.Unwrap()

@@ -127,17 +127,32 @@ func TestDialContextHost(t *testing.T) {
 }
 
 func TestDialContextNoHost(t *testing.T) {
-	var searches int
-	o := &Outbound{createDialer: func() (transport.StreamDialer, error) {
-		searches++
-		return &recordingDialer{}, nil
-	}}
-	_, err := o.DialContext(context.Background(), "tcp", metadata.Socksaddr{Port: 443})
-	if err == nil || errors.Is(err, errDialRefused) {
-		t.Fatalf("DialContext: got %v, want a no-host error before dialing", err)
-	}
-	if searches != 0 {
-		t.Fatalf("ran %d strategy searches for a destination with no host", searches)
+	for _, tc := range []struct {
+		name string
+		meta *adapter.InboundContext // inbound metadata, nil for none
+	}{
+		{"no metadata", nil},
+		// An inherited domain must not stand in for a missing destination.
+		{"inherited domain", &adapter.InboundContext{Domain: "example.com"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var searches int
+			o := &Outbound{createDialer: func() (transport.StreamDialer, error) {
+				searches++
+				return &recordingDialer{}, nil
+			}}
+			ctx := context.Background()
+			if tc.meta != nil {
+				ctx = adapter.WithContext(ctx, tc.meta)
+			}
+			_, err := o.DialContext(ctx, "tcp", metadata.Socksaddr{Port: 443})
+			if err == nil || errors.Is(err, errDialRefused) {
+				t.Fatalf("DialContext: got %v, want a no-host error before dialing", err)
+			}
+			if searches != 0 {
+				t.Fatalf("ran %d strategy searches for a destination with no host", searches)
+			}
+		})
 	}
 }
 
