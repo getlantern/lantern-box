@@ -12,6 +12,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	O "github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/metadata"
 	"golang.getoutline.org/sdk/transport"
@@ -81,6 +82,35 @@ func TestSmartConfigAcceptedByStrategyFinder(t *testing.T) {
 		if !d.dialed(addr) {
 			t.Errorf("resolver %s was never tried; config:\n%s", addr, config)
 		}
+	}
+}
+
+func TestDialContextHost(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		domain string // inbound metadata's domain, "" for none
+		dest   string
+		want   string
+	}{
+		// A remote rule-set's download_detour dials the outbound directly.
+		{"no metadata, hostname destination", "", "cdn.jsdelivr.net:443", "cdn.jsdelivr.net:443"},
+		{"no metadata, IPv6 destination", "", "[2001:db8::1]:443", "[2001:db8::1]:443"},
+		{"routed with sniffed domain", "example.com", "192.0.2.1:443", "example.com:443"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &recordingDialer{}
+			o := &Outbound{createDialer: func() (transport.StreamDialer, error) { return d, nil }}
+			ctx := context.Background()
+			if tc.domain != "" {
+				ctx = adapter.WithContext(ctx, &adapter.InboundContext{Domain: tc.domain})
+			}
+			if _, err := o.DialContext(ctx, "tcp", metadata.ParseSocksaddr(tc.dest)); !errors.Is(err, errDialRefused) {
+				t.Fatalf("DialContext: got %v, want %v", err, errDialRefused)
+			}
+			if !d.dialed(tc.want) {
+				t.Fatalf("dialed %v, want %q", d.addrs, tc.want)
+			}
+		})
 	}
 }
 

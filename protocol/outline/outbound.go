@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -119,7 +120,14 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	md.Outbound = o.Tag()
 	md.Destination = destination
 
-	return d.DialStream(ctx, fmt.Sprintf("%s:%d", md.Domain, destination.Port))
+	// A caller that dials this outbound directly, such as a remote rule-set's
+	// download_detour, carries no inbound metadata, so its host is only in
+	// destination.
+	host := md.Domain
+	if host == "" {
+		host = destination.AddrString()
+	}
+	return d.DialStream(ctx, net.JoinHostPort(host, strconv.Itoa(int(destination.Port))))
 }
 
 // getDialer returns the smart dialer, joining the in-flight search or starting
