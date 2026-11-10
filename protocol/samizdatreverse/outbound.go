@@ -94,20 +94,38 @@ func (o *Outbound) session() (*http2.ClientConn, error) {
 
 // DialContext opens a TCP stream, or a UoT stream for UDP, on the session.
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	sent := sniffedDestination(ctx, destination)
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
 
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
-		return o.connect(ctx, destination)
+		return o.connect(ctx, sent)
 	case N.NetworkUDP:
 		if _, err := o.session(); err != nil {
 			return nil, err
 		}
-		return o.uotClient.DialContext(ctx, network, destination)
+		return o.uotClient.DialContext(ctx, network, sent)
 	}
 	return nil, fmt.Errorf("samizdat-reverse: unsupported network: %s", network)
+}
+
+// sniffedDestination swaps an IP destination for the host sniffed from the
+// connection (TLS or QUIC SNI, HTTP Host), as sing-box's
+// sniff_override_destination does: the inviter's exit policy rejects IP
+// literals and admits only allowlisted hostnames. A claimed host never
+// unlocks the original IP, since the bridge resolves the name itself and
+// dials the address it resolved.
+func sniffedDestination(ctx context.Context, destination M.Socksaddr) M.Socksaddr {
+	if !destination.IsIP() {
+		return destination
+	}
+	metadata := adapter.ContextFrom(ctx)
+	if metadata == nil || !M.IsDomainName(metadata.Domain) {
+		return destination
+	}
+	return M.Socksaddr{Fqdn: metadata.Domain, Port: destination.Port}
 }
 
 // ListenPacket opens a UoT packet connection on the session.

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	sblog "github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -431,5 +432,63 @@ func TestReverseStreamResetHidesAddresses(t *testing.T) {
 	_, portalPort, _ := net.SplitHostPort(addr)
 	for _, leak := range []string{"127.0.0.1", "[::", portalPort, localPort} {
 		assert.NotContains(t, err.Error(), leak, "stream error names a session endpoint")
+	}
+}
+
+// hostRecorder answers CONNECT with 200 and reports the destination the
+// bridge would route: r.Host for TCP, the UoT request's destination for UDP.
+func hostRecorder(got chan<- string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		if M.ParseSocksaddr(r.Host).Fqdn != uot.MagicAddress {
+			got <- r.Host
+		} else if req, err := uot.ReadRequest(r.Body); err == nil {
+			got <- req.Destination.String()
+		}
+		<-r.Context().Done()
+	})
+}
+
+func TestReverseSendsSniffedHost(t *testing.T) {
+	got := make(chan string, 1)
+	p := portalWithSession(t, hostRecorder(got))
+	o := newTestReverse(t, tagA, p)
+
+	withDomain := func(domain string) context.Context {
+		return adapter.WithContext(context.Background(), &adapter.InboundContext{Domain: domain})
+	}
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		dest string
+		want string
+	}{
+		{"sniffed host replaces IPv4", withDomain("example.com"), "10.11.12.13:443", "example.com:443"},
+		{"sniffed host replaces IPv6", withDomain("example.com"), "[2001:db8::1]:8443", "example.com:8443"},
+		{"no metadata", context.Background(), "10.11.12.13:443", "10.11.12.13:443"},
+		{"no domain", withDomain(""), "10.11.12.13:443", "10.11.12.13:443"},
+		{"IP as domain", withDomain("192.0.2.1"), "10.11.12.13:443", "10.11.12.13:443"},
+		{"invalid domain", withDomain("not a domain"), "10.11.12.13:443", "10.11.12.13:443"},
+		{"FQDN destination kept", withDomain("example.com"), "other.example.org:443", "other.example.org:443"},
+	} {
+		for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
+			t.Run(tc.name+"/"+network, func(t *testing.T) {
+				conn, err := o.DialContext(tc.ctx, network, M.ParseSocksaddr(tc.dest))
+				require.NoError(t, err)
+				defer conn.Close()
+				if network == N.NetworkUDP {
+					// The UoT request goes out with the first packet.
+					_, err = conn.Write([]byte("ping"))
+					require.NoError(t, err)
+				}
+				select {
+				case host := <-got:
+					assert.Equal(t, tc.want, host)
+				case <-time.After(5 * time.Second):
+					t.Fatal("no CONNECT reached the bridge")
+				}
+			})
+		}
 	}
 }
