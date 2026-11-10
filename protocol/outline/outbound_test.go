@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -86,25 +87,34 @@ func TestSmartConfigAcceptedByStrategyFinder(t *testing.T) {
 }
 
 func TestDialContextHost(t *testing.T) {
+	addr := metadata.ParseSocksaddr
 	for _, tc := range []struct {
-		name   string
-		domain string // inbound metadata's domain, "" for none
-		dest   string
-		want   string
+		name string
+		meta *adapter.InboundContext // inbound metadata, nil for none
+		dest metadata.Socksaddr
+		want string
 	}{
 		// A remote rule-set's download_detour dials the outbound directly.
-		{"no metadata, hostname destination", "", "cdn.jsdelivr.net:443", "cdn.jsdelivr.net:443"},
-		{"no metadata, IPv6 destination", "", "[2001:db8::1]:443", "[2001:db8::1]:443"},
-		{"routed with sniffed domain", "example.com", "192.0.2.1:443", "example.com:443"},
+		{"no metadata, hostname destination", nil, addr("cdn.jsdelivr.net:443"), "cdn.jsdelivr.net:443"},
+		{"no metadata, IPv4 destination", nil, addr("192.0.2.1:443"), "192.0.2.1:443"},
+		{"no metadata, IPv6 destination", nil, addr("[2001:db8::1]:443"), "[2001:db8::1]:443"},
+		{"no metadata, IPv4-mapped destination", nil,
+			metadata.Socksaddr{Addr: netip.MustParseAddr("::ffff:192.0.2.1"), Port: 443}, "192.0.2.1:443"},
+		{"routed with sniffed domain", &adapter.InboundContext{Domain: "example.com"}, addr("192.0.2.1:443"), "example.com:443"},
+		{"routed without sniffed domain", &adapter.InboundContext{}, addr("192.0.2.1:443"), "192.0.2.1:443"},
+		{"inherited domain doesn't override a hostname destination",
+			&adapter.InboundContext{Domain: "youtube.com"}, addr("dns.google:853"), "dns.google:853"},
+		{"hostname kept when the destination also has an IP", nil,
+			metadata.Socksaddr{Addr: netip.MustParseAddr("192.0.2.1"), Fqdn: "cdn.jsdelivr.net", Port: 443}, "cdn.jsdelivr.net:443"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := &recordingDialer{}
 			o := &Outbound{createDialer: func() (transport.StreamDialer, error) { return d, nil }}
 			ctx := context.Background()
-			if tc.domain != "" {
-				ctx = adapter.WithContext(ctx, &adapter.InboundContext{Domain: tc.domain})
+			if tc.meta != nil {
+				ctx = adapter.WithContext(ctx, tc.meta)
 			}
-			if _, err := o.DialContext(ctx, "tcp", metadata.ParseSocksaddr(tc.dest)); !errors.Is(err, errDialRefused) {
+			if _, err := o.DialContext(ctx, "tcp", tc.dest); !errors.Is(err, errDialRefused) {
 				t.Fatalf("DialContext: got %v, want %v", err, errDialRefused)
 			}
 			if !d.dialed(tc.want) {
