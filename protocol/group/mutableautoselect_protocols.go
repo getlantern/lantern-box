@@ -24,6 +24,11 @@ type protocolBehavior struct {
 	lastResort bool
 }
 
+// behaviorFor returns a protocol's probing knobs. A probe's timeout covers
+// the dial, the handshake and the whole bandit probe body. TCP protocols get
+// 3s: a healthy route through a triangle frontend from Iran often needs
+// 1.6-2s for that, and a client that gives up mid-body makes the proxy report
+// the route as stalled.
 func behaviorFor(outboundType string) protocolBehavior {
 	switch outboundType {
 	case lConst.TypeALGeneva:
@@ -31,7 +36,7 @@ func behaviorFor(outboundType string) protocolBehavior {
 	case lConst.TypeAmnezia:
 		return protocolBehavior{probeTimeout: 1500 * time.Millisecond}
 	case C.TypeHTTP:
-		return protocolBehavior{probeTimeout: 2000 * time.Millisecond}
+		return protocolBehavior{probeTimeout: 3000 * time.Millisecond}
 	case C.TypeHysteria:
 		return protocolBehavior{probeTimeout: 1500 * time.Millisecond}
 	case C.TypeHysteria2, lConst.TypeHysteria2X:
@@ -43,11 +48,11 @@ func behaviorFor(outboundType string) protocolBehavior {
 	case lConst.TypeSamizdat:
 		return protocolBehavior{probeTimeout: 3000 * time.Millisecond}
 	case C.TypeShadowsocks:
-		return protocolBehavior{probeTimeout: 2000 * time.Millisecond}
+		return protocolBehavior{probeTimeout: 3000 * time.Millisecond}
 	case C.TypeShadowTLS:
 		return protocolBehavior{probeTimeout: 3000 * time.Millisecond}
 	case C.TypeSOCKS:
-		return protocolBehavior{probeTimeout: 2000 * time.Millisecond}
+		return protocolBehavior{probeTimeout: 3000 * time.Millisecond}
 	case C.TypeSSH:
 		return protocolBehavior{probeTimeout: 3000 * time.Millisecond}
 	case C.TypeTor:
@@ -61,12 +66,12 @@ func behaviorFor(outboundType string) protocolBehavior {
 		// take tens of seconds.
 		return protocolBehavior{probeTimeout: 60 * time.Second, lastResort: true}
 	case C.TypeVLESS:
-		return protocolBehavior{probeTimeout: 2000 * time.Millisecond}
+		return protocolBehavior{probeTimeout: 3000 * time.Millisecond}
 	case C.TypeVMess:
-		return protocolBehavior{probeTimeout: 2000 * time.Millisecond}
+		return protocolBehavior{probeTimeout: 3000 * time.Millisecond}
 	case C.TypeWireGuard:
 		return protocolBehavior{probeTimeout: 1500 * time.Millisecond}
 	default:
-		return protocolBehavior{probeTimeout: 2000 * time.Millisecond}
+		return protocolBehavior{probeTimeout: 3000 * time.Millisecond}
 	}
 }
