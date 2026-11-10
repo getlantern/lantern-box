@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -287,4 +288,28 @@ func TestBatcherDrainsFallbacksAfterClose(t *testing.T) {
 	single.mu.Lock()
 	defer single.mu.Unlock()
 	assert.Len(t, single.tokens, n, "every queued single callback is sent")
+}
+
+// close returns within its timeout when the batch endpoint hangs with
+// several batches waiting, rather than waiting out each batch's request.
+func TestBatcherCloseBoundsTheFinalFlush(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The server notices the client hang up only once the body is read.
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	single := &singleRecorder{}
+	b := testBatcher(t, srv.URL, time.Hour, 1, single)
+	b.closeTimeout = 200 * time.Millisecond
+	for i := range 5 {
+		b.add(probeQuery(fmt.Sprintf("tok-%d", i)), "", result{verdict: verdictDelivered})
+	}
+	start := time.Now()
+	b.close()
+	assert.Less(t, time.Since(start), 2*time.Second, "close waits out one shared timeout")
+	b.fallbacks.Wait()
+	single.mu.Lock()
+	defer single.mu.Unlock()
+	assert.Empty(t, single.tokens, "batches unsent at the deadline are dropped, not sent singly")
 }

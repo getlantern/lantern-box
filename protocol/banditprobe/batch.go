@@ -17,8 +17,9 @@ import (
 
 const (
 	defaultBatchInterval = time.Second
-	// maxBatchInterval keeps every callback's queue time under the 5s the
-	// API credits.
+	// maxBatchInterval keeps a callback's wait for its batch short. The API
+	// deducts that wait from its latency, up to a bound that also covers one
+	// batch send running to callbackTimeout.
 	maxBatchInterval    = 4 * time.Second
 	defaultBatchMaxSize = 200
 	maxBatchMaxSize     = 1000
@@ -27,8 +28,8 @@ const (
 	maxBatchBacklog = 10
 	// fallbackWorkers send the single callbacks of refused batches.
 	fallbackWorkers = 16
-	// closeDrainTimeout bounds how long close waits for single callbacks
-	// still in flight.
+	// closeDrainTimeout bounds how long close waits, for the final flush and
+	// the single callbacks still in flight together.
 	closeDrainTimeout = callbackTimeout
 )
 
@@ -80,6 +81,12 @@ type batcher struct {
 	dropped int
 	closed  bool
 
+	// ctx carries every batch send; close cancels it once closeTimeout has
+	// passed, ending a send in flight as well as the final flush.
+	ctx          context.Context
+	cancel       context.CancelFunc
+	closeTimeout time.Duration
+
 	// fallback holds single callbacks for refused batches, which
 	// fallbackWorkers send until it is closed and empty. Only run sends to
 	// it, so close can close it once run has returned.
@@ -94,9 +101,11 @@ type batcher struct {
 func newBatcher(cfg batchConfig, client *http.Client, lg logger.ContextLogger, now func() time.Time,
 	single func(context.Context, url.Values, string, result) error,
 ) *batcher {
+	ctx, cancel := context.WithCancel(context.Background())
 	b := &batcher{cfg: cfg, client: client, logger: lg, now: now, single: single,
+		ctx: ctx, cancel: cancel, closeTimeout: closeDrainTimeout,
 		fallback: make(chan queuedCallback, cfg.maxSize*maxBatchBacklog),
-		kick: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{})}
+		kick:     make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{})}
 	for range fallbackWorkers {
 		go b.sendFallbacks()
 	}
@@ -141,17 +150,21 @@ func (b *batcher) run() {
 		case <-ticker.C:
 		case <-b.kick:
 		case <-b.stop:
-			b.flush()
+			b.flush(b.ctx)
 			return
 		}
-		b.flush()
+		b.flush(b.ctx)
 	}
 }
 
 // close sends what is waiting and stops the batcher. A callback added later
-// goes out on its own. It waits up to closeDrainTimeout for the single
-// callbacks of refused batches.
+// goes out on its own. It returns within closeTimeout: by then it ends the
+// batch send in flight, the final flush drops the batches it has not sent,
+// and close stops waiting for the single callbacks of refused batches.
 func (b *batcher) close() {
+	timer := time.AfterFunc(b.closeTimeout, b.cancel)
+	defer timer.Stop()
+	defer b.cancel()
 	b.mu.Lock()
 	b.closed = true
 	b.mu.Unlock()
@@ -167,7 +180,7 @@ func (b *batcher) close() {
 	}()
 	select {
 	case <-drained:
-	case <-time.After(closeDrainTimeout):
+	case <-b.ctx.Done():
 	}
 }
 
@@ -200,22 +213,31 @@ func (b *batcher) sendFallbacks() {
 	}
 }
 
-// flush sends every waiting callback, maxSize to a batch.
-func (b *batcher) flush() {
+// flush sends every waiting callback, maxSize to a batch. Once ctx is done
+// it drops what it has not sent.
+func (b *batcher) flush(ctx context.Context) {
 	b.mu.Lock()
 	pending, dropped := b.pending, b.dropped
 	b.pending, b.dropped = nil, 0
 	b.mu.Unlock()
-	ctx := context.Background()
+	lctx := context.Background()
 	if dropped > 0 {
-		b.logger.WarnContext(ctx, "bandit probe callback batches backed up; dropped ", dropped, " callbacks")
+		b.logger.WarnContext(lctx, "bandit probe callback batches backed up; dropped ", dropped, " callbacks")
 	}
 	for len(pending) > 0 {
+		if ctx.Err() != nil {
+			b.logger.WarnContext(lctx, "bandit probe callback batcher closed; dropped ", len(pending), " callbacks")
+			return
+		}
 		n := min(len(pending), b.cfg.maxSize)
 		batch := pending[:n]
 		pending = pending[n:]
 		if err := b.send(ctx, batch); err != nil {
-			b.logger.WarnContext(ctx, "bandit probe callback batch failed, sending its ", len(batch), " callbacks singly: ", err)
+			if ctx.Err() != nil {
+				b.logger.WarnContext(lctx, "bandit probe callback batcher closed; dropped ", len(batch)+len(pending), " callbacks: ", err)
+				return
+			}
+			b.logger.WarnContext(lctx, "bandit probe callback batch failed, sending its ", len(batch), " callbacks singly: ", err)
 			b.sendSingly(batch)
 		}
 	}
