@@ -124,6 +124,18 @@ func TestDialContextHost(t *testing.T) {
 	}
 }
 
+func TestDialContextNoHost(t *testing.T) {
+	d := &recordingDialer{}
+	o := &Outbound{createDialer: func() (transport.StreamDialer, error) { return d, nil }}
+	_, err := o.DialContext(context.Background(), "tcp", metadata.Socksaddr{Port: 443})
+	if err == nil || errors.Is(err, errDialRefused) {
+		t.Fatalf("DialContext: got %v, want a no-host error before dialing", err)
+	}
+	if len(d.addrs) != 0 {
+		t.Fatalf("dialed %v with no host", d.addrs)
+	}
+}
+
 type failingStreamDialer struct{ err error }
 
 func (d failingStreamDialer) DialStream(context.Context, string) (transport.StreamConn, error) {

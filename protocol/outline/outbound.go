@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 
@@ -110,31 +109,34 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 
 // DialContext dials destination through the smart dialer, which needs a
 // hostname for its DNS and TLS strategies. It uses the destination's own
-// hostname, else the sniffed domain of a routed connection whose destination
-// is an IP, else the IP. Callers that dial the outbound directly, such as a
-// remote rule-set's download_detour, carry no inbound metadata, and a nested
-// dial can inherit a parent connection's unrelated domain.
+// hostname, else the domain the router attached to the connection (sniffed,
+// or from a reverse DNS mapping) when the destination is an IP, else the IP.
+// Callers that dial the outbound directly, such as a remote rule-set's
+// download_detour, carry no inbound metadata, so only destination names the
+// host.
 func (o *Outbound) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
+	ctx, md := adapter.ExtendContext(ctx)
+	var addr metadata.Socksaddr
+	switch {
+	case destination.IsFqdn():
+		addr = metadata.Socksaddr{Fqdn: destination.Fqdn, Port: destination.Port}
+	case md.Domain != "":
+		addr = metadata.Socksaddr{Fqdn: md.Domain, Port: destination.Port}
+	case destination.Addr.IsValid():
+		addr = destination.Unwrap()
+	default:
+		return nil, fmt.Errorf("outline: destination %q has no host", destination.String())
+	}
+
 	d, err := o.getDialer(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, md := adapter.ExtendContext(ctx)
 	md.Outbound = o.Tag()
 	md.Destination = destination
 
-	port := strconv.Itoa(int(destination.Port))
-	var addr string
-	switch {
-	case destination.IsFqdn():
-		addr = net.JoinHostPort(destination.Fqdn, port)
-	case md.Domain != "":
-		addr = net.JoinHostPort(md.Domain, port)
-	default:
-		addr = destination.Unwrap().String()
-	}
-	return d.DialStream(ctx, addr)
+	return d.DialStream(ctx, addr.String())
 }
 
 // getDialer returns the smart dialer, joining the in-flight search or starting
