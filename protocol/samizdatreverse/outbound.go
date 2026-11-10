@@ -16,6 +16,8 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/baderror"
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/bufio/deadline"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -130,13 +132,70 @@ func sniffedDestination(ctx context.Context, destination M.Socksaddr) M.Socksadd
 
 // ListenPacket opens a UoT packet connection on the session.
 func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	sent := sniffedDestination(ctx, destination)
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
 	if _, err := o.session(); err != nil {
 		return nil, err
 	}
-	return o.uotClient.ListenPacket(ctx, destination)
+	if sent == destination {
+		return o.uotClient.ListenPacket(ctx, destination)
+	}
+	pc, err := o.uotClient.ListenPacket(ctx, sent)
+	if err != nil {
+		return nil, err
+	}
+	return &sniffedPacketConn{NetPacketConn: bufio.NewPacketConn(pc), origin: destination.Unwrap(), sent: sent}, nil
+}
+
+// sniffedPacketConn sends packets addressed to origin to the sniffed host
+// instead, and reports origin as the source of every reply. That is exact:
+// the bridge's exit routes UDP with udp_connect, so its socket is connected
+// and every reply comes from the one address it resolved, and a connected
+// socket such as QUIC's needs replies to come from the address it sent to.
+// Like wrapConn it hides Upstream and the UoT read waiter, so sing-box
+// cannot read or write past it.
+type sniffedPacketConn struct {
+	N.NetPacketConn
+	origin M.Socksaddr
+	sent   M.Socksaddr
+}
+
+func (c *sniffedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, _, err := c.NetPacketConn.ReadFrom(p)
+	if err != nil {
+		return n, nil, err
+	}
+	return n, c.origin.UDPAddr(), nil
+}
+
+func (c *sniffedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	_, err := c.NetPacketConn.ReadPacket(buffer)
+	if err != nil {
+		return M.Socksaddr{}, err
+	}
+	return c.origin, nil
+}
+
+func (c *sniffedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	// A Socksaddr, not a *net.UDPAddr, so the host survives.
+	return c.NetPacketConn.WriteTo(p, c.rewrite(M.SocksaddrFromNet(addr)))
+}
+
+func (c *sniffedPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	return c.NetPacketConn.WritePacket(buffer, c.rewrite(destination))
+}
+
+func (c *sniffedPacketConn) rewrite(destination M.Socksaddr) M.Socksaddr {
+	if destination.Unwrap() == c.origin {
+		return c.sent
+	}
+	return destination
+}
+
+func (c *sniffedPacketConn) NeedAdditionalReadDeadline() bool {
+	return deadline.NeedAdditionalReadDeadline(c.NetPacketConn)
 }
 
 // Close is a no-op: the portal owns the session.

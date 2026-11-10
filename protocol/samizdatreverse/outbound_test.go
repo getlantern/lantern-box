@@ -12,6 +12,8 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	sblog "github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
@@ -490,5 +492,100 @@ func TestReverseSendsSniffedHost(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// replyFrom is the source the packet recorder gives its reply, as a bridge
+// would after resolving the sniffed host.
+const replyFrom = "198.51.100.7:443"
+
+// packetRecorder serves a UoT packet stream: for each packet it reports the
+// request's destination and the packet's, then echoes the packet from
+// replyFrom.
+func packetRecorder(got chan<- string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		stream := &handlerConn{r: r.Body, w: w}
+		req, err := uot.ReadRequest(stream)
+		if err != nil {
+			return
+		}
+		uc := uot.NewConn(stream, *req)
+		for {
+			// ReadPacket, not ReadFrom, which drops a host from the address.
+			packet := buf.NewPacket()
+			addr, err := uc.ReadPacket(packet)
+			if err != nil {
+				packet.Release()
+				return
+			}
+			got <- req.Destination.String() + " " + addr.String()
+			_, err = uc.WriteTo(packet.Bytes(), M.ParseSocksaddr(replyFrom))
+			packet.Release()
+			if err != nil {
+				return
+			}
+		}
+	})
+}
+
+func TestReverseListenPacketSendsSniffedHost(t *testing.T) {
+	got := make(chan string, 1)
+	p := portalWithSession(t, packetRecorder(got))
+	o := newTestReverse(t, tagA, p)
+
+	withDomain := func(domain string) context.Context {
+		return adapter.WithContext(context.Background(), &adapter.InboundContext{Domain: domain})
+	}
+	for _, tc := range []struct {
+		name      string
+		ctx       context.Context
+		dest      string
+		writeTo   string
+		wantSent  string
+		wantReply string
+	}{
+		{"sniffed host replaces IP", withDomain("example.com"), "10.11.12.13:443", "10.11.12.13:443", "example.com:443 example.com:443", "10.11.12.13:443"},
+		{"other address unchanged", withDomain("example.com"), "10.11.12.13:443", "10.11.12.14:443", "example.com:443 10.11.12.14:443", "10.11.12.13:443"},
+		{"no domain", context.Background(), "10.11.12.13:443", "10.11.12.13:443", "10.11.12.13:443 10.11.12.13:443", replyFrom},
+		{"invalid domain", withDomain("192.0.2.1"), "10.11.12.13:443", "10.11.12.13:443", "10.11.12.13:443 10.11.12.13:443", replyFrom},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pc, err := o.ListenPacket(tc.ctx, M.ParseSocksaddr(tc.dest))
+			require.NoError(t, err)
+			defer pc.Close()
+			to, err := net.ResolveUDPAddr("udp", tc.writeTo)
+			require.NoError(t, err)
+			_, err = pc.WriteTo([]byte("ping"), to)
+			require.NoError(t, err)
+			select {
+			case sent := <-got:
+				assert.Equal(t, tc.wantSent, sent)
+			case <-time.After(5 * time.Second):
+				t.Fatal("no packet reached the bridge")
+			}
+			b := make([]byte, 16)
+			n, from, err := pc.ReadFrom(b)
+			require.NoError(t, err)
+			assert.Equal(t, "ping", string(b[:n]))
+			assert.Equal(t, tc.wantReply, M.SocksaddrFromNet(from).String())
+
+			// The same through the buffer API, which sing-box uses.
+			npc := bufio.NewPacketConn(pc)
+			require.NoError(t, npc.WritePacket(buf.As([]byte("pong")), M.ParseSocksaddr(tc.writeTo)))
+			select {
+			case sent := <-got:
+				assert.Equal(t, tc.wantSent, sent)
+			case <-time.After(5 * time.Second):
+				t.Fatal("no packet reached the bridge")
+			}
+			packet := buf.NewPacket()
+			defer packet.Release()
+			from2, err := npc.ReadPacket(packet)
+			require.NoError(t, err)
+			assert.Equal(t, "pong", string(packet.Bytes()))
+			assert.Equal(t, tc.wantReply, from2.String())
+		})
 	}
 }
