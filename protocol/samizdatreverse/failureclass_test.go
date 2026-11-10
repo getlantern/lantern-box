@@ -18,6 +18,7 @@ import (
 	sbdns "github.com/sagernet/sing-box/dns"
 	sblog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/route/rule"
+	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -55,6 +56,8 @@ func TestFailureClass(t *testing.T) {
 		{"wrapped canceled", fmt.Errorf("dial: %w", context.Canceled), "canceled"},
 		{"deadline", context.DeadlineExceeded, "timeout"},
 		{"net timeout", &net.OpError{Op: "dial", Net: "tcp", Err: timeoutErr{}}, "timeout"},
+		{"refused then timeout, joined", errors.Join(dialErr(refusedErrnos[0]), &net.OpError{Op: "dial", Net: "tcp", Err: timeoutErr{}}), "timeout"},
+		{"refused then timeout, sing multi", E.Errors(dialErr(refusedErrnos[0]), &net.OpError{Op: "dial", Net: "tcp", Err: timeoutErr{}}), "timeout"},
 		{"dns", &net.DNSError{Err: "no such host", Name: "example.com", IsNotFound: true}, "dns"},
 		{"wrapped dns", fmt.Errorf("lookup: %w", &net.DNSError{Err: "server misbehaving", Name: "example.com"}), "dns"},
 		{"rcode", fmt.Errorf("exchange: %w", sbdns.RcodeNameError), "dns"},

@@ -22,8 +22,7 @@ func failureClass(err error) string {
 	if errors.Is(err, context.Canceled) {
 		return "canceled"
 	}
-	var netErr net.Error
-	if E.IsTimeout(err) || errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+	if errors.Is(err, context.DeadlineExceeded) || anyTimeout(err) {
 		return "timeout"
 	}
 	var dnsErr *net.DNSError
@@ -45,6 +44,26 @@ func failureClass(err error) string {
 		return "closed"
 	}
 	return "other"
+}
+
+// anyTimeout reports whether any error in err's tree is a net.Error that
+// timed out. errors.As would stop at the first net.Error, which in an error
+// joined from parallel dials can be a refusal ahead of the timeout.
+func anyTimeout(err error) bool {
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	switch x := err.(type) {
+	case interface{ Unwrap() error }:
+		return anyTimeout(x.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, inner := range x.Unwrap() {
+			if anyTimeout(inner) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isErrno(err error, errnos []syscall.Errno) bool {
