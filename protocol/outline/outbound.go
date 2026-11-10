@@ -107,19 +107,37 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 	}, nil
 }
 
-// DialContext extracts the metadata domain, add the destination to the context
-// and use the proxyless dialer for sending the request
+// DialContext dials destination through the smart dialer, which needs a
+// hostname for its DNS and TLS strategies. It uses the destination's own
+// hostname, else the inbound metadata's domain (sniffed, or from a reverse DNS
+// mapping) when the destination is an IP, else the IP. Callers that dial the
+// outbound directly, such as a remote rule-set's download_detour, carry no
+// metadata. A nested dial with an IP destination, such as a DNS server using
+// this outbound as its detour, can still inherit a parent connection's
+// unrelated domain.
 func (o *Outbound) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
+	ctx, md := adapter.ExtendContext(ctx)
+	var addr metadata.Socksaddr
+	switch {
+	case destination.IsDomain():
+		addr = metadata.Socksaddr{Fqdn: destination.Fqdn, Port: destination.Port}
+	case md.Domain != "" && destination.Addr.IsValid():
+		addr = metadata.Socksaddr{Fqdn: md.Domain, Port: destination.Port}
+	case destination.Addr.IsValid():
+		addr = destination.Unwrap()
+	default:
+		return nil, fmt.Errorf("outline: destination %q has no host", destination.String())
+	}
+
 	d, err := o.getDialer(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, md := adapter.ExtendContext(ctx)
 	md.Outbound = o.Tag()
 	md.Destination = destination
 
-	return d.DialStream(ctx, fmt.Sprintf("%s:%d", md.Domain, destination.Port))
+	return d.DialStream(ctx, addr.String())
 }
 
 // getDialer returns the smart dialer, joining the in-flight search or starting

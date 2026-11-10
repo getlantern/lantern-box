@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	O "github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/metadata"
 	"golang.getoutline.org/sdk/transport"
@@ -81,6 +83,76 @@ func TestSmartConfigAcceptedByStrategyFinder(t *testing.T) {
 		if !d.dialed(addr) {
 			t.Errorf("resolver %s was never tried; config:\n%s", addr, config)
 		}
+	}
+}
+
+func TestDialContextHost(t *testing.T) {
+	addr := metadata.ParseSocksaddr
+	for _, tc := range []struct {
+		name string
+		meta *adapter.InboundContext // inbound metadata, nil for none
+		dest metadata.Socksaddr
+		want string
+	}{
+		// A remote rule-set's download_detour dials the outbound directly.
+		{"no metadata, hostname destination", nil, addr("cdn.jsdelivr.net:443"), "cdn.jsdelivr.net:443"},
+		{"no metadata, IPv4 destination", nil, addr("192.0.2.1:443"), "192.0.2.1:443"},
+		{"no metadata, IPv6 destination", nil, addr("[2001:db8::1]:443"), "[2001:db8::1]:443"},
+		{"no metadata, IPv4-mapped destination", nil,
+			metadata.Socksaddr{Addr: netip.MustParseAddr("::ffff:192.0.2.1"), Port: 443}, "192.0.2.1:443"},
+		{"routed with sniffed domain", &adapter.InboundContext{Domain: "example.com"}, addr("192.0.2.1:443"), "example.com:443"},
+		{"routed without sniffed domain", &adapter.InboundContext{}, addr("192.0.2.1:443"), "192.0.2.1:443"},
+		{"inherited domain doesn't override a hostname destination",
+			&adapter.InboundContext{Domain: "youtube.com"}, addr("dns.google:853"), "dns.google:853"},
+		{"hostname kept when the destination also has an IP", nil,
+			metadata.Socksaddr{Addr: netip.MustParseAddr("192.0.2.1"), Fqdn: "cdn.jsdelivr.net", Port: 443}, "cdn.jsdelivr.net:443"},
+		{"non-strict hostname still dialed", &adapter.InboundContext{Domain: "youtube.com"},
+			metadata.Socksaddr{Fqdn: "bücher.de", Port: 443}, "bücher.de:443"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &recordingDialer{}
+			o := &Outbound{createDialer: func() (transport.StreamDialer, error) { return d, nil }}
+			ctx := context.Background()
+			if tc.meta != nil {
+				ctx = adapter.WithContext(ctx, tc.meta)
+			}
+			if _, err := o.DialContext(ctx, "tcp", tc.dest); !errors.Is(err, errDialRefused) {
+				t.Fatalf("DialContext: got %v, want %v", err, errDialRefused)
+			}
+			if !d.dialed(tc.want) {
+				t.Fatalf("dialed %v, want %q", d.addrs, tc.want)
+			}
+		})
+	}
+}
+
+func TestDialContextNoHost(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		meta *adapter.InboundContext // inbound metadata, nil for none
+	}{
+		{"no metadata", nil},
+		// An inherited domain must not stand in for a missing destination.
+		{"inherited domain", &adapter.InboundContext{Domain: "example.com"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var searches int
+			o := &Outbound{createDialer: func() (transport.StreamDialer, error) {
+				searches++
+				return &recordingDialer{}, nil
+			}}
+			ctx := context.Background()
+			if tc.meta != nil {
+				ctx = adapter.WithContext(ctx, tc.meta)
+			}
+			_, err := o.DialContext(ctx, "tcp", metadata.Socksaddr{Port: 443})
+			if err == nil || errors.Is(err, errDialRefused) {
+				t.Fatalf("DialContext: got %v, want a no-host error before dialing", err)
+			}
+			if searches != 0 {
+				t.Fatalf("ran %d strategy searches for a destination with no host", searches)
+			}
+		})
 	}
 }
 
