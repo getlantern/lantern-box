@@ -327,7 +327,8 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // blocks until it is done, since the stream ends when ServeHTTP returns.
 // Adapted from protocol/samizdat/inbound.go (Inbound.handleConnection)
 // without its peerconn events and byte counting (see Bridge), and without
-// logging the destination or routing errors, which can name it.
+// logging the destination or routing errors, which can name it. A failure
+// logs only its failureClass.
 func (b *Bridge) handleConnection(ctx context.Context, conn net.Conn, destination string) {
 	conn = &wrapConn{Conn: conn}
 
@@ -340,7 +341,7 @@ func (b *Bridge) handleConnection(ctx context.Context, conn net.Conn, destinatio
 	done := make(chan struct{})
 	b.router.RouteConnectionEx(ctx, conn, metadata, func(err error) {
 		if err != nil {
-			b.logger.DebugContext(ctx, constant.TypeSamizdatBridge, ": a routed connection failed")
+			b.logger.DebugContext(ctx, constant.TypeSamizdatBridge, ": a routed connection failed: ", failureClass(err))
 		}
 		close(done)
 	})
