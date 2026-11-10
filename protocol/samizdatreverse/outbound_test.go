@@ -455,40 +455,81 @@ func TestReverseSendsSniffedHost(t *testing.T) {
 	p := portalWithSession(t, hostRecorder(got))
 	o := newTestReverse(t, tagA, p)
 
-	withDomain := func(domain string) context.Context {
-		return adapter.WithContext(context.Background(), &adapter.InboundContext{Domain: domain})
-	}
 	for _, tc := range []struct {
-		name string
-		ctx  context.Context
-		dest string
-		want string
+		name    string
+		ctx     context.Context
+		network string
+		dest    string
+		want    string
 	}{
-		{"sniffed host replaces IPv4", withDomain("example.com"), "10.11.12.13:443", "example.com:443"},
-		{"sniffed host replaces IPv6", withDomain("example.com"), "[2001:db8::1]:8443", "example.com:8443"},
-		{"no metadata", context.Background(), "10.11.12.13:443", "10.11.12.13:443"},
-		{"no domain", withDomain(""), "10.11.12.13:443", "10.11.12.13:443"},
-		{"IP as domain", withDomain("192.0.2.1"), "10.11.12.13:443", "10.11.12.13:443"},
-		{"invalid domain", withDomain("not a domain"), "10.11.12.13:443", "10.11.12.13:443"},
-		{"FQDN destination kept", withDomain("example.com"), "other.example.org:443", "other.example.org:443"},
+		{"sniffed host replaces IPv4", withDomain("example.com"), N.NetworkTCP, "10.11.12.13:443", "example.com:443"},
+		{"sniffed host replaces IPv6", withDomain("example.com"), N.NetworkTCP, "[2001:db8::1]:8443", "example.com:8443"},
+		{"no metadata", context.Background(), N.NetworkTCP, "10.11.12.13:443", "10.11.12.13:443"},
+		{"no domain", withDomain(""), N.NetworkTCP, "10.11.12.13:443", "10.11.12.13:443"},
+		{"IP as domain", withDomain("192.0.2.1"), N.NetworkTCP, "10.11.12.13:443", "10.11.12.13:443"},
+		{"invalid domain", withDomain("not a domain"), N.NetworkTCP, "10.11.12.13:443", "10.11.12.13:443"},
+		{"FQDN destination kept", withDomain("example.com"), N.NetworkTCP, "other.example.org:443", "other.example.org:443"},
+		{"UDP keeps the IP", withDomain("example.com"), N.NetworkUDP, "10.11.12.13:3478", "10.11.12.13:3478"},
 	} {
-		for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
-			t.Run(tc.name+"/"+network, func(t *testing.T) {
-				conn, err := o.DialContext(tc.ctx, network, M.ParseSocksaddr(tc.dest))
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := o.DialContext(tc.ctx, tc.network, M.ParseSocksaddr(tc.dest))
+			require.NoError(t, err)
+			defer conn.Close()
+			if tc.network == N.NetworkUDP {
+				// The UoT request goes out with the first packet.
+				_, err = conn.Write([]byte("ping"))
 				require.NoError(t, err)
-				defer conn.Close()
-				if network == N.NetworkUDP {
-					// The UoT request goes out with the first packet.
-					_, err = conn.Write([]byte("ping"))
-					require.NoError(t, err)
-				}
-				select {
-				case host := <-got:
-					assert.Equal(t, tc.want, host)
-				case <-time.After(5 * time.Second):
-					t.Fatal("no CONNECT reached the bridge")
-				}
-			})
-		}
+			}
+			select {
+			case host := <-got:
+				assert.Equal(t, tc.want, host)
+			case <-time.After(5 * time.Second):
+				t.Fatal("no CONNECT reached the bridge")
+			}
+		})
 	}
+}
+
+func TestReverseListenPacketKeepsIP(t *testing.T) {
+	got := make(chan string, 1)
+	p := portalWithSession(t, hostRecorder(got))
+	o := newTestReverse(t, tagA, p)
+
+	pc, err := o.ListenPacket(withDomain("example.com"), M.ParseSocksaddr("10.11.12.13:3478"))
+	require.NoError(t, err)
+	defer pc.Close()
+	_, err = pc.WriteTo([]byte("ping"), &net.UDPAddr{IP: net.IPv4(10, 11, 12, 13), Port: 3478})
+	require.NoError(t, err)
+	select {
+	case host := <-got:
+		assert.Equal(t, "10.11.12.13:3478", host)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no CONNECT reached the bridge")
+	}
+}
+
+func TestReverseRefusesQUIC(t *testing.T) {
+	got := make(chan string, 4)
+	p := portalWithSession(t, hostRecorder(got))
+	o := newTestReverse(t, tagA, p)
+	dest := M.ParseSocksaddr("10.11.12.13:443")
+
+	conn, err := o.DialContext(withDomain("example.com"), N.NetworkUDP, dest)
+	assert.ErrorIs(t, err, ErrQUICRefused)
+	assert.Nil(t, conn)
+	pc, err := o.ListenPacket(withDomain("example.com"), dest)
+	assert.ErrorIs(t, err, ErrQUICRefused)
+	assert.Nil(t, pc)
+	assert.NotContains(t, err.Error(), "10.11.12.13")
+	assert.NotContains(t, err.Error(), "example.com")
+
+	select {
+	case host := <-got:
+		t.Fatalf("a refused dial reached the bridge: %s", host)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func withDomain(domain string) context.Context {
+	return adapter.WithContext(context.Background(), &adapter.InboundContext{Domain: domain})
 }

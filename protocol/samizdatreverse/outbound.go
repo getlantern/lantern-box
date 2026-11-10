@@ -31,6 +31,13 @@ import (
 // has no live reversed session on the portal.
 var ErrNoSession = errors.New("samizdat-reverse: no session")
 
+// ErrQUICRefused is returned by a reverse outbound's UDP dials to port 443.
+// The inviter's exit admits only hostnames, and QUIC carries none we can
+// rely on, so a browser would wait out a QUIC attempt the exit rejects.
+// Refusing it here makes the browser fall back to TCP, which sends the
+// sniffed hostname.
+var ErrQUICRefused = errors.New("samizdat-reverse: QUIC refused")
+
 // connectTimeout bounds how long a CONNECT waits for its response headers.
 // It does not apply to the stream once established. A var so tests can
 // shorten it.
@@ -103,16 +110,19 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	case N.NetworkTCP:
 		return o.connect(ctx, sent)
 	case N.NetworkUDP:
+		if destination.Port == 443 {
+			return nil, ErrQUICRefused
+		}
 		if _, err := o.session(); err != nil {
 			return nil, err
 		}
-		return o.uotClient.DialContext(ctx, network, sent)
+		return o.uotClient.DialContext(ctx, network, destination)
 	}
 	return nil, fmt.Errorf("samizdat-reverse: unsupported network: %s", network)
 }
 
-// sniffedDestination swaps an IP destination for the host sniffed from the
-// connection (TLS or QUIC SNI, HTTP Host), as sing-box's
+// sniffedDestination swaps an IP TCP destination for the host sniffed from
+// the connection (TLS SNI or HTTP Host), as sing-box's
 // sniff_override_destination does: the inviter's exit policy rejects IP
 // literals and admits only allowlisted hostnames. A claimed host never
 // unlocks the original IP, since the bridge resolves the name itself and
@@ -133,6 +143,9 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = o.Tag()
 	metadata.Destination = destination
+	if destination.Port == 443 {
+		return nil, ErrQUICRefused
+	}
 	if _, err := o.session(); err != nil {
 		return nil, err
 	}
