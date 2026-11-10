@@ -203,10 +203,14 @@ func (b *batcher) sendSingly(cbs []queuedCallback) {
 }
 
 // sendFallbacks sends queued single callbacks until the queue is closed and
-// empty.
+// empty. The single endpoint takes no queue time, so the time a callback
+// waited for its batch, the batch's failure and a worker goes into its drain
+// time, which the API deducts from its latency as time the proxy held it.
 func (b *batcher) sendFallbacks() {
 	for cb := range b.fallback {
-		if err := b.single(context.Background(), cb.query, cb.traceparent, cb.res); err != nil {
+		res := cb.res
+		res.drain += max(b.now().Sub(cb.queued), 0)
+		if err := b.single(context.Background(), cb.query, cb.traceparent, res); err != nil {
 			b.logger.WarnContext(context.Background(), "bandit probe callback failed: ", err)
 		}
 		b.fallbacks.Done()

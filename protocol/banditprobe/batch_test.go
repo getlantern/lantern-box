@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -312,4 +313,26 @@ func TestBatcherCloseBoundsTheFinalFlush(t *testing.T) {
 	single.mu.Lock()
 	defer single.mu.Unlock()
 	assert.Empty(t, single.tokens, "batches unsent at the deadline are dropped, not sent singly")
+}
+
+// A refused batch's single callback carries the time it waited before going
+// out in its drain time, which the single endpoint deducts from its latency.
+func TestBatcherFallbackCreditsQueueTimeAsDrain(t *testing.T) {
+	_, srv := newBatchRecorder(t, http.StatusServiceUnavailable)
+	u, err := url.Parse(srv.URL + "/v1/bandit/callbacks")
+	require.NoError(t, err)
+	var clock atomic.Int64
+	start := time.Now()
+	now := func() time.Time { return start.Add(time.Duration(clock.Load())) }
+	drains := make(chan time.Duration, 1)
+	b := newBatcher(batchConfig{url: u, token: "fleet-token", interval: time.Hour, maxSize: 100},
+		http.DefaultClient, log.NewNOPFactory().Logger(), now,
+		func(_ context.Context, _ url.Values, _ string, res result) error {
+			drains <- res.drain
+			return nil
+		})
+	b.add(probeQuery("tok-1"), "", result{verdict: verdictDelivered, drain: 50 * time.Millisecond})
+	clock.Store(int64(3 * time.Second))
+	b.close()
+	assert.Equal(t, 3050*time.Millisecond, <-drains)
 }
