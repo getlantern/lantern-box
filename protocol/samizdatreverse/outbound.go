@@ -32,8 +32,9 @@ import (
 var ErrNoSession = errors.New("samizdat-reverse: no session")
 
 // ErrQUICRefused is returned by a reverse outbound's UDP dials to port 443.
-// The inviter's exit admits only hostnames, and QUIC carries none we can
-// rely on, so a browser would wait out a QUIC attempt the exit rejects.
+// The helper's exit may admit only allowlisted hostnames, and QUIC carries
+// none we can rely on, so a browser would wait out a QUIC attempt the exit
+// rejects.
 // Refusing it here makes the browser fall back to TCP, which sends the
 // sniffed hostname.
 var ErrQUICRefused = errors.New("samizdat-reverse: QUIC refused")
@@ -123,8 +124,8 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 
 // sniffedDestination swaps an IP TCP destination for the host sniffed from
 // the connection (TLS SNI or HTTP Host), as sing-box's
-// sniff_override_destination does: the inviter's exit policy rejects IP
-// literals and admits only allowlisted hostnames. A claimed host never
+// sniff_override_destination does: the helper's exit policy may reject IP
+// literals and admit only allowlisted hostnames. A claimed host never
 // unlocks the original IP, since the bridge resolves the name itself and
 // dials the address it resolved.
 func sniffedDestination(ctx context.Context, destination M.Socksaddr) M.Socksaddr {
