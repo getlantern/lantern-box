@@ -38,6 +38,7 @@ type config struct {
 	stallTimeout  time.Duration
 	maxWait       time.Duration
 	reportStalled bool
+	batch         batchConfig
 }
 
 type result struct {
@@ -54,6 +55,8 @@ type responder struct {
 	readState  func(*net.TCPConn) (sendState, error)
 	httpClient *http.Client
 	now        func() time.Time
+	// batch, when set, sends callbacks in batches instead of one by one.
+	batch *batcher
 }
 
 func (r *responder) serve(ctx context.Context, conn net.Conn) error {
@@ -87,6 +90,12 @@ func (r *responder) serve(ctx context.Context, conn net.Conn) error {
 	r.logger.DebugContext(ctx, "bandit probe ", string(res.verdict), " drain=", res.drain, " acked=", res.acked,
 		" retrans=", res.state.retrans, " rtt=", res.state.rtt)
 	if res.verdict == verdictAborted || (res.verdict == verdictStalled && !r.cfg.reportStalled) {
+		return nil
+	}
+	if r.batch != nil {
+		// The batch carries what a single callback would: the client's
+		// parameters under callback_url's own.
+		r.batch.add(r.callbackQuery(query), req.Header.Get("traceparent"), res)
 		return nil
 	}
 	if err := r.sendCallback(ctx, query, req.Header.Get("traceparent"), res); err != nil {
@@ -465,16 +474,7 @@ func writeChunked(conn net.Conn, b []byte) error {
 // apply; drain_ms lets it take the delivery wait out of that latency.
 func (r *responder) sendCallback(ctx context.Context, clientQuery url.Values, traceparent string, res result) error {
 	u := *r.cfg.callbackURL
-	q := url.Values{}
-	for k, vs := range clientQuery {
-		q[k] = append([]string(nil), vs...)
-	}
-	for _, k := range reservedParams {
-		q.Del(k)
-	}
-	for k, vs := range r.cfg.callbackURL.Query() {
-		q[k] = append([]string(nil), vs...)
-	}
+	q := r.callbackQuery(clientQuery)
 	q.Set("verdict", string(res.verdict))
 	q.Set("drain_ms", strconv.FormatInt(res.drain.Milliseconds(), 10))
 	if res.verdict != verdictUnknown {
@@ -505,6 +505,22 @@ func (r *responder) sendCallback(ctx context.Context, clientQuery url.Values, tr
 		return fmt.Errorf("callback returned %s", resp.Status)
 	}
 	return nil
+}
+
+// callbackQuery is the client's callback parameters, less the reserved ones,
+// with callback_url's own parameters over them.
+func (r *responder) callbackQuery(clientQuery url.Values) url.Values {
+	q := url.Values{}
+	for k, vs := range clientQuery {
+		q[k] = append([]string(nil), vs...)
+	}
+	for _, k := range reservedParams {
+		q.Del(k)
+	}
+	for k, vs := range r.cfg.callbackURL.Query() {
+		q[k] = append([]string(nil), vs...)
+	}
+	return q
 }
 
 func writeStatus(conn net.Conn, code int) {

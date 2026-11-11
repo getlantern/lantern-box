@@ -70,8 +70,15 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 	// its host, off the VPN tunnel.
 	// An environment proxy may be named by hostname even when the callback
 	// host is an IP literal.
+	// The batch endpoint is dialed the same way, so its host counts too.
 	_, ipErr := netip.ParseAddr(cfg.callbackURL.Hostname())
-	callbackDialer, err := dialer.New(ctx, options.DialerOptions, ipErr != nil || options.UseProxyEnvironment)
+	resolve := ipErr != nil || options.UseProxyEnvironment
+	if cfg.batch.url != nil {
+		if _, err := netip.ParseAddr(cfg.batch.url.Hostname()); err != nil {
+			resolve = true
+		}
+	}
+	callbackDialer, err := dialer.New(ctx, options.DialerOptions, resolve)
 	if err != nil {
 		return nil, fmt.Errorf("banditprobe: callback dialer: %w", err)
 	}
@@ -86,6 +93,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		readState:  readSendState,
 		httpClient: newCallbackClient(callbackDialer, callbackProxy(options)),
 		now:        time.Now,
+	}
+	if cfg.batch.url != nil {
+		r.batch = newBatcher(cfg.batch, r.httpClient, lg, r.now, r.sendCallback)
 	}
 	return &Outbound{
 		Adapter:   outbound.NewAdapterWithDialerOptions(constant.TypeBanditProbe, tag, []string{N.NetworkTCP}, options.DialerOptions),
@@ -158,7 +168,19 @@ func newConfig(options option.BanditProbeOutboundOptions) (config, error) {
 	if cfg.maxWait > maxMaxWait {
 		return config{}, fmt.Errorf("banditprobe: max_wait %s exceeds %s", cfg.maxWait, maxMaxWait)
 	}
+	cfg.batch, err = newBatchConfig(options.BatchURL, options.BatchToken, time.Duration(options.BatchInterval), options.BatchMaxSize)
+	if err != nil {
+		return config{}, err
+	}
 	return cfg, nil
+}
+
+// Close sends the callbacks waiting for a batch.
+func (o *Outbound) Close() error {
+	if o.responder.batch != nil {
+		o.responder.batch.close()
+	}
+	return nil
 }
 
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
