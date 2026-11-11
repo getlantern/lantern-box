@@ -33,7 +33,7 @@ type MutableAutoSelectOutboundOptions struct {
 	URLOverrides map[string]string `json:"url_overrides,omitempty"`
 
 	// ProbeTimeoutsMs overrides the probe timeout, in milliseconds, for
-	// members of the given outbound types, e.g. {"hysteria2x": 3000}. A type
+	// members of the given outbound types, e.g. {"hysteria2x": 5000}. A type
 	// not listed, or a value outside 250 to 60000, keeps its built-in
 	// timeout. SetProbeTimeouts replaces the set at runtime.
 	ProbeTimeoutsMs ProbeTimeoutsMs `json:"probe_timeouts_ms,omitempty"`
