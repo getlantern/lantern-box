@@ -25,8 +25,8 @@ type protocolBehavior struct {
 }
 
 // behaviorFor returns a protocol's probing knobs. A probe's timeout covers
-// the dial, the handshake and the whole bandit probe body, so every protocol
-// gets at least defaultProbeTimeout: a healthy route through a triangle
+// the dial, the handshake and the whole bandit probe body, so no protocol gets
+// less than defaultProbeTimeout by default: a healthy route through a triangle
 // frontend from Iran often needs 1.6-2s for that, and a client that gives up
 // mid-body makes the proxy report the route as stalled.
 func behaviorFor(outboundType string) protocolBehavior {

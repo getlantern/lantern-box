@@ -305,32 +305,19 @@ func TestHydrateLocalHistory_DropsAgedUserFailures(t *testing.T) {
 }
 
 func TestBehaviorFor_Timeouts(t *testing.T) {
-	cases := []struct {
-		typeName string
-		want     time.Duration
-	}{
-		{lConst.TypeALGeneva, 3000 * time.Millisecond},
-		{lConst.TypeAmnezia, 3000 * time.Millisecond},
-		{C.TypeHTTP, 3000 * time.Millisecond},
-		{C.TypeHysteria, 3000 * time.Millisecond},
-		{C.TypeHysteria2, 3000 * time.Millisecond},
-		{lConst.TypeHysteria2X, 3000 * time.Millisecond},
-		{lConst.TypeOutline, 10000 * time.Millisecond},
-		{lConst.TypeReflex, 3000 * time.Millisecond},
-		{lConst.TypeSamizdat, 3000 * time.Millisecond},
-		{C.TypeShadowsocks, 3000 * time.Millisecond},
-		{C.TypeShadowTLS, 3000 * time.Millisecond},
-		{C.TypeSOCKS, 3000 * time.Millisecond},
-		{C.TypeSSH, 3000 * time.Millisecond},
-		{C.TypeTrojan, 3000 * time.Millisecond},
-		{C.TypeTUIC, 3000 * time.Millisecond},
-		{C.TypeVLESS, 3000 * time.Millisecond},
-		{C.TypeVMess, 3000 * time.Millisecond},
-		{C.TypeWireGuard, 3000 * time.Millisecond},
-	}
-	for _, c := range cases {
-		assert.Equalf(t, c.want, behaviorFor(c.typeName).probeTimeout,
-			"behaviorFor(%q).probeTimeout", c.typeName)
+	assert.Equal(t, 10*time.Second, behaviorFor(lConst.TypeOutline).probeTimeout)
+	assert.Equal(t, 60*time.Second, behaviorFor(lConst.TypeUnbounded).probeTimeout)
+
+	// A probe downloads the whole bandit probe body, so no protocol may get
+	// less than defaultProbeTimeout to do it in.
+	for _, typeName := range []string{
+		lConst.TypeALGeneva, lConst.TypeAmnezia, C.TypeHTTP, C.TypeHysteria, C.TypeHysteria2,
+		lConst.TypeHysteria2X, lConst.TypeOutline, lConst.TypeReflex, lConst.TypeSamizdat,
+		C.TypeShadowsocks, C.TypeShadowTLS, C.TypeSOCKS, C.TypeSSH, C.TypeTrojan, C.TypeTUIC,
+		lConst.TypeUnbounded, C.TypeVLESS, C.TypeVMess, C.TypeWireGuard, "unknown-type",
+	} {
+		assert.GreaterOrEqualf(t, behaviorFor(typeName).probeTimeout, defaultProbeTimeout,
+			"behaviorFor(%q).probeTimeout", typeName)
 	}
 }
 
