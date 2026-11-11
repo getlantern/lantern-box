@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	sblog "github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -432,4 +433,150 @@ func TestReverseStreamResetHidesAddresses(t *testing.T) {
 	for _, leak := range []string{"127.0.0.1", "[::", portalPort, localPort} {
 		assert.NotContains(t, err.Error(), leak, "stream error names a session endpoint")
 	}
+}
+
+// hostRecorder answers CONNECT with 200 and reports the destination the
+// bridge would route: r.Host for TCP, the UoT request's destination for UDP.
+func hostRecorder(got chan<- string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		if M.ParseSocksaddr(r.Host).Fqdn != uot.MagicAddress {
+			got <- r.Host
+		} else if req, err := uot.ReadRequest(r.Body); err == nil {
+			got <- req.Destination.String()
+		}
+		<-r.Context().Done()
+	})
+}
+
+func TestReverseSendsSniffedHost(t *testing.T) {
+	got := make(chan string, 1)
+	p := portalWithSession(t, hostRecorder(got))
+	o := newTestReverse(t, tagA, p)
+
+	for _, tc := range []struct {
+		name    string
+		ctx     context.Context
+		network string
+		dest    string
+		want    string
+	}{
+		{"sniffed host replaces IPv4", withDomain("example.com"), N.NetworkTCP, "10.11.12.13:443", "example.com:443"},
+		{"sniffed host replaces IPv6", withDomain("example.com"), N.NetworkTCP, "[2001:db8::1]:8443", "example.com:8443"},
+		{"no metadata", context.Background(), N.NetworkTCP, "10.11.12.13:443", "10.11.12.13:443"},
+		{"no domain", withDomain(""), N.NetworkTCP, "10.11.12.13:443", "10.11.12.13:443"},
+		{"IP as domain", withDomain("192.0.2.1"), N.NetworkTCP, "10.11.12.13:443", "10.11.12.13:443"},
+		{"invalid domain", withDomain("not a domain"), N.NetworkTCP, "10.11.12.13:443", "10.11.12.13:443"},
+		{"FQDN destination kept", withDomain("example.com"), N.NetworkTCP, "other.example.org:443", "other.example.org:443"},
+		{"UDP keeps the IP", withDomain("example.com"), N.NetworkUDP, "10.11.12.13:3478", "10.11.12.13:3478"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := o.DialContext(tc.ctx, tc.network, M.ParseSocksaddr(tc.dest))
+			require.NoError(t, err)
+			defer conn.Close()
+			if tc.network == N.NetworkUDP {
+				// The UoT request goes out with the first packet.
+				_, err = conn.Write([]byte("ping"))
+				require.NoError(t, err)
+			}
+			select {
+			case host := <-got:
+				assert.Equal(t, tc.want, host)
+			case <-time.After(5 * time.Second):
+				t.Fatal("no CONNECT reached the bridge")
+			}
+		})
+	}
+}
+
+func TestReverseListenPacketKeepsIP(t *testing.T) {
+	got := make(chan string, 1)
+	p := portalWithSession(t, hostRecorder(got))
+	o := newTestReverse(t, tagA, p)
+
+	pc, err := o.ListenPacket(withDomain("example.com"), M.ParseSocksaddr("10.11.12.13:3478"))
+	require.NoError(t, err)
+	defer pc.Close()
+	_, err = pc.WriteTo([]byte("ping"), &net.UDPAddr{IP: net.IPv4(10, 11, 12, 13), Port: 3478})
+	require.NoError(t, err)
+	select {
+	case host := <-got:
+		assert.Equal(t, "10.11.12.13:3478", host)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no CONNECT reached the bridge")
+	}
+}
+
+func TestReverseBlackHolesQUIC(t *testing.T) {
+	got := make(chan string, 4)
+	p := portalWithSession(t, hostRecorder(got))
+	o := newTestReverse(t, tagA, p)
+	dest := M.ParseSocksaddr("10.11.12.13:443")
+
+	conn, err := o.DialContext(withDomain("example.com"), N.NetworkUDP, dest)
+	require.NoError(t, err)
+	defer conn.Close()
+	pc, err := o.ListenPacket(withDomain("example.com"), dest)
+	require.NoError(t, err)
+	defer pc.Close()
+	assert.Equal(t, dest.String(), conn.RemoteAddr().String())
+
+	n, err := conn.Write([]byte("initial"))
+	require.NoError(t, err)
+	assert.Equal(t, 7, n)
+	n, err = pc.WriteTo([]byte("initial"), dest.UDPAddr())
+	require.NoError(t, err)
+	assert.Equal(t, 7, n)
+
+	// A read times out at its deadline.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(50*time.Millisecond)))
+	_, err = conn.Read(make([]byte, 16))
+	var ne net.Error
+	require.ErrorAs(t, err, &ne)
+	assert.True(t, ne.Timeout())
+	require.NoError(t, pc.SetDeadline(time.Now().Add(50*time.Millisecond)))
+	_, _, err = pc.ReadFrom(make([]byte, 16))
+	require.ErrorAs(t, err, &ne)
+	assert.True(t, ne.Timeout())
+
+	// A read blocked without a deadline returns once the conn closes.
+	require.NoError(t, pc.SetDeadline(time.Time{}))
+	readErr := make(chan error, 1)
+	go func() {
+		_, _, err := pc.ReadFrom(make([]byte, 16))
+		readErr <- err
+	}()
+	select {
+	case err := <-readErr:
+		t.Fatalf("read returned before Close: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	require.NoError(t, pc.Close())
+	require.NoError(t, pc.Close())
+	select {
+	case err := <-readErr:
+		assert.ErrorIs(t, err, net.ErrClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("read still blocked after Close")
+	}
+	_, err = pc.WriteTo([]byte("late"), dest.UDPAddr())
+	assert.ErrorIs(t, err, net.ErrClosed)
+
+	select {
+	case host := <-got:
+		t.Fatalf("a black-holed dial reached the bridge: %s", host)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestReverseBlackHolesQUICWithoutSession(t *testing.T) {
+	o := newTestReverse(t, tagA, nil)
+	pc, err := o.ListenPacket(context.Background(), M.ParseSocksaddr("10.11.12.13:443"))
+	require.NoError(t, err)
+	pc.Close()
+}
+
+func withDomain(domain string) context.Context {
+	return adapter.WithContext(context.Background(), &adapter.InboundContext{Domain: domain})
 }

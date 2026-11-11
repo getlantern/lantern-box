@@ -70,7 +70,9 @@ func probeThrough(t *testing.T, serverInbound, clientOutbound string) {
 	resp.Body.Close()
 	require.NoError(t, err)
 	require.Equal(t, 200, resp.StatusCode)
-	require.Equal(t, 64*1024, len(body), "the responder answers with a 64 KiB body")
+	require.EqualValues(t, resp.ContentLength, len(body), "the body must match its Content-Length")
+	require.GreaterOrEqual(t, len(body), 64*1024, "the responder answers with at least a 64 KiB body")
+	require.LessOrEqual(t, len(body), 96*1024, "the responder adds at most half again to the body")
 }
 
 const ssPassword = "d4M6fAj9Q07uK4HePntATUAs1KBceMzq8hGPy1AFxFA="
