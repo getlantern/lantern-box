@@ -133,6 +133,7 @@ func NewInbound(
 		MasqueradeIdleTimeout: masqIdleTimeout,
 		MasqueradeMaxDuration: masqMaxDuration,
 		MaxConcurrentStreams:  options.MaxConcurrentStreams,
+		LeanH2:                options.LeanH2,
 		Handler: func(ctx context.Context, conn net.Conn, destination string) {
 			ib.handleConnection(ctx, conn, destination)
 		},

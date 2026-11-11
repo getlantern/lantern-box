@@ -52,4 +52,8 @@ type SamizdatInboundOptions struct {
 
 	// Limits
 	MaxConcurrentStreams int `json:"max_concurrent_streams,omitempty"` // per connection (default: 250)
+
+	// LeanH2 serves tunnels with samizdat's own HTTP/2 server instead of
+	// x/net's: the same frames on the wire, a fraction of the CPU per byte.
+	LeanH2 bool `json:"lean_h2,omitempty"`
 }
