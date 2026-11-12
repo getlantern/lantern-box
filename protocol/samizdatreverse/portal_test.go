@@ -540,7 +540,7 @@ func TestPortalInterfaceUpdatedDebouncesRebind(t *testing.T) {
 	addr := portalAddr(t, p)
 
 	for range 5 {
-		p.InterfaceUpdated()
+		p.InterfaceUpdated(context.Background())
 	}
 	require.Eventually(t, func() bool { return p.rebinds.Load() == 1 }, 5*time.Second, 20*time.Millisecond)
 	time.Sleep(500 * time.Millisecond)
@@ -554,7 +554,7 @@ func TestPortalInterfaceUpdatedDebouncesRebind(t *testing.T) {
 func TestPortalInterfaceUpdatedWhenStopped(t *testing.T) {
 	p := newTestPortal(t, option.SamizdatPortalInboundOptions{})
 	p.rebindDelay = 10 * time.Millisecond
-	p.InterfaceUpdated()
+	p.InterfaceUpdated(context.Background())
 	time.Sleep(100 * time.Millisecond)
 	assert.Nil(t, p.Addr())
 	assert.EqualValues(t, 0, p.rebinds.Load())
@@ -586,7 +586,7 @@ func TestPortalFailedRebindRetriesOnNextUpdate(t *testing.T) {
 	assert.False(t, ok)
 
 	require.NoError(t, blocker.Close())
-	p.InterfaceUpdated()
+	p.InterfaceUpdated(context.Background())
 	require.Eventually(t, func() bool { return p.Addr() != nil }, 5*time.Second, 20*time.Millisecond)
 	assert.Equal(t, addr, portalAddr(t, p), "portal came back on another port")
 	helper(t, addr, k, id, "a")

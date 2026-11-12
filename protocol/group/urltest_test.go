@@ -90,6 +90,42 @@ func TestMarkFailedAndReselect_SwitchesToHealthyOutbound(t *testing.T) {
 	require.Equal("beta", g.selectedOutboundUDP.Load().Tag())
 }
 
+func TestPerformUpdateCheck_ConcurrentWithMembershipChanges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	outbounds := map[string]adapter.Outbound{
+		"alpha": &mockOutbound{tag: "alpha"},
+		"beta":  &mockOutbound{tag: "beta"},
+	}
+	g := newURLTestGroup(ctx, &mockOutboundManager{outbounds: outbounds}, sbLog.NewNOPFactory().Logger(),
+		[]string{"alpha", "beta"}, "https://example.com", nil, time.Minute, time.Minute, 50)
+	for tag := range outbounds {
+		g.outbounds.Store(tag, outbounds[tag])
+	}
+	g.history.StoreURLTestHistory("alpha", &adapter.URLTestHistory{Time: time.Now(), Delay: 50})
+	s := &MutableURLTest{group: g}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 200 {
+			s.PerformUpdateCheck()
+		}
+	}()
+	for range 200 {
+		_, _ = g.Remove([]string{"beta"})
+		_, _ = g.Add([]string{"beta"})
+	}
+	<-done
+
+	_, _ = g.Remove([]string{"beta"})
+	s.PerformUpdateCheck()
+	selected := g.selectedOutboundTCP.Load()
+	if assert.NotNil(t, selected) {
+		assert.Equal(t, "alpha", selected.Tag(), "a removed member must not be reselected")
+	}
+}
+
 // retryMode parameterizes the table-driven tests across DialContext (tcp) and
 // ListenPacket (udp), which share the same retry machinery.
 type retryMode struct {

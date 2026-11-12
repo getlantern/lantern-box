@@ -103,18 +103,18 @@ func TestMutableSelectorSpans_RedactHelperTags(t *testing.T) {
 	_, err = s.ListenPacket(context.Background(), metadata.Socksaddr{})
 	require.Error(t, err)
 
-	// No selected outbound, so NewConnectionEx fails at once, but its span
+	// No selected outbound, so NewConnection fails at once, but its span
 	// still carries the routed connection's outbound tag.
 	empty := &MutableSelector{logger: log.NewNOPFactory().Logger()}
-	empty.NewConnectionEx(context.Background(), nil, sbAdapter.InboundContext{Outbound: helperTagB}, nil)
-	empty.NewPacketConnectionEx(context.Background(), nil, sbAdapter.InboundContext{Outbound: helperTagB}, nil)
+	empty.NewConnection(context.Background(), nil, sbAdapter.InboundContext{Outbound: helperTagB}, nil)
+	empty.NewPacketConnection(context.Background(), nil, sbAdapter.InboundContext{Outbound: helperTagB}, nil)
 
 	spans := exporter.GetSpans()
 	assertNoHelperHex(t, spans)
 	v, ok := spanAttr(spans, "MutableSelector.DialContext", "outbound")
 	require.True(t, ok)
 	assert.Equal(t, "helper", v)
-	v, ok = spanAttr(spans, "MutableSelector.NewConnectionEx", "outbound")
+	v, ok = spanAttr(spans, "MutableSelector.NewConnection", "outbound")
 	require.True(t, ok)
 	assert.Equal(t, "helper", v)
 }

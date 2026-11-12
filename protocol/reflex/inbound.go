@@ -18,8 +18,8 @@ import (
 	N "github.com/sagernet/sing/common/network"
 
 	"github.com/getlantern/lantern-box/constant"
-	"github.com/getlantern/lantern-box/protocol/internal/masquerade"
 	"github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/protocol/internal/masquerade"
 )
 
 // defaultSilenceJitter is applied when SilenceTimeout is set but
@@ -122,8 +122,8 @@ func NewInbound(ctx context.Context, router adapter.Router, lg log.ContextLogger
 	return ib, nil
 }
 
-// NewConnectionEx handles a new TCP connection with the reversed TLS handshake.
-func (i *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+// NewConnection handles a new TCP connection with the reversed TLS handshake.
+func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	// Silence-based probe resistance: a legitimate Lantern client sends no bytes
 	// until the server speaks (that's the Reflex protocol). Active probes and
 	// misdirected TLS clients speak immediately. If we see any bytes within the

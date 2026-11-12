@@ -161,7 +161,7 @@ var _ adapter.InterfaceUpdateListener = (*Portal)(nil)
 // changes. The listener was bound to the interface that was the default
 // when it was created, so the portal rebinds after updates stop arriving
 // for rebindDelay. It returns at once: the caller is the network monitor.
-func (p *Portal) InterfaceUpdated() {
+func (p *Portal) InterfaceUpdated(context.Context) {
 	p.rebindMu.Lock()
 	defer p.rebindMu.Unlock()
 	if p.rebindTimer == nil {

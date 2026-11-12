@@ -12,7 +12,7 @@ import (
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
+	trafficontrol "github.com/sagernet/sing-box/common/trafficcontrol"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/logger"
 

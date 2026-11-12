@@ -53,7 +53,7 @@ func (d *recordingDialer) dialed(addr string) bool {
 
 func TestSmartConfigAcceptedByStrategyFinder(t *testing.T) {
 	options := option.OutboundOutlineOptions{
-		DialerOptions: O.DialerOptions{Detour: "direct", BindInterface: "eth0"},
+		DialerOptions: O.DialerOptions{Detour: "direct", AbstractDialerOptions: O.AbstractDialerOptions{BindInterface: "eth0"}},
 		ServerOptions: O.ServerOptions{Server: "example.com", ServerPort: 443},
 		DNSResolvers: []option.DNSEntryConfig{
 			{HTTPS: &option.HTTPSEntryConfig{Name: "cloudflare-dns.com", Address: "192.0.2.1:443"}},
