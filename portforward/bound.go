@@ -207,6 +207,10 @@ func searchIGD(ctx context.Context, fn control.Func, targets []string,
 				case <-fetchCtx.Done():
 				}
 			}()
+		case <-ctx.Done():
+			// Fetches cancelled with it drop their results, so pending
+			// would never reach zero.
+			return nil, ctx.Err()
 		case r := <-results:
 			pending--
 			if r.c != nil {

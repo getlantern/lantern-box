@@ -360,3 +360,41 @@ func TestSearchIGD_SlowResponderDoesNotHideAGateway(t *testing.T) {
 	require.NotNil(t, c)
 	assert.Less(t, time.Since(start), deviceFetchTimeout, "found without waiting on the slow device")
 }
+
+// Cancelling the search while a description is being fetched returns at once
+// with ctx's error, rather than waiting on a fetch that drops its result.
+func TestSearchIGD_CancelDuringAFetchReturns(t *testing.T) {
+	loopbackIsTheLAN(t)
+	fetching := make(chan struct{}, 1)
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case fetching <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); slow.Close() })
+	fakeSSDP(t, internetgateway2.URN_WANIPConnection_2, slow.URL+"/desc.xml")
+	fn, _ := countingControl()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-fetching
+		cancel()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := discoverIGDv2Bound(ctx, fn)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the search hung after its context was cancelled")
+	}
+}
