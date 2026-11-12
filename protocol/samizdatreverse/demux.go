@@ -85,6 +85,10 @@ func (p *Portal) newIdentity(privateKey, certPEM, keyPEM []byte, ids [][8]byte) 
 		CertPEM:        certPEM,
 		KeyPEM:         keyPEM,
 		SessionHandler: p.handleSession,
+		// The portal refuses replayed SessionIDs itself, before admitting
+		// them, so it can masquerade them: these servers have no masquerade
+		// and would only close the connection.
+		ReplayWindow: -1,
 	})
 	if err != nil {
 		return nil, err
@@ -279,6 +283,12 @@ func (p *Portal) route(conn net.Conn) {
 		return
 	}
 	if id := r.pick(record[5:], time.Now()); id != nil {
+		// A SessionID seen before is a copy of an observed ClientHello:
+		// masquerade it, as samizdat's server does.
+		if sid, err := samizdat.ExtractSessionID(record[5:]); err != nil || p.replayed.seen(sid, time.Now()) {
+			p.masquerade(r.stop, conn, record)
+			return
+		}
 		ac := id.admit(conn, record)
 		if ac == nil {
 			// Retired since the routes were read.
