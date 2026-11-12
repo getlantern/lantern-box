@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackpal/gateway"
+	"github.com/sagernet/sing/common/control"
 )
 
 // NAT-PMP (RFC 6886) and its successor PCP (RFC 6887) are what Apple routers
@@ -57,11 +58,13 @@ var (
 // build gets the socket's local address, which PCP puts in its requests. Once
 // a request has gone out, a transport error leaves its outcome unknown, so it
 // is wrapped in errOutcomeUnknown.
-func pmpExchange(gw *net.UDPAddr, timeout time.Duration, build func(local net.IP) []byte, accept func(b []byte) (bool, error)) ([]byte, error) {
-	conn, err := net.DialUDP("udp4", nil, gw)
+func pmpExchange(gw *net.UDPAddr, timeout time.Duration, fn control.Func, build func(local net.IP) []byte, accept func(b []byte) (bool, error)) ([]byte, error) {
+	d := net.Dialer{Control: fn}
+	c, err := d.Dial("udp4", gw.String())
 	if err != nil {
 		return nil, err
 	}
+	conn := c.(*net.UDPConn)
 	defer conn.Close()
 	req := build(conn.LocalAddr().(*net.UDPAddr).IP)
 	deadline := time.Now().Add(timeout)
@@ -199,6 +202,8 @@ func (s *pmpMappings) lease(protocol string, internalPort uint16) (time.Duration
 type natPMPClient struct {
 	gw      *net.UDPAddr
 	timeout time.Duration
+	// control, if set, controls the socket of every request. See BoundTo.
+	control control.Func
 	pmpMappings
 }
 
@@ -214,7 +219,7 @@ const (
 )
 
 func (c *natPMPClient) request(op byte, req []byte, minLen int) ([]byte, error) {
-	res, err := pmpExchange(c.gw, c.timeout, func(net.IP) []byte { return req },
+	res, err := pmpExchange(c.gw, c.timeout, c.control, func(net.IP) []byte { return req },
 		func(b []byte) (bool, error) {
 			if len(b) >= 2 && b[0] != natPMPVersion {
 				return false, errPMPVersion
@@ -283,6 +288,8 @@ func (c *natPMPClient) GetExternalIPAddress() (string, error) {
 type pcpClient struct {
 	gw      *net.UDPAddr
 	timeout time.Duration
+	// control, if set, controls the socket of every request. See BoundTo.
+	control control.Func
 	pmpMappings
 
 	nonces     map[pcpKey][12]byte
@@ -372,7 +379,7 @@ func (c *pcpClient) mapPort(protocol string, internalPort, externalPort uint16, 
 		copy(m[20:36], net.IPv4zero.To16())
 		return req
 	}
-	res, err := pmpExchange(c.gw, c.timeout, build, pcpAccept(pcpOpMap, func(b []byte) bool {
+	res, err := pmpExchange(c.gw, c.timeout, c.control, build, pcpAccept(pcpOpMap, func(b []byte) bool {
 		if len(b) < pcpHeaderLen+pcpMapLen {
 			return false
 		}
@@ -411,7 +418,7 @@ func (c *pcpClient) GetExternalIPAddress() (string, error) {
 
 // announce asks the gateway whether it speaks PCP.
 func (c *pcpClient) announce() error {
-	_, err := pmpExchange(c.gw, c.timeout, func(local net.IP) []byte { return pcpHeader(pcpOpAnnounce, 0, local) },
+	_, err := pmpExchange(c.gw, c.timeout, c.control, func(local net.IP) []byte { return pcpHeader(pcpOpAnnounce, 0, local) },
 		pcpAccept(pcpOpAnnounce, func([]byte) bool { return true }))
 	if err != nil {
 		return fmt.Errorf("pcp: %w", err)
@@ -439,10 +446,100 @@ var findGateway = func(ctx context.Context) (net.IP, error) {
 	}
 }
 
+// discoverGateways lists the gateways of the routing table's routes. A var so
+// tests can supply them.
+var discoverGateways = gateway.DiscoverGateways
+
+// findGatewayBound is findGateway, but with fn set it is the gateway on the
+// subnet of the interface fn binds to. While a VPN tunnel holds the default
+// route, the first gateway in the routing table can be the tunnel's, which
+// no PCP, NAT-PMP or UPnP request should go to. With no such gateway, it
+// falls back to findGateway.
+func findGatewayBound(ctx context.Context, fn control.Func) (net.IP, error) {
+	if fn == nil {
+		return findGateway(ctx)
+	}
+	type found struct {
+		ip  net.IP
+		err error
+	}
+	ch := make(chan found, 1)
+	go func() {
+		ip, err := gatewayOnBoundSubnet(fn)
+		ch <- found{ip, err}
+	}()
+	select {
+	case f := <-ch:
+		if f.err == nil {
+			return f.ip, nil
+		}
+		return findGateway(ctx)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// gatewayOnBoundSubnet is the first routing-table gateway inside the subnet
+// of the address a dial controlled by fn goes out from.
+func gatewayOnBoundSubnet(fn control.Func) (net.IP, error) {
+	local, err := boundLocalIP(fn)
+	if err != nil {
+		return nil, err
+	}
+	subnet, err := subnetOf(net.ParseIP(local))
+	if err != nil {
+		return nil, err
+	}
+	gws, err := discoverGateways()
+	if err != nil {
+		return nil, err
+	}
+	for _, gw := range gws {
+		if gw.To4() != nil && subnet.Contains(gw) {
+			return gw, nil
+		}
+	}
+	return nil, fmt.Errorf("no gateway in %s", subnet)
+}
+
+// subnetOf is the network of the interface address ip, found through
+// interfaceAddrs.
+func subnetOf(ip net.IP) (*net.IPNet, error) {
+	if ip == nil {
+		return nil, errors.New("no local address")
+	}
+	addrs, err := interfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(ip) {
+			return &net.IPNet{IP: n.IP.Mask(n.Mask), Mask: n.Mask}, nil
+		}
+	}
+	return nil, fmt.Errorf("no interface holds %s", ip)
+}
+
+// boundLocalIP is the address a dial controlled by fn goes out from. A var so
+// tests can supply it.
+var boundLocalIP = func(fn control.Func) (string, error) {
+	return localIPByDial(&net.Dialer{Control: fn})
+}
+
+// interfaceAddrs is net.InterfaceAddrs, a var so tests can supply addresses.
+var interfaceAddrs = net.InterfaceAddrs
+
 // discoverPMP finds a gateway that speaks PCP or NAT-PMP, preferring PCP. It
 // asks both at once, bounded by pmpProbeTimeout. gw is the gateway's address,
 // or nil to find the default gateway.
 func discoverPMP(ctx context.Context, gw *net.UDPAddr) (igdClient, string, error) {
+	return discoverPMPBound(ctx, gw, nil)
+}
+
+// discoverPMPBound is discoverPMP with every request's socket, and the
+// returned client's, controlled by fn when it is set (see BoundTo). The
+// gateway it finds is then the one on fn's interface.
+func discoverPMPBound(ctx context.Context, gw *net.UDPAddr, fn control.Func) (igdClient, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
@@ -451,7 +548,7 @@ func discoverPMP(ctx context.Context, gw *net.UDPAddr) (igdClient, string, error
 	bounded, cancel := context.WithTimeout(ctx, pmpProbeTimeout)
 	defer cancel()
 	if gw == nil {
-		ip, err := findGateway(bounded)
+		ip, err := findGatewayBound(bounded, fn)
 		if err != nil {
 			return nil, "", fmt.Errorf("find default gateway: %w", err)
 		}
@@ -461,6 +558,7 @@ func discoverPMP(ctx context.Context, gw *net.UDPAddr) (igdClient, string, error
 	timeout := time.Until(d)
 	pcp := newPCPClient(gw, timeout)
 	pmp := newNATPMPClient(gw, timeout)
+	pcp.control, pmp.control = fn, fn
 	pcpErr := make(chan error, 1)
 	pmpErr := make(chan error, 1)
 	go func() { pcpErr <- pcp.announce() }()
