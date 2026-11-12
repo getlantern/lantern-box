@@ -160,10 +160,10 @@ func TestSamizdatLegacyAuthOption(t *testing.T) {
 // cert_spki_sha256 reaches the client: pinned to the inbound's certificate
 // the route works, pinned to another it fails the handshake.
 func TestSamizdatCertPinOption(t *testing.T) {
+	// One key pair and certificate for both cases, so only the pin differs.
 	in, out, pin := samizdatPairPin(t, "", "")
 	probeThrough(t, in, strings.Replace(out, `}`, `,"cert_spki_sha256":"`+pin+`"}`, 1))
 
-	in, out, _ = samizdatPairPin(t, "", "")
 	wrong := strings.Repeat("ab", 32)
 	require.Error(t, probeThroughErr(t, in, strings.Replace(out, `}`, `,"cert_spki_sha256":"`+wrong+`"}`, 1)))
 }
