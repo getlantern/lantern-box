@@ -25,4 +25,7 @@ type SamizdatBridgeInboundOptions struct {
 	ServerName     string   `json:"server_name"`      // cover domain
 	CertSPKISHA256 string   `json:"cert_spki_sha256"` // hex, 32 bytes
 	Fingerprint    string   `json:"fingerprint,omitempty"`
+	// LegacyAuth sends samizdat's version 1 SessionID, for a portal older
+	// than version 2 auth.
+	LegacyAuth bool `json:"legacy_auth,omitempty"`
 }

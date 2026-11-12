@@ -129,6 +129,7 @@ func NewBridge(ctx context.Context, router adapter.Router, logger log.ContextLog
 			ShortID:              b.shortID,
 			ServerCertSPKISHA256: pin,
 			Fingerprint:          options.Fingerprint,
+			LegacyAuth:           options.LegacyAuth,
 			// On, as on lantern-box's samizdat outbound, whose
 			// disable_tcp_fragmentation defaults to false.
 			TCPFragmentation: true,

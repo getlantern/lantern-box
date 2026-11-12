@@ -31,7 +31,8 @@ type SamizdatOutboundOptions struct {
 
 	// LegacyAuth sends samizdat's version 1 SessionID instead of version 2,
 	// for servers older than version 2. Version 1 can be copied into another
-	// ClientHello and starts with the short ID in the clear.
+	// ClientHello and starts with the short ID in the clear. Servers that
+	// old don't accept shaping either, so set disable_shaping too.
 	LegacyAuth bool `json:"legacy_auth,omitempty"`
 
 	// Connection management
