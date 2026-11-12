@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,11 +32,19 @@ import (
 // none).
 func samizdatPair(t *testing.T, inboundExtra, outboundExtra string) (string, string) {
 	t.Helper()
+	in, out, _ := samizdatPairPin(t, inboundExtra, outboundExtra)
+	return in, out
+}
+
+// samizdatPairPin is samizdatPair also returning the hex pin of the
+// inbound's certificate.
+func samizdatPairPin(t *testing.T, inboundExtra, outboundExtra string) (string, string, string) {
+	t.Helper()
 	priv, pub, err := samizdat.GenerateKeyPair()
 	require.NoError(t, err)
 	sid, err := samizdat.GenerateShortID()
 	require.NoError(t, err)
-	certPEM, keyPEM, _ := selfSignedCert(t)
+	certPEM, keyPEM, pin := selfSignedCert(t)
 	cert, err := json.Marshal(string(certPEM))
 	require.NoError(t, err)
 	key, err := json.Marshal(string(keyPEM))
@@ -46,7 +55,7 @@ func samizdatPair(t *testing.T, inboundExtra, outboundExtra string) (string, str
 	outbound := `{"type":"samizdat","tag":"samizdat-out","server":"127.0.0.1","server_port":%d,` +
 		`"public_key":"` + hex.EncodeToString(pub) + `","short_id":"` + hex.EncodeToString(sid[:]) + `",` +
 		`"server_name":"localhost","disable_tcp_fragmentation":true` + outboundExtra + `}`
-	return inbound, outbound
+	return inbound, outbound, hex.EncodeToString(pin[:])
 }
 
 // Shaping is on by default at both ends.
@@ -146,4 +155,15 @@ func TestSamizdatLegacyAuthOption(t *testing.T) {
 	require.True(t, bytes.HasPrefix(v1, sid[:]), "legacy_auth sent a SessionID that isn't version 1's")
 	v2, sid := sentSessionID(t, "")
 	require.False(t, bytes.HasPrefix(v2, sid[:]), "the default sent version 1's SessionID")
+}
+
+// cert_spki_sha256 reaches the client: pinned to the inbound's certificate
+// the route works, pinned to another it fails the handshake.
+func TestSamizdatCertPinOption(t *testing.T) {
+	in, out, pin := samizdatPairPin(t, "", "")
+	probeThrough(t, in, strings.Replace(out, `}`, `,"cert_spki_sha256":"`+pin+`"}`, 1))
+
+	in, out, _ = samizdatPairPin(t, "", "")
+	wrong := strings.Repeat("ab", 32)
+	require.Error(t, probeThroughErr(t, in, strings.Replace(out, `}`, `,"cert_spki_sha256":"`+wrong+`"}`, 1)))
 }

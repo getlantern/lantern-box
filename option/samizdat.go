@@ -35,6 +35,15 @@ type SamizdatOutboundOptions struct {
 	// old don't accept shaping either, so set disable_shaping too.
 	LegacyAuth bool `json:"legacy_auth,omitempty"`
 
+	// CertSPKISHA256 pins the server's certificate: the SHA-256 of the
+	// leaf's SubjectPublicKeyInfo, hex (64 chars). With it, a connection the
+	// server sends to its cover site (its auth was refused, for instance
+	// because the client's clock is more than the server's clock skew off)
+	// fails the TLS handshake. Without it, the client completes the cover
+	// site's handshake and sends its CONNECT requests, and their
+	// destinations, to the cover site. Optional; empty pins nothing.
+	CertSPKISHA256 string `json:"cert_spki_sha256,omitempty"`
+
 	// Connection management
 	MaxStreamsPerConn int    `json:"max_streams_per_conn,omitempty"` // max H2 streams per TCP conn (default: 100)
 	IdleTimeout      string `json:"idle_timeout,omitempty"`         // close idle connections after (default: "5m")

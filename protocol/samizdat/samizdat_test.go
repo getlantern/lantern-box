@@ -308,3 +308,28 @@ func TestNewOutbound_InvalidShortID(t *testing.T) {
 		})
 	}
 }
+
+func TestNewOutbound_InvalidCertPin(t *testing.T) {
+	pubKey := testPubKeyHex(t)
+	shortID := testShortIDHex(t)
+
+	tests := []struct {
+		name string
+		pin  string
+	}{
+		{"not hex", "zz" + strings.Repeat("00", 31)},
+		{"too short", hex.EncodeToString(make([]byte, 16))},
+		{"too long", hex.EncodeToString(make([]byte, 33))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewOutbound(context.Background(), nil, nil, "test", option.SamizdatOutboundOptions{
+				PublicKey:      pubKey,
+				ShortID:        shortID,
+				CertSPKISHA256: tt.pin,
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cert_spki_sha256")
+		})
+	}
+}
