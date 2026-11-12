@@ -112,6 +112,7 @@ func NewOutbound(
 		MaxJitterMs:         options.MaxJitterMs,
 		TCPFragmentation:    !options.DisableTCPFragmentation,
 		RecordFragmentation: !options.DisableRecordFragmentation,
+		DisableShaping:      options.DisableShaping,
 		MaxStreamsPerConn:   options.MaxStreamsPerConn,
 		IdleTimeout:         idleTimeout,
 		ConnectTimeout:      connectTimeout,

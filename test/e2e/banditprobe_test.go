@@ -39,6 +39,12 @@ func probeServer(inbound, callbackURL string) string {
 // probeThrough sends a bandit probe through a client box to a server box and
 // checks that the responder answered it with the whole body.
 func probeThrough(t *testing.T, serverInbound, clientOutbound string) {
+	require.NoError(t, probeThroughErr(t, serverInbound, clientOutbound))
+}
+
+// probeThroughErr is probeThrough returning, rather than failing on, an error
+// getting the probe's answer, for tests that expect the route to fail.
+func probeThroughErr(t *testing.T, serverInbound, clientOutbound string) error {
 	ctx := box.BaseContext()
 	serverPort, clientPort := freePort(t), freePort(t)
 	callbackURL := fmt.Sprintf("https://127.0.0.1:%d/v1/bandit/callback", freePort(t))
@@ -65,7 +71,9 @@ func probeThrough(t *testing.T, serverInbound, clientOutbound string) {
 		},
 	}}
 	resp, err := hc.Get("http://" + probeAPIHost + "/v1/bandit/callback?token=abc&device=x")
-	require.NoError(t, err)
+	if err != nil {
+		return err
+	}
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	require.NoError(t, err)
@@ -73,6 +81,7 @@ func probeThrough(t *testing.T, serverInbound, clientOutbound string) {
 	require.EqualValues(t, resp.ContentLength, len(body), "the body must match its Content-Length")
 	require.GreaterOrEqual(t, len(body), 64*1024, "the responder answers with at least a 64 KiB body")
 	require.LessOrEqual(t, len(body), 96*1024, "the responder adds at most half again to the body")
+	return nil
 }
 
 const ssPassword = "d4M6fAj9Q07uK4HePntATUAs1KBceMzq8hGPy1AFxFA="

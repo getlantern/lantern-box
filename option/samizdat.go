@@ -23,6 +23,12 @@ type SamizdatOutboundOptions struct {
 	DisableTCPFragmentation    bool `json:"disable_tcp_fragmentation,omitempty"`    // disable ClientHello fragmentation
 	DisableRecordFragmentation bool `json:"disable_record_fragmentation,omitempty"` // disable TLS record fragmentation
 
+	// Connection-start shaping: the first TLS records follow sizes and
+	// directions drawn from a model of real TLS (enabled by default; set to
+	// true to disable). The server must accept shaping, as samizdat servers
+	// do unless their inbound sets disable_shaping.
+	DisableShaping bool `json:"disable_shaping,omitempty"`
+
 	// Connection management
 	MaxStreamsPerConn int    `json:"max_streams_per_conn,omitempty"` // max H2 streams per TCP conn (default: 100)
 	IdleTimeout      string `json:"idle_timeout,omitempty"`         // close idle connections after (default: "5m")
@@ -52,4 +58,10 @@ type SamizdatInboundOptions struct {
 
 	// Limits
 	MaxConcurrentStreams int `json:"max_concurrent_streams,omitempty"` // per connection (default: 250)
+
+	// DisableShaping stops the inbound accepting clients that shape their
+	// connections' first TLS records, which it does by default. Clients that
+	// don't shape work either way; clients that do fail against an inbound
+	// with it set.
+	DisableShaping bool `json:"disable_shaping,omitempty"`
 }
