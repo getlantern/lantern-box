@@ -43,6 +43,16 @@ var ssdpWait = 2 * time.Second
 // goupnp does.
 const deviceFetchTimeout = 3 * time.Second
 
+// ssdpFetchGrace is how long after a search stops reading answers its
+// description fetches may still run, so devices that stall theirs can't
+// spend the caller's whole budget. A gateway on the LAN answers in far less.
+// A var so tests can shorten it.
+var ssdpFetchGrace = time.Second
+
+// maxSSDPLocations caps the distinct locations one search fetches, so a
+// device answering with many can't pile up fetches.
+const maxSSDPLocations = 8
+
 // discoverIGDv2Bound is discoverIGDv2 through sockets fn controls.
 func discoverIGDv2Bound(ctx context.Context, fn control.Func) (igdClient, error) {
 	return searchIGD(ctx, fn, []string{internetgateway2.URN_WANIPConnection_2},
@@ -164,6 +174,9 @@ func searchIGD(ctx context.Context, fn control.Func, targets []string,
 			if !ok || tried[key] || !sameLANHost(from, loc, subnet) {
 				continue
 			}
+			if len(tried) >= maxSSDPLocations {
+				continue
+			}
 			tried[key] = true
 			select {
 			case answers <- answer{target, loc}:
@@ -179,7 +192,7 @@ func searchIGD(ctx context.Context, fn control.Func, targets []string,
 		c   igdClient
 		err error
 	}
-	fetchCtx, cancelFetches := context.WithCancel(ctx)
+	fetchCtx, cancelFetches := context.WithDeadline(ctx, deadline.Add(ssdpFetchGrace))
 	defer cancelFetches()
 	results := make(chan result)
 	slots := make(chan struct{}, 4)
@@ -207,10 +220,14 @@ func searchIGD(ctx context.Context, fn control.Func, targets []string,
 				case <-fetchCtx.Done():
 				}
 			}()
-		case <-ctx.Done():
+		case <-fetchCtx.Done():
 			// Fetches cancelled with it drop their results, so pending
 			// would never reach zero.
-			return nil, ctx.Err()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			// The fetch budget ran out: no gateway described itself in time.
+			return nil, lastErr
 		case r := <-results:
 			pending--
 			if r.c != nil {

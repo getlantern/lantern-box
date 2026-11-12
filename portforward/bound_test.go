@@ -398,3 +398,36 @@ func TestSearchIGD_CancelDuringAFetchReturns(t *testing.T) {
 		t.Fatal("the search hung after its context was cancelled")
 	}
 }
+
+// A device advertising many locations and stalling every description can't
+// pile up fetches or hold the search past its window and fetch grace.
+func TestSearchIGD_ManyStalledLocationsAreBounded(t *testing.T) {
+	loopbackIsTheLAN(t)
+	prevWait, prevGrace := ssdpWait, ssdpFetchGrace
+	ssdpWait, ssdpFetchGrace = 300*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { ssdpWait, ssdpFetchGrace = prevWait, prevGrace })
+	var requests atomic.Int32
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); slow.Close() })
+	var locations []string
+	for i := range 50 {
+		locations = append(locations, fmt.Sprintf("%s/desc%d.xml", slow.URL, i))
+	}
+	fakeSSDP(t, internetgateway2.URN_WANIPConnection_2, locations...)
+	fn, _ := countingControl()
+
+	start := time.Now()
+	c, err := discoverIGDv2Bound(context.Background(), fn)
+	elapsed := time.Since(start)
+	assert.Nil(t, c)
+	assert.NotErrorIs(t, err, context.DeadlineExceeded, "the caller's context didn't end")
+	assert.Less(t, elapsed, ssdpWait+ssdpFetchGrace+time.Second)
+	assert.LessOrEqual(t, int(requests.Load()), maxSSDPLocations)
+}
