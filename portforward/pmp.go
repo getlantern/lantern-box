@@ -453,8 +453,9 @@ var discoverGateways = gateway.DiscoverGateways
 // findGatewayBound is findGateway, but with fn set it is the gateway on the
 // subnet of the interface fn binds to. While a VPN tunnel holds the default
 // route, the first gateway in the routing table can be the tunnel's, which
-// no PCP, NAT-PMP or UPnP request should go to. With no such gateway, it
-// falls back to findGateway.
+// no PCP, NAT-PMP or UPnP request should go to. With no such gateway it
+// fails rather than fall back to findGateway: a bound request to a gateway
+// off the local network would leave outside the tunnel.
 func findGatewayBound(ctx context.Context, fn control.Func) (net.IP, error) {
 	if fn == nil {
 		return findGateway(ctx)
@@ -470,10 +471,7 @@ func findGatewayBound(ctx context.Context, fn control.Func) (net.IP, error) {
 	}()
 	select {
 	case f := <-ch:
-		if f.err == nil {
-			return f.ip, nil
-		}
-		return findGateway(ctx)
+		return f.ip, f.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -482,11 +480,7 @@ func findGatewayBound(ctx context.Context, fn control.Func) (net.IP, error) {
 // gatewayOnBoundSubnet is the first routing-table gateway inside the subnet
 // of the address a dial controlled by fn goes out from.
 func gatewayOnBoundSubnet(fn control.Func) (net.IP, error) {
-	local, err := boundLocalIP(fn)
-	if err != nil {
-		return nil, err
-	}
-	subnet, err := subnetOf(net.ParseIP(local))
+	subnet, err := boundSubnet(fn)
 	if err != nil {
 		return nil, err
 	}
@@ -500,6 +494,28 @@ func gatewayOnBoundSubnet(fn control.Func) (net.IP, error) {
 		}
 	}
 	return nil, fmt.Errorf("no gateway in %s", subnet)
+}
+
+// boundSubnet is the network of the interface fn binds to: the only place a
+// bound request to the gateway may go.
+func boundSubnet(fn control.Func) (*net.IPNet, error) {
+	_, subnet, err := boundNetwork(fn)
+	return subnet, err
+}
+
+// boundNetwork is the address a dial controlled by fn goes out from, and its
+// network.
+func boundNetwork(fn control.Func) (net.IP, *net.IPNet, error) {
+	local, err := boundLocalIP(fn)
+	if err != nil {
+		return nil, nil, err
+	}
+	ip := net.ParseIP(local)
+	subnet, err := subnetOf(ip)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ip, subnet, nil
 }
 
 // subnetOf is the network of the interface address ip, found through

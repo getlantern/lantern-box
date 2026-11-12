@@ -73,15 +73,17 @@ func TestFindGatewayBound_PicksThePhysicalSubnet(t *testing.T) {
 	assert.Zero(t, fallbacks.Load())
 }
 
-func TestFindGatewayBound_FallsBackWithoutAGatewayOnTheSubnet(t *testing.T) {
+// With no gateway on the bound subnet, a bound lookup fails rather than hand
+// back a gateway off the local network, which bound requests would reach
+// outside the tunnel.
+func TestFindGatewayBound_FailsWithoutAGatewayOnTheSubnet(t *testing.T) {
 	fallbacks := stubGatewayLookup(t, "192.168.1.20",
 		[]string{"192.168.1.20/24"}, []string{"10.10.1.2"})
 	fn, _ := countingControl()
 
-	ip, err := findGatewayBound(context.Background(), fn)
-	require.NoError(t, err)
-	assert.Equal(t, "10.10.1.2", ip.String())
-	assert.Equal(t, int32(1), fallbacks.Load())
+	_, err := findGatewayBound(context.Background(), fn)
+	assert.ErrorContains(t, err, "no gateway in 192.168.1.0/24")
+	assert.Zero(t, fallbacks.Load())
 }
 
 func TestFindGatewayBound_UnboundIsFindGateway(t *testing.T) {
@@ -144,6 +146,18 @@ const testExternalIPResponse = `<?xml version="1.0"?>
 <NewExternalIPAddress>203.0.113.7</NewExternalIPAddress>
 </u:GetExternalIPAddressResponse></s:Body></s:Envelope>`
 
+// loopbackIsTheLAN makes 127.0.0.1 the bound address and 127.0.0.0/8 the
+// local network, where the fakes below run.
+func loopbackIsTheLAN(t *testing.T) {
+	t.Helper()
+	prevLocal, prevAddrs := boundLocalIP, interfaceAddrs
+	t.Cleanup(func() { boundLocalIP, interfaceAddrs = prevLocal, prevAddrs })
+	boundLocalIP = func(control.Func) (string, error) { return "127.0.0.1", nil }
+	interfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{&net.IPNet{IP: net.IPv4(127, 0, 0, 1), Mask: net.CIDRMask(8, 32)}}, nil
+	}
+}
+
 // fakeSSDP answers SSDP searches for target with location, on loopback, and
 // points ssdpAddr at itself.
 func fakeSSDP(t *testing.T, target, location string) {
@@ -170,13 +184,18 @@ func fakeSSDP(t *testing.T, target, location string) {
 	}()
 }
 
-// A bound UPnP search finds the gateway, and its description and SOAP calls
-// go over sockets the control sees.
-func TestDiscoverIGDv2Bound_UsesTheControl(t *testing.T) {
+// fakeIGDServer serves the device description at /desc.xml, with its
+// URLBase set to urlBase if not empty, and answers GetExternalIPAddress.
+func fakeIGDServer(t *testing.T, urlBase string) *httptest.Server {
+	t.Helper()
+	desc := testDeviceXML
+	if urlBase != "" {
+		desc = strings.Replace(desc, "<device>", "<URLBase>"+urlBase+"</URLBase><device>", 1)
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/desc.xml":
-			_, _ = w.Write([]byte(testDeviceXML))
+			_, _ = w.Write([]byte(desc))
 		case "/ctl":
 			w.Header().Set("Content-Type", `text/xml; charset="utf-8"`)
 			_, _ = w.Write([]byte(testExternalIPResponse))
@@ -185,6 +204,14 @@ func TestDiscoverIGDv2Bound_UsesTheControl(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A bound UPnP search finds the gateway, and its description and SOAP calls
+// go over sockets the control sees.
+func TestDiscoverIGDv2Bound_UsesTheControl(t *testing.T) {
+	loopbackIsTheLAN(t)
+	srv := fakeIGDServer(t, "")
 	fakeSSDP(t, internetgateway2.URN_WANIPConnection_2, srv.URL+"/desc.xml")
 	fn, n := countingControl()
 
@@ -203,6 +230,7 @@ func TestDiscoverIGDv2Bound_UsesTheControl(t *testing.T) {
 // With no gateway answering, the search ends at ssdpWait with no client and
 // no error, as goupnp's does.
 func TestSearchIGD_NoAnswer(t *testing.T) {
+	loopbackIsTheLAN(t)
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
@@ -224,4 +252,86 @@ func TestSearchIGD_ControlErrorFails(t *testing.T) {
 	refuse := func(string, string, syscall.RawConn) error { return errors.New("no physical interface") }
 	_, err := discoverIGDv2Bound(context.Background(), refuse)
 	assert.ErrorContains(t, err, "no physical interface")
+}
+
+// An answer whose LOCATION is on another host than the one that sent it is
+// ignored: bound requests bypass the tunnel, so the client must not be sent
+// anywhere else.
+func TestSearchIGD_IgnoresALocationOnAnotherHost(t *testing.T) {
+	loopbackIsTheLAN(t)
+	prevWait := ssdpWait
+	ssdpWait = 300 * time.Millisecond
+	t.Cleanup(func() { ssdpWait = prevWait })
+	srv := fakeIGDServer(t, "")
+	// Reachable, so only the check refuses it.
+	elsewhere := strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)
+	fakeSSDP(t, internetgateway2.URN_WANIPConnection_2, elsewhere+"/desc.xml")
+	fn, _ := countingControl()
+
+	c, err := discoverIGDv2Bound(context.Background(), fn)
+	assert.NoError(t, err)
+	assert.Nil(t, c)
+}
+
+// A URLBase naming another host is ignored, so SOAP calls still go to the
+// gateway that answered.
+func TestSearchIGD_IgnoresAURLBaseOnAnotherHost(t *testing.T) {
+	loopbackIsTheLAN(t)
+	srv := fakeIGDServer(t, "http://203.0.113.9:80/")
+	fakeSSDP(t, internetgateway2.URN_WANIPConnection_2, srv.URL+"/desc.xml")
+	fn, _ := countingControl()
+
+	c, err := discoverIGDv2Bound(context.Background(), fn)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	ip, err := c.GetExternalIPAddress()
+	require.NoError(t, err)
+	assert.Equal(t, "203.0.113.7", ip)
+}
+
+// The bound HTTP client dials nothing off the local network and follows no
+// redirect.
+func TestBoundHTTPClient_StaysOnTheLAN(t *testing.T) {
+	subnet := &net.IPNet{IP: net.IPv4(127, 0, 0, 0), Mask: net.CIDRMask(8, 32)}
+	hc := boundHTTPClient(nil, subnet)
+
+	_, err := hc.Get("http://203.0.113.9:80/desc.xml")
+	assert.ErrorContains(t, err, "off the local network")
+
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://203.0.113.9/", http.StatusFound)
+	}))
+	t.Cleanup(redirect.Close)
+	resp, err := hc.Get(redirect.URL)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusFound, resp.StatusCode, "the redirect is not followed")
+}
+
+// IGDv1's two connection services are searched for at once, and a gateway
+// offering only WANPPPConnection is found.
+func TestDiscoverIGDv1Bound_FindsWANPPP(t *testing.T) {
+	loopbackIsTheLAN(t)
+	desc := strings.NewReplacer(
+		"InternetGatewayDevice:2", "InternetGatewayDevice:1",
+		"WANDevice:2", "WANDevice:1",
+		"WANConnectionDevice:2", "WANConnectionDevice:1",
+		"service:WANIPConnection:2", "service:WANPPPConnection:1",
+		"WANIPConn1", "WANPPPConn1").Replace(testDeviceXML)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/desc.xml" {
+			_, _ = w.Write([]byte(desc))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	fakeSSDP(t, "urn:schemas-upnp-org:service:WANPPPConnection:1", srv.URL+"/desc.xml")
+	fn, _ := countingControl()
+
+	start := time.Now()
+	c, err := discoverIGDv1Bound(context.Background(), fn)
+	require.NoError(t, err)
+	assert.IsType(t, wanPPPv1Wrapper{}, c)
+	assert.Less(t, time.Since(start), ssdpWait, "found without waiting out the search")
 }
