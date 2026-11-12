@@ -136,39 +136,111 @@ func searchIGD(ctx context.Context, fn control.Func, targets []string,
 			hc.CloseIdleConnections()
 		}
 	}()
-	tried := map[string]bool{}
+
+	// Answers are read apart from the descriptions they lead to, so a gateway
+	// slow to describe itself can't hold up reading a working one's answer
+	// until the search's deadline has passed.
+	type answer struct {
+		target string
+		loc    *url.URL
+	}
+	answers := make(chan answer, 16)
+	var readErr error
+	go func() {
+		defer close(answers)
+		tried := map[string]bool{}
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				var ne net.Error
+				if !errors.As(err, &ne) || !ne.Timeout() {
+					readErr = err
+				}
+				return
+			}
+			target, loc, ok := ssdpLocation(buf[:n], targets)
+			key := target + " " + loc.String()
+			if !ok || tried[key] || !sameLANHost(from, loc, subnet) {
+				continue
+			}
+			tried[key] = true
+			select {
+			case answers <- answer{target, loc}:
+			default:
+				// A LAN answering with this many gateways has one among them.
+			}
+		}
+	}()
+
+	// Descriptions are fetched a few at a time; the first gateway that
+	// describes itself usefully wins.
+	type result struct {
+		c   igdClient
+		err error
+	}
+	fetchCtx, cancelFetches := context.WithCancel(ctx)
+	defer cancelFetches()
+	results := make(chan result)
+	slots := make(chan struct{}, 4)
+	pending := 0
 	var lastErr error
-	buf := make([]byte, 2048)
-	for {
-		n, from, err := pc.ReadFrom(buf)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
+	for answers != nil || pending > 0 {
+		select {
+		case a, ok := <-answers:
+			if !ok {
+				answers = nil
+				continue
 			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				// No gateway described itself in time; a failure to
-				// describe one is worth reporting.
-				return nil, lastErr
+			pending++
+			go func() {
+				var r result
+				select {
+				case slots <- struct{}{}:
+					r.c, r.err = describeIGD(fetchCtx, hc, a.target, a.loc, build)
+					<-slots
+				case <-fetchCtx.Done():
+					r.err = fetchCtx.Err()
+				}
+				select {
+				case results <- r:
+				case <-fetchCtx.Done():
+				}
+			}()
+		case r := <-results:
+			pending--
+			if r.c != nil {
+				found = true
+				return r.c, nil
 			}
-			return nil, err
-		}
-		target, loc, ok := ssdpLocation(buf[:n], targets)
-		key := target + " " + loc.String()
-		if !ok || tried[key] || !sameLANHost(from, loc, subnet) {
-			continue
-		}
-		tried[key] = true
-		root, err := fetchRootDevice(ctx, hc, loc)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if c := build(target, root, loc, hc); c != nil && soapOnHost(c, loc) {
-			found = true
-			return c, nil
+			if r.err != nil {
+				lastErr = r.err
+			}
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	// No gateway described itself in time; a failure to describe one is
+	// worth reporting.
+	return nil, lastErr
+}
+
+// describeIGD fetches the description at loc and returns the client build
+// makes from it, if its SOAP calls go to loc's host.
+func describeIGD(ctx context.Context, hc *http.Client, target string, loc *url.URL,
+	build func(target string, root *goupnp.RootDevice, loc *url.URL, hc *http.Client) igdClient) (igdClient, error) {
+	root, err := fetchRootDevice(ctx, hc, loc)
+	if err != nil {
+		return nil, err
+	}
+	if c := build(target, root, loc, hc); c != nil && soapOnHost(c, loc) {
+		return c, nil
+	}
+	return nil, nil
 }
 
 // ssdpLocation is which of targets an SSDP answer is for, and its LOCATION.

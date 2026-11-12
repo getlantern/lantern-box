@@ -158,9 +158,9 @@ func loopbackIsTheLAN(t *testing.T) {
 	}
 }
 
-// fakeSSDP answers SSDP searches for target with location, on loopback, and
-// points ssdpAddr at itself.
-func fakeSSDP(t *testing.T, target, location string) {
+// fakeSSDP answers SSDP searches for target once for each location, in
+// order, on loopback, and points ssdpAddr at itself.
+func fakeSSDP(t *testing.T, target string, locations ...string) {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
@@ -178,8 +178,10 @@ func fakeSSDP(t *testing.T, target, location string) {
 			if !strings.Contains(string(buf[:n]), "ST: "+target) {
 				continue
 			}
-			resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nST: %s\r\nUSN: uuid:test::%s\r\nLOCATION: %s\r\n\r\n", target, target, location)
-			_, _ = conn.WriteTo([]byte(resp), from)
+			for _, location := range locations {
+				resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nST: %s\r\nUSN: uuid:test::%s\r\nLOCATION: %s\r\n\r\n", target, target, location)
+				_, _ = conn.WriteTo([]byte(resp), from)
+			}
 		}
 	}()
 }
@@ -334,4 +336,27 @@ func TestDiscoverIGDv1Bound_FindsWANPPP(t *testing.T) {
 	require.NoError(t, err)
 	assert.IsType(t, wanPPPv1Wrapper{}, c)
 	assert.Less(t, time.Since(start), ssdpWait, "found without waiting out the search")
+}
+
+// A device that answers first and is slow to describe itself doesn't keep a
+// working gateway's answer from being read and used.
+func TestSearchIGD_SlowResponderDoesNotHideAGateway(t *testing.T) {
+	loopbackIsTheLAN(t)
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); slow.Close() })
+	srv := fakeIGDServer(t, "")
+	fakeSSDP(t, internetgateway2.URN_WANIPConnection_2, slow.URL+"/desc.xml", srv.URL+"/desc.xml")
+	fn, _ := countingControl()
+
+	start := time.Now()
+	c, err := discoverIGDv2Bound(context.Background(), fn)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	assert.Less(t, time.Since(start), deviceFetchTimeout, "found without waiting on the slow device")
 }
