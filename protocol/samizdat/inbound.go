@@ -103,6 +103,19 @@ func NewInbound(
 			return nil, fmt.Errorf("parsing masquerade_max_duration: %w", err)
 		}
 	}
+	var replayWindow, maxClockSkew time.Duration
+	if options.ReplayWindow != "" {
+		replayWindow, err = time.ParseDuration(options.ReplayWindow)
+		if err != nil {
+			return nil, fmt.Errorf("parsing replay_window: %w", err)
+		}
+	}
+	if options.MaxClockSkew != "" {
+		maxClockSkew, err = time.ParseDuration(options.MaxClockSkew)
+		if err != nil {
+			return nil, fmt.Errorf("parsing max_clock_skew: %w", err)
+		}
+	}
 
 	ib := &Inbound{
 		Adapter: inbound.NewAdapter(constant.TypeSamizdat, tag),
@@ -116,13 +129,6 @@ func NewInbound(
 		}),
 	}
 
-	// Use sing-box's listener to create the TCP listener, honoring ListenOptions
-	tcpListener, err := ib.listener.ListenTCP()
-	if err != nil {
-		return nil, fmt.Errorf("creating TCP listener: %w", err)
-	}
-	ib.tcpListener = tcpListener
-
 	serverConfig := samizdat.ServerConfig{
 		PrivateKey:            privKey,
 		ShortIDs:              shortIDs,
@@ -134,16 +140,28 @@ func NewInbound(
 		MasqueradeMaxDuration: masqMaxDuration,
 		MaxConcurrentStreams:  options.MaxConcurrentStreams,
 		DisableShaping:        options.DisableShaping,
+		RequireAuthV2:         options.RequireAuthV2,
+		ReplayWindow:          replayWindow,
+		MaxClockSkew:          maxClockSkew,
 		Handler: func(ctx context.Context, conn net.Conn, destination string) {
 			ib.handleConnection(ctx, conn, destination)
 		},
 	}
 
+	// The server first: a config it refuses fails before any port is bound.
 	server, err := samizdat.NewServer(serverConfig)
 	if err != nil {
 		return nil, fmt.Errorf("creating samizdat server: %w", err)
 	}
 	ib.server = server
+
+	// Use sing-box's listener to create the TCP listener, honoring ListenOptions
+	tcpListener, err := ib.listener.ListenTCP()
+	if err != nil {
+		server.Close()
+		return nil, fmt.Errorf("creating TCP listener: %w", err)
+	}
+	ib.tcpListener = tcpListener
 
 	return ib, nil
 }

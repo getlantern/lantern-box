@@ -259,6 +259,33 @@ func TestNewInbound_InvalidTimeouts(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "masquerade_max_duration")
 	})
+
+	t.Run("bad replay_window", func(t *testing.T) {
+		o := opts
+		o.ReplayWindow = "not-a-duration"
+		_, err := NewInbound(context.Background(), nil, nil, "test", o)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "replay_window")
+	})
+
+	t.Run("bad max_clock_skew", func(t *testing.T) {
+		o := opts
+		o.MaxClockSkew = "not-a-duration"
+		_, err := NewInbound(context.Background(), nil, nil, "test", o)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "max_clock_skew")
+	})
+
+	// samizdat refuses a replay window shorter than twice the clock skew,
+	// which shows both reach it.
+	t.Run("replay_window shorter than twice max_clock_skew", func(t *testing.T) {
+		o := opts
+		o.ReplayWindow = "1h"
+		o.MaxClockSkew = "1h"
+		_, err := NewInbound(context.Background(), nil, nil, "test", o)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ReplayWindow")
+	})
 }
 
 // --- NewOutbound validation tests ---

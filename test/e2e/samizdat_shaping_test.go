@@ -167,3 +167,12 @@ func TestSamizdatCertPinOption(t *testing.T) {
 	wrong := strings.Repeat("ab", 32)
 	require.Error(t, probeThroughErr(t, in, strings.Replace(out, `}`, `,"cert_spki_sha256":"`+wrong+`"}`, 1)))
 }
+
+// require_auth_v2 reaches the server: version 2 clients get through, and a
+// legacy_auth client is refused.
+func TestSamizdatRequireAuthV2Option(t *testing.T) {
+	in, out := samizdatPair(t, `,"require_auth_v2":true`, "")
+	probeThrough(t, in, out)
+	in, out = samizdatPair(t, `,"require_auth_v2":true`, `,"legacy_auth":true,"disable_shaping":true`)
+	require.Error(t, probeThroughErr(t, in, out))
+}

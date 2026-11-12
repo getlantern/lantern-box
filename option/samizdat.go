@@ -79,4 +79,22 @@ type SamizdatInboundOptions struct {
 	// don't shape work either way; clients that do fail against an inbound
 	// with it set.
 	DisableShaping bool `json:"disable_shaping,omitempty"`
+
+	// RequireAuthV2 refuses samizdat's version 1 SessionIDs, which can be
+	// copied into another ClientHello and carry the short ID in the clear.
+	// Set it once every client of the inbound sends version 2: clients from
+	// before version 2, and outbounds with legacy_auth, then fail.
+	RequireAuthV2 bool `json:"require_auth_v2,omitempty"`
+
+	// ReplayWindow is how long the inbound remembers an authenticated
+	// SessionID and refuses it again, as a duration (default: "24h"); each is
+	// remembered for between it and twice it. Negative turns replay
+	// protection off. It must be at least twice max_clock_skew.
+	ReplayWindow string `json:"replay_window,omitempty"`
+
+	// MaxClockSkew is how far a version 2 SessionID's time may be from the
+	// inbound's, as a duration (default: "12h", or half of replay_window if
+	// that is less). A client whose clock is further off is sent to the
+	// masquerade.
+	MaxClockSkew string `json:"max_clock_skew,omitempty"`
 }
