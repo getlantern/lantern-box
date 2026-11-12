@@ -29,6 +29,11 @@ type SamizdatOutboundOptions struct {
 	// do unless their inbound sets disable_shaping.
 	DisableShaping bool `json:"disable_shaping,omitempty"`
 
+	// LegacyAuth sends samizdat's version 1 SessionID instead of version 2,
+	// for servers older than version 2. Version 1 can be copied into another
+	// ClientHello and starts with the short ID in the clear.
+	LegacyAuth bool `json:"legacy_auth,omitempty"`
+
 	// Connection management
 	MaxStreamsPerConn int    `json:"max_streams_per_conn,omitempty"` // max H2 streams per TCP conn (default: 100)
 	IdleTimeout      string `json:"idle_timeout,omitempty"`         // close idle connections after (default: "5m")

@@ -113,6 +113,7 @@ func NewOutbound(
 		TCPFragmentation:    !options.DisableTCPFragmentation,
 		RecordFragmentation: !options.DisableRecordFragmentation,
 		DisableShaping:      options.DisableShaping,
+		LegacyAuth:          options.LegacyAuth,
 		MaxStreamsPerConn:   options.MaxStreamsPerConn,
 		IdleTimeout:         idleTimeout,
 		ConnectTimeout:      connectTimeout,

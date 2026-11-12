@@ -108,11 +108,12 @@ func (id *identity) is(privateKey, certPEM, keyPEM []byte) bool {
 		bytes.Equal(id.keyPEM, keyPEM)
 }
 
-// authenticates reports whether sessionID carries a valid tag under id's key
-// for one of its short IDs.
-func (id *identity) authenticates(sessionID []byte) bool {
-	_, ok, err := samizdat.VerifySessionID(sessionID, id.publicKey, id.server.ShortIDs())
-	return err == nil && ok
+// authenticates reports whether the ClientHello handshake message hello
+// carries a version 2 or version 1 SessionID under id's key for one of its
+// short IDs, as id's server checks.
+func (id *identity) authenticates(hello []byte) bool {
+	_, ok := samizdat.AuthenticateClientHello(hello, id.privateKey, id.server.ShortIDs(), samizdat.DefaultMaxClockSkew)
+	return ok
 }
 
 // admit counts conn against id and returns it wrapped to be handed to id's
@@ -217,14 +218,10 @@ type routes struct {
 // one, or the previous one while it is still accepting. It returns nil when
 // the ClientHello authenticates under neither.
 func (r *routes) pick(hello []byte, now time.Time) *identity {
-	sessionID, err := samizdat.ExtractSessionID(hello)
-	if err != nil {
-		return nil
-	}
-	if r.cur.authenticates(sessionID) {
+	if r.cur.authenticates(hello) {
 		return r.cur
 	}
-	if r.prev != nil && now.Before(r.prevUntil) && r.prev.authenticates(sessionID) {
+	if r.prev != nil && now.Before(r.prevUntil) && r.prev.authenticates(hello) {
 		return r.prev
 	}
 	return nil
