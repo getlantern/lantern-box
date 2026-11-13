@@ -39,7 +39,7 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 			if !s.chargeable(outerTag, route) {
 				return
 			}
-			if !s.recordUserFailure(outerTag, kind, generation) {
+			if !s.recordUserFailure(outerTag, network, kind, generation) {
 				return
 			}
 			if confirms && (kind == adapter.UserFailureReset || kind == adapter.UserFailureNoResponse) {

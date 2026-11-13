@@ -21,6 +21,7 @@ import (
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 	"github.com/stretchr/testify/assert"
@@ -49,7 +50,7 @@ func newTestMUR(t *testing.T, tags ...string) (*MutableAutoSelect, map[string]*m
 		logger:       log.NewNOPFactory().Logger(),
 		tags:         append([]string(nil), tags...),
 		urlOverrides: map[string]string{},
-		histories:    map[string]*localHistory{},
+		histories:    map[string]*memberHistory{},
 		cfg: mutableAutoSelectConfig{
 			switchTolerance:                50 * time.Millisecond,
 			activeInterval:                 time.Hour,
@@ -84,6 +85,7 @@ func recordSuccess(s *MutableAutoSelect, tag string, delay uint32) time.Time {
 	now := time.Now()
 	h := s.historyForLocked(tag)
 	h.recordProbeSuccess(delay, now)
+	h.updatedAt = now
 	return now
 }
 
@@ -200,11 +202,11 @@ func TestLocalHistory_FailureDoesNotClearLastSuccessDelay(t *testing.T) {
 	assert.Equal(t, uint32(1), consec, "consecutive failures bump")
 }
 
-func TestToTagHistory_HardDemoted(t *testing.T) {
+func TestToNetworkHistory_HardDemoted(t *testing.T) {
 	p := defaultHistoryParams()
 	now := time.Now()
 
-	assert.False(t, newLocalHistory().toTagHistory(now, p).HardDemoted,
+	assert.False(t, newLocalHistory().toNetworkHistory(now, p).HardDemoted,
 		"fresh history is not hard demoted")
 
 	// Failures are injected in the recent past so the snapshot's updatedAt
@@ -212,14 +214,14 @@ func TestToTagHistory_HardDemoted(t *testing.T) {
 	// mutation and its persisted snapshot share one timestamp.
 
 	// Consecutive probe failures at the limit are hard even alongside a
-	// healthy prior success delay: toTagHistory zeroes selfMs/bestAltMs,
+	// healthy prior success delay: toNetworkHistory zeroes selfMs/bestAltMs,
 	// so the switch-penalty boost can never rescue the persisted tier.
 	consecHard := newLocalHistory()
 	consecHard.recordProbeSuccess(10, now.Add(-time.Hour))
 	for i := uint32(0); i < p.consecutiveFailLimit; i++ {
 		consecHard.recordProbeFailure(now.Add(-time.Duration(i) * time.Second))
 	}
-	got := consecHard.toTagHistory(now, p)
+	got := consecHard.toNetworkHistory(now, p)
 	assert.True(t, got.HardDemoted, "consecutive failures at limit are hard demoted")
 	assert.Equal(t, uint32(10), got.LastSuccessDelayMs, "a fast prior success must not clear the tier")
 
@@ -229,14 +231,14 @@ func TestToTagHistory_HardDemoted(t *testing.T) {
 	for i := uint32(0); i < p.softFailLimit; i++ {
 		soft.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, p.userFailureWindow, 0)
 	}
-	assert.False(t, soft.toTagHistory(now, p).HardDemoted,
+	assert.False(t, soft.toNetworkHistory(now, p).HardDemoted,
 		"user failures below the hard limit are not hard demoted")
 
 	userHard := newLocalHistory()
 	for i := uint32(0); i < p.consecutiveFailLimit; i++ {
 		userHard.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, p.userFailureWindow, 0)
 	}
-	assert.True(t, userHard.toTagHistory(now, p).HardDemoted,
+	assert.True(t, userHard.toNetworkHistory(now, p).HardDemoted,
 		"user failures at the hard limit are hard demoted")
 }
 
@@ -289,7 +291,7 @@ func TestLocalHistory_AddUserFailureDedupesBurst(t *testing.T) {
 
 func TestHydrateLocalHistory_DropsAgedUserFailures(t *testing.T) {
 	now := time.Now()
-	persisted := &adapter.TagHistory{
+	persisted := &adapter.NetworkHistory{
 		LastSuccessDelayMs: 120,
 		LastOutcomeAt:      now.Add(-time.Minute),
 		UserFailures: []adapter.UserFailure{
@@ -391,6 +393,7 @@ func addUserFailureN(s *MutableAutoSelect, tag string, n int) {
 	for i := 0; i < n; i++ {
 		h.addUserFailure(adapter.UserFailure{At: now.Add(time.Duration(i) * time.Millisecond), Kind: adapter.UserFailureStall}, s.hist.userFailureWindow, 0)
 	}
+	h.updatedAt = now
 }
 
 func TestSelectOutbound_ThreeTierFallback(t *testing.T) {
@@ -560,7 +563,7 @@ func TestSetURLOverrides_KeepsSelectionOffFailedMember(t *testing.T) {
 	recordSuccess(s, "b", 200)
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.consecutiveFailLimit {
-		s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load())
+		s.recordUserFailure("a", N.NetworkTCP, adapter.UserFailureNoResponse, s.networkGeneration.Load())
 	}
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -762,8 +765,8 @@ func TestLateProbeAfterRemoveRecordsNothing(t *testing.T) {
 
 func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	assert.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load()), "first call must persist")
-	assert.False(t, s.recordUserFailure("a", adapter.UserFailureStall, s.networkGeneration.Load()), "immediate burst must return false (deduped)")
+	assert.True(t, s.recordUserFailure("a", N.NetworkTCP, adapter.UserFailureDial, s.networkGeneration.Load()), "first call must persist")
+	assert.False(t, s.recordUserFailure("a", N.NetworkTCP, adapter.UserFailureStall, s.networkGeneration.Load()), "immediate burst must return false (deduped)")
 	s.access.Lock()
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
@@ -771,7 +774,7 @@ func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	assert.Equal(t, uint32(1), h.userFailureCount(time.Now(), s.hist.userFailureWindow),
 		"successive calls within dedupe window must collapse")
 
-	assert.False(t, s.recordUserFailure("nonexistent", adapter.UserFailureDial, s.networkGeneration.Load()), "non-member must return false")
+	assert.False(t, s.recordUserFailure("nonexistent", N.NetworkTCP, adapter.UserFailureDial, s.networkGeneration.Load()), "non-member must return false")
 	s.access.Lock()
 	_, exists := s.peekHistoryLocked("nonexistent")
 	s.access.Unlock()
@@ -806,7 +809,7 @@ func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 
 func TestRecordUserFailure_AttributesDialKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	require.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load()))
+	require.True(t, s.recordUserFailure("a", N.NetworkTCP, adapter.UserFailureDial, s.networkGeneration.Load()))
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -2032,7 +2035,7 @@ func seedProbe(s *MutableAutoSelect, tag string, success bool, delayMs uint32) {
 	if !ok {
 		return
 	}
-	s.recordProbeOutcomeLocked(tag, &probeOutcome{
+	s.recordProbeOutcomeLocked(tag, s.environment, &probeOutcome{
 		success:    success,
 		delayMs:    delayMs,
 		generation: s.networkGeneration.Load(),
@@ -2064,7 +2067,7 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 			recordSuccess(s, "b", 200)
 			s.hist.userFailureDedupeWindow = 0
 			for range s.hist.consecutiveFailLimit {
-				s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load())
+				s.recordUserFailure("a", N.NetworkTCP, adapter.UserFailureNoResponse, s.networkGeneration.Load())
 			}
 			s.access.Lock()
 			s.historyForLocked("a").startRecoveryGate(time.Now())

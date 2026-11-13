@@ -11,6 +11,7 @@ import (
 
 	"github.com/getlantern/lantern-box/adapter"
 	A "github.com/sagernet/sing-box/adapter"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 	"github.com/stretchr/testify/require"
@@ -910,10 +911,10 @@ func TestSchedulerInterfaceUpdatedRejectsStaleUserFailure(t *testing.T) {
 	s.hydrateHistoryLocked("a")
 	s.access.Unlock()
 	generation := s.networkGeneration.Load()
-	require.True(t, s.recordUserFailure("a", adapter.UserFailureStall, generation))
+	require.True(t, s.recordUserFailure("a", N.NetworkTCP, adapter.UserFailureStall, generation))
 	s.InterfaceUpdated(context.Background())
 	require.NotEqual(t, generation, s.networkGeneration.Load())
-	require.False(t, s.recordUserFailure("a", adapter.UserFailureReset, generation))
+	require.False(t, s.recordUserFailure("a", N.NetworkTCP, adapter.UserFailureReset, generation))
 	require.Contains(t, s.histories, "a")
 	snapshot := s.history.Load("a")
 	require.EqualValues(t, 12, snapshot.LastSuccessDelayMs)

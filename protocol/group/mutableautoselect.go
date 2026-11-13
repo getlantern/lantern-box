@@ -66,7 +66,10 @@ type MutableAutoSelect struct {
 	cancel      context.CancelFunc
 	outboundMgr A.OutboundManager
 	connMgr     A.ConnectionManager
-	logger      log.ContextLogger
+	// networkMgr identifies the network environment; nil in tests and on
+	// boxes without one, where every history is on environment 0.
+	networkMgr A.NetworkManager
+	logger     log.ContextLogger
 
 	access       sync.Mutex
 	tags         []string
@@ -76,10 +79,13 @@ type MutableAutoSelect struct {
 	// probeTimeouts overrides behaviorFor's probe timeout by outbound type.
 	// SetProbeTimeouts writes it without access held, so it is swapped whole.
 	probeTimeouts atomic.Pointer[map[string]time.Duration]
-	histories     map[string]*localHistory
-	cfg           mutableAutoSelectConfig
-	hist          historyParams
-	history       adapter.AutoSelectHistoryStorage
+	histories     map[string]*memberHistory
+	// environment is the network environment histories are recorded under.
+	// Guarded by access; it changes only with networkGeneration.
+	environment uint64
+	cfg         mutableAutoSelectConfig
+	hist        historyParams
+	history     adapter.AutoSelectHistoryStorage
 
 	// Scratch buffers reused across calls by rankLocked and splitHealthyForLocked
 	// to avoid per-dial allocation; guarded by access, which their callers hold
@@ -229,11 +235,12 @@ func NewMutableAutoSelect(ctx context.Context, _ A.Router, logger log.ContextLog
 		cancel:       cancel,
 		outboundMgr:  service.FromContext[A.OutboundManager](ctx),
 		connMgr:      service.FromContext[A.ConnectionManager](ctx),
+		networkMgr:   service.FromContext[A.NetworkManager](ctx),
 		logger:       logger,
 		tags:         append([]string(nil), options.Outbounds...),
 		urlOverrides: maps.Clone(options.URLOverrides),
 		defaultURL:   options.URL,
-		histories:    make(map[string]*localHistory),
+		histories:    make(map[string]*memberHistory),
 		cfg:          cfg,
 		hist:         hp,
 		history:      resolveHistoryStorage(ctx),
@@ -242,6 +249,7 @@ func NewMutableAutoSelect(ctx context.Context, _ A.Router, logger log.ContextLog
 	if slogger, ok := logger.(lLog.SLogger); ok {
 		out.logger = slogger.WithAttrs(slog.String("mutableautoselect_group", tag))
 	}
+	out.setEnvironmentLocked(out.liveEnvironment())
 	out.initProbeState()
 	out.registerProbePauseCallback()
 	out.SetProbeTimeouts(options.ProbeTimeoutsMs)
@@ -330,8 +338,9 @@ func (s *MutableAutoSelect) addMemberLocked(tag string, out A.Outbound) {
 	s.addProbeMemberLocked(tag)
 }
 
-// Caller must hold s.access. No-op when an in-memory entry already exists
-// or when the persisted snapshot is older than cfg.maxPersistedAge.
+// Caller must hold s.access. No-op when an in-memory entry already exists.
+// Networks last updated more than cfg.maxPersistedAge ago are dropped, as is
+// a snapshot with none left.
 func (s *MutableAutoSelect) hydrateHistoryLocked(tag string) {
 	if _, ok := s.histories[tag]; ok {
 		return
@@ -343,15 +352,25 @@ func (s *MutableAutoSelect) hydrateHistoryLocked(tag string) {
 	if snap == nil {
 		return
 	}
+	// A snapshot without Networks is hydrated as the current network's.
+	s.refreshEnvironmentLocked()
 	now := time.Now()
-	if !snap.UpdatedAt.IsZero() && now.Sub(snap.UpdatedAt) > s.cfg.maxPersistedAge {
+	if len(snap.Networks) == 0 && !s.persistedFresh(snap.UpdatedAt, now) {
 		// Stale snapshot from a prior session — typically describes a
 		// candidate the bandit has rotated away from. Drop it from the
 		// store too so a later All() doesn't surface it.
 		s.history.Delete(tag)
 		return
 	}
-	s.histories[tag] = hydrateLocalHistory(snap, now, s.hist.userFailureWindow)
+	m := hydrateMemberHistory(snap, s.environment, now, s.cfg.maxPersistedAge, s.hist.userFailureWindow)
+	s.histories[tag] = m
+	// Re-store so the snapshot's top-level fields describe the current
+	// network rather than the one it was saved on.
+	if len(m.byNetwork) == 0 {
+		s.history.Delete(tag)
+		return
+	}
+	s.history.Store(tag, m.toTagHistory(s.environment, now, s.hist))
 }
 
 // PostStart is idempotent. Background probing starts on the first dial or
@@ -379,6 +398,63 @@ func (s *MutableAutoSelect) Close() error {
 		s.unregisterProbePauseCallback()
 	})
 	return nil
+}
+
+// liveEnvironment returns the network environment the box is on now.
+func (s *MutableAutoSelect) liveEnvironment() uint64 {
+	if s.networkMgr == nil {
+		return 0
+	}
+	return s.networkMgr.NetworkEnvironment()
+}
+
+// syncEnvironmentLocked treats a network environment change that arrived
+// without InterfaceUpdated, such as a new Wi-Fi SSID or gateway on the same
+// interface, as a network change.
+func (s *MutableAutoSelect) syncEnvironmentLocked() {
+	if s.refreshEnvironmentLocked() {
+		s.dispatchProbesLocked()
+	}
+}
+
+// refreshEnvironmentLocked advances the network generation if the live
+// environment differs from the recorded one, and reports whether it did.
+// Unlike syncEnvironmentLocked it doesn't dispatch probes, so
+// dispatchProbesLocked can call it.
+func (s *MutableAutoSelect) refreshEnvironmentLocked() bool {
+	if s.isClosed() || s.liveEnvironment() == s.environment {
+		return false
+	}
+	s.advanceNetworkLocked()
+	s.logger.Info("network environment changed: generation=", s.networkGeneration.Load())
+	return true
+}
+
+// setEnvironmentLocked records env as the current network environment, drops
+// expired networks, and re-stores every member's snapshot so its top-level
+// fields describe env.
+func (s *MutableAutoSelect) setEnvironmentLocked(env uint64) {
+	if env == s.environment {
+		return
+	}
+	now := time.Now()
+	// Expire networks a member hasn't been updated on, the one being left and
+	// the destination included, so returning to one doesn't revive its stale
+	// failures.
+	for _, m := range s.histories {
+		m.prune(now, s.cfg.maxPersistedAge)
+	}
+	s.environment = env
+	if s.history == nil {
+		return
+	}
+	for tag, m := range s.histories {
+		if len(m.byNetwork) == 0 {
+			s.history.Delete(tag)
+			continue
+		}
+		s.history.Store(tag, m.toTagHistory(env, now, s.hist))
+	}
 }
 
 // InterfaceUpdated invalidates ordinary probes and requests replacements while probing is active.
@@ -551,7 +627,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	// Attribute the failure to the outer (member) tag so rankLocked sees
 	// it. For nested groups, the inner tag isn't a member of this group,
 	// so recordUserFailure would drop on the member gate.
-	s.recordUserFailure(outerTag, adapter.UserFailureDial, generation)
+	s.recordUserFailure(outerTag, N.NetworkName(network), adapter.UserFailureDial, generation)
 
 	// Fast failover: try one alternate from the current rank. The active
 	// 3-min cadence keeps the probe history fresh enough to pick a working
@@ -569,7 +645,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 			return s.wrapStream(conn, network, alt, fallbackRoute, altGeneration), nil
 		}
 		s.logger.ErrorContext(ctx, err)
-		s.recordUserFailure(replacementTag, adapter.UserFailureDial, altGeneration)
+		s.recordUserFailure(replacementTag, N.NetworkName(network), adapter.UserFailureDial, altGeneration)
 		outerTag, ladderGeneration = replacementTag, altGeneration
 	}
 
@@ -597,7 +673,7 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		return s.wrapPacket(conn, o, primaryRoute, generation), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.recordUserFailure(outerTag, adapter.UserFailureDial, generation)
+	s.recordUserFailure(outerTag, N.NetworkUDP, adapter.UserFailureDial, generation)
 
 	ladderGeneration := generation
 	alt, altGeneration, altErr := s.selectOutbound("udp", outerTag)
@@ -608,7 +684,7 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 			return s.wrapPacket(conn, alt, fallbackRoute, altGeneration), nil
 		}
 		s.logger.ErrorContext(ctx, err)
-		s.recordUserFailure(replacementTag, adapter.UserFailureDial, altGeneration)
+		s.recordUserFailure(replacementTag, N.NetworkUDP, adapter.UserFailureDial, altGeneration)
 		outerTag, ladderGeneration = replacementTag, altGeneration
 	}
 
@@ -671,6 +747,7 @@ func (s *MutableAutoSelect) selectOutbound(network, excludeTag string) (A.Outbou
 		return nil, 0, fmt.Errorf("network %s not supported", network)
 	}
 	s.access.Lock()
+	s.syncEnvironmentLocked()
 	if excludeTag == "" {
 		s.keepAliveLocked()
 	}
@@ -801,22 +878,33 @@ func (s *MutableAutoSelect) probeURLForLocked(tag string) string {
 	return s.defaultURL
 }
 
-// historyForLocked returns the history for tag, creating an empty one if
-// none exists. Use only on the write path; read-only callers must use
-// peekHistoryLocked so ranking a never-probed tag doesn't litter the map.
-// Caller must hold s.access.
+// historyForLocked returns tag's history on the current network environment,
+// creating an empty one if none exists. Use only on the write path; read-only
+// callers must use peekHistoryLocked so ranking a never-probed tag doesn't
+// litter the map. Caller must hold s.access.
 func (s *MutableAutoSelect) historyForLocked(tag string) *localHistory {
-	h, ok := s.histories[tag]
-	if !ok {
-		h = newLocalHistory()
-		s.histories[tag] = h
-	}
-	return h
+	return s.memberHistoryLocked(tag).forNetwork(s.environment)
 }
 
+// memberHistoryLocked returns tag's history on every network, creating an
+// empty one if none exists. Caller must hold s.access.
+func (s *MutableAutoSelect) memberHistoryLocked(tag string) *memberHistory {
+	m, ok := s.histories[tag]
+	if !ok {
+		m = newMemberHistory()
+		s.histories[tag] = m
+	}
+	return m
+}
+
+// peekHistoryLocked returns tag's history on the current network environment.
+// Caller must hold s.access.
 func (s *MutableAutoSelect) peekHistoryLocked(tag string) (*localHistory, bool) {
-	h, ok := s.histories[tag]
-	return h, ok
+	m, ok := s.histories[tag]
+	if !ok {
+		return nil, false
+	}
+	return m.peek(s.environment)
 }
 
 // demoteLevel ranks how cautious selection should be about a candidate.
@@ -934,13 +1022,13 @@ func (s *MutableAutoSelect) rankLocked(now time.Time) []rankedCandidate {
 			consec = c
 			userFails = uint32(len(uf))
 			hasRecoveryGate = gated
+		} else if m, ok := s.histories[tag]; ok {
+			// No history on this network yet: rank by the latest delay seen
+			// on another network until a probe here lands.
+			rawDelay = m.delayHint(s.environment, now, s.cfg.maxPersistedAge)
 		} else if s.history != nil {
 			if seed := s.history.Load(tag); seed != nil {
-				if seed.UpdatedAt.IsZero() || now.Sub(seed.UpdatedAt) <= s.cfg.maxPersistedAge {
-					rawDelay = seed.LastSuccessDelayMs
-					consec = seed.ConsecutiveFailures
-					userFails = countUserFailuresInWindow(seed.UserFailures, now, s.hist.userFailureWindow)
-				}
+				rawDelay, consec, userFails = s.seedRankInputs(seed, now)
 			}
 		}
 		pres = append(pres, preCandidate{o: o, tag: tag, delayMs: rawDelay, consec: consec, userFails: userFails, lastResort: beh.lastResort, hasRecoveryGate: hasRecoveryGate})
@@ -1020,6 +1108,40 @@ var probeBound = func(beh protocolBehavior) time.Duration {
 	return beh.probeTimeout + 5*time.Second
 }
 
+// seedRankInputs returns the ranking inputs a persisted snapshot gives for the
+// current network environment, falling back to a delay-only hint from the
+// most recent successful probe on another network. Entries older than
+// cfg.maxPersistedAge give nothing.
+func (s *MutableAutoSelect) seedRankInputs(seed *adapter.TagHistory, now time.Time) (delayMs, consec, userFails uint32) {
+	if len(seed.Networks) == 0 {
+		if !s.persistedFresh(seed.UpdatedAt, now) {
+			return 0, 0, 0
+		}
+		return seed.LastSuccessDelayMs, seed.ConsecutiveFailures,
+			countUserFailuresInWindow(seed.UserFailures, now, s.hist.userFailureWindow)
+	}
+	if n := seed.Networks[s.environment]; n != nil && s.persistedFresh(n.UpdatedAt, now) {
+		return n.LastSuccessDelayMs, n.ConsecutiveFailures,
+			countUserFailuresInWindow(n.UserFailures, now, s.hist.userFailureWindow)
+	}
+	var hintAt time.Time
+	for env, n := range seed.Networks {
+		if env == s.environment || n == nil || n.LastSuccessDelayMs == 0 || !s.persistedFresh(n.UpdatedAt, now) {
+			continue
+		}
+		if delayMs == 0 || n.LastSuccessAt.After(hintAt) {
+			delayMs, hintAt = n.LastSuccessDelayMs, n.LastSuccessAt
+		}
+	}
+	return delayMs, 0, 0
+}
+
+// persistedFresh reports whether persisted history last updated at updatedAt
+// is recent enough to use. A zero time counts as fresh.
+func (s *MutableAutoSelect) persistedFresh(updatedAt, now time.Time) bool {
+	return updatedAt.IsZero() || now.Sub(updatedAt) <= s.cfg.maxPersistedAge
+}
+
 // mutateHistory accepts mutations only for the current network generation.
 func (s *MutableAutoSelect) mutateHistory(tag string, generation uint64, fn func(*localHistory, time.Time) bool) bool {
 	s.access.Lock()
@@ -1027,33 +1149,43 @@ func (s *MutableAutoSelect) mutateHistory(tag string, generation uint64, fn func
 	if _, member := s.members.Load(tag); !member {
 		return false
 	}
+	// A change found here advances the generation, so a mutation observed
+	// on the previous network is dropped rather than recorded on it.
+	s.syncEnvironmentLocked()
 	if !s.matchesGenerationLocked(generation) {
 		return false
 	}
-	return s.mutateHistoryLocked(tag, fn)
+	return s.mutateHistoryLocked(tag, s.environment, fn)
 }
 
-// mutateHistoryLocked applies fn to tag's history and persists the result
-// when fn reports a change.
-func (s *MutableAutoSelect) mutateHistoryLocked(tag string, fn func(*localHistory, time.Time) bool) bool {
-	h := s.historyForLocked(tag)
+// mutateHistoryLocked applies fn to tag's history on network environment env
+// and persists the result when fn reports a change.
+func (s *MutableAutoSelect) mutateHistoryLocked(tag string, env uint64, fn func(*localHistory, time.Time) bool) bool {
+	m := s.memberHistoryLocked(tag)
 	now := time.Now()
+	// Expire first, so a late result for a network the group has left starts
+	// that network's history afresh instead of reviving expired counters.
+	m.prune(now, s.cfg.maxPersistedAge, s.environment)
+	h := m.forNetwork(env)
 	if !fn(h, now) {
 		return false
 	}
+	h.updatedAt = now
+	m.prune(now, s.cfg.maxPersistedAge, s.environment, env)
 	if s.history != nil {
-		s.history.Store(tag, h.toTagHistory(now, s.hist))
+		s.history.Store(tag, m.toTagHistory(s.environment, now, s.hist))
 	}
 	return true
 }
 
-// recordUserFailure reports whether a current member's failure was added to its window.
-func (s *MutableAutoSelect) recordUserFailure(tag string, kind adapter.UserFailureKind, generation uint64) bool {
+// recordUserFailure reports whether a current member's failure on network
+// ("tcp" or "udp") was added to its window.
+func (s *MutableAutoSelect) recordUserFailure(tag, network string, kind adapter.UserFailureKind, generation uint64) bool {
 	recorded := s.mutateHistory(tag, generation, func(h *localHistory, now time.Time) bool {
-		return h.addUserFailure(adapter.UserFailure{At: now, Kind: kind}, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
+		return h.addUserFailure(adapter.UserFailure{At: now, Kind: kind, Network: network}, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
 	})
 	if recorded {
-		s.logger.Info("user failure: tag=", tag, " kind=", kind)
+		s.logger.Info("user failure: tag=", tag, " network=", network, " kind=", kind)
 	}
 	return recorded
 }
