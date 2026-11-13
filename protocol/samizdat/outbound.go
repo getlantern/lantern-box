@@ -116,8 +116,6 @@ func NewOutbound(
 		PublicKey:            pubKey,
 		ShortID:              shortID,
 		Fingerprint:          options.Fingerprint,
-		Jitter:               !options.DisableJitter,
-		MaxJitterMs:          options.MaxJitterMs,
 		TCPFragmentation:     !options.DisableTCPFragmentation,
 		RecordFragmentation:  !options.DisableRecordFragmentation,
 		DisableShaping:       options.DisableShaping,
