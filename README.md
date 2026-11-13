@@ -269,7 +269,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 | `short_id` | string | *required* | Pre-shared 8-byte ID (16 hex chars) |
 | `server_name` | string | | Cover site SNI (e.g. `"ok.ru"`) |
 | `fingerprint` | string | `"chrome"` | TLS fingerprint: `"chrome"`, `"firefox"`, `"safari"` |
-| `cert_spki_sha256` | string | | Pin the server's certificate (SHA-256 of its SubjectPublicKeyInfo, 64 hex chars), so a connection sent to the cover site fails instead of continuing |
+| `cert_spki_sha256` | string | | Pin the server's certificate (SHA-256 of its SubjectPublicKeyInfo, 64 hex chars). With it, a connection the server sends to the cover site (for instance because the client's clock is too far off) fails the TLS handshake. Without it, the client completes the cover site's handshake and sends its CONNECT requests, and their destinations, to the cover site |
 | `disable_shaping` | bool | `false` | Don't shape the first TLS records after the handshake. Works with any server |
 | `legacy_auth` | bool | `false` | Send version 1 auth, for servers older than version 2 (set `disable_shaping` too) |
 | `disable_tcp_fragmentation` | bool | `false` | Don't fragment the ClientHello |
