@@ -11,12 +11,16 @@ import (
 	"encoding/pem"
 	"math/big"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/log"
+	singoption "github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -358,5 +362,20 @@ func TestNewOutbound_InvalidCertPin(t *testing.T) {
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "cert_spki_sha256")
 		})
+	}
+}
+
+// TestNewInbound_LeanH2ByDefault: the inbound serves tunnels on samizdat's
+// lean HTTP/2 server unless disable_lean_h2 is set.
+func TestNewInbound_LeanH2ByDefault(t *testing.T) {
+	for _, disable := range []bool{false, true} {
+		opts := validInboundOptions(t)
+		addr := badoption.Addr(netip.MustParseAddr("127.0.0.1"))
+		opts.ListenOptions = singoption.ListenOptions{Listen: &addr}
+		opts.DisableLeanH2 = disable
+		ib, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "test", opts)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = ib.Close() })
+		assert.Equal(t, !disable, ib.(*Inbound).leanH2, "disable_lean_h2=%v", disable)
 	}
 }
