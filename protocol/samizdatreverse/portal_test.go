@@ -1425,3 +1425,103 @@ func TestPortalStalledHandshakeDoesNotHoldRetiredIdentity(t *testing.T) {
 	_, err := io.Copy(io.Discard, conn)
 	assert.NoError(t, err, "the portal did not close the stalled connection")
 }
+
+// TestPortalReplayedSessionIDGoesToMasquerade replays the ClientHello of a
+// session the portal admitted, as a censor that observed it could. The
+// portal must hand the copy to the masquerade, as it does any connection it
+// can't admit, rather than to an identity server, which has no masquerade
+// and would only close it.
+func TestPortalReplayedSessionIDGoesToMasquerade(t *testing.T) {
+	masq, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer masq.Close()
+	reached := make(chan struct{}, 1)
+	go func() {
+		for {
+			c, err := masq.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case reached <- struct{}{}:
+			default:
+			}
+			c.Close()
+		}
+	}()
+
+	k := newTestKeys(t)
+	sid := newShortID(t)
+	p := newTestPortal(t, option.SamizdatPortalInboundOptions{MasqueradeDomain: "example.com", MasqueradeAddr: masq.Addr().String()})
+	require.NoError(t, p.Configure(k.config(0, map[[8]byte]string{sid: tagA})))
+
+	var mu sync.Mutex
+	var hello []byte
+	c, err := samizdat.NewClient(samizdat.ClientConfig{
+		ServerAddr: portalAddr(t, p), ServerName: "localhost", PublicKey: k.pub, ShortID: sid,
+		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &firstWriteConn{Conn: conn, mu: &mu, first: &hello}, nil
+		},
+	})
+	require.NoError(t, err)
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := c.DialSession(ctx)
+	require.NoError(t, err, "the real ClientHello must be admitted")
+	defer conn.Close()
+
+	mu.Lock()
+	replay := append([]byte(nil), hello...)
+	mu.Unlock()
+	require.NotEmpty(t, replay)
+	raw, err := net.Dial("tcp", portalAddr(t, p))
+	require.NoError(t, err)
+	defer raw.Close()
+	_, err = raw.Write(replay)
+	require.NoError(t, err)
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a replayed SessionID did not reach the masquerade")
+	}
+}
+
+// firstWriteConn keeps a copy of the first Write: a samizdat client's
+// ClientHello record.
+type firstWriteConn struct {
+	net.Conn
+	mu    *sync.Mutex
+	first *[]byte
+}
+
+func (c *firstWriteConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	if *c.first == nil {
+		*c.first = append([]byte(nil), b...)
+	}
+	c.mu.Unlock()
+	return c.Conn.Write(b)
+}
+
+func TestSeenSessionIDs(t *testing.T) {
+	now := time.Unix(0, 0)
+	s := newSeenSessionIDs(time.Hour, 2)
+	require.False(t, s.seen([]byte("a"), now))
+	require.True(t, s.seen([]byte("a"), now))
+	// Still remembered one window on, gone two windows on.
+	require.True(t, s.seen([]byte("a"), now.Add(time.Hour)))
+	require.False(t, s.seen([]byte("a"), now.Add(3*time.Hour)))
+	// At capacity, the current generation rotates rather than growing; the
+	// older entries are still found in the previous one.
+	s = newSeenSessionIDs(time.Hour, 2)
+	s.seen([]byte("x"), now)
+	s.seen([]byte("y"), now)
+	require.False(t, s.seen([]byte("z"), now))
+	require.True(t, s.seen([]byte("x"), now))
+	require.Len(t, s.cur, 1)
+}

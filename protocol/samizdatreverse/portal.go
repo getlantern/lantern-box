@@ -117,6 +117,9 @@ type Portal struct {
 	routeMu sync.Mutex
 	routing map[net.Conn]struct{}
 	routeWG sync.WaitGroup
+	// replayed remembers the SessionIDs the portal has admitted, so a copy
+	// of one goes to the masquerade like any connection it can't admit.
+	replayed *seenSessionIDs
 
 	// sessMu guards pairings and sessions. It is never held while blocking.
 	sessMu   sync.Mutex
@@ -145,6 +148,7 @@ func NewPortal(ctx context.Context, router adapter.Router, logger log.ContextLog
 		confirmTimeout:   5 * time.Second,
 		rebindDelay:      time.Second,
 		routing:          make(map[net.Conn]struct{}),
+		replayed:         newSeenSessionIDs(replayWindow, replayCapacity),
 		sessions:         make(map[string]*portalSession),
 	}, nil
 }

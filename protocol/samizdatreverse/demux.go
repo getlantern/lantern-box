@@ -85,6 +85,10 @@ func (p *Portal) newIdentity(privateKey, certPEM, keyPEM []byte, ids [][8]byte) 
 		CertPEM:        certPEM,
 		KeyPEM:         keyPEM,
 		SessionHandler: p.handleSession,
+		// The portal refuses replayed SessionIDs itself, before admitting
+		// them, so it can masquerade them: these servers have no masquerade
+		// and would only close the connection.
+		ReplayWindow: -1,
 	})
 	if err != nil {
 		return nil, err
@@ -104,11 +108,12 @@ func (id *identity) is(privateKey, certPEM, keyPEM []byte) bool {
 		bytes.Equal(id.keyPEM, keyPEM)
 }
 
-// authenticates reports whether sessionID carries a valid tag under id's key
-// for one of its short IDs.
-func (id *identity) authenticates(sessionID []byte) bool {
-	_, ok, err := samizdat.VerifySessionID(sessionID, id.publicKey, id.server.ShortIDs())
-	return err == nil && ok
+// authenticates reports whether the ClientHello handshake message hello
+// carries a version 2 or version 1 SessionID under id's key for one of its
+// short IDs, as id's server checks.
+func (id *identity) authenticates(hello []byte) bool {
+	_, ok := samizdat.AuthenticateClientHello(hello, id.privateKey, id.server.ShortIDs(), samizdat.DefaultMaxClockSkew)
+	return ok
 }
 
 // admit counts conn against id and returns it wrapped to be handed to id's
@@ -213,14 +218,10 @@ type routes struct {
 // one, or the previous one while it is still accepting. It returns nil when
 // the ClientHello authenticates under neither.
 func (r *routes) pick(hello []byte, now time.Time) *identity {
-	sessionID, err := samizdat.ExtractSessionID(hello)
-	if err != nil {
-		return nil
-	}
-	if r.cur.authenticates(sessionID) {
+	if r.cur.authenticates(hello) {
 		return r.cur
 	}
-	if r.prev != nil && now.Before(r.prevUntil) && r.prev.authenticates(sessionID) {
+	if r.prev != nil && now.Before(r.prevUntil) && r.prev.authenticates(hello) {
 		return r.prev
 	}
 	return nil
@@ -279,6 +280,12 @@ func (p *Portal) route(conn net.Conn) {
 		return
 	}
 	if id := r.pick(record[5:], time.Now()); id != nil {
+		// A SessionID seen before is a copy of an observed ClientHello:
+		// masquerade it, as samizdat's server does.
+		if sid, err := samizdat.ExtractSessionID(record[5:]); err != nil || p.replayed.seen(sid, time.Now()) {
+			p.masquerade(r.stop, conn, record)
+			return
+		}
 		ac := id.admit(conn, record)
 		if ac == nil {
 			// Retired since the routes were read.
