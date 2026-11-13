@@ -297,8 +297,8 @@ github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534 h1:3BwvWj0JZzFEvNNi
 github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534/go.mod h1:ZsLfOY6gKQOTyEcPYNA9ws5/XHZQFroxqCOhHjGcs9Y=
 github.com/getlantern/quic-go-unbounded-fork v0.62.1-unbounded h1:vH2G0xioKMdV6NpGI0MbNTeuof0qeOl5RragE3vejqk=
 github.com/getlantern/quic-go-unbounded-fork v0.62.1-unbounded/go.mod h1:RAro2j2yN9a9EiPACLHT9IB2NXCvGQmmo/alT0yYI0w=
-github.com/getlantern/samizdat v0.0.3-0.20261113042552-79c635d74557 h1:AJZNmW8dlgWBPsyoEgqVGWS9i7Hg5J1IeET7067/EWE=
-github.com/getlantern/samizdat v0.0.3-0.20261113042552-79c635d74557/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
+github.com/getlantern/samizdat v0.0.3-0.20261113054634-b727322f4e2b h1:QmEPmhj+d0VqAWVshNSmwjHO/70Lx09MHDjoBXksjs8=
+github.com/getlantern/samizdat v0.0.3-0.20261113054634-b727322f4e2b/go.mod h1:uEeykQSW2/6rTjfPlj3MTTo59poSHXfAHTGgzYDkbr0=
 github.com/getlantern/semconv v0.0.0-20261103162524-c0c2ac0e0a3e h1:YuyL8jSRYD782QtcnRgkK1ZRXHQqgq+Ju1H1tSh6PWo=
 github.com/getlantern/semconv v0.0.0-20261103162524-c0c2ac0e0a3e/go.mod h1:GkPT5P9JoOTIRXRmFWxYgu1hhXgTFFTNc2hoG7WQc3g=
 github.com/getlantern/sing-box-minimal v1.14.2-lantern.3 h1:CrMSBbhyQxUAk9+8TWIJwezP+LABfEQ65xpCCyQg7FM=
