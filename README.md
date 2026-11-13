@@ -169,12 +169,13 @@ Pick the protocol that fits your threat model.
 
 [Samizdat](https://github.com/getlantern/samizdat) is built to defeat the full spectrum of modern DPI, including Russian TSPU infrastructure. It makes proxy traffic look like a browser visiting a real website over HTTP/2:
 
-- **Single TLS 1.3 layer** with a Chrome fingerprint via uTLS (no TLS-over-TLS)
-- **HTTP/2 CONNECT** tunneling with multiplexed streams on one TCP connection
-- **PSK-based authentication** embedded in the TLS SessionID field
-- **TCP-level masquerade** to a real domain for active probe resistance
-- **Geneva-inspired TCP fragmentation** of the ClientHello at the SNI boundary
-- **Traffic shaping** with Chrome-profile padding and timing jitter
+- **TLS 1.3** with a Chrome fingerprint via uTLS
+- **HTTP/2 CONNECT** tunneling, with many streams sharing each TLS connection (100 by default, `max_streams_per_conn`)
+- **Authentication in the TLS SessionID:** version 2 is sealed with an X25519 secret and bound to the whole ClientHello, as in REALITY; each server refuses SessionIDs it has already accepted, for as long as it remembers them (see `replay_window`)
+- **TCP-level masquerade:** with `masquerade_domain` set, every connection that doesn't authenticate, including probes that aren't TLS, is forwarded to that real cover site (without it, such connections are closed)
+- **Connection-start shaping:** the first 10 TLS records after the handshake follow sizes and directions drawn from a model of real TLS (CenKL, IEEE S&P 2027)
+- **Geneva-inspired fragmentation** of the ClientHello around the SNI (best effort)
+- **A lean HTTP/2 server** on the inbound: 66–90% less server CPU per GB downloaded in samizdat's benchmarks, and about half the CPU in a loopback test through lantern-box (#442)
 
 **When to use it:** The censor is doing deep packet inspection, active probing, and traffic analysis. You need the heavy artillery.
 
@@ -268,16 +269,15 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 | `short_id` | string | *required* | Pre-shared 8-byte ID (16 hex chars) |
 | `server_name` | string | | Cover site SNI (e.g. `"ok.ru"`) |
 | `fingerprint` | string | `"chrome"` | TLS fingerprint: `"chrome"`, `"firefox"`, `"safari"` |
-| `disable_padding` | bool | `false` | Disable H2 DATA frame padding |
-| `disable_jitter` | bool | `false` | Disable timing jitter |
-| `max_jitter_ms` | int | `30` | Maximum jitter in milliseconds |
-| `padding_profile` | string | `"chrome"` | Padding profile: `"chrome"`, `"firefox"` |
-| `disable_tcp_fragmentation` | bool | `false` | Disable ClientHello fragmentation |
-| `disable_record_fragmentation` | bool | `false` | Disable TLS record fragmentation |
-| `max_streams_per_conn` | int | `100` | Max H2 streams per TCP connection |
+| `cert_spki_sha256` | string | | Pin the server's certificate (SHA-256 of its SubjectPublicKeyInfo, 64 hex chars). With it, a connection the server sends to the cover site (for instance because the client's clock is too far off) fails the TLS handshake. Without it, the client completes the cover site's handshake and sends its CONNECT requests, and their destinations, to the cover site |
+| `disable_shaping` | bool | `false` | Don't shape the first TLS records after the handshake. Works with any server |
+| `legacy_auth` | bool | `false` | Send version 1 auth, for servers older than version 2 (set `disable_shaping` too) |
+| `disable_tcp_fragmentation` | bool | `false` | Don't fragment the ClientHello |
+| `max_streams_per_conn` | int | `100` | Max H2 streams per TLS connection |
 | `idle_timeout` | string | `"5m"` | Close idle connections after this duration |
 | `connect_timeout` | string | `"15s"` | TCP+TLS connect timeout |
-| `data_threshold` | int | `14000` | Bytes before aggressive padding kicks in |
+| `disable_jitter`, `max_jitter_ms` | | | Ignored. Samizdat's per-write timing jitter was removed; the keys still parse so older configs keep working |
+| `disable_record_fragmentation` | bool | | No effect: samizdat doesn't implement record fragmentation |
 
 #### All server options
 
@@ -289,11 +289,16 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 | `key_path` | string | | Path to TLS key PEM file |
 | `cert_pem` | string | | Inline TLS certificate PEM |
 | `key_pem` | string | | Inline TLS key PEM |
-| `masquerade_domain` | string | | Domain to masquerade as |
-| `masquerade_addr` | string | | IP:port override for masquerade |
-| `masquerade_idle_timeout` | string | `"5m"` | Masquerade connection idle timeout |
+| `masquerade_domain` | string | | Cover site that every connection that doesn't authenticate is forwarded to. Without it, those connections are closed, even with `masquerade_addr` set |
+| `masquerade_addr` | string | | IP:port override for the cover site |
+| `masquerade_idle_timeout` | string | `"5m"` | Accepted but not enforced yet: samizdat's masquerade doesn't apply an idle timeout |
 | `masquerade_max_duration` | string | `"10m"` | Max masquerade connection duration |
 | `max_concurrent_streams` | int | `250` | Max H2 streams per connection |
+| `disable_shaping` | bool | `false` | Refuse clients that shape. Clients that shape then fail, so disable it on them first |
+| `require_auth_v2` | bool | `false` | Refuse version 1 auth, once every client sends version 2 |
+| `replay_window` | string | `"24h"` | How long this server refuses SessionIDs it has accepted: normally between it and twice it, less if more than a million authenticate in one window. In memory, per server: a restart forgets. Negative turns it off; otherwise at least twice `max_clock_skew` |
+| `max_clock_skew` | string | `"12h"`, or half `replay_window` if smaller | How far a version 2 SessionID's time may be from the server's |
+| `disable_lean_h2` | bool | `false` | Serve tunnels with Go's x/net HTTP/2 server instead of samizdat's lean one |
 
 ---
 
