@@ -97,4 +97,9 @@ type SamizdatInboundOptions struct {
 	// that is less). A client whose clock is further off is sent to the
 	// masquerade.
 	MaxClockSkew string `json:"max_clock_skew,omitempty"`
+
+	// DisableLeanH2 serves tunnels with x/net's HTTP/2 server instead of
+	// samizdat's lean one, which the inbound uses by default: the same
+	// frames to clients, a fraction of the server CPU per byte.
+	DisableLeanH2 bool `json:"disable_lean_h2,omitempty"`
 }
