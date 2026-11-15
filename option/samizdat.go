@@ -51,6 +51,14 @@ type SamizdatOutboundOptions struct {
 	IdleTimeout       string `json:"idle_timeout,omitempty"`         // close idle connections after (default: "5m")
 	ConnectTimeout    string `json:"connect_timeout,omitempty"`      // TCP+TLS connect timeout (default: "15s")
 
+	// Receive windows: how much the server may send ahead of what the client
+	// has read, per tunnel and per connection, in bytes (defaults: 512KiB and
+	// 8MiB). A new tunnel's response waits behind what is queued on its
+	// connection, so larger windows let a download delay new requests on a
+	// slow link; a tunnel's throughput is at most its window over the
+	// round-trip time.
+	MaxReceiveBufferPerStream int `json:"max_receive_buffer_per_stream,omitempty"`
+	MaxReceiveBufferPerConn   int `json:"max_receive_buffer_per_conn,omitempty"`
 }
 
 // SamizdatInboundOptions configures a Samizdat inbound proxy.

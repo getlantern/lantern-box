@@ -365,6 +365,36 @@ func TestNewOutbound_InvalidCertPin(t *testing.T) {
 	}
 }
 
+// TestNewOutbound_ReceiveWindowsReachClient: the receive-window options
+// reach the samizdat client, which refuses windows out of range.
+func TestNewOutbound_ReceiveWindowsReachClient(t *testing.T) {
+	pubKey := testPubKeyHex(t)
+	shortID := testShortIDHex(t)
+
+	tests := []struct {
+		name          string
+		stream, conn  int
+		wantErrSubstr string
+	}{
+		{"stream negative", -1, 0, "MaxReceiveBufferPerStream"},
+		{"conn below minimum", 0, 1000, "MaxReceiveBufferPerConn"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewOutbound(context.Background(), nil, nil, "test", option.SamizdatOutboundOptions{
+				ServerOptions:             singoption.ServerOptions{Server: "127.0.0.1", ServerPort: 443},
+				ServerName:                "example.com",
+				PublicKey:                 pubKey,
+				ShortID:                   shortID,
+				MaxReceiveBufferPerStream: tt.stream,
+				MaxReceiveBufferPerConn:   tt.conn,
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErrSubstr)
+		})
+	}
+}
+
 // TestNewInbound_LeanH2ByDefault: the inbound serves tunnels on samizdat's
 // lean HTTP/2 server unless disable_lean_h2 is set.
 func TestNewInbound_LeanH2ByDefault(t *testing.T) {
