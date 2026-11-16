@@ -20,7 +20,6 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/control"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
@@ -42,6 +41,9 @@ type rtcNet struct {
 	// directFallback lets DialTCP and DialUDP dial directly when the dialer's conn has no socket.
 	// It is false with any dialer option, such as a detour, which a direct dial would skip.
 	directFallback bool
+	// resolveHosts has Dial resolve a host before dialing, for a dialer that takes only addresses.
+	// An outbound's dialer gets the host, which a detour may resolve through its proxy.
+	resolveHosts bool
 }
 
 var _ transport.Net = (*rtcNet)(nil)
@@ -138,11 +140,11 @@ func (n *rtcNet) InterfaceByName(name string) (*transport.Interface, error) {
 	return fresh.InterfaceByName(name)
 }
 
-// Dial resolves a host first, through lookup or else stdnet, since sing-box's default dialer takes
-// only addresses. Its errors name no address, as DialTCP's don't.
+// Dial resolves a host first with resolveHosts, through lookup or else stdnet. Its errors name no
+// address, as DialTCP's don't.
 func (n *rtcNet) Dial(network, address string) (net.Conn, error) {
 	dest := metadata.ParseSocksaddr(address)
-	if dest.IsFqdn() {
+	if n.resolveHosts && dest.IsFqdn() {
 		a, err := n.resolveHost(network, dest.Fqdn)
 		if err != nil {
 			return nil, dialError(network, err)
@@ -292,7 +294,7 @@ func (n *rtcNet) dialDirect(network string, raddr net.Addr) (net.Conn, error) {
 	if !n.directFallback {
 		return nil, dialError(network, errNoSocket)
 	}
-	d := net.Dialer{Control: physnet.ListenControl(n.ctx)}
+	d := physicalDialer(n.ctx)
 	conn, err := d.DialContext(n.ctx, network, raddr.String())
 	if err != nil {
 		return nil, dialError(network, err)
@@ -333,22 +335,54 @@ func (c *wrappedTCPConn) ReadFrom(r io.Reader) (int64, error) {
 	return io.Copy(struct{ io.Writer }{c.Conn}, r)
 }
 
-// udpOnly is the part of transport.UDPConn that net.Conn lacks.
+// udpOnly is the socket controls of transport.UDPConn that net.Conn lacks.
 type udpOnly interface {
 	SetReadBuffer(bytes int) error
 	SetWriteBuffer(bytes int) error
-	ReadFrom(p []byte) (n int, addr net.Addr, err error)
-	ReadFromUDP(b []byte) (n int, addr *net.UDPAddr, err error)
-	ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error)
-	WriteTo(p []byte, addr net.Addr) (n int, err error)
-	WriteToUDP(b []byte, addr *net.UDPAddr) (int, error)
-	WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error)
 }
 
-// wrappedUDPConn is wrappedTCPConn for UDP.
+// wrappedUDPConn is wrappedTCPConn for UDP: every datagram goes through the wrapper, through its
+// ReadFrom and WriteTo where it has them, and only the socket controls go to the socket.
 type wrappedUDPConn struct {
 	net.Conn
 	udpOnly
+}
+
+// ReadFrom, without the wrapper's, is a Read: the conn is dialed, so its peer sent every datagram.
+func (c *wrappedUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	if pc, ok := c.Conn.(net.PacketConn); ok {
+		return pc.ReadFrom(p)
+	}
+	n, err := c.Conn.Read(p)
+	return n, c.Conn.RemoteAddr(), err
+}
+
+func (c *wrappedUDPConn) ReadFromUDP(b []byte) (int, *net.UDPAddr, error) {
+	n, addr, err := c.ReadFrom(b)
+	udpAddr, _ := addr.(*net.UDPAddr)
+	return n, udpAddr, err
+}
+
+// WriteTo, without the wrapper's, fails as a dialed *net.UDPConn's does.
+func (c *wrappedUDPConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if pc, ok := c.Conn.(net.PacketConn); ok {
+		return pc.WriteTo(p, addr)
+	}
+	return 0, &net.OpError{Op: "write", Net: "udp", Err: net.ErrWriteToConnected}
+}
+
+func (c *wrappedUDPConn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
+	return c.WriteTo(b, addr)
+}
+
+// ReadMsgUDP and WriteMsgUDP carry control messages the wrapper can't, and the socket would skip
+// the wrapper, so they fail. pion reads and writes a dialed conn with Read and Write.
+func (c *wrappedUDPConn) ReadMsgUDP(_, _ []byte) (int, int, int, *net.UDPAddr, error) {
+	return 0, 0, 0, nil, &net.OpError{Op: "read", Net: "udp", Err: errors.ErrUnsupported}
+}
+
+func (c *wrappedUDPConn) WriteMsgUDP(_, _ []byte, _ *net.UDPAddr) (int, int, error) {
+	return 0, 0, &net.OpError{Op: "write", Net: "udp", Err: errors.ErrUnsupported}
 }
 
 // CreateDialer returns a transport.Dialer whose every method funnels back
@@ -432,14 +466,20 @@ func (n *rtcNet) resolve(network, address string) (netip.Addr, int, bool, error)
 	if err != nil {
 		return netip.Addr{}, 0, true, err
 	}
-	port, err := strconv.Atoi(portStr)
+	port, err := parsePort(network, portStr)
 	if err != nil {
-		port, err = net.LookupPort(network, portStr)
-		if err != nil {
-			return netip.Addr{}, 0, true, errResolve
-		}
+		return netip.Addr{}, 0, true, errResolve
 	}
 	return a, port, true, nil
+}
+
+// parsePort is a port number in range, or a service name's port.
+func parsePort(network, s string) (int, error) {
+	if s != "" && strings.ContainsAny(s[:1], "+-0123456789") {
+		port, err := strconv.ParseUint(s, 10, 16)
+		return int(port), err
+	}
+	return net.LookupPort(network, s)
 }
 
 func (n *rtcNet) ResolveUDPAddr(network, address string) (*net.UDPAddr, error) {
@@ -495,9 +535,10 @@ func NewProtectedNet(ctx context.Context) (transport.Net, error) {
 	if err != nil {
 		return nil, err
 	}
+	n.resolveHosts = true
 	if nm := service.FromContext[adapter.NetworkManager](ctx); nm != nil &&
 		!nm.AutoDetectInterface() && nm.DefaultOptions().BindInterface == "" {
-		n.dialer = &physDialer{control: physnet.ListenControl(ctx)}
+		n.dialer = &physDialer{dialer: physicalDialer(ctx)}
 		return n, nil
 	}
 	n.dialer, err = dialer.New(ctx, option.DialerOptions{}, false)
@@ -510,12 +551,16 @@ func NewProtectedNet(ctx context.Context) (transport.Net, error) {
 // physDialer is an N.Dialer whose every socket gets physnet's control. Like sing-box's default
 // dialer it takes addresses: rtcNet resolves hosts before it dials.
 type physDialer struct {
-	control control.Func
+	dialer net.Dialer
+}
+
+// physicalDialer is a net.Dialer bound off the tunnel, with sing-box's connect timeout.
+func physicalDialer(ctx context.Context) net.Dialer {
+	return net.Dialer{Timeout: C.TCPConnectTimeout, Control: physnet.ListenControl(ctx)}
 }
 
 func (d *physDialer) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
-	nd := net.Dialer{Control: d.control}
-	return nd.DialContext(ctx, network, destination.String())
+	return d.dialer.DialContext(ctx, network, destination.String())
 }
 
 // ListenPacket picks the family as sing-box's default dialer does.
@@ -524,6 +569,6 @@ func (d *physDialer) ListenPacket(ctx context.Context, destination metadata.Sock
 	if destination.IsIPv4() && !destination.Addr.IsUnspecified() {
 		network += "4"
 	}
-	lc := net.ListenConfig{Control: d.control}
+	lc := net.ListenConfig{Control: d.dialer.Control}
 	return lc.ListenPacket(ctx, network, "")
 }

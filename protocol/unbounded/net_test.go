@@ -352,6 +352,139 @@ func TestRTCNetDialResolvesHosts(t *testing.T) {
 	})
 }
 
+// recordingDialer records the destinations it is asked to dial, and dials none.
+type recordingDialer struct {
+	N.Dialer
+	asked []metadata.Socksaddr
+}
+
+func (d *recordingDialer) DialContext(_ context.Context, _ string, dest metadata.Socksaddr) (net.Conn, error) {
+	d.asked = append(d.asked, dest)
+	return nil, errors.New("not dialing")
+}
+
+// An outbound's dialer may resolve a host itself, as a detour does through its proxy, so its Dial
+// passes the host on.
+func TestRTCNetDialPassesHostsToTheOutboundsDialer(t *testing.T) {
+	router := &fakeRouter{addrs: []netip.Addr{netip.MustParseAddr("127.0.0.1")}}
+	d := &recordingDialer{}
+	n, err := newRTCNet(dnsCtx(router, C.DNSTypeHTTPS), d, nil, false)
+	require.NoError(t, err)
+	_, _ = n.Dial("tcp", "turn.example:3478")
+	require.Len(t, d.asked, 1)
+	assert.Equal(t, "turn.example", d.asked[0].Fqdn)
+	assert.Empty(t, router.asked)
+}
+
+func TestRTCNetResolveRejectsPortsOutOfRange(t *testing.T) {
+	router := &fakeRouter{addrs: []netip.Addr{netip.MustParseAddr("192.0.2.7")}}
+	n, err := newRTCNet(dnsCtx(router, C.DNSTypeHTTPS), nil, nil, true)
+	require.NoError(t, err)
+	for _, port := range []string{"65536", "65537", "-1"} {
+		_, err := n.ResolveUDPAddr("udp4", "turn.example:"+port)
+		assert.ErrorIs(t, err, errResolve, port)
+		_, err = n.ResolveTCPAddr("tcp4", "turn.example:"+port)
+		assert.ErrorIs(t, err, errResolve, port)
+	}
+	a, err := n.ResolveUDPAddr("udp4", "turn.example:65535")
+	require.NoError(t, err)
+	assert.Equal(t, 65535, a.Port)
+}
+
+func TestPhysicalDialsHaveAConnectTimeout(t *testing.T) {
+	assert.Equal(t, C.TCPConnectTimeout, physicalDialer(context.Background()).Timeout)
+}
+
+// countingConn is a dialer's wrapper that counts the datagrams it passes.
+type countingConn struct {
+	net.Conn
+	reads, writes atomic.Int32
+}
+
+func (c *countingConn) Read(b []byte) (int, error)  { c.reads.Add(1); return c.Conn.Read(b) }
+func (c *countingConn) Write(b []byte) (int, error) { c.writes.Add(1); return c.Conn.Write(b) }
+
+// countingPacketConn is a wrapper that also has a PacketConn's ReadFrom and WriteTo.
+type countingPacketConn struct {
+	*countingConn
+	readFroms, writeTos atomic.Int32
+}
+
+func (c *countingPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	c.readFroms.Add(1)
+	n, err := c.countingConn.Conn.Read(b)
+	return n, c.RemoteAddr(), err
+}
+
+func (c *countingPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+	c.writeTos.Add(1)
+	return c.countingConn.Conn.Write(b)
+}
+
+// The datagrams of a wrapped UDP conn go through the wrapper, which counts and tracks them; only
+// socket controls reach the socket.
+func TestWrappedUDPConnSendsDatagramsThroughTheWrapper(t *testing.T) {
+	peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer peer.Close()
+	dial := func(t *testing.T) *net.UDPConn {
+		raw, err := net.DialUDP("udp4", nil, peer.LocalAddr().(*net.UDPAddr))
+		require.NoError(t, err)
+		t.Cleanup(func() { raw.Close() })
+		return raw
+	}
+	echo := func(t *testing.T) {
+		buf := make([]byte, 16)
+		peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, from, err := peer.ReadFrom(buf)
+		require.NoError(t, err)
+		_, err = peer.WriteTo(buf[:n], from)
+		require.NoError(t, err)
+	}
+
+	t.Run("plain conn", func(t *testing.T) {
+		raw := dial(t)
+		w := &countingConn{Conn: raw}
+		c := &wrappedUDPConn{Conn: w, udpOnly: raw}
+		_, err := c.WriteTo([]byte("x"), peer.LocalAddr())
+		assert.ErrorIs(t, err, net.ErrWriteToConnected, "as a dialed *net.UDPConn's WriteTo")
+		_, err = c.Write([]byte("ping"))
+		require.NoError(t, err)
+		echo(t)
+		buf := make([]byte, 16)
+		_, from, err := c.ReadFrom(buf)
+		require.NoError(t, err)
+		assert.Equal(t, peer.LocalAddr().String(), from.String())
+		_, err = c.Write([]byte("ping"))
+		require.NoError(t, err)
+		echo(t)
+		_, udpFrom, err := c.ReadFromUDP(buf)
+		require.NoError(t, err)
+		assert.Equal(t, peer.LocalAddr().String(), udpFrom.String())
+		assert.Equal(t, int32(2), w.reads.Load())
+		assert.Equal(t, int32(2), w.writes.Load())
+		_, _, _, _, err = c.ReadMsgUDP(buf, make([]byte, 8))
+		assert.ErrorIs(t, err, errors.ErrUnsupported)
+		_, _, err = c.WriteMsgUDP([]byte("x"), nil, nil)
+		assert.ErrorIs(t, err, errors.ErrUnsupported)
+		require.NoError(t, c.SetReadBuffer(1<<16))
+	})
+
+	t.Run("packet conn", func(t *testing.T) {
+		raw := dial(t)
+		w := &countingPacketConn{countingConn: &countingConn{Conn: raw}}
+		c := &wrappedUDPConn{Conn: w, udpOnly: raw}
+		_, err := c.WriteToUDP([]byte("ping"), peer.LocalAddr().(*net.UDPAddr))
+		require.NoError(t, err)
+		echo(t)
+		buf := make([]byte, 16)
+		_, _, err = c.ReadFromUDP(buf)
+		require.NoError(t, err)
+		assert.Equal(t, int32(1), w.writeTos.Load())
+		assert.Equal(t, int32(1), w.readFroms.Load())
+	})
+}
+
 // Any dialer option is policy a direct dial would drop: tcp_fast_open, for one, hides the socket
 // on every conn, so the fallback would take every dial.
 func TestDirectFallbackOnlyWithoutDialerOptions(t *testing.T) {
