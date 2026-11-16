@@ -37,20 +37,24 @@ type rtcNet struct {
 	ctx    context.Context
 	dialer N.Dialer
 	logger log.ContextLogger
+	// directFallback lets DialTCP and DialUDP dial directly when the dialer's conn has no socket.
+	// It is false with a detour, which a direct dial would skip.
+	directFallback bool
 }
 
 var _ transport.Net = (*rtcNet)(nil)
 
-func newRTCNet(ctx context.Context, dialer N.Dialer, logger log.ContextLogger) (*rtcNet, error) {
+func newRTCNet(ctx context.Context, dialer N.Dialer, logger log.ContextLogger, directFallback bool) (*rtcNet, error) {
 	snet, err := stdnet.NewNet()
 	if err != nil {
 		return nil, err
 	}
 	return &rtcNet{
-		Net:    snet,
-		ctx:    ctx,
-		dialer: dialer,
-		logger: logger,
+		Net:            snet,
+		ctx:            ctx,
+		dialer:         dialer,
+		logger:         logger,
+		directFallback: directFallback,
 	}, nil
 }
 
@@ -187,8 +191,10 @@ func (n *rtcNet) ListenUDP(network string, laddr *net.UDPAddr) (transport.UDPCon
 
 // DialTCP dials through n.dialer. In a running box that dialer wraps each conn for connection
 // tracking and counting, and the wrapper is a plain net.Conn, so the socket under it serves pion's
-// TCP-only methods. A dialer with no socket under its conn, such as a detour, is closed and the
-// address dialed directly, bound off the tunnel.
+// TCP-only methods. A conn with no socket under it, such as a detour's through a QUIC- or mux-based
+// outbound, is closed. Without a detour the address is then dialed directly, bound off the tunnel;
+// with one the dial fails, since a direct dial would skip the detour and show the server this
+// host's address.
 func (n *rtcNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.TCPConn, error) {
 	conn, err := n.dialer.DialContext(n.ctx, network, metadata.SocksaddrFromNet(raddr))
 	if err != nil {
@@ -201,7 +207,7 @@ func (n *rtcNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.T
 		return &wrappedTCPConn{Conn: conn, tcpOnly: tcp}, nil
 	}
 	conn.Close()
-	conn, err = n.dialDirect(network, raddr.String())
+	conn, err = n.dialDirect(network, raddr)
 	if err != nil {
 		return nil, err
 	}
@@ -221,16 +227,23 @@ func (n *rtcNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transport.U
 		return &wrappedUDPConn{Conn: conn, udpOnly: udp}, nil
 	}
 	conn.Close()
-	conn, err = n.dialDirect(network, raddr.String())
+	conn, err = n.dialDirect(network, raddr)
 	if err != nil {
 		return nil, err
 	}
 	return conn.(*net.UDPConn), nil
 }
 
-func (n *rtcNet) dialDirect(network, address string) (net.Conn, error) {
+// errNoSocket is the error a dial fails with when the dialer's conn has no socket and a direct dial
+// isn't allowed.
+var errNoSocket = errors.New("unbounded: detour's conn has no socket for pion")
+
+func (n *rtcNet) dialDirect(network string, raddr net.Addr) (net.Conn, error) {
+	if !n.directFallback {
+		return nil, dialError(network, errNoSocket)
+	}
 	d := net.Dialer{Control: physnet.ListenControl(n.ctx)}
-	conn, err := d.DialContext(n.ctx, network, address)
+	conn, err := d.DialContext(n.ctx, network, raddr.String())
 	if err != nil {
 		return nil, dialError(network, err)
 	}
@@ -428,5 +441,5 @@ func NewProtectedNet(ctx context.Context) (transport.Net, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unbounded: build sing-box dialer: %w", err)
 	}
-	return newRTCNet(ctx, d, nil)
+	return newRTCNet(ctx, d, nil, true)
 }

@@ -66,7 +66,7 @@ func TestRTCNetHidesTheVPNsInterfaces(t *testing.T) {
 	mine := hostInterface(t)
 	ctx := service.ContextWith[adapter.NetworkManager](context.Background(),
 		&fakeNetworkManager{monitor: &fakeMonitor{names: []string{mine}}})
-	n, err := newRTCNet(ctx, nil, nil)
+	n, err := newRTCNet(ctx, nil, nil, true)
 	require.NoError(t, err)
 
 	ifs, err := n.Interfaces()
@@ -90,7 +90,7 @@ func TestRTCNetHidesNothingWithoutAMonitor(t *testing.T) {
 			&fakeNetworkManager{}),
 	} {
 		t.Run(name, func(t *testing.T) {
-			n, err := newRTCNet(ctx, nil, nil)
+			n, err := newRTCNet(ctx, nil, nil, true)
 			require.NoError(t, err)
 			ifs, err := n.Interfaces()
 			require.NoError(t, err)
@@ -139,7 +139,7 @@ func TestRTCNetResolvesThroughSingBox(t *testing.T) {
 	router := &fakeRouter{addrs: []netip.Addr{
 		netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("192.0.2.7"),
 	}}
-	n, err := newRTCNet(dnsCtx(router, C.DNSTypeHTTPS), nil, nil)
+	n, err := newRTCNet(dnsCtx(router, C.DNSTypeHTTPS), nil, nil, true)
 	require.NoError(t, err)
 
 	udp, err := n.ResolveUDPAddr("udp4", "turn.example:3478")
@@ -158,7 +158,7 @@ func TestRTCNetResolvesThroughSingBox(t *testing.T) {
 
 func TestRTCNetPassesLiteralsThrough(t *testing.T) {
 	router := &fakeRouter{}
-	n, err := newRTCNet(dnsCtx(router, C.DNSTypeHTTPS), nil, nil)
+	n, err := newRTCNet(dnsCtx(router, C.DNSTypeHTTPS), nil, nil, true)
 	require.NoError(t, err)
 	udp, err := n.ResolveUDPAddr("udp4", "192.0.2.9:3478")
 	require.NoError(t, err)
@@ -172,7 +172,7 @@ func TestRTCNetFallsBackWithoutSingBoxDNS(t *testing.T) {
 		"fake-IP default": dnsCtx(&fakeRouter{err: errors.New("must not be asked")}, C.DNSTypeFakeIP),
 	} {
 		t.Run(name, func(t *testing.T) {
-			n, err := newRTCNet(ctx, nil, nil)
+			n, err := newRTCNet(ctx, nil, nil, true)
 			require.NoError(t, err)
 			udp, err := n.ResolveUDPAddr("udp4", "localhost:3478")
 			require.NoError(t, err)
@@ -187,7 +187,7 @@ func TestRTCNetResolveErrorsNameNoHost(t *testing.T) {
 		"wrong family": {addrs: []netip.Addr{netip.MustParseAddr("2001:db8::1")}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			n, err := newRTCNet(dnsCtx(router, C.DNSTypeHTTPS), nil, nil)
+			n, err := newRTCNet(dnsCtx(router, C.DNSTypeHTTPS), nil, nil, true)
 			require.NoError(t, err)
 			_, err = n.ResolveUDPAddr("udp4", "secret.example:3478")
 			require.Error(t, err)
@@ -285,22 +285,75 @@ func TestRTCNetDialsDirectlyWhenTheDialerHidesTheSocket(t *testing.T) {
 	require.NoError(t, err)
 	defer ln.Close()
 	go func() {
-		if c, err := ln.Accept(); err == nil {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
 			c.Close()
 		}
 	}()
-	d := &pipeDialer{closed: make(chan struct{})}
-	n, err := newRTCNet(context.Background(), d, nil)
+	peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
-	c, err := n.DialTCP("tcp4", nil, ln.Addr().(*net.TCPAddr))
-	require.NoError(t, err)
-	defer c.Close()
-	assert.Equal(t, ln.Addr().String(), c.RemoteAddr().String())
-	select {
-	case <-d.closed:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the dialer's conn was left open")
+	defer peer.Close()
+	tcpAddr := ln.Addr().(*net.TCPAddr)
+	udpAddr := peer.LocalAddr().(*net.UDPAddr)
+
+	waitClosed := func(t *testing.T, d *pipeDialer) {
+		select {
+		case <-d.closed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the dialer's conn was left open")
+		}
 	}
+	assertNoAddress := func(t *testing.T, err error, port int) {
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "127.0.0.1", "error %q names the address", err)
+		assert.NotContains(t, err.Error(), strconv.Itoa(port), "error %q names the address", err)
+	}
+
+	t.Run("fallback tcp", func(t *testing.T) {
+		d := &pipeDialer{closed: make(chan struct{})}
+		n, err := newRTCNet(context.Background(), d, nil, true)
+		require.NoError(t, err)
+		c, err := n.DialTCP("tcp4", nil, tcpAddr)
+		require.NoError(t, err)
+		defer c.Close()
+		assert.Equal(t, tcpAddr.String(), c.RemoteAddr().String())
+		waitClosed(t, d)
+	})
+
+	t.Run("fallback udp", func(t *testing.T) {
+		d := &pipeDialer{closed: make(chan struct{})}
+		n, err := newRTCNet(context.Background(), d, nil, true)
+		require.NoError(t, err)
+		c, err := n.DialUDP("udp4", nil, udpAddr)
+		require.NoError(t, err)
+		defer c.Close()
+		assert.Equal(t, udpAddr.String(), c.RemoteAddr().String())
+		waitClosed(t, d)
+	})
+
+	// With a detour, a direct dial would skip it and show the TURN server this host's address.
+	t.Run("no fallback tcp", func(t *testing.T) {
+		d := &pipeDialer{closed: make(chan struct{})}
+		n, err := newRTCNet(context.Background(), d, nil, false)
+		require.NoError(t, err)
+		c, err := n.DialTCP("tcp4", nil, tcpAddr)
+		assert.Nil(t, c)
+		assertNoAddress(t, err, tcpAddr.Port)
+		waitClosed(t, d)
+	})
+
+	t.Run("no fallback udp", func(t *testing.T) {
+		d := &pipeDialer{closed: make(chan struct{})}
+		n, err := newRTCNet(context.Background(), d, nil, false)
+		require.NoError(t, err)
+		c, err := n.DialUDP("udp4", nil, udpAddr)
+		assert.Nil(t, c)
+		assertNoAddress(t, err, udpAddr.Port)
+		waitClosed(t, d)
+	})
 }
 
 func TestRTCNetDialErrorsNameNoAddress(t *testing.T) {
