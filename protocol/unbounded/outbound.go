@@ -156,7 +156,7 @@ func NewOutbound(
 	if err != nil {
 		return nil, fmt.Errorf("unbounded: build sing-box dialer: %w", err)
 	}
-	rtcNet, err := newRTCNet(ctx, outboundDialer, lg)
+	rtcNet, err := newRTCNet(ctx, outboundDialer, lg, directFallbackAllowed(opts.DialerOptions))
 	if err != nil {
 		return nil, fmt.Errorf("unbounded: build pion net shim: %w", err)
 	}
