@@ -6,9 +6,11 @@ import (
 
 	"github.com/pion/transport/v5"
 	"github.com/pion/transport/v5/stdnet"
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 
 	"github.com/getlantern/lantern-box/protocol/internal/physnet"
 )
@@ -39,6 +41,84 @@ func newRTCNet(ctx context.Context, dialer N.Dialer, logger log.ContextLogger) (
 		dialer: dialer,
 		logger: logger,
 	}, nil
+}
+
+// myInterfaces is the set of interfaces the VPN serving n.ctx registered as its own: its tunnel. It
+// is read on each call, since the tunnel comes back under a new name after a restart, and is nil
+// with no VPN.
+func (n *rtcNet) myInterfaces() map[string]bool {
+	nm := service.FromContext[adapter.NetworkManager](n.ctx)
+	if nm == nil {
+		return nil
+	}
+	monitor := nm.InterfaceMonitor()
+	if monitor == nil {
+		return nil
+	}
+	names := monitor.MyInterfaces()
+	if len(names) == 0 {
+		return nil
+	}
+	mine := make(map[string]bool, len(names))
+	for _, name := range names {
+		mine[name] = true
+	}
+	return mine
+}
+
+// Interfaces lists the host's interfaces for pion's host candidates, without the VPN's own. A
+// candidate on the tunnel's address sends into the tunnel, even from this process whose other
+// sockets skip it, and physnet would pin its socket there: its checks then reach whichever outbound
+// the tunnel routes to, which for a personal proxy is the very helper they are trying to reach.
+// Like limitedNet's, the list is fresh each call, since this Net outlives network changes.
+func (n *rtcNet) Interfaces() ([]*transport.Interface, error) {
+	fresh, err := newStdNet()
+	if err != nil {
+		return nil, err
+	}
+	ifs, err := fresh.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	mine := n.myInterfaces()
+	if mine == nil {
+		return ifs, nil
+	}
+	kept := make([]*transport.Interface, 0, len(ifs))
+	for _, i := range ifs {
+		if !mine[i.Name] {
+			kept = append(kept, i)
+		}
+	}
+	return kept, nil
+}
+
+// InterfaceByIndex is Interfaces' lookup by index: the VPN's own interfaces aren't found.
+func (n *rtcNet) InterfaceByIndex(index int) (*transport.Interface, error) {
+	fresh, err := newStdNet()
+	if err != nil {
+		return nil, err
+	}
+	i, err := fresh.InterfaceByIndex(index)
+	if err != nil {
+		return nil, err
+	}
+	if n.myInterfaces()[i.Name] {
+		return nil, transport.ErrInterfaceNotFound
+	}
+	return i, nil
+}
+
+// InterfaceByName is Interfaces' lookup by name: the VPN's own interfaces aren't found.
+func (n *rtcNet) InterfaceByName(name string) (*transport.Interface, error) {
+	if n.myInterfaces()[name] {
+		return nil, transport.ErrInterfaceNotFound
+	}
+	fresh, err := newStdNet()
+	if err != nil {
+		return nil, err
+	}
+	return fresh.InterfaceByName(name)
 }
 
 func (n *rtcNet) Dial(network, address string) (net.Conn, error) {
