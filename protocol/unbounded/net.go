@@ -138,8 +138,50 @@ func (n *rtcNet) InterfaceByName(name string) (*transport.Interface, error) {
 	return fresh.InterfaceByName(name)
 }
 
+// Dial resolves a host first, through lookup or else stdnet, since sing-box's default dialer takes
+// only addresses. Its errors name no address, as DialTCP's don't.
 func (n *rtcNet) Dial(network, address string) (net.Conn, error) {
-	return n.dialer.DialContext(n.ctx, network, metadata.ParseSocksaddr(address))
+	dest := metadata.ParseSocksaddr(address)
+	if dest.IsFqdn() {
+		a, err := n.resolveHost(network, dest.Fqdn)
+		if err != nil {
+			return nil, dialError(network, err)
+		}
+		dest = metadata.SocksaddrFrom(a, dest.Port)
+	}
+	conn, err := n.dialer.DialContext(n.ctx, network, dest)
+	if err != nil {
+		return nil, dialError(network, err)
+	}
+	return conn, nil
+}
+
+// resolveHost is host's address in network's family, through lookup, or stdnet when sing-box can't
+// be asked.
+func (n *rtcNet) resolveHost(network, host string) (netip.Addr, error) {
+	addrs, ok, err := n.lookup(host)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	if ok {
+		return pick(network, addrs)
+	}
+	ipNet := "ip"
+	switch {
+	case strings.HasSuffix(network, "4"):
+		ipNet = "ip4"
+	case strings.HasSuffix(network, "6"):
+		ipNet = "ip6"
+	}
+	ip, err := n.Net.ResolveIPAddr(ipNet, host)
+	if err != nil {
+		return netip.Addr{}, errResolve
+	}
+	a, ok := netip.AddrFromSlice(ip.IP)
+	if !ok {
+		return netip.Addr{}, errResolve
+	}
+	return a.Unmap(), nil
 }
 
 func (n *rtcNet) ListenPacket(network, address string) (net.PacketConn, error) {
@@ -455,7 +497,7 @@ func NewProtectedNet(ctx context.Context) (transport.Net, error) {
 	}
 	if nm := service.FromContext[adapter.NetworkManager](ctx); nm != nil &&
 		!nm.AutoDetectInterface() && nm.DefaultOptions().BindInterface == "" {
-		n.dialer = &physDialer{control: physnet.ListenControl(ctx), lookup: n.lookup}
+		n.dialer = &physDialer{control: physnet.ListenControl(ctx)}
 		return n, nil
 	}
 	n.dialer, err = dialer.New(ctx, option.DialerOptions{}, false)
@@ -465,31 +507,15 @@ func NewProtectedNet(ctx context.Context) (transport.Net, error) {
 	return n, nil
 }
 
-// physDialer is an N.Dialer whose every socket gets physnet's control. It resolves a host through
-// lookup, as rtcNet does, since the OS resolver points into the tunnel, and through the OS resolver
-// only when sing-box can't be asked.
+// physDialer is an N.Dialer whose every socket gets physnet's control. Like sing-box's default
+// dialer it takes addresses: rtcNet resolves hosts before it dials.
 type physDialer struct {
 	control control.Func
-	lookup  func(host string) ([]netip.Addr, bool, error)
 }
 
 func (d *physDialer) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
-	address := destination.String()
-	if destination.IsFqdn() {
-		addrs, ok, err := d.lookup(destination.Fqdn)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			a, err := pick(network, addrs)
-			if err != nil {
-				return nil, err
-			}
-			address = metadata.SocksaddrFrom(a, destination.Port).String()
-		}
-	}
 	nd := net.Dialer{Control: d.control}
-	return nd.DialContext(ctx, network, address)
+	return nd.DialContext(ctx, network, destination.String())
 }
 
 // ListenPacket picks the family as sing-box's default dialer does.

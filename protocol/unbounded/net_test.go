@@ -224,6 +224,7 @@ func (m *unboundNetworkManager) InterfaceFinder() control.InterfaceFinder {
 	return control.NewDefaultInterfaceFinder()
 }
 func (m *unboundNetworkManager) AutoRedirectOutputMarkFunc() control.Func      { return nil }
+func (m *unboundNetworkManager) AutoRedirectOutputMark() uint32                { return 0 }
 func (m *unboundNetworkManager) ProtectFunc() control.Func                     { return nil }
 func (m *unboundNetworkManager) InterfaceMonitor() tun.DefaultInterfaceMonitor { return nil }
 func (m *unboundNetworkManager) AutoDetectInterfaceFunc() control.Func {
@@ -302,6 +303,53 @@ func TestNewProtectedNetWithoutAVPNDials(t *testing.T) {
 	pc, err := n.ListenPacket("udp4", "127.0.0.1:3478")
 	require.NoError(t, err)
 	pc.Close()
+}
+
+// Dial resolves a host itself, since the box's dialer takes only addresses.
+func TestRTCNetDialResolvesHosts(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+
+	t.Run("os resolver", func(t *testing.T) {
+		n, err := NewProtectedNet(context.Background())
+		require.NoError(t, err)
+		c, err := n.Dial("tcp4", net.JoinHostPort("localhost", port))
+		require.NoError(t, err)
+		c.Close()
+		c, err = n.CreateDialer(nil).Dial("tcp4", net.JoinHostPort("localhost", port))
+		require.NoError(t, err)
+		c.Close()
+	})
+
+	t.Run("sing-box dns", func(t *testing.T) {
+		router := &fakeRouter{addrs: []netip.Addr{netip.MustParseAddr("127.0.0.1")}}
+		n, err := NewProtectedNet(dnsCtx(router, C.DNSTypeHTTPS))
+		require.NoError(t, err)
+		c, err := n.Dial("tcp4", net.JoinHostPort("turn.example", port))
+		require.NoError(t, err)
+		c.Close()
+		assert.Equal(t, []string{"turn.example"}, router.asked)
+	})
+
+	t.Run("errors name no host", func(t *testing.T) {
+		router := &fakeRouter{err: errors.New("no such host")}
+		n, err := NewProtectedNet(dnsCtx(router, C.DNSTypeHTTPS))
+		require.NoError(t, err)
+		_, err = n.Dial("tcp4", net.JoinHostPort("secret.example", port))
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "secret.example")
+	})
 }
 
 // Any dialer option is policy a direct dial would drop: tcp_fast_open, for one, hides the socket
