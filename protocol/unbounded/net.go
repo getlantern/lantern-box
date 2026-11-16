@@ -2,12 +2,21 @@ package unbounded
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
+	"net/netip"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/pion/transport/v5"
 	"github.com/pion/transport/v5/stdnet"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
@@ -219,9 +228,128 @@ func (d *rtcDialer) Dial(network, address string) (net.Conn, error) {
 	return d.net.Dial(network, address)
 }
 
-// The Resolve* methods fall through to the embedded stdnet.Net, which resolves
-// via the OS resolver. On mobile that's the physical-interface resolver, not
-// the TUN's. Kept as passthroughs so pion can enumerate local interfaces for
-// ICE candidate gathering; routing DNS through the sing-box dialer here would
-// not make sense (it's not a dial, and we don't want to add sing-box's DNS
-// policy to pion's internal bookkeeping).
+// errResolve is the error a failed lookup returns. It names no host: the hosts are the ICE servers
+// Freddie sends, and errors reach logs.
+var errResolve = errors.New("unbounded: resolve ICE server host")
+
+// lookupTimeout bounds a lookup, since pion passes no context.
+const lookupTimeout = 5 * time.Second
+
+// lookup resolves host through sing-box's default DNS server, and reports whether it could ask
+// sing-box at all. This process's sockets skip the VPN's tunnel, but the OS resolver they would use
+// points into it, so stdnet's lookups time out while the VPN runs, and a TURN server given by name
+// never gets a relay candidate. Naming the transport skips the DNS rules, and with them the fake-IP
+// rule, whose addresses are only routable through the tunnel. With no sing-box DNS on ctx, or a
+// fake-IP default, it reports false and the caller asks stdnet, as before.
+func (n *rtcNet) lookup(host string) ([]netip.Addr, bool, error) {
+	router := service.FromContext[adapter.DNSRouter](n.ctx)
+	transports := service.FromContext[adapter.DNSTransportManager](n.ctx)
+	if router == nil || transports == nil {
+		return nil, false, nil
+	}
+	def := transports.Default()
+	if def == nil || def.Type() == C.DNSTypeFakeIP {
+		return nil, false, nil
+	}
+	ctx, cancel := context.WithTimeout(n.ctx, lookupTimeout)
+	defer cancel()
+	addrs, err := router.Lookup(ctx, host, adapter.DNSQueryOptions{Transport: def})
+	if err != nil {
+		return nil, true, errResolve
+	}
+	return addrs, true, nil
+}
+
+// pick is the first of addrs in network's family ("4" or "6" suffix), or the first at all.
+func pick(network string, addrs []netip.Addr) (netip.Addr, error) {
+	for _, a := range addrs {
+		a = a.Unmap()
+		switch {
+		case strings.HasSuffix(network, "4") && !a.Is4():
+		case strings.HasSuffix(network, "6") && !a.Is6():
+		default:
+			return a, nil
+		}
+	}
+	return netip.Addr{}, errResolve
+}
+
+// resolve is the address and port for a "host:port" pion gives, through lookup, or ok=false when
+// the host is a literal or sing-box can't be asked.
+func (n *rtcNet) resolve(network, address string) (netip.Addr, int, bool, error) {
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return netip.Addr{}, 0, false, nil
+	}
+	if _, err := netip.ParseAddr(host); err == nil || host == "" {
+		return netip.Addr{}, 0, false, nil
+	}
+	addrs, ok, err := n.lookup(host)
+	if !ok || err != nil {
+		return netip.Addr{}, 0, ok, err
+	}
+	a, err := pick(network, addrs)
+	if err != nil {
+		return netip.Addr{}, 0, true, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		port, err = net.LookupPort(network, portStr)
+		if err != nil {
+			return netip.Addr{}, 0, true, errResolve
+		}
+	}
+	return a, port, true, nil
+}
+
+func (n *rtcNet) ResolveUDPAddr(network, address string) (*net.UDPAddr, error) {
+	a, port, ok, err := n.resolve(network, address)
+	if !ok {
+		return n.Net.ResolveUDPAddr(network, address)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &net.UDPAddr{IP: a.AsSlice(), Port: port, Zone: a.Zone()}, nil
+}
+
+func (n *rtcNet) ResolveTCPAddr(network, address string) (*net.TCPAddr, error) {
+	a, port, ok, err := n.resolve(network, address)
+	if !ok {
+		return n.Net.ResolveTCPAddr(network, address)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &net.TCPAddr{IP: a.AsSlice(), Port: port, Zone: a.Zone()}, nil
+}
+
+func (n *rtcNet) ResolveIPAddr(network, address string) (*net.IPAddr, error) {
+	if _, err := netip.ParseAddr(address); err == nil || address == "" {
+		return n.Net.ResolveIPAddr(network, address)
+	}
+	addrs, ok, err := n.lookup(address)
+	if !ok {
+		return n.Net.ResolveIPAddr(network, address)
+	}
+	if err != nil {
+		return nil, err
+	}
+	a, err := pick(network, addrs)
+	if err != nil {
+		return nil, err
+	}
+	return &net.IPAddr{IP: a.AsSlice(), Zone: a.Zone()}, nil
+}
+
+// NewProtectedNet is a pion transport.Net for WebRTC run in the process that serves ctx's sing-box
+// VPN, such as the app's Unbounded widget: it dials through sing-box's default dialer, binds its
+// sockets to the physical interface, gathers no candidate on the VPN's own interface, and resolves
+// through sing-box's DNS. With a ctx carrying no sing-box services it behaves as pion's own Net.
+func NewProtectedNet(ctx context.Context) (transport.Net, error) {
+	d, err := dialer.New(ctx, option.DialerOptions{}, false)
+	if err != nil {
+		return nil, fmt.Errorf("unbounded: build sing-box dialer: %w", err)
+	}
+	return newRTCNet(ctx, d, nil)
+}

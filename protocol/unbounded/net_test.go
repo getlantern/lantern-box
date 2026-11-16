@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/pion/transport/v5"
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
@@ -90,4 +93,108 @@ func TestRTCNetHidesNothingWithoutAMonitor(t *testing.T) {
 			assert.NoError(t, err)
 		})
 	}
+}
+
+type fakeTransport struct {
+	adapter.DNSTransport
+	typ string
+}
+
+func (t *fakeTransport) Type() string { return t.typ }
+
+type fakeTransports struct {
+	adapter.DNSTransportManager
+	def adapter.DNSTransport
+}
+
+func (m *fakeTransports) Default() adapter.DNSTransport { return m.def }
+
+// fakeRouter answers every lookup with addrs, or err, and records the transport it was asked to use.
+type fakeRouter struct {
+	adapter.DNSRouter
+	addrs []netip.Addr
+	err   error
+	used  adapter.DNSTransport
+	asked []string
+}
+
+func (r *fakeRouter) Lookup(_ context.Context, domain string, o adapter.DNSQueryOptions) ([]netip.Addr, error) {
+	r.used = o.Transport
+	r.asked = append(r.asked, domain)
+	return r.addrs, r.err
+}
+
+func dnsCtx(router *fakeRouter, typ string) context.Context {
+	ctx := service.ContextWith[adapter.DNSRouter](context.Background(), router)
+	return service.ContextWith[adapter.DNSTransportManager](ctx, &fakeTransports{def: &fakeTransport{typ: typ}})
+}
+
+func TestRTCNetResolvesThroughSingBox(t *testing.T) {
+	router := &fakeRouter{addrs: []netip.Addr{
+		netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("192.0.2.7"),
+	}}
+	n, err := newRTCNet(dnsCtx(router, C.DNSTypeHTTPS), nil, nil)
+	require.NoError(t, err)
+
+	udp, err := n.ResolveUDPAddr("udp4", "turn.example:3478")
+	require.NoError(t, err)
+	assert.Equal(t, "192.0.2.7:3478", udp.String())
+	assert.Equal(t, C.DNSTypeHTTPS, router.used.Type(), "the default transport, set explicitly")
+
+	tcp, err := n.ResolveTCPAddr("tcp6", "turn.example:443")
+	require.NoError(t, err)
+	assert.Equal(t, "[2001:db8::1]:443", tcp.String())
+
+	ip, err := n.ResolveIPAddr("ip", "turn.example")
+	require.NoError(t, err)
+	assert.Equal(t, "2001:db8::1", ip.String(), "with no family asked, the first answer")
+}
+
+func TestRTCNetPassesLiteralsThrough(t *testing.T) {
+	router := &fakeRouter{}
+	n, err := newRTCNet(dnsCtx(router, C.DNSTypeHTTPS), nil, nil)
+	require.NoError(t, err)
+	udp, err := n.ResolveUDPAddr("udp4", "192.0.2.9:3478")
+	require.NoError(t, err)
+	assert.Equal(t, "192.0.2.9:3478", udp.String())
+	assert.Empty(t, router.asked)
+}
+
+func TestRTCNetFallsBackWithoutSingBoxDNS(t *testing.T) {
+	for name, ctx := range map[string]context.Context{
+		"no router":       context.Background(),
+		"fake-IP default": dnsCtx(&fakeRouter{err: errors.New("must not be asked")}, C.DNSTypeFakeIP),
+	} {
+		t.Run(name, func(t *testing.T) {
+			n, err := newRTCNet(ctx, nil, nil)
+			require.NoError(t, err)
+			udp, err := n.ResolveUDPAddr("udp4", "localhost:3478")
+			require.NoError(t, err)
+			assert.True(t, udp.IP.IsLoopback())
+		})
+	}
+}
+
+func TestRTCNetResolveErrorsNameNoHost(t *testing.T) {
+	for name, router := range map[string]*fakeRouter{
+		"lookup fails": {err: errors.New("lookup secret.example: boom")},
+		"wrong family": {addrs: []netip.Addr{netip.MustParseAddr("2001:db8::1")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			n, err := newRTCNet(dnsCtx(router, C.DNSTypeHTTPS), nil, nil)
+			require.NoError(t, err)
+			_, err = n.ResolveUDPAddr("udp4", "secret.example:3478")
+			require.Error(t, err)
+			assert.True(t, errors.Is(err, errResolve))
+			assert.False(t, strings.Contains(err.Error(), "secret.example"), "error %q names the host", err)
+		})
+	}
+}
+
+func TestNewProtectedNetWithoutAVPN(t *testing.T) {
+	n, err := NewProtectedNet(context.Background())
+	require.NoError(t, err)
+	ifs, err := n.Interfaces()
+	require.NoError(t, err)
+	assert.NotEmpty(t, ifs)
 }
