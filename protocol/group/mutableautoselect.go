@@ -81,11 +81,19 @@ type MutableAutoSelect struct {
 	probeTimeouts atomic.Pointer[map[string]time.Duration]
 	histories     map[string]*memberHistory
 	// environment is the network environment histories are recorded under.
-	// Guarded by access; it changes only with networkGeneration.
+	// Guarded by access; it changes only with networkGeneration, except when
+	// the unidentified network is first identified (see
+	// refreshEnvironmentLocked).
 	environment uint64
-	cfg         mutableAutoSelectConfig
-	hist        historyParams
-	history     adapter.AutoSelectHistoryStorage
+	// environmentIdentified is set once environment has been non-zero.
+	// recordedUnidentified reports whether history has been recorded under
+	// environment 0 since the last generation advance. Both guarded by
+	// access.
+	environmentIdentified bool
+	recordedUnidentified  bool
+	cfg                   mutableAutoSelectConfig
+	hist                  historyParams
+	history               adapter.AutoSelectHistoryStorage
 
 	// Scratch buffers reused across calls by rankLocked and splitHealthyForLocked
 	// to avoid per-dial allocation; guarded by access, which their callers hold
@@ -422,7 +430,26 @@ func (s *MutableAutoSelect) syncEnvironmentLocked() {
 // Unlike syncEnvironmentLocked it doesn't dispatch probes, so
 // dispatchProbesLocked can call it.
 func (s *MutableAutoSelect) refreshEnvironmentLocked() bool {
-	if s.isClosed() || s.liveEnvironment() == s.environment {
+	if s.isClosed() {
+		return false
+	}
+	live := s.liveEnvironment()
+	if live == s.environment {
+		return false
+	}
+	// sing-box identifies the network only after outbounds start, without
+	// InterfaceUpdated, so the first non-zero environment names the network
+	// the group has been on all along. With nothing yet recorded under 0, it
+	// is adopted without discarding the probes already running on it.
+	if s.environment == 0 && !s.environmentIdentified && !s.recordedUnidentified {
+		generation := s.networkGeneration.Load()
+		for _, attempt := range s.inFlightProbes {
+			if attempt.environment == 0 && attempt.generation == generation {
+				attempt.environment = live
+			}
+		}
+		s.setEnvironmentLocked(live)
+		s.logger.Info("network environment identified")
 		return false
 	}
 	s.advanceNetworkLocked()
@@ -438,13 +465,19 @@ func (s *MutableAutoSelect) setEnvironmentLocked(env uint64) {
 		return
 	}
 	now := time.Now()
-	// Expire networks a member hasn't been updated on, the one being left and
-	// the destination included, so returning to one doesn't revive its stale
-	// failures.
+	// Expire networks a member hasn't used within maxPersistedAge, the
+	// destination included, so returning to one doesn't revive its stale
+	// failures. The network being left was in use until now.
 	for _, m := range s.histories {
+		if h, ok := m.peek(s.environment); ok {
+			h.leftAt = now
+		}
 		m.prune(now, s.cfg.maxPersistedAge)
 	}
 	s.environment = env
+	if env != 0 {
+		s.environmentIdentified = true
+	}
 	if s.history == nil {
 		return
 	}
@@ -878,16 +911,10 @@ func (s *MutableAutoSelect) probeURLForLocked(tag string) string {
 	return s.defaultURL
 }
 
-// historyForLocked returns tag's history on the current network environment,
-// creating an empty one if none exists. Use only on the write path; read-only
-// callers must use peekHistoryLocked so ranking a never-probed tag doesn't
-// litter the map. Caller must hold s.access.
-func (s *MutableAutoSelect) historyForLocked(tag string) *localHistory {
-	return s.memberHistoryLocked(tag).forNetwork(s.environment)
-}
-
 // memberHistoryLocked returns tag's history on every network, creating an
-// empty one if none exists. Caller must hold s.access.
+// empty one if none exists. Use only on the write path; read-only callers
+// must use peekHistoryLocked so ranking a never-probed tag doesn't litter the
+// map. Caller must hold s.access.
 func (s *MutableAutoSelect) memberHistoryLocked(tag string) *memberHistory {
 	m, ok := s.histories[tag]
 	if !ok {
@@ -1126,7 +1153,8 @@ func (s *MutableAutoSelect) seedRankInputs(seed *adapter.TagHistory, now time.Ti
 	}
 	var hintAt time.Time
 	for env, n := range seed.Networks {
-		if env == s.environment || n == nil || n.LastSuccessDelayMs == 0 || !s.persistedFresh(n.UpdatedAt, now) {
+		if env == s.environment || n == nil || n.LastSuccessDelayMs == 0 || !s.persistedFresh(n.UpdatedAt, now) ||
+			n.LastSuccessAt.IsZero() || !s.persistedFresh(n.LastSuccessAt, now) {
 			continue
 		}
 		if delayMs == 0 || n.LastSuccessAt.After(hintAt) {
@@ -1171,6 +1199,9 @@ func (s *MutableAutoSelect) mutateHistoryLocked(tag string, env uint64, fn func(
 		return false
 	}
 	h.updatedAt = now
+	if env == 0 && !s.environmentIdentified {
+		s.recordedUnidentified = true
+	}
 	m.prune(now, s.cfg.maxPersistedAge, s.environment, env)
 	if s.history != nil {
 		s.history.Store(tag, m.toTagHistory(s.environment, now, s.hist))

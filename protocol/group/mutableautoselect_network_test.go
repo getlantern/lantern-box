@@ -196,6 +196,72 @@ func TestProbe_DetectsEnvironmentChange(t *testing.T) {
 	})
 }
 
+func TestEnvironment_FirstIdentificationKeepsProbes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newSchedulerTest(t, "a")
+		nm := &fakeNetworkManager{}
+		s.access.Lock()
+		s.networkMgr = nm
+		s.access.Unlock()
+		release := make(chan struct{})
+		var dials atomic.Int32
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			if dials.Add(1) == 1 {
+				<-release
+			}
+			return probeResponderConn(), nil
+		}
+		requestTestProbes(s, []string{"a"}, probeForced)
+		synctest.Wait()
+		generation := s.networkGeneration.Load()
+
+		nm.env.Store(envA)
+		close(release)
+		synctest.Wait()
+
+		assert.Equal(t, generation, s.networkGeneration.Load(), "identifying the network isn't a network change")
+		assert.Equal(t, int32(1), dials.Load(), "the probe running while unidentified isn't redone")
+		s.access.Lock()
+		defer s.access.Unlock()
+		assert.Equal(t, envA, s.environment)
+		_, onA := s.histories["a"].peek(envA)
+		assert.True(t, onA, "its result is recorded on the identified network")
+		_, on0 := s.histories["a"].peek(0)
+		assert.False(t, on0)
+	})
+}
+
+func TestEnvironment_IdentificationAfterRecordingUnderZeroAdvances(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	nm := &fakeNetworkManager{}
+	s.networkMgr = nm
+	require.True(t, s.recordUserFailure("a", N.NetworkTCP, adapter.UserFailureDial, s.networkGeneration.Load()))
+	before := s.networkGeneration.Load()
+
+	nm.env.Store(envA)
+	_, generation, err := s.selectOutbound(N.NetworkTCP, "")
+	require.NoError(t, err)
+	assert.Greater(t, generation, before, "history recorded under 0 makes identification a network change")
+}
+
+func TestEnvironment_OnlyFirstIdentificationKeepsGeneration(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	nm := &fakeNetworkManager{}
+	s.networkMgr = nm
+	before := s.networkGeneration.Load()
+	nm.env.Store(envA)
+	_, generation, err := s.selectOutbound(N.NetworkTCP, "")
+	require.NoError(t, err)
+	require.Equal(t, before, generation)
+
+	switchNetwork(s, nm, 0)
+	before = s.networkGeneration.Load()
+	nm.env.Store(envB)
+	_, generation, err = s.selectOutbound(N.NetworkTCP, "")
+	require.NoError(t, err)
+	assert.Greater(t, generation, before, "once identified, leaving 0 is a network change")
+}
+
 func TestSelectOutbound_DetectsEnvironmentChangeWithoutInterfaceUpdate(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	nm := withNetwork(s, envA)
@@ -329,7 +395,7 @@ func TestRankLocked_SeedFallbackUsesCurrentNetwork(t *testing.T) {
 	s.history.Store("a", &adapter.TagHistory{
 		UpdatedAt: now,
 		Networks: map[uint64]*adapter.NetworkHistory{
-			envA: {LastSuccessDelayMs: 40, LastOutcomeAt: now, ConsecutiveFailures: 9, UpdatedAt: now},
+			envA: {LastSuccessDelayMs: 40, LastSuccessAt: now, LastOutcomeAt: now, ConsecutiveFailures: 9, UpdatedAt: now},
 		},
 	})
 	s.history.Store("b", &adapter.TagHistory{
@@ -453,6 +519,23 @@ func TestEnvironment_TopLevelUpdatedAtIsCurrentNetworks(t *testing.T) {
 		"B's view must carry B's timestamp, not A's newer one")
 }
 
+func TestEnvironment_TopLevelLastSuccessAtIsCurrentNetworks(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	nm := withNetwork(s, envA)
+	require.True(t, s.mutateHistory("a", s.networkGeneration.Load(), func(h *localHistory, now time.Time) bool {
+		h.recordProbeSuccess(40, now)
+		return true
+	}))
+	snap := s.history.Load("a")
+	require.False(t, snap.LastSuccessAt.IsZero())
+	assert.Equal(t, snap.LastSuccessAt, snap.LatestSuccessTime())
+
+	switchNetwork(s, nm, envB)
+	snap = s.history.Load("a")
+	assert.Zero(t, snap.LatestSuccessTime(), "nothing has been measured on B")
+	assert.False(t, snap.Networks[envA].LastSuccessAt.IsZero(), "A keeps its success time")
+}
+
 func TestHydrate_RefreshesEnvironmentFirst(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	nm := withNetwork(s, envA)
@@ -554,14 +637,16 @@ func TestRankLocked_SeedSkipsStaleNetworks(t *testing.T) {
 	now := time.Now()
 	s.history.Store("a", &adapter.TagHistory{
 		Networks: map[uint64]*adapter.NetworkHistory{
-			envA:  {LastSuccessDelayMs: 40, LastSuccessAt: now.Add(-time.Hour), UpdatedAt: now},
+			envA:  {LastSuccessDelayMs: 40, LastSuccessAt: now.Add(-5 * time.Minute), UpdatedAt: now},
 			envB:  {LastSuccessDelayMs: 90, ConsecutiveFailures: 9, UpdatedAt: now.Add(-time.Hour)},
 			0xc00: {LastSuccessDelayMs: 10, LastSuccessAt: now, UpdatedAt: now.Add(-time.Hour)},
+			0xd00: {LastSuccessDelayMs: 5, LastSuccessAt: now.Add(-time.Hour), ConsecutiveFailures: 9, UpdatedAt: now},
 		},
 	})
 	got := rankedFor(s, "a")
 	assert.Equal(t, demoteClean, got.demote, "the current network's stale entry gives nothing")
-	assert.Equal(t, uint32(40), got.delayMs, "a stale network can't supply the hint")
+	assert.Equal(t, uint32(40), got.delayMs,
+		"neither a stale network nor a fresh network's stale success can supply the hint")
 }
 
 func TestEnvironment_ChangeExpiresIdleNetworks(t *testing.T) {
@@ -577,17 +662,12 @@ func TestEnvironment_ChangeExpiresIdleNetworks(t *testing.T) {
 	require.Equal(t, demoteHard, rankedFor(s, "a").demote)
 	switchNetwork(s, nm, envB)
 
-	// Age A's history past max_persisted_age with no writes since.
-	s.access.Lock()
-	onA, ok := s.histories["a"].peek(envA)
-	require.True(t, ok)
-	onA.updatedAt = onA.updatedAt.Add(-2 * s.cfg.maxPersistedAge)
-	s.access.Unlock()
+	ageNetwork(t, s, "a", envA, 2*s.cfg.maxPersistedAge)
 
 	switchNetwork(s, nm, envA)
 	assert.Equal(t, demoteClean, rankedFor(s, "a").demote, "A's expired failures must not come back")
 	s.access.Lock()
-	_, ok = s.histories["a"].peek(envA)
+	_, ok := s.histories["a"].peek(envA)
 	s.access.Unlock()
 	assert.False(t, ok)
 	assert.Nil(t, s.history.Load("a"), "a member with no unexpired history is removed from storage")
@@ -647,21 +727,26 @@ func TestHydrateMemberHistory_CapsNetworks(t *testing.T) {
 	}
 }
 
-func TestEnvironment_LeavingExpiredNetworkDropsIt(t *testing.T) {
+func TestEnvironment_LeftNetworkExpiresFromLeaving(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	nm := withNetwork(s, envA)
+	failProbes(t, s, "a", envA, s.hist.consecutiveFailLimit)
+	// Idle on A, with no writes for longer than max_persisted_age.
 	s.access.Lock()
-	recordSuccess(s, "a", 40)
 	onA, _ := s.histories["a"].peek(envA)
 	onA.updatedAt = onA.updatedAt.Add(-2 * s.cfg.maxPersistedAge)
 	s.access.Unlock()
 
 	switchNetwork(s, nm, envB)
-	s.access.Lock()
-	_, ok := s.histories["a"].peek(envA)
-	s.access.Unlock()
-	assert.False(t, ok, "an expired network is dropped when the group leaves it")
-	assert.Zero(t, rankedFor(s, "a").delayMs, "an expired network can't supply the hint")
+	switchNetwork(s, nm, envA)
+	assert.Equal(t, demoteHard, rankedFor(s, "a").demote,
+		"a brief switch away must not expire the network the group was just on")
+
+	switchNetwork(s, nm, envB)
+	ageNetwork(t, s, "a", envA, 2*s.cfg.maxPersistedAge)
+	switchNetwork(s, nm, envA)
+	assert.Equal(t, demoteClean, rankedFor(s, "a").demote,
+		"a network left more than max_persisted_age ago expires")
 }
 
 func TestMemberHistory_DelayHintSkipsExpired(t *testing.T) {
@@ -677,7 +762,22 @@ func TestMemberHistory_DelayHintSkipsExpired(t *testing.T) {
 	assert.Equal(t, uint32(10), m.delayHint(0xc, now, 0), "maxAge <= 0 disables aging")
 }
 
-// ageNetwork makes tag's history on env look last changed age ago.
+func TestMemberHistory_DelayHintSkipsStaleSuccess(t *testing.T) {
+	now := time.Now()
+	m := newMemberHistory()
+	// Failing on A for an hour: the network is fresh, its success isn't.
+	failing := m.forNetwork(envA)
+	failing.recordProbeSuccess(10, now.Add(-time.Hour))
+	failing.recordProbeFailure(now)
+	failing.updatedAt = now
+	working := m.forNetwork(envB)
+	working.recordProbeSuccess(50, now.Add(-10*time.Minute))
+	working.updatedAt = now.Add(-10 * time.Minute)
+	assert.Equal(t, uint32(50), m.delayHint(0xc, now, 15*time.Minute))
+	assert.Zero(t, m.delayHint(envB, now, 15*time.Minute), "a success older than maxAge gives no hint")
+}
+
+// ageNetwork makes tag's history on env look last used age ago.
 func ageNetwork(t *testing.T, s *MutableAutoSelect, tag string, env uint64, age time.Duration) {
 	t.Helper()
 	s.access.Lock()
@@ -685,6 +785,7 @@ func ageNetwork(t *testing.T, s *MutableAutoSelect, tag string, env uint64, age 
 	h, ok := s.histories[tag].peek(env)
 	require.True(t, ok)
 	h.updatedAt = time.Now().Add(-age)
+	h.leftAt = h.updatedAt
 }
 
 func failProbes(t *testing.T, s *MutableAutoSelect, tag string, env uint64, n uint32) {
@@ -902,10 +1003,12 @@ func TestProbe_LateLastResortAtCap(t *testing.T) {
 			time.Sleep(time.Second)
 		}
 		// The probe runs on network 5 and completes after the switch to 6.
+		// Network 1, left only at the switch to 5, is the most recently used
+		// of 1..4, so 2 is evicted.
 		switchNetwork(s, nm, maxNetworksPerMember+1)
 		lateLastResortProbe(t, s, obs, nm, maxNetworksPerMember+2, func() {})
 
-		want := []uint64{2, 3, 4, maxNetworksPerMember + 1}
+		want := []uint64{1, 3, 4, maxNetworksPerMember + 1}
 		s.access.Lock()
 		got := slices.Sorted(maps.Keys(s.histories["ub"].byNetwork))
 		s.access.Unlock()

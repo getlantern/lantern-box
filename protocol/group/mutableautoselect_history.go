@@ -68,10 +68,12 @@ type localHistory struct {
 	userFailures        []adapter.UserFailure
 	// In-memory only; zero means no recovery gate.
 	recoveryGateStartedAt time.Time
-	// updatedAt is the time of the last recorded change; it ages the entry
-	// out once the group has left this network. Guarded by the group's
-	// access lock rather than mu.
+	// updatedAt is the time of the last recorded change and leftAt the last
+	// time the group left this network; the later of the two ages the entry
+	// out once the group is elsewhere. Both are guarded by the group's access
+	// lock rather than mu, and leftAt is in-memory only.
 	updatedAt time.Time
+	leftAt    time.Time
 }
 
 func newLocalHistory() *localHistory { return &localHistory{} }
@@ -187,6 +189,15 @@ func (h *localHistory) toNetworkHistory(now time.Time, p historyParams) *adapter
 	return out
 }
 
+// lastUsedAt returns when h last changed or the group last left its network,
+// whichever is later.
+func (h *localHistory) lastUsedAt() time.Time {
+	if h.leftAt.After(h.updatedAt) {
+		return h.leftAt
+	}
+	return h.updatedAt
+}
+
 // lastSuccess returns the last successful probe delay and when it was
 // measured.
 func (h *localHistory) lastSuccess() (uint32, time.Time) {
@@ -221,8 +232,8 @@ func (m *memberHistory) peek(env uint64) (*localHistory, bool) {
 	return h, ok
 }
 
-// delayHint returns the most recently observed successful probe delay on any
-// network other than exclude that changed within maxAge of now (maxAge <= 0
+// delayHint returns the most recent successful probe delay measured within
+// maxAge of now on any unexpired network other than exclude (maxAge <= 0
 // disables aging), or 0 if there is none. It carries a latency estimate onto
 // a network the member has no history for, never its failures.
 func (m *memberHistory) delayHint(exclude uint64, now time.Time, maxAge time.Duration) uint32 {
@@ -231,22 +242,26 @@ func (m *memberHistory) delayHint(exclude uint64, now time.Time, maxAge time.Dur
 		bestAt time.Time
 	)
 	for env, h := range m.byNetwork {
-		if env == exclude || expired(h.updatedAt, now, maxAge) {
+		if env == exclude || expired(h.lastUsedAt(), now, maxAge) {
 			continue
 		}
-		if delay, at := h.lastSuccess(); delay > 0 && (best == 0 || at.After(bestAt)) {
+		delay, at := h.lastSuccess()
+		if delay == 0 || expired(at, now, maxAge) {
+			continue
+		}
+		if best == 0 || at.After(bestAt) {
 			best, bestAt = delay, at
 		}
 	}
 	return best
 }
 
-// prune drops every network not in keep whose history was last changed more
-// than maxAge before now (maxAge <= 0 disables aging), then the least recently
-// changed others until at most maxNetworksPerMember remain.
+// prune drops every network not in keep whose history was last used more than
+// maxAge before now (maxAge <= 0 disables aging), then the least recently used
+// others until at most maxNetworksPerMember remain.
 func (m *memberHistory) prune(now time.Time, maxAge time.Duration, keep ...uint64) {
 	for env, h := range m.byNetwork {
-		if !slices.Contains(keep, env) && expired(h.updatedAt, now, maxAge) {
+		if !slices.Contains(keep, env) && expired(h.lastUsedAt(), now, maxAge) {
 			delete(m.byNetwork, env)
 		}
 	}
@@ -257,8 +272,8 @@ func (m *memberHistory) prune(now time.Time, maxAge time.Duration, keep ...uint6
 			found    bool
 		)
 		for env, h := range m.byNetwork {
-			if !slices.Contains(keep, env) && (!found || h.updatedAt.Before(oldestAt)) {
-				oldest, oldestAt, found = env, h.updatedAt, true
+			if usedAt := h.lastUsedAt(); !slices.Contains(keep, env) && (!found || usedAt.Before(oldestAt)) {
+				oldest, oldestAt, found = env, usedAt, true
 			}
 		}
 		if !found {
@@ -268,10 +283,10 @@ func (m *memberHistory) prune(now time.Time, maxAge time.Duration, keep ...uint6
 	}
 }
 
-// expired reports whether history last changed at updatedAt is more than
-// maxAge old at now. maxAge <= 0 never expires.
-func expired(updatedAt, now time.Time, maxAge time.Duration) bool {
-	return maxAge > 0 && now.Sub(updatedAt) > maxAge
+// expired reports whether at is more than maxAge before now. maxAge <= 0
+// never expires.
+func expired(at, now time.Time, maxAge time.Duration) bool {
+	return maxAge > 0 && now.Sub(at) > maxAge
 }
 
 // toTagHistory snapshots every network's history as of now, with the
@@ -286,6 +301,7 @@ func (m *memberHistory) toTagHistory(current uint64, now time.Time, p historyPar
 		if env == current {
 			out.UpdatedAt = n.UpdatedAt
 			out.LastSuccessDelayMs = n.LastSuccessDelayMs
+			out.LastSuccessAt = n.LastSuccessAt
 			out.LastOutcomeAt = n.LastOutcomeAt
 			out.ConsecutiveFailures = n.ConsecutiveFailures
 			out.HardDemoted = n.HardDemoted
@@ -356,8 +372,8 @@ func hydrateMemberHistory(t *adapter.TagHistory, current uint64, now time.Time, 
 		return m
 	}
 	if len(t.Networks) == 0 {
-		var successAt time.Time
-		if t.LastSuccessDelayMs > 0 {
+		successAt := t.LastSuccessAt
+		if successAt.IsZero() && t.LastSuccessDelayMs > 0 {
 			successAt = t.LastOutcomeAt
 		}
 		m.byNetwork[current] = hydrateLocalHistory(&adapter.NetworkHistory{

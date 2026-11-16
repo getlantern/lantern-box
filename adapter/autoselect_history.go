@@ -82,6 +82,9 @@ type TagHistory struct {
 	// LastSuccessDelayMs is the most recent successful probe RTT.
 	// 0 means "no successful probe yet".
 	LastSuccessDelayMs uint32 `json:"last_success_delay_ms,omitempty"`
+	// LastSuccessAt is when LastSuccessDelayMs was measured; zero in
+	// snapshots written before it was recorded.
+	LastSuccessAt time.Time `json:"last_success_at,omitempty"`
 	// LastOutcomeAt is the timestamp of the most recent probe outcome.
 	LastOutcomeAt time.Time `json:"last_outcome_at,omitempty"`
 	// ConsecutiveFailures counts probe failures since the last probe
@@ -107,8 +110,7 @@ type TagHistory struct {
 // environment. Fields shared with TagHistory mean the same as its top-level
 // fields.
 type NetworkHistory struct {
-	LastSuccessDelayMs uint32 `json:"last_success_delay_ms,omitempty"`
-	// LastSuccessAt is when LastSuccessDelayMs was measured.
+	LastSuccessDelayMs  uint32        `json:"last_success_delay_ms,omitempty"`
 	LastSuccessAt       time.Time     `json:"last_success_at,omitempty"`
 	LastOutcomeAt       time.Time     `json:"last_outcome_at,omitempty"`
 	ConsecutiveFailures uint32        `json:"consecutive_failures,omitempty"`
@@ -228,14 +230,15 @@ func (h *TagHistory) LatestSuccessDelay() uint32 {
 	return h.LastSuccessDelayMs
 }
 
-// LatestSuccessTime is best-effort: the spec only persists the most
-// recent outcome timestamp (success or failure), so callers asking
-// "tested N seconds ago" get UpdatedAt as a usable reference even when
-// the most recent outcome was a failure. Returns the zero time when h
-// is nil.
+// LatestSuccessTime returns when LatestSuccessDelay was measured, or the zero
+// time when h is nil or has no successful probe. For a snapshot without
+// LastSuccessAt it falls back to UpdatedAt.
 func (h *TagHistory) LatestSuccessTime() time.Time {
-	if h == nil {
+	if h == nil || h.LastSuccessDelayMs == 0 {
 		return time.Time{}
+	}
+	if !h.LastSuccessAt.IsZero() {
+		return h.LastSuccessAt
 	}
 	return h.UpdatedAt
 }

@@ -78,6 +78,12 @@ func newTestMUR(t *testing.T, tags ...string) (*MutableAutoSelect, map[string]*m
 	return s, obs
 }
 
+// historyForLocked returns tag's history on the current network environment,
+// creating an empty one if none exists. Caller must hold s.access.
+func (s *MutableAutoSelect) historyForLocked(tag string) *localHistory {
+	return s.memberHistoryLocked(tag).forNetwork(s.environment)
+}
+
 // recordSuccess writes a single fresh probe success to a member's
 // history, returning the timestamp so callers can compute a cycleStart
 // that includes (or excludes) the entry.

@@ -193,7 +193,8 @@ func (s *MutableAutoSelect) dispatchProbesLocked() {
 	if s.isClosed() || s.paused() {
 		return
 	}
-	// Every attempt records its result under the environment it starts on.
+	// Every attempt records its result under the environment it starts on,
+	// or under the one first identified while it runs.
 	s.refreshEnvironmentLocked()
 	s.startLadderBudgetLocked()
 	now := time.Now()
@@ -819,6 +820,7 @@ func (s *MutableAutoSelect) matchesGenerationLocked(generation uint64) bool {
 
 func (s *MutableAutoSelect) advanceNetworkLocked() {
 	s.networkGeneration.Add(1)
+	s.recordedUnidentified = false
 	s.setEnvironmentLocked(s.liveEnvironment())
 	now := time.Now()
 	// Only the first update after a quiet ladderCooldown lifts the ladder

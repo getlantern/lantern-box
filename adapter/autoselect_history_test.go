@@ -98,3 +98,13 @@ func TestUserFailure_UnmarshalJSON_LegacyTimestampClearsNetwork(t *testing.T) {
 	assert.Equal(t, UserFailureUnknown, u.Kind)
 	assert.Empty(t, u.Network, "a legacy failure has no network")
 }
+
+func TestTagHistory_LatestSuccessTime(t *testing.T) {
+	success := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	updated := success.Add(time.Minute)
+	assert.Zero(t, (*TagHistory)(nil).LatestSuccessTime())
+	assert.Zero(t, (&TagHistory{UpdatedAt: updated}).LatestSuccessTime(), "no successful probe")
+	assert.Equal(t, success, (&TagHistory{LastSuccessDelayMs: 40, LastSuccessAt: success, UpdatedAt: updated}).LatestSuccessTime())
+	assert.Equal(t, updated, (&TagHistory{LastSuccessDelayMs: 40, UpdatedAt: updated}).LatestSuccessTime(),
+		"a snapshot without LastSuccessAt falls back to UpdatedAt")
+}
