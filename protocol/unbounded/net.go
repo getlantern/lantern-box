@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
@@ -183,32 +185,107 @@ func (n *rtcNet) ListenUDP(network string, laddr *net.UDPAddr) (transport.UDPCon
 	return udpConn, nil
 }
 
+// DialTCP dials through n.dialer. In a running box that dialer wraps each conn for connection
+// tracking and counting, and the wrapper is a plain net.Conn, so the socket under it serves pion's
+// TCP-only methods. A dialer with no socket under its conn, such as a detour, is closed and the
+// address dialed directly, bound off the tunnel.
 func (n *rtcNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.TCPConn, error) {
 	conn, err := n.dialer.DialContext(n.ctx, network, metadata.SocksaddrFromNet(raddr))
 	if err != nil {
-		return nil, err
+		return nil, dialError(network, err)
 	}
-	tcpConn, ok := conn.(transport.TCPConn)
-	if !ok {
-		conn.Close()
-		return nil, &net.OpError{Op: "dial", Net: network, Addr: raddr,
-			Err: net.InvalidAddrError("sing-box dialer returned non-TCP conn")}
+	if tcp, ok := conn.(transport.TCPConn); ok {
+		return tcp, nil
 	}
-	return tcpConn, nil
-}
-
-func (n *rtcNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transport.UDPConn, error) {
-	conn, err := n.dialer.DialContext(n.ctx, network, metadata.SocksaddrFromNet(raddr))
+	if tcp, ok := common.Cast[*net.TCPConn](conn); ok {
+		return &wrappedTCPConn{Conn: conn, tcpOnly: tcp}, nil
+	}
+	conn.Close()
+	conn, err = n.dialDirect(network, raddr.String())
 	if err != nil {
 		return nil, err
 	}
-	udpConn, ok := conn.(transport.UDPConn)
-	if !ok {
-		conn.Close()
-		return nil, &net.OpError{Op: "dial", Net: network, Addr: raddr,
-			Err: net.InvalidAddrError("sing-box dialer returned non-UDP conn")}
+	return conn.(*net.TCPConn), nil
+}
+
+// DialUDP is DialTCP for UDP.
+func (n *rtcNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transport.UDPConn, error) {
+	conn, err := n.dialer.DialContext(n.ctx, network, metadata.SocksaddrFromNet(raddr))
+	if err != nil {
+		return nil, dialError(network, err)
 	}
-	return udpConn, nil
+	if udp, ok := conn.(transport.UDPConn); ok {
+		return udp, nil
+	}
+	if udp, ok := common.Cast[*net.UDPConn](conn); ok {
+		return &wrappedUDPConn{Conn: conn, udpOnly: udp}, nil
+	}
+	conn.Close()
+	conn, err = n.dialDirect(network, raddr.String())
+	if err != nil {
+		return nil, err
+	}
+	return conn.(*net.UDPConn), nil
+}
+
+func (n *rtcNet) dialDirect(network, address string) (net.Conn, error) {
+	d := net.Dialer{Control: physnet.ListenControl(n.ctx)}
+	conn, err := d.DialContext(n.ctx, network, address)
+	if err != nil {
+		return nil, dialError(network, err)
+	}
+	return conn, nil
+}
+
+// dialError is err without the address a *net.OpError carries: the addresses are the ICE servers
+// Freddie sends, and errors reach logs.
+func dialError(network string, err error) error {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		err = opErr.Err
+	}
+	return &net.OpError{Op: "dial", Net: network, Err: err}
+}
+
+// tcpOnly is the part of transport.TCPConn that net.Conn lacks, but for ReadFrom.
+type tcpOnly interface {
+	CloseRead() error
+	CloseWrite() error
+	SetLinger(sec int) error
+	SetKeepAlive(keepalive bool) error
+	SetKeepAlivePeriod(d time.Duration) error
+	SetNoDelay(noDelay bool) error
+	SetWriteBuffer(bytes int) error
+	SetReadBuffer(bytes int) error
+}
+
+// wrappedTCPConn is a conn the sing-box dialer wrapped: Read, Write and Close go through the
+// wrapper, so its tracking and counting still see them, and the TCP-only methods to the socket.
+type wrappedTCPConn struct {
+	net.Conn
+	tcpOnly
+}
+
+func (c *wrappedTCPConn) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(struct{ io.Writer }{c.Conn}, r)
+}
+
+// udpOnly is the part of transport.UDPConn that net.Conn lacks.
+type udpOnly interface {
+	SetReadBuffer(bytes int) error
+	SetWriteBuffer(bytes int) error
+	ReadFrom(p []byte) (n int, addr net.Addr, err error)
+	ReadFromUDP(b []byte) (n int, addr *net.UDPAddr, err error)
+	ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error)
+	WriteTo(p []byte, addr net.Addr) (n int, err error)
+	WriteToUDP(b []byte, addr *net.UDPAddr) (int, error)
+	WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error)
+}
+
+// wrappedUDPConn is wrappedTCPConn for UDP.
+type wrappedUDPConn struct {
+	net.Conn
+	udpOnly
 }
 
 // CreateDialer returns a transport.Dialer whose every method funnels back

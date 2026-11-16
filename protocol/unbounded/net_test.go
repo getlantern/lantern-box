@@ -3,15 +3,21 @@ package unbounded
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pion/transport/v5"
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/route"
 	"github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -197,4 +203,114 @@ func TestNewProtectedNetWithoutAVPN(t *testing.T) {
 	ifs, err := n.Interfaces()
 	require.NoError(t, err)
 	assert.NotEmpty(t, ifs)
+}
+
+// trackingCtx is the ctx a running box gives its dialers: with a connection manager, whose
+// DefaultDialer wraps every conn it dials.
+func trackingCtx() (context.Context, *route.ConnectionManager) {
+	cm := route.NewConnectionManager(nil)
+	return service.ContextWith[adapter.ConnectionManager](context.Background(), cm), cm
+}
+
+func TestRTCNetDialsThroughATrackingDialer(t *testing.T) {
+	ctx, cm := trackingCtx()
+	n, err := NewProtectedNet(ctx)
+	require.NoError(t, err)
+
+	t.Run("tcp", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer ln.Close()
+		accepted := make(chan net.Conn, 1)
+		go func() {
+			c, _ := ln.Accept()
+			accepted <- c
+		}()
+
+		c, err := n.DialTCP("tcp4", nil, ln.Addr().(*net.TCPAddr))
+		require.NoError(t, err)
+		peer := <-accepted
+		require.NotNil(t, peer)
+		defer peer.Close()
+		assert.Equal(t, 1, cm.Count(), "the dialer's tracking still holds the conn")
+		require.NoError(t, c.SetNoDelay(true))
+		_, err = c.Write([]byte("ping"))
+		require.NoError(t, err)
+		buf := make([]byte, 4)
+		_, err = io.ReadFull(peer, buf)
+		require.NoError(t, err)
+		assert.Equal(t, "ping", string(buf))
+		require.NoError(t, c.Close())
+		assert.Equal(t, 0, cm.Count(), "Close went through the tracking")
+	})
+
+	t.Run("udp", func(t *testing.T) {
+		peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		require.NoError(t, err)
+		defer peer.Close()
+
+		c, err := n.DialUDP("udp4", nil, peer.LocalAddr().(*net.UDPAddr))
+		require.NoError(t, err)
+		assert.Equal(t, 1, cm.Count(), "the dialer's tracking still holds the conn")
+		require.NoError(t, c.SetReadBuffer(1<<16))
+		_, err = c.Write([]byte("ping"))
+		require.NoError(t, err)
+		buf := make([]byte, 4)
+		require.NoError(t, peer.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, _, err = peer.ReadFromUDP(buf)
+		require.NoError(t, err)
+		assert.Equal(t, "ping", string(buf))
+		require.NoError(t, c.Close())
+		assert.Equal(t, 0, cm.Count(), "Close went through the tracking")
+	})
+}
+
+// pipeDialer dials a conn with no socket under it, as a detour through another outbound would.
+type pipeDialer struct {
+	N.Dialer
+	closed chan struct{}
+}
+
+func (d *pipeDialer) DialContext(context.Context, string, metadata.Socksaddr) (net.Conn, error) {
+	c, other := net.Pipe()
+	go func() {
+		_, _ = io.Copy(io.Discard, other)
+		close(d.closed)
+	}()
+	return c, nil
+}
+
+func TestRTCNetDialsDirectlyWhenTheDialerHidesTheSocket(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			c.Close()
+		}
+	}()
+	d := &pipeDialer{closed: make(chan struct{})}
+	n, err := newRTCNet(context.Background(), d, nil)
+	require.NoError(t, err)
+	c, err := n.DialTCP("tcp4", nil, ln.Addr().(*net.TCPAddr))
+	require.NoError(t, err)
+	defer c.Close()
+	assert.Equal(t, ln.Addr().String(), c.RemoteAddr().String())
+	select {
+	case <-d.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the dialer's conn was left open")
+	}
+}
+
+func TestRTCNetDialErrorsNameNoAddress(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().(*net.TCPAddr)
+	require.NoError(t, ln.Close())
+	n, err := NewProtectedNet(context.Background())
+	require.NoError(t, err)
+	_, err = n.DialTCP("tcp4", nil, addr)
+	require.Error(t, err)
+	assert.False(t, strings.Contains(err.Error(), strconv.Itoa(addr.Port)), "error %q names the address", err)
 }
