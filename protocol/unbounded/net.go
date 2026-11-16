@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/control"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
@@ -38,7 +40,7 @@ type rtcNet struct {
 	dialer N.Dialer
 	logger log.ContextLogger
 	// directFallback lets DialTCP and DialUDP dial directly when the dialer's conn has no socket.
-	// It is false with a detour, which a direct dial would skip.
+	// It is false with any dialer option, such as a detour, which a direct dial would skip.
 	directFallback bool
 }
 
@@ -192,9 +194,9 @@ func (n *rtcNet) ListenUDP(network string, laddr *net.UDPAddr) (transport.UDPCon
 // DialTCP dials through n.dialer. In a running box that dialer wraps each conn for connection
 // tracking and counting, and the wrapper is a plain net.Conn, so the socket under it serves pion's
 // TCP-only methods. A conn with no socket under it, such as a detour's through a QUIC- or mux-based
-// outbound, is closed. Without a detour the address is then dialed directly, bound off the tunnel;
-// with one the dial fails, since a direct dial would skip the detour and show the server this
-// host's address.
+// outbound or a tcp_fast_open one, is closed. With no dialer options the address is then dialed
+// directly, bound off the tunnel; with any the dial fails, since a direct dial would drop them: a
+// skipped detour, for one, would show the server this host's address.
 func (n *rtcNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.TCPConn, error) {
 	conn, err := n.dialer.DialContext(n.ctx, network, metadata.SocksaddrFromNet(raddr))
 	if err != nil {
@@ -236,7 +238,13 @@ func (n *rtcNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transport.U
 
 // errNoSocket is the error a dial fails with when the dialer's conn has no socket and a direct dial
 // isn't allowed.
-var errNoSocket = errors.New("unbounded: detour's conn has no socket for pion")
+var errNoSocket = errors.New("unbounded: dialer's conn has no socket for pion, and its options rule out a direct dial")
+
+// directFallbackAllowed reports whether an outbound's rtcNet may dial directly: only with no dialer
+// options at all, since the direct dial honours none of them.
+func directFallbackAllowed(opts option.DialerOptions) bool {
+	return reflect.DeepEqual(opts, option.DialerOptions{})
+}
 
 func (n *rtcNet) dialDirect(network string, raddr net.Addr) (net.Conn, error) {
 	if !n.directFallback {
@@ -436,10 +444,60 @@ func (n *rtcNet) ResolveIPAddr(network, address string) (*net.IPAddr, error) {
 // VPN, such as the app's Unbounded widget: it dials through sing-box's default dialer, binds its
 // sockets to the physical interface, gathers no candidate on the VPN's own interface, and resolves
 // through sing-box's DNS. With a ctx carrying no sing-box services it behaves as pion's own Net.
+//
+// sing-box's default dialer binds only with auto_detect_interface or a default interface set, so
+// in a VPN with neither it dials through a physDialer instead. The box's dialer stays wherever it
+// binds, for the marks and connection tracking it adds.
 func NewProtectedNet(ctx context.Context) (transport.Net, error) {
-	d, err := dialer.New(ctx, option.DialerOptions{}, false)
+	n, err := newRTCNet(ctx, nil, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	if nm := service.FromContext[adapter.NetworkManager](ctx); nm != nil &&
+		!nm.AutoDetectInterface() && nm.DefaultOptions().BindInterface == "" {
+		n.dialer = &physDialer{control: physnet.ListenControl(ctx), lookup: n.lookup}
+		return n, nil
+	}
+	n.dialer, err = dialer.New(ctx, option.DialerOptions{}, false)
 	if err != nil {
 		return nil, fmt.Errorf("unbounded: build sing-box dialer: %w", err)
 	}
-	return newRTCNet(ctx, d, nil, true)
+	return n, nil
+}
+
+// physDialer is an N.Dialer whose every socket gets physnet's control. It resolves a host through
+// lookup, as rtcNet does, since the OS resolver points into the tunnel, and through the OS resolver
+// only when sing-box can't be asked.
+type physDialer struct {
+	control control.Func
+	lookup  func(host string) ([]netip.Addr, bool, error)
+}
+
+func (d *physDialer) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
+	address := destination.String()
+	if destination.IsFqdn() {
+		addrs, ok, err := d.lookup(destination.Fqdn)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			a, err := pick(network, addrs)
+			if err != nil {
+				return nil, err
+			}
+			address = metadata.SocksaddrFrom(a, destination.Port).String()
+		}
+	}
+	nd := net.Dialer{Control: d.control}
+	return nd.DialContext(ctx, network, address)
+}
+
+// ListenPacket picks the family as sing-box's default dialer does.
+func (d *physDialer) ListenPacket(ctx context.Context, destination metadata.Socksaddr) (net.PacketConn, error) {
+	network := N.NetworkUDP
+	if destination.IsIPv4() && !destination.Addr.IsUnspecified() {
+		network += "4"
+	}
+	lc := net.ListenConfig{Control: d.control}
+	return lc.ListenPacket(ctx, network, "")
 }

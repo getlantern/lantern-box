@@ -8,14 +8,18 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/pion/transport/v5"
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/route"
 	"github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing/common/control"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
@@ -203,6 +207,114 @@ func TestNewProtectedNetWithoutAVPN(t *testing.T) {
 	ifs, err := n.Interfaces()
 	require.NoError(t, err)
 	assert.NotEmpty(t, ifs)
+}
+
+// unboundNetworkManager is a VPN's NetworkManager without auto_detect_interface, so sing-box's
+// default dialer binds nothing. Its auto-detect control counts the sockets it is given.
+type unboundNetworkManager struct {
+	adapter.NetworkManager
+	calls atomic.Int32
+}
+
+func (m *unboundNetworkManager) AutoDetectInterface() bool { return false }
+func (m *unboundNetworkManager) DefaultOptions() adapter.NetworkOptions {
+	return adapter.NetworkOptions{}
+}
+func (m *unboundNetworkManager) InterfaceFinder() control.InterfaceFinder {
+	return control.NewDefaultInterfaceFinder()
+}
+func (m *unboundNetworkManager) AutoRedirectOutputMarkFunc() control.Func      { return nil }
+func (m *unboundNetworkManager) ProtectFunc() control.Func                     { return nil }
+func (m *unboundNetworkManager) InterfaceMonitor() tun.DefaultInterfaceMonitor { return nil }
+func (m *unboundNetworkManager) AutoDetectInterfaceFunc() control.Func {
+	return func(network, address string, conn syscall.RawConn) error {
+		m.calls.Add(1)
+		return nil
+	}
+}
+
+func TestNewProtectedNetProtectsWithoutAutoDetect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	tcpAddr := ln.Addr().(*net.TCPAddr)
+
+	nm := &unboundNetworkManager{}
+	ctx := service.ContextWith[adapter.NetworkManager](context.Background(), nm)
+	n, err := NewProtectedNet(ctx)
+	require.NoError(t, err)
+
+	t.Run("dial tcp", func(t *testing.T) {
+		nm.calls.Store(0)
+		c, err := n.DialTCP("tcp4", nil, tcpAddr)
+		require.NoError(t, err)
+		c.Close()
+		assert.NotZero(t, nm.calls.Load(), "the socket was not protected")
+	})
+
+	t.Run("listen packet", func(t *testing.T) {
+		nm.calls.Store(0)
+		pc, err := n.ListenPacket("udp4", "127.0.0.1:3478")
+		require.NoError(t, err)
+		pc.Close()
+		assert.NotZero(t, nm.calls.Load(), "the socket was not protected")
+	})
+
+	// A host is resolved through sing-box's DNS, not the OS resolver whose server is in the tunnel.
+	t.Run("dial domain", func(t *testing.T) {
+		nm.calls.Store(0)
+		router := &fakeRouter{addrs: []netip.Addr{netip.MustParseAddr("127.0.0.1")}}
+		dctx := service.ContextWith[adapter.NetworkManager](dnsCtx(router, C.DNSTypeHTTPS), nm)
+		n, err := NewProtectedNet(dctx)
+		require.NoError(t, err)
+		c, err := n.Dial("tcp4", net.JoinHostPort("turn.example", strconv.Itoa(tcpAddr.Port)))
+		require.NoError(t, err)
+		c.Close()
+		assert.Equal(t, []string{"turn.example"}, router.asked)
+		assert.NotZero(t, nm.calls.Load(), "the socket was not protected")
+	})
+}
+
+func TestNewProtectedNetWithoutAVPNDials(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			c.Close()
+		}
+	}()
+	n, err := NewProtectedNet(context.Background())
+	require.NoError(t, err)
+	c, err := n.DialTCP("tcp4", nil, ln.Addr().(*net.TCPAddr))
+	require.NoError(t, err)
+	c.Close()
+	pc, err := n.ListenPacket("udp4", "127.0.0.1:3478")
+	require.NoError(t, err)
+	pc.Close()
+}
+
+// Any dialer option is policy a direct dial would drop: tcp_fast_open, for one, hides the socket
+// on every conn, so the fallback would take every dial.
+func TestDirectFallbackOnlyWithoutDialerOptions(t *testing.T) {
+	with := func(o option.AbstractDialerOptions) option.DialerOptions {
+		return option.DialerOptions{AbstractDialerOptions: o}
+	}
+	assert.True(t, directFallbackAllowed(option.DialerOptions{}))
+	assert.False(t, directFallbackAllowed(option.DialerOptions{Detour: "proxy"}))
+	assert.False(t, directFallbackAllowed(with(option.AbstractDialerOptions{TCPFastOpen: true})))
+	assert.False(t, directFallbackAllowed(with(option.AbstractDialerOptions{BindInterface: "en0"})))
+	assert.False(t, directFallbackAllowed(with(option.AbstractDialerOptions{RoutingMark: 1})))
 }
 
 // trackingCtx is the ctx a running box gives its dialers: with a connection manager, whose
