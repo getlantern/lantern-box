@@ -163,8 +163,9 @@ func TestRTCNetInterfaceFiltering(t *testing.T) {
 		// With no default known, a point-to-point link or ppp0 may be the uplink.
 		{"no default", vpnCtx([]string{"utun4"}, ""),
 			[]string{"lo0", "en0", "ppp0", "pdp_ip0", "p2plink"}},
+		// With no VPN there is no tunnel of ours to keep checks out of, and the Net is pion's own.
 		{"no VPN", context.Background(),
-			[]string{"lo0", "en0", "ppp0", "pdp_ip0", "p2plink"}},
+			[]string{"lo0", "en0", "utun3", "utun4", "ppp0", "pdp_ip0", "gif0", "wg0", "p2plink"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			n, err := newRTCNet(c.ctx, nil, nil, true)

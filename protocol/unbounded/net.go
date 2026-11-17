@@ -100,9 +100,11 @@ func hasAnyPrefix(s string, prefixes []string) bool {
 }
 
 // hides is true for the VPN's own interfaces even when one is the default: our tunnel is never a
-// way out for a candidate.
-func (f interfaceFilter) hides(name string, flags net.Flags) bool {
+// way out for a candidate. A nil filter, with no VPN, hides nothing.
+func (f *interfaceFilter) hides(name string, flags net.Flags) bool {
 	switch {
+	case f == nil:
+		return false
 	case f.mine[name]:
 		return true
 	case f.def == "":
@@ -113,17 +115,18 @@ func (f interfaceFilter) hides(name string, flags net.Flags) bool {
 }
 
 // interfaceFilter is read on each call, since the tunnel comes back under a new name after a
-// restart and the default interface changes with the network.
-func (n *rtcNet) interfaceFilter() interfaceFilter {
+// restart and the default interface changes with the network. It is nil with no VPN, so that a Net
+// without sing-box behaves as pion's own.
+func (n *rtcNet) interfaceFilter() *interfaceFilter {
 	nm := service.FromContext[adapter.NetworkManager](n.ctx)
 	if nm == nil {
-		return interfaceFilter{}
+		return nil
 	}
 	monitor := nm.InterfaceMonitor()
 	if monitor == nil {
-		return interfaceFilter{}
+		return nil
 	}
-	var f interfaceFilter
+	f := &interfaceFilter{}
 	if names := monitor.MyInterfaces(); len(names) > 0 {
 		f.mine = make(map[string]bool, len(names))
 		for _, name := range names {
