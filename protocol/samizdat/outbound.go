@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/sagernet/sing/common/uot"
 
 	"github.com/getlantern/lantern-box/constant"
+	L "github.com/getlantern/lantern-box/log"
 	"github.com/getlantern/lantern-box/option"
 
 	samizdat "github.com/getlantern/samizdat"
@@ -124,6 +126,7 @@ func NewOutbound(
 		MaxStreamsPerConn:    options.MaxStreamsPerConn,
 		IdleTimeout:          idleTimeout,
 		ConnectTimeout:       connectTimeout,
+		Logger:               slog.New(L.NewLogHandler(logger)),
 		Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
 			return outboundDialer.DialContext(ctx, network, M.ParseSocksaddr(address))
 		},
