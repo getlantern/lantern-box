@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/log"
 	O "github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/metadata"
 	"golang.getoutline.org/sdk/transport"
+	"golang.getoutline.org/sdk/x/configurl"
 	"golang.getoutline.org/sdk/x/smart"
 
 	"github.com/getlantern/lantern-box/option"
@@ -51,7 +53,7 @@ func (d *recordingDialer) dialed(addr string) bool {
 	return slices.Contains(d.addrs, addr)
 }
 
-func TestSmartConfigAcceptedByStrategyFinder(t *testing.T) {
+func TestSmartConfigAcceptedByFinder(t *testing.T) {
 	options := option.OutboundOutlineOptions{
 		DialerOptions: O.DialerOptions{Detour: "direct", AbstractDialerOptions: O.AbstractDialerOptions{BindInterface: "eth0"}},
 		ServerOptions: O.ServerOptions{Server: "example.com", ServerPort: 443},
@@ -62,6 +64,7 @@ func TestSmartConfigAcceptedByStrategyFinder(t *testing.T) {
 			{UDP: &option.UDPEntryConfig{Address: "192.0.2.4:53"}},
 		},
 		TLS:         []string{"", "split:1", "tlsfrag:1"},
+		Fallback:    []string{"socks5://192.0.2.5:1080"},
 		TestTimeout: "5s",
 		Domains:     []string{"cdn.jsdelivr.net"},
 	}
@@ -71,15 +74,25 @@ func TestSmartConfigAcceptedByStrategyFinder(t *testing.T) {
 	}
 
 	d := &recordingDialer{}
-	finder := &smart.StrategyFinder{TestTimeout: 5 * time.Second, StreamDialer: d, PacketDialer: d}
+	registry := configurl.NewDefaultRegistry()
+	configurl.RegisterBase(registry, func(context.Context, configurl.Registry, *configurl.Config) (transport.StreamDialer, error) {
+		return d, nil
+	})
+	configurl.RegisterBase(registry, func(context.Context, configurl.Registry, *configurl.Config) (transport.PacketDialer, error) {
+		return d, nil
+	})
+	finder, err := smart.NewFinderConfig().SetTestTimeout(5 * time.Second).SetConfigURLRegistry(registry).New()
+	if err != nil {
+		t.Fatalf("FinderConfig.New: %v", err)
+	}
 	_, err = finder.NewDialer(context.Background(), options.Domains, config)
 	if err == nil {
 		t.Fatal("NewDialer succeeded with every dial refused")
 	}
 	if strings.Contains(err.Error(), "parse config") {
-		t.Fatalf("StrategyFinder rejected config:\n%s\nerror: %v", config, err)
+		t.Fatalf("Finder rejected config:\n%s\nerror: %v", config, err)
 	}
-	for _, addr := range []string{"192.0.2.1:443", "192.0.2.2:853", "192.0.2.3:53", "192.0.2.4:53"} {
+	for _, addr := range []string{"192.0.2.1:443", "192.0.2.2:853", "192.0.2.3:53", "192.0.2.4:53", "192.0.2.5:1080"} {
 		if !d.dialed(addr) {
 			t.Errorf("resolver %s was never tried; config:\n%s", addr, config)
 		}
@@ -267,4 +280,44 @@ func TestCancelledDialLeavesSearchRunning(t *testing.T) {
 			t.Fatalf("createDialer called %d times, want 1", got)
 		}
 	})
+}
+
+func TestNewOutboundOptions(t *testing.T) {
+	ptr := func(s string) *string { return &s }
+	for _, tc := range []struct {
+		name     string
+		mutate   func(*option.OutboundOutlineOptions)
+		networks []string
+		wantErr  string
+	}{
+		{"defaults are TCP-only", func(*option.OutboundOutlineOptions) {}, []string{"tcp"}, ""},
+		{"zero timeout uses the SDK default", func(o *option.OutboundOutlineOptions) { o.TestTimeout = "0s" }, []string{"tcp"}, ""},
+		{"bad timeout", func(o *option.OutboundOutlineOptions) { o.TestTimeout = "soon" }, nil, "soon"},
+		{"plain UDP", func(o *option.OutboundOutlineOptions) { o.UDP = ptr("") }, []string{"tcp", "udp"}, ""},
+		{"quicprelude UDP", func(o *option.OutboundOutlineOptions) { o.UDP = ptr("quicprelude:count=2&version=reserved") }, []string{"tcp", "udp"}, ""},
+		{"bad quicprelude option", func(o *option.OutboundOutlineOptions) { o.UDP = ptr("quicprelude:mode=nonsense") }, nil, "nonsense"},
+		{"stream-only transport rejected for UDP", func(o *option.OutboundOutlineOptions) { o.UDP = ptr("tlsfrag:1") }, nil, "udp config"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := option.OutboundOutlineOptions{Domains: []string{"example.com"}}
+			tc.mutate(&options)
+			out, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "outline", options)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("NewOutbound: got %v, want an error mentioning %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewOutbound: %v", err)
+			}
+			if got := out.Network(); !slices.Equal(got, tc.networks) {
+				t.Fatalf("Network() = %v, want %v", got, tc.networks)
+			}
+			_, err = out.ListenPacket(context.Background(), metadata.ParseSocksaddr("127.0.0.1:443"))
+			if udp := slices.Contains(tc.networks, "udp"); !udp && err == nil {
+				t.Fatal("ListenPacket succeeded on a TCP-only outbound")
+			}
+		})
+	}
 }
