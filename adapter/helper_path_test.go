@@ -7,6 +7,12 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// HelperPathGrace mirrors broflake's default no-path grace, one room
+// attempt's worst case.
+func TestHelperPathGrace(t *testing.T) {
+	assert.Equal(t, 20*time.Second, HelperPathGrace)
+}
+
 func TestNewHelperPathStatus(t *testing.T) {
 	now := time.Now()
 	for _, tc := range []struct {

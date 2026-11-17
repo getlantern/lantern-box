@@ -399,8 +399,12 @@ type helperPathSource struct {
 // HelperPath reports a rooms-only (helper) consumer's WebRTC path to its
 // helper, which is unavailable once no slot has been connected for
 // lbAdapter.HelperPathGrace, whether one was and dropped or none has been
-// since Start: then broflake fails its flows and dials and, unlike a pool
-// consumer, nothing will offer it another peer. ok is
+// since Start: then broflake resets its open streams and, unlike a pool
+// consumer, nothing will offer it another peer. The grace delays only that
+// reset and the "unavailable" report: new dials fail at once whenever no
+// slot is connected (checkHelperConnected), so a slot that drops and
+// reconnects within the grace still fails the flows dialed meanwhile, and
+// Available stays true through it only as a UI debounce. ok is
 // false for a pool consumer and before Start. It takes one mutex in
 // broflake, so a status poll may call it freely.
 func (o *Outbound) HelperPath() (lbAdapter.HelperPathStatus, bool) {

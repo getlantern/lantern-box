@@ -3,12 +3,17 @@ package adapter
 import "time"
 
 // HelperPathGrace is how long a rooms (helper) consumer may go without a
-// connected WebRTC path before it reports its helper unavailable. It is also
-// the grace after which broflake fails the consumer's QUIC streams and dials
-// (WebRTCOptions.ConsumerNoPathGrace), so the two agree: a slot that drops
-// and reconnects at once, as a data channel sometimes does, never shows, and
-// a path that stays down is reported down when its flows start failing.
-const HelperPathGrace = 10 * time.Second
+// connected WebRTC path before its open streams are reset and it reports its
+// helper unavailable. It mirrors broflake's default no-path grace, which the
+// outbound passes as WebRTCOptions.ConsumerNoPathGrace: one room attempt's
+// worst case, ICE gathering (capped at 8s) plus the 10s a room attempt waits
+// for its data channel. The grace only delays those two things. New dials
+// fail at once whenever no slot is connected (see the outbound's
+// checkHelperConnected), so while a slot reconnects new flows fail even
+// though Available stays true: Available is a debounce for the UI, so a
+// brief drop doesn't flash the helper as unavailable, not a promise that
+// the consumer carries traffic.
+const HelperPathGrace = 20 * time.Second
 
 // HelperPathStatus is a rooms consumer's view of its WebRTC path to a helper.
 // Connected means a WebRTC data channel to a helper is open, not that the
@@ -33,8 +38,8 @@ type HelperPathStatus struct {
 	Since time.Time
 	// Available reports whether the consumer is connected, or has been
 	// disconnected, or looking for its helper since starting, for less than
-	// HelperPathGrace. Connecting counts as available, though it carries no
-	// traffic yet.
+	// HelperPathGrace. It is a UI debounce: while connecting, or reconnecting
+	// within the grace, it is true though new dials fail at once.
 	Available bool
 }
 
