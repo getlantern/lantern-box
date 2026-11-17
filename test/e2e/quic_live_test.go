@@ -133,3 +133,32 @@ func TestOutlineLiveQUICSites(t *testing.T) {
 		t.Logf("outline %s → proto=%s bytes=%d", u, proto, n)
 	}
 }
+
+// TestHedgeLiveQUICSites sends real HTTP/3 requests through a hedge whose
+// First is the outline outbound with quicprelude and whose Then is direct, so
+// the UDP hedge, including commit on the first reply, runs against real QUIC
+// servers. It reaches the internet, so it only runs with QUIC_LIVE=1.
+func TestHedgeLiveQUICSites(t *testing.T) {
+	if os.Getenv("QUIC_LIVE") == "" {
+		t.Skip("set QUIC_LIVE=1 to run against live QUIC sites")
+	}
+	boxCtx := box.BaseContext()
+	clientPort := freePort(t)
+	startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
+		"log": {"level": "error"},
+		"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+		"outbounds": [
+			{"type": "hedge", "tag": "smart", "first": "proxyless", "then": "direct"},
+			{"type": "outline", "tag": "proxyless", "domains": ["example.com"], "udp": "quicprelude:count=1"},
+			{"type": "direct", "tag": "direct"}
+		],
+		"route": {"final": "smart"}
+	}`, clientPort)))
+	sc := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
+	for _, u := range []string{"https://www.youtube.com/", "https://i.ytimg.com/generate_204", "https://www.google.com/generate_204", "https://cloudflare-quic.com/"} {
+		proto, n, err := h3Get(t, u, sc)
+		require.NoError(t, err, u)
+		require.Equal(t, "HTTP/3.0", proto)
+		t.Logf("hedge %s → proto=%s bytes=%d", u, proto, n)
+	}
+}

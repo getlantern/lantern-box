@@ -123,6 +123,7 @@ func registerOutbounds(registry *outbound.Registry) {
 	// utility outbounds
 	banditprobe.RegisterOutbound(registry)
 	group.RegisterFallback(registry)
+	group.RegisterHedge(registry)
 	group.RegisterMutableSelector(registry)
 	group.RegisterMutableURLTest(registry)
 	group.RegisterMutableAutoSelect(registry)

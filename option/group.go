@@ -12,6 +12,31 @@ type FallbackOutboundOptions struct {
 	Fallback string `json:"fallback"`
 }
 
+// HedgeOutboundOptions configure a hedge: each connection goes to First, and
+// moves to Then, replaying what the client sent, if First gives no reply.
+// Whether First worked is remembered per site, so a site First can't reach
+// goes straight to Then until FailureTTL passes.
+type HedgeOutboundOptions struct {
+	// First and Then are outbound tags. First is typically a proxyless
+	// outbound, Then the proxy group. Bandit probes always go to Then.
+	First string `json:"first"`
+	Then  string `json:"then"`
+	// CommitTimeout is how long First may take to send its first byte after
+	// the client's first write before the connection moves to Then.
+	// Default 1s.
+	CommitTimeout badoption.Duration `json:"commit_timeout,omitempty"`
+	// FailureTTL is how long a site First failed for skips First. Default
+	// 5m, longer than the GFW's 180s residual block.
+	FailureTTL badoption.Duration `json:"failure_ttl,omitempty"`
+	// SuccessTTL is how long a site First worked for is remembered as good,
+	// which keeps the address-block prior below from sending it to Then.
+	// Default 1h.
+	SuccessTTL badoption.Duration `json:"success_ttl,omitempty"`
+	// MaxHeldBytes bounds what is kept for replay before First replies. A
+	// connection that writes more stays on First. Default 64 KiB.
+	MaxHeldBytes int `json:"max_held_bytes,omitempty"`
+}
+
 type MutableSelectorOutboundOptions struct {
 	Outbounds []string `json:"outbounds"`
 }
