@@ -18,26 +18,41 @@ type HelperPathStatus struct {
 	// connected to a helper now.
 	Connected bool
 	// Connecting reports whether no slot has connected since the consumer
-	// started: it is still looking for its helper, and has lost nothing.
+	// started, less than HelperPathGrace ago: it is still looking for its
+	// helper. A consumer still looking after that is unavailable, as one that
+	// lost its helper is: the helper is offline or unreachable, and broflake
+	// fails its dials.
 	Connecting bool
+	// NeverConnected reports whether no slot has connected since the
+	// consumer started.
+	NeverConnected bool
 	// Since is when Connected last changed, the first slot connecting or the
-	// last one dropping, or zero while Connecting.
+	// last one dropping, or, while NeverConnected, when the consumer started.
+	// A consumer restarts, and so starts over, whenever a personal proxy
+	// selection narrows or widens its tickets.
 	Since time.Time
-	// Available is false once the consumer has lost its helper: a slot was
-	// connected, and none has been for HelperPathGrace. It is true while
-	// Connecting, which is not a loss but carries no traffic either.
+	// Available reports whether the consumer is connected, or has been
+	// disconnected, or looking for its helper since starting, for less than
+	// HelperPathGrace. Connecting counts as available, though it carries no
+	// traffic yet.
 	Available bool
 }
 
 // NewHelperPathStatus returns, as of now, the status of a path that has been
-// connected, or not, since since, zero if it never has been.
-func NewHelperPathStatus(connected bool, since, now time.Time) HelperPathStatus {
-	connecting := !connected && since.IsZero()
+// connected, or not, since since, which is zero if no slot has connected
+// since the consumer started at started.
+func NewHelperPathStatus(connected bool, since, started, now time.Time) HelperPathStatus {
+	never := !connected && since.IsZero()
+	if never {
+		since = started
+	}
+	available := connected || since.IsZero() || now.Sub(since) < HelperPathGrace
 	return HelperPathStatus{
-		Connected:  connected,
-		Connecting: connecting,
-		Since:      since,
-		Available:  connected || connecting || now.Sub(since) < HelperPathGrace,
+		Connected:      connected,
+		Connecting:     never && available,
+		NeverConnected: never,
+		Since:          since,
+		Available:      available,
 	}
 }
 

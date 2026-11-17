@@ -27,9 +27,11 @@ func newLoggedTestOutbound(t *testing.T, tag string) *Outbound {
 	return out.(*Outbound)
 }
 
-func setConsumerConnected(o *Outbound, connected bool, since time.Time) {
-	f := func() (bool, time.Time) { return connected, since }
-	o.consumerConnected.Store(&f)
+func setConsumerConnected(o *Outbound, connected bool, since, started time.Time) {
+	o.path.Store(&helperPathSource{
+		connected: func() (bool, time.Time) { return connected, since },
+		started:   started,
+	})
 }
 
 // A helper consumer gives broflake the same no-path grace it reports its
@@ -43,7 +45,7 @@ func TestNewOutbound_HelperPathGrace(t *testing.T) {
 func TestHelperPath(t *testing.T) {
 	t.Run("pool consumer", func(t *testing.T) {
 		o := newTestOutbound(t, context.Background(), "unbounded-out-pool1")
-		setConsumerConnected(o, true, time.Now())
+		setConsumerConnected(o, true, time.Now(), time.Now())
 		_, ok := o.HelperPath()
 		assert.False(t, ok)
 	})
@@ -65,7 +67,7 @@ func TestHelperPath(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			since := time.Now().Add(-tc.down)
-			setConsumerConnected(o, tc.connected, since)
+			setConsumerConnected(o, tc.connected, since, since.Add(-time.Hour))
 			s, ok := o.HelperPath()
 			require.True(t, ok)
 			assert.Equal(t, tc.connected, s.Connected)
@@ -73,27 +75,49 @@ func TestHelperPath(t *testing.T) {
 			assert.Equal(t, tc.available, s.Available)
 		})
 	}
-	t.Run("never connected", func(t *testing.T) {
-		setConsumerConnected(o, false, time.Time{})
+	t.Run("never connected, just started", func(t *testing.T) {
+		started := time.Now()
+		setConsumerConnected(o, false, time.Time{}, started)
 		s, ok := o.HelperPath()
 		require.True(t, ok)
 		assert.True(t, s.Connecting)
+		assert.True(t, s.NeverConnected)
 		assert.True(t, s.Available)
+		assert.Equal(t, started, s.Since)
+	})
+	// The helper was offline when the consumer started, as when selecting a
+	// friend restarts it: unavailable once broflake fails its dials.
+	t.Run("never connected past grace", func(t *testing.T) {
+		started := time.Now().Add(-lbAdapter.HelperPathGrace - time.Second)
+		setConsumerConnected(o, false, time.Time{}, started)
+		s, ok := o.HelperPath()
+		require.True(t, ok)
+		assert.False(t, s.Connecting)
+		assert.True(t, s.NeverConnected)
+		assert.False(t, s.Available)
+		assert.Equal(t, started, s.Since)
 	})
 }
 
 // A started helper consumer reports its real engine's path: with no peer ever
-// offered, not connected, and not lost. Broflake reports a zero since until a
-// slot first connects (a version before that reported the engine's start).
+// offered, connecting since its own Start. A consumer started later, as a
+// restart recreates it, counts from its own Start.
 func TestHelperPath_RealEngine(t *testing.T) {
+	before := time.Now()
 	o := startNoPeerOutbound(t, "helper-0123456789ab")
 	s, ok := o.HelperPath()
 	require.True(t, ok)
 	assert.False(t, s.Connected)
-	if !s.Since.IsZero() {
-		assert.WithinDuration(t, time.Now(), s.Since, 5*time.Second)
-	}
+	assert.True(t, s.NeverConnected)
+	assert.True(t, s.Connecting)
 	assert.True(t, s.Available)
+	assert.False(t, s.Since.Before(before), "since is the consumer's start")
+
+	time.Sleep(10 * time.Millisecond)
+	restarted := startNoPeerOutbound(t, "helper-0123456789ab")
+	s2, ok := restarted.HelperPath()
+	require.True(t, ok)
+	assert.True(t, s2.Since.After(s.Since), "a restarted consumer starts over")
 
 	_, ok = startNoPeerOutbound(t, "unbounded-out-pool1").HelperPath()
 	assert.False(t, ok)

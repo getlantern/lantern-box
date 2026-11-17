@@ -90,10 +90,9 @@ type Outbound struct {
 	// reads it before each dial so it can fail at once when no helper is
 	// connected.
 	consumerSlots func() []UBClientcore.ConsumerSlot
-	// consumerConnected is broflake's BroflakeEngine.ConsumerConnected, for
-	// HelperPath. Atomic because status readers may call HelperPath while
-	// Start is setting it.
-	consumerConnected atomic.Pointer[func() (bool, time.Time)]
+	// path is what HelperPath reads, set at Start. Atomic because status
+	// readers may call HelperPath while Start is setting it.
+	path atomic.Pointer[helperPathSource]
 
 	// Constructed in NewOutbound; observes successful dial latencies and
 	// emits structured warnings when the current pairing's dials look
@@ -247,8 +246,7 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 	o.broflakeConn = bfConn
 	o.ui = ui
 	o.consumerSlots = ui.BroflakeEngine.ConsumerSlots
-	connected := ui.BroflakeEngine.ConsumerConnected
-	o.consumerConnected.Store(&connected)
+	o.path.Store(&helperPathSource{connected: ui.BroflakeEngine.ConsumerConnected, started: startedAt})
 	o.ql = ql
 	o.dial = UBClientcore.CreateSOCKS5Dialer(ql)
 
@@ -389,23 +387,32 @@ func helperUnavailable(err error) (error, bool) {
 
 var _ lbAdapter.HelperPathReporter = (*Outbound)(nil)
 
+// helperPathSource is what a started consumer's HelperPath reads: broflake's
+// BroflakeEngine.ConsumerConnected, and when Start began, which is when a
+// consumer that never connects started looking for its helper. Each
+// outbound starts once; radiance restarts a consumer by recreating it.
+type helperPathSource struct {
+	connected func() (bool, time.Time)
+	started   time.Time
+}
+
 // HelperPath reports a rooms-only (helper) consumer's WebRTC path to its
-// helper, which is unavailable once a slot has been connected and none has
-// been for lbAdapter.HelperPathGrace: then broflake has failed its flows and
-// dials and, unlike a pool consumer, nothing will offer it another peer.
-// Until a slot first connects it is connecting, not unavailable. ok is
+// helper, which is unavailable once no slot has been connected for
+// lbAdapter.HelperPathGrace, whether one was and dropped or none has been
+// since Start: then broflake fails its flows and dials and, unlike a pool
+// consumer, nothing will offer it another peer. ok is
 // false for a pool consumer and before Start. It takes one mutex in
 // broflake, so a status poll may call it freely.
 func (o *Outbound) HelperPath() (lbAdapter.HelperPathStatus, bool) {
 	if !o.rtcOpt.ConsumerRoomsOnly {
 		return lbAdapter.HelperPathStatus{}, false
 	}
-	connected := o.consumerConnected.Load()
-	if connected == nil {
+	src := o.path.Load()
+	if src == nil {
 		return lbAdapter.HelperPathStatus{}, false
 	}
-	up, since := (*connected)()
-	return lbAdapter.NewHelperPathStatus(up, since, time.Now()), true
+	up, since := src.connected()
+	return lbAdapter.NewHelperPathStatus(up, since, src.started, time.Now()), true
 }
 
 // checkHelperConnected fails a rooms-only consumer's dial at once while no
