@@ -62,10 +62,62 @@ func newRTCNet(ctx context.Context, dialer N.Dialer, logger log.ContextLogger, d
 	}, nil
 }
 
-// myInterfaces is the set of interfaces the VPN serving n.ctx registered as its own: its tunnel. It
-// is read on each call, since the tunnel comes back under a new name after a restart, and is nil
-// with no VPN.
-func (n *rtcNet) myInterfaces() map[string]bool {
+// interfaceFilter is which interfaces pion must not see: the VPN's own and any other tunnel.
+type interfaceFilter struct {
+	// mine is the set the VPN serving the ctx registered as its own: its tunnel.
+	mine map[string]bool
+	// def is the VPN's default interface, kept even when it looks like a tunnel. Unknown, only
+	// unmistakable tunnel names are hidden, since a point-to-point link may be the uplink.
+	def string
+}
+
+// tunnelPrefixes name tunnels unmistakably, including ones without the point-to-point flag such as
+// tap and WireGuard.
+var tunnelPrefixes = []string{"utun", "tun", "tap", "wg", "tailscale", "gif", "stf", "ipsec"}
+
+// cellularPrefixes name mobile data links, some point-to-point, such as iOS's pdp_ip and Android's
+// clat v4- interfaces: the device's way out, not another VPN.
+var cellularPrefixes = []string{"pdp_ip", "rmnet", "ccmni", "wwan", "v4-"}
+
+// isTunnel is whether an interface looks like a tunnel: point-to-point, PPP or a tunnel's name.
+// Windows flags only PPP and tunnel adapters, so Wintun and TAP adapters, with names their apps
+// choose, pass.
+func isTunnel(name string, flags net.Flags) bool {
+	if hasAnyPrefix(name, cellularPrefixes) {
+		return false
+	}
+	return flags&net.FlagPointToPoint != 0 || strings.HasPrefix(name, "ppp") ||
+		hasAnyPrefix(name, tunnelPrefixes)
+}
+
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// hides is true for the VPN's own interfaces even when one is the default: our tunnel is never a
+// way out for a candidate. A nil filter, with no VPN, hides nothing.
+func (f *interfaceFilter) hides(name string, flags net.Flags) bool {
+	switch {
+	case f == nil:
+		return false
+	case f.mine[name]:
+		return true
+	case f.def == "":
+		return hasAnyPrefix(name, tunnelPrefixes)
+	default:
+		return name != f.def && isTunnel(name, flags)
+	}
+}
+
+// interfaceFilter is read on each call, since the tunnel comes back under a new name after a
+// restart and the default interface changes with the network. It is nil with no VPN, so that a Net
+// without sing-box behaves as pion's own.
+func (n *rtcNet) interfaceFilter() *interfaceFilter {
 	nm := service.FromContext[adapter.NetworkManager](n.ctx)
 	if nm == nil {
 		return nil
@@ -74,70 +126,72 @@ func (n *rtcNet) myInterfaces() map[string]bool {
 	if monitor == nil {
 		return nil
 	}
-	names := monitor.MyInterfaces()
-	if len(names) == 0 {
-		return nil
+	f := &interfaceFilter{}
+	if names := monitor.MyInterfaces(); len(names) > 0 {
+		f.mine = make(map[string]bool, len(names))
+		for _, name := range names {
+			f.mine[name] = true
+		}
 	}
-	mine := make(map[string]bool, len(names))
-	for _, name := range names {
-		mine[name] = true
+	if def := monitor.DefaultInterface(); def != nil {
+		f.def = def.Name
 	}
-	return mine
+	return f
 }
 
-// Interfaces lists the host's interfaces for pion's host candidates, without the VPN's own. A
-// candidate on the tunnel's address sends into the tunnel, even from this process whose other
-// sockets skip it, and physnet would pin its socket there: its checks then reach whichever outbound
-// the tunnel routes to, which for a personal proxy is the very helper they are trying to reach.
-// Like limitedNet's, the list is fresh each call, since this Net outlives network changes.
-func (n *rtcNet) Interfaces() ([]*transport.Interface, error) {
+// hostInterfaces is the host's interfaces now. Tests replace it.
+var hostInterfaces = func() ([]*transport.Interface, error) {
 	fresh, err := newStdNet()
 	if err != nil {
 		return nil, err
 	}
-	ifs, err := fresh.Interfaces()
+	return fresh.Interfaces()
+}
+
+// Interfaces lists the host's interfaces for pion's host candidates, without the VPN's own or any
+// other tunnel. A candidate on the tunnel's address sends into the tunnel, even from this process
+// whose other sockets skip it, and physnet would pin its socket there: its checks then reach
+// whichever outbound the tunnel routes to, which for a personal proxy is the very helper they are
+// trying to reach. Another app's VPN would carry them off the same way, or loop them back into ours.
+// Only host candidates use it today: broflake sets no interface or IP filter, so srflx and relay
+// gathering never consult it.
+// Like limitedNet's, the list is fresh each call, since this Net outlives network changes.
+func (n *rtcNet) Interfaces() ([]*transport.Interface, error) {
+	ifs, err := hostInterfaces()
 	if err != nil {
 		return nil, err
 	}
-	mine := n.myInterfaces()
-	if mine == nil {
-		return ifs, nil
-	}
+	f := n.interfaceFilter()
 	kept := make([]*transport.Interface, 0, len(ifs))
 	for _, i := range ifs {
-		if !mine[i.Name] {
+		if !f.hides(i.Name, i.Flags) {
 			kept = append(kept, i)
 		}
 	}
 	return kept, nil
 }
 
-// InterfaceByIndex is Interfaces' lookup by index: the VPN's own interfaces aren't found.
+// InterfaceByIndex is Interfaces' lookup by index: hidden interfaces aren't found.
 func (n *rtcNet) InterfaceByIndex(index int) (*transport.Interface, error) {
-	fresh, err := newStdNet()
-	if err != nil {
-		return nil, err
-	}
-	i, err := fresh.InterfaceByIndex(index)
-	if err != nil {
-		return nil, err
-	}
-	if n.myInterfaces()[i.Name] {
-		return nil, transport.ErrInterfaceNotFound
-	}
-	return i, nil
+	return n.findInterface(func(i *transport.Interface) bool { return i.Index == index })
 }
 
-// InterfaceByName is Interfaces' lookup by name: the VPN's own interfaces aren't found.
+// InterfaceByName is Interfaces' lookup by name: hidden interfaces aren't found.
 func (n *rtcNet) InterfaceByName(name string) (*transport.Interface, error) {
-	if n.myInterfaces()[name] {
-		return nil, transport.ErrInterfaceNotFound
-	}
-	fresh, err := newStdNet()
+	return n.findInterface(func(i *transport.Interface) bool { return i.Name == name })
+}
+
+func (n *rtcNet) findInterface(match func(*transport.Interface) bool) (*transport.Interface, error) {
+	ifs, err := n.Interfaces()
 	if err != nil {
 		return nil, err
 	}
-	return fresh.InterfaceByName(name)
+	for _, i := range ifs {
+		if match(i) {
+			return i, nil
+		}
+	}
+	return nil, transport.ErrInterfaceNotFound
 }
 
 // Dial resolves a host first with resolveHosts, through lookup or else stdnet. Its errors name no

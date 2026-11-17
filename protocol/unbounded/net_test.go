@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -27,13 +29,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeMonitor reports names as the VPN's own interfaces. Every other method panics, unused.
+// fakeMonitor reports names as the VPN's own interfaces and def as its default. Every other method
+// panics, unused.
 type fakeMonitor struct {
 	tun.DefaultInterfaceMonitor
 	names []string
+	def   *control.Interface
 }
 
-func (m *fakeMonitor) MyInterfaces() []string { return m.names }
+func (m *fakeMonitor) MyInterfaces() []string               { return m.names }
+func (m *fakeMonitor) DefaultInterface() *control.Interface { return m.def }
 
 // fakeNetworkManager gives rtcNet an interface monitor and nothing else.
 type fakeNetworkManager struct {
@@ -43,13 +48,16 @@ type fakeNetworkManager struct {
 
 func (m *fakeNetworkManager) InterfaceMonitor() tun.DefaultInterfaceMonitor { return m.monitor }
 
-// hostInterface is a real interface of this machine with an address, which the test pretends is
-// the tunnel.
+// hostInterface is a real interface of this machine with an address and no tunnel's looks, which
+// the test pretends is the tunnel.
 func hostInterface(t *testing.T) string {
 	t.Helper()
 	ifs, err := net.Interfaces()
 	require.NoError(t, err)
 	for _, i := range ifs {
+		if isTunnel(i.Name, i.Flags) {
+			continue
+		}
 		if addrs, _ := i.Addrs(); len(addrs) > 0 {
 			return i.Name
 		}
@@ -86,7 +94,7 @@ func TestRTCNetHidesTheVPNsInterfaces(t *testing.T) {
 	assert.True(t, errors.Is(err, transport.ErrInterfaceNotFound), "got %v", err)
 }
 
-func TestRTCNetHidesNothingWithoutAMonitor(t *testing.T) {
+func TestRTCNetHidesOnlyTunnelsWithoutAMonitor(t *testing.T) {
 	mine := hostInterface(t)
 	for name, ctx := range map[string]context.Context{
 		"no network manager": context.Background(),
@@ -102,6 +110,139 @@ func TestRTCNetHidesNothingWithoutAMonitor(t *testing.T) {
 			_, err = n.InterfaceByName(mine)
 			assert.NoError(t, err)
 		})
+	}
+}
+
+const (
+	p2p  = net.FlagUp | net.FlagPointToPoint | net.FlagMulticast
+	eth  = net.FlagUp | net.FlagBroadcast | net.FlagMulticast
+	loop = net.FlagUp | net.FlagLoopback
+)
+
+// withHostInterfaces has rtcNet see ifs, named with their flags, as the host's interfaces.
+func withHostInterfaces(t *testing.T, ifs map[string]net.Flags) {
+	t.Helper()
+	prev := hostInterfaces
+	hostInterfaces = func() ([]*transport.Interface, error) {
+		var out []*transport.Interface
+		for i, name := range slices.Sorted(maps.Keys(ifs)) {
+			out = append(out, transport.NewInterface(net.Interface{Index: i + 1, Name: name, Flags: ifs[name]}))
+		}
+		return out, nil
+	}
+	t.Cleanup(func() { hostInterfaces = prev })
+}
+
+func vpnCtx(mine []string, def string) context.Context {
+	m := &fakeMonitor{names: mine}
+	if def != "" {
+		m.def = &control.Interface{Name: def}
+	}
+	return service.ContextWith[adapter.NetworkManager](context.Background(), &fakeNetworkManager{monitor: m})
+}
+
+func TestRTCNetInterfaceFiltering(t *testing.T) {
+	withHostInterfaces(t, map[string]net.Flags{
+		"lo0": loop, "en0": eth, "utun3": p2p, "utun4": p2p, "ppp0": p2p, "pdp_ip0": p2p,
+		"gif0": net.FlagPointToPoint, "wg0": eth, "p2plink": p2p,
+	})
+	for _, c := range []struct {
+		name string
+		ctx  context.Context
+		kept []string
+	}{
+		// A VPN on a tunnel-looking default, such as PPPoE or another VPN under ours, still needs it.
+		{"default kept though a tunnel", vpnCtx([]string{"utun4"}, "ppp0"),
+			[]string{"lo0", "en0", "ppp0", "pdp_ip0"}},
+		{"default utun kept", vpnCtx([]string{"utun4"}, "utun3"),
+			[]string{"lo0", "en0", "utun3", "pdp_ip0"}},
+		// The VPN's own interface wins over the default: our tunnel is never a host candidate's way
+		// out, and a monitor briefly naming it the default must not let candidates into it.
+		{"VPN's own default hidden", vpnCtx([]string{"utun4"}, "utun4"),
+			[]string{"lo0", "en0", "pdp_ip0"}},
+		// With no default known, a point-to-point link or ppp0 may be the uplink.
+		{"no default", vpnCtx([]string{"utun4"}, ""),
+			[]string{"lo0", "en0", "ppp0", "pdp_ip0", "p2plink"}},
+		// With no VPN there is no tunnel of ours to keep checks out of, and the Net is pion's own.
+		{"no VPN", context.Background(),
+			[]string{"lo0", "en0", "utun3", "utun4", "ppp0", "pdp_ip0", "gif0", "wg0", "p2plink"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			n, err := newRTCNet(c.ctx, nil, nil, true)
+			require.NoError(t, err)
+			ifs, err := n.Interfaces()
+			require.NoError(t, err)
+			assert.ElementsMatch(t, c.kept, names(ifs))
+
+			all, err := hostInterfaces()
+			require.NoError(t, err)
+			for _, i := range all {
+				byName, nameErr := n.InterfaceByName(i.Name)
+				byIndex, indexErr := n.InterfaceByIndex(i.Index)
+				if slices.Contains(c.kept, i.Name) {
+					require.NoError(t, nameErr, i.Name)
+					require.NoError(t, indexErr, i.Name)
+					assert.Equal(t, i.Name, byName.Name)
+					assert.Equal(t, i.Name, byIndex.Name)
+				} else {
+					assert.True(t, errors.Is(nameErr, transport.ErrInterfaceNotFound), "%s: got %v", i.Name, nameErr)
+					assert.True(t, errors.Is(indexErr, transport.ErrInterfaceNotFound), "%s: got %v", i.Name, indexErr)
+				}
+			}
+		})
+	}
+}
+
+func TestInterfaceFilter(t *testing.T) {
+	known := interfaceFilter{def: "en0"}
+	vpn := interfaceFilter{mine: map[string]bool{"utun9": true, "lantern": true}, def: "utun3"}
+	for _, c := range []struct {
+		f      interfaceFilter
+		name   string
+		flags  net.Flags
+		hidden bool
+	}{
+		{known, "en0", eth, false},
+		{known, "eth0", eth, false},
+		{known, "wlan0", eth, false},
+		{known, "Wi-Fi", eth, false},
+		{known, "Ethernet", eth, false},
+		{known, "lo0", loop, false},
+		{known, "bridge0", eth, false},
+		{known, "docker0", eth, false},
+		{known, "utun4", p2p, true},
+		{known, "ipsec0", p2p, true},
+		{known, "ppp0", p2p, true},
+		{known, "tun0", p2p, true},
+		{known, "gif0", net.FlagPointToPoint | net.FlagMulticast, true},
+		{known, "stf0", 0, true},
+		{known, "tap0", eth, true},
+		{known, "wg0", eth, true},
+		{known, "tailscale0", eth, true},
+		{known, "some vpn", p2p, true},
+		{known, "OpenVPN Wintun", net.FlagUp | net.FlagMulticast, false},
+		{known, "pdp_ip0", p2p, false},
+		{known, "rmnet_data0", p2p, false},
+		{known, "ccmni0", p2p, false},
+		{known, "wwan0", p2p, false},
+		{known, "v4-rmnet_data0", p2p, false},
+		{vpn, "utun9", p2p, true},
+		{vpn, "lantern", net.FlagUp | net.FlagMulticast, true},
+		{vpn, "utun3", p2p, false},
+		{vpn, "utun4", p2p, true},
+		{vpn, "en0", eth, false},
+		{interfaceFilter{def: "ppp0"}, "ppp0", p2p, false},
+		{interfaceFilter{mine: map[string]bool{"utun9": true}, def: "utun9"}, "utun9", p2p, true},
+		{interfaceFilter{}, "ppp0", p2p, false},
+		{interfaceFilter{}, "some vpn", p2p, false},
+		{interfaceFilter{}, "pdp_ip0", p2p, false},
+		{interfaceFilter{}, "en0", eth, false},
+		{interfaceFilter{}, "utun4", p2p, true},
+		{interfaceFilter{}, "wg0", eth, true},
+		{interfaceFilter{}, "ipsec0", p2p, true},
+		{interfaceFilter{mine: map[string]bool{"lantern": true}}, "lantern", eth, true},
+	} {
+		assert.Equal(t, c.hidden, c.f.hides(c.name, c.flags), "%q %v with %+v", c.name, c.flags, c.f)
 	}
 }
 
