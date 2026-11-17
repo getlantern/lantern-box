@@ -186,17 +186,22 @@ func NewForwarder(ctx context.Context, opts ...Option) (*Forwarder, error) {
 	// while the failure path logged nothing at all. Whether IGDv2 was refused
 	// or simply absent is the first thing anyone asks when a peer turns out to
 	// be unreachable.
-	cp, method, errPMP := discoverPMP(ctx, nil)
+	cp, method, errPMP := discoverPMPBound(ctx, nil, o.control)
 	if errPMP == nil {
 		logInfo(o.quiet, "portforward: gateway discovered", "method", method)
 		return newForwarder(cp, method, o), nil
 	}
-	c2, err2 := discoverIGDv2(ctx)
+	discover2, discover1 := discoverIGDv2, discoverIGDv1
+	if o.control != nil {
+		discover2 = func(ctx context.Context) (igdClient, error) { return discoverIGDv2Bound(ctx, o.control) }
+		discover1 = func(ctx context.Context) (igdClient, error) { return discoverIGDv1Bound(ctx, o.control) }
+	}
+	c2, err2 := discover2(ctx)
 	if err2 == nil && c2 != nil {
 		logInfo(o.quiet, "portforward: gateway discovered", "method", "upnp-igd2", "pmp_err", errPMP)
 		return newForwarder(c2, "upnp-igd2", o), nil
 	}
-	c1, err1 := discoverIGDv1(ctx)
+	c1, err1 := discover1(ctx)
 	if err1 == nil && c1 != nil {
 		logInfo(o.quiet, "portforward: gateway discovered", "method", "upnp-igd1",
 			// Worth knowing: a router that answers v1 but not v2 is common, and
@@ -218,7 +223,7 @@ func NewForwarder(ctx context.Context, opts ...Option) (*Forwarder, error) {
 // newForwarder wraps a discovered client. A PCP or NAT-PMP client logs from
 // inside its mapping code, so it shares the Forwarder's quiet switch.
 func newForwarder(client igdClient, method string, o options) *Forwarder {
-	f := &Forwarder{client: client, method: method}
+	f := &Forwarder{client: client, method: method, localIPControl: o.control}
 	f.quiet.Store(o.quiet)
 	if q, ok := client.(interface{ setQuiet(*atomic.Bool) }); ok {
 		q.setQuiet(&f.quiet)

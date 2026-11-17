@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+
+	"github.com/sagernet/sing/common/control"
 )
 
 // Option configures NewForwarder and ProbeUPnP.
@@ -11,6 +13,9 @@ type Option func(*options)
 
 type options struct {
 	quiet bool
+	// control, if set, controls every socket discovery and the Forwarder
+	// open. See BoundTo.
+	control control.Func
 }
 
 // QuietLogs has the Forwarder, and the discovery that builds it, log without

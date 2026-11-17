@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/sagernet/sing/common/uot"
 
 	"github.com/getlantern/lantern-box/constant"
+	L "github.com/getlantern/lantern-box/log"
 	"github.com/getlantern/lantern-box/option"
 
 	samizdat "github.com/getlantern/samizdat"
@@ -76,6 +78,14 @@ func NewOutbound(
 	var shortID [8]byte
 	copy(shortID[:], shortIDBytes)
 
+	var certPin []byte
+	if options.CertSPKISHA256 != "" {
+		certPin, err = hex.DecodeString(options.CertSPKISHA256)
+		if err != nil || len(certPin) != 32 {
+			return nil, fmt.Errorf("cert_spki_sha256 must be 64 hex characters (32 bytes)")
+		}
+	}
+
 	// Build server address
 	serverAddr := options.ServerOptions.Build().String()
 
@@ -103,18 +113,20 @@ func NewOutbound(
 	}
 
 	config := samizdat.ClientConfig{
-		ServerAddr:          serverAddr,
-		ServerName:          options.ServerName,
-		PublicKey:           pubKey,
-		ShortID:             shortID,
-		Fingerprint:         options.Fingerprint,
-		Jitter:              !options.DisableJitter,
-		MaxJitterMs:         options.MaxJitterMs,
-		TCPFragmentation:    !options.DisableTCPFragmentation,
-		RecordFragmentation: !options.DisableRecordFragmentation,
-		MaxStreamsPerConn:   options.MaxStreamsPerConn,
-		IdleTimeout:         idleTimeout,
-		ConnectTimeout:      connectTimeout,
+		ServerAddr:           serverAddr,
+		ServerName:           options.ServerName,
+		PublicKey:            pubKey,
+		ShortID:              shortID,
+		Fingerprint:          options.Fingerprint,
+		TCPFragmentation:     !options.DisableTCPFragmentation,
+		RecordFragmentation:  !options.DisableRecordFragmentation,
+		DisableShaping:       options.DisableShaping,
+		LegacyAuth:           options.LegacyAuth,
+		ServerCertSPKISHA256: certPin,
+		MaxStreamsPerConn:    options.MaxStreamsPerConn,
+		IdleTimeout:          idleTimeout,
+		ConnectTimeout:       connectTimeout,
+		Logger:               slog.New(L.NewLogHandler(logger)),
 		Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
 			return outboundDialer.DialContext(ctx, network, M.ParseSocksaddr(address))
 		},

@@ -82,6 +82,16 @@ func startVMessPair(t *testing.T, patch ...func(*option.Options)) (*mockTracker,
 }
 
 func startSamizdatPair(t *testing.T, patch ...func(*option.Options)) (*mockTracker, *testClient) {
+	return startSamizdatPairWith(t, false, patch...)
+}
+
+// startSamizdatXNetPair is startSamizdatPair with the inbound serving
+// tunnels on x/net's HTTP/2 server instead of samizdat's lean one.
+func startSamizdatXNetPair(t *testing.T, patch ...func(*option.Options)) (*mockTracker, *testClient) {
+	return startSamizdatPairWith(t, true, patch...)
+}
+
+func startSamizdatPairWith(t *testing.T, disableLean bool, patch ...func(*option.Options)) (*mockTracker, *testClient) {
 	privKey, pubKey, err := samizdat.GenerateKeyPair()
 	require.NoError(t, err)
 	shortID := make([]byte, 8)
@@ -98,6 +108,7 @@ func startSamizdatPair(t *testing.T, patch ...func(*option.Options)) (*mockTrack
 					CertPEM:          certPEM,
 					KeyPEM:           keyPEM,
 					MasqueradeDomain: "example.com",
+					DisableLeanH2:    disableLean,
 				}}
 		},
 		func(port uint16) option.Outbound {
@@ -161,6 +172,7 @@ func TestProxy(t *testing.T) {
 		{name: "shadowsocks", start: startShadowsocksPair, tag: "ss-out", frameConn: true, udp: true},
 		{name: "vmess", start: startVMessPair, tag: "vmess-out"},
 		{name: "samizdat", start: startSamizdatPair, tag: "samizdat-out"},
+		{name: "samizdat x/net h2", start: startSamizdatXNetPair, tag: "samizdat-out"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -16,6 +16,7 @@ import (
 	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/route/rule"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 
 	"github.com/getlantern/lantern-box/constant"
@@ -40,6 +41,7 @@ type Inbound struct {
 	listener        *listener.Listener
 	tcpListener     net.Listener
 	server          *samizdat.Server
+	leanH2          bool          // whether the server runs samizdat's lean HTTP/2 server
 	shutdownTimeout time.Duration // time to wait for goroutines after ctx cancel; 0 = 5s
 }
 
@@ -103,6 +105,19 @@ func NewInbound(
 			return nil, fmt.Errorf("parsing masquerade_max_duration: %w", err)
 		}
 	}
+	var replayWindow, maxClockSkew time.Duration
+	if options.ReplayWindow != "" {
+		replayWindow, err = time.ParseDuration(options.ReplayWindow)
+		if err != nil {
+			return nil, fmt.Errorf("parsing replay_window: %w", err)
+		}
+	}
+	if options.MaxClockSkew != "" {
+		maxClockSkew, err = time.ParseDuration(options.MaxClockSkew)
+		if err != nil {
+			return nil, fmt.Errorf("parsing max_clock_skew: %w", err)
+		}
+	}
 
 	ib := &Inbound{
 		Adapter: inbound.NewAdapter(constant.TypeSamizdat, tag),
@@ -116,13 +131,6 @@ func NewInbound(
 		}),
 	}
 
-	// Use sing-box's listener to create the TCP listener, honoring ListenOptions
-	tcpListener, err := ib.listener.ListenTCP()
-	if err != nil {
-		return nil, fmt.Errorf("creating TCP listener: %w", err)
-	}
-	ib.tcpListener = tcpListener
-
 	serverConfig := samizdat.ServerConfig{
 		PrivateKey:            privKey,
 		ShortIDs:              shortIDs,
@@ -133,16 +141,31 @@ func NewInbound(
 		MasqueradeIdleTimeout: masqIdleTimeout,
 		MasqueradeMaxDuration: masqMaxDuration,
 		MaxConcurrentStreams:  options.MaxConcurrentStreams,
+		DisableShaping:        options.DisableShaping,
+		RequireAuthV2:         options.RequireAuthV2,
+		ReplayWindow:          replayWindow,
+		MaxClockSkew:          maxClockSkew,
+		LeanH2:                !options.DisableLeanH2,
 		Handler: func(ctx context.Context, conn net.Conn, destination string) {
 			ib.handleConnection(ctx, conn, destination)
 		},
 	}
 
+	// The server first: a config it refuses fails before any port is bound.
 	server, err := samizdat.NewServer(serverConfig)
 	if err != nil {
 		return nil, fmt.Errorf("creating samizdat server: %w", err)
 	}
 	ib.server = server
+	ib.leanH2 = serverConfig.LeanH2
+
+	// Use sing-box's listener to create the TCP listener, honoring ListenOptions
+	tcpListener, err := ib.listener.ListenTCP()
+	if err != nil {
+		server.Close()
+		return nil, fmt.Errorf("creating TCP listener: %w", err)
+	}
+	ib.tcpListener = tcpListener
 
 	return ib, nil
 }
@@ -206,7 +229,11 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	i.router.RouteConnectionEx(ctx, conn, metadata, func(err error) {
 		if err != nil {
 			rejected.Store(rule.IsRejected(err))
-			i.logger.ErrorContext(ctx, err)
+			// A relay that ends because one side closed is a normal end, as
+			// sing-box's own connection logging treats it.
+			if !E.IsClosedOrCanceled(err) {
+				i.logger.ErrorContext(ctx, err)
+			}
 		}
 		close(done)
 	})

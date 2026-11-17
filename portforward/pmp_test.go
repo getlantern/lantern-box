@@ -628,7 +628,7 @@ func TestPMPExchange_ErrorAfterSendIsUncertain(t *testing.T) {
 	require.NoError(t, err)
 	addr := conn.LocalAddr().(*net.UDPAddr)
 	conn.Close()
-	_, err = pmpExchange(addr, time.Second, func(net.IP) []byte { return []byte{0, 0} },
+	_, err = pmpExchange(addr, time.Second, nil, func(net.IP) []byte { return []byte{0, 0} },
 		func([]byte) (bool, error) { return false, nil })
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errOutcomeUnknown)

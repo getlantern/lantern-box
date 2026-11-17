@@ -40,6 +40,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	UBClientcore "github.com/getlantern/broflake/clientcore"
@@ -89,6 +90,9 @@ type Outbound struct {
 	// reads it before each dial so it can fail at once when no helper is
 	// connected.
 	consumerSlots func() []UBClientcore.ConsumerSlot
+	// path is what HelperPath reads, set at Start. Atomic because status
+	// readers may call HelperPath while Start is setting it.
+	path atomic.Pointer[helperPathSource]
 
 	// Constructed in NewOutbound; observes successful dial latencies and
 	// emits structured warnings when the current pairing's dials look
@@ -156,7 +160,7 @@ func NewOutbound(
 	if err != nil {
 		return nil, fmt.Errorf("unbounded: build sing-box dialer: %w", err)
 	}
-	rtcNet, err := newRTCNet(ctx, outboundDialer, lg)
+	rtcNet, err := newRTCNet(ctx, outboundDialer, lg, directFallbackAllowed(opts.DialerOptions))
 	if err != nil {
 		return nil, fmt.Errorf("unbounded: build pion net shim: %w", err)
 	}
@@ -176,6 +180,7 @@ func NewOutbound(
 	if lbAdapter.IsHelperTag(tag) {
 		rtcOpt.RoomTicketSource = lbAdapter.RoomTicketSourceFromContext(ctx)
 		rtcOpt.ConsumerRoomsOnly = true
+		rtcOpt.ConsumerNoPathGrace = lbAdapter.HelperPathGrace
 	}
 
 	o := &Outbound{
@@ -241,6 +246,7 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 	o.broflakeConn = bfConn
 	o.ui = ui
 	o.consumerSlots = ui.BroflakeEngine.ConsumerSlots
+	o.path.Store(&helperPathSource{connected: ui.BroflakeEngine.ConsumerConnected, started: startedAt})
 	o.ql = ql
 	o.dial = UBClientcore.CreateSOCKS5Dialer(ql)
 
@@ -286,6 +292,10 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		o.logger.DebugContext(ctx, "unbounded TCP dial start", "dest", dest)
 		conn, err := o.dial(ctx, network, dest)
 		if err != nil {
+			if err, ok := helperUnavailable(err); ok {
+				o.logger.DebugContext(ctx, "unbounded TCP dial failed: helper unavailable")
+				return nil, err
+			}
 			o.logger.ErrorContext(ctx, "unbounded TCP dial failed",
 				"dest", dest,
 				"elapsed", time.Since(started),
@@ -302,6 +312,10 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		o.logger.DebugContext(ctx, "unbounded UoT dial start", "dest", dest)
 		conn, err := o.uot.DialContext(ctx, network, destination)
 		if err != nil {
+			if err, ok := helperUnavailable(err); ok {
+				o.logger.DebugContext(ctx, "unbounded UoT dial failed: helper unavailable")
+				return nil, err
+			}
 			o.logger.ErrorContext(ctx, "unbounded UoT dial failed",
 				"dest", dest,
 				"elapsed", time.Since(started),
@@ -334,6 +348,10 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	o.logger.DebugContext(ctx, "unbounded UoT ListenPacket start", "dest", dest)
 	pc, err := o.uot.ListenPacket(ctx, destination)
 	if err != nil {
+		if err, ok := helperUnavailable(err); ok {
+			o.logger.DebugContext(ctx, "unbounded UoT ListenPacket failed: helper unavailable")
+			return nil, err
+		}
 		o.logger.ErrorContext(ctx, "unbounded UoT ListenPacket failed",
 			"dest", dest,
 			"elapsed", time.Since(started),
@@ -349,8 +367,57 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 }
 
 // ErrNoHelperConnected is returned by a rooms-only (helper) outbound's dials
-// while none of its WebRTC slots is connected to a helper.
+// while none of its WebRTC slots is connected to a helper, and wraps
+// broflake's ErrNoConnectedPath when the path died under a dial already in
+// broflake's hands: either way the helper is unavailable.
 var ErrNoHelperConnected = errors.New("unbounded: no helper connected")
+
+// helperUnavailable returns err as ErrNoHelperConnected, and true, if
+// broflake failed it for want of a connected WebRTC path. Only a rooms-only
+// consumer's dials fail so; a pool consumer's wait for a peer.
+func helperUnavailable(err error) (error, bool) {
+	if !errors.Is(err, UBClientcore.ErrNoConnectedPath) {
+		return err, false
+	}
+	if errors.Is(err, ErrNoHelperConnected) {
+		return err, true
+	}
+	return fmt.Errorf("%w: %w", ErrNoHelperConnected, err), true
+}
+
+var _ lbAdapter.HelperPathReporter = (*Outbound)(nil)
+
+// helperPathSource is what a started consumer's HelperPath reads: broflake's
+// BroflakeEngine.ConsumerConnected, and when Start began, which is when a
+// consumer that never connects started looking for its helper. Each
+// outbound starts once; radiance restarts a consumer by recreating it.
+type helperPathSource struct {
+	connected func() (bool, time.Time)
+	started   time.Time
+}
+
+// HelperPath reports a rooms-only (helper) consumer's WebRTC path to its
+// helper, which is unavailable once no slot has been connected for
+// lbAdapter.HelperPathGrace, whether one was and dropped or none has been
+// since Start: then broflake resets its open streams and, unlike a pool
+// consumer, nothing will offer it another peer. The grace delays only that
+// reset and the "unavailable" report: new dials fail at once whenever no
+// slot is connected (checkHelperConnected), so a slot that drops and
+// reconnects within the grace still fails the flows dialed meanwhile, and
+// Available stays true through it only as a UI debounce. ok is
+// false for a pool consumer and before Start. It takes one mutex in
+// broflake, so a status poll may call it freely.
+func (o *Outbound) HelperPath() (lbAdapter.HelperPathStatus, bool) {
+	if !o.rtcOpt.ConsumerRoomsOnly {
+		return lbAdapter.HelperPathStatus{}, false
+	}
+	src := o.path.Load()
+	if src == nil {
+		return lbAdapter.HelperPathStatus{}, false
+	}
+	up, since := src.connected()
+	return lbAdapter.NewHelperPathStatus(up, since, src.started, time.Now()), true
+}
 
 // checkHelperConnected fails a rooms-only consumer's dial at once while no
 // slot is connected, including while one is still connecting. Broflake's

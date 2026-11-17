@@ -558,3 +558,53 @@ func TestBridgeCloseAbortsBlockedWrite(t *testing.T) {
 		t.Fatal("the bridge's handler did not return after the stream was closed")
 	}
 }
+
+// bridgeSessionID starts a bridge with opts' legacy_auth set as given,
+// pointed at a listener that only records the first TLS record, and returns
+// that ClientHello's SessionID and the bridge's short ID.
+func bridgeSessionID(t *testing.T, legacyAuth bool) ([]byte, [8]byte) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	got := make(chan []byte, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		c.SetReadDeadline(time.Now().Add(10 * time.Second))
+		hdr := make([]byte, 5)
+		if _, err := io.ReadFull(c, hdr); err != nil {
+			return
+		}
+		rec := make([]byte, int(hdr[3])<<8|int(hdr[4]))
+		if _, err := io.ReadFull(c, rec); err != nil {
+			return
+		}
+		got <- rec
+	}()
+	id := newShortID(t)
+	opts := bridgeOptions(t, ln.Addr().String(), newTestKeys(t), id)
+	opts.LegacyAuth = legacyAuth
+	newTestBridge(t, opts, &dialRouter{})
+	select {
+	case rec := <-got:
+		sid, err := samizdat.ExtractSessionID(rec)
+		require.NoError(t, err)
+		return sid, id
+	case <-time.After(10 * time.Second):
+		t.Fatal("the bridge sent no ClientHello")
+	}
+	return nil, id
+}
+
+// The bridge's legacy_auth reaches its client: with it, the SessionID is
+// version 1's, which starts with the short ID; without it, version 2's.
+func TestBridgeLegacyAuthOption(t *testing.T) {
+	v1, id := bridgeSessionID(t, true)
+	require.True(t, bytes.HasPrefix(v1, id[:]), "legacy_auth sent a SessionID that isn't version 1's")
+	v2, id := bridgeSessionID(t, false)
+	require.False(t, bytes.HasPrefix(v2, id[:]), "the default sent version 1's SessionID")
+}

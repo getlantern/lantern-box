@@ -4,6 +4,8 @@ package physnet
 
 import (
 	"context"
+	"errors"
+	"syscall"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing/common/control"
@@ -26,13 +28,48 @@ import (
 // explicitly set auto_detect_interface on the outbound. Gating on
 // AutoDetectInterface() would reintroduce the "NAT failure, aborting!"
 // regression the unbounded outbound's ListenUDP override exists to fix.
+//
+// Like that dialer it then sets route.default_mark, refusing it alongside
+// tun.auto_redirect as the dialer does, and appends the tun's auto_redirect
+// output mark, without which auto_redirect's nftables OUTPUT rules redirect
+// the socket back into the tunnel on Linux. Both are read per socket, since
+// the tun registers its mark at start, possibly after the caller got this
+// func.
 func ListenControl(ctx context.Context) control.Func {
 	nm := service.FromContext[adapter.NetworkManager](ctx)
 	if nm == nil {
 		return nil
 	}
-	if pf := nm.ProtectFunc(); pf != nil {
-		return pf
+	bind := nm.ProtectFunc()
+	if bind == nil {
+		bind = nm.AutoDetectInterfaceFunc()
 	}
-	return nm.AutoDetectInterfaceFunc()
+	return control.Append(bind, func(network, address string, conn syscall.RawConn) error {
+		autoRedirect := nm.AutoRedirectOutputMark() != 0
+		if mark := nm.DefaultOptions().RoutingMark; mark != 0 {
+			if autoRedirect {
+				return errDefaultMarkConflict
+			}
+			if err := applyMark(routingMark(mark), network, address, conn); err != nil {
+				return err
+			}
+		}
+		if !autoRedirect {
+			return nil
+		}
+		return nm.AutoRedirectOutputMarkFunc()(network, address, conn)
+	})
+}
+
+// errDefaultMarkConflict is the error sing-box's default dialer gives for the same sockets.
+var errDefaultMarkConflict = errors.New("`route.default_mark` is conflict with `tun.auto_redirect`")
+
+// routingMark is control.RoutingMark, which sets nothing outside Linux; tests replace it.
+var routingMark = control.RoutingMark
+
+func applyMark(f control.Func, network, address string, conn syscall.RawConn) error {
+	if f == nil {
+		return nil
+	}
+	return f(network, address, conn)
 }

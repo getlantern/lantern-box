@@ -38,6 +38,7 @@ type config struct {
 	stallTimeout  time.Duration
 	maxWait       time.Duration
 	reportStalled bool
+	batch         batchConfig
 }
 
 type result struct {
@@ -54,6 +55,8 @@ type responder struct {
 	readState  func(*net.TCPConn) (sendState, error)
 	httpClient *http.Client
 	now        func() time.Time
+	// batch, when set, sends callbacks in batches instead of one by one.
+	batch *batcher
 }
 
 func (r *responder) serve(ctx context.Context, conn net.Conn) error {
@@ -89,6 +92,12 @@ func (r *responder) serve(ctx context.Context, conn net.Conn) error {
 	if res.verdict == verdictAborted || (res.verdict == verdictStalled && !r.cfg.reportStalled) {
 		return nil
 	}
+	if r.batch != nil {
+		// The batch carries what a single callback would: the client's
+		// parameters under callback_url's own.
+		r.batch.add(r.callbackQuery(query), req.Header.Get("traceparent"), res)
+		return nil
+	}
 	if err := r.sendCallback(ctx, query, req.Header.Get("traceparent"), res); err != nil {
 		r.logger.WarnContext(ctx, "bandit probe callback failed: ", err)
 	}
@@ -109,12 +118,13 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 	start := r.now()
 	deadline := start.Add(r.cfg.maxWait)
 	writeDeadline := time.Now().Add(r.cfg.maxWait)
+	body := r.body()
 	header := "HTTP/1.1 200 OK\r\n" +
 		"Content-Type: application/octet-stream\r\n" +
-		"Content-Length: " + strconv.Itoa(r.cfg.bodySize) + "\r\n" +
+		"Content-Length: " + strconv.Itoa(len(body)) + "\r\n" +
 		"Cache-Control: no-store\r\n" +
 		"Connection: close\r\n\r\n"
-	payload := append([]byte(header), r.body()...)
+	payload := response{header: header, body: body}
 
 	conn.SetWriteDeadline(writeDeadline)
 	tc, isTCP := common.Cast[*net.TCPConn](conn)
@@ -217,7 +227,7 @@ func (r *responder) respond(ctx context.Context, conn net.Conn) result {
 		// frame reached the socket, but h2mux can still be holding the tail in
 		// its HTTP/2 writer, so the client must also have acknowledged at least
 		// the response's length since the baseline.
-		if writeDone && deliveredOn(shared, st, baseline, watermark, len(payload)) {
+		if writeDone && deliveredOn(shared, st, baseline, watermark, payload.len()) {
 			return result{verdict: verdictDelivered, drain: r.now().Sub(start), acked: st.acked, state: st}
 		}
 		now := r.now()
@@ -372,11 +382,14 @@ const writeAbortGrace = time.Second
 
 const pollInterval = 50 * time.Millisecond
 
-// body returns bodySize random bytes from a random offset in the pool, so the
-// response is incompressible and differs from probe to probe.
+// body returns random bytes from a random offset in the pool, so the response
+// is incompressible and differs from probe to probe. Its length is bodySize
+// plus up to half again, capped at the pool, so a censor can't pick probe
+// responses out by a fixed size.
 func (r *responder) body() []byte {
-	offset := rand.IntN(len(r.pool) - r.cfg.bodySize + 1)
-	return r.pool[offset : offset+r.cfg.bodySize]
+	size := r.cfg.bodySize + rand.IntN(min(r.cfg.bodySize/2, len(r.pool)-r.cfg.bodySize)+1)
+	offset := rand.IntN(len(r.pool) - size + 1)
+	return r.pool[offset : offset+size]
 }
 
 // reservedParams are set only by the proxy; a client copy is discarded so it
@@ -394,11 +407,25 @@ type writeResult struct {
 	done time.Time
 }
 
+// response is a probe response: its header and a body that is a slice of the
+// shared random pool, kept apart so the body is never copied.
+type response struct {
+	header string
+	body   []byte
+}
+
+func (p response) len() int { return len(p.header) + len(p.body) }
+
+// firstChunks holds the buffers that join the header to the start of the
+// body, so the first Write is a full chunk, as it would be from a server that
+// buffers its response.
+var firstChunks = sync.Pool{New: func() any { return new([maxWriteChunk]byte) }}
+
 // writeAsync writes payload on its own goroutine and delivers the result on
 // the returned channel. recover only covers the goroutine it runs in, so a
 // panic in a wrapper's Write is caught here, logged, and delivered as
 // errWritePanic rather than taking down the proxy.
-func (r *responder) writeAsync(ctx context.Context, conn net.Conn, payload []byte) <-chan writeResult {
+func (r *responder) writeAsync(ctx context.Context, conn net.Conn, payload response) <-chan writeResult {
 	written := make(chan writeResult, 1)
 	go func() {
 		defer func() {
@@ -408,21 +435,37 @@ func (r *responder) writeAsync(ctx context.Context, conn net.Conn, payload []byt
 				written <- writeResult{err: err, done: time.Now()}
 			}
 		}()
-		var err error
+		first := firstChunks.Get().(*[maxWriteChunk]byte)
+		n := copy(first[:], payload.header)
+		n += copy(first[n:], payload.body)
 		// Some inbounds frame each Write as a single protocol chunk and panic
 		// instead of splitting one larger than their maximum (shadowsocks 2022
 		// caps a chunk at 64 KiB - 1, less than the header plus the body).
-		for len(payload) > 0 && err == nil {
-			var n int
-			n, err = conn.Write(payload[:min(len(payload), maxWriteChunk)])
-			if n == 0 && err == nil {
-				err = io.ErrShortWrite
-			}
-			payload = payload[n:]
+		err := writeChunked(conn, first[:n])
+		if err == nil {
+			err = writeChunked(conn, payload.body[n-len(payload.header):])
 		}
+		// A Write that has returned no longer holds its buffer; one that
+		// panicked may have, so that buffer is left to the GC.
+		firstChunks.Put(first)
 		written <- writeResult{err: err, done: time.Now()}
 	}()
 	return written
+}
+
+// writeChunked writes b in Writes of at most maxWriteChunk bytes.
+func writeChunked(conn net.Conn, b []byte) error {
+	for len(b) > 0 {
+		n, err := conn.Write(b[:min(len(b), maxWriteChunk)])
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		b = b[n:]
+	}
+	return nil
 }
 
 // sendCallback forwards the client's callback to the API with the verdict
@@ -431,16 +474,7 @@ func (r *responder) writeAsync(ctx context.Context, conn net.Conn, payload []byt
 // apply; drain_ms lets it take the delivery wait out of that latency.
 func (r *responder) sendCallback(ctx context.Context, clientQuery url.Values, traceparent string, res result) error {
 	u := *r.cfg.callbackURL
-	q := url.Values{}
-	for k, vs := range clientQuery {
-		q[k] = append([]string(nil), vs...)
-	}
-	for _, k := range reservedParams {
-		q.Del(k)
-	}
-	for k, vs := range r.cfg.callbackURL.Query() {
-		q[k] = append([]string(nil), vs...)
-	}
+	q := r.callbackQuery(clientQuery)
 	q.Set("verdict", string(res.verdict))
 	q.Set("drain_ms", strconv.FormatInt(res.drain.Milliseconds(), 10))
 	if res.verdict != verdictUnknown {
@@ -471,6 +505,22 @@ func (r *responder) sendCallback(ctx context.Context, clientQuery url.Values, tr
 		return fmt.Errorf("callback returned %s", resp.Status)
 	}
 	return nil
+}
+
+// callbackQuery is the client's callback parameters, less the reserved ones,
+// with callback_url's own parameters over them.
+func (r *responder) callbackQuery(clientQuery url.Values) url.Values {
+	q := url.Values{}
+	for k, vs := range clientQuery {
+		q[k] = append([]string(nil), vs...)
+	}
+	for _, k := range reservedParams {
+		q.Del(k)
+	}
+	for k, vs := range r.cfg.callbackURL.Query() {
+		q[k] = append([]string(nil), vs...)
+	}
+	return q
 }
 
 func writeStatus(conn net.Conn, code int) {
