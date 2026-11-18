@@ -65,19 +65,7 @@ func TestDirectExitE2E(t *testing.T) {
 	})
 
 	t.Run("udp echo", func(t *testing.T) {
-		echo, err := net.ListenPacket("udp4", "127.0.0.1:0")
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = echo.Close() })
-		go func() {
-			buf := make([]byte, 2048)
-			for {
-				n, from, err := echo.ReadFrom(buf)
-				if err != nil {
-					return
-				}
-				_, _ = echo.WriteTo(buf[:n], from)
-			}
-		}()
+		echo := udpListener(t, true)
 
 		routedBefore := rig.router.routed.Load()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -107,8 +95,51 @@ func TestDirectExitE2E(t *testing.T) {
 		require.Zero(t, rig.egressDials.Load(), "the egress carried a direct exit's UDP")
 	})
 
+	t.Run("udp session stays on its first destination", func(t *testing.T) {
+		echo := udpListener(t, true)
+		other := udpListener(t, false)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		client := socks.NewClient(N.SystemDialer, M.ParseSocksaddr(rig.proxy), socks.Version5, "", "")
+		pc, err := client.ListenPacket(ctx, M.SocksaddrFromNet(echo.LocalAddr()))
+		require.NoError(t, err, "SOCKS5 UDP associate")
+		t.Cleanup(func() { _ = pc.Close() })
+
+		buf := make([]byte, 2048)
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			require.True(t, time.Now().Before(deadline), "no UDP echo through the direct exit within 20s")
+			_, err := pc.WriteTo([]byte("first"), echo.LocalAddr())
+			require.NoError(t, err)
+			_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+			if _, _, err := pc.ReadFrom(buf); err == nil {
+				break
+			}
+		}
+		// The exit box's rules saw only the session's first destination: a later datagram to
+		// another address must not reach it.
+		for range 5 {
+			_, err := pc.WriteTo([]byte("second"), other.LocalAddr())
+			require.NoError(t, err)
+			time.Sleep(100 * time.Millisecond)
+		}
+		_ = other.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _, err = other.ReadFrom(buf)
+		require.Error(t, err, "a later datagram reached another address than the session's first")
+	})
+
 	t.Run("10.0.0.0/8 refused", func(t *testing.T) {
 		requireRefused(t, rig, "http://10.255.255.1:80/", nil)
+	})
+
+	t.Run("domain resolving to 10.0.0.0/8 refused", func(t *testing.T) {
+		requireRefused(t, rig, "http://private.test:80/", nil)
+	})
+
+	t.Run("private addresses refused", func(t *testing.T) {
+		// Link-local is in none of the fixture's ip_cidr rejects, only in ip_is_private.
+		requireRefused(t, rig, "http://169.254.255.1:80/", nil)
+		requireRefused(t, rig, "http://linklocal.test:80/", nil)
 	})
 
 	t.Run("port 25 refused", func(t *testing.T) {
@@ -236,8 +267,14 @@ func startDirectExitRig(t testing.TB, c directExitCase) *directExitRig {
 	return rig
 }
 
-// startExitBox checks testdata/direct_exit_server.json's abuse rules and starts an exit box
-// from it, in its own service registry as node's exit boxes are, and returns its router.
+// startExitBox checks testdata/direct_exit_server.json's rules as RunExit does and starts an
+// exit box from it, in its own service registry as node's exit boxes are, and returns its
+// router.
+//
+// The fixture is shaped as lantern-cloud's direct exit configs must be: a resolve first, the
+// rejects, an ip_is_private reject and a final route with udp_connect. Only its route of
+// 127.0.0.1, ahead of the ip_is_private reject, is the test's: every server here is on
+// loopback, which ip_is_private refuses.
 func startExitBox(t testing.TB) adapter.ConnectionRouterEx {
 	t.Helper()
 	raw, err := os.ReadFile("testdata/direct_exit_server.json")
@@ -247,6 +284,7 @@ func startExitBox(t testing.TB) adapter.ConnectionRouterEx {
 	ctx := service.ExtendContext(box.BaseContext())
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, raw)
 	require.NoError(t, err, "parse the exit box's options")
+	require.NoError(t, peerrules.ValidateDirectExitRulesOptions(opts), "the fixture's resolve and private reject")
 	b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
 	require.NoError(t, err, "exit box New")
 	require.NoError(t, b.Start(), "exit box Start")
@@ -280,6 +318,27 @@ func (r *countingRouter) RouteConnectionEx(ctx context.Context, conn net.Conn, m
 func (r *countingRouter) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn, md adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	r.routed.Add(1)
 	r.ConnectionRouterEx.RoutePacketConnectionEx(ctx, conn, md, r.onClose(onClose))
+}
+
+// udpListener listens for UDP on loopback, echoing what it reads if echo is set.
+func udpListener(t *testing.T, echo bool) net.PacketConn {
+	t.Helper()
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	if echo {
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				n, from, err := pc.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+				_, _ = pc.WriteTo(buf[:n], from)
+			}
+		}()
+	}
+	return pc
 }
 
 func countingHandler(hits *atomic.Int64) http.Handler {

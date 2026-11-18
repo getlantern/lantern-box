@@ -42,12 +42,20 @@
 {"server_config": "<sing-box options JSON>", "rotation_interval_seconds": 3600}
 ```
 
-`server_config` has a `direct` outbound, `route.rule_set` with the four abuse tags, `route.rules` with the same reject rules as a direct-mode registration (allowlist for the pool), `route.final: "direct"` (or the allowlist's terminal reject), and `dns`. It has no inbounds. There is no route row, verify, heartbeat or deregister.
+`server_config` has a `direct` outbound, `route.rule_set` with the four abuse tags, `dns`, and `route.rules` with the same reject rules as a direct-mode registration (allowlist for the pool). Every `mode:"webrtc"` `server_config`, pool or paired, must have, ahead of any rule that can route `unbounded-exit` traffic to an outbound:
+
+1. an unconditional `resolve` action rule (sing-box's `ip_cidr` and `ip_is_private` match a domain destination only after one);
+2. an unconditional `{"ip_is_private": true, "action": "reject"}`;
+3. the abuse rule-set rejects and the static IP and port rejects.
+
+Every rule that routes to `direct` must set `udp_connect: true` (a Hysteria2 UDP session names a destination per packet, and the rules see only the first): the terminal route is an explicit final rule rather than `route.final`, which can't set it, and for the pool it is the allowlist's route rule ahead of its terminal reject. lantern-cloud's `applyPeerAllowlist` and `applyPersonalExit` already build this shape for samizdat peers. The config has no `experimental` (no debug listener), no inbounds, no endpoints and no services. RunExit refuses a config without the resolve and the `ip_is_private` reject after it, and drops any inbounds, endpoints, services, `experimental` and `ntp` regardless. There is no route row, verify, heartbeat or deregister.
+
+The client treats a registration as valid for 2 × the rotation interval (`rotation_interval_seconds`, capped at 24h; 0 means an hour), so a device lantern-cloud starts refusing keeps exiting traffic for up to that long after its last successful registration.
 
 lantern-cloud also adds, through config-new:
 - `direct_exit` (bool) to the volunteer's features;
 - `direct_exit: {"server_name": "<sni>"}` to the user's `unbounded` outbound options;
-- `"direct_exit": true` to a Lamplighter node's volunteer service options when the flag is on.
+- `"direct_exit": true` to a Lamplighter node's volunteer service options when the flag is on. The node (and `lantern-box run`) turns it off unless the box's config passes the abuse check and has the resolve and `ip_is_private` reject above; the pool peer config the volunteer service rides on already does.
 
 ## File Structure
 
