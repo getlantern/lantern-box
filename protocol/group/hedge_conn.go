@@ -57,7 +57,9 @@ type hedgeLeg struct {
 	noReplay bool
 	overflow bool
 	moveErr  error // why the move to Then failed
-	// moveCtx bounds the dial to Then; cancel ends it, on Close too.
+	// moveCtx is what Then is dialed with (see moveContext). cancel ends
+	// it, when the move fails or the connection closes, never after a
+	// successful move.
 	moveCtx context.Context
 	cancel  context.CancelFunc
 	// pending is Then's leg while the copy is replayed to it, so Close can
@@ -229,7 +231,7 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 		return false
 	}
 	l.moving = true
-	l.moveCtx, l.cancel = failoverContext(l.ctx)
+	l.moveCtx, l.cancel = moveContext(l.ctx)
 	l.mu.Unlock()
 	l.h.markBad(l.ctx, l.key, why)
 	_ = closeFirst()
@@ -259,13 +261,27 @@ func replayTimer(c io.Closer) (done func() bool) {
 	return timer.Stop
 }
 
-// finishMoveLocked publishes the outcome of a move. Caller holds mu.
+// dialTimer bounds a dial to Then by the failover timeout by cancelling the
+// move's context. stop reports whether the dial finished first; once it has,
+// the context is never cancelled by the timer.
+func (l *hedgeLeg) dialTimer() (stop func() bool) {
+	l.mu.Lock()
+	cancel := l.cancel
+	l.mu.Unlock()
+	return time.AfterFunc(hedgeFailoverDialTimeout, cancel).Stop
+}
+
+// finishMoveLocked publishes the outcome of a move. A failed move cancels
+// its context; a successful one leaves it alone, since Then's connection may
+// live on it. Caller holds mu.
 func (l *hedgeLeg) finishMoveLocked(err error) {
 	l.moveErr = err
 	l.onFirst = false
 	l.moving = false
 	l.pending = nil
-	l.cancel()
+	if err != nil {
+		l.cancel()
+	}
 	close(l.moved)
 }
 
@@ -330,7 +346,12 @@ func (s *hedgeStream) runMove() {
 	var conn net.Conn
 	then, err := s.h.outbound(s.h.thenTag)
 	if err == nil {
+		stop := s.dialTimer()
 		conn, err = then.DialContext(ctx, s.network, s.dest)
+		if !stop() && err == nil {
+			conn.Close() // the timer cancelled the context it lives on
+			err = os.ErrDeadlineExceeded
+		}
 	}
 	if err == nil {
 		switch {
@@ -726,7 +747,13 @@ func (p *hedgePacket) runMove() {
 	)
 	then, err := p.h.outbound(p.h.thenTag)
 	if err == nil {
-		if raw, err = then.ListenPacket(ctx, p.dest); err == nil {
+		stop := p.dialTimer()
+		raw, err = then.ListenPacket(ctx, p.dest)
+		if !stop() && err == nil {
+			raw.Close() // the timer cancelled the context it lives on
+			err = os.ErrDeadlineExceeded
+		}
+		if err == nil {
 			conn = netPacketConn(raw)
 		}
 	}

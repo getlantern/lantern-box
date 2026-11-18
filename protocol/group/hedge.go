@@ -34,8 +34,7 @@ const (
 )
 
 // hedgeFailoverDialTimeout bounds the dial to Then when a connection moves,
-// and the replay to it. The original dial's context may be gone by then. A
-// variable so tests can shorten it.
+// and the replay to it. A variable so tests can shorten it.
 var hedgeFailoverDialTimeout = 15 * time.Second
 
 func RegisterHedge(registry *outbound.Registry) {
@@ -267,8 +266,12 @@ func (h *Hedge) firstDialContext(ctx context.Context) (dialCtx context.Context, 
 	}
 }
 
-// failoverContext detaches from the dial's context, which may end once the
-// dial returns, and bounds the dial to Then.
-func failoverContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), hedgeFailoverDialTimeout)
+// moveContext is the context Then is dialed with when a connection moves. It
+// detaches from the original dial's context, which may end once that dial
+// returns, and has no deadline of its own: some outbounds, such as meek, tie
+// a connection's life to the context it was dialed with, so a successful
+// move must never cancel it. The dial is bounded by a separate timer, and the
+// context is cancelled only when the move fails or the connection closes.
+func moveContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.WithoutCancel(ctx))
 }

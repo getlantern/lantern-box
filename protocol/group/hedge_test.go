@@ -43,6 +43,9 @@ type fakeOutbound struct {
 	headroom int
 	// hang makes every dial wait for its context and return its error.
 	hang bool
+	// ctxBound closes each dialed conn when its dial context ends, as meek's
+	// conns do.
+	ctxBound bool
 	// wrap, when set, wraps each dialed stream conn.
 	wrap     func(net.Conn) net.Conn
 	dialCtxs chan context.Context
@@ -81,6 +84,12 @@ func (f *fakeOutbound) DialContext(ctx context.Context, network string, destinat
 	}
 	client, server := net.Pipe()
 	go f.stream(server)
+	if f.ctxBound {
+		go func() {
+			<-ctx.Done()
+			client.Close()
+		}()
+	}
 	if f.wrap != nil {
 		return f.wrap(client), nil
 	}
@@ -1098,4 +1107,21 @@ func TestHedgeDialUDPBypassingFirstToPlainSocket(t *testing.T) {
 	n, err := c.Read(buf)
 	require.NoError(t, err)
 	require.Equal(t, "ping", string(buf[:n]))
+}
+
+func TestHedgeMoveKeepsThenAliveOnItsDialContext(t *testing.T) {
+	old := hedgeFailoverDialTimeout
+	hedgeFailoverDialTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { hedgeFailoverDialTimeout = old })
+	then := &fakeOutbound{stream: answer("then:"), ctxBound: true}
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, then, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.Equal(t, "then:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+	require.Equal(t, "then:again", exchange(t, c, "again"),
+		"a successful move must not cancel the context Then's connection lives on")
+	time.Sleep(3 * hedgeFailoverDialTimeout)
+	require.Equal(t, "then:later", exchange(t, c, "later"),
+		"nor may that context expire with the failover timeout")
 }
