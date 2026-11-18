@@ -21,8 +21,8 @@ const InboundTag = "unbounded-exit"
 // Exit is unavailable without with_quic: New always fails.
 type Exit struct{}
 
-func New(context.Context, logger.ContextLogger) (*Exit, error)      { return nil, ErrUnavailable }
-func (*Exit) SetEnabled(bool)                                       {}
-func (*Exit) SetRouter(Kind, adapter.ConnectionRouterEx, time.Time) {}
-func (*Exit) Options() *UBClientcore.ExitOptions                    { return nil }
-func (*Exit) Close()                                                {}
+func New(context.Context, logger.ContextLogger) (*Exit, error)                    { return nil, ErrUnavailable }
+func (*Exit) SetEnabled(bool)                                                     {}
+func (*Exit) SetRouter(Kind, adapter.ConnectionRouterEx, time.Time, func() error) {}
+func (*Exit) Options() *UBClientcore.ExitOptions                                  { return nil }
+func (*Exit) Close()                                                              {}

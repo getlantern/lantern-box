@@ -52,7 +52,9 @@ type Exit struct {
 
 // kindState is one kind's exit box router.
 type kindState struct {
-	router     adapter.ConnectionRouterEx
+	router adapter.ConnectionRouterEx
+	// ready checks the router can route now: that the box's abuse rule sets hold rules.
+	ready      func() error
 	validUntil time.Time
 	// expiry clears the router at validUntil. gen counts SetRouter calls for the kind, so an
 	// expiry that fires after a later one leaves its router alone.
@@ -101,11 +103,15 @@ func (e *Exit) SetEnabled(on bool) {
 	e.updateRevokedLocked()
 }
 
-// SetRouter sets kind's current exit box router and how long its registration lasts. nil clears
-// it and ends the kind's running sessions, as validUntil passing does. The other kind is left
-// as it is. A kind other than Pool and Personal is ignored, and so is any call after Close,
-// such as one from a rule set callback that was still running when its owner closed the exit.
-func (e *Exit) SetRouter(kind Kind, r adapter.ConnectionRouterEx, validUntil time.Time) {
+// SetRouter sets kind's current exit box router, how long its registration lasts, and ready,
+// which reports whether the router may route now: whether the box's abuse rule sets hold rules
+// (see directexit.AbuseRuleSetsLoaded). The exit calls ready before routing each stream or flow
+// and before offering or minting each session, and treats the kind as unready while it fails,
+// so a list a download or reload emptied refuses new streams until it holds rules again. A nil
+// ready is never ready. nil r clears the kind and ends its running sessions, as validUntil
+// passing does. The other kind is left as it is. A kind other than Pool and Personal is
+// ignored, and so is any call after Close.
+func (e *Exit) SetRouter(kind Kind, r adapter.ConnectionRouterEx, validUntil time.Time, ready func() error) {
 	if kind != Pool && kind != Personal {
 		return
 	}
@@ -126,7 +132,10 @@ func (e *Exit) SetRouter(kind Kind, r adapter.ConnectionRouterEx, validUntil tim
 		gen := ks.gen
 		ks.expiry = time.AfterFunc(validUntil.Sub(e.now()), func() { e.expire(kind, gen) })
 	}
-	ks.router, ks.validUntil = r, validUntil
+	if r == nil {
+		ready = nil
+	}
+	ks.router, ks.validUntil, ks.ready = r, validUntil, ready
 	e.updateRevokedLocked()
 }
 
@@ -138,7 +147,7 @@ func (e *Exit) expire(kind Kind, gen uint64) {
 	if ks.gen != gen {
 		return
 	}
-	ks.router, ks.validUntil, ks.expiry = nil, time.Time{}, nil
+	ks.router, ks.validUntil, ks.expiry, ks.ready = nil, time.Time{}, nil, nil
 	e.updateRevokedLocked()
 }
 
@@ -184,14 +193,21 @@ func (e *Exit) ready(kind Kind) bool {
 }
 
 // currentRouter is the router to route a stream or flow of a kind's session through, or nil
-// once the exit is off or closed or the kind's registration has run out or been cleared.
-// Revocation ends sessions asynchronously, and expiry by timer, so a session can still open
-// streams and flows in the meantime.
+// once the exit is off or closed, the kind's registration has run out or been cleared, or its
+// ready check fails. Revocation ends sessions asynchronously, and expiry by timer, so a session
+// can still open streams and flows in the meantime.
+//
+// The ready check runs here, at each stream or flow, rather than on rule set updates: sing-box
+// publishes a set's new rules before it calls its callbacks, so a callback would always act
+// after the fact. A set emptied between this check and the routing still passes the one stream
+// being routed; that window is the residue of checking at the point of use.
 func (e *Exit) currentRouter(kind Kind) adapter.ConnectionRouterEx {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	ks := &e.kinds[kind]
-	if e.closed || !e.enabled || ks.router == nil || !e.now().Before(ks.validUntil) {
+	ks := e.kinds[kind]
+	usable := !e.closed && e.enabled && ks.router != nil && e.now().Before(ks.validUntil)
+	e.mu.Unlock()
+	// Outside mu: it takes the rule sets' locks.
+	if !usable || ks.ready == nil || ks.ready() != nil {
 		return nil
 	}
 	return ks.router

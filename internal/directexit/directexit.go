@@ -84,24 +84,3 @@ func AbuseRuleSetsLoaded(router RuleSetLookup) error {
 func ruleSetLoaded(set adapter.RuleSet) bool {
 	return set.Metadata() != (adapter.RuleSetMetadata{})
 }
-
-// WatchAbuseRuleSets calls f each time one of lookup's abuse rule sets updates, until the
-// returned stop is called, for a direct exit to recheck AbuseRuleSetsLoaded: sing-box replaces a
-// set's rules with each download or reload, which may hold none. f runs on the updating
-// goroutine, and may still be running, or about to, when stop returns.
-func WatchAbuseRuleSets(lookup RuleSetLookup, f func()) (stop func()) {
-	var stops []func()
-	for _, tag := range AbuseRuleSetTags {
-		set, ok := lookup.RuleSet(tag)
-		if !ok {
-			continue
-		}
-		el := set.RegisterCallback(func(adapter.RuleSet) { f() })
-		stops = append(stops, func() { set.UnregisterCallback(el) })
-	}
-	return func() {
-		for _, stop := range stops {
-			stop()
-		}
-	}
-}

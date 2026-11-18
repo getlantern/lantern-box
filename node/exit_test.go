@@ -24,7 +24,6 @@ import (
 	"github.com/sagernet/sing-box/option"
 	sjson "github.com/sagernet/sing/common/json"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -130,15 +129,15 @@ func (ev *exitEvents) list() []string {
 
 type fakeExitRouter struct {
 	id int
-	// unloaded, when set before the router is checked, makes the abuse rule sets it reports
-	// hold no rules; setLoaded changes it later, as a rule set update does.
-	unloaded bool
 
-	mu        sync.Mutex
-	callbacks list.List[adapter.RuleSetUpdateCallback]
+	mu sync.Mutex
+	// unloaded makes the abuse rule sets it reports hold no rules, as an empty download does.
+	unloaded bool
 }
 
-// fakeRuleSet is one of a fake router's abuse rule sets, all of which load or empty together.
+// fakeRuleSet is one of a fake router's abuse rule sets, all of which hold rules or none
+// together. It embeds a nil RuleSet, so registering a callback on it panics: RunExit registers
+// none.
 type fakeRuleSet struct {
 	adapter.RuleSet
 	r *fakeExitRouter
@@ -150,40 +149,16 @@ func (s fakeRuleSet) Metadata() adapter.RuleSetMetadata {
 	return adapter.RuleSetMetadata{ContainsNonIPCIDRRule: !s.r.unloaded}
 }
 
-func (s fakeRuleSet) RegisterCallback(cb adapter.RuleSetUpdateCallback) *list.Element[adapter.RuleSetUpdateCallback] {
-	s.r.mu.Lock()
-	defer s.r.mu.Unlock()
-	return s.r.callbacks.PushBack(cb)
-}
-
-func (s fakeRuleSet) UnregisterCallback(el *list.Element[adapter.RuleSetUpdateCallback]) {
-	s.r.mu.Lock()
-	defer s.r.mu.Unlock()
-	s.r.callbacks.Remove(el)
-}
-
 // RuleSet is sing-box's router lookup, which RunExit checks the abuse rule sets with.
 func (r *fakeExitRouter) RuleSet(string) (adapter.RuleSet, bool) {
 	return fakeRuleSet{r: r}, true
 }
 
-// setLoaded updates every abuse rule set to hold rules or none, as a download does, and calls
-// their callbacks.
+// setLoaded makes every abuse rule set hold rules or none, as a download does.
 func (r *fakeExitRouter) setLoaded(loaded bool) {
 	r.mu.Lock()
-	r.unloaded = !loaded
-	callbacks := r.callbacks.Array()
-	r.mu.Unlock()
-	for _, cb := range callbacks {
-		cb(fakeRuleSet{r: r})
-	}
-}
-
-// watchers counts the callbacks registered on its rule sets.
-func (r *fakeExitRouter) watchers() int {
-	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.callbacks.Len()
+	r.unloaded = !loaded
 }
 
 func (*fakeExitRouter) RouteConnection(context.Context, net.Conn, adapter.InboundContext) error {
@@ -293,7 +268,7 @@ type recordingExit struct {
 	ev *exitEvents
 }
 
-func (r *recordingExit) SetRouter(kind exit.Kind, router adapter.ConnectionRouterEx, validUntil time.Time) {
+func (r *recordingExit) SetRouter(kind exit.Kind, router adapter.ConnectionRouterEx, validUntil time.Time, ready func() error) {
 	prefix := ""
 	if kind == exit.Personal {
 		prefix = "personal "
@@ -303,7 +278,7 @@ func (r *recordingExit) SetRouter(kind exit.Kind, router adapter.ConnectionRoute
 	} else {
 		r.ev.add("%srouter nil", prefix)
 	}
-	r.Exit.SetRouter(kind, router, validUntil)
+	r.Exit.SetRouter(kind, router, validUntil, ready)
 }
 
 // runExitAsync runs the registrar with fast retries, recording its routers in ev.
@@ -1125,7 +1100,7 @@ func TestRunExitKeepsTheBoxWhenRuleSetsDontLoad(t *testing.T) {
 	newBox := func(ctx context.Context, options string) (ExitBox, error) {
 		b, err := boxes.new(ctx, options)
 		if err == nil && builds.Add(1) > 1 {
-			b.(*fakeExitBox).router.unloaded = true
+			b.(*fakeExitBox).router.setLoaded(false)
 		}
 		return b, err
 	}
@@ -1163,7 +1138,7 @@ func TestRunExitChecksEveryBoxsRuleSets(t *testing.T) {
 		log  string
 	}{
 		"unloaded": {
-			wrap: func(b *fakeExitBox) ExitBox { b.router.unloaded = true; return b },
+			wrap: func(b *fakeExitBox) ExitBox { b.router.setLoaded(false); return b },
 			log:  "abuse rule sets haven't loaded",
 		},
 		"uncheckable": {
@@ -1217,9 +1192,9 @@ func TestRunExitChecksEveryBoxsRuleSets(t *testing.T) {
 	}
 }
 
-// A served box's abuse rule sets can be emptied by a later update. RunExit withdraws the kind
-// while any is empty, serves it again once they all hold rules, and stops watching once the box
-// closes.
+// A served box's abuse rule sets can be emptied by a later update. The exit checks them at
+// each stream and session, so the kind is unready while any is empty, and ready again once they
+// all hold rules, with no rule set callbacks: the fake's sets panic if one is registered.
 func TestRunExitFollowsAServedBoxsRuleSets(t *testing.T) {
 	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"server_config": validExitConfig, "personal_server_config": personalExitConfig})
@@ -1240,23 +1215,21 @@ func TestRunExitFollowsAServedBoxsRuleSets(t *testing.T) {
 		}
 	}
 	require.NotNil(t, personalBox)
-	require.Eventually(t, func() bool { return personalBox.router.watchers() > 0 }, 5*time.Second, time.Millisecond)
 
 	personalBox.router.setLoaded(false)
-	assert.False(t, o.Ready(true), "the personal kind is withdrawn while its list is empty")
+	assert.False(t, o.Ready(true), "the personal kind is unready while its list is empty")
+	_, _, ok := o.Params(true)
+	assert.False(t, ok)
 	assert.True(t, o.Ready(false), "the pool kind serves on")
 	personalBox.router.setLoaded(true)
-	assert.True(t, o.Ready(true), "and served again once it holds rules")
+	assert.True(t, o.Ready(true), "and ready again once it holds rules")
 
 	cancel()
 	waitDone(t, done)
-	for _, b := range boxes.all() {
-		assert.Zero(t, b.router.watchers(), "box %d's rule sets are unwatched once it closes", b.id)
-	}
 }
 
 // A renewal of an unchanged box rechecks its abuse rule sets, and doesn't extend a box whose
-// sets are empty.
+// sets are empty: the exit records no second router for it.
 func TestRunExitDoesntRenewABoxWithAnEmptyList(t *testing.T) {
 	var registers atomic.Int32
 	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1275,17 +1248,19 @@ func TestRunExitDoesntRenewABoxWithAnEmptyList(t *testing.T) {
 	o := e.Options()
 	require.Eventually(t, func() bool { return o.Ready(false) }, 5*time.Second, time.Millisecond)
 	b := boxes.last()
-	// Empty, but without a callback: only the renewal can see it.
-	b.router.mu.Lock()
-	b.router.unloaded = true
-	b.router.mu.Unlock()
+	b.router.setLoaded(false)
 	reregister <- struct{}{}
-	require.Eventually(t, func() bool { return registers.Load() >= 2 }, 5*time.Second, time.Millisecond)
-	require.Eventually(t, func() bool { return !o.Ready(false) }, 5*time.Second, time.Millisecond,
-		"an unchanged box with an empty list isn't renewed")
-	assert.Len(t, boxes.all(), 1)
+	require.Eventually(t, func() bool { return registers.Load() >= 3 }, 5*time.Second, time.Millisecond, "it retries")
 	cancel()
 	waitDone(t, done)
+	routed := 0
+	for _, event := range ev.list() {
+		if event == "router 1" {
+			routed++
+		}
+	}
+	assert.Equal(t, 1, routed, "an unchanged box with an empty list isn't renewed")
+	assert.Len(t, boxes.all(), 1)
 }
 
 // holdOffs records what RunExit reports through OnHoldOff.

@@ -34,6 +34,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	box "github.com/getlantern/lantern-box"
+	"github.com/getlantern/lantern-box/internal/directexit"
 	lbOption "github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/peerrules"
 	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
@@ -245,8 +246,9 @@ func TestDirectExitPersonalAndPoolSessions(t *testing.T) {
 	require.NoError(t, err, "exit.New")
 	t.Cleanup(e.Close)
 	e.SetEnabled(true)
-	e.SetRouter(exit.Personal, personal, time.Now().Add(time.Hour))
-	e.SetRouter(exit.Pool, pool, time.Now().Add(time.Hour))
+	ready := abuseRuleSetsReady(exitBox)
+	e.SetRouter(exit.Personal, personal, time.Now().Add(time.Hour), ready)
+	e.SetRouter(exit.Pool, pool, time.Now().Add(time.Hour), ready)
 	startWidget(t, ctx, freddieURL, egressURL, func(_ *UBClientcore.BroflakeOptions, rtcOpt *UBClientcore.WebRTCOptions) {
 		rtcOpt.Exit = e.Options()
 		rtcOpt.SetRoomTickets([]string{ticket(helperticket.RoleVolunteer)})
@@ -321,7 +323,7 @@ func startDirectExitRig(t testing.TB, c directExitCase) *directExitRig {
 	t.Cleanup(e.Close)
 	e.SetEnabled(c.enabled)
 	if c.router {
-		e.SetRouter(exit.Pool, rig.router, time.Now().Add(time.Hour))
+		e.SetRouter(exit.Pool, rig.router, time.Now().Add(time.Hour), abuseRuleSetsReady(rig.router.ConnectionRouterEx))
 	}
 	exitOpts := *e.Options()
 	onSession := exitOpts.OnSession
@@ -382,6 +384,11 @@ func startExitBox(t testing.TB) adapter.ConnectionRouterEx {
 	require.NoError(t, b.Start(), "exit box Start")
 	t.Cleanup(func() { _ = b.Close() })
 	return b.Router()
+}
+
+// abuseRuleSetsReady is the exit's ready check for an exit box's router, as RunExit's.
+func abuseRuleSetsReady(router adapter.ConnectionRouterEx) func() error {
+	return func() error { return directexit.AbuseRuleSetsLoaded(router.(directexit.RuleSetLookup)) }
 }
 
 // countingRouter counts the streams and flows the exit hands the exit box, and those the exit

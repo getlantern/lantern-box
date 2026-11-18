@@ -186,7 +186,7 @@ func newVolunteerExit(t *testing.T) *volunteerExit {
 	t.Cleanup(e.Close)
 	r := newEchoRouter(t)
 	e.SetEnabled(true)
-	e.SetRouter(exit.Pool, r, time.Now().Add(time.Hour))
+	e.SetRouter(exit.Pool, r, time.Now().Add(time.Hour), func() error { return nil })
 	return &volunteerExit{e: e, r: r}
 }
 
