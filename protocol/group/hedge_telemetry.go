@@ -59,6 +59,9 @@ const (
 	hedgeOutcomeStalledAfterCommit = "stalled_after_commit"
 	hedgeOutcomeResetAfterCommit   = "reset_after_commit"
 	hedgeOutcomeResetNotReplayable = "reset_not_replayable"
+	// hedgeOutcomeThenDialError is a connection Then failed to dial, on any
+	// path, so Then's failures are counted as First's are.
+	hedgeOutcomeThenDialError = "then_dial_error"
 	// hedgeOutcomeAbandoned is a connection the client closed before First
 	// replied or failed.
 	hedgeOutcomeAbandoned = "abandoned"
@@ -75,8 +78,36 @@ type hedgeTelemetry struct {
 	firstByte   metric.Float64Histogram
 }
 
-func newHedgeTelemetry() (*hedgeTelemetry, error) {
-	meter := otel.Meter(tracerName)
+// hedgeFirstByteBuckets are seconds, from a nearby CDN to a slow fallback.
+var hedgeFirstByteBuckets = []float64{0.025, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1, 1.5, 2.5, 5, 10}
+
+// hedgeInstruments holds the instruments of the meter provider they were
+// created from. The provider is replaced when telemetry's config changes or
+// it is turned off or on, so instruments are looked up per record rather
+// than kept from when the hedge was built.
+var hedgeInstruments struct {
+	mu       sync.Mutex
+	provider metric.MeterProvider
+	tel      *hedgeTelemetry
+}
+
+// currentHedgeTelemetry returns the instruments of the current global meter
+// provider, or nil when they can't be created.
+func currentHedgeTelemetry() *hedgeTelemetry {
+	mp := otel.GetMeterProvider()
+	hedgeInstruments.mu.Lock()
+	defer hedgeInstruments.mu.Unlock()
+	if hedgeInstruments.provider != mp {
+		tel, err := newHedgeTelemetry(mp.Meter(tracerName))
+		if err != nil {
+			tel = nil
+		}
+		hedgeInstruments.provider, hedgeInstruments.tel = mp, tel
+	}
+	return hedgeInstruments.tel
+}
+
+func newHedgeTelemetry(meter metric.Meter) (*hedgeTelemetry, error) {
 	connections, err := meter.Int64Counter("hedge.connections",
 		metric.WithDescription("Hedged connections, by the path they took and how First fared"))
 	if err != nil {
@@ -90,7 +121,8 @@ func newHedgeTelemetry() (*hedgeTelemetry, error) {
 	}
 	firstByte, err := meter.Float64Histogram("hedge.time_to_first_byte",
 		metric.WithDescription("Time from the hedge's dial to the first byte the client receives"),
-		metric.WithUnit("s"))
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(hedgeFirstByteBuckets...))
 	if err != nil {
 		return nil, err
 	}
@@ -167,11 +199,28 @@ func (s *hedgeStats) wrote(n int) {
 	}
 }
 
+// thenDialed records a connection whose dial to Then failed. With no error,
+// or for a dial that records nothing (a probe's, or one while the hedge is
+// switched off), it does nothing.
+func (s *hedgeStats) thenDialed(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	recorded := s.path != ""
+	s.mu.Unlock()
+	if !recorded {
+		return
+	}
+	s.set("", hedgeOutcomeThenDialError)
+	s.finish(true)
+}
+
 // finish records the connection. tried reports whether it tried First, so
 // an outcome is due.
 func (s *hedgeStats) finish(tried bool) {
 	s.once.Do(func() {
-		t := s.h.tel
+		t := currentHedgeTelemetry()
 		if t == nil {
 			return
 		}

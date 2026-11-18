@@ -22,8 +22,7 @@ import (
 	"github.com/getlantern/lantern-box/option"
 )
 
-// recordMetrics installs an in-memory meter provider for the test. Hedges
-// must be created after it, since they create their instruments then.
+// recordMetrics installs an in-memory meter provider for the test.
 func recordMetrics(t *testing.T) *sdkmetric.ManualReader {
 	t.Helper()
 	reader := sdkmetric.NewManualReader()
@@ -38,9 +37,10 @@ func recordMetrics(t *testing.T) *sdkmetric.ManualReader {
 }
 
 type hedgePoint struct {
-	attrs map[string]string
-	int   int64
-	count uint64 // histogram sample count
+	attrs  map[string]string
+	int    int64
+	count  uint64    // histogram sample count
+	bounds []float64 // histogram bucket boundaries
 }
 
 func collectHedge(t *testing.T, reader *sdkmetric.ManualReader, name string) []hedgePoint {
@@ -60,7 +60,7 @@ func collectHedge(t *testing.T, reader *sdkmetric.ManualReader, name string) []h
 				}
 			case metricdata.Histogram[float64]:
 				for _, dp := range data.DataPoints {
-					points = append(points, hedgePoint{attrs: attrMap(dp.Attributes.ToSlice()), count: dp.Count})
+					points = append(points, hedgePoint{attrs: attrMap(dp.Attributes.ToSlice()), count: dp.Count, bounds: dp.Bounds})
 				}
 			}
 		}
@@ -165,6 +165,52 @@ func TestHedgeTelemetryBytesAndFirstByte(t *testing.T) {
 	require.EqualValues(t, 1, ttfb[0].count)
 	require.Equal(t, hedgePathFirst, ttfb[0].attrs["hedge.path"])
 	require.NotContains(t, ttfb[0].attrs, "hedge.outcome", "first byte is keyed by path alone")
+	require.Equal(t, hedgeFirstByteBuckets, ttfb[0].bounds, "buckets in seconds, not the SDK's millisecond-sized defaults")
+}
+
+// Then's dial failures are counted, as First's are, so the paths compare
+// fairly.
+func TestHedgeTelemetryThenDialError(t *testing.T) {
+	failing := &fakeOutbound{dialErr: errors.New("then down")}
+	t.Run("then directly", func(t *testing.T) {
+		reader := recordMetrics(t)
+		f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, failing, nil)
+		f.hedge.cache.mark(hedgeKeyFor(context.Background(), "tcp", hedgeDest), hedgeBad, time.Minute)
+		_, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+		require.Error(t, err)
+		attrs := connectionRecord(t, reader)
+		require.Equal(t, hedgePathThenKnownBad, attrs["hedge.path"])
+		require.Equal(t, hedgeOutcomeThenDialError, attrs["hedge.outcome"])
+	})
+	t.Run("after first failed to dial", func(t *testing.T) {
+		reader := recordMetrics(t)
+		f := newHedgeFixture(t, &fakeOutbound{dialErr: errors.New("no strategy")}, failing, nil)
+		_, err := f.hedge.ListenPacket(f.ctx, hedgeDest)
+		require.Error(t, err)
+		attrs := connectionRecord(t, reader)
+		require.Equal(t, hedgePathThenAfterMove, attrs["hedge.path"])
+		require.Equal(t, hedgeOutcomeThenDialError, attrs["hedge.outcome"])
+		require.Equal(t, "udp", attrs["network.protocol.name"])
+	})
+	t.Run("a probe records nothing", func(t *testing.T) {
+		reader := recordMetrics(t)
+		f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, failing, nil)
+		_, err := f.hedge.DialContext(lAdapter.ContextWithProbe(f.ctx), "tcp", hedgeDest)
+		require.Error(t, err)
+		require.Empty(t, collectHedge(t, reader, "hedge.connections"))
+	})
+}
+
+// A hedge built before the meter provider is replaced, as radiance does when
+// telemetry's config changes, records to the new one.
+func TestHedgeTelemetryFollowsTheMeterProvider(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	reader := recordMetrics(t)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.Equal(t, "first:hi", exchange(t, c, "hi"))
+	c.Close()
+	require.Equal(t, hedgePathFirst, connectionRecord(t, reader)["hedge.path"])
 }
 
 func TestHedgeTelemetryThenPaths(t *testing.T) {

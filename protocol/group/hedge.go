@@ -78,8 +78,6 @@ type Hedge struct {
 	// telemetrySites are the registered domains the hedge.site attribute may
 	// name; others are reported as "other".
 	telemetrySites map[string]bool
-	// tel is nil when the instruments couldn't be created.
-	tel *hedgeTelemetry
 }
 
 var _ lAdapter.Switchable = (*Hedge)(nil)
@@ -126,11 +124,6 @@ func NewHedge(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		}
 		sites[registeredDomain(site)] = true
 	}
-	tel, err := newHedgeTelemetry()
-	if err != nil {
-		logger.Warn("hedge: telemetry disabled: ", err)
-		tel = nil
-	}
 	h := &Hedge{
 		// Only Then is a dependency. First may come and go at runtime, as a
 		// server-sent outbound does: the hedge looks it up on every dial and
@@ -146,7 +139,6 @@ func NewHedge(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		exploreRate:    options.ExploreRate,
 		random:         rand.Float64,
 		telemetrySites: sites,
-		tel:            tel,
 	}
 	h.enabled.Store(!options.Disabled)
 	return h, nil
@@ -241,11 +233,13 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 	}
 	first, key, path := h.route(ctx, N.NetworkTCP, destination)
 	if first == nil {
+		stats := h.newStats(key, N.NetworkTCP, path, start)
 		conn, err := then.DialContext(ctx, network, destination)
 		if err != nil || path == "" {
+			stats.thenDialed(err)
 			return conn, err
 		}
-		return &statsStream{Conn: conn, stats: h.newStats(key, N.NetworkTCP, path, start)}, nil
+		return &statsStream{Conn: conn, stats: stats}, nil
 	}
 	stats := h.newStats(key, N.NetworkTCP, path, start)
 	dialCtx, timedOut, stop := h.firstDialContext(ctx)
@@ -258,11 +252,12 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 		if !timedOut() {
 			h.markBad(ctx, key, err)
 		}
+		stats.set(hedgePathThenAfterMove, hedgeOutcomeMovedDialError)
 		conn, err := then.DialContext(ctx, network, destination)
 		if err != nil {
+			stats.thenDialed(err)
 			return nil, err
 		}
-		stats.set(hedgePathThenAfterMove, hedgeOutcomeMovedDialError)
 		return &statsStream{Conn: conn, stats: stats}, nil
 	}
 	return newHedgeStream(h, ctx, key, network, destination, conn, stats), nil
@@ -276,11 +271,13 @@ func (h *Hedge) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	}
 	first, key, path := h.route(ctx, N.NetworkUDP, destination)
 	if first == nil {
+		stats := h.newStats(key, N.NetworkUDP, path, start)
 		conn, err := then.ListenPacket(ctx, destination)
 		if err != nil || path == "" {
+			stats.thenDialed(err)
 			return conn, err
 		}
-		return newStatsPacket(conn, h.newStats(key, N.NetworkUDP, path, start)), nil
+		return newStatsPacket(conn, stats), nil
 	}
 	stats := h.newStats(key, N.NetworkUDP, path, start)
 	dialCtx, timedOut, stop := h.firstDialContext(ctx)
@@ -293,11 +290,12 @@ func (h *Hedge) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		if !timedOut() {
 			h.markBad(ctx, key, err)
 		}
+		stats.set(hedgePathThenAfterMove, hedgeOutcomeMovedDialError)
 		conn, err := then.ListenPacket(ctx, destination)
 		if err != nil {
+			stats.thenDialed(err)
 			return nil, err
 		}
-		stats.set(hedgePathThenAfterMove, hedgeOutcomeMovedDialError)
 		return newStatsPacket(conn, stats), nil
 	}
 	return newHedgePacket(h, ctx, key, destination, conn, stats), nil
