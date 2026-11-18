@@ -338,12 +338,30 @@ func (l *hedgeLeg) staticResetOutcomeLocked() string {
 func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter.UserFailureKind)) {
 	l.mu.Lock()
 	if l.committed {
-		l.failedAfterCommitLocked(kind)
+		// No reply is no failure once First has replied, as in beginMove: a
+		// reply that committed while the watchdog's report was on its way.
+		if kind != lAdapter.UserFailureNoResponse {
+			l.failedAfterCommitLocked(kind)
+		}
 		l.mu.Unlock()
 		return
 	}
 	l.mu.Unlock()
 	move(kind)
+}
+
+// noteReset runs as the watchdog charges a reset on First, before the
+// client sees the error. A reset after the commit is counted here, since
+// firstFailed handles it later on its own goroutine, possibly after the
+// client closed and the close was taken as clean. A reset before the commit
+// is left to firstFailed's move. The watchdog calls this from the IO path,
+// which never holds mu.
+func (l *hedgeLeg) noteReset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.committed && l.onFirst && !l.moving {
+		l.failedAfterCommitLocked(lAdapter.UserFailureReset)
+	}
 }
 
 // failedAfterCommitLocked handles First failing after it replied. A stall
@@ -699,7 +717,9 @@ func (s *hedgeStream) write(p []byte) (int, error) {
 		s.mu.Unlock()
 
 		n, err := c.Write(p)
-		if err == nil || !kept {
+		// A write that ran out the caller's deadline is the caller's
+		// timeout, not First failing.
+		if err == nil || !kept || isTimeout(err) {
 			return n, err
 		}
 		// p is in the copy, so a move delivers it.
@@ -1124,7 +1144,7 @@ func (p *hedgePacket) writeLeg(b []byte, dest M.Socksaddr) error {
 		p.mu.Unlock()
 
 		err := writePacket(c, raw, b, dest)
-		if err == nil || !kept {
+		if err == nil || !kept || isTimeout(err) {
 			return err
 		}
 		p.move(lAdapter.UserFailureReset)

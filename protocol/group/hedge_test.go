@@ -1071,10 +1071,13 @@ func TestHedgeConnFromBeforeANetworkChangeDoesNotMark(t *testing.T) {
 
 func TestHedgeCacheDropsEmptyAddressBlocks(t *testing.T) {
 	c := newHedgeCache()
+	now := time.Now()
+	c.now = func() time.Time { return now }
 	for i := range 100 {
 		prefix, _ := netip.AddrFrom4([4]byte{10, 0, byte(i), 1}).Prefix(24)
 		k := hedgeKey{site: "flaky.example", network: "tcp", prefix: prefix}
-		c.mark(k, hedgeBad, time.Hour)
+		c.mark(k, hedgeBad, time.Minute)
+		now = now.Add(2 * time.Minute) // a failure recovers when it expires
 		c.mark(k, hedgeGood, time.Hour)
 	}
 	require.Empty(t, c.badSites, "a block whose last bad site recovered must be removed")
@@ -1370,7 +1373,7 @@ func commitThenReset(t *testing.T, f *hedgeFixture, viaMove bool) net.Conn {
 // bad. Both ways a reset after the commit arrives count.
 func TestHedgeResetsAfterAReplyTakeTwoStrikes(t *testing.T) {
 	for _, viaMove := range []bool{false, true} {
-		f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+		f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, longCommit)
 		c := commitThenReset(t, f, viaMove)
 		require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()), "one reset after a reply is a strike, not a block")
 		c.Close()
@@ -1382,7 +1385,7 @@ func TestHedgeResetsAfterAReplyTakeTwoStrikes(t *testing.T) {
 
 // A connection that closes cleanly after First replied clears the strikes.
 func TestHedgeCleanConnectionClearsStrikes(t *testing.T) {
-	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, longCommit)
 	commitThenReset(t, f, false).Close()
 	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
 	require.NoError(t, err)
@@ -1394,7 +1397,7 @@ func TestHedgeCleanConnectionClearsStrikes(t *testing.T) {
 
 // One connection strikes once, however many paths see its reset.
 func TestHedgeOneConnectionStrikesOnce(t *testing.T) {
-	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, longCommit)
 	c := commitThenReset(t, f, true)
 	s := c.(*hedgeStream)
 	s.firstFailed(lAdapter.UserFailureReset, s.move) // the same reset, handled
@@ -1404,7 +1407,7 @@ func TestHedgeOneConnectionStrikesOnce(t *testing.T) {
 
 // A stall after a reply isn't teardown: it marks the site bad at once.
 func TestHedgeStallAfterAReplyMarksBad(t *testing.T) {
-	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, longCommit)
 	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
 	require.NoError(t, err)
 	defer c.Close()
@@ -1431,7 +1434,7 @@ func TestHedgeCacheStrikesExpire(t *testing.T) {
 
 // A reply that lands after a failure doesn't mark the site good again.
 func TestHedgeReplyAfterAFailureKeepsItBad(t *testing.T) {
-	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, longCommit)
 	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
 	require.NoError(t, err)
 	defer c.Close()
@@ -1443,4 +1446,104 @@ func TestHedgeReplyAfterAFailureKeepsItBad(t *testing.T) {
 	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
 	s.commit(s.releaseLocked) // the reply that was on its way
 	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()), "the late reply doesn't mark it good")
+}
+
+// A reply doesn't clear a failure that hasn't expired: it can come from a
+// connection opened before the site failed. Once it expires, good sticks.
+func TestHedgeCacheGoodDoesNotClearALiveFailure(t *testing.T) {
+	c := newHedgeCache()
+	now := time.Now()
+	c.now = func() time.Time { return now }
+	k := hedgeKey{site: "example.com", network: "tcp"}
+	c.mark(k, hedgeBad, time.Minute)
+	c.mark(k, hedgeGood, time.Hour)
+	require.Equal(t, hedgeBad, c.verdict(k))
+	now = now.Add(2 * time.Minute)
+	c.mark(k, hedgeGood, time.Hour)
+	require.Equal(t, hedgeGood, c.verdict(k))
+}
+
+// clearStrikes from a connection on a network the cache has forgotten
+// leaves the new network's strikes alone.
+func TestHedgeCacheClearStrikesIgnoresAnOldNetwork(t *testing.T) {
+	c := newHedgeCache()
+	old := hedgeKey{site: "example.com", network: "tcp", gen: c.generation()}
+	c.clear()
+	cur := hedgeKey{site: "example.com", network: "tcp", gen: c.generation()}
+	require.False(t, c.strike(cur, time.Minute))
+	c.clearStrikes(old)
+	require.True(t, c.strike(cur, time.Minute), "the old connection's clean close didn't wipe the strike")
+}
+
+// A post-commit report of no reply is ignored: a reply committed while the
+// watchdog's report was on its way.
+func TestHedgeNoReplyReportAfterACommitIsIgnored(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")},
+		func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) })
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.Equal(t, "first:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+	s := c.(*hedgeStream)
+	s.firstFailed(lAdapter.UserFailureNoResponse, s.move)
+	require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()))
+}
+
+// A write that runs out the caller's deadline isn't a reset by First.
+func TestHedgeWriteDeadlineIsNotAReset(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn {
+		return &failingConn{Conn: c, err: timeoutErr{}, failWrite: true}
+	}}, &fakeOutbound{stream: answer("then:")},
+		func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) })
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte(tlsRecord("hi")))
+	require.Error(t, err)
+	require.NotEqual(t, hedgeBad, f.verdict(hedgeDest.String()))
+	require.EqualValues(t, 0, f.then.dials.Load(), "no move to Then for the caller's own timeout")
+}
+
+// The watchdog's synchronous reset note strikes before the client sees the
+// error, so a close that follows at once isn't taken as clean.
+func TestHedgeResetNotedBeforeTheCloseStrikes(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")},
+		func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) })
+	for _, want := range []hedgeVerdict{hedgeGood, hedgeBad} {
+		c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+		require.NoError(t, err)
+		require.Equal(t, "first:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+		c.(*hedgeStream).noteReset() // as the watchdog does
+		c.Close()                    // before firstFailed would have run
+		require.Equal(t, want, f.verdict(hedgeDest.String()))
+	}
+}
+
+// longCommit keeps the commit timer out of tests that need First to reply.
+func longCommit(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) }
+
+// A real reset after First replied, through the watchdog, with the client
+// closing as soon as it sees the error: the strikes still add up.
+func TestHedgeRealResetsAfterAReplyStrikeBeforeTheClose(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn {
+		return &failingConn{Conn: c, err: connResetErr(), firstN: 8}
+	}}, &fakeOutbound{stream: answer("then:")}, longCommit)
+	for i := range 2 {
+		c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+		require.NoError(t, err)
+		require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+		_, err = c.Write([]byte(tlsRecord("hi")))
+		require.NoError(t, err)
+		buf := make([]byte, 16)
+		n, err := c.Read(buf)
+		require.NoError(t, err, "First's reply commits")
+		require.Equal(t, 8, n)
+		_, err = c.Read(buf)
+		require.Error(t, err, "then First resets")
+		c.Close()
+		if i == 0 {
+			require.NotEqual(t, hedgeBad, f.verdict(hedgeDest.String()), "one strike")
+		}
+	}
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()), "two strikes, though each client closed at once")
 }
