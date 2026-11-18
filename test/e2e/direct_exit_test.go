@@ -22,6 +22,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	sblog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/route/rule"
 	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -107,27 +108,11 @@ func TestDirectExitE2E(t *testing.T) {
 	})
 
 	t.Run("10.0.0.0/8 refused", func(t *testing.T) {
-		// Unroutable here, so only a refusal fails fast: a dial would time out.
 		requireRefused(t, rig, "http://10.255.255.1:80/", nil)
 	})
 
 	t.Run("port 25 refused", func(t *testing.T) {
-		// An origin on port 25 shows that only the rule stops the request. Binding it can
-		// need privileges; without it, the fast failure and the exit box's routing of the
-		// request still show a refusal.
-		var smtpHits atomic.Int64
-		if l, err := net.Listen("tcp", "127.0.0.1:25"); err == nil {
-			srv := &http.Server{Handler: countingHandler(&smtpHits)}
-			go func() { _ = srv.Serve(l) }()
-			t.Cleanup(func() { _ = srv.Close() })
-			resp, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://127.0.0.1:25/")
-			require.NoError(t, err, "the port 25 origin, directly")
-			resp.Body.Close()
-			require.Equal(t, int64(1), smtpHits.Load())
-		} else {
-			t.Log("cannot bind 127.0.0.1:25 here; checking the refusal without an origin")
-		}
-		requireRefused(t, rig, "http://127.0.0.1:25/", &smtpHits)
+		requireRefused(t, rig, "http://127.0.0.1:25/", nil)
 	})
 
 	t.Run("abuse rule set refused", func(t *testing.T) {
@@ -137,7 +122,7 @@ func TestDirectExitE2E(t *testing.T) {
 		for _, host := range []string{"malware.test", "phishing.test", "cryptominer.test"} {
 			requireRefused(t, rig, "http://"+host+":"+originPort+"/", &originHits)
 		}
-		// geoip-malware's address is TEST-NET-1, unroutable: only a refusal fails fast.
+		// geoip-malware's inline set holds this TEST-NET-1 address.
 		requireRefused(t, rig, "http://192.0.2.66:80/", nil)
 	})
 
@@ -264,20 +249,32 @@ func startExitBox(t *testing.T) adapter.ConnectionRouterEx {
 	return b.Router()
 }
 
-// countingRouter counts the streams and flows the exit hands the exit box.
+// countingRouter counts the streams and flows the exit hands the exit box, and those the exit
+// box's rules rejected, which sing-box reports through onClose.
 type countingRouter struct {
 	adapter.ConnectionRouterEx
-	routed atomic.Int64
+	routed, rejected atomic.Int64
+}
+
+func (r *countingRouter) onClose(onClose N.CloseHandlerFunc) N.CloseHandlerFunc {
+	return func(err error) {
+		if rule.IsRejected(err) {
+			r.rejected.Add(1)
+		}
+		if onClose != nil {
+			onClose(err)
+		}
+	}
 }
 
 func (r *countingRouter) RouteConnectionEx(ctx context.Context, conn net.Conn, md adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	r.routed.Add(1)
-	r.ConnectionRouterEx.RouteConnectionEx(ctx, conn, md, onClose)
+	r.ConnectionRouterEx.RouteConnectionEx(ctx, conn, md, r.onClose(onClose))
 }
 
 func (r *countingRouter) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn, md adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	r.routed.Add(1)
-	r.ConnectionRouterEx.RoutePacketConnectionEx(ctx, conn, md, onClose)
+	r.ConnectionRouterEx.RoutePacketConnectionEx(ctx, conn, md, r.onClose(onClose))
 }
 
 func countingHandler(hits *atomic.Int64) http.Handler {
@@ -288,12 +285,12 @@ func countingHandler(hits *atomic.Int64) http.Handler {
 	})
 }
 
-// requireRefused fails unless a GET of target through the rig's consumer fails fast, after
-// reaching the volunteer's exit box and without reaching the egress or, if hits is not nil,
-// the origin hits counts.
+// requireRefused fails unless a GET of target through the rig's consumer fails, with the
+// volunteer's exit box rejecting it by rule, and without reaching the egress or, if hits is
+// not nil, the origin hits counts.
 func requireRefused(t *testing.T, rig *directExitRig, target string, hits *atomic.Int64) {
 	t.Helper()
-	routedBefore := rig.router.routed.Load()
+	rejectedBefore := rig.router.rejected.Load()
 	dialsBefore := rig.egressDials.Load()
 	var hitsBefore int64
 	if hits != nil {
@@ -301,10 +298,12 @@ func requireRefused(t *testing.T, rig *directExitRig, target string, hits *atomi
 	}
 	started := time.Now()
 	require.False(t, proxiedGetOK(rig.proxy, target, 10*time.Second), "%s was not refused", target)
-	// Well under sing-box's 5s TCP connect timeout, which an unrefused dial to an unroutable
-	// address runs into.
-	require.Less(t, time.Since(started), 2*time.Second, "%s failed slowly, not by refusal", target)
-	require.Greater(t, rig.router.routed.Load(), routedBefore, "%s never reached the exit box", target)
+	// Only a guard against hangs: the rejection count below is what shows the refusal.
+	require.Less(t, time.Since(started), 4*time.Second, "%s failed slowly", target)
+	// sing-box reports the rejection through onClose, which can run just after the user's
+	// side sees the stream fail.
+	require.Eventually(t, func() bool { return rig.router.rejected.Load() > rejectedBefore },
+		2*time.Second, 20*time.Millisecond, "the exit box's rules did not reject %s", target)
 	require.Equal(t, dialsBefore, rig.egressDials.Load(), "%s went to the egress", target)
 	if hits != nil {
 		require.Equal(t, hitsBefore, hits.Load(), "%s reached its origin", target)
