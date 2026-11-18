@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -218,6 +219,56 @@ func TestHedgeTelemetryMoveFailed(t *testing.T) {
 	attrs := connectionRecord(t, reader)
 	require.Equal(t, hedgePathFirst, attrs["hedge.path"])
 	require.Equal(t, hedgeOutcomeMoveFailed, attrs["hedge.outcome"])
+}
+
+// recordingHalfCloser is a conn that can half-close, and records that it did.
+type recordingHalfCloser struct {
+	net.Conn
+	closedWrite bool
+}
+
+func (c *recordingHalfCloser) CloseWrite() error { c.closedWrite = true; return nil }
+
+// The relay half-closes a destination only if it is an N.WriteCloser, so
+// wrapping Then's conn must keep that exactly as the conn has it.
+func TestStatsStreamKeepsHalfClose(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	hc := &recordingHalfCloser{Conn: a}
+	wrapped, ok := newStatsStream(hc, &hedgeStats{}).(N.WriteCloser)
+	require.True(t, ok, "a conn that can half-close stays one")
+	require.NoError(t, wrapped.CloseWrite())
+	require.True(t, hc.closedWrite)
+
+	_, ok = newStatsStream(a, &hedgeStats{}).(N.WriteCloser)
+	require.False(t, ok, "one that can't doesn't pretend to")
+}
+
+// A caller that gives up while First dials is counted as abandoned, not
+// left out of the comparison.
+func TestHedgeTelemetryCancelledDialIsAbandoned(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{dialErr: errors.New("cancelled")}, &fakeOutbound{stream: answer("then:")}, nil)
+	ctx, cancel := context.WithCancel(f.ctx)
+	cancel()
+	_, err := f.hedge.DialContext(ctx, "tcp", hedgeDest)
+	require.Error(t, err)
+	attrs := connectionRecord(t, reader)
+	require.Equal(t, hedgePathFirst, attrs["hedge.path"])
+	require.Equal(t, hedgeOutcomeAbandoned, attrs["hedge.outcome"])
+}
+
+// A reset after the commit whose handling runs only after the client closed
+// is still recorded as one.
+func TestHedgeTelemetryResetSeenBeforeItIsHandled(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	stats := f.hedge.newStats(hedgeKeyFor(context.Background(), "tcp", hedgeDest), "tcp", hedgePathFirst, time.Now())
+	stats.set("", hedgeOutcomeCommitted)
+	stats.noteReset()
+	stats.finish(true)
+	require.Equal(t, hedgeOutcomeResetAfterCommit, connectionRecord(t, reader)["hedge.outcome"])
 }
 
 // A hedge built before the meter provider is replaced, as radiance does when

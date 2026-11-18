@@ -239,7 +239,7 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 			stats.thenDialed(err)
 			return conn, err
 		}
-		return &statsStream{Conn: conn, stats: stats}, nil
+		return newStatsStream(conn, stats), nil
 	}
 	stats := h.newStats(key, N.NetworkTCP, path, start)
 	dialCtx, timedOut, stop := h.firstDialContext(ctx)
@@ -247,6 +247,7 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 	stop()
 	if err != nil {
 		if ctx.Err() != nil {
+			stats.finish(true) // abandoned: the caller gave up
 			return nil, err
 		}
 		if !timedOut() {
@@ -260,7 +261,7 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 			return nil, err
 		}
 		stats.set(hedgePathThenAfterMove, "")
-		return &statsStream{Conn: conn, stats: stats}, nil
+		return newStatsStream(conn, stats), nil
 	}
 	return newHedgeStream(h, ctx, key, network, destination, conn, stats), nil
 }
@@ -287,6 +288,7 @@ func (h *Hedge) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	stop()
 	if err != nil {
 		if ctx.Err() != nil {
+			stats.finish(true) // abandoned: the caller gave up
 			return nil, err
 		}
 		if !timedOut() {

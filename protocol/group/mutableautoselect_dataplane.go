@@ -28,6 +28,11 @@ type dataPlaneHooks struct {
 	// onError runs on the IO goroutine, outside the watchdog's lock.
 	onError    func(err error, state dataPlaneIO, excused bool)
 	onActivity func(time.Time)
+	// onReset runs synchronously when a reset is charged, before onFailure
+	// is dispatched on its own goroutine, so a caller can note the reset
+	// before the IO error reaches the client. It must not block or take
+	// locks the IO path holds.
+	onReset func()
 }
 
 // makeHooks records chargeable failures and starts recovery. Only primary TCP
@@ -289,6 +294,9 @@ func (w *dataPlaneWatchdog) fireResetFailure() {
 	}
 	if !w.fired.CompareAndSwap(false, true) {
 		return
+	}
+	if w.hooks.onReset != nil {
+		w.hooks.onReset()
 	}
 	if w.hooks.onFailure != nil {
 		// run onFailure in a goroutine to avoid deadlocks: the callback may call back

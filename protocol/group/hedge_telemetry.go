@@ -150,6 +150,10 @@ type hedgeStats struct {
 	mu      sync.Mutex
 	path    string
 	outcome string
+	// resetSeen is set synchronously when the watchdog charges a reset on
+	// First, whose handling (firstFailed) runs later on its own goroutine,
+	// possibly after the client has closed.
+	resetSeen bool
 
 	firstByte atomic.Int64 // nanoseconds after start, 0 before any
 	up, down  atomic.Int64
@@ -181,6 +185,14 @@ func (s *hedgeStats) set(path, outcome string) {
 	if outcome != "" {
 		s.outcome = outcome
 	}
+}
+
+// noteReset records that First was reset, for a record finished before the
+// reset is handled.
+func (s *hedgeStats) noteReset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resetSeen = true
 }
 
 // setOutcomeIfUnset keeps an earlier, more specific outcome.
@@ -240,6 +252,9 @@ func (s *hedgeStats) finish(tried bool) {
 		s.mu.Lock()
 		path, outcome := s.path, s.outcome
 		firstByte, up, down := s.firstByte.Load(), s.up.Load(), s.down.Load()
+		if s.resetSeen && outcome == hedgeOutcomeCommitted {
+			outcome = hedgeOutcomeResetAfterCommit
+		}
 		s.mu.Unlock()
 		if tried && outcome == "" {
 			outcome = hedgeOutcomeAbandoned
@@ -302,6 +317,26 @@ func (c *statsStream) Close() error {
 // does not mark the reader replaceable, so reads still pass through Read.
 func (c *statsStream) Upstream() any { return c.Conn }
 
+// newStatsStream wraps conn, keeping half-close exactly as conn has it:
+// sing-box's relay half-closes a destination only if it is itself an
+// N.WriteCloser, and otherwise closes it at upload EOF, cutting off the
+// response.
+func newStatsStream(conn net.Conn, stats *hedgeStats) net.Conn {
+	c := &statsStream{Conn: conn, stats: stats}
+	if wc, ok := conn.(N.WriteCloser); ok {
+		return &statsDuplexStream{statsStream: c, closeWriter: wc}
+	}
+	return c
+}
+
+// statsDuplexStream is a statsStream over a conn that can half-close.
+type statsDuplexStream struct {
+	*statsStream
+	closeWriter N.WriteCloser
+}
+
+func (c *statsDuplexStream) CloseWrite() error { return c.closeWriter.CloseWrite() }
+
 // statsPacket measures a packet connection that went straight to Then.
 type statsPacket struct {
 	net.PacketConn
@@ -354,5 +389,6 @@ func (c *statsPacket) Upstream() any { return c.PacketConn }
 
 var (
 	_ net.Conn        = (*statsStream)(nil)
+	_ N.WriteCloser   = (*statsDuplexStream)(nil)
 	_ N.NetPacketConn = (*statsPacket)(nil)
 )
