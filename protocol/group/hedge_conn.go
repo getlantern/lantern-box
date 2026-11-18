@@ -1207,7 +1207,9 @@ func (p *hedgePacket) readFrom(b []byte) (int, net.Addr, error) {
 
 func (p *hedgePacket) write(b []byte, dest M.Socksaddr) error {
 	err := p.writeLeg(b, dest)
-	if err == nil {
+	// A datagram taken for a move (errTakenTimeout) is sent by its replay,
+	// so it counts as written, as WriteTo and WritePacket report it.
+	if err == nil || err == errTakenTimeout {
 		p.stats.wrote(len(b))
 	}
 	return err
