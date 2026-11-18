@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/service"
 
 	"github.com/getlantern/lantern-box/peerrules"
 	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
@@ -65,6 +66,7 @@ type exitRunner struct {
 // RunExit keeps a WebRTC-only registration and its exit box current until ctx ends. ctx must
 // carry lantern-box's option registries, as box.BaseContext does. It returns an error only
 // for a config it can't run with; lantern-cloud and box failures are logged and retried.
+// Exit boxes don't share services with ctx: each gets its own clone of ctx's registry.
 func RunExit(ctx context.Context, cfg ExitConfig) error {
 	r, err := newExitRunner(cfg)
 	if err != nil {
@@ -256,9 +258,11 @@ func logExitFailure(err error, retry time.Duration) {
 	}
 }
 
-// newExitSingBox is the default NewBox: sing-box in ctx.
+// newExitSingBox is the default NewBox: sing-box in a clone of ctx's service registry, so it
+// keeps ctx's option registries and cancellation but registers its managers only in its own
+// registry, never over those of ctx's box or the previous exit box.
 func newExitSingBox(ctx context.Context, options string) (ExitBox, error) {
-	b, err := startSingBox(ctx, options)
+	b, err := startSingBox(service.ExtendContext(ctx), options)
 	if err != nil {
 		return nil, err
 	}

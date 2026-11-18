@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	sjson "github.com/sagernet/sing/common/json"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -425,4 +427,16 @@ func TestNewExitSingBoxRoutes(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, b.Router())
 	require.NoError(t, b.Close())
+}
+
+func TestNewExitSingBoxKeepsItsServicesToItself(t *testing.T) {
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	sentinel := log.NewDefaultFactory(context.Background(), log.Formatter{}, io.Discard, "", nil, false)
+	service.MustRegister[log.Factory](ctx, sentinel)
+	b, err := newExitSingBox(ctx, `{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	require.NoError(t, err)
+	defer func() { _ = b.Close() }()
+	assert.Same(t, sentinel, service.FromContext[log.Factory](ctx), "the caller's log factory is still its own")
+	assert.Nil(t, service.FromContext[adapter.OutboundManager](ctx), "the exit box's managers stay out of the caller's registry")
 }
