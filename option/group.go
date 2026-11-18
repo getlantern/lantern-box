@@ -48,9 +48,11 @@ type HedgeOutboundOptions struct {
 	// take that go to Then instead, so telemetry can compare the two paths on
 	// the same sites. Default 0.
 	ExploreRate float64 `json:"explore_rate,omitempty"`
-	// TelemetrySites are the registered domains telemetry may name. Every
-	// other site is reported as "other", and with none listed no site is
-	// reported at all, so a user's browsing never leaves the client.
+	// TelemetrySites are the registered domains hedge metrics may name in
+	// hedge.site. Every other site is reported as "other", and with none
+	// listed hedge.site is left out. The metrics' other attributes (path,
+	// outcome, transport, outbound tags) and byte and timing measurements
+	// are reported either way.
 	TelemetrySites []string `json:"telemetry_sites,omitempty"`
 }
 

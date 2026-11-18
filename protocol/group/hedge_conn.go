@@ -243,11 +243,15 @@ func (l *hedgeLeg) commit(release func()) bool {
 	}
 	first := !l.committed
 	l.committed = true
+	if first {
+		// Under mu, so a failure seen after the commit (stalled or reset
+		// after commit) always replaces it, never the other way round.
+		l.stats.set("", hedgeOutcomeCommitted)
+	}
 	l.stopCommitLocked()
 	release()
 	l.mu.Unlock()
 	if first {
-		l.stats.set("", hedgeOutcomeCommitted)
 		l.h.markGood(l.key)
 	}
 	return true
@@ -306,7 +310,9 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 	if why == lAdapter.UserFailureNoResponse {
 		outcome = hedgeOutcomeMovedNoReply
 	}
-	l.stats.set(hedgePathThenAfterMove, outcome)
+	// The path becomes then_after_move only once the move succeeds
+	// (finishMoveLocked).
+	l.stats.set("", outcome)
 	l.h.markBad(l.ctx, l.key, why)
 	_ = closeFirst()
 	return true
@@ -350,6 +356,12 @@ func (l *hedgeLeg) dialTimer() (stop func() bool) {
 // live on it. Caller holds mu.
 func (l *hedgeLeg) finishMoveLocked(err error) {
 	l.moveErr = err
+	switch {
+	case err == nil:
+		l.stats.set(hedgePathThenAfterMove, "")
+	case !l.closed:
+		l.stats.set("", hedgeOutcomeMoveFailed)
+	}
 	l.onFirst = false
 	l.moving = false
 	l.pending = nil

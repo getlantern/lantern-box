@@ -114,7 +114,7 @@ func NewHedge(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if cfg.maxHeldBytes <= 0 {
 		cfg.maxHeldBytes = defaultHedgeMaxHeldBytes
 	}
-	if options.ExploreRate < 0 || options.ExploreRate > 1 {
+	if !(options.ExploreRate >= 0 && options.ExploreRate <= 1) { // rejects NaN too
 		return nil, fmt.Errorf("hedge: explore_rate must be between 0 and 1, got %v", options.ExploreRate)
 	}
 	var sites map[string]bool

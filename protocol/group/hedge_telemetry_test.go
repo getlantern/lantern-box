@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"strings"
 	"testing"
@@ -201,6 +202,24 @@ func TestHedgeTelemetryThenDialError(t *testing.T) {
 	})
 }
 
+// A move to Then that fails keeps the first path and records move_failed,
+// so it doesn't look like a successful move.
+func TestHedgeTelemetryMoveFailed(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{dialErr: errors.New("then down")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = c.Write([]byte(tlsRecord("hi")))
+	require.NoError(t, err)
+	_, err = c.Read(make([]byte, 16))
+	require.Error(t, err, "the move fails")
+	c.Close()
+	attrs := connectionRecord(t, reader)
+	require.Equal(t, hedgePathFirst, attrs["hedge.path"])
+	require.Equal(t, hedgeOutcomeMoveFailed, attrs["hedge.outcome"])
+}
+
 // A hedge built before the meter provider is replaced, as radiance does when
 // telemetry's config changes, records to the new one.
 func TestHedgeTelemetryFollowsTheMeterProvider(t *testing.T) {
@@ -298,18 +317,20 @@ func TestHedgeTelemetrySites(t *testing.T) {
 	reader := recordMetrics(t)
 	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")},
 		func(o *option.HedgeOutboundOptions) { o.TelemetrySites = []string{"www.YouTube.com."} })
-	for _, host := range []string{"rr1---sn-x.youtube.com:443", "private-blog.example:443"} {
+	dial := func(host string) {
 		c, err := f.hedge.DialContext(f.ctx, "tcp", M.ParseSocksaddr(host))
 		require.NoError(t, err)
 		exchange(t, c, "hi")
 		c.Close()
 	}
-	sites := map[string]bool{}
+	dial("rr1---sn-x.youtube.com:443")
+	require.Equal(t, "youtube.com", connectionRecord(t, reader)["hedge.site"], "a listed site is named")
+	dial("private-blog.example:443")
+	sites := map[string]int64{}
 	for _, p := range collectHedge(t, reader, "hedge.connections") {
-		sites[p.attrs["hedge.site"]] = true
+		sites[p.attrs["hedge.site"]] += p.int
 	}
-	require.Equal(t, map[string]bool{"youtube.com": true, "other": true}, sites,
-		"listed sites are named, every other site is \"other\"")
+	require.Equal(t, map[string]int64{"youtube.com": 1, "other": 1}, sites, "every other site is \"other\"")
 }
 
 func TestHedgeTelemetryRedactsHelperTags(t *testing.T) {
@@ -393,7 +414,7 @@ func TestHedgeExplore(t *testing.T) {
 
 func TestNewHedgeRejectsBadExploreRate(t *testing.T) {
 	ctx := service.ContextWithDefaultRegistry(context.Background())
-	for _, rate := range []float64{-0.1, 1.5} {
+	for _, rate := range []float64{-0.1, 1.5, math.NaN()} {
 		_, err := NewHedge(ctx, nil, log.NewNOPFactory().Logger(), "h",
 			option.HedgeOutboundOptions{First: "a", Then: "b", ExploreRate: rate})
 		require.Error(t, err, "rate %v", rate)

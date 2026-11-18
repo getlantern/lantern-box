@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"net"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,7 +23,8 @@ const (
 	// hedgePathKey is where a connection's bytes went: see the hedgePath
 	// constants.
 	hedgePathKey attribute.Key = "hedge.path"
-	// hedgeOutcomeKey is how a connection that tried First ended.
+	// hedgeOutcomeKey is how a connection that tried First ended, or that
+	// Then failed to dial on any path.
 	hedgeOutcomeKey attribute.Key = "hedge.outcome"
 	// hedgeSiteAttrKey is the connection's registered domain, only when it is one
 	// of the hedge's telemetry_sites, else "other". Never set otherwise.
@@ -49,7 +51,8 @@ const (
 	hedgePathThenExplore = "then_explore"
 )
 
-// Outcomes of connections that tried First.
+// Outcomes of connections that tried First, and then_dial_error, which any
+// path can have.
 const (
 	hedgeOutcomeCommitted          = "committed"
 	hedgeOutcomeMovedNoReply       = "moved_no_reply"
@@ -59,6 +62,9 @@ const (
 	hedgeOutcomeStalledAfterCommit = "stalled_after_commit"
 	hedgeOutcomeResetAfterCommit   = "reset_after_commit"
 	hedgeOutcomeResetNotReplayable = "reset_not_replayable"
+	// hedgeOutcomeMoveFailed is a connection whose move to Then failed: Then
+	// couldn't be dialed or didn't take the replayed opening.
+	hedgeOutcomeMoveFailed = "move_failed"
 	// hedgeOutcomeThenDialError is a connection Then failed to dial, on any
 	// path, so Then's failures are counted as First's are.
 	hedgeOutcomeThenDialError = "then_dial_error"
@@ -97,7 +103,10 @@ func currentHedgeTelemetry() *hedgeTelemetry {
 	mp := otel.GetMeterProvider()
 	hedgeInstruments.mu.Lock()
 	defer hedgeInstruments.mu.Unlock()
-	if hedgeInstruments.provider != mp {
+	// A provider whose type can't be compared would make != panic; such a
+	// provider gets fresh instruments on every record instead.
+	comparable := reflect.TypeOf(mp).Comparable()
+	if !comparable || hedgeInstruments.provider != mp {
 		tel, err := newHedgeTelemetry(mp.Meter(tracerName))
 		if err != nil {
 			tel = nil
@@ -187,8 +196,12 @@ func (s *hedgeStats) read(n int) {
 	if n <= 0 {
 		return
 	}
+	// Under mu, with finish's snapshot, so a record has the first byte's
+	// time and its bytes or neither.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.firstByte.Load() == 0 {
-		s.firstByte.CompareAndSwap(0, max(int64(time.Since(s.start)), 1))
+		s.firstByte.Store(max(int64(time.Since(s.start)), 1))
 	}
 	s.down.Add(int64(n))
 }
@@ -226,6 +239,7 @@ func (s *hedgeStats) finish(tried bool) {
 		}
 		s.mu.Lock()
 		path, outcome := s.path, s.outcome
+		firstByte, up, down := s.firstByte.Load(), s.up.Load(), s.down.Load()
 		s.mu.Unlock()
 		if tried && outcome == "" {
 			outcome = hedgeOutcomeAbandoned
@@ -245,17 +259,17 @@ func (s *hedgeStats) finish(tried bool) {
 		}
 		ctx := context.Background()
 		t.connections.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(attrs...)))
-		if ns := s.firstByte.Load(); ns > 0 {
-			t.firstByte.Record(ctx, time.Duration(ns).Seconds(), pathAttrs)
+		if firstByte > 0 {
+			t.firstByte.Record(ctx, time.Duration(firstByte).Seconds(), pathAttrs)
 		}
 		dir := func(d string) metric.MeasurementOption {
 			return metric.WithAttributeSet(attribute.NewSet(append(attrs[:len(attrs):len(attrs)],
 				semconv.NetworkIODirectionKey.String(d))...))
 		}
-		if up := s.up.Load(); up > 0 {
+		if up > 0 {
 			t.io.Add(ctx, up, dir("transmit"))
 		}
-		if down := s.down.Load(); down > 0 {
+		if down > 0 {
 			t.io.Add(ctx, down, dir("receive"))
 		}
 	})
