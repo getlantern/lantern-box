@@ -78,6 +78,17 @@ type UnboundedOutboundOptions struct {
 	EgressEndpoint       string `json:"egress_endpoint,omitempty"`
 	EgressConnectTimeout int    `json:"egress_connect_timeout,omitempty"` // seconds
 	EgressErrorBackoff   int    `json:"egress_error_backoff,omitempty"`   // seconds
+
+	// DirectExit, when set, lets this outbound take direct exits from volunteers that offer
+	// them. lantern-cloud sets it.
+	DirectExit *UnboundedDirectExitOptions `json:"direct_exit,omitempty"`
+}
+
+// UnboundedDirectExitOptions configures the Hysteria2 client an Unbounded outbound runs over each
+// volunteer's direct exit.
+type UnboundedDirectExitOptions struct {
+	// ServerName is the SNI the Hysteria2 handshake sends. Required.
+	ServerName string `json:"server_name"`
 }
 
 // UnboundedVolunteerOptions configures the volunteer side of Unbounded as a sing-box service: the
