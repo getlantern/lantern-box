@@ -1276,3 +1276,103 @@ func TestHedgeConcurrentDeadlineSettersAgree(t *testing.T) {
 		require.True(t, stored.Equal(applied), "round %d: stored %v but First holds %v", round, stored, applied)
 	}
 }
+
+func TestNewHedgeRejectsItselfAsFirstOrThen(t *testing.T) {
+	ctx := service.ContextWithDefaultRegistry(context.Background())
+	for _, opts := range []option.HedgeOutboundOptions{
+		{First: "h", Then: "then"},
+		{First: "first", Then: "h"},
+	} {
+		_, err := NewHedge(ctx, nil, log.NewNOPFactory().Logger(), "h", opts)
+		require.Error(t, err, "%+v", opts)
+	}
+}
+
+// Two hedges whose First names the other would recurse forever; the loop is
+// caught, and each falls back to its Then.
+func TestHedgeLoopThroughFirstEnds(t *testing.T) {
+	thenA := &fakeOutbound{tag: "then-a", stream: answer("then-a:"), packet: func(p []byte) []byte { return append([]byte("then-a:"), p...) }}
+	thenB := &fakeOutbound{tag: "then-b", stream: answer("then-b:")}
+	mgr := &mockOutboundManager{outbounds: map[string]adapter.Outbound{"then-a": thenA, "then-b": thenB}}
+	ctx := service.ContextWithDefaultRegistry(context.Background())
+	service.MustRegister[adapter.OutboundManager](ctx, mgr)
+	newHedge := func(tag, first, then string) *Hedge {
+		out, err := NewHedge(ctx, nil, log.NewNOPFactory().Logger(), tag,
+			option.HedgeOutboundOptions{First: first, Then: then, CommitTimeout: badoption.Duration(time.Minute)})
+		require.NoError(t, err)
+		return out.(*Hedge)
+	}
+	a := newHedge("a", "b", "then-a")
+	mgr.outbounds["a"] = a
+	mgr.outbounds["b"] = newHedge("b", "a", "then-b")
+
+	type result struct {
+		reply string
+		err   error
+	}
+	got := make(chan result, 1)
+	go func() {
+		c, err := a.DialContext(ctx, "tcp", hedgeDest)
+		if err != nil {
+			got <- result{err: err}
+			return
+		}
+		defer c.Close()
+		// Before any reply commits: the inner hedge's loop error didn't
+		// mark the site bad.
+		if v := a.cache.verdict(hedgeKeyFor(context.Background(), "tcp", hedgeDest)); v == hedgeBad {
+			got <- result{err: errors.New("a hedge loop marked the site bad")}
+			return
+		}
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := c.Write([]byte(tlsRecord("hi"))); err != nil {
+			got <- result{err: err}
+			return
+		}
+		buf := make([]byte, 64)
+		n, err := c.Read(buf)
+		got <- result{reply: string(buf[:n]), err: err}
+	}()
+	select {
+	case r := <-got:
+		require.NoError(t, r.err)
+		// a's First is b; b's First (a) fails as a loop, so b uses then-b.
+		require.Equal(t, "then-b:"+tlsRecord("hi"), r.reply)
+	case <-time.After(5 * time.Second):
+		t.Fatal("dialing a hedge loop never returned")
+	}
+
+	pc, err := a.DialContext(ctx, "udp", hedgeDest)
+	require.NoError(t, err, "a UDP dial through DialContext isn't mistaken for a loop")
+	pc.Close()
+}
+
+// A failure that saw the connection uncommitted, then lost the race to a
+// reply, still marks the site bad.
+func TestHedgeFailureLosingToACommitStillMarksBad(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.Equal(t, "first:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+	require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()))
+	s := c.(*hedgeStream)
+	s.beginMove(lAdapter.UserFailureReset, func() error { return nil }) // as the failure's move would
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
+}
+
+// A reply that lands after a failure doesn't mark the site good again.
+func TestHedgeReplyAfterAFailureKeepsItBad(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = c.Write([]byte("hello")) // not a handshake, so a failure can't move it
+	require.NoError(t, err)
+	s := c.(*hedgeStream)
+	s.beginMove(lAdapter.UserFailureReset, func() error { return nil })
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
+	s.commit(s.releaseLocked) // the reply that was on its way
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()), "the late reply doesn't mark it good")
+}

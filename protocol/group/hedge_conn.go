@@ -267,9 +267,8 @@ func (l *hedgeLeg) commit(release func()) bool {
 // a reset gets when it can't move now (staticResetOutcomeLocked), or
 // reset_unmoved for a replayable opening. A move that follows, which an
 // undecided opening can still make once the rest of a handshake arrives,
-// replaces either. Once
-// the client has closed, settleLocked and the sealed record ignore it: an
-// error then can be the teardown itself. The watchdog calls this from the
+// replaces either. Once the client has closed, settleLocked and the sealed
+// record ignore it: an error then can be the teardown itself. The watchdog calls this from the
 // IO path, which never holds mu.
 func (l *hedgeLeg) noteReset() {
 	l.mu.Lock()
@@ -353,6 +352,17 @@ func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter
 // retries on Then.
 func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() error) bool {
 	l.mu.Lock()
+	if l.committed && why != lAdapter.UserFailureNoResponse {
+		// A failure that saw the connection uncommitted, then lost the race
+		// to a reply: it's a failure after the commit, as firstFailed
+		// would have handled it.
+		outcome := hedgeOutcomeResetAfterCommit
+		if why == lAdapter.UserFailureStall {
+			outcome = hedgeOutcomeStalledAfterCommit
+		}
+		l.stats.replaceOutcome(hedgeOutcomeCommitted, outcome)
+		l.settleLocked(hedgeBad, why)
+	}
 	if l.moving || !l.onFirst || l.committed || l.closed {
 		l.mu.Unlock()
 		return false

@@ -676,3 +676,18 @@ func TestNewHedgeRejectsBadExploreRate(t *testing.T) {
 		require.Error(t, err, "rate %v", rate)
 	}
 }
+
+// A failure that lost the race to a reply is recorded as a failure after
+// the commit, matching the bad verdict it settles.
+func TestHedgeTelemetryFailureLosingToACommit(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.Equal(t, "first:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+	s := c.(*hedgeStream)
+	s.beginMove(lAdapter.UserFailureReset, func() error { return nil })
+	c.Close()
+	require.Equal(t, hedgeOutcomeResetAfterCommit, connectionRecord(t, reader)["hedge.outcome"])
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
+}
