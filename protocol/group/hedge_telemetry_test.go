@@ -259,16 +259,41 @@ func TestHedgeTelemetryCancelledDialIsAbandoned(t *testing.T) {
 	require.Equal(t, hedgeOutcomeAbandoned, attrs["hedge.outcome"])
 }
 
-// A reset after the commit whose handling runs only after the client closed
-// is still recorded as one.
-func TestHedgeTelemetryResetSeenBeforeItIsHandled(t *testing.T) {
-	reader := recordMetrics(t)
-	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
-	stats := f.hedge.newStats(hedgeKeyFor(context.Background(), "tcp", hedgeDest), "tcp", hedgePathFirst, time.Now())
-	stats.set("", hedgeOutcomeCommitted)
-	stats.noteReset()
-	stats.finish(true)
-	require.Equal(t, hedgeOutcomeResetAfterCommit, connectionRecord(t, reader)["hedge.outcome"])
+// A reset the watchdog charges is recorded before its handling, which runs
+// on its own goroutine and can come after the client closed.
+func TestHedgeTelemetryResetNotedBeforeItIsHandled(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*option.HedgeOutboundOptions)
+		write   string
+		read    bool
+		outcome string
+	}{
+		{"after commit", nil, tlsRecord("hi"), true, hedgeOutcomeResetAfterCommit},
+		{"not replayable", nil, "hello", false, hedgeOutcomeResetNotReplayable},
+		{"overflowed", func(o *option.HedgeOutboundOptions) { o.MaxHeldBytes = 1 }, tlsRecord("too long"), false, hedgeOutcomeOverflowFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := recordMetrics(t)
+			first := &fakeOutbound{stream: answer("first:")}
+			if !tc.read {
+				first = &fakeOutbound{stream: blackhole}
+			}
+			f := newHedgeFixture(t, first, &fakeOutbound{stream: answer("then:")}, tc.mutate)
+			c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+			require.NoError(t, err)
+			require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+			_, err = c.Write([]byte(tc.write))
+			require.NoError(t, err)
+			if tc.read {
+				_, err = c.Read(make([]byte, 64))
+				require.NoError(t, err)
+			}
+			c.(*hedgeStream).noteReset() // as the watchdog does, before firstFailed runs
+			c.Close()
+			require.Equal(t, tc.outcome, connectionRecord(t, reader)["hedge.outcome"])
+		})
+	}
 }
 
 // A hedge built before the meter provider is replaced, as radiance does when

@@ -150,10 +150,6 @@ type hedgeStats struct {
 	mu      sync.Mutex
 	path    string
 	outcome string
-	// resetSeen is set synchronously when the watchdog charges a reset on
-	// First, whose handling (firstFailed) runs later on its own goroutine,
-	// possibly after the client has closed.
-	resetSeen bool
 
 	firstByte atomic.Int64 // nanoseconds after start, 0 before any
 	up, down  atomic.Int64
@@ -185,14 +181,6 @@ func (s *hedgeStats) set(path, outcome string) {
 	if outcome != "" {
 		s.outcome = outcome
 	}
-}
-
-// noteReset records that First was reset, for a record finished before the
-// reset is handled.
-func (s *hedgeStats) noteReset() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.resetSeen = true
 }
 
 // setOutcomeIfUnset keeps an earlier, more specific outcome.
@@ -252,9 +240,6 @@ func (s *hedgeStats) finish(tried bool) {
 		s.mu.Lock()
 		path, outcome := s.path, s.outcome
 		firstByte, up, down := s.firstByte.Load(), s.up.Load(), s.down.Load()
-		if s.resetSeen && outcome == hedgeOutcomeCommitted {
-			outcome = hedgeOutcomeResetAfterCommit
-		}
 		s.mu.Unlock()
 		if tried && outcome == "" {
 			outcome = hedgeOutcomeAbandoned
