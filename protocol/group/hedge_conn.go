@@ -80,7 +80,8 @@ type hedgeLeg struct {
 	moveCtx context.Context
 	cancel  context.CancelFunc
 	// pending is Then's leg while the copy is replayed to it, so Close can
-	// interrupt the replay and deadline changes reach it.
+	// interrupt the replay. Deadlines reach it only once the replay is done
+	// (applyDeadlinesLocked).
 	pending deadlineCloser
 	// readDeadline and writeDeadline bound waits for a move and are
 	// applied to Then's leg. deadlineChanged is closed and replaced whenever
@@ -210,10 +211,11 @@ func (l *hedgeLeg) awaitMove(deadline func() time.Time) (onThen bool, err error)
 func (l *hedgeLeg) readDeadlineLocked() time.Time  { return l.readDeadline }
 func (l *hedgeLeg) writeDeadlineLocked() time.Time { return l.writeDeadline }
 
-// setDeadlines records new deadlines and wakes waiters. During a move it
-// applies them to Then's pending leg, since First is closed, and reports
-// moving so the caller skips First. The replay stays bound by the failover
-// timeout whatever the caller sets.
+// setDeadlines records new deadlines and wakes waiters, which wait out a
+// move against them. During a move it reports moving so the caller skips
+// First, and leaves Then's pending leg alone: the replay carries writes
+// already reported taken, and may read a handshake, so the deadlines apply
+// once it's done (applyDeadlinesLocked). The failover timeout bounds it.
 func (l *hedgeLeg) setDeadlines(read, write *time.Time) (moving bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -225,18 +227,7 @@ func (l *hedgeLeg) setDeadlines(read, write *time.Time) (moving bool) {
 	}
 	close(l.deadlineChanged)
 	l.deadlineChanged = make(chan struct{})
-	if !l.moving {
-		return false
-	}
-	if l.pending != nil {
-		if read != nil {
-			_ = l.pending.SetReadDeadline(*read)
-		}
-		if write != nil {
-			_ = l.pending.SetWriteDeadline(*write)
-		}
-	}
-	return true
+	return l.moving
 }
 
 // commit records First's reply and runs release under mu to free the copy.
@@ -428,9 +419,8 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 	return true
 }
 
-// startReplay records Then's leg so Close and deadline changes reach it, and
-// applies the caller's current deadlines to it. It reports false when the
-// connection closed meanwhile.
+// startReplay records Then's leg so Close can interrupt the replay. It
+// reports false when the connection closed meanwhile.
 func (l *hedgeLeg) startReplay(c deadlineCloser) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -438,16 +428,50 @@ func (l *hedgeLeg) startReplay(c deadlineCloser) bool {
 		return false
 	}
 	l.pending = c
-	_ = c.SetReadDeadline(l.readDeadline)
-	_ = c.SetWriteDeadline(l.writeDeadline)
+	// No deadlines yet: the replay carries writes First already took, which
+	// a deadline that ran out while they waited mustn't fail. replayTimer
+	// bounds it, and the caller's deadlines apply once it's done
+	// (applyDeadlinesLocked).
 	return true
 }
+
+// applyDeadlinesLocked gives c, the leg a move replayed onto, the caller's
+// deadlines, held back until the replay was done. Caller holds mu.
+func (l *hedgeLeg) applyDeadlinesLocked(c deadlineCloser) {
+	_ = c.SetReadDeadline(l.readDeadline)
+	_ = c.SetWriteDeadline(l.writeDeadline)
+}
+
+// hedgeMoveError is why a move to Then failed. It isn't a timeout, even
+// when its cause is, so a caller that retries timeouts sees the connection
+// is dead rather than retrying it forever. errors.Is and errors.As reach
+// its cause, except one that is a timeout, which would read as one.
+type hedgeMoveError struct{ cause error }
+
+func (e *hedgeMoveError) Error() string { return "hedge: move to then failed: " + e.cause.Error() }
+func (e *hedgeMoveError) Unwrap() error {
+	var ne net.Error
+	if errors.Is(e.cause, os.ErrDeadlineExceeded) || errors.Is(e.cause, context.DeadlineExceeded) ||
+		(errors.As(e.cause, &ne) && ne.Timeout()) {
+		return nil // any timeout, so nothing beneath reads as one
+	}
+	return e.cause
+}
+
+func (e *hedgeMoveError) Timeout() bool   { return false }
+func (e *hedgeMoveError) Temporary() bool { return false }
+
+// timedOut is a move's error once dialTimer or replayTimer fired. Each
+// timer is stopped right after the call it bounds returns, so its having
+// fired means it caused whatever that call returned (a cancelled context,
+// a closed conn), which would otherwise read as a close.
+func timedOut() error { return os.ErrDeadlineExceeded }
 
 // replayTimer closes c if the replay outlives the failover timeout, which
 // holds even for a conn that ignores deadlines. done reports whether the
 // replay finished first.
-func replayTimer(c io.Closer) (done func() bool) {
-	timer := time.AfterFunc(hedgeFailoverDialTimeout, func() { _ = c.Close() })
+func (l *hedgeLeg) replayTimer(c io.Closer) (done func() bool) {
+	timer := time.AfterFunc(l.h.cfg.failoverTimeout, func() { _ = c.Close() })
 	return timer.Stop
 }
 
@@ -458,13 +482,21 @@ func (l *hedgeLeg) dialTimer() (stop func() bool) {
 	l.mu.Lock()
 	cancel := l.cancel
 	l.mu.Unlock()
-	return time.AfterFunc(hedgeFailoverDialTimeout, cancel).Stop
+	return time.AfterFunc(l.h.cfg.failoverTimeout, cancel).Stop
 }
 
 // finishMoveLocked publishes the outcome of a move. A failed move cancels
 // its context; a successful one leaves it alone, since Then's connection may
 // live on it. Caller holds mu.
 func (l *hedgeLeg) finishMoveLocked(err error) {
+	// The client's own close isn't Then failing, whatever the cancelled
+	// dial or closed replay returned.
+	switch {
+	case err != nil && l.closed:
+		err = net.ErrClosed
+	case err != nil:
+		err = &hedgeMoveError{cause: err}
+	}
 	l.moveErr = err
 	switch {
 	case err == nil:
@@ -554,12 +586,17 @@ func (s *hedgeStream) runMove() {
 	if err == nil {
 		stop := s.dialTimer()
 		conn, err = then.DialContext(ctx, s.network, s.dest)
-		if !stop() && err == nil {
-			conn.Close() // the timer cancelled the context it lives on
-			err = os.ErrDeadlineExceeded
+		if !stop() {
+			if err == nil {
+				conn.Close() // the timer cancelled the context it lives on
+			}
+			err = timedOut()
 		}
 	}
 	if err == nil {
+		// Bounds the replay and the half-close after it, which run without
+		// the caller's deadlines (startReplay).
+		done := s.replayTimer(conn)
 		switch {
 		case !s.startReplay(conn):
 			err = net.ErrClosed
@@ -567,11 +604,7 @@ func (s *hedgeStream) runMove() {
 			// With nothing to replay, an empty write still kicks a
 			// deferred handshake on Then, which a server-first protocol
 			// would otherwise wait on forever.
-			done := replayTimer(conn)
 			_, err = conn.Write(held)
-			if !done() && err == nil {
-				err = os.ErrDeadlineExceeded
-			}
 		}
 		// Repeat the client's half-close. CloseWrite waits out a move, so
 		// writeClosed can't change now. Then failing to half-close fails
@@ -583,6 +616,9 @@ func (s *hedgeStream) runMove() {
 			if writeClosed {
 				err = closeWrite(conn)
 			}
+		}
+		if !done() {
+			err = timedOut()
 		}
 		if err != nil {
 			conn.Close()
@@ -598,6 +634,7 @@ func (s *hedgeStream) runMove() {
 		err = net.ErrClosed
 	default:
 		s.cur = conn
+		s.applyDeadlinesLocked(conn)
 	}
 	s.held = nil
 	s.finishMoveLocked(err)
@@ -742,7 +779,9 @@ func (s *hedgeStream) write(p []byte) (int, error) {
 		s.move(lAdapter.UserFailureReset)
 		onThen, moveErr := s.awaitMove(s.writeDeadlineLocked)
 		if moveErr == os.ErrDeadlineExceeded {
-			return 0, moveErr
+			// The move goes on and replays all of p, so it's reported as
+			// taken: a caller that resent any of it would duplicate it.
+			return len(p), moveErr
 		}
 		if onThen {
 			if moveErr != nil {
@@ -1019,9 +1058,11 @@ func (p *hedgePacket) runMove() {
 	if err == nil {
 		stop := p.dialTimer()
 		raw, err = then.ListenPacket(ctx, p.dest)
-		if !stop() && err == nil {
-			raw.Close() // the timer cancelled the context it lives on
-			err = os.ErrDeadlineExceeded
+		if !stop() {
+			if err == nil {
+				raw.Close() // the timer cancelled the context it lives on
+			}
+			err = timedOut()
 		}
 		if err == nil {
 			conn = netPacketConn(raw)
@@ -1031,14 +1072,14 @@ func (p *hedgePacket) runMove() {
 		if !p.startReplay(conn) {
 			err = net.ErrClosed
 		} else if len(held) > 0 {
-			done := replayTimer(conn)
+			done := p.replayTimer(conn)
 			for _, packet := range held {
 				if err = writePacket(conn, raw, packet.data, packet.dest); err != nil {
 					break
 				}
 			}
-			if !done() && err == nil {
-				err = os.ErrDeadlineExceeded
+			if !done() {
+				err = timedOut()
 			}
 		}
 		if err != nil {
@@ -1055,6 +1096,7 @@ func (p *hedgePacket) runMove() {
 		err = net.ErrClosed
 	default:
 		p.cur, p.curRaw = conn, raw
+		p.applyDeadlinesLocked(conn)
 	}
 	p.held, p.heldBytes = nil, 0
 	p.finishMoveLocked(err)
@@ -1186,15 +1228,34 @@ func (p *hedgePacket) writeLeg(b []byte, dest M.Socksaddr) error {
 		}
 		p.move(lAdapter.UserFailureReset)
 		onThen, moveErr := p.awaitMove(p.writeDeadlineLocked)
-		if moveErr == os.ErrDeadlineExceeded || onThen {
+		if moveErr == os.ErrDeadlineExceeded {
+			// The datagram is held and the move goes on to replay it, so
+			// it's taken: a caller that resent it would send it twice.
+			return errTakenTimeout
+		}
+		if onThen {
 			return moveErr
 		}
 		return err
 	}
 }
 
+// errTakenTimeout is a write whose deadline ran out after its datagram was
+// held for a move, which will still send it.
+var errTakenTimeout = &takenTimeoutError{}
+
+type takenTimeoutError struct{}
+
+func (*takenTimeoutError) Error() string   { return os.ErrDeadlineExceeded.Error() }
+func (*takenTimeoutError) Unwrap() error   { return os.ErrDeadlineExceeded }
+func (*takenTimeoutError) Timeout() bool   { return true }
+func (*takenTimeoutError) Temporary() bool { return true }
+
 func (p *hedgePacket) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if err := p.write(b, M.SocksaddrFromNet(addr)); err != nil {
+		if err == errTakenTimeout {
+			return len(b), err // taken: the move sends it
+		}
 		return 0, err
 	}
 	return len(b), nil
@@ -1213,7 +1274,12 @@ func (p *hedgePacket) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 // strip to an IP.
 func (p *hedgePacket) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	defer buffer.Release()
-	return p.write(buffer.Bytes(), destination)
+	if err := p.write(buffer.Bytes(), destination); err != errTakenTimeout {
+		return err
+	}
+	// Taken: the move sends it, and a buffered write has no count to
+	// report that with, so it succeeds rather than invite a resend.
+	return nil
 }
 
 func (p *hedgePacket) Close() error {

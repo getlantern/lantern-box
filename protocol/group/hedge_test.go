@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -43,6 +44,8 @@ type fakeOutbound struct {
 	headroom int
 	// hang makes every dial wait for its context and return its error.
 	hang bool
+	// delay holds each stream dial this long before it succeeds.
+	delay time.Duration
 	// ctxBound closes each dialed conn when its dial context ends, as meek's
 	// conns do.
 	ctxBound bool
@@ -81,6 +84,13 @@ func (f *fakeOutbound) DialContext(ctx context.Context, network string, destinat
 	}
 	if f.dialErr != nil {
 		return nil, f.dialErr
+	}
+	if f.delay > 0 {
+		select {
+		case <-time.After(f.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	client, server := net.Pipe()
 	go f.stream(server)
@@ -968,7 +978,14 @@ func TestHedgeWaitersSeeDeadlineChanges(t *testing.T) {
 	}
 }
 
-func TestHedgeDeadlineReachesPendingReplay(t *testing.T) {
+// A write deadline set during the replay doesn't cut it short, since it
+// carries writes already taken, but a stalled replay still can't hang the
+// connection: the failover timeout ends it, as a move failure, not a
+// timeout.
+func TestHedgeStalledReplayEndsAtTheFailoverTimeout(t *testing.T) {
+	old := hedgeFailoverDialTimeout
+	hedgeFailoverDialTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { hedgeFailoverDialTimeout = old })
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	slowThen := func(c net.Conn) {
@@ -987,12 +1004,15 @@ func TestHedgeDeadlineReachesPendingReplay(t *testing.T) {
 		defer s.mu.Unlock()
 		return s.pending != nil
 	}, 2*time.Second, 5*time.Millisecond, "the replay never started")
-	require.NoError(t, c.SetWriteDeadline(time.Now().Add(100*time.Millisecond)))
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(10*time.Millisecond)))
 	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
 	start := time.Now()
 	_, err = c.Read(make([]byte, 64))
-	require.Error(t, err, "a deadline set during the replay must interrupt it")
-	require.Less(t, time.Since(start), 2*time.Second)
+	require.Error(t, err, "the stalled replay fails the move")
+	require.Less(t, time.Since(start), 2*time.Second, "at the failover timeout, not the read deadline")
+	var me *hedgeMoveError
+	require.ErrorAs(t, err, &me)
+	require.NotErrorIs(t, err, os.ErrDeadlineExceeded, "a failed move doesn't read as a timeout")
 }
 
 // quicInitial builds a long-header packet with the given connection IDs.
@@ -1585,4 +1605,137 @@ func TestHedgeTimedOutPartialWriteReplaysOnce(t *testing.T) {
 	got, err := c.Read(buf) // First never answers, so the hedge moves
 	require.NoError(t, err)
 	require.Equal(t, "then:"+string(opening), string(buf[:got]))
+}
+
+// A write whose failure moves the connection, with Then's dial outlasting
+// the caller's write deadline: the write reports all of p taken, since the
+// move replays it, so the caller doesn't resend any and Then gets the
+// opening once.
+func TestHedgeWriteDeadlineDuringAMoveReportsTheWriteTaken(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn {
+		return &failingConn{Conn: c, err: connResetErr(), failWrite: true}
+	}}, &fakeOutbound{stream: answer("then:"), delay: 300 * time.Millisecond}, longCommit)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	opening := []byte(tlsRecord("client hello"))
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(50*time.Millisecond)))
+	n, err := c.Write(opening)
+	require.Error(t, err, "the caller's deadline ran out during the move")
+	require.Equal(t, len(opening), n, "the move replays all of it")
+	var ne net.Error
+	require.ErrorAs(t, err, &ne)
+	require.True(t, ne.Timeout())
+	// Only a read deadline: the replay mustn't depend on the caller
+	// extending the write deadline that ran out.
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 64)
+	got, err := c.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "then:"+string(opening), string(buf[:got]))
+}
+
+// A move that fails because Then's dial timed out isn't reported as a
+// timeout, so a caller that retries timeouts sees the connection is dead.
+func TestHedgeFailedMoveIsNotATimeout(t *testing.T) {
+	old := hedgeFailoverDialTimeout
+	hedgeFailoverDialTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { hedgeFailoverDialTimeout = old })
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{hang: true}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte(tlsRecord("hi")))
+	require.NoError(t, err)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(hedgeFailoverDialTimeout+5*time.Second)))
+	_, err = c.Read(make([]byte, 16))
+	require.Error(t, err)
+	var ne net.Error
+	if errors.As(err, &ne) {
+		require.False(t, ne.Timeout(), "a failed move isn't a timeout: %v", err)
+	}
+	var me *hedgeMoveError
+	require.ErrorAs(t, err, &me, "the move's failure, with its cause")
+	require.NotErrorIs(t, err, context.Canceled, "a Then dial that timed out isn't a cancellation")
+}
+
+// A deadline the caller sets while the move is under way, even one already
+// passed, doesn't fail the replay of writes it took.
+func TestHedgeDeadlineSetDuringTheMoveSparesTheReplay(t *testing.T) {
+	// Then reads late, so the replay's write is blocked when the deadline
+	// is set.
+	slowReader := func(c net.Conn) {
+		time.Sleep(300 * time.Millisecond)
+		answer("then:")(c)
+	}
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: slowReader}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	opening := []byte(tlsRecord("hello"))
+	_, err = c.Write(opening)
+	require.NoError(t, err)
+	s := c.(*hedgeStream)
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.pending != nil
+	}, 2*time.Second, 5*time.Millisecond, "the replay never started")
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(-time.Second))) // already passed
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	require.NoError(t, err, "the replay went through")
+	require.Equal(t, "then:"+string(opening), string(buf[:n]))
+}
+
+// The client closing while Then is still dialing ends the move as a close,
+// not as a failure of Then.
+func TestHedgeCloseDuringTheMoveIsNotAMoveFailure(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:"), delay: time.Minute}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	_, err = c.Write([]byte(tlsRecord("hi")))
+	require.NoError(t, err)
+	s := c.(*hedgeStream)
+	var moved chan struct{}
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		moved = s.moved
+		return s.moving
+	}, 2*time.Second, 5*time.Millisecond, "the move never started")
+	c.Close()
+	select {
+	case <-moved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the move didn't end on close")
+	}
+	s.mu.Lock()
+	moveErr := s.moveErr
+	s.mu.Unlock()
+	require.Error(t, moveErr)
+	var me *hedgeMoveError
+	require.False(t, errors.As(moveErr, &me), "a close isn't a move failure: %v", moveErr)
+	require.ErrorIs(t, moveErr, net.ErrClosed, "it reads as the close it was")
+}
+
+// A failed move whose cause is a deadline doesn't read as a timeout to
+// errors.Is either.
+func TestHedgeMoveErrorHidesADeadlineCause(t *testing.T) {
+	for _, cause := range []error{os.ErrDeadlineExceeded, context.DeadlineExceeded} {
+		err := error(&hedgeMoveError{cause: cause})
+		require.NotErrorIs(t, err, os.ErrDeadlineExceeded)
+		require.NotErrorIs(t, err, context.DeadlineExceeded)
+	}
+	require.ErrorIs(t, &hedgeMoveError{cause: errors.ErrUnsupported}, errors.ErrUnsupported, "other causes stay reachable")
+	var opReset *net.OpError
+	require.True(t, errors.As(&hedgeMoveError{cause: &net.OpError{Op: "write", Err: syscall.ECONNRESET}}, &opReset),
+		"a cause that isn't a timeout keeps its details")
+	var opTimeout *net.OpError
+	require.False(t, errors.As(&hedgeMoveError{cause: &net.OpError{Op: "dial", Err: syscall.ETIMEDOUT}}, &opTimeout),
+		"any cause that is a timeout is hidden, not only the deadline sentinels")
+	var op *net.OpError
+	require.False(t, errors.As(&hedgeMoveError{cause: &net.OpError{Op: "write", Err: os.ErrDeadlineExceeded}}, &op),
+		"nor through a cause's own timeout")
 }
