@@ -105,7 +105,11 @@ func NewHedge(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		cfg.maxHeldBytes = defaultHedgeMaxHeldBytes
 	}
 	h := &Hedge{
-		Adapter:     outbound.NewAdapter(constant.TypeHedge, tag, []string{N.NetworkTCP, N.NetworkUDP}, []string{options.First, options.Then}),
+		// Only Then is a dependency. First may come and go at runtime, as a
+		// server-sent outbound does: the hedge looks it up on every dial and
+		// uses Then while it's missing. As a dependency, the outbound
+		// manager would refuse to remove it.
+		Adapter:     outbound.NewAdapter(constant.TypeHedge, tag, []string{N.NetworkTCP, N.NetworkUDP}, []string{options.Then}),
 		outboundMgr: service.FromContext[adapter.OutboundManager](ctx),
 		logger:      logger,
 		firstTag:    options.First,
@@ -127,11 +131,11 @@ func (h *Hedge) SetEnabled(enabled bool) {
 // Enabled reports whether new connections may try First.
 func (h *Hedge) Enabled() bool { return h.enabled.Load() }
 
+// Start checks that Then exists. First may be missing; connections use Then
+// until it appears.
 func (h *Hedge) Start() error {
-	for _, tag := range []string{h.firstTag, h.thenTag} {
-		if _, loaded := h.outboundMgr.Outbound(tag); !loaded {
-			return fmt.Errorf("hedge: missing outbound %s", tag)
-		}
+	if _, loaded := h.outboundMgr.Outbound(h.thenTag); !loaded {
+		return fmt.Errorf("hedge: missing outbound %s", h.thenTag)
 	}
 	return nil
 }

@@ -122,6 +122,46 @@ func TestHedgeSwitchableFromBox(t *testing.T) {
 	require.True(t, sw.Enabled())
 }
 
+// TestHedgeSurvivesRemovingFirst removes First from a running box, as a
+// client does when the server stops sending it. The removal must succeed, and
+// the hedge must go on serving through Then.
+func TestHedgeSurvivesRemovingFirst(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer origin.Close()
+	proxy := startTestSOCKS(t, origin.Listener.Addr().String(), nil)
+
+	boxCtx := box.BaseContext()
+	clientPort := freePort(t)
+	client, err := sbox.New(sbox.Options{Context: boxCtx, Options: mustOptions(boxCtx, t, fmt.Sprintf(`{
+		"log": {"level": "error"},
+		"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+		"outbounds": [
+			{"type": "hedge", "tag": "smart", "first": "proxyless", "then": "proxy"},
+			{"type": "direct", "tag": "proxyless"},
+			{"type": "socks", "tag": "proxy", "server": "127.0.0.1", "server_port": %d}
+		],
+		"route": {"final": "smart"}
+	}`, clientPort, proxy.port))})
+	require.NoError(t, err)
+	require.NoError(t, client.Start())
+	t.Cleanup(func() { client.Close() })
+
+	require.NoError(t, client.Outbound().Remove("proxyless"), "First is not a dependency the manager may refuse to remove")
+
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", clientPort))
+	hc := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
+		Proxy:             http.ProxyURL(proxyURL),
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+		DisableKeepAlives: true,
+	}}
+	resp, err := hc.Get("https://site.example/")
+	require.NoError(t, err, "with First gone, the hedge serves through Then")
+	resp.Body.Close()
+	require.Equal(t, 1, proxy.count("site.example"))
+}
+
 // testSOCKS is a SOCKS5 CONNECT server that sends every connection to one
 // origin. With a blocklist it acts as a censor: it reads the ClientHello and
 // silently drops connections whose SNI is listed.
