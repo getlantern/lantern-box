@@ -50,6 +50,12 @@ type hedgeLeg struct {
 	moving    bool
 	moved     chan struct{} // closed when a move finishes
 	closed    bool
+	// resetNoted is set when the watchdog charged a reset on First
+	// (noteReset), and resetBeforeCommit when that came before any reply.
+	resetNoted, resetBeforeCommit bool
+	// markedBad is set once this connection has marked its site bad, so it
+	// does so once however many paths see the failure.
+	markedBad bool
 	// decided is set once enough bytes have been written, across writes, to
 	// tell whether the connection can be replayed (see keepLocked); until
 	// then undecidedKept marks a kept prefix that must not be replayed.
@@ -249,10 +255,13 @@ func (l *hedgeLeg) commit(release func()) bool {
 		// reset noteReset already recorded is kept: it came first.
 		l.stats.setOutcomeIfUnset(hedgeOutcomeCommitted)
 	}
+	// A reset already seen marked the site bad; a reply that was in
+	// flight doesn't make it good.
+	good := first && !l.resetNoted
 	l.stopCommitLocked()
 	release()
 	l.mu.Unlock()
-	if first {
+	if good {
 		l.h.markGood(l.key)
 	}
 	return true
@@ -265,17 +274,33 @@ func (l *hedgeLeg) commit(release func()) bool {
 // without a move (staticResetOutcomeLocked). A replayable opening is left
 // for its move to record. The watchdog calls this from the IO path, which
 // never holds mu.
+//
+// A connection the client already closed is left alone: an error then can
+// be the teardown itself, not First failing.
 func (l *hedgeLeg) noteReset() {
 	l.mu.Lock()
-	if !l.onFirst || l.moving {
+	if !l.onFirst || l.moving || l.closed || l.resetNoted {
 		l.mu.Unlock()
 		return
 	}
+	l.resetNoted = true
+	l.resetBeforeCommit = !l.committed
 	if outcome := l.staticResetOutcomeLocked(); outcome != "" {
 		l.stats.set("", outcome)
 	}
 	l.mu.Unlock()
-	l.h.markBad(l.ctx, l.key, lAdapter.UserFailureReset)
+	l.markBadOnce(lAdapter.UserFailureReset)
+}
+
+// markBadOnce marks the site bad, once per connection.
+func (l *hedgeLeg) markBadOnce(why any) {
+	l.mu.Lock()
+	already := l.markedBad
+	l.markedBad = true
+	l.mu.Unlock()
+	if !already {
+		l.h.markBad(l.ctx, l.key, why)
+	}
 }
 
 // staticResetOutcomeLocked returns the outcome of a reset on First that no
@@ -302,15 +327,19 @@ func (l *hedgeLeg) staticResetOutcomeLocked() string {
 func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter.UserFailureKind)) {
 	l.mu.Lock()
 	committed := l.committed
+	resetBeforeCommit := l.resetBeforeCommit
 	l.mu.Unlock()
 	if committed {
-		outcome := hedgeOutcomeResetAfterCommit
-		if kind == lAdapter.UserFailureStall {
-			outcome = hedgeOutcomeStalledAfterCommit
+		// A reset noted before the commit isn't a reset after it: its
+		// outcome, if it had one, stands.
+		if kind != lAdapter.UserFailureReset || !resetBeforeCommit {
+			outcome := hedgeOutcomeResetAfterCommit
+			if kind == lAdapter.UserFailureStall {
+				outcome = hedgeOutcomeStalledAfterCommit
+			}
+			l.stats.replaceOutcome(hedgeOutcomeCommitted, outcome)
 		}
-		// A reset recorded before the commit (noteReset) keeps its outcome.
-		l.stats.replaceOutcome(hedgeOutcomeCommitted, outcome)
-		l.h.markBad(l.ctx, l.key, kind)
+		l.markBadOnce(kind)
 		return
 	}
 	move(kind)
@@ -334,7 +363,7 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 		l.mu.Unlock()
 		if !slowOnly {
 			l.stats.set("", outcome)
-			l.h.markBad(l.ctx, l.key, why)
+			l.markBadOnce(why)
 			_ = closeFirst()
 		}
 		return false
@@ -349,7 +378,7 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 	// The path becomes then_after_move only once the move succeeds
 	// (finishMoveLocked).
 	l.stats.set("", outcome)
-	l.h.markBad(l.ctx, l.key, why)
+	l.markBadOnce(why)
 	_ = closeFirst()
 	return true
 }

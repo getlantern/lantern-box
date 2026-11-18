@@ -313,11 +313,44 @@ func TestHedgeTelemetryCommitKeepsAnEarlierReset(t *testing.T) {
 	require.NoError(t, err, "First's reply commits the connection")
 	c.Close()
 	require.Equal(t, hedgeOutcomeResetNotReplayable, connectionRecord(t, reader)["hedge.outcome"])
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()), "the reply doesn't mark the site good again")
+}
+
+// A reset on a replayable opening, noted before a reply commits it, isn't
+// relabelled as a reset after the commit when firstFailed handles it.
+func TestHedgeTelemetryResetBeforeCommitNotRelabelled(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = c.Write([]byte(tlsRecord("hi")))
+	require.NoError(t, err)
+	s := c.(*hedgeStream)
+	s.noteReset()
+	_, err = c.Read(make([]byte, 64))
+	require.NoError(t, err)
+	s.firstFailed(lAdapter.UserFailureReset, s.move)
+	c.Close()
+	require.Equal(t, hedgeOutcomeCommitted, connectionRecord(t, reader)["hedge.outcome"])
+}
+
+// An error after the client closed can be the teardown itself, so it marks
+// nothing.
+func TestHedgeNoteResetIgnoresAClosedConnection(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	c.Close()
+	c.(*hedgeStream).noteReset()
+	require.NotEqual(t, hedgeBad, f.verdict(hedgeDest.String()))
 }
 
 // A real reset on First, through the watchdog's hook: a write that isn't a
 // handshake fails, the client closes at once, and the record and the cache
-// still show it.
+// still show it. firstFailed can also get there first, so this checks the
+// wiring end to end; TestHedgeTelemetryResetNotedBeforeItIsHandled pins the
+// ordering.
 func TestHedgeTelemetryResetOnWriteEndToEnd(t *testing.T) {
 	reader := recordMetrics(t)
 	first := &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn {
