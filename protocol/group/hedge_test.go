@@ -1521,3 +1521,29 @@ func TestHedgeResetNotedBeforeTheCloseStrikes(t *testing.T) {
 
 // longCommit keeps the commit timer out of tests that need First to reply.
 func longCommit(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) }
+
+// A real reset after First replied, through the watchdog, with the client
+// closing as soon as it sees the error: the strikes still add up.
+func TestHedgeRealResetsAfterAReplyStrikeBeforeTheClose(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn {
+		return &failingConn{Conn: c, err: connResetErr(), firstN: 8}
+	}}, &fakeOutbound{stream: answer("then:")}, longCommit)
+	for i := range 2 {
+		c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+		require.NoError(t, err)
+		require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+		_, err = c.Write([]byte(tlsRecord("hi")))
+		require.NoError(t, err)
+		buf := make([]byte, 16)
+		n, err := c.Read(buf)
+		require.NoError(t, err, "First's reply commits")
+		require.Equal(t, 8, n)
+		_, err = c.Read(buf)
+		require.Error(t, err, "then First resets")
+		c.Close()
+		if i == 0 {
+			require.NotEqual(t, hedgeBad, f.verdict(hedgeDest.String()), "one strike")
+		}
+	}
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()), "two strikes, though each client closed at once")
+}
