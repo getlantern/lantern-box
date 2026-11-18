@@ -49,7 +49,10 @@ type ExitConfig struct {
 	// never calls SetEnabled.
 	Exit *exit.Exit
 	// NewBox builds and starts the exit box from options JSON. nil: sing-box in ctx. It is
-	// exported for tests, and for embedders that build boxes their own way.
+	// exported for tests, and for embedders that build boxes their own way. It must return a box
+	// that has run every start stage, as sing-box's Box.Start does: its router's PostStart is
+	// when the route rules take up their rule sets, and RunExit serves the box as soon as it
+	// returns.
 	NewBox func(ctx context.Context, options string) (ExitBox, error)
 	// RotationInterval overrides the interval lantern-cloud gives. 0: lantern-cloud's, or an hour.
 	RotationInterval time.Duration

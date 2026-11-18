@@ -74,6 +74,8 @@ type Volunteer struct {
 	exit   *exit.Exit
 	cancel context.CancelFunc
 	done   chan struct{}
+	// serveExit sets the exit's router, at PostStart; nil once it has, or with no exit.
+	serveExit func()
 }
 
 func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts option.UnboundedVolunteerOptions) (adapter.Service, error) {
@@ -183,6 +185,16 @@ func (v *Volunteer) Tag() string  { return v.tag }
 // Start runs broflake once the box is up. A volunteer only dials out, so it needs nothing from
 // the box's inbounds or outbounds.
 func (v *Volunteer) Start(stage adapter.StartStage) error {
+	if stage == adapter.StartStatePostStart {
+		v.mu.Lock()
+		serve := v.serveExit
+		v.serveExit = nil
+		v.mu.Unlock()
+		if serve != nil {
+			serve()
+		}
+		return nil
+	}
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -205,7 +217,7 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 	if err != nil {
 		if e != nil {
 			e.Close()
-			v.rtcOpt.Exit = nil
+			v.rtcOpt.Exit, v.serveExit = nil, nil
 		}
 		return fmt.Errorf("unbounded volunteer: start broflake: %w", err)
 	}
@@ -231,7 +243,7 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 func (v *Volunteer) Close() error {
 	v.mu.Lock()
 	ui, e, cancel, done := v.ui, v.exit, v.cancel, v.done
-	v.ui, v.exit, v.cancel, v.done = nil, nil, nil, nil
+	v.ui, v.exit, v.cancel, v.done, v.serveExit = nil, nil, nil, nil, nil
 	v.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -286,7 +298,12 @@ func (v *Volunteer) startExit() *exit.Exit {
 	if err := ready(); err != nil {
 		v.logger.WarnContext(v.ctx, "unbounded volunteer: no direct exit until its abuse rule sets hold rules: ", err)
 	}
-	e.SetRouter(exit.Pool, router, validUntil, ready)
+	// sing-box starts services before its router's PostStart, which is when the route rules
+	// take up their rule sets: until then the abuse rejects match nothing, whatever the sets
+	// hold. The router comes before the services in each stage, so by the volunteer's PostStart
+	// the rules are in place. Until then the exit has no router, so it is unready, and broflake
+	// offers no direct exit.
+	v.serveExit = func() { e.SetRouter(exit.Pool, router, validUntil, ready) }
 	return e
 }
 

@@ -277,3 +277,38 @@ func TestVolunteerDirectExitFollowsItsAbuseRuleSets(t *testing.T) {
 	assert.Eventually(t, func() bool { return e.Ready(false) }, 10*time.Second, 20*time.Millisecond,
 		"and offered again once it holds rules")
 }
+
+// sing-box starts services before its router's PostStart, which is when the route rules take up
+// their rule sets: until then the abuse rejects match nothing, whatever the sets hold. The
+// volunteer offers its direct exit only from its own PostStart, which follows the router's.
+func TestVolunteerDirectExitWaitsForPostStart(t *testing.T) {
+	probe, err := exit.New(context.Background(), sblog.NewNOPFactory().Logger())
+	if errors.Is(err, exit.ErrUnavailable) {
+		t.Skip("built without with_quic")
+	}
+	probe.Close()
+	unreachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(unreachable.Close)
+	ctx := service.ExtendContext(lbox.BaseContext())
+	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(fmt.Sprintf(directExitBoxConfig,
+		unreachable.URL, "ws"+unreachable.URL[len("http"):], true)))
+	require.NoError(t, err)
+	ctx, stripped := peerrules.CheckDirectExit(ctx, &opts)
+	require.False(t, stripped)
+	b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Close() })
+	svc, ok := service.FromContext[adapter.ServiceManager](ctx).Get("volunteer")
+	require.True(t, ok)
+
+	// The stages as sing-box runs them for a service, without the router's.
+	require.NoError(t, svc.Start(adapter.StartStateStart))
+	e := unbounded.VolunteerExit(svc)
+	require.NotNil(t, e)
+	assert.False(t, e.Ready(false), "no direct exit before PostStart")
+	require.NoError(t, svc.Start(adapter.StartStatePostStart))
+	assert.True(t, e.Ready(false), "the direct exit from PostStart")
+	require.NoError(t, svc.Close())
+}
