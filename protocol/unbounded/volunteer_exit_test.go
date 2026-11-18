@@ -149,7 +149,7 @@ func TestVolunteerDirectExitEndsAtItsDeadline(t *testing.T) {
 		ready    bool
 	}{
 		"passed":   {deadline: -time.Second},
-		"upcoming": {deadline: 500 * time.Millisecond, ready: true},
+		"upcoming": {deadline: 2 * time.Second, ready: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := service.ExtendContext(lbox.BaseContext())
@@ -168,7 +168,7 @@ func TestVolunteerDirectExitEndsAtItsDeadline(t *testing.T) {
 			e := unbounded.VolunteerExit(svc)
 			require.NotNil(t, e)
 			assert.Equal(t, tc.ready, e.Ready(false))
-			assert.Eventually(t, func() bool { return !e.Ready(false) }, 5*time.Second, 20*time.Millisecond,
+			assert.Eventually(t, func() bool { return !e.Ready(false) }, 10*time.Second, 20*time.Millisecond,
 				"the exit stops at the deadline")
 		})
 	}

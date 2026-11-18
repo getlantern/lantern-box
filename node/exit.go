@@ -253,11 +253,13 @@ func (r *exitRunner) refresh(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The registration lasts from lantern-cloud's answer, however long its boxes take to start.
+	registeredAt := time.Now()
 	// lantern-cloud answered, so a hold-off it asked for is over, whatever the configs hold.
 	if r.heldOff {
 		r.holdOff(time.Time{})
 	}
-	return r.launch(ctx, resp)
+	return r.launch(ctx, resp, registeredAt)
 }
 
 func (r *exitRunner) register(ctx context.Context) (*webrtcRegisterResponse, error) {
@@ -273,8 +275,10 @@ func (r *exitRunner) register(ctx context.Context) (*webrtcRegisterResponse, err
 // registration extended, so its streams survive; this matters most while the other kind's
 // config keeps failing, when RunExit re-registers at every retry. A kind with no config is
 // cleared. A kind whose config fails keeps its current box, and launch returns that failure,
-// so RunExit retries soon.
-func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) error {
+// so RunExit retries soon, except for a routing mark the process can no longer set, which
+// withdraws the kind's box too. Each kind's registration lasts two rotations from
+// registeredAt; a box that finishes starting after that is closed unserved.
+func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse, registeredAt time.Time) error {
 	rotation := r.cfg.RotationInterval
 	if rotation <= 0 {
 		rotation = DefaultRotationInterval
@@ -283,6 +287,7 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) e
 		}
 	}
 	r.rotation = rotation
+	validUntil := registeredAt.Add(2 * rotation)
 	configs := [2]string{exit.Pool: resp.ServerConfig, exit.Personal: resp.PersonalServerConfig}
 	var errs []error
 	for _, kind := range exitKinds {
@@ -292,13 +297,17 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) e
 		}
 		options, err := r.prepare(ctx, kind, configs[kind])
 		if err != nil {
+			if errors.Is(err, errMarkRefused) {
+				// The running box's sockets would go unmarked too, for auto_redirect to capture.
+				r.closeKind(kind)
+			}
 			errs = append(errs, err)
 			continue
 		}
 		kb := &r.boxes[kind]
 		if kb.box != nil && kb.options == options {
-			kb.validUntil = time.Now().Add(2 * rotation)
-			r.exit.SetRouter(kind, kb.box.Router(), kb.validUntil)
+			kb.validUntil = validUntil
+			r.exit.SetRouter(kind, kb.box.Router(), validUntil)
 			continue
 		}
 		b, err := r.newBox(ctx, options)
@@ -306,8 +315,13 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) e
 			errs = append(errs, &exitStageError{stage: "start the " + kind.String() + " exit box", err: err})
 			continue
 		}
+		if !time.Now().Before(validUntil) {
+			_ = b.Close()
+			errs = append(errs, &exitStageError{stage: "start the " + kind.String() + " exit box", err: errStartedTooLate, loggable: true})
+			continue
+		}
 		prev := kb.box
-		*kb = kindBox{box: b, options: options, validUntil: time.Now().Add(2 * rotation)}
+		*kb = kindBox{box: b, options: options, validUntil: validUntil}
 		r.exit.SetRouter(kind, b.Router(), kb.validUntil)
 		if prev != nil {
 			_ = prev.Close()
@@ -315,6 +329,9 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) e
 	}
 	return errors.Join(errs...)
 }
+
+// errStartedTooLate is a box that finished starting after its registration ran out.
+var errStartedTooLate = errors.New("it started after its registration ran out")
 
 // errMarkRefused is a routing mark the process may not set.
 var errMarkRefused = errors.New("could not set the routing mark on a socket (it needs CAP_NET_ADMIN)")

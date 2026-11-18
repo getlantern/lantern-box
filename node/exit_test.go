@@ -419,11 +419,13 @@ func TestRunExitRotatesWithoutAGap(t *testing.T) {
 
 func TestRunExitKeepsServingUntilExpiryWhenRefused(t *testing.T) {
 	var registers atomic.Int32
+	var registeredAt atomic.Int64
 	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
 		if registers.Add(1) > 1 {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
+		registeredAt.Store(time.Now().UnixNano())
 		writeJSON(w, map[string]any{"server_config": validExitConfig})
 	})
 	e := enabledExit(t)
@@ -442,7 +444,8 @@ func TestRunExitKeepsServingUntilExpiryWhenRefused(t *testing.T) {
 	}
 	require.Eventually(t, func() bool { closed, _ := b.isClosed(); return closed }, 5*time.Second, 5*time.Millisecond)
 	_, closedAt := b.isClosed()
-	assert.GreaterOrEqual(t, closedAt.Sub(b.builtAt), 2*rotation, "the box serves until two rotations have passed")
+	assert.GreaterOrEqual(t, closedAt.Sub(time.Unix(0, registeredAt.Load())), 2*rotation,
+		"the box serves until two rotations have passed since its registration")
 	assert.False(t, e.Options().Ready(false))
 	assert.Len(t, boxes.all(), 1)
 	assert.Equal(t, []string{"build 1", "router 1", "router nil", "close 1"}, ev.list())
@@ -639,10 +642,13 @@ func TestRunExitBuildsABoxPerKind(t *testing.T) {
 // runs out, while the other kind's box keeps rotating.
 func TestRunExitFailsOneKindAlone(t *testing.T) {
 	var registers atomic.Int32
+	var registeredAt atomic.Int64
 	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
 		personal := personalExitConfig
 		if registers.Add(1) > 1 {
 			personal = exitConfigWithoutAbuseRules
+		} else {
+			registeredAt.Store(time.Now().UnixNano())
 		}
 		writeJSON(w, map[string]any{"server_config": validExitConfig, "personal_server_config": personal})
 	})
@@ -665,7 +671,8 @@ func TestRunExitFailsOneKindAlone(t *testing.T) {
 	require.NotNil(t, personalBox)
 	require.Eventually(t, func() bool { closed, _ := personalBox.isClosed(); return closed }, 5*time.Second, time.Millisecond)
 	_, closedAt := personalBox.isClosed()
-	assert.GreaterOrEqual(t, closedAt.Sub(personalBox.builtAt), 2*rotation, "the personal box serves until its registration runs out")
+	assert.GreaterOrEqual(t, closedAt.Sub(time.Unix(0, registeredAt.Load())), 2*rotation,
+		"the personal box serves until its registration runs out")
 	assert.False(t, o.Ready(true))
 	assert.True(t, o.Ready(false), "the pool's box keeps serving")
 	for _, b := range boxes.all() {
@@ -692,10 +699,21 @@ func TestRunExitRefusesAResponseWithoutAConfig(t *testing.T) {
 	boxes := &fakeExitBoxes{ev: ev}
 	ctx, cancel := context.WithCancel(box.BaseContext())
 	defer cancel()
+	reregister := make(chan struct{}, 1)
 	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
-		NewBox: boxes.new, RotationInterval: time.Hour}, ev)
+		NewBox: boxes.new, RotationInterval: time.Hour, Reregister: reregister}, ev)
 	o := e.Options()
 	require.Eventually(t, func() bool { return o.Ready(false) && o.Ready(true) }, 5*time.Second, time.Millisecond)
+	reregister <- struct{}{}
+	require.Eventually(t, func() bool { return registers.Load() >= 2 }, 5*time.Second, time.Millisecond)
+	// The answer's handling follows the handler's return; give it a moment.
+	time.Sleep(100 * time.Millisecond)
+	for _, b := range boxes.all() {
+		closed, _ := b.isClosed()
+		assert.False(t, closed, "box %d", b.id)
+	}
+	assert.True(t, o.Ready(false))
+	assert.True(t, o.Ready(true))
 	cancel()
 	waitDone(t, done)
 	assert.Len(t, boxes.all(), 2)
@@ -848,6 +866,73 @@ func TestRunExitClearsTheHoldOffOnRegistering(t *testing.T) {
 	got := held.list()
 	assert.False(t, got[0].IsZero())
 	assert.True(t, got[1].IsZero(), "lantern-cloud answered, so the hold-off is over")
+}
+
+// A box's registration runs from when lantern-cloud answered, not from when the box finished
+// starting, so a box that takes longer to start than its registration lasts is never served.
+func TestRunExitServesNoBoxPastItsRegistration(t *testing.T) {
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"server_config": validExitConfig})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	boxes := &fakeExitBoxes{ev: ev}
+	const rotation = 50 * time.Millisecond
+	slow := func(ctx context.Context, options string) (ExitBox, error) {
+		time.Sleep(3 * rotation)
+		return boxes.new(ctx, options)
+	}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: slow, RotationInterval: rotation}, ev)
+	require.Eventually(t, func() bool { return len(boxes.all()) >= 2 }, 5*time.Second, time.Millisecond)
+	cancel()
+	waitDone(t, done)
+	for _, b := range boxes.all() {
+		closed, _ := b.isClosed()
+		assert.True(t, closed, "box %d", b.id)
+	}
+	for _, event := range ev.list() {
+		assert.NotContains(t, event, "router", "a box past its registration was served")
+	}
+	assert.False(t, e.Options().Ready(false))
+}
+
+// A mark the process can no longer set withdraws the kind's running box too, which would
+// otherwise serve on with sockets auto_redirect can capture.
+func TestRunExitWithdrawsABoxItCanNoLongerMark(t *testing.T) {
+	var refuse atomic.Bool
+	orig, origProbe := isLinux, probeMark
+	isLinux, probeMark = true, func(uint32) error {
+		if refuse.Load() {
+			return errors.New("operation not permitted")
+		}
+		return nil
+	}
+	t.Cleanup(func() { isLinux, probeMark = orig, origProbe })
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"server_config": validExitConfig, "personal_server_config": personalExitConfig})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	boxes := &fakeExitBoxes{ev: ev}
+	reregister := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: boxes.new, RoutingMark: 0x2024, Reregister: reregister}, ev)
+	o := e.Options()
+	require.Eventually(t, func() bool { return o.Ready(false) && o.Ready(true) }, 5*time.Second, time.Millisecond)
+	refuse.Store(true)
+	reregister <- struct{}{}
+	require.Eventually(t, func() bool { return !o.Ready(false) && !o.Ready(true) }, 5*time.Second, time.Millisecond)
+	for _, b := range boxes.all() {
+		closed, _ := b.isClosed()
+		assert.True(t, closed, "box %d", b.id)
+	}
+	cancel()
+	waitDone(t, done)
 }
 
 // holdOffs records what RunExit reports through OnHoldOff.
