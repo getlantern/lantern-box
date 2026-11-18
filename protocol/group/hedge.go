@@ -54,6 +54,10 @@ func RegisterHedge(registry *outbound.Registry) {
 //
 // Bandit probes (see [lAdapter.ContextWithProbe]) measure the proxy behind
 // the hedge, so they always go straight to Then and teach the cache nothing.
+//
+// A hedge is a [lAdapter.Switchable]: switched off, it sends every new
+// connection straight to Then and leaves the cache alone, so a feature flag
+// can stop proxyless use without rebuilding the tunnel.
 type Hedge struct {
 	outbound.Adapter
 	outboundMgr adapter.OutboundManager
@@ -62,7 +66,10 @@ type Hedge struct {
 	thenTag     string
 	cfg         hedgeConfig
 	cache       *hedgeCache
+	enabled     atomic.Bool
 }
+
+var _ lAdapter.Switchable = (*Hedge)(nil)
 
 type hedgeConfig struct {
 	commitTimeout time.Duration
@@ -96,7 +103,7 @@ func NewHedge(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if cfg.maxHeldBytes <= 0 {
 		cfg.maxHeldBytes = defaultHedgeMaxHeldBytes
 	}
-	return &Hedge{
+	h := &Hedge{
 		Adapter:     outbound.NewAdapter(constant.TypeHedge, tag, []string{N.NetworkTCP, N.NetworkUDP}, []string{options.First, options.Then}),
 		outboundMgr: service.FromContext[adapter.OutboundManager](ctx),
 		logger:      logger,
@@ -104,8 +111,20 @@ func NewHedge(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		thenTag:     options.Then,
 		cfg:         cfg,
 		cache:       sharedHedgeCache(ctx),
-	}, nil
+	}
+	h.enabled.Store(!options.Disabled)
+	return h, nil
 }
+
+// SetEnabled switches the hedge on or off for new connections.
+func (h *Hedge) SetEnabled(enabled bool) {
+	if h.enabled.Swap(enabled) != enabled {
+		h.logger.Info("hedge ", h.Tag(), " switched ", map[bool]string{true: "on", false: "off"}[enabled])
+	}
+}
+
+// Enabled reports whether new connections may try First.
+func (h *Hedge) Enabled() bool { return h.enabled.Load() }
 
 func (h *Hedge) Start() error {
 	for _, tag := range []string{h.firstTag, h.thenTag} {
@@ -135,7 +154,7 @@ func (h *Hedge) outbound(tag string) (adapter.Outbound, error) {
 // useFirst reports whether a dial should try First, and the key its result
 // is remembered by.
 func (h *Hedge) useFirst(ctx context.Context, network string, destination M.Socksaddr) (adapter.Outbound, hedgeKey, bool) {
-	if lAdapter.IsProbe(ctx) {
+	if lAdapter.IsProbe(ctx) || !h.enabled.Load() {
 		return nil, hedgeKey{}, false
 	}
 	first, err := h.outbound(h.firstTag)
@@ -216,17 +235,26 @@ func (h *Hedge) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 // firstDialContext bounds First's dial by the commit timeout, so a slow
 // dial, such as the outline outbound's first strategy search, falls back to
 // Then instead of holding the connection. A dial that ran out of time is
-// slow, not blocked, so it doesn't mark the site bad. The context is
-// cancelled only on that timeout: some outbounds tie a connection's life to
-// the context it was dialed with. stop must be called once the dial returns.
+// slow, not blocked, so it doesn't mark the site bad.
+//
+// The context is cancelled by that timeout or by ctx, and never once the dial
+// has returned, since some outbounds tie a connection's life to the context
+// it was dialed with. It hangs off ctx through context.AfterFunc rather than
+// WithCancel, so stop can detach it: a child that is never cancelled would
+// stay registered on the inbound's long-lived context for every connection.
+// stop must be called once the dial returns.
 func (h *Hedge) firstDialContext(ctx context.Context) (dialCtx context.Context, timedOut func() bool, stop func()) {
-	dialCtx, cancel := context.WithCancel(ctx)
+	dialCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	detach := context.AfterFunc(ctx, cancel)
 	var fired atomic.Bool
 	timer := time.AfterFunc(h.cfg.commitTimeout, func() {
 		fired.Store(true)
 		cancel()
 	})
-	return dialCtx, fired.Load, func() { timer.Stop() }
+	return dialCtx, fired.Load, func() {
+		timer.Stop()
+		detach()
+	}
 }
 
 // failoverContext detaches from the dial's context, which may end once the

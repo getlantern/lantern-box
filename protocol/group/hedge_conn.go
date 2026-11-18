@@ -160,10 +160,11 @@ func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter
 }
 
 // beginMove claims the move. It returns false when the connection already
-// committed, moved, or closed, or can't be replayed. A connection that can't
-// be replayed stays on First: a slow reply is left alone, and a failure
-// marks the site bad and closes First, so the client fails fast and retries
-// on Then.
+// committed, moved, or closed, or can't be replayed, and then the connection
+// stays on First. One that doesn't open with a handshake is left alone when
+// First is merely slow. Otherwise, and for one whose copy overflowed, the
+// failure marks the site bad and closes First, so the client fails fast and
+// retries on Then.
 func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() error) bool {
 	l.mu.Lock()
 	if l.moving || !l.onFirst || l.committed || l.closed {
@@ -279,9 +280,7 @@ func (s *hedgeStream) move(why lAdapter.UserFailureKind) {
 			err = net.ErrClosed
 		case len(held) > 0:
 			_ = conn.SetWriteDeadline(replayDeadline(writeDeadline))
-			if _, err = conn.Write(held); err == nil {
-				err = conn.SetWriteDeadline(writeDeadline)
-			}
+			_, err = conn.Write(held)
 		}
 		if err != nil {
 			conn.Close()
@@ -297,12 +296,10 @@ func (s *hedgeStream) move(why lAdapter.UserFailureKind) {
 		err = net.ErrClosed
 	default:
 		s.cur = conn
-		if !s.readDeadline.IsZero() {
-			_ = conn.SetReadDeadline(s.readDeadline)
-		}
-		if !s.writeDeadline.IsZero() {
-			_ = conn.SetWriteDeadline(s.writeDeadline)
-		}
+		// The deadlines as they stand now, cleared ones included: the
+		// caller may have changed them while the copy was replayed.
+		_ = conn.SetReadDeadline(s.readDeadline)
+		_ = conn.SetWriteDeadline(s.writeDeadline)
 	}
 	s.held = nil
 	s.finishMoveLocked(err)
@@ -538,9 +535,6 @@ func (p *hedgePacket) move(why lAdapter.UserFailureKind) {
 					break
 				}
 			}
-			if err == nil {
-				err = conn.SetWriteDeadline(writeDeadline)
-			}
 		}
 		if err != nil {
 			conn.Close()
@@ -556,12 +550,10 @@ func (p *hedgePacket) move(why lAdapter.UserFailureKind) {
 		err = net.ErrClosed
 	default:
 		p.cur, p.curRaw = conn, raw
-		if !p.readDeadline.IsZero() {
-			_ = conn.SetReadDeadline(p.readDeadline)
-		}
-		if !p.writeDeadline.IsZero() {
-			_ = conn.SetWriteDeadline(p.writeDeadline)
-		}
+		// The deadlines as they stand now, cleared ones included: the
+		// caller may have changed them while the copy was replayed.
+		_ = conn.SetReadDeadline(p.readDeadline)
+		_ = conn.SetWriteDeadline(p.writeDeadline)
 	}
 	p.held, p.heldBytes = nil, 0
 	p.finishMoveLocked(err)

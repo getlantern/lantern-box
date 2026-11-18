@@ -17,11 +17,13 @@ import (
 	"testing"
 	"time"
 
+	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/sniff"
 	"github.com/stretchr/testify/require"
 
 	box "github.com/getlantern/lantern-box"
+	lAdapter "github.com/getlantern/lantern-box/adapter"
 )
 
 // TestHedgeMultiDomainPage loads a page whose resources come from several
@@ -86,6 +88,31 @@ func TestHedgeMultiDomainPage(t *testing.T) {
 	require.Equal(t, 1, proxy.count("blocked.com"))
 	require.Equal(t, 1, proxy.count("cdn.blocked.com"))
 	require.Zero(t, proxy.count("www.open.com")+proxy.count("img.open.com"), "open sites must not use the proxy")
+}
+
+// TestHedgeSwitchableFromBox builds a hedge from JSON, as radiance does, and
+// reaches its switch through the box's outbound manager, as radiance will to
+// apply a feature flag.
+func TestHedgeSwitchableFromBox(t *testing.T) {
+	boxCtx := box.BaseContext()
+	client, err := sbox.New(sbox.Options{Context: boxCtx, Options: mustOptions(boxCtx, t, `{
+		"log": {"level": "error"},
+		"outbounds": [
+			{"type": "hedge", "tag": "smart", "first": "a", "then": "b", "disabled": true},
+			{"type": "direct", "tag": "a"},
+			{"type": "direct", "tag": "b"}
+		]
+	}`)})
+	require.NoError(t, err)
+	require.NoError(t, client.Start())
+	t.Cleanup(func() { client.Close() })
+	out, ok := client.Outbound().Outbound("smart")
+	require.True(t, ok)
+	sw, ok := out.(lAdapter.Switchable)
+	require.True(t, ok, "the hedge must be reachable as adapter.Switchable")
+	require.False(t, sw.Enabled())
+	sw.SetEnabled(true)
+	require.True(t, sw.Enabled())
 }
 
 // testSOCKS is a SOCKS5 CONNECT server that sends every connection to one

@@ -35,9 +35,14 @@ type HedgeOutboundOptions struct {
 	// which keeps the address-block prior below from sending it to Then.
 	// Default 1h.
 	SuccessTTL badoption.Duration `json:"success_ttl,omitempty"`
+	// Disabled starts the hedge switched off: every connection goes straight
+	// to Then until it is switched on through adapter.Switchable.
+	Disabled bool `json:"disabled,omitempty"`
 	// MaxHeldBytes bounds what is kept for replay before First replies, and
 	// UDP also keeps at most 64 datagrams. A connection that writes more
-	// stays on First. Default 64 KiB.
+	// can't move: if First fails or gives no reply within CommitTimeout, it
+	// is closed and its site marked bad, so the client's retry uses Then.
+	// Default 64 KiB.
 	MaxHeldBytes int `json:"max_held_bytes,omitempty"`
 }
 

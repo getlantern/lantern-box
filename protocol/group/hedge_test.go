@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -694,4 +695,98 @@ func TestHedgeCacheBoundsAddressBlockIndex(t *testing.T) {
 		records += len(sites)
 	}
 	require.LessOrEqual(t, records, hedgeMaxEntries, "one site failing across many blocks must stay bounded")
+}
+
+func TestHedgeSwitch(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")},
+		func(o *option.HedgeOutboundOptions) { o.Disabled = true })
+	var sw lAdapter.Switchable = f.hedge
+	require.False(t, sw.Enabled(), "disabled starts the hedge off")
+	dial := func() string {
+		c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+		require.NoError(t, err)
+		defer c.Close()
+		return exchange(t, c, tlsRecord("hi"))
+	}
+
+	require.Equal(t, "then:"+tlsRecord("hi"), dial())
+	require.Zero(t, f.first.dials.Load(), "a hedge switched off must not try First")
+	require.Equal(t, hedgeUnknown, f.verdict("www.youtube.com:443"), "nor touch the cache")
+
+	sw.SetEnabled(true)
+	require.Equal(t, "first:"+tlsRecord("hi"), dial())
+	require.EqualValues(t, 1, f.first.dials.Load())
+
+	sw.SetEnabled(false)
+	require.Equal(t, "then:"+tlsRecord("hi"), dial())
+	pc, err := f.hedge.ListenPacket(f.ctx, hedgeDest)
+	require.NoError(t, err)
+	pc.Close()
+	require.EqualValues(t, 1, f.first.dials.Load())
+	require.Zero(t, f.first.listens.Load(), "switching off covers UDP too")
+}
+
+// doneCtx is a context whose Done channel the context package can't see
+// into, so a child that is never cancelled costs a goroutine for as long as
+// the parent lives.
+type doneCtx struct {
+	context.Context
+	done chan struct{}
+}
+
+func (c *doneCtx) Done() <-chan struct{} { return c.done }
+
+func (c *doneCtx) Err() error {
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+
+func TestHedgeFirstDialLeavesNothingOnTheParent(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	parent := &doneCtx{Context: f.ctx, done: make(chan struct{})}
+	defer close(parent.done)
+	before := runtime.NumGoroutine()
+	for range 50 {
+		c, err := f.hedge.DialContext(parent, "tcp", hedgeDest)
+		require.NoError(t, err)
+		require.Equal(t, "first:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+		c.Close()
+	}
+	require.Eventually(t, func() bool { return runtime.NumGoroutine() <= before+5 },
+		2*time.Second, 20*time.Millisecond, "each successful dial left something waiting on the parent context")
+}
+
+func TestHedgeClearedWriteDeadlineDuringReplay(t *testing.T) {
+	release := make(chan struct{})
+	slowThen := func(c net.Conn) {
+		<-release // hold the replay until the test has cleared the deadline
+		answer("then:")(c)
+	}
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: slowThen}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(400*time.Millisecond)))
+	_, err = c.Write([]byte(tlsRecord("hello")))
+	require.NoError(t, err)
+	s := c.(*hedgeStream)
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.pending != nil
+	}, 2*time.Second, 5*time.Millisecond, "the replay never started")
+	require.NoError(t, c.SetWriteDeadline(time.Time{}))
+	close(release)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "then:"+tlsRecord("hello"), string(buf[:n]))
+	time.Sleep(500 * time.Millisecond) // past the deadline that was cleared
+	_, err = c.Write([]byte("later"))
+	require.NoError(t, err, "a deadline cleared during the replay must not survive on Then's leg")
 }
