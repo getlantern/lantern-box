@@ -25,6 +25,7 @@ const (
 const (
 	TypeBanditProbe       = "banditprobe"
 	TypeFallback          = "fallback"
+	TypeHedge             = "hedge"
 	TypeMutableSelector   = "mutableselector"
 	TypeMutableURLTest    = "mutableurltest"
 	TypeMutableAutoSelect = "mutableautoselect"

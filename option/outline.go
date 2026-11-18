@@ -3,16 +3,30 @@ package option
 import O "github.com/sagernet/sing-box/option"
 
 // OutboundOutlineOptions set the outbound options used by the outline-sdk
-// smart dialer. You can find more details about the parameters by looking
-// through the implementation: https://github.com/Jigsaw-Code/outline-sdk/blob/v0.0.18/x/smart/stream_dialer.go#L65-L100
-// Or check the documentation README: https://github.com/Jigsaw-Code/outline-sdk/tree/v0.0.18/x/smart
+// smart dialer. See the smart dialer README for the strategy format:
+// https://github.com/OutlineFoundation/outline-sdk/tree/x/v0.3.0/x/smart
+// TLS, Fallback and UDP entries are config URLs:
+// https://pkg.go.dev/golang.getoutline.org/sdk/x/configurl#hdr-Configuration_Format
 type OutboundOutlineOptions struct {
 	O.DialerOptions
 	O.ServerOptions
 	DNSResolvers []DNSEntryConfig `json:"dns,omitempty"`
 	TLS          []string         `json:"tls,omitempty"`
-	TestTimeout  string           `json:"test_timeout"`
-	Domains      []string         `json:"domains"`
+	// Fallback lists stream dialer config URLs, such as ss:// or socks5://,
+	// tried in order when no DNS/TLS strategy works.
+	Fallback []string `json:"fallback,omitempty"`
+	// TestTimeout bounds each strategy test. Empty or zero uses the SDK
+	// default of five seconds.
+	TestTimeout string   `json:"test_timeout"`
+	Domains     []string `json:"domains"`
+	// UDP enables UDP through the outbound, built from this packet listener
+	// config URL over the outbound's own dialer. An empty string is plain UDP;
+	// "quicprelude:count=1" sends a decoy QUIC Initial ahead of every datagram
+	// that may carry a ClientHello. Unset leaves the outbound TCP-only.
+	UDP *string `json:"udp,omitempty"`
+	// StrategyCachePath is a file that keeps the strategies found to work, so
+	// a restart reuses them instead of searching again. Unset disables it.
+	StrategyCachePath string `json:"strategy_cache_path,omitempty"`
 }
 
 // DNSEntryConfig specifies a list of resolvers to test and they can be one of
