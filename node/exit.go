@@ -67,6 +67,12 @@ type ExitConfig struct {
 	// NetworkManager in ctx, when ctx is the VPN box's, read at each rotation, so a tun that
 	// starts after a rotation is missed until the next one. Ignored elsewhere than Linux.
 	RoutingMark uint32
+	// NetworkReset, when set, resets the current exit box's network on each receive, closing
+	// its connections and re-seeding its interface state, as radiance does for the VPN box when
+	// the default interface keeps its name and index but changes address (macOS and iOS), which
+	// the box's interface monitor doesn't report. RunExit reads it only between registrations,
+	// so the embedder should send without blocking, on a channel with a buffer of one.
+	NetworkReset <-chan struct{}
 }
 
 // isLinux is a var so tests can mark the exit box's sockets on any OS.
@@ -75,6 +81,8 @@ var isLinux = runtime.GOOS == "linux"
 // ExitBox is a running exit box. It is exported for NewBox.
 type ExitBox interface {
 	Router() adapter.ConnectionRouterEx
+	// ResetNetwork resets the box's network, as sing-box's NetworkManager.ResetNetwork does.
+	ResetNetwork()
 	Close() error
 }
 
@@ -278,8 +286,8 @@ func (r *exitRunner) routingMark(ctx context.Context) uint32 {
 	return 0
 }
 
-// wait waits d, expiring the current box if its registration runs out first, and reports
-// false if ctx ends.
+// wait waits d, expiring the current box if its registration runs out first and resetting
+// its network on each NetworkReset, and reports false if ctx ends.
 func (r *exitRunner) wait(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -296,6 +304,10 @@ func (r *exitRunner) wait(ctx context.Context, d time.Duration) bool {
 		case <-expiry:
 			expiry = nil
 			r.expire()
+		case <-r.cfg.NetworkReset:
+			if r.box != nil {
+				r.box.ResetNetwork()
+			}
 		case <-t.C:
 			return true
 		}
@@ -367,10 +379,14 @@ func newExitSingBox(ctx context.Context, options string) (ExitBox, error) {
 	if err != nil {
 		return nil, err
 	}
-	return singExitBox{b}, nil
+	return singExitBox{b: b, ctx: ctx}, nil
 }
 
-type singExitBox struct{ b *sbox.Box }
+type singExitBox struct {
+	b   *sbox.Box
+	ctx context.Context
+}
 
 func (s singExitBox) Router() adapter.ConnectionRouterEx { return s.b.Router() }
+func (s singExitBox) ResetNetwork()                      { s.b.Network().ResetNetwork(s.ctx) }
 func (s singExitBox) Close() error                       { return s.b.Close() }

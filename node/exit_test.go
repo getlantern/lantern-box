@@ -156,6 +156,8 @@ func (b *fakeExitBox) Close() error {
 	return nil
 }
 
+func (b *fakeExitBox) ResetNetwork() { b.ev.add("reset %d", b.id) }
+
 func (b *fakeExitBox) isClosed() (bool, time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -476,6 +478,45 @@ func TestRunExitMarksTheExitBoxsSockets(t *testing.T) {
 	}
 }
 
+// A network reset from the embedder, such as radiance's when the default interface keeps its
+// name and index but changes address, resets the current exit box's network.
+func TestRunExitResetsTheExitBoxsNetwork(t *testing.T) {
+	var registers atomic.Int32
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		if registers.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"server_config": validExitConfig, "rotation_interval_seconds": 3600})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	reset := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	r, err := newExitRunner(ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: (&fakeExitBoxes{ev: ev}).new, NetworkReset: reset})
+	require.NoError(t, err)
+	r.minRetry, r.maxRetry = 200*time.Millisecond, 200*time.Millisecond
+	r.exit = &recordingExit{Exit: e, ev: ev}
+	done := make(chan error, 1)
+	go func() { done <- r.loop(ctx) }()
+
+	// With no box yet, a reset has nothing to reset.
+	require.Eventually(t, func() bool { return registers.Load() == 1 }, 5*time.Second, time.Millisecond)
+	reset <- struct{}{}
+	require.Eventually(t, func() bool { return len(reset) == 0 }, 5*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, 5*time.Millisecond)
+	assert.Equal(t, []string{"build 1", "router 1"}, ev.list())
+
+	reset <- struct{}{}
+	require.Eventually(t, func() bool { return len(ev.list()) == 3 }, 5*time.Second, time.Millisecond)
+	assert.Equal(t, []string{"build 1", "router 1", "reset 1"}, ev.list())
+	assert.True(t, e.Options().Ready(), "a reset keeps the box serving")
+	cancel()
+	waitDone(t, done)
+}
+
 // holdOffs records what RunExit reports through OnHoldOff.
 type holdOffs struct {
 	mu    sync.Mutex
@@ -683,6 +724,7 @@ func TestNewExitSingBoxRoutes(t *testing.T) {
 	b, err := newExitSingBox(ctx, `{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}]}`)
 	require.NoError(t, err)
 	assert.NotNil(t, b.Router())
+	b.ResetNetwork()
 	require.NoError(t, b.Close())
 }
 
