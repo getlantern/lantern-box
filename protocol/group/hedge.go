@@ -77,6 +77,9 @@ type hedgeConfig struct {
 	failureTTL    time.Duration
 	successTTL    time.Duration
 	maxHeldBytes  int
+	// failoverTimeout bounds a move's dial to Then and its replay: the
+	// package's hedgeFailoverDialTimeout when the hedge was built.
+	failoverTimeout time.Duration
 }
 
 func NewHedge(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HedgeOutboundOptions) (adapter.Outbound, error) {
@@ -94,6 +97,9 @@ func NewHedge(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		failureTTL:    time.Duration(options.FailureTTL),
 		successTTL:    time.Duration(options.SuccessTTL),
 		maxHeldBytes:  options.MaxHeldBytes,
+		// Read once here, so a running move never reads the package value
+		// while a test changes it.
+		failoverTimeout: hedgeFailoverDialTimeout,
 	}
 	if cfg.commitTimeout <= 0 {
 		cfg.commitTimeout = defaultHedgeCommitTimeout

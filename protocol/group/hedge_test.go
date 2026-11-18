@@ -1655,6 +1655,7 @@ func TestHedgeFailedMoveIsNotATimeout(t *testing.T) {
 	}
 	var me *hedgeMoveError
 	require.ErrorAs(t, err, &me, "the move's failure, with its cause")
+	require.NotErrorIs(t, err, context.Canceled, "a Then dial that timed out isn't a cancellation")
 }
 
 // A deadline the caller sets while the move is under way, even one already
@@ -1687,16 +1688,34 @@ func TestHedgeDeadlineSetDuringTheMoveSparesTheReplay(t *testing.T) {
 	require.Equal(t, "then:"+string(opening), string(buf[:n]))
 }
 
-// A move the client's own close cuts short reports net.ErrClosed, not a
-// failure of Then.
+// The client closing while Then is still dialing ends the move as a close,
+// not as a failure of Then.
 func TestHedgeCloseDuringTheMoveIsNotAMoveFailure(t *testing.T) {
-	s := &hedgeStream{}
-	s.moved = make(chan struct{})
-	s.cancel = func() {}
-	s.finishMoveLocked(net.ErrClosed)
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:"), delay: time.Minute}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	_, err = c.Write([]byte(tlsRecord("hi")))
+	require.NoError(t, err)
+	s := c.(*hedgeStream)
+	var moved chan struct{}
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		moved = s.moved
+		return s.moving
+	}, 2*time.Second, 5*time.Millisecond, "the move never started")
+	c.Close()
+	select {
+	case <-moved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the move didn't end on close")
+	}
+	s.mu.Lock()
+	moveErr := s.moveErr
+	s.mu.Unlock()
+	require.Error(t, moveErr)
 	var me *hedgeMoveError
-	require.False(t, errors.As(s.moveErr, &me))
-	require.ErrorIs(t, s.moveErr, net.ErrClosed)
+	require.False(t, errors.As(moveErr, &me), "a close isn't a move failure: %v", moveErr)
 }
 
 // A failed move whose cause is a deadline doesn't read as a timeout to
@@ -1708,4 +1727,7 @@ func TestHedgeMoveErrorHidesADeadlineCause(t *testing.T) {
 		require.NotErrorIs(t, err, context.DeadlineExceeded)
 	}
 	require.ErrorIs(t, &hedgeMoveError{cause: errors.ErrUnsupported}, errors.ErrUnsupported, "other causes stay reachable")
+	var op *net.OpError
+	require.ErrorAs(t, &hedgeMoveError{cause: &net.OpError{Op: "write", Err: os.ErrDeadlineExceeded}}, &op,
+		"errors.As still finds the cause's details")
 }

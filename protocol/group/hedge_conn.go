@@ -207,10 +207,11 @@ func (l *hedgeLeg) awaitMove(deadline func() time.Time) (onThen bool, err error)
 func (l *hedgeLeg) readDeadlineLocked() time.Time  { return l.readDeadline }
 func (l *hedgeLeg) writeDeadlineLocked() time.Time { return l.writeDeadline }
 
-// setDeadlines records new deadlines and wakes waiters. During a move it
-// applies them to Then's pending leg, since First is closed, and reports
-// moving so the caller skips First. The replay stays bound by the failover
-// timeout whatever the caller sets.
+// setDeadlines records new deadlines and wakes waiters, which wait out a
+// move against them. During a move it reports moving so the caller skips
+// First, and leaves Then's pending leg alone: the replay carries writes
+// already reported taken, and may read a handshake, so the deadlines apply
+// once it's done (applyDeadlinesLocked). The failover timeout bounds it.
 func (l *hedgeLeg) setDeadlines(read, write *time.Time) (moving bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -224,11 +225,6 @@ func (l *hedgeLeg) setDeadlines(read, write *time.Time) (moving bool) {
 	l.deadlineChanged = make(chan struct{})
 	if !l.moving {
 		return false
-	}
-	// The write deadline waits for the replay to finish
-	// (applyWriteDeadlineLocked): the replay carries writes already taken.
-	if l.pending != nil && read != nil {
-		_ = l.pending.SetReadDeadline(*read)
 	}
 	return true
 }
@@ -370,17 +366,17 @@ func (l *hedgeLeg) startReplay(c deadlineCloser) bool {
 		return false
 	}
 	l.pending = c
-	// The replay carries writes First already took, which a write deadline
-	// that ran out while they waited mustn't fail. replayTimer bounds it;
-	// the caller's write deadline applies once it's done (adoptLocked).
-	_ = c.SetReadDeadline(l.readDeadline)
+	// No deadlines yet: the replay carries writes First already took, which
+	// a deadline that ran out while they waited mustn't fail. replayTimer
+	// bounds it, and the caller's deadlines apply once it's done
+	// (applyDeadlinesLocked).
 	return true
 }
 
-// applyWriteDeadlineLocked gives c, the leg a move replayed onto, the
-// caller's write deadline, held back until the replay was done. Caller
-// holds mu.
-func (l *hedgeLeg) applyWriteDeadlineLocked(c deadlineCloser) {
+// applyDeadlinesLocked gives c, the leg a move replayed onto, the caller's
+// deadlines, held back until the replay was done. Caller holds mu.
+func (l *hedgeLeg) applyDeadlinesLocked(c deadlineCloser) {
+	_ = c.SetReadDeadline(l.readDeadline)
 	_ = c.SetWriteDeadline(l.writeDeadline)
 }
 
@@ -397,14 +393,18 @@ func (e *hedgeMoveError) Unwrap() error {
 	}
 	return e.cause
 }
-func (e *hedgeMoveError) Timeout() bool   { return false }
-func (e *hedgeMoveError) Temporary() bool { return false }
+
+// As reaches into the cause even when Unwrap hides it, so a caller can still
+// find, say, its *net.OpError.
+func (e *hedgeMoveError) As(target any) bool { return errors.As(e.cause, target) }
+func (e *hedgeMoveError) Timeout() bool      { return false }
+func (e *hedgeMoveError) Temporary() bool    { return false }
 
 // replayTimer closes c if the replay outlives the failover timeout, which
 // holds even for a conn that ignores deadlines. done reports whether the
 // replay finished first.
-func replayTimer(c io.Closer) (done func() bool) {
-	timer := time.AfterFunc(hedgeFailoverDialTimeout, func() { _ = c.Close() })
+func (l *hedgeLeg) replayTimer(c io.Closer) (done func() bool) {
+	timer := time.AfterFunc(l.h.cfg.failoverTimeout, func() { _ = c.Close() })
 	return timer.Stop
 }
 
@@ -415,7 +415,7 @@ func (l *hedgeLeg) dialTimer() (stop func() bool) {
 	l.mu.Lock()
 	cancel := l.cancel
 	l.mu.Unlock()
-	return time.AfterFunc(hedgeFailoverDialTimeout, cancel).Stop
+	return time.AfterFunc(l.h.cfg.failoverTimeout, cancel).Stop
 }
 
 // finishMoveLocked publishes the outcome of a move. A failed move cancels
@@ -423,7 +423,7 @@ func (l *hedgeLeg) dialTimer() (stop func() bool) {
 // live on it. Caller holds mu.
 func (l *hedgeLeg) finishMoveLocked(err error) {
 	// The client's own close isn't Then failing.
-	if err != nil && !errors.Is(err, net.ErrClosed) {
+	if err != nil && !l.closed {
 		err = &hedgeMoveError{cause: err}
 	}
 	l.moveErr = err
@@ -506,15 +506,19 @@ func (s *hedgeStream) runMove() {
 	if err == nil {
 		stop := s.dialTimer()
 		conn, err = then.DialContext(ctx, s.network, s.dest)
-		if !stop() && err == nil {
-			conn.Close() // the timer cancelled the context it lives on
+		// The timer firing is the cause, whatever the dial returned for
+		// its cancelled context.
+		if !stop() {
+			if err == nil {
+				conn.Close() // the timer cancelled the context it lives on
+			}
 			err = os.ErrDeadlineExceeded
 		}
 	}
 	if err == nil {
 		// Bounds the replay and the half-close after it, which run without
 		// the caller's write deadline (startReplay).
-		done := replayTimer(conn)
+		done := s.replayTimer(conn)
 		switch {
 		case !s.startReplay(conn):
 			err = net.ErrClosed
@@ -535,7 +539,9 @@ func (s *hedgeStream) runMove() {
 				err = closeWrite(conn)
 			}
 		}
-		if !done() && err == nil {
+		// The timer firing is the cause, whatever the write returned for
+		// the conn it closed.
+		if !done() {
 			err = os.ErrDeadlineExceeded
 		}
 		if err != nil {
@@ -552,7 +558,7 @@ func (s *hedgeStream) runMove() {
 		err = net.ErrClosed
 	default:
 		s.cur = conn
-		s.applyWriteDeadlineLocked(conn)
+		s.applyDeadlinesLocked(conn)
 	}
 	s.held = nil
 	s.finishMoveLocked(err)
@@ -963,8 +969,10 @@ func (p *hedgePacket) runMove() {
 	if err == nil {
 		stop := p.dialTimer()
 		raw, err = then.ListenPacket(ctx, p.dest)
-		if !stop() && err == nil {
-			raw.Close() // the timer cancelled the context it lives on
+		if !stop() {
+			if err == nil {
+				raw.Close() // the timer cancelled the context it lives on
+			}
 			err = os.ErrDeadlineExceeded
 		}
 		if err == nil {
@@ -975,13 +983,13 @@ func (p *hedgePacket) runMove() {
 		if !p.startReplay(conn) {
 			err = net.ErrClosed
 		} else if len(held) > 0 {
-			done := replayTimer(conn)
+			done := p.replayTimer(conn)
 			for _, packet := range held {
 				if err = writePacket(conn, raw, packet.data, packet.dest); err != nil {
 					break
 				}
 			}
-			if !done() && err == nil {
+			if !done() {
 				err = os.ErrDeadlineExceeded
 			}
 		}
@@ -999,7 +1007,7 @@ func (p *hedgePacket) runMove() {
 		err = net.ErrClosed
 	default:
 		p.cur, p.curRaw = conn, raw
-		p.applyWriteDeadlineLocked(conn)
+		p.applyDeadlinesLocked(conn)
 	}
 	p.held, p.heldBytes = nil, 0
 	p.finishMoveLocked(err)
@@ -1161,7 +1169,12 @@ func (p *hedgePacket) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 // strip to an IP.
 func (p *hedgePacket) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	defer buffer.Release()
-	return p.write(buffer.Bytes(), destination)
+	if err := p.write(buffer.Bytes(), destination); err != errTakenTimeout {
+		return err
+	}
+	// Taken: the move sends it, and a buffered write has no count to
+	// report that with, so it succeeds rather than invite a resend.
+	return nil
 }
 
 func (p *hedgePacket) Close() error {
