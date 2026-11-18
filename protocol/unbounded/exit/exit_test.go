@@ -938,3 +938,51 @@ func TestExitNeedsAReadyCheck(t *testing.T) {
 	assert.False(t, e.Options().Ready(false))
 	assert.Nil(t, e.currentRouter(Pool))
 }
+
+// A UoT stream's header is the client's to send whenever it likes, and sing-box's UoT router
+// waits for it before routing. The exit checks readiness again, and takes the kind's router
+// then current, once the header has arrived, so a header held back while a set empties is
+// refused.
+func TestExitChecksReadinessAfterTheUoTHeader(t *testing.T) {
+	var empty atomic.Bool
+	ready := func() error {
+		if empty.Load() {
+			return errors.New("emptied")
+		}
+		return nil
+	}
+	r := &dialRouter{}
+	e := newTestExit(t)
+	e.SetEnabled(true)
+	e.SetRouter(Pool, r, time.Now().Add(time.Hour), ready)
+	vConn, uConn := pathPair(t)
+	pin, password, _ := e.Options().Params(false)
+	serve(t, e, vConn, password)
+	c := testClient(t, uConn, pin, password)
+
+	var header bytes.Buffer
+	require.NoError(t, uot.WriteRequest(&header, uot.Request{Destination: M.ParseSocksaddr("example.com:53")}))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := c.DialConn(ctx, M.Socksaddr{Fqdn: uot.MagicAddress})
+	require.NoError(t, err)
+	defer conn.Close()
+	// The stream's request goes with the first byte; the rest of the header waits.
+	_, err = conn.Write(header.Bytes()[:1])
+	require.NoError(t, err)
+	time.Sleep(200 * time.Millisecond)
+	empty.Store(true)
+	_, err = conn.Write(header.Bytes()[1:])
+	require.NoError(t, err)
+	time.Sleep(300 * time.Millisecond)
+	assert.Zero(t, r.count(), "a UoT flow whose header came after a set emptied reached the router")
+
+	empty.Store(false)
+	conn2, err := c.DialConn(ctx, M.Socksaddr{Fqdn: uot.MagicAddress})
+	require.NoError(t, err)
+	defer conn2.Close()
+	_, err = conn2.Write(header.Bytes())
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return r.count() == 1 }, 5*time.Second, 10*time.Millisecond,
+		"a new UoT flow routes once the set holds rules")
+}

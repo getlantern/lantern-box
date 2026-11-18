@@ -24,23 +24,65 @@ type handler struct {
 }
 
 func (h *handler) NewConnectionEx(ctx context.Context, conn net.Conn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	r := h.exit.currentRouter(h.kind)
-	if r == nil {
+	if h.exit.currentRouter(h.kind) == nil {
 		_ = N.CloseOnHandshakeFailure(conn, onClose, os.ErrClosed)
 		return
 	}
 	ctx = log.ContextWithNewID(ctx)
-	r.RouteConnectionEx(ctx, h.exit.metrics.countConn(conn), metadata(source, destination), h.exit.onRoutedClose(ctx, onClose))
+	h.exit.routers[h.kind].RouteConnectionEx(ctx, h.exit.metrics.countConn(conn), metadata(source, destination), h.exit.onRoutedClose(ctx, onClose))
 }
 
 func (h *handler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	r := h.exit.currentRouter(h.kind)
-	if r == nil {
+	if h.exit.currentRouter(h.kind) == nil {
 		_ = N.CloseOnHandshakeFailure(conn, onClose, os.ErrClosed)
 		return
 	}
 	ctx = log.ContextWithNewID(ctx)
-	r.RoutePacketConnectionEx(ctx, h.exit.metrics.countPacketConn(conn), metadata(source, destination), h.exit.onRoutedClose(ctx, onClose))
+	h.exit.routers[h.kind].RoutePacketConnectionEx(ctx, h.exit.metrics.countPacketConn(conn), metadata(source, destination), h.exit.onRoutedClose(ctx, onClose))
+}
+
+// kindRouter forwards to its kind's current router, taking it, and checking its readiness, at
+// the moment it forwards. The handler checks too, before routing, so an unready kind refuses
+// at once; this check is the one that counts for a UoT stream, whose header the client may
+// hold back while sing-box's UoT router waits for it, and for a stream opened just before the
+// box rotated.
+type kindRouter struct {
+	e    *Exit
+	kind Kind
+}
+
+func (r kindRouter) RouteConnection(ctx context.Context, conn net.Conn, md adapter.InboundContext) error {
+	current := r.e.currentRouter(r.kind)
+	if current == nil {
+		return os.ErrClosed
+	}
+	return current.RouteConnection(ctx, conn, md)
+}
+
+func (r kindRouter) RoutePacketConnection(ctx context.Context, conn N.PacketConn, md adapter.InboundContext) error {
+	current := r.e.currentRouter(r.kind)
+	if current == nil {
+		return os.ErrClosed
+	}
+	return current.RoutePacketConnection(ctx, conn, md)
+}
+
+func (r kindRouter) RouteConnectionEx(ctx context.Context, conn net.Conn, md adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	current := r.e.currentRouter(r.kind)
+	if current == nil {
+		_ = N.CloseOnHandshakeFailure(conn, onClose, os.ErrClosed)
+		return
+	}
+	current.RouteConnectionEx(ctx, conn, md, onClose)
+}
+
+func (r kindRouter) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn, md adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	current := r.e.currentRouter(r.kind)
+	if current == nil {
+		_ = N.CloseOnHandshakeFailure(conn, onClose, os.ErrClosed)
+		return
+	}
+	current.RoutePacketConnectionEx(ctx, conn, md, onClose)
 }
 
 // metadata is a stream's or flow's routing metadata. source is the session's placeholder

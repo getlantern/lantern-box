@@ -45,6 +45,9 @@ type Exit struct {
 	closed  bool
 	enabled bool
 	kinds   [2]kindState
+	// routers route each kind's streams and flows: UoT decoding over a router that takes the
+	// kind's current router, and checks its readiness, at the moment it forwards.
+	routers [2]adapter.ConnectionRouterEx
 
 	now     func() time.Time
 	metrics *exitMetrics
@@ -83,6 +86,8 @@ func New(ctx context.Context, lg logger.ContextLogger) (*Exit, error) {
 	for k := range e.kinds {
 		e.kinds[k].revoked = make(chan struct{})
 		close(e.kinds[k].revoked)
+		// The UoT router logs each flow's destination at info, so it gets no logger.
+		e.routers[k] = uotrouter.New(kindRouter{e: e, kind: Kind(k)}, sblog.NewNOPFactory().Logger())
 	}
 	e.opts = &UBClientcore.ExitOptions{
 		Ready:  func(personal bool) bool { return e.ready(KindOf(personal)) },
@@ -127,8 +132,6 @@ func (e *Exit) SetRouter(kind Kind, r adapter.ConnectionRouterEx, validUntil tim
 		ks.expiry = nil
 	}
 	if r != nil {
-		// The UoT router logs each flow's destination at info, so it gets no logger.
-		r = uotrouter.New(r, sblog.NewNOPFactory().Logger())
 		gen := ks.gen
 		ks.expiry = time.AfterFunc(validUntil.Sub(e.now()), func() { e.expire(kind, gen) })
 	}
