@@ -186,6 +186,10 @@ func (h *Hedge) markGood(key hedgeKey) {
 	h.cache.mark(key, hedgeGood, h.cfg.successTTL)
 }
 
+// errHedgeLoop is a dial that came back to a hedge it already passed: a
+// configuration error, not a sign that a site is blocked.
+var errHedgeLoop = errors.New("hedge: loops back to itself")
+
 // hedgeChainKey carries the hedges a dial has passed through.
 type hedgeChainKey struct{}
 
@@ -204,7 +208,7 @@ func (h *Hedge) enter(ctx context.Context) (context.Context, error) {
 	parent, _ := ctx.Value(hedgeChainKey{}).(*hedgeChain)
 	for c := parent; c != nil; c = c.parent {
 		if c.tag == h.Tag() {
-			return nil, fmt.Errorf("hedge: %s loops back to itself", h.Tag())
+			return nil, fmt.Errorf("%w: %s", errHedgeLoop, h.Tag())
 		}
 	}
 	return context.WithValue(ctx, hedgeChainKey{}, &hedgeChain{tag: h.Tag(), parent: parent}), nil
@@ -244,7 +248,7 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 		if ctx.Err() != nil {
 			return nil, err
 		}
-		if !timedOut() {
+		if !timedOut() && !errors.Is(err, errHedgeLoop) {
 			h.markBad(ctx, key, err)
 		}
 		return then.DialContext(ctx, network, destination)
@@ -277,7 +281,7 @@ func (h *Hedge) listenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		if ctx.Err() != nil {
 			return nil, err
 		}
-		if !timedOut() {
+		if !timedOut() && !errors.Is(err, errHedgeLoop) {
 			h.markBad(ctx, key, err)
 		}
 		return then.ListenPacket(ctx, destination)

@@ -1318,6 +1318,12 @@ func TestHedgeLoopThroughFirstEnds(t *testing.T) {
 			return
 		}
 		defer c.Close()
+		// Before any reply commits: the inner hedge's loop error didn't
+		// mark the site bad.
+		if v := a.cache.verdict(hedgeKeyFor(context.Background(), "tcp", hedgeDest)); v == hedgeBad {
+			got <- result{err: errors.New("a hedge loop marked the site bad")}
+			return
+		}
 		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 		if _, err := c.Write([]byte(tlsRecord("hi"))); err != nil {
 			got <- result{err: err}
