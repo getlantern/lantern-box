@@ -365,6 +365,26 @@ func TestHedgeLateEventsAfterCloseChangeNothing(t *testing.T) {
 	}
 }
 
+// The same, in the window where Close has marked the leg closed but not yet
+// written the record.
+func TestHedgeEventsBetweenCloseAndRecordChangeNothing(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")},
+		func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) })
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	_, err = c.Write([]byte("hello"))
+	require.NoError(t, err)
+	s := c.(*hedgeStream)
+	s.mu.Lock()
+	s.closeLocked() // Close's first step
+	s.mu.Unlock()
+	s.noteReset()
+	c.Close() // records
+	require.Equal(t, hedgeOutcomeAbandoned, connectionRecord(t, reader)["hedge.outcome"])
+	require.Equal(t, hedgeUnknown, f.verdict(hedgeDest.String()))
+}
+
 // A reset on a replayable opening whose client closes before the move
 // starts still shows as a reset, in the record and the cache.
 func TestHedgeResetBeforeTheMoveShows(t *testing.T) {
