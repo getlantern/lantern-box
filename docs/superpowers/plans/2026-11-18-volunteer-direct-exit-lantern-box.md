@@ -48,6 +48,10 @@
 2. an unconditional `{"ip_is_private": true, "action": "reject"}`;
 3. the abuse rule-set rejects and the static IP and port rejects.
 
+The config has exactly one `resolve` rule, the unconditional one above: a later resolve (one with `disable_cache`, say) replaces the destination's addresses after the rejects checked the first lookup. RunExit refuses a config with any other resolve, conditional or inside a logical rule.
+
+The abuse rule-set rejects must also come before any `sniff` rule. A sniffed HTTP Host or TLS SNI replaces the domain the geosite rule sets match, so a client can name an allowed host in its request and reach a listed one. lantern-cloud's bandit-probe injection (`injectBanditProbe`) prepends a port-80 sniff ahead of them when a config has endpoints, so the `mode:"webrtc"` builder must not inject one ahead of the rejects. Today's samizdat pool configs have the same hole and should be fixed there too. lantern-box's check does not model sniffing, so it does not catch this.
+
 Every rule that routes to `direct` must set `udp_connect: true` (a Hysteria2 UDP session names a destination per packet, and the rules see only the first): the terminal route is an explicit final rule rather than `route.final`, which can't set it, and for the pool it is the allowlist's route rule ahead of its terminal reject. lantern-cloud's `applyPeerAllowlist` and `applyPersonalExit` already build this shape for samizdat peers. The config has no `experimental` (no debug listener), no inbounds, no endpoints and no services. RunExit refuses a config without the resolve and the `ip_is_private` reject after it, and drops any inbounds, endpoints, services, `experimental` and `ntp` regardless. There is no route row, verify, heartbeat or deregister.
 
 The client treats a registration as valid for 2 × the rotation interval (`rotation_interval_seconds`, capped at 24h; 0 means an hour), so a device lantern-cloud starts refusing keeps exiting traffic for up to that long after its last successful registration.

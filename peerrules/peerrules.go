@@ -96,7 +96,8 @@ func ValidateAbuseRulesOptions(options option.Options) error {
 // route by exact domain, and port, alone, to a banditprobe outbound.
 //
 // No rule or direct outbound may rewrite a destination's address or port: the rejects checked
-// the destination as it was.
+// the destination as it was. Nor may a second resolve come anywhere: it would replace the
+// addresses they checked.
 //
 // Every route must also set udp_connect: hysteria2 names a destination per UDP datagram, and
 // the rules see only a flow's first. Nothing may fall through to route.final or the default
@@ -124,6 +125,9 @@ func ValidateDirectExitRulesOptions(options option.Options) error {
 	}
 	for _, r := range rules {
 		action := ruleAction(r)
+		if action.Action == constant.RuleActionTypeResolve && (resolved || !isUnconditionalResolve(r.DefaultOptions) || !isDefaultRule(r)) {
+			return errors.New("route.rules has a resolve besides its one unconditional resolve (it would replace the addresses the rejects checked)")
+		}
 		if overridesDestination(action) {
 			return errors.New("route.rules has a rule that overrides the destination (the rules checked another)")
 		}

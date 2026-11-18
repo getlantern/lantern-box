@@ -460,6 +460,14 @@ func TestValidateDirectExitRulesNeedsOrderAndUDPConnect(t *testing.T) {
 		"no final and no terminal rule": cloudConfig(resolveRule, privateRejectRule, cloudAbuse, cloudAllowed),
 		"conditional last rule":         cloudConfig(resolveRule, privateRejectRule, cloudAbuse, `{"action":"reject","port":[22]}`),
 		"inverted last rule":            cloudConfig(resolveRule, privateRejectRule, cloudAbuse, `{"action":"reject","port":[22],"invert":true}`),
+		// A later resolve replaces the addresses the rejects checked.
+		"second resolve after the safeguards": cloudConfig(resolveRule, privateRejectRule, cloudAbuse,
+			`{"action":"resolve","server":"dns","disable_cache":true}`, finalRoute),
+		"conditional second resolve": cloudConfig(resolveRule, privateRejectRule, cloudAbuse,
+			`{"action":"resolve","port":[443]}`, finalRoute),
+		"resolve in a logical rule": cloudConfig(resolveRule, privateRejectRule, cloudAbuse,
+			`{"type":"logical","mode":"or","rules":[{"port":[443]},{"network":["udp"]}],"action":"resolve"}`, finalRoute),
+		"conditional resolve first": cloudConfig(`{"action":"resolve","domain":["api.test"]}`, resolveRule, privateRejectRule, cloudAbuse, finalRoute),
 		// The probe is exempt only because its responder answers locally and never dials.
 		"probe-shaped route to direct": cloudConfig(`{"domain":["private.test"],"port":[80],"action":"route","outbound":"direct"}`,
 			resolveRule, privateRejectRule, cloudAbuse, finalRoute),
