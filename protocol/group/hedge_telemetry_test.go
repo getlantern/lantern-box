@@ -316,9 +316,9 @@ func TestHedgeTelemetryCommitKeepsAnEarlierReset(t *testing.T) {
 	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()), "the reply doesn't mark the site good again")
 }
 
-// A reset on a replayable opening, noted before a reply commits it, isn't
-// relabelled as a reset after the commit when firstFailed handles it.
-func TestHedgeTelemetryResetBeforeCommitNotRelabelled(t *testing.T) {
+// A reset on a replayable opening that a reply then commits: the record and
+// the cache agree that First failed this connection.
+func TestHedgeTelemetryResetAndReplyAgree(t *testing.T) {
 	reader := recordMetrics(t)
 	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
 	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
@@ -330,20 +330,30 @@ func TestHedgeTelemetryResetBeforeCommitNotRelabelled(t *testing.T) {
 	s.noteReset()
 	_, err = c.Read(make([]byte, 64))
 	require.NoError(t, err)
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()), "the reply doesn't undo the reset")
 	s.firstFailed(lAdapter.UserFailureReset, s.move)
 	c.Close()
-	require.Equal(t, hedgeOutcomeCommitted, connectionRecord(t, reader)["hedge.outcome"])
+	require.Equal(t, hedgeOutcomeResetAfterCommit, connectionRecord(t, reader)["hedge.outcome"])
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
 }
 
 // An error after the client closed can be the teardown itself, so it marks
 // nothing.
-func TestHedgeNoteResetIgnoresAClosedConnection(t *testing.T) {
+func TestHedgeFailuresIgnoreAClosedConnection(t *testing.T) {
+	reader := recordMetrics(t)
 	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
 	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
 	require.NoError(t, err)
+	require.Equal(t, "first:hi", exchange(t, c, "hi"))
+	s := c.(*hedgeStream)
+	s.mu.Lock()
+	s.closed = true // as Close does before it records, then a late failure
+	s.mu.Unlock()
+	s.noteReset()
+	s.firstFailed(lAdapter.UserFailureReset, s.move)
 	c.Close()
-	c.(*hedgeStream).noteReset()
-	require.NotEqual(t, hedgeBad, f.verdict(hedgeDest.String()))
+	require.Equal(t, hedgeOutcomeCommitted, connectionRecord(t, reader)["hedge.outcome"])
+	require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()))
 }
 
 // A real reset on First, through the watchdog's hook: a write that isn't a

@@ -50,12 +50,10 @@ type hedgeLeg struct {
 	moving    bool
 	moved     chan struct{} // closed when a move finishes
 	closed    bool
-	// resetNoted is set when the watchdog charged a reset on First
-	// (noteReset), and resetBeforeCommit when that came before any reply.
-	resetNoted, resetBeforeCommit bool
-	// markedBad is set once this connection has marked its site bad, so it
-	// does so once however many paths see the failure.
-	markedBad bool
+	// verdict is what this connection taught the cache about its site,
+	// decided and written under mu (settleLocked): unset, good on First's
+	// first reply, bad on any failure of First. Bad is final.
+	verdict hedgeVerdict
 	// decided is set once enough bytes have been written, across writes, to
 	// tell whether the connection can be replayed (see keepLocked); until
 	// then undecidedKept marks a kept prefix that must not be replayed.
@@ -254,52 +252,48 @@ func (l *hedgeLeg) commit(release func()) bool {
 		// after commit) always replaces it, never the other way round. A
 		// reset noteReset already recorded is kept: it came first.
 		l.stats.setOutcomeIfUnset(hedgeOutcomeCommitted)
+		l.settleLocked(hedgeGood, nil)
 	}
-	// A reset already seen marked the site bad; a reply that was in
-	// flight doesn't make it good.
-	good := first && !l.resetNoted
 	l.stopCommitLocked()
 	release()
 	l.mu.Unlock()
-	if good {
-		l.h.markGood(l.key)
-	}
 	return true
 }
 
 // noteReset runs as the watchdog charges a reset on First, before the
 // client sees the error. firstFailed handles the reset later, on its own
 // goroutine, and by then the client may have closed, which stops a move. So
-// noteReset marks the site bad itself, and records the outcome a reset gets
-// without a move (staticResetOutcomeLocked). A replayable opening is left
-// for its move to record. The watchdog calls this from the IO path, which
-// never holds mu.
-//
-// A connection the client already closed is left alone: an error then can
-// be the teardown itself, not First failing.
+// noteReset settles the site bad itself, and records the outcome a reset
+// gets without a move (staticResetOutcomeLocked). A replayable opening is
+// left for its move to record. A connection the client already closed is
+// left alone: an error then can be the teardown itself. The watchdog calls
+// this from the IO path, which never holds mu.
 func (l *hedgeLeg) noteReset() {
 	l.mu.Lock()
-	if !l.onFirst || l.moving || l.closed || l.resetNoted {
-		l.mu.Unlock()
+	defer l.mu.Unlock()
+	if !l.onFirst || l.moving || l.closed {
 		return
 	}
-	l.resetNoted = true
-	l.resetBeforeCommit = !l.committed
 	if outcome := l.staticResetOutcomeLocked(); outcome != "" {
 		l.stats.set("", outcome)
 	}
-	l.mu.Unlock()
-	l.markBadOnce(lAdapter.UserFailureReset)
+	l.settleLocked(hedgeBad, lAdapter.UserFailureReset)
 }
 
-// markBadOnce marks the site bad, once per connection.
-func (l *hedgeLeg) markBadOnce(why any) {
-	l.mu.Lock()
-	already := l.markedBad
-	l.markedBad = true
-	l.mu.Unlock()
-	if !already {
+// settleLocked records what this connection teaches the cache about its
+// site, and writes it to the cache, all under mu so every path agrees on
+// one verdict: good only while nothing is decided, bad over anything, and
+// nothing after bad. The cache's lock is never held while taking a leg's,
+// so writing it under mu can't deadlock. Caller holds mu.
+func (l *hedgeLeg) settleLocked(v hedgeVerdict, why any) {
+	if l.verdict == hedgeBad || (v == hedgeGood && l.verdict != hedgeUnknown) {
+		return
+	}
+	l.verdict = v
+	if v == hedgeBad {
 		l.h.markBad(l.ctx, l.key, why)
+	} else {
+		l.h.markGood(l.key)
 	}
 }
 
@@ -326,22 +320,22 @@ func (l *hedgeLeg) staticResetOutcomeLocked() string {
 // client has already seen First's bytes.
 func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter.UserFailureKind)) {
 	l.mu.Lock()
-	committed := l.committed
-	resetBeforeCommit := l.resetBeforeCommit
-	l.mu.Unlock()
-	if committed {
-		// A reset noted before the commit isn't a reset after it: its
-		// outcome, if it had one, stands.
-		if kind != lAdapter.UserFailureReset || !resetBeforeCommit {
+	if l.committed {
+		// After the client closed, an error can be the teardown itself,
+		// as in noteReset and beginMove.
+		if !l.closed {
 			outcome := hedgeOutcomeResetAfterCommit
 			if kind == lAdapter.UserFailureStall {
 				outcome = hedgeOutcomeStalledAfterCommit
 			}
+			// A reset recorded before the commit keeps its outcome.
 			l.stats.replaceOutcome(hedgeOutcomeCommitted, outcome)
+			l.settleLocked(hedgeBad, kind)
 		}
-		l.markBadOnce(kind)
+		l.mu.Unlock()
 		return
 	}
+	l.mu.Unlock()
 	move(kind)
 }
 
@@ -359,18 +353,18 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 	}
 	if notReplayable := l.noReplay || l.undecidedKept; notReplayable || l.overflow {
 		slowOnly := notReplayable && why == lAdapter.UserFailureNoResponse
-		outcome := l.staticResetOutcomeLocked()
+		if !slowOnly {
+			l.stats.set("", l.staticResetOutcomeLocked())
+			l.settleLocked(hedgeBad, why)
+		}
 		l.mu.Unlock()
 		if !slowOnly {
-			l.stats.set("", outcome)
-			l.markBadOnce(why)
 			_ = closeFirst()
 		}
 		return false
 	}
 	l.moving = true
 	l.moveCtx, l.cancel = moveContext(l.ctx)
-	l.mu.Unlock()
 	outcome := hedgeOutcomeMovedReset
 	if why == lAdapter.UserFailureNoResponse {
 		outcome = hedgeOutcomeMovedNoReply
@@ -378,7 +372,8 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 	// The path becomes then_after_move only once the move succeeds
 	// (finishMoveLocked).
 	l.stats.set("", outcome)
-	l.markBadOnce(why)
+	l.settleLocked(hedgeBad, why)
+	l.mu.Unlock()
 	_ = closeFirst()
 	return true
 }
@@ -705,11 +700,13 @@ func (s *hedgeStream) NeedHandshakeForWrite() bool {
 }
 
 func (s *hedgeStream) Close() error {
-	s.stats.finish(true)
 	s.mu.Lock()
 	cancel, pending := s.closeLocked()
 	c := s.cur
 	s.mu.Unlock()
+	// After closed is set, so nothing noted from here on (noteReset and
+	// firstFailed check it) can change the record.
+	s.stats.finish(true)
 	cancel()
 	if pending != nil {
 		_ = pending.Close()
@@ -1111,11 +1108,11 @@ func (p *hedgePacket) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) e
 }
 
 func (p *hedgePacket) Close() error {
-	p.stats.finish(true)
 	p.mu.Lock()
 	cancel, pending := p.closeLocked()
 	c := p.cur
 	p.mu.Unlock()
+	p.stats.finish(true)
 	cancel()
 	if pending != nil {
 		_ = pending.Close()
