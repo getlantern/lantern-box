@@ -50,6 +50,9 @@ type hedgeLeg struct {
 	moving    bool
 	moved     chan struct{} // closed when a move finishes
 	closed    bool
+	// verdict is what this connection taught the cache about its site,
+	// decided and written under mu (settleLocked).
+	verdict hedgeVerdict
 	// decided is set once enough bytes have been written, across writes, to
 	// tell whether the connection can be replayed (see keepLocked); until
 	// then undecidedKept marks a kept prefix that must not be replayed.
@@ -239,15 +242,31 @@ func (l *hedgeLeg) commit(release func()) bool {
 		l.mu.Unlock()
 		return false
 	}
-	first := !l.committed
 	l.committed = true
+	l.settleLocked(hedgeGood, nil)
 	l.stopCommitLocked()
 	release()
 	l.mu.Unlock()
-	if first {
+	return true
+}
+
+// settleLocked records what this connection teaches the cache about its
+// site, and writes it to the cache, under mu, so the commit and every
+// failure path agree on one verdict whatever order they run in: good only
+// while nothing is decided, bad over anything, nothing after bad, and
+// nothing once the client closed, when an error can be the teardown
+// itself. The cache's lock is never held while taking a leg's, so writing
+// it under mu can't deadlock. Caller holds mu.
+func (l *hedgeLeg) settleLocked(v hedgeVerdict, why any) {
+	if l.closed || l.verdict == hedgeBad || (v == hedgeGood && l.verdict != hedgeUnknown) {
+		return
+	}
+	l.verdict = v
+	if v == hedgeBad {
+		l.h.markBad(l.ctx, l.key, why)
+	} else {
 		l.h.markGood(l.key)
 	}
-	return true
 }
 
 // firstFailed handles a failure the watchdog saw on First: before a commit it
@@ -255,12 +274,12 @@ func (l *hedgeLeg) commit(release func()) bool {
 // client has already seen First's bytes.
 func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter.UserFailureKind)) {
 	l.mu.Lock()
-	committed := l.committed
-	l.mu.Unlock()
-	if committed {
-		l.h.markBad(l.ctx, l.key, kind)
+	if l.committed {
+		l.settleLocked(hedgeBad, kind)
+		l.mu.Unlock()
 		return
 	}
+	l.mu.Unlock()
 	move(kind)
 }
 
@@ -272,23 +291,31 @@ func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter
 // retries on Then.
 func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() error) bool {
 	l.mu.Lock()
+	if l.committed && why != lAdapter.UserFailureNoResponse {
+		// A failure that saw the connection uncommitted, then lost the race
+		// to a reply: it's a failure after the commit, as firstFailed
+		// would have handled it.
+		l.settleLocked(hedgeBad, why)
+	}
 	if l.moving || !l.onFirst || l.committed || l.closed {
 		l.mu.Unlock()
 		return false
 	}
 	if notReplayable := l.noReplay || l.undecidedKept; notReplayable || l.overflow {
 		slowOnly := notReplayable && why == lAdapter.UserFailureNoResponse
+		if !slowOnly {
+			l.settleLocked(hedgeBad, why)
+		}
 		l.mu.Unlock()
 		if !slowOnly {
-			l.h.markBad(l.ctx, l.key, why)
 			_ = closeFirst()
 		}
 		return false
 	}
 	l.moving = true
 	l.moveCtx, l.cancel = moveContext(l.ctx)
+	l.settleLocked(hedgeBad, why)
 	l.mu.Unlock()
-	l.h.markBad(l.ctx, l.key, why)
 	_ = closeFirst()
 	return true
 }

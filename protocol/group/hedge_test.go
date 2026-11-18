@@ -1340,3 +1340,33 @@ func TestHedgeLoopThroughFirstEnds(t *testing.T) {
 	require.NoError(t, err, "a UDP dial through DialContext isn't mistaken for a loop")
 	pc.Close()
 }
+
+// A failure that saw the connection uncommitted, then lost the race to a
+// reply, still marks the site bad.
+func TestHedgeFailureLosingToACommitStillMarksBad(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.Equal(t, "first:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+	require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()))
+	s := c.(*hedgeStream)
+	s.beginMove(lAdapter.UserFailureReset, func() error { return nil }) // as the failure's move would
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
+}
+
+// A reply that lands after a failure doesn't mark the site good again.
+func TestHedgeReplyAfterAFailureKeepsItBad(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = c.Write([]byte("hello")) // not a handshake, so a failure can't move it
+	require.NoError(t, err)
+	s := c.(*hedgeStream)
+	s.beginMove(lAdapter.UserFailureReset, func() error { return nil })
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
+	s.commit(s.releaseLocked) // the reply that was on its way
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()), "the late reply doesn't mark it good")
+}
