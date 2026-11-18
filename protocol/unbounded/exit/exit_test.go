@@ -402,6 +402,59 @@ func TestExitServeEndsWhenRevoked(t *testing.T) {
 	}
 }
 
+// A registration that runs out revokes the exit by itself: lantern-cloud no longer vouches for
+// the box's router, and the registrar may still be busy getting the next one.
+func TestExitExpiresWithItsRegistration(t *testing.T) {
+	e := newTestExit(t)
+	e.SetEnabled(true)
+	e.SetRouter(newEchoRouter(t), time.Now().Add(500*time.Millisecond))
+	vConn, uConn := pathPair(t)
+	pin, password, _ := e.Options().Params()
+	done := serve(t, e, vConn, password)
+	echo(t, testClient(t, uConn, pin, password))
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve outlived the registration")
+	}
+	assert.False(t, e.Options().Ready())
+}
+
+// A stream that reaches the exit after its registration ran out isn't routed, whether or not
+// the expiry has revoked it yet.
+func TestExitRoutesNothingAfterExpiry(t *testing.T) {
+	r := newEchoRouter(t)
+	e := readyExit(t, r)
+	now := time.Now()
+	e.mu.Lock()
+	e.now = func() time.Time { return now.Add(2 * time.Hour) }
+	e.mu.Unlock()
+	assert.Nil(t, e.currentRouter())
+	server, client := net.Pipe()
+	defer client.Close()
+	closed := make(chan error, 1)
+	(&handler{exit: e}).NewConnectionEx(context.Background(), server, M.Socksaddr{}, M.ParseSocksaddr("example.com:80"),
+		func(err error) { closed <- err })
+	select {
+	case err := <-closed:
+		assert.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream was neither routed nor refused")
+	}
+	assert.Zero(t, r.count(), "nothing reaches the router")
+}
+
+// A later router replaces the earlier one's expiry.
+func TestExitExpiryIsTheCurrentRouters(t *testing.T) {
+	e := newTestExit(t)
+	e.SetEnabled(true)
+	e.SetRouter(newEchoRouter(t), time.Now().Add(100*time.Millisecond))
+	e.SetRouter(newEchoRouter(t), time.Now().Add(time.Hour))
+	time.Sleep(300 * time.Millisecond)
+	assert.True(t, e.Options().Ready())
+	assert.NotNil(t, e.currentRouter())
+}
+
 func TestExitServeEndsAtOnceWhenNotServable(t *testing.T) {
 	e := newTestExit(t)
 	vConn, _ := pathPair(t)

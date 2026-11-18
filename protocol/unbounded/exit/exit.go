@@ -44,6 +44,10 @@ type Exit struct {
 	enabled    bool
 	router     adapter.ConnectionRouterEx
 	validUntil time.Time
+	// expiry clears the router at validUntil. routerGen counts SetRouter calls, so an expiry
+	// that fires after a later one leaves its router alone.
+	expiry    *time.Timer
+	routerGen uint64
 	// revoked is closed when the exit stops being servable, ending its sessions. A new
 	// channel replaces it once it is servable again.
 	revoked chan struct{}
@@ -88,15 +92,33 @@ func (e *Exit) SetEnabled(on bool) {
 }
 
 // SetRouter sets the current exit box's router and how long its registration lasts. nil
-// clears it and ends running sessions.
+// clears it and ends running sessions, as validUntil passing does.
 func (e *Exit) SetRouter(r adapter.ConnectionRouterEx, validUntil time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.routerGen++
+	if e.expiry != nil {
+		e.expiry.Stop()
+		e.expiry = nil
+	}
 	if r != nil {
 		// The UoT router logs each flow's destination at info, so it gets no logger.
 		r = uotrouter.New(r, sblog.NewNOPFactory().Logger())
+		gen := e.routerGen
+		e.expiry = time.AfterFunc(validUntil.Sub(e.now()), func() { e.expire(gen) })
 	}
 	e.router, e.validUntil = r, validUntil
+	e.updateRevokedLocked()
+}
+
+// expire clears the router set by SetRouter call gen, unless a later one replaced it.
+func (e *Exit) expire(gen uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.routerGen != gen {
+		return
+	}
+	e.router, e.validUntil, e.expiry = nil, time.Time{}, nil
 	e.updateRevokedLocked()
 }
 
@@ -107,14 +129,17 @@ func (e *Exit) Options() *UBClientcore.ExitOptions { return e.opts }
 func (e *Exit) Close() {
 	e.mu.Lock()
 	e.closed = true
+	if e.expiry != nil {
+		e.expiry.Stop()
+		e.expiry = nil
+	}
 	e.updateRevokedLocked()
 	e.mu.Unlock()
 	e.cancel()
 }
 
 // updateRevokedLocked closes revoked when the exit can't serve, and opens a new one when it
-// can again. Expiry alone doesn't revoke: running sessions end with their path or when
-// the registrar clears the router.
+// can again. Expiry revokes through the router it clears.
 func (e *Exit) updateRevokedLocked() {
 	servable := !e.closed && e.enabled && e.router != nil
 	select {
@@ -135,9 +160,14 @@ func (e *Exit) ready() bool {
 	return !e.closed && e.enabled && e.router != nil && e.now().Before(e.validUntil)
 }
 
+// currentRouter is the router to route a stream or flow through, or nil once its registration
+// has run out, even before its expiry has cleared it.
 func (e *Exit) currentRouter() adapter.ConnectionRouterEx {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if !e.now().Before(e.validUntil) {
+		return nil
+	}
 	return e.router
 }
 
