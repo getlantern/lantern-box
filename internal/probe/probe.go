@@ -16,16 +16,46 @@ import (
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
 
 	lAdapter "github.com/getlantern/lantern-box/adapter"
 )
 
-// ErrUnusableInput wraps a failure caused by Run's own arguments: an unusable
-// probeURL, or a non-positive timeout. It means the arguments cannot produce a
-// probe, not that the outbound or the target failed.
+// Some servers block requests without a browser User-Agent.
+const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.8037.97 Safari/537.36"
+
+// ErrUnusableInput wraps a failure caused by Run's or Measure's own arguments:
+// an unusable probeURL, or a non-positive timeout. It means the arguments
+// cannot produce a probe, not that the outbound or the target failed.
 var ErrUnusableInput = errors.New("unusable probe input")
+
+// Each of these identifies the stage at which a Measure call failed.
+var (
+	ErrDial = errors.New("dial")
+	// ErrRequest means no response headers arrived; the path may never have
+	// opened, for an outbound that defers its handshake to first use.
+	ErrRequest = errors.New("do request")
+	// ErrResponseBody means the response arrived and its body then failed
+	// partway, so the target was reached.
+	ErrResponseBody = errors.New("read response body")
+)
+
+// Result reports what one Measure observed. Its durations span the handshake and
+// the request, plus the dial, unless the dial succeeded for an outbound that
+// defers its handshake to first use.
+type Result struct {
+	HTTPStatus    int
+	TimeToHeaders time.Duration
+	// Elapsed spans up to the failure, or through reading the body.
+	Elapsed time.Duration
+	// BytesRead counts body bytes, stopping at the limit Measure was given.
+	BytesRead int64
+	// ThroughputBytesPerSecond is BytesRead over the time spent reading them.
+	ThroughputBytesPerSecond float64
+}
 
 // Run dials out, completes an HTTP GET to probeURL over that one connection,
 // discarding the body, and reports how long it took. A request that completes
@@ -67,6 +97,7 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	if err != nil {
 		return 0, fmt.Errorf("new request: %w", err)
 	}
+	req.Header.Set("User-Agent", userAgent)
 	if tp := req.URL.Query().Get("tp"); tp != "" {
 		req.Header.Set("traceparent", tp)
 	}
@@ -99,6 +130,92 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 		return 0, fmt.Errorf("await request write: %w", err)
 	}
 	return end.Sub(start), nil
+}
+
+// Measure dials out, completes an HTTP GET to probeURL over that one connection,
+// and records what it observed. It reads at most maxBytes of the response body;
+// a non-positive maxBytes reads all of it. Unlike Run, a body that fails partway
+// is an error, ErrResponseBody. Any error other than an ErrUnusableInput one
+// wraps ErrDial, ErrRequest, or ErrResponseBody, and the result holds whatever
+// had been observed by then. The connection is closed before Measure returns.
+//
+// out's DialContext must return once ctx is cancelled or its deadline passes;
+// Measure returns no sooner than that dial does.
+func Measure(ctx context.Context, out A.Outbound, probeURL string, timeout time.Duration, maxBytes int64) (Result, error) {
+	var result Result
+	destination, err := probeDestination(probeURL)
+	if err != nil {
+		return result, err
+	}
+	if timeout <= 0 {
+		return result, fmt.Errorf("%w: non-positive timeout %s", ErrUnusableInput, timeout)
+	}
+
+	probeCtx, cancel := context.WithTimeout(lAdapter.ContextWithProbe(ctx), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return result, fmt.Errorf("%w: %w", ErrUnusableInput, err)
+	}
+	req.Header.Set("User-Agent", userAgent)
+	if tp := req.URL.Query().Get("tp"); tp != "" {
+		req.Header.Set("traceparent", tp)
+	}
+	// Built before the clock starts, so its setup is not charged to the
+	// measurement: the transport closure reads conn, which is dialed below and
+	// set before Do runs.
+	var conn net.Conn
+	client := http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return conn, nil
+			},
+			TLSClientConfig: &tls.Config{
+				Time:    ntp.TimeFuncFromContext(probeCtx),
+				RootCAs: A.RootPoolFromContext(probeCtx),
+			},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	defer client.CloseIdleConnections()
+
+	start := time.Now()
+	conn, err = out.DialContext(probeCtx, "tcp", destination)
+	if err != nil {
+		result.Elapsed = time.Since(start)
+		return result, fmt.Errorf("%w: %w", ErrDial, err)
+	}
+	defer conn.Close()
+	if earlyConn, ok := common.Cast[N.EarlyConn](conn); ok && earlyConn.NeedHandshake() {
+		start = time.Now()
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		result.Elapsed = time.Since(start)
+		return result, fmt.Errorf("%w: %w", ErrRequest, err)
+	}
+	defer resp.Body.Close()
+	result.HTTPStatus = resp.StatusCode
+	result.TimeToHeaders = time.Since(start)
+
+	body := io.Reader(resp.Body)
+	if maxBytes > 0 {
+		body = io.LimitReader(resp.Body, maxBytes)
+	}
+	bodyStart := time.Now()
+	result.BytesRead, err = io.Copy(io.Discard, body)
+	bodyElapsed := time.Since(bodyStart)
+	result.Elapsed = time.Since(start)
+	if bodyElapsed > 0 {
+		result.ThroughputBytesPerSecond = float64(result.BytesRead) / bodyElapsed.Seconds()
+	}
+	if err != nil {
+		return result, fmt.Errorf("%w: %w", ErrResponseBody, err)
+	}
+	return result, nil
 }
 
 // ValidateURL returns the ErrUnusableInput error Run would return for probeURL

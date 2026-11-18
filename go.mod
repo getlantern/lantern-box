@@ -34,6 +34,7 @@ require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/getlantern/algeneva v0.0.0-20260731172949-952f13725b7b
 	github.com/getlantern/broflake v0.0.0-20261117033427-62a624d1b849
+	github.com/getlantern/common v1.2.1-0.20260918012933-d4772c51b208
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260520145825-958775d51395
 	github.com/getlantern/samizdat v0.0.3-0.20261117205503-f66a0285afd9

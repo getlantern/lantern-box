@@ -1,0 +1,224 @@
+package outboundeval
+
+import (
+	"context"
+	"crypto/x509"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	A "github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/ntp"
+	"github.com/sagernet/sing/service"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/getlantern/lantern-box/option"
+)
+
+type stubOutboundManager struct {
+	A.OutboundManager
+	outbounds map[string]A.Outbound
+}
+
+func (m *stubOutboundManager) Outbound(tag string) (A.Outbound, bool) {
+	out, found := m.outbounds[tag]
+	return out, found
+}
+
+func contextWithOutbounds(outbounds map[string]A.Outbound) context.Context {
+	return service.ContextWith[A.OutboundManager](
+		context.Background(), &stubOutboundManager{outbounds: outbounds},
+	)
+}
+
+// wiredService is a service pointed at a stub control API, wired as Start would
+// wire it but without the cycle loop running.
+func wiredService(t *testing.T, handler http.HandlerFunc) *Service {
+	t.Helper()
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(server.Close)
+
+	options := testOptions()
+	options.AcquireURL = server.URL + "/assignments"
+	options.AttestURL = server.URL + "/attestations"
+	options.SubmitURL = server.URL + "/reports"
+
+	control := &stubOutbound{tag: "direct", address: server.Listener.Addr().String()}
+	manager := &assignmentTestManager{outbounds: map[string]A.Outbound{"direct": control}}
+	ctx := targetContext(service.ContextWith[A.OutboundManager](context.Background(), manager))
+
+	created, err := NewService(ctx, log.NewNOPFactory().Logger(), "eval", options)
+	require.NoError(t, err)
+	s := created.(*Service)
+	s.retryDelay = time.Millisecond
+	s.timeService = liveTime{}
+	s.outbounds = service.FromContext[A.OutboundManager](ctx)
+	s.api = newAPIClient(s.ctx, control, time.Now, s.options)
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	s.api.http.Transport.(*http.Transport).TLSClientConfig.RootCAs = roots
+	s.attest = s.api.attest
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+	return s
+}
+
+func TestNewServiceAppliesDefaults(t *testing.T) {
+	options := testOptions()
+	options.MinFreshSessionDelay = 0
+	s := newTestService(t, options)
+
+	assert.Equal(t, defaultControlOutboundTag, s.options.ControlOutboundTag)
+	assert.Equal(t, 5*time.Minute, time.Duration(s.options.PollInterval))
+	assert.Equal(t, 5*time.Minute, time.Duration(s.options.NoAssignmentInterval))
+	assert.Equal(t, defaultMaxRetryBackoff, time.Duration(s.options.MaxRetryBackoff))
+	assert.Equal(t, defaultRequestTimeout, time.Duration(s.options.RequestTimeout))
+	assert.Equal(t, defaultMinFreshSessionDelay, time.Duration(s.options.MinFreshSessionDelay))
+	assert.EqualValues(t, defaultMaxResponseBytes, s.options.MaxResponseBytes)
+	assert.EqualValues(t, defaultMaxAssignmentBytes, s.options.MaxAssignmentBytes)
+	assert.EqualValues(t, defaultMaxWindows, s.options.MaxWindows)
+	assert.EqualValues(t, defaultMaxAttemptsPerWindow, s.options.MaxAttemptsPerWindow)
+}
+
+func TestDefaultPollingLeavesRoomWithinRunnerActivityWindow(t *testing.T) {
+	s := newTestService(t, testOptions())
+	const assignmentLifetime = 15 * time.Minute
+	const activityWindow = 30 * time.Minute
+
+	// Requests are spaced from one another, so an assignment that runs to its
+	// expiry is followed by the next request at once.
+	for _, interval := range []time.Duration{
+		time.Duration(s.options.PollInterval),
+		time.Duration(s.options.NoAssignmentInterval),
+	} {
+		assert.Less(t, max(assignmentLifetime, interval), activityWindow)
+	}
+}
+
+func TestNewServiceRejectsUnusableOptions(t *testing.T) {
+	for name, mutate := range map[string]func(*option.OutboundEvalServiceOptions){
+		"no acquire url": func(o *option.OutboundEvalServiceOptions) { o.AcquireURL = "" },
+		"no attest url":  func(o *option.OutboundEvalServiceOptions) { o.AttestURL = "" },
+		"no submit url":  func(o *option.OutboundEvalServiceOptions) { o.SubmitURL = "" },
+		"no token":       func(o *option.OutboundEvalServiceOptions) { o.Token = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			options := testOptions()
+			mutate(&options)
+			_, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "eval", options)
+			assert.Error(t, err)
+		})
+	}
+}
+
+func TestNewServiceValidatesControlURLs(t *testing.T) {
+	for _, endpoint := range []struct {
+		name string
+		set  func(*option.OutboundEvalServiceOptions, string)
+	}{
+		{"acquire_url", func(o *option.OutboundEvalServiceOptions, value string) { o.AcquireURL = value }},
+		{"attest_url", func(o *option.OutboundEvalServiceOptions, value string) { o.AttestURL = value }},
+		{"submit_url", func(o *option.OutboundEvalServiceOptions, value string) { o.SubmitURL = value }},
+	} {
+		for _, test := range []struct {
+			name  string
+			url   string
+			valid bool
+		}{
+			{"https", "https://control.example/api", true},
+			{"https with port", "https://control.example:8443/api", true},
+			{"https with IPv6", "https://[::1]:8443/api", true},
+			{"http", "http://control.example/api", false},
+			{"other scheme", "ftp://control.example/api", false},
+			{"relative", "/api", false},
+			{"scheme relative", "//control.example/api", false},
+			{"missing hostname", "https:///api", false},
+			{"port without hostname", "https://:443/api", false},
+			{"opaque", "https:control.example/api", false},
+			{"malformed", "https://control.example/%zz", false},
+		} {
+			for _, token := range []string{"", "token"} {
+				tokenState := "without token"
+				if token != "" {
+					tokenState = "with token"
+				}
+				t.Run(endpoint.name+"/"+test.name+"/"+tokenState, func(t *testing.T) {
+					options := testOptions()
+					options.Token = token
+					endpoint.set(&options, test.url)
+					created, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "eval", options)
+					if !test.valid {
+						require.EqualError(t, err, endpoint.name+" must be an absolute HTTPS URL with a hostname")
+						assert.Nil(t, created)
+					} else if token == "" {
+						require.EqualError(t, err, "token is required")
+						assert.Nil(t, created)
+					} else {
+						require.NoError(t, err)
+						require.NoError(t, created.Close())
+					}
+				})
+			}
+		}
+	}
+}
+
+// A box that keeps its own clock is the one this service reads, rather than
+// starting a second time service beside it.
+func TestStartUsesTheBoxsTimeService(t *testing.T) {
+	pinned := time.Now().UTC().Add(4 * time.Hour)
+	ctx := service.ContextWith[ntp.TimeService](contextWithOutbounds(map[string]A.Outbound{
+		"direct": &stubOutbound{tag: "direct"},
+	}), fixedTime{at: pinned})
+	created, err := NewService(ctx, log.NewNOPFactory().Logger(), "eval", testOptions())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, created.Close()) })
+
+	require.NoError(t, created.Start(A.StartStateStarted))
+
+	assert.Equal(t, pinned, created.(*Service).timeService.TimeFunc()())
+}
+
+func TestStartRequiresTheControlOutbound(t *testing.T) {
+	for name, outbounds := range map[string]map[string]A.Outbound{
+		"another outbound":    {"proxy": &stubOutbound{tag: "proxy"}},
+		"no outbounds at all": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := contextWithOutbounds(outbounds)
+			created, err := NewService(ctx, log.NewNOPFactory().Logger(), "eval", testOptions())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, created.Close()) })
+			assert.Error(t, created.Start(A.StartStateStarted))
+		})
+	}
+}
+
+func TestStartMeasuresNothingBeforeItsStage(t *testing.T) {
+	requests := 0
+	s := wiredService(t, func(http.ResponseWriter, *http.Request) { requests++ })
+
+	for _, stage := range []A.StartStage{A.StartStateInitialize, A.StartStateStart, A.StartStatePostStart} {
+		require.NoError(t, s.Start(stage))
+	}
+	assert.False(t, s.started.Load())
+	assert.Zero(t, requests)
+}
+
+func TestCloseIsIdempotentAndPromptWithoutAStart(t *testing.T) {
+	s := newTestService(t, testOptions())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		require.NoError(t, s.Close())
+		require.NoError(t, s.Close())
+	}()
+	select {
+	case <-done:
+	case <-time.After(closeGracePeriod):
+		t.Fatal("Close blocked on a cycle that never ran")
+	}
+}
