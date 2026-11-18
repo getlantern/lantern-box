@@ -83,6 +83,11 @@ type exitRunner struct {
 // RunExit never turns the exit on or off: the embedder drives cfg.Exit's SetEnabled, and
 // should cancel ctx while the exit is off, so RunExit stops registering every rotation. Each
 // rotation closes the previous box, which resets the streams still routed through it.
+//
+// The embedder must not run RunExit where the device's country is unknown or censored, as
+// radiance's wantPairingRoute (backend/peer_pairings.go) gates its pairings-only route: the
+// country override (RADIANCE_COUNTRY) wins over the saved country, and none at all counts as
+// not allowed. lantern-cloud refuses such a volunteer too, but its geolocation can fail open.
 func RunExit(ctx context.Context, cfg ExitConfig) error {
 	r, err := newExitRunner(cfg)
 	if err != nil {
