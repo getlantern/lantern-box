@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -430,6 +431,34 @@ func TestExitPathsRemoveADeadPath(t *testing.T) {
 	assert.True(t, s.user.closed.Load(), "the path's conn is closed")
 	assert.Equal(t, 0, p.live())
 	assert.Zero(t, p.failureCount(), "a path that worked and died is no failure")
+}
+
+// A dead path beneath the newest live one is closed and dropped too, by a dial or by the next
+// path's arrival, rather than held until every path above it dies.
+func TestExitPathsSweepEveryDeadPath(t *testing.T) {
+	for name, sweep := range map[string]func(*testing.T, *exitPaths, *volunteerExit){
+		"newest":     func(_ *testing.T, p *exitPaths, _ *volunteerExit) { require.NotNil(t, p.newest()) },
+		"onExitPath": func(t *testing.T, p *exitPaths, v *volunteerExit) { p.onExitPath(v.session(t).ep) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := newVolunteerExit(t)
+			p := newTestExitPaths(t)
+			older, newer := v.session(t), v.session(t)
+			p.onExitPath(older.ep)
+			p.onExitPath(newer.ep)
+			p.mu.Lock()
+			oldest := p.paths[0]
+			p.mu.Unlock()
+			_ = oldest.conn.Close() // its QUIC connection ended
+			sweep(t, p, v)
+			p.mu.Lock()
+			kept := slices.Contains(p.paths, oldest)
+			p.mu.Unlock()
+			assert.False(t, kept, "the dead path is dropped")
+			assert.True(t, older.user.closed.Load(), "and closed")
+			assert.False(t, newer.user.closed.Load())
+		})
+	}
 }
 
 func TestExitPathsCloseClosesEveryPath(t *testing.T) {

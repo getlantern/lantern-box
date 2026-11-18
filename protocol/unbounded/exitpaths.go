@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -159,8 +160,10 @@ func (p *exitPaths) onExitPath(ep UBClientcore.ExitPath) {
 		path.close()
 		return
 	}
+	dead := p.sweepLocked()
 	p.paths = append(p.paths, path)
 	p.mu.Unlock()
+	closePaths(dead)
 	p.metrics.path(ep.Relayed)
 }
 
@@ -238,26 +241,37 @@ func usePath[T any](p *exitPaths, ctx context.Context, f func(*hysteria2.Client)
 	}
 }
 
-// newest returns the newest live path, dropping dead ones, or nil.
+// newest returns the newest live path, or nil, dropping every dead one.
 func (p *exitPaths) newest() *exitPath {
-	var dead []*exitPath
-	defer func() {
-		for _, path := range dead {
-			path.close()
-		}
-	}()
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	for len(p.paths) > 0 {
-		path := p.paths[len(p.paths)-1]
-		if !path.dead() {
-			return path
-		}
-		dead = append(dead, path)
-		p.paths[len(p.paths)-1] = nil
-		p.paths = p.paths[:len(p.paths)-1]
+	dead := p.sweepLocked()
+	var path *exitPath
+	if len(p.paths) > 0 {
+		path = p.paths[len(p.paths)-1]
 	}
-	return nil
+	p.mu.Unlock()
+	closePaths(dead)
+	return path
+}
+
+// sweepLocked drops every dead path and returns them, for the caller to close once it has let
+// go of mu.
+func (p *exitPaths) sweepLocked() []*exitPath {
+	var dead []*exitPath
+	p.paths = slices.DeleteFunc(p.paths, func(path *exitPath) bool {
+		if path.dead() {
+			dead = append(dead, path)
+			return true
+		}
+		return false
+	})
+	return dead
+}
+
+func closePaths(paths []*exitPath) {
+	for _, path := range paths {
+		path.close()
+	}
 }
 
 func (p *exitPaths) drop(path *exitPath) {
