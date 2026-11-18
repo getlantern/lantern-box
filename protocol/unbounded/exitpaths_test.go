@@ -530,8 +530,11 @@ func TestExitPathsNeverLogSecrets(t *testing.T) {
 	v := newVolunteerExit(t)
 	p := newExitPaths(context.Background(), factory.Logger(), "www.example.com")
 	t.Cleanup(p.close)
+	// The bad path alone first, so its handshake fails rather than sitting under a newer path.
 	bad := v.badPinSession(t)
 	p.onExitPath(bad.ep)
+	_, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr("example.com:80"))
+	require.ErrorIs(t, err, errNoExitPath, "the wrong pin fails the handshake")
 	good := v.session(t)
 	p.onExitPath(good.ep)
 	conn, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr("example.com:80"))

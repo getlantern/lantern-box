@@ -44,7 +44,7 @@ func BenchmarkPath(b *testing.B) {
 	for _, path := range []string{"ice", "webrtc"} {
 		b.Run(path, func(b *testing.B) {
 			link := newLossyLink(time.Now().UnixNano())
-			proxy := startBenchRig(b, path, server, link)
+			proxy, egressDials := startBenchRig(b, path, server, link)
 			for _, loss := range benchLosses() {
 				b.Run(fmt.Sprintf("loss=%d", loss), func(b *testing.B) {
 					for _, rtt := range benchRTTs() {
@@ -56,6 +56,11 @@ func BenchmarkPath(b *testing.B) {
 							b.Run("bulk", func(b *testing.B) { benchBulk(b, proxy, server) })
 							b.Run("open", func(b *testing.B) { benchOpen(b, proxy, server) })
 							b.Run("hol", func(b *testing.B) { benchHOL(b, proxy, server, link, float64(loss)/100) })
+							if path == "ice" {
+								// A direct exit that failed over to the egress would report
+								// the relayed path's numbers as its own.
+								require.Zero(b, egressDials.Load(), "the direct exit's traffic went to the egress")
+							}
 						})
 					}
 				})
@@ -93,8 +98,9 @@ const (
 
 // startBenchRig starts a direct exit rig whose consumer takes the given path, with link
 // between the user and the volunteer, checks that the link carries the path, and warms it up
-// with a bulk transfer from server. It returns the consumer's proxy address.
-func startBenchRig(b *testing.B, path, server string, link *lossyLink) string {
+// with a bulk transfer from server. It returns the consumer's proxy address and the egress's
+// dial count.
+func startBenchRig(b *testing.B, path, server string, link *lossyLink) (string, *atomic.Int64) {
 	b.Helper()
 	c := directExitCase{enabled: true, router: true, consumerDirectExit: true}
 	switch path {
@@ -135,7 +141,7 @@ func startBenchRig(b *testing.B, path, server string, link *lossyLink) string {
 	link.set(0, time.Duration(benchRTTs()[0])*time.Millisecond)
 	_, _, err := download(rig.proxy, server, bulkBytes, transferCap)
 	require.NoError(b, err, "warm-up transfer")
-	return rig.proxy
+	return rig.proxy, rig.egressDials
 }
 
 // benchBulk times bulkBytes through one stream, from its first byte.
