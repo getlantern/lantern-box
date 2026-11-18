@@ -977,7 +977,14 @@ func TestHedgeWaitersSeeDeadlineChanges(t *testing.T) {
 	}
 }
 
-func TestHedgeDeadlineReachesPendingReplay(t *testing.T) {
+// A write deadline set during the replay doesn't cut it short, since it
+// carries writes already taken, but a stalled replay still can't hang the
+// connection: the failover timeout ends it, as a move failure, not a
+// timeout.
+func TestHedgeStalledReplayEndsAtTheFailoverTimeout(t *testing.T) {
+	old := hedgeFailoverDialTimeout
+	hedgeFailoverDialTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { hedgeFailoverDialTimeout = old })
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	slowThen := func(c net.Conn) {
@@ -996,12 +1003,15 @@ func TestHedgeDeadlineReachesPendingReplay(t *testing.T) {
 		defer s.mu.Unlock()
 		return s.pending != nil
 	}, 2*time.Second, 5*time.Millisecond, "the replay never started")
-	require.NoError(t, c.SetWriteDeadline(time.Now().Add(100*time.Millisecond)))
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(10*time.Millisecond)))
 	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
 	start := time.Now()
 	_, err = c.Read(make([]byte, 64))
-	require.Error(t, err, "a deadline set during the replay must interrupt it")
-	require.Less(t, time.Since(start), 2*time.Second)
+	require.Error(t, err, "the stalled replay fails the move")
+	require.Less(t, time.Since(start), 2*time.Second, "at the failover timeout, not the read deadline")
+	var me *hedgeMoveError
+	require.ErrorAs(t, err, &me)
+	require.NotErrorIs(t, err, os.ErrDeadlineExceeded, "a failed move doesn't read as a timeout")
 }
 
 // quicInitial builds a long-header packet with the given connection IDs.
@@ -1645,4 +1655,40 @@ func TestHedgeFailedMoveIsNotATimeout(t *testing.T) {
 	}
 	var me *hedgeMoveError
 	require.ErrorAs(t, err, &me, "the move's failure, with its cause")
+}
+
+// A deadline the caller sets while the move is under way, even one already
+// passed, doesn't fail the replay of writes it took.
+func TestHedgeDeadlineSetDuringTheMoveSparesTheReplay(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:"), delay: 300 * time.Millisecond}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	opening := []byte(tlsRecord("hello"))
+	_, err = c.Write(opening)
+	require.NoError(t, err)
+	s := c.(*hedgeStream)
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.moving
+	}, 2*time.Second, 5*time.Millisecond, "the move never started")
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(-time.Second))) // already passed
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	require.NoError(t, err, "the replay went through")
+	require.Equal(t, "then:"+string(opening), string(buf[:n]))
+}
+
+// A move the client's own close cuts short reports net.ErrClosed, not a
+// failure of Then.
+func TestHedgeCloseDuringTheMoveIsNotAMoveFailure(t *testing.T) {
+	s := &hedgeStream{}
+	s.moved = make(chan struct{})
+	s.cancel = func() {}
+	s.finishMoveLocked(net.ErrClosed)
+	var me *hedgeMoveError
+	require.False(t, errors.As(s.moveErr, &me))
+	require.ErrorIs(t, s.moveErr, net.ErrClosed)
 }
