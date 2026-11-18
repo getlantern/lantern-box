@@ -559,6 +559,11 @@ func applyOperatorLimits(ctx context.Context, options string, maxPeers int, band
 }
 
 func newSingBox(ctx context.Context, options string) (boxService, error) {
+	return startSingBox(ctx, options)
+}
+
+// startSingBox builds and starts a sing-box from options JSON.
+func startSingBox(ctx context.Context, options string) (*sbox.Box, error) {
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(options))
 	if err != nil {
 		return nil, fmt.Errorf("parse server config: %w", err)

@@ -77,6 +77,8 @@ type api struct {
 	// honors in place of the feature flags.
 	featureOverrides string
 	version          string
+	// header, when set, is applied to every request after the defaults, so its headers win.
+	header func(http.Header)
 }
 
 func (a *api) register(ctx context.Context, req registerRequest) (*registerResponse, error) {
@@ -91,6 +93,30 @@ func (a *api) register(ctx context.Context, req registerRequest) (*registerRespo
 	}
 	return &resp, nil
 }
+
+// webrtcRegisterRequest registers a device that serves only WebRTC direct exits: it has no
+// inbound for lantern-cloud to verify or hand out, so no route and no heartbeats.
+type webrtcRegisterRequest struct {
+	Mode string `json:"mode"`
+}
+
+type webrtcRegisterResponse struct {
+	ServerConfig            string `json:"server_config"`
+	RotationIntervalSeconds int64  `json:"rotation_interval_seconds"`
+}
+
+func (a *api) registerWebRTC(ctx context.Context) (*webrtcRegisterResponse, error) {
+	var resp webrtcRegisterResponse
+	if err := a.do(ctx, "/peer/register", webrtcRegisterRequest{Mode: "webrtc"}, &resp); err != nil {
+		return nil, fmt.Errorf("register: %w", err)
+	}
+	if resp.ServerConfig == "" {
+		return nil, errNoExitConfig
+	}
+	return &resp, nil
+}
+
+var errNoExitConfig = errors.New("register: response has no config")
 
 // verify asks lantern-cloud to dial the node's inbound from outside. It fails
 // unless the inbound is reachable, and lantern-cloud then drops the route.
@@ -160,6 +186,9 @@ func (a *api) do(ctx context.Context, path string, body, out any) error {
 	}
 	if a.featureOverrides != "" {
 		r.Header.Set("X-Lantern-Feature-Override", a.featureOverrides)
+	}
+	if a.header != nil {
+		a.header(r.Header)
 	}
 	resp, err := a.httpClient.Do(r)
 	if err != nil {
