@@ -214,8 +214,15 @@ func (c *hedgeCache) mark(k hedgeKey, v hedgeVerdict, ttl time.Duration) {
 	if k.gen != c.gen {
 		return // learned on a network the cache has since forgotten
 	}
-	expires := c.now().Add(ttl)
-	c.sites[hedgeSiteKey{k.site, k.network}] = hedgeEntry{verdict: v, expires: expires}
+	now := c.now()
+	sk := hedgeSiteKey{k.site, k.network}
+	if e, ok := c.sites[sk]; ok && v == hedgeGood && e.verdict == hedgeBad && now.Before(e.expires) {
+		// A reply on a connection opened before the site failed doesn't
+		// clear the failure: it recovers when it expires.
+		return
+	}
+	expires := now.Add(ttl)
+	c.sites[sk] = hedgeEntry{verdict: v, expires: expires}
 	if k.prefix.IsValid() {
 		pk := hedgePrefixKey{k.prefix, k.network}
 		switch v {
@@ -334,5 +341,8 @@ func (c *hedgeCache) clearStrikes(k hedgeKey) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if k.gen != c.gen {
+		return // a connection from a network the cache has since forgotten
+	}
 	delete(c.strikes, hedgeSiteKey{k.site, k.network})
 }
