@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"runtime"
 	"time"
 
 	sbox "github.com/sagernet/sing-box"
@@ -57,7 +58,19 @@ type ExitConfig struct {
 	// zero time once a registration succeeds after that. The wait is RunExit's back-off, or
 	// the response's Retry-After when longer. Other failures hold off only within a run.
 	OnHoldOff func(until time.Time)
+	// RoutingMark, on Linux, is the mark the exit box's sockets carry: the VPN tun's
+	// auto_redirect output mark (sing-tun's default, 0x2024, unless the tun sets
+	// auto_redirect_output_mark), as radiance's Linux tun runs auto_redirect. The exit box has
+	// no tun to mark its own sockets, and without the mark the VPN's nftables OUTPUT rules
+	// redirect exit traffic into the volunteer's tunnel. Marking needs CAP_NET_ADMIN, and
+	// a mark is harmless while the VPN is off. 0: the auto_redirect output mark of the
+	// NetworkManager in ctx, when ctx is the VPN box's, read at each rotation, so a tun that
+	// starts after a rotation is missed until the next one. Ignored elsewhere than Linux.
+	RoutingMark uint32
 }
+
+// isLinux is a var so tests can mark the exit box's sockets on any OS.
+var isLinux = runtime.GOOS == "linux"
 
 // ExitBox is a running exit box. It is exported for NewBox.
 type ExitBox interface {
@@ -221,6 +234,9 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) e
 	opts.Experimental, opts.NTP = nil, nil
 	// Exit traffic leaves on the physical interface, never through the volunteer's own tunnel.
 	opts.Route.AutoDetectInterface = true
+	if mark := r.routingMark(ctx); mark != 0 {
+		opts.Route.DefaultMark = option.FwMark(mark)
+	}
 	// sing-box's router logs every routed connection's destination, and this box carries
 	// strangers' traffic.
 	opts.Log = &option.LogOptions{Disabled: true}
@@ -246,6 +262,20 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) e
 		_ = prev.Close()
 	}
 	return nil
+}
+
+// routingMark is the mark for the exit box's sockets on Linux (see ExitConfig.RoutingMark), or 0.
+func (r *exitRunner) routingMark(ctx context.Context) uint32 {
+	if !isLinux {
+		return 0
+	}
+	if r.cfg.RoutingMark != 0 {
+		return r.cfg.RoutingMark
+	}
+	if nm := service.FromContext[adapter.NetworkManager](ctx); nm != nil {
+		return nm.AutoRedirectOutputMark()
+	}
+	return 0
 }
 
 // wait waits d, expiring the current box if its registration runs out first, and reports

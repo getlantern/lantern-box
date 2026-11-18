@@ -134,6 +134,7 @@ type fakeExitBox struct {
 	router              *fakeExitRouter
 	builtAt             time.Time
 	autoDetectInterface bool
+	defaultMark         uint32
 	logDisabled         bool
 	// extras counts the inbounds, endpoints, services, experimental and NTP sections it got.
 	extras int
@@ -177,6 +178,9 @@ func (f *fakeExitBoxes) new(ctx context.Context, options string) (ExitBox, error
 	defer f.mu.Unlock()
 	b := &fakeExitBox{id: len(f.boxes) + 1, ev: f.ev, router: &fakeExitRouter{id: len(f.boxes) + 1}, builtAt: time.Now()}
 	b.autoDetectInterface = opts.Route != nil && opts.Route.AutoDetectInterface
+	if opts.Route != nil {
+		b.defaultMark = uint32(opts.Route.DefaultMark)
+	}
 	b.logDisabled = opts.Log != nil && opts.Log.Disabled
 	b.extras = len(opts.Inbounds) + len(opts.Endpoints) + len(opts.Services)
 	if opts.Experimental != nil {
@@ -419,6 +423,57 @@ func TestRunExitKeepsServingUntilExpiryWhenRefused(t *testing.T) {
 	cancel()
 	waitDone(t, done)
 	assert.Equal(t, []string{"build 1", "router 1", "router nil", "close 1"}, ev.list(), "nothing is left to close")
+}
+
+// markNetworkManager is the VPN box's NetworkManager, with tun.auto_redirect's output mark.
+type markNetworkManager struct {
+	adapter.NetworkManager
+	mark uint32
+}
+
+func (m *markNetworkManager) AutoRedirectOutputMark() uint32 { return m.mark }
+
+// On Linux, the exit box has no tun, so its sockets would carry no auto_redirect output mark,
+// and the VPN's nftables OUTPUT rules would redirect exit traffic into the volunteer's own
+// tunnel. RunExit marks them with ExitConfig.RoutingMark, or else the mark of the
+// NetworkManager in ctx.
+func TestRunExitMarksTheExitBoxsSockets(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		linux    bool
+		cfgMark  uint32
+		vpnMark  uint32
+		wantMark uint32
+	}{
+		{"configured", true, 0x2024, 0, 0x2024},
+		{"configured wins over the VPN's", true, 0x2024, 0x99, 0x2024},
+		{"the VPN's", true, 0, 0x2025, 0x2025},
+		{"none", true, 0, 0, 0},
+		{"not on Linux", false, 0x2024, 0x2025, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			orig := isLinux
+			isLinux = tc.linux
+			t.Cleanup(func() { isLinux = orig })
+			srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, map[string]any{"server_config": validExitConfig, "rotation_interval_seconds": 3600})
+			})
+			e := enabledExit(t)
+			ev := &exitEvents{}
+			boxes := &fakeExitBoxes{ev: ev}
+			ctx, cancel := context.WithCancel(box.BaseContext())
+			defer cancel()
+			if tc.vpnMark != 0 {
+				ctx = service.ContextWith[adapter.NetworkManager](ctx, &markNetworkManager{mark: tc.vpnMark})
+			}
+			done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+				NewBox: boxes.new, RoutingMark: tc.cfgMark}, ev)
+			require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, 5*time.Millisecond)
+			assert.Equal(t, tc.wantMark, boxes.last().defaultMark)
+			cancel()
+			waitDone(t, done)
+		})
+	}
 }
 
 // holdOffs records what RunExit reports through OnHoldOff.
