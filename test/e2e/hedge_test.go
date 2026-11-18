@@ -34,7 +34,9 @@ import (
 // second host of that site must skip the censored path entirely, and open
 // sites must never use the proxy.
 func TestHedgeMultiDomainPage(t *testing.T) {
-	const commitTimeout = 500 * time.Millisecond
+	// Generous enough that a loaded CI runner doesn't push an open site's
+	// dial or first reply past it; at 500ms one did.
+	const commitTimeout = 2 * time.Second
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, r.Host)
 	}))
@@ -88,7 +90,8 @@ func TestHedgeMultiDomainPage(t *testing.T) {
 	require.Zero(t, censor.count("cdn.blocked.com"), "the censored path must not be tried again for the site")
 	require.Equal(t, 1, proxy.count("blocked.com"))
 	require.Equal(t, 1, proxy.count("cdn.blocked.com"))
-	require.Zero(t, proxy.count("www.open.com")+proxy.count("img.open.com"), "open sites must not use the proxy")
+	require.Zero(t, proxy.count("www.open.com"), "open sites must not use the proxy")
+	require.Zero(t, proxy.count("img.open.com"), "open sites must not use the proxy")
 }
 
 // TestHedgeSwitchableFromBox builds a hedge from JSON, as radiance does, and
