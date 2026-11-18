@@ -24,6 +24,7 @@ import (
 
 	box "github.com/getlantern/lantern-box"
 	lAdapter "github.com/getlantern/lantern-box/adapter"
+	"github.com/getlantern/lantern-box/tracker/clientcontext"
 )
 
 // TestHedgeMultiDomainPage loads a page whose resources come from several
@@ -92,9 +93,12 @@ func TestHedgeMultiDomainPage(t *testing.T) {
 
 // TestHedgeSwitchableFromBox builds a hedge from JSON, as radiance does, and
 // reaches its switch through the box's outbound manager, as radiance will to
-// apply a feature flag.
+// apply a feature flag. The client-info injector radiance installs wraps
+// outbounds, so it is installed here too: it must leave the hedge unwrapped.
 func TestHedgeSwitchableFromBox(t *testing.T) {
 	boxCtx := box.BaseContext()
+	injector := clientcontext.NewInjector(func() clientcontext.ClientInfo { return clientcontext.ClientInfo{} }, "smart", "a", "b")
+	require.NoError(t, injector.Install(boxCtx))
 	client, err := sbox.New(sbox.Options{Context: boxCtx, Options: mustOptions(boxCtx, t, `{
 		"log": {"level": "error"},
 		"outbounds": [
