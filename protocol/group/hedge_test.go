@@ -1058,3 +1058,44 @@ func TestHedgeCacheDropsEmptyAddressBlocks(t *testing.T) {
 	}
 	require.Empty(t, c.badSites, "a block whose last bad site recovered must be removed")
 }
+
+// udpOutbound returns real UDP sockets, which accept only *net.UDPAddr.
+type udpOutbound struct {
+	adapter.Outbound
+	tag string
+}
+
+func (u *udpOutbound) Tag() string       { return u.tag }
+func (u *udpOutbound) Type() string      { return "udp" }
+func (u *udpOutbound) Network() []string { return []string{"udp"} }
+func (u *udpOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return net.ListenUDP("udp4", nil)
+}
+
+func TestHedgeDialUDPBypassingFirstToPlainSocket(t *testing.T) {
+	echo, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer echo.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := echo.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = echo.WriteTo(buf[:n], from)
+		}
+	}()
+	f := newHedgeFixture(t, &fakeOutbound{}, &fakeOutbound{}, func(o *option.HedgeOutboundOptions) { o.Disabled = true })
+	f.mgr.outbounds["then"] = &udpOutbound{tag: "then"}
+	c, err := f.hedge.DialContext(f.ctx, "udp", M.SocksaddrFromNet(echo.LocalAddr()))
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte("ping"))
+	require.NoError(t, err, "a plain UDP socket must get a *net.UDPAddr")
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "ping", string(buf[:n]))
+}

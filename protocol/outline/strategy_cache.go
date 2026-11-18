@@ -25,6 +25,28 @@ type fileStrategyCache struct {
 
 var _ smart.StrategyResultCache = (*fileStrategyCache)(nil)
 
+var (
+	strategyCachesMu sync.Mutex
+	strategyCaches   = map[string]*fileStrategyCache{}
+)
+
+// strategyCacheFor returns the cache for path, shared by every outbound that
+// names the same file: each rewrites the whole file from memory, so separate
+// instances would drop each other's entries.
+func strategyCacheFor(path string, logger logger.ContextLogger) *fileStrategyCache {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	strategyCachesMu.Lock()
+	defer strategyCachesMu.Unlock()
+	if c, ok := strategyCaches[path]; ok {
+		return c
+	}
+	c := newFileStrategyCache(path, logger)
+	strategyCaches[path] = c
+	return c
+}
+
 func newFileStrategyCache(path string, logger logger.ContextLogger) *fileStrategyCache {
 	c := &fileStrategyCache{path: path, logger: logger, entries: map[string][]byte{}}
 	data, err := os.ReadFile(path)
@@ -77,6 +99,10 @@ func (c *fileStrategyCache) Put(key string, value []byte) {
 func (c *fileStrategyCache) save() error {
 	data, err := json.Marshal(c.entries)
 	if err != nil {
+		return err
+	}
+	// A fresh data directory may not exist yet.
+	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(c.path), filepath.Base(c.path)+".*")

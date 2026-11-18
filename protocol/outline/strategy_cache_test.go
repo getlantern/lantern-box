@@ -50,3 +50,26 @@ func TestFileStrategyCache(t *testing.T) {
 		t.Fatalf("cache did not recover from a null file: %q, %v", got, ok)
 	}
 }
+
+func TestFileStrategyCacheCreatesItsDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fresh", "data", "strategies.json")
+	newFileStrategyCache(path, nil).Put("winner", []byte("w"))
+	if got, ok := newFileStrategyCache(path, nil).Get("winner"); !ok || string(got) != "w" {
+		t.Fatalf("cache in a missing directory did not persist: %q, %v", got, ok)
+	}
+}
+
+func TestStrategyCacheSharedPerPath(t *testing.T) {
+	dir := t.TempDir()
+	a := strategyCacheFor(filepath.Join(dir, "s.json"), nil)
+	b := strategyCacheFor(filepath.Join(dir, ".", "s.json"), nil)
+	if a != b {
+		t.Fatal("outbounds naming the same file must share one cache")
+	}
+	a.Put("from-a", []byte("1"))
+	b.Put("from-b", []byte("2"))
+	reloaded := newFileStrategyCache(filepath.Join(dir, "s.json"), nil)
+	if _, ok := reloaded.Get("from-a"); !ok {
+		t.Fatal("one outbound's save dropped the other's entry")
+	}
+}

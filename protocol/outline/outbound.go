@@ -107,7 +107,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		}
 	}
 	if options.StrategyCachePath != "" {
-		finderConfig.SetCache(newFileStrategyCache(options.StrategyCachePath, log))
+		finderConfig.SetCache(strategyCacheFor(options.StrategyCachePath, log))
 	}
 	finder, err := finderConfig.New()
 	if err != nil {

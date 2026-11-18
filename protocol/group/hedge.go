@@ -186,7 +186,14 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 		if err != nil {
 			return nil, err
 		}
-		return bufio.NewBindPacketConn(conn, destination), nil
+		// A plain UDP socket, which Then may return when First is skipped,
+		// takes only *net.UDPAddr; a domain name is kept for conns that
+		// resolve it.
+		var remote net.Addr = destination
+		if destination.IsIP() {
+			remote = destination.UDPAddr()
+		}
+		return bufio.NewBindPacketConn(conn, remote), nil
 	}
 	then, err := h.outbound(h.thenTag)
 	if err != nil {

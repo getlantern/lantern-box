@@ -10,7 +10,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -94,10 +96,19 @@ func h3Get(t *testing.T, u string, sc *socks.Client) (string, int, error) {
 			if sc == nil {
 				return quic.DialAddrEarly(ctx, addr, tlsCfg, cfg)
 			}
-			ua, err := net.ResolveUDPAddr("udp4", addr)
+			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
 			}
+			ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", host)
+			if err != nil {
+				return nil, err
+			}
+			portNum, err := strconv.Atoi(port)
+			if err != nil {
+				return nil, err
+			}
+			ua := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ips[0], uint16(portNum)))
 			pc, err := sc.ListenPacket(ctx, M.SocksaddrFromNet(ua))
 			if err != nil {
 				return nil, err
