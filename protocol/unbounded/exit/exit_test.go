@@ -5,14 +5,18 @@ package exit
 import (
 	"bytes"
 	"context"
+	stdtls "crypto/tls"
 	"encoding/base64"
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
 	sblog "github.com/sagernet/sing-box/log"
@@ -562,7 +566,7 @@ func TestExitCountsSessionsAndBytes(t *testing.T) {
 }
 
 func TestExitForcesBBR(t *testing.T) {
-	o := serviceOptions(context.Background(), sblog.NewNOPFactory().Logger(), nil, nil)
+	o := serviceOptions(context.Background(), nil, nil)
 	assert.True(t, o.IgnoreClientBandwidth)
 	assert.Zero(t, o.ReceiveBPS)
 	assert.Zero(t, o.SendBPS)
@@ -600,4 +604,36 @@ func TestExitNeverLogsAUoTDestination(t *testing.T) {
 	assert.Equal(t, "secret.example.com:53", md.Destination.String(), "routed by the real destination")
 	assert.Equal(t, InboundTag, md.Inbound)
 	assert.NotContains(t, logs.String(), "secret")
+}
+
+// A client's QUIC close reason is its own text, and could carry anything: sing-quic logs the
+// error it closes the session with, so the exit's logs must not see it.
+func TestExitNeverLogsAClientsCloseReason(t *testing.T) {
+	logs := &syncBuffer{}
+	e, _ := meteredExit(t, debugLogger(t, logs))
+	e.SetEnabled(true)
+	e.SetRouter(newEchoRouter(t), time.Now().Add(time.Hour))
+	vConn, uConn := pathPair(t)
+	_, password, _ := e.Options().Params()
+	serve(t, e, vConn, password)
+
+	// A hand-made Hysteria2 client, as the test client always closes with an empty reason.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// Only the PacketConn methods: quic-go would write to a *net.UDPConn's address.
+	qc, err := quic.Dial(ctx, struct{ net.PacketConn }{uConn}, placeholderAddr, &stdtls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}},
+		&quic.Config{EnableDatagrams: true})
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://hysteria/auth", nil)
+	require.NoError(t, err)
+	req.Header.Set("Hysteria-Auth", password)
+	req.Header.Set("Hysteria-CC-RX", "0")
+	resp, err := (&http3.Transport{}).NewClientConn(qc).RoundTrip(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	require.Equal(t, 233, resp.StatusCode, "authenticated")
+	require.NoError(t, qc.CloseWithError(0x101, "secret-close-reason"))
+
+	time.Sleep(200 * time.Millisecond)
+	assert.NotContains(t, logs.String(), "secret-close-reason")
 }

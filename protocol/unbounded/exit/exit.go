@@ -190,7 +190,7 @@ func (e *Exit) serve(ctx context.Context, conn net.PacketConn, password string) 
 		return
 	}
 	defer func() { _ = tlsConfig.Close() }()
-	svc, err := hysteria2.NewService[int](serviceOptions(ctx, e.logger, tlsConfig, &handler{exit: e}))
+	svc, err := hysteria2.NewService[int](serviceOptions(ctx, tlsConfig, &handler{exit: e}))
 	if err != nil {
 		e.logger.WarnContext(ctx, "unbounded exit: service: ", err)
 		return
@@ -210,11 +210,13 @@ func (e *Exit) serve(ctx context.Context, conn net.PacketConn, password string) 
 
 // serviceOptions forces BBR: with IgnoreClientBandwidth and no receive rate the service
 // answers every client RxAuto, so Brutal is never negotiated. No masquerade: a client that
-// fails authentication gets a bare 404.
-func serviceOptions(ctx context.Context, lg logger.ContextLogger, tlsConfig tls.ServerConfig, h hysteria2.ServerHandler) hysteria2.ServiceOptions {
+// fails authentication gets a bare 404. The service gets no logger: it logs the errors its
+// sessions end with, which quote a client's close reason, text the client chose. The handler
+// logs a failure's class instead.
+func serviceOptions(ctx context.Context, tlsConfig tls.ServerConfig, h hysteria2.ServerHandler) hysteria2.ServiceOptions {
 	return hysteria2.ServiceOptions{
 		Context:               ctx,
-		Logger:                lg,
+		Logger:                sblog.NewNOPFactory().Logger(),
 		TLSConfig:             tlsConfig,
 		IgnoreClientBandwidth: true,
 		SendBPS:               0,
