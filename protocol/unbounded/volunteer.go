@@ -74,6 +74,8 @@ type Volunteer struct {
 	exit   *exit.Exit
 	cancel context.CancelFunc
 	done   chan struct{}
+	// unwatch unregisters the rule set callbacks a direct exit waits on, if any.
+	unwatch []func()
 }
 
 func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts option.UnboundedVolunteerOptions) (adapter.Service, error) {
@@ -230,9 +232,12 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 
 func (v *Volunteer) Close() error {
 	v.mu.Lock()
-	ui, e, cancel, done := v.ui, v.exit, v.cancel, v.done
-	v.ui, v.exit, v.cancel, v.done = nil, nil, nil, nil
+	ui, e, cancel, done, unwatch := v.ui, v.exit, v.cancel, v.done, v.unwatch
+	v.ui, v.exit, v.cancel, v.done, v.unwatch = nil, nil, nil, nil, nil
 	v.mu.Unlock()
+	for _, f := range unwatch {
+		f()
+	}
 	if cancel != nil {
 		cancel()
 		<-done
@@ -279,8 +284,40 @@ func (v *Volunteer) startExit() *exit.Exit {
 	// A node's box carries one policy, and nodes register to serve the pool, so it serves pool
 	// sessions alone: its friends' room sessions, if any, relay to the egress as before rather
 	// than exit through a policy that isn't theirs.
-	e.SetRouter(exit.Pool, router, validUntil)
+	serve := func() { e.SetRouter(exit.Pool, router, validUntil) }
+	if err := directexit.AbuseRuleSetsLoaded(router); err != nil {
+		// sing-box started the box with the rule sets it couldn't download empty, so the abuse
+		// rejects would match nothing. The volunteer relays only until they load, which sing-box
+		// retries on its own back-off.
+		v.logger.WarnContext(v.ctx, "unbounded volunteer: no direct exit until its abuse rule sets load: ", err)
+		v.unwatch = whenAbuseRuleSetsLoad(router, serve)
+		return e
+	}
+	serve()
 	return e
+}
+
+// whenAbuseRuleSetsLoad calls f once router's abuse rule sets have all loaded, as they update,
+// and returns the funcs that stop it waiting.
+func whenAbuseRuleSetsLoad(router adapter.Router, f func()) []func() {
+	var once sync.Once
+	check := func() {
+		if directexit.AbuseRuleSetsLoaded(router) == nil {
+			once.Do(f)
+		}
+	}
+	var unwatch []func()
+	for _, tag := range directexit.AbuseRuleSetTags {
+		set, ok := router.RuleSet(tag)
+		if !ok {
+			continue
+		}
+		el := set.RegisterCallback(func(adapter.RuleSet) { check() })
+		unwatch = append(unwatch, func() { set.UnregisterCallback(el) })
+	}
+	// A set that loaded before its callback was registered.
+	check()
+	return unwatch
 }
 
 // stunPreflight logs STUN checks that fail. A node that can't reach any STUN server stops taking

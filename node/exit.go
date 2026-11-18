@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
 
+	"github.com/getlantern/lantern-box/internal/directexit"
 	"github.com/getlantern/lantern-box/peerrules"
 	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 )
@@ -318,7 +319,9 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse, r
 		}
 		b, err := r.newBox(ctx, options)
 		if err != nil {
-			errs = append(errs, &exitStageError{stage: "start the " + kind.String() + " exit box", err: err})
+			// Unloaded rule sets are named by tag alone; other start errors can quote the config.
+			errs = append(errs, &exitStageError{stage: "start the " + kind.String() + " exit box", err: err,
+				loggable: errors.Is(err, directexit.ErrAbuseRuleSetsNotLoaded)})
 			continue
 		}
 		if !time.Now().Before(validUntil) {
@@ -531,6 +534,13 @@ func newExitSingBox(ctx context.Context, options string) (ExitBox, error) {
 	service.MustRegister[log.Factory](ctx, log.NewNOPFactory())
 	b, err := startSingBox(ctx, options)
 	if err != nil {
+		return nil, err
+	}
+	// sing-box starts with a remote rule set it couldn't download empty, so the abuse rejects
+	// would match nothing ahead of the exit's final route. RunExit retries such a box on its
+	// back-off, and the kind's current box, if any, serves on until then.
+	if err := directexit.AbuseRuleSetsLoaded(b.Router()); err != nil {
+		_ = b.Close()
 		return nil, err
 	}
 	return singExitBox{b: b, ctx: ctx}, nil

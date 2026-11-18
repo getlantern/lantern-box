@@ -23,12 +23,9 @@ import (
 // If the server-side list grows or renames a tag, this list grows
 // with it — the server-side test asserts the emit side; this list
 // asserts the client side sees the same shape after registration.
-var abuseRuleSetTags = []string{
-	"geosite-malware",
-	"geoip-malware",
-	"geosite-phishing",
-	"geosite-cryptominers",
-}
+// directexit holds it so that the volunteer service, which can't
+// import peerrules, checks the same tags have loaded.
+var abuseRuleSetTags = directexit.AbuseRuleSetTags
 
 // rfc1918CanaryCIDR and smtpCanaryPort are sentinel values that, if
 // missing from the launch_cfg's reject rules, indicate the server-

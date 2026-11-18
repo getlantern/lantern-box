@@ -29,6 +29,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	box "github.com/getlantern/lantern-box"
+	"github.com/getlantern/lantern-box/internal/directexit"
 	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 )
 
@@ -973,6 +974,118 @@ func TestRunExitRenewsOnTimeAfterASlowStart(t *testing.T) {
 	waitDone(t, done)
 }
 
+// inlineExitBoxConfig is an exit box whose abuse rule sets are inline, so it downloads nothing.
+const inlineExitBoxConfig = `{
+	"log": {"disabled": true},
+	"outbounds": [{"type": "direct", "tag": "direct"}],
+	"route": {
+		"rule_set": [
+			{"type": "inline", "tag": "geosite-malware", "rules": [{"domain": ["malware.test"]}]},
+			{"type": "inline", "tag": "geoip-malware", "rules": [{"ip_cidr": ["192.0.2.66/32"]}]},
+			{"type": "inline", "tag": "geosite-phishing", "rules": [{"domain": ["phishing.test"]}]},
+			{"type": "inline", "tag": "geosite-cryptominers", "rules": [{"domain": ["cryptominer.test"]}]}
+		],
+		"rules": [
+			{"action": "reject", "rule_set": ["geosite-malware", "geoip-malware", "geosite-phishing", "geosite-cryptominers"]},
+			{"action": "route", "outbound": "direct"}
+		]
+	}
+}`
+
+// unloadedRuleSetConfig is a box whose geosite-malware is remote, at %q, and whose other abuse
+// rule sets are inline.
+const unloadedRuleSetConfig = `{
+	"log": {"disabled": true},
+	"outbounds": [{"type": "direct", "tag": "direct"}],
+	"route": {
+		"rule_set": [
+			{"type": "remote", "tag": "geosite-malware", "format": "source", "url": %q, "download_detour": "direct"},
+			{"type": "inline", "tag": "geoip-malware", "rules": [{"ip_cidr": ["192.0.2.66/32"]}]},
+			{"type": "inline", "tag": "geosite-phishing", "rules": [{"domain": ["phishing.test"]}]},
+			{"type": "inline", "tag": "geosite-cryptominers", "rules": [{"domain": ["cryptominer.test"]}]}
+		],
+		"rules": [
+			{"action": "reject", "rule_set": ["geosite-malware", "geoip-malware", "geosite-phishing", "geosite-cryptominers"]},
+			{"action": "route", "outbound": "direct"}
+		]
+	}
+}`
+
+// sing-box starts a box whose remote rule set failed to download with the set empty, so its
+// rejects match nothing. The default NewBox refuses such a box.
+func TestNewExitSingBoxRefusesUnloadedAbuseRuleSets(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status int
+		ok     bool
+	}{
+		"download fails": {status: http.StatusInternalServerError},
+		"download works": {status: http.StatusOK, ok: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				if tc.status == http.StatusOK {
+					_, _ = w.Write([]byte(`{"version": 3, "rules": [{"domain": ["malware.test"]}]}`))
+				}
+			}))
+			t.Cleanup(srv.Close)
+			ctx, cancel := context.WithCancel(box.BaseContext())
+			defer cancel()
+			b, err := newExitSingBox(ctx, fmt.Sprintf(unloadedRuleSetConfig, srv.URL))
+			if tc.ok {
+				require.NoError(t, err)
+				require.NoError(t, b.Close())
+				return
+			}
+			require.ErrorIs(t, err, directexit.ErrAbuseRuleSetsNotLoaded)
+			assert.Nil(t, b)
+		})
+	}
+}
+
+// A box whose abuse rule sets didn't load leaves its kind's current box serving, and is logged
+// as such, with RunExit retrying.
+func TestRunExitKeepsTheBoxWhenRuleSetsDontLoad(t *testing.T) {
+	buf := &exitLogBuffer{}
+	factory := log.NewDefaultFactory(context.Background(), log.Formatter{}, buf, "", nil, false)
+	factory.SetLevel(log.LevelTrace)
+	require.NoError(t, factory.Start())
+	prev := log.StdLogger()
+	log.SetStdLogger(factory.Logger())
+	t.Cleanup(func() {
+		log.SetStdLogger(prev)
+		_ = factory.Close()
+	})
+	var registers atomic.Int32
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"server_config": rotatedConfig(int(registers.Add(1)))})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	boxes := &fakeExitBoxes{ev: ev}
+	var builds atomic.Int32
+	newBox := func(ctx context.Context, options string) (ExitBox, error) {
+		if builds.Add(1) > 1 {
+			return nil, fmt.Errorf("start: %w: geosite-malware", directexit.ErrAbuseRuleSetsNotLoaded)
+		}
+		return boxes.new(ctx, options)
+	}
+	reregister := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: newBox, RotationInterval: time.Hour, Reregister: reregister}, ev)
+	require.Eventually(t, func() bool { return e.Options().Ready(false) }, 5*time.Second, time.Millisecond)
+	reregister <- struct{}{}
+	require.Eventually(t, func() bool { return builds.Load() >= 3 }, 5*time.Second, time.Millisecond, "it retries")
+	assert.True(t, e.Options().Ready(false), "the current box keeps serving")
+	closed, _ := boxes.last().isClosed()
+	assert.False(t, closed)
+	cancel()
+	waitDone(t, done)
+	assert.Contains(t, buf.String(), "abuse rule sets haven't loaded: geosite-malware")
+}
+
 // holdOffs records what RunExit reports through OnHoldOff.
 type holdOffs struct {
 	mu    sync.Mutex
@@ -1177,7 +1290,7 @@ func TestRunExitLogsNoSecrets(t *testing.T) {
 func TestNewExitSingBoxRoutes(t *testing.T) {
 	ctx, cancel := context.WithCancel(box.BaseContext())
 	defer cancel()
-	b, err := newExitSingBox(ctx, `{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	b, err := newExitSingBox(ctx, inlineExitBoxConfig)
 	require.NoError(t, err)
 	assert.NotNil(t, b.Router())
 	b.ResetNetwork()
@@ -1189,7 +1302,7 @@ func TestNewExitSingBoxKeepsItsServicesToItself(t *testing.T) {
 	defer cancel()
 	sentinel := log.NewDefaultFactory(context.Background(), log.Formatter{}, io.Discard, "", nil, false)
 	service.MustRegister[log.Factory](ctx, sentinel)
-	b, err := newExitSingBox(ctx, `{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	b, err := newExitSingBox(ctx, inlineExitBoxConfig)
 	require.NoError(t, err)
 	defer func() { _ = b.Close() }()
 	assert.Same(t, sentinel, service.FromContext[log.Factory](ctx), "the caller's log factory is still its own")
@@ -1217,7 +1330,7 @@ func TestNewExitSingBoxNeverUsesTheCallersLogFactory(t *testing.T) {
 	defer cancel()
 	sentinel := &sentinelFactory{Factory: log.NewNOPFactory()}
 	service.MustRegister[log.Factory](ctx, sentinel)
-	b, err := newExitSingBox(ctx, `{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	b, err := newExitSingBox(ctx, inlineExitBoxConfig)
 	require.NoError(t, err)
 	require.NoError(t, b.Close())
 	assert.False(t, sentinel.used.Load(), "the exit box logs nothing through the caller's factory")

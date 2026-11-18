@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -170,6 +172,63 @@ func TestVolunteerDirectExitEndsAtItsDeadline(t *testing.T) {
 			assert.Equal(t, tc.ready, e.Ready(false))
 			assert.Eventually(t, func() bool { return !e.Ready(false) }, 10*time.Second, 20*time.Millisecond,
 				"the exit stops at the deadline")
+		})
+	}
+}
+
+// sing-box starts a box whose remote rule set failed to download with the set empty, so its
+// abuse rejects would match nothing. The volunteer offers no direct exit until every abuse rule
+// set has loaded, and offers them once a later download succeeds.
+func TestVolunteerDirectExitWaitsForItsAbuseRuleSets(t *testing.T) {
+	probe, err := exit.New(context.Background(), sblog.NewNOPFactory().Logger())
+	if errors.Is(err, exit.ErrUnavailable) {
+		t.Skip("built without with_quic")
+	}
+	probe.Close()
+	unreachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(unreachable.Close)
+
+	for name, failures := range map[string]int32{
+		"never loads":      1 << 30,
+		"loads on a retry": 1,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var served atomic.Int32
+			lists := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if served.Add(1) <= failures {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				_, _ = w.Write([]byte(`{"version": 3, "rules": [{"domain": ["malware.test"]}]}`))
+			}))
+			t.Cleanup(lists.Close)
+			config := strings.Replace(directExitBoxConfig,
+				`{"type": "inline", "tag": "geosite-malware", "rules": [{"domain": ["malware.test"]}]}`,
+				fmt.Sprintf(`{"type": "remote", "tag": "geosite-malware", "format": "source", "url": %q, "download_detour": "direct"}`, lists.URL), 1)
+			ctx := service.ExtendContext(lbox.BaseContext())
+			opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(fmt.Sprintf(config,
+				unreachable.URL, "ws"+unreachable.URL[len("http"):], true)))
+			require.NoError(t, err)
+			ctx, stripped := peerrules.CheckDirectExit(ctx, &opts)
+			require.False(t, stripped)
+			b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = b.Close() })
+			require.NoError(t, b.Start())
+
+			svc, ok := service.FromContext[adapter.ServiceManager](ctx).Get("volunteer")
+			require.True(t, ok)
+			e := unbounded.VolunteerExit(svc)
+			require.NotNil(t, e)
+			if failures > 1 {
+				assert.Never(t, func() bool { return e.Ready(false) }, time.Second, 20*time.Millisecond,
+					"a direct exit while its abuse rule sets are empty")
+				return
+			}
+			assert.Eventually(t, func() bool { return e.Ready(false) }, 10*time.Second, 20*time.Millisecond,
+				"the direct exit once its abuse rule sets loaded")
 		})
 	}
 }
