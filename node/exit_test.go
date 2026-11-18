@@ -216,13 +216,13 @@ type recordingExit struct {
 	ev *exitEvents
 }
 
-func (r *recordingExit) SetRouter(router adapter.ConnectionRouterEx, validUntil time.Time) {
+func (r *recordingExit) SetRouter(kind exit.Kind, router adapter.ConnectionRouterEx, validUntil time.Time) {
 	if fr, ok := router.(*fakeExitRouter); ok {
 		r.ev.add("router %d", fr.id)
 	} else {
 		r.ev.add("router nil")
 	}
-	r.Exit.SetRouter(router, validUntil)
+	r.Exit.SetRouter(kind, router, validUntil)
 }
 
 // runExitAsync runs the registrar with fast retries, recording its routers in ev.
@@ -271,7 +271,7 @@ func TestRunExitRegistersWebRTCOnly(t *testing.T) {
 			Header: func(h http.Header) { h.Set("X-Lantern-App", "lantern") },
 		})
 	}()
-	require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return e.Options().Ready(false) }, 5*time.Second, 10*time.Millisecond)
 	mu.Lock()
 	assert.Equal(t, map[string]any{"mode": "webrtc"}, got)
 	assert.Equal(t, "lantern", hdr.Get("X-Lantern-App"), "the caller's headers win")
@@ -286,7 +286,7 @@ func TestRunExitRegistersWebRTCOnly(t *testing.T) {
 	assert.Zero(t, b.extras, "the exit box opens no listeners and runs no services")
 	cancel()
 	waitDone(t, done)
-	assert.False(t, e.Options().Ready())
+	assert.False(t, e.Options().Ready(false))
 	closed, _ := b.isClosed()
 	assert.True(t, closed)
 }
@@ -315,7 +315,7 @@ func TestRunExitRefusesConfigWithoutAbuseRules(t *testing.T) {
 	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e, NewBox: boxes.new}, ev)
 	require.Eventually(t, func() bool { return registers.Load() >= 3 }, 5*time.Second, 5*time.Millisecond, "it keeps retrying")
 	assert.Empty(t, boxes.all(), "no box is built from a config without the abuse rules")
-	assert.False(t, e.Options().Ready())
+	assert.False(t, e.Options().Ready(false))
 	cancel()
 	waitDone(t, done)
 }
@@ -341,7 +341,7 @@ func TestRunExitRefusesConfigWithoutAResolveAndPrivateReject(t *testing.T) {
 			done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e, NewBox: boxes.new}, ev)
 			require.Eventually(t, func() bool { return registers.Load() >= 2 }, 5*time.Second, 5*time.Millisecond)
 			assert.Empty(t, boxes.all(), "no box is built from a config that skips IP rules for domains")
-			assert.False(t, e.Options().Ready())
+			assert.False(t, e.Options().Ready(false))
 			cancel()
 			waitDone(t, done)
 		})
@@ -359,7 +359,7 @@ func TestRunExitRotatesWithoutAGap(t *testing.T) {
 	defer cancel()
 	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e, NewBox: boxes.new,
 		RotationInterval: 100 * time.Millisecond}, ev)
-	require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return e.Options().Ready(false) }, 5*time.Second, time.Millisecond)
 
 	var gap atomic.Bool
 	stop := make(chan struct{})
@@ -372,7 +372,7 @@ func TestRunExitRotatesWithoutAGap(t *testing.T) {
 				return
 			default:
 			}
-			if !e.Options().Ready() {
+			if !e.Options().Ready(false) {
 				gap.Store(true)
 			}
 			time.Sleep(time.Millisecond)
@@ -410,16 +410,16 @@ func TestRunExitKeepsServingUntilExpiryWhenRefused(t *testing.T) {
 	const rotation = 100 * time.Millisecond
 	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e, NewBox: boxes.new,
 		RotationInterval: rotation}, ev)
-	require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return e.Options().Ready(false) }, 5*time.Second, time.Millisecond)
 	require.Eventually(t, func() bool { return registers.Load() >= 2 }, 5*time.Second, time.Millisecond)
 	b := boxes.last()
 	if time.Since(b.builtAt) < 2*rotation-20*time.Millisecond {
-		assert.True(t, e.Options().Ready(), "a refusal leaves the current box serving until it expires")
+		assert.True(t, e.Options().Ready(false), "a refusal leaves the current box serving until it expires")
 	}
 	require.Eventually(t, func() bool { closed, _ := b.isClosed(); return closed }, 5*time.Second, 5*time.Millisecond)
 	_, closedAt := b.isClosed()
 	assert.GreaterOrEqual(t, closedAt.Sub(b.builtAt), 2*rotation, "the box serves until two rotations have passed")
-	assert.False(t, e.Options().Ready())
+	assert.False(t, e.Options().Ready(false))
 	assert.Len(t, boxes.all(), 1)
 	assert.Equal(t, []string{"build 1", "router 1", "router nil", "close 1"}, ev.list())
 	cancel()
@@ -470,7 +470,7 @@ func TestRunExitMarksTheExitBoxsSockets(t *testing.T) {
 			}
 			done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
 				NewBox: boxes.new, RoutingMark: tc.cfgMark}, ev)
-			require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, 5*time.Millisecond)
+			require.Eventually(t, func() bool { return e.Options().Ready(false) }, 5*time.Second, 5*time.Millisecond)
 			assert.Equal(t, tc.wantMark, boxes.last().defaultMark)
 			cancel()
 			waitDone(t, done)
@@ -506,13 +506,13 @@ func TestRunExitResetsTheExitBoxsNetwork(t *testing.T) {
 	require.Eventually(t, func() bool { return registers.Load() == 1 }, 5*time.Second, time.Millisecond)
 	reset <- struct{}{}
 	require.Eventually(t, func() bool { return len(reset) == 0 }, 5*time.Second, time.Millisecond)
-	require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return e.Options().Ready(false) }, 5*time.Second, 5*time.Millisecond)
 	assert.Equal(t, []string{"build 1", "router 1"}, ev.list())
 
 	reset <- struct{}{}
 	require.Eventually(t, func() bool { return len(ev.list()) == 3 }, 5*time.Second, time.Millisecond)
 	assert.Equal(t, []string{"build 1", "router 1", "reset 1"}, ev.list())
-	assert.True(t, e.Options().Ready(), "a reset keeps the box serving")
+	assert.True(t, e.Options().Ready(false), "a reset keeps the box serving")
 	cancel()
 	waitDone(t, done)
 }
@@ -562,7 +562,7 @@ func TestRunExitHonorsRetryAfter(t *testing.T) {
 			started := time.Now()
 			done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
 				NewBox: (&fakeExitBoxes{ev: ev}).new, OnHoldOff: held.record}, ev)
-			require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, 5*time.Millisecond)
+			require.Eventually(t, func() bool { return e.Options().Ready(false) }, 5*time.Second, 5*time.Millisecond)
 			mu.Lock()
 			require.Len(t, at, 2)
 			gap := at[1].Sub(at[0])
@@ -626,7 +626,7 @@ func TestRunExitWaitsForNotBefore(t *testing.T) {
 	notBefore := time.Now().Add(300 * time.Millisecond)
 	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
 		NewBox: (&fakeExitBoxes{ev: ev}).new, NotBefore: notBefore}, ev)
-	require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return e.Options().Ready(false) }, 5*time.Second, 5*time.Millisecond)
 	mu.Lock()
 	assert.False(t, first.Before(notBefore), "registered before NotBefore")
 	mu.Unlock()

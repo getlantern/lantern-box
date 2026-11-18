@@ -16,12 +16,15 @@ import (
 	"github.com/getlantern/lantern-box/protocol/internal/failureclass"
 )
 
-// handler routes each of a session's streams and flows through the router current at that
-// moment, so that a stream opened after the exit box rotates goes to the new one.
-type handler struct{ exit *Exit }
+// handler routes each of a session's streams and flows through its kind's router current at
+// that moment, so that a stream opened after the exit box rotates goes to the new one.
+type handler struct {
+	exit *Exit
+	kind Kind
+}
 
 func (h *handler) NewConnectionEx(ctx context.Context, conn net.Conn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	r := h.exit.currentRouter()
+	r := h.exit.currentRouter(h.kind)
 	if r == nil {
 		_ = N.CloseOnHandshakeFailure(conn, onClose, os.ErrClosed)
 		return
@@ -31,7 +34,7 @@ func (h *handler) NewConnectionEx(ctx context.Context, conn net.Conn, source, de
 }
 
 func (h *handler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	r := h.exit.currentRouter()
+	r := h.exit.currentRouter(h.kind)
 	if r == nil {
 		_ = N.CloseOnHandshakeFailure(conn, onClose, os.ErrClosed)
 		return

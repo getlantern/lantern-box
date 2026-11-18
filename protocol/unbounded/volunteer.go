@@ -276,7 +276,10 @@ func (v *Volunteer) startExit() *exit.Exit {
 		validUntil = time.Now().Add(directExitLifetime)
 	}
 	e.SetEnabled(true)
-	e.SetRouter(router, validUntil)
+	// A node's box carries one policy, and nodes register to serve the pool, so it serves pool
+	// sessions alone: its friends' room sessions, if any, relay to the egress as before rather
+	// than exit through a policy that isn't theirs.
+	e.SetRouter(exit.Pool, router, validUntil)
 	return e
 }
 

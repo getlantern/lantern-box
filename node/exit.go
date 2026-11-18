@@ -88,7 +88,7 @@ type ExitBox interface {
 
 // exitRouterSetter is the part of exit.Exit the registrar drives.
 type exitRouterSetter interface {
-	SetRouter(r adapter.ConnectionRouterEx, validUntil time.Time)
+	SetRouter(kind exit.Kind, r adapter.ConnectionRouterEx, validUntil time.Time)
 }
 
 type exitRunner struct {
@@ -265,7 +265,7 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) e
 	}
 	prev := r.box
 	r.box, r.rotation, r.validUntil = b, rotation, time.Now().Add(2*rotation)
-	r.exit.SetRouter(b.Router(), r.validUntil)
+	r.exit.SetRouter(exit.Pool, b.Router(), r.validUntil)
 	if prev != nil {
 		_ = prev.Close()
 	}
@@ -325,7 +325,7 @@ func (r *exitRunner) close() {
 	if r.box == nil {
 		return
 	}
-	r.exit.SetRouter(nil, time.Time{})
+	r.exit.SetRouter(exit.Pool, nil, time.Time{})
 	_ = r.box.Close()
 	r.box, r.validUntil = nil, time.Time{}
 }

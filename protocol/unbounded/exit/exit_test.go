@@ -166,17 +166,23 @@ func readyExit(t *testing.T, r adapter.ConnectionRouterEx) *Exit {
 	t.Helper()
 	e := newTestExit(t)
 	e.SetEnabled(true)
-	e.SetRouter(r, time.Now().Add(time.Hour))
+	e.SetRouter(Pool, r, time.Now().Add(time.Hour))
 	return e
 }
 
-// serve runs the exit's Serve on conn until the test ends, and returns a channel closed
-// when Serve returns.
+// serve runs the exit's Serve on conn for a pool session until the test ends, and returns a
+// channel closed when Serve returns.
 func serve(t *testing.T, e *Exit, conn net.PacketConn, password string) <-chan struct{} {
+	t.Helper()
+	return serveKind(t, e, conn, password, Pool)
+}
+
+// serveKind is serve for a session of kind.
+func serveKind(t *testing.T, e *Exit, conn net.PacketConn, password string, kind Kind) <-chan struct{} {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { e.Options().Serve(ctx, conn, password); close(done) }()
+	go func() { e.Options().Serve(ctx, conn, password, kind == Personal); close(done) }()
 	t.Cleanup(func() {
 		cancel()
 		<-done
@@ -247,27 +253,27 @@ func echo(t *testing.T, c *hysteria2.Client) {
 func TestExitNotReadyUntilEnabledAndRouted(t *testing.T) {
 	e := newTestExit(t)
 	o := e.Options()
-	assert.False(t, o.Ready(), "new: off and no router")
+	assert.False(t, o.Ready(false), "new: off and no router")
 	e.SetEnabled(true)
-	assert.False(t, o.Ready(), "no router")
-	e.SetRouter(&dialRouter{}, time.Now().Add(time.Hour))
-	assert.True(t, o.Ready())
-	_, _, ok := o.Params()
+	assert.False(t, o.Ready(false), "no router")
+	e.SetRouter(Pool, &dialRouter{}, time.Now().Add(time.Hour))
+	assert.True(t, o.Ready(false))
+	_, _, ok := o.Params(false)
 	assert.True(t, ok)
-	e.SetRouter(&dialRouter{}, time.Now().Add(-time.Second))
-	assert.False(t, o.Ready(), "registration expired")
-	_, _, ok = o.Params()
+	e.SetRouter(Pool, &dialRouter{}, time.Now().Add(-time.Second))
+	assert.False(t, o.Ready(false), "registration expired")
+	_, _, ok = o.Params(false)
 	assert.False(t, ok)
-	e.SetRouter(&dialRouter{}, time.Now().Add(time.Hour))
+	e.SetRouter(Pool, &dialRouter{}, time.Now().Add(time.Hour))
 	e.SetEnabled(false)
-	assert.False(t, o.Ready(), "flag off")
+	assert.False(t, o.Ready(false), "flag off")
 	e.SetEnabled(true)
-	assert.True(t, o.Ready(), "flag back on")
+	assert.True(t, o.Ready(false), "flag back on")
 	e.Close()
-	assert.False(t, o.Ready(), "closed")
+	assert.False(t, o.Ready(false), "closed")
 	e.SetEnabled(true)
-	e.SetRouter(&dialRouter{}, time.Now().Add(time.Hour))
-	assert.False(t, o.Ready(), "closed for good")
+	e.SetRouter(Pool, &dialRouter{}, time.Now().Add(time.Hour))
+	assert.False(t, o.Ready(false), "closed for good")
 }
 
 func TestExitOptionsAreStable(t *testing.T) {
@@ -277,9 +283,9 @@ func TestExitOptionsAreStable(t *testing.T) {
 
 func TestExitParamsAreFreshPerSession(t *testing.T) {
 	e := readyExit(t, &dialRouter{})
-	pin1, pw1, ok := e.Options().Params()
+	pin1, pw1, ok := e.Options().Params(false)
 	require.True(t, ok)
-	pin2, pw2, _ := e.Options().Params()
+	pin2, pw2, _ := e.Options().Params(false)
 	assert.Equal(t, pin1, pin2, "one certificate per process")
 	assert.NotEqual(t, pw1, pw2)
 	raw, err := base64.RawURLEncoding.DecodeString(pw1)
@@ -291,7 +297,7 @@ func TestExitServesTCPThroughTheRouter(t *testing.T) {
 	r := newEchoRouter(t)
 	e := readyExit(t, r)
 	vConn, uConn := pathPair(t)
-	pin, password, _ := e.Options().Params()
+	pin, password, _ := e.Options().Params(false)
 	serve(t, e, vConn, password)
 	echo(t, testClient(t, uConn, pin, password))
 	md := r.lastRouted()
@@ -319,7 +325,7 @@ func TestExitEndsTheStreamWhenTheDestinationCloses(t *testing.T) {
 	}()
 	e := readyExit(t, &dialRouter{dial: l.Addr().String()})
 	vConn, uConn := pathPair(t)
-	pin, password, _ := e.Options().Params()
+	pin, password, _ := e.Options().Params(false)
 	serve(t, e, vConn, password)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -340,11 +346,11 @@ func TestExitRoutesThroughTheCurrentRouter(t *testing.T) {
 	r1, r2 := newEchoRouter(t), newEchoRouter(t)
 	e := readyExit(t, r1)
 	vConn, uConn := pathPair(t)
-	pin, password, _ := e.Options().Params()
+	pin, password, _ := e.Options().Params(false)
 	serve(t, e, vConn, password)
 	c := testClient(t, uConn, pin, password)
 	echo(t, c)
-	e.SetRouter(r2, time.Now().Add(time.Hour))
+	e.SetRouter(Pool, r2, time.Now().Add(time.Hour))
 	echo(t, c)
 	assert.Equal(t, 1, r1.count())
 	assert.Equal(t, 1, r2.count(), "a stream opened after rotation goes to the new router")
@@ -361,10 +367,10 @@ func TestExitRejectsAWrongPasswordOrPin(t *testing.T) {
 			r := newEchoRouter(t)
 			e := readyExit(t, r)
 			vConn, uConn := pathPair(t)
-			pin, password, _ := e.Options().Params()
+			pin, password, _ := e.Options().Params(false)
 			serve(t, e, vConn, password)
 			if tc.wrongPassword {
-				_, password, _ = e.Options().Params() // another session's password
+				_, password, _ = e.Options().Params(false) // another session's password
 			}
 			if tc.wrongPin {
 				other, err := newCertificate()
@@ -384,13 +390,13 @@ func TestExitRejectsAWrongPasswordOrPin(t *testing.T) {
 func TestExitServeEndsWhenRevoked(t *testing.T) {
 	for name, revoke := range map[string]func(*Exit){
 		"disabled":       func(e *Exit) { e.SetEnabled(false) },
-		"router cleared": func(e *Exit) { e.SetRouter(nil, time.Time{}) },
+		"router cleared": func(e *Exit) { e.SetRouter(Pool, nil, time.Time{}) },
 		"closed":         func(e *Exit) { e.Close() },
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := readyExit(t, newEchoRouter(t))
 			vConn, _ := pathPair(t)
-			_, password, _ := e.Options().Params()
+			_, password, _ := e.Options().Params(false)
 			done := serve(t, e, vConn, password)
 			revoke(e)
 			select {
@@ -407,9 +413,9 @@ func TestExitServeEndsWhenRevoked(t *testing.T) {
 func TestExitExpiresWithItsRegistration(t *testing.T) {
 	e := newTestExit(t)
 	e.SetEnabled(true)
-	e.SetRouter(newEchoRouter(t), time.Now().Add(500*time.Millisecond))
+	e.SetRouter(Pool, newEchoRouter(t), time.Now().Add(500*time.Millisecond))
 	vConn, uConn := pathPair(t)
-	pin, password, _ := e.Options().Params()
+	pin, password, _ := e.Options().Params(false)
 	done := serve(t, e, vConn, password)
 	echo(t, testClient(t, uConn, pin, password))
 	select {
@@ -417,7 +423,7 @@ func TestExitExpiresWithItsRegistration(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve outlived the registration")
 	}
-	assert.False(t, e.Options().Ready())
+	assert.False(t, e.Options().Ready(false))
 }
 
 // A stream that reaches the exit after its registration ran out isn't routed, whether or not
@@ -429,11 +435,11 @@ func TestExitRoutesNothingAfterExpiry(t *testing.T) {
 	e.mu.Lock()
 	e.now = func() time.Time { return now.Add(2 * time.Hour) }
 	e.mu.Unlock()
-	assert.Nil(t, e.currentRouter())
+	assert.Nil(t, e.currentRouter(Pool))
 	server, client := net.Pipe()
 	defer client.Close()
 	closed := make(chan error, 1)
-	(&handler{exit: e}).NewConnectionEx(context.Background(), server, M.Socksaddr{}, M.ParseSocksaddr("example.com:80"),
+	(&handler{exit: e, kind: Pool}).NewConnectionEx(context.Background(), server, M.Socksaddr{}, M.ParseSocksaddr("example.com:80"),
 		func(err error) { closed <- err })
 	select {
 	case err := <-closed:
@@ -455,11 +461,11 @@ func TestExitRoutesNothingOnceRevoked(t *testing.T) {
 			r := newEchoRouter(t)
 			e := readyExit(t, r)
 			revoke(e)
-			assert.Nil(t, e.currentRouter())
+			assert.Nil(t, e.currentRouter(Pool))
 			server, client := net.Pipe()
 			defer client.Close()
 			closed := make(chan error, 2)
-			h := &handler{exit: e}
+			h := &handler{exit: e, kind: Pool}
 			h.NewConnectionEx(context.Background(), server, M.Socksaddr{}, M.ParseSocksaddr("example.com:80"),
 				func(err error) { closed <- err })
 			flow, _ := pathPair(t)
@@ -482,11 +488,11 @@ func TestExitRoutesNothingOnceRevoked(t *testing.T) {
 func TestExitExpiryIsTheCurrentRouters(t *testing.T) {
 	e := newTestExit(t)
 	e.SetEnabled(true)
-	e.SetRouter(newEchoRouter(t), time.Now().Add(100*time.Millisecond))
-	e.SetRouter(newEchoRouter(t), time.Now().Add(time.Hour))
+	e.SetRouter(Pool, newEchoRouter(t), time.Now().Add(100*time.Millisecond))
+	e.SetRouter(Pool, newEchoRouter(t), time.Now().Add(time.Hour))
 	time.Sleep(300 * time.Millisecond)
-	assert.True(t, e.Options().Ready())
-	assert.NotNil(t, e.currentRouter())
+	assert.True(t, e.Options().Ready(false))
+	assert.NotNil(t, e.currentRouter(Pool))
 }
 
 func TestExitServeEndsAtOnceWhenNotServable(t *testing.T) {
@@ -506,7 +512,7 @@ func TestExitRevocationDoesNotEndLaterSessions(t *testing.T) {
 	e.SetEnabled(false)
 	e.SetEnabled(true)
 	vConn, uConn := pathPair(t)
-	pin, password, _ := e.Options().Params()
+	pin, password, _ := e.Options().Params(false)
 	serve(t, e, vConn, password)
 	echo(t, testClient(t, uConn, pin, password))
 }
@@ -514,10 +520,10 @@ func TestExitRevocationDoesNotEndLaterSessions(t *testing.T) {
 func TestExitServeEndsWithItsContext(t *testing.T) {
 	e := readyExit(t, newEchoRouter(t))
 	vConn, _ := pathPair(t)
-	_, password, _ := e.Options().Params()
+	_, password, _ := e.Options().Params(false)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { e.Options().Serve(ctx, vConn, password); close(done) }()
+	go func() { e.Options().Serve(ctx, vConn, password, false); close(done) }()
 	cancel()
 	select {
 	case <-done:
@@ -529,7 +535,7 @@ func TestExitServeEndsWithItsContext(t *testing.T) {
 func TestExitServeEndsWithItsPath(t *testing.T) {
 	e := readyExit(t, newEchoRouter(t))
 	vConn, _ := pathPair(t)
-	_, password, _ := e.Options().Params()
+	_, password, _ := e.Options().Params(false)
 	done := serve(t, e, vConn, password)
 	time.Sleep(50 * time.Millisecond)
 	_ = vConn.UDPConn.Close() // the ICE session ends: reads fail
@@ -609,9 +615,9 @@ func TestExitCountsRefusals(t *testing.T) {
 	e, reader := meteredExit(t, debugLogger(t, logs))
 	r := &refuseRouter{}
 	e.SetEnabled(true)
-	e.SetRouter(r, time.Now().Add(time.Hour))
+	e.SetRouter(Pool, r, time.Now().Add(time.Hour))
 	vConn, uConn := pathPair(t)
-	pin, password, _ := e.Options().Params()
+	pin, password, _ := e.Options().Params(false)
 	serve(t, e, vConn, password)
 	c := testClient(t, uConn, pin, password)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -635,7 +641,7 @@ func TestExitCountsRefusals(t *testing.T) {
 func TestExitCountsSessionsAndBytes(t *testing.T) {
 	e, reader := meteredExit(t, sblog.NewNOPFactory().Logger())
 	e.SetEnabled(true)
-	e.SetRouter(newEchoRouter(t), time.Now().Add(time.Hour))
+	e.SetRouter(Pool, newEchoRouter(t), time.Now().Add(time.Hour))
 	e.Options().OnSession(true)
 	e.Options().OnSession(true)
 	e.Options().OnSession(false)
@@ -643,7 +649,7 @@ func TestExitCountsSessionsAndBytes(t *testing.T) {
 	assert.EqualValues(t, 1, counterSum(t, reader, "unbounded.exit.sessions", attribute.String("path", "webrtc")))
 
 	vConn, uConn := pathPair(t)
-	pin, password, _ := e.Options().Params()
+	pin, password, _ := e.Options().Params(false)
 	serve(t, e, vConn, password)
 	echo(t, testClient(t, uConn, pin, password))
 	require.Eventually(t, func() bool {
@@ -665,7 +671,7 @@ func TestExitForcesBBR(t *testing.T) {
 	// A client that asks for Brutal still connects, on BBR.
 	e := readyExit(t, newEchoRouter(t))
 	vConn, uConn := pathPair(t)
-	pin, password, _ := e.Options().Params()
+	pin, password, _ := e.Options().Params(false)
 	serve(t, e, vConn, password)
 	echo(t, testClient(t, uConn, pin, password, clientOpts{sendBPS: 10_000_000, receiveBPS: 10_000_000}))
 }
@@ -675,9 +681,9 @@ func TestExitNeverLogsAUoTDestination(t *testing.T) {
 	e, _ := meteredExit(t, debugLogger(t, logs))
 	r := &dialRouter{}
 	e.SetEnabled(true)
-	e.SetRouter(r, time.Now().Add(time.Hour))
+	e.SetRouter(Pool, r, time.Now().Add(time.Hour))
 	vConn, uConn := pathPair(t)
-	pin, password, _ := e.Options().Params()
+	pin, password, _ := e.Options().Params(false)
 	serve(t, e, vConn, password)
 	c := testClient(t, uConn, pin, password)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -699,9 +705,9 @@ func TestExitNeverLogsAClientsCloseReason(t *testing.T) {
 	logs := &syncBuffer{}
 	e, _ := meteredExit(t, debugLogger(t, logs))
 	e.SetEnabled(true)
-	e.SetRouter(newEchoRouter(t), time.Now().Add(time.Hour))
+	e.SetRouter(Pool, newEchoRouter(t), time.Now().Add(time.Hour))
 	vConn, uConn := pathPair(t)
-	_, password, _ := e.Options().Params()
+	_, password, _ := e.Options().Params(false)
 	serve(t, e, vConn, password)
 
 	// A hand-made Hysteria2 client, as the test client always closes with an empty reason.
@@ -723,4 +729,108 @@ func TestExitNeverLogsAClientsCloseReason(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 	assert.NotContains(t, logs.String(), "secret-close-reason")
+}
+
+// Each kind is ready on its own: enabled, with a router of its own whose registration hasn't
+// run out.
+func TestExitReadinessIsPerKind(t *testing.T) {
+	e := newTestExit(t)
+	o := e.Options()
+	e.SetEnabled(true)
+	e.SetRouter(Pool, &dialRouter{}, time.Now().Add(time.Hour))
+	assert.True(t, o.Ready(false))
+	assert.False(t, o.Ready(true), "no personal router")
+	_, _, ok := o.Params(true)
+	assert.False(t, ok)
+	e.SetRouter(Personal, &dialRouter{}, time.Now().Add(time.Hour))
+	assert.True(t, o.Ready(true))
+	_, _, ok = o.Params(true)
+	assert.True(t, ok)
+	e.SetRouter(Pool, &dialRouter{}, time.Now().Add(-time.Second))
+	assert.False(t, o.Ready(false), "pool registration expired")
+	assert.True(t, o.Ready(true), "the personal one hasn't")
+	e.SetEnabled(false)
+	assert.False(t, o.Ready(true), "the flag gates both kinds")
+}
+
+// A personal session routes only through the personal router, and a pool session only through
+// the pool router, with no fall back to the other kind's when its own is missing.
+func TestExitRoutesEachKindThroughItsOwnRouter(t *testing.T) {
+	pool, personal := newEchoRouter(t), newEchoRouter(t)
+	e := newTestExit(t)
+	e.SetEnabled(true)
+	e.SetRouter(Pool, pool, time.Now().Add(time.Hour))
+	e.SetRouter(Personal, personal, time.Now().Add(time.Hour))
+
+	for _, kind := range []Kind{Personal, Pool} {
+		vConn, uConn := pathPair(t)
+		pin, password, ok := e.Options().Params(kind == Personal)
+		require.True(t, ok)
+		serveKind(t, e, vConn, password, kind)
+		echo(t, testClient(t, uConn, pin, password))
+	}
+	assert.Equal(t, 1, personal.count(), "the personal session went through the personal router")
+	assert.Equal(t, 1, pool.count(), "the pool session through the pool router")
+
+	// With only one kind's router, the other kind's streams are refused, not crossed over.
+	for _, tc := range []struct {
+		cleared, other Kind
+		otherRouter    *dialRouter
+	}{
+		{Personal, Pool, pool},
+		{Pool, Personal, personal},
+	} {
+		e.SetRouter(Pool, pool, time.Now().Add(time.Hour))
+		e.SetRouter(Personal, personal, time.Now().Add(time.Hour))
+		e.SetRouter(tc.cleared, nil, time.Time{})
+		before := tc.otherRouter.count()
+		assert.Nil(t, e.currentRouter(tc.cleared))
+		server, client := net.Pipe()
+		closed := make(chan error, 1)
+		(&handler{exit: e, kind: tc.cleared}).NewConnectionEx(context.Background(), server, M.Socksaddr{},
+			M.ParseSocksaddr("example.com:80"), func(err error) { closed <- err })
+		select {
+		case err := <-closed:
+			assert.Error(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the stream was neither routed nor refused")
+		}
+		_ = client.Close()
+		assert.Equal(t, before, tc.otherRouter.count(), "a %s stream never reaches the %s router", tc.cleared, tc.other)
+	}
+}
+
+// Clearing or expiring one kind's router ends only that kind's sessions.
+func TestExitRevokingOneKindLeavesTheOther(t *testing.T) {
+	for name, revoke := range map[string]func(*Exit){
+		"cleared": func(e *Exit) { e.SetRouter(Personal, nil, time.Time{}) },
+		"expired": func(e *Exit) { e.SetRouter(Personal, newEchoRouter(t), time.Now().Add(100*time.Millisecond)) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newTestExit(t)
+			e.SetEnabled(true)
+			e.SetRouter(Pool, newEchoRouter(t), time.Now().Add(time.Hour))
+			e.SetRouter(Personal, newEchoRouter(t), time.Now().Add(time.Hour))
+			pConn, puConn := pathPair(t)
+			pin, poolPassword, _ := e.Options().Params(false)
+			poolDone := serveKind(t, e, pConn, poolPassword, Pool)
+			fConn, _ := pathPair(t)
+			_, personalPassword, _ := e.Options().Params(true)
+			personalDone := serveKind(t, e, fConn, personalPassword, Personal)
+			revoke(e)
+			select {
+			case <-personalDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the personal session outlived its router")
+			}
+			select {
+			case <-poolDone:
+				t.Fatal("the pool session ended with the personal router")
+			case <-time.After(200 * time.Millisecond):
+			}
+			echo(t, testClient(t, puConn, pin, poolPassword))
+			assert.True(t, e.Options().Ready(false))
+			assert.False(t, e.Options().Ready(true))
+		})
+	}
 }

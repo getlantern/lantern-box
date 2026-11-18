@@ -241,7 +241,7 @@ func startDirectExitRig(t testing.TB, c directExitCase) *directExitRig {
 	t.Cleanup(e.Close)
 	e.SetEnabled(c.enabled)
 	if c.router {
-		e.SetRouter(rig.router, time.Now().Add(time.Hour))
+		e.SetRouter(exit.Pool, rig.router, time.Now().Add(time.Hour))
 	}
 	exitOpts := *e.Options()
 	onSession := exitOpts.OnSession

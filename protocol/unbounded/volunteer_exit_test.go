@@ -123,9 +123,10 @@ func TestVolunteerDirectExitHooksIntoBroflake(t *testing.T) {
 				return
 			}
 			require.NotNil(t, e)
-			assert.True(t, e.Ready(), "the exit is on, with the box's router")
+			assert.True(t, e.Ready(false), "the exit is on, with the box's router")
+			assert.False(t, e.Ready(true), "a node's box carries the pool policy alone")
 			closeBox()
-			assert.False(t, e.Ready(), "closing the volunteer closes its exit")
+			assert.False(t, e.Ready(false), "closing the volunteer closes its exit")
 		})
 	}
 }
@@ -166,8 +167,8 @@ func TestVolunteerDirectExitEndsAtItsDeadline(t *testing.T) {
 			require.True(t, ok)
 			e := unbounded.VolunteerExit(svc)
 			require.NotNil(t, e)
-			assert.Equal(t, tc.ready, e.Ready())
-			assert.Eventually(t, func() bool { return !e.Ready() }, 5*time.Second, 20*time.Millisecond,
+			assert.Equal(t, tc.ready, e.Ready(false))
+			assert.Eventually(t, func() bool { return !e.Ready(false) }, 5*time.Second, 20*time.Millisecond,
 				"the exit stops at the deadline")
 		})
 	}

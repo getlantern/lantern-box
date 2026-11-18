@@ -186,7 +186,7 @@ func newVolunteerExit(t *testing.T) *volunteerExit {
 	t.Cleanup(e.Close)
 	r := newEchoRouter(t)
 	e.SetEnabled(true)
-	e.SetRouter(r, time.Now().Add(time.Hour))
+	e.SetRouter(exit.Pool, r, time.Now().Add(time.Hour))
 	return &volunteerExit{e: e, r: r}
 }
 
@@ -200,11 +200,11 @@ type session struct {
 // serveSession serves one session over vConn and returns the user's ExitPath.
 func (v *volunteerExit) serveSession(t *testing.T, vConn net.PacketConn, uConn *trackedConn) UBClientcore.ExitPath {
 	t.Helper()
-	pin, password, ok := v.e.Options().Params()
+	pin, password, ok := v.e.Options().Params(false)
 	require.True(t, ok)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { v.e.Options().Serve(ctx, vConn, password); close(done) }()
+	go func() { v.e.Options().Serve(ctx, vConn, password, false); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
 	return UBClientcore.ExitPath{Conn: uConn, CertPin: pin, Password: password}
 }
@@ -227,7 +227,7 @@ func (v *volunteerExit) badPinSession(t *testing.T) *session {
 	t.Helper()
 	s := v.session(t)
 	other := newVolunteerExit(t)
-	pin, _, _ := other.e.Options().Params()
+	pin, _, _ := other.e.Options().Params(false)
 	s.ep.CertPin = pin
 	return s
 }
@@ -289,7 +289,7 @@ func TestExitPathsFailOverFromASilentPath(t *testing.T) {
 	p := newTestExitPaths(t)
 	p.onExitPath(v.path(t))
 	_, uConn := pathPair(t)
-	pin, _, _ := v.e.Options().Params()
+	pin, _, _ := v.e.Options().Params(false)
 	p.onExitPath(UBClientcore.ExitPath{Conn: &trackedConn{placeholderConn: uConn}, CertPin: pin, Password: "x"})
 	started := time.Now()
 	conn, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr("example.com:80"))
@@ -605,7 +605,7 @@ func TestExitPathsOnExitPathDoesNotBlock(t *testing.T) {
 	p := newTestExitPaths(t)
 	_, uConn := pathPair(t)
 	other := newVolunteerExit(t)
-	pin, password, _ := other.e.Options().Params()
+	pin, password, _ := other.e.Options().Params(false)
 	done := make(chan struct{})
 	go func() {
 		p.onExitPath(UBClientcore.ExitPath{Conn: &trackedConn{placeholderConn: uConn}, CertPin: pin, Password: password})

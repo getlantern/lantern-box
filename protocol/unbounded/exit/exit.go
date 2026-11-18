@@ -31,7 +31,9 @@ var ErrUnavailable = errors.New("unbounded exit: built without with_quic")
 const InboundTag = "unbounded-exit"
 
 // Exit serves a volunteer's direct exits: Hysteria2 over each ICE path broflake hands it, with
-// each stream and flow routed into the current exit box as inbound unbounded-exit.
+// each stream and flow routed into the current exit box of the session's kind as inbound
+// unbounded-exit. A kind is servable only while the exit is enabled and that kind has a router
+// whose registration hasn't run out, and a session never routes through the other kind's.
 type Exit struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -39,51 +41,59 @@ type Exit struct {
 	cert   *certificate
 	opts   *UBClientcore.ExitOptions
 
-	mu         sync.Mutex
-	closed     bool
-	enabled    bool
-	router     adapter.ConnectionRouterEx
-	validUntil time.Time
-	// expiry clears the router at validUntil. routerGen counts SetRouter calls, so an expiry
-	// that fires after a later one leaves its router alone.
-	expiry    *time.Timer
-	routerGen uint64
-	// revoked is closed when the exit stops being servable, ending its sessions. A new
-	// channel replaces it once it is servable again.
-	revoked chan struct{}
+	mu      sync.Mutex
+	closed  bool
+	enabled bool
+	kinds   [2]kindState
 
 	now     func() time.Time
 	metrics *exitMetrics
 }
 
-// New makes an exit, off and with no router, and its certificate, which it keeps for its life.
+// kindState is one kind's exit box router.
+type kindState struct {
+	router     adapter.ConnectionRouterEx
+	validUntil time.Time
+	// expiry clears the router at validUntil. gen counts SetRouter calls for the kind, so an
+	// expiry that fires after a later one leaves its router alone.
+	expiry *time.Timer
+	gen    uint64
+	// revoked is closed when the kind stops being servable, ending its sessions. A new
+	// channel replaces it once it is servable again.
+	revoked chan struct{}
+}
+
+// New makes an exit, off and with no routers, and its certificate, which it keeps for its life.
 func New(ctx context.Context, lg logger.ContextLogger) (*Exit, error) {
 	cert, err := newCertificate()
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	revoked := make(chan struct{})
-	close(revoked)
 	e := &Exit{
 		ctx:     ctx,
 		cancel:  cancel,
 		logger:  lg,
 		cert:    cert,
-		revoked: revoked,
 		now:     time.Now,
 		metrics: newExitMetrics(),
 	}
+	for k := range e.kinds {
+		e.kinds[k].revoked = make(chan struct{})
+		close(e.kinds[k].revoked)
+	}
 	e.opts = &UBClientcore.ExitOptions{
-		Ready:     e.ready,
-		Params:    e.params,
-		Serve:     e.serve,
+		Ready:  func(personal bool) bool { return e.ready(KindOf(personal)) },
+		Params: func(personal bool) (string, string, bool) { return e.params(KindOf(personal)) },
+		Serve: func(ctx context.Context, conn net.PacketConn, password string, personal bool) {
+			e.serve(ctx, conn, password, KindOf(personal))
+		},
 		OnSession: func(directExit bool) { e.metrics.session(directExit) },
 	}
 	return e, nil
 }
 
-// SetEnabled sets the direct_exit flag. Turning it off also ends running sessions.
+// SetEnabled sets the direct_exit flag. Turning it off also ends running sessions of both kinds.
 func (e *Exit) SetEnabled(on bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -91,34 +101,37 @@ func (e *Exit) SetEnabled(on bool) {
 	e.updateRevokedLocked()
 }
 
-// SetRouter sets the current exit box's router and how long its registration lasts. nil
-// clears it and ends running sessions, as validUntil passing does.
-func (e *Exit) SetRouter(r adapter.ConnectionRouterEx, validUntil time.Time) {
+// SetRouter sets kind's current exit box router and how long its registration lasts. nil clears
+// it and ends the kind's running sessions, as validUntil passing does. The other kind is left
+// as it is.
+func (e *Exit) SetRouter(kind Kind, r adapter.ConnectionRouterEx, validUntil time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.routerGen++
-	if e.expiry != nil {
-		e.expiry.Stop()
-		e.expiry = nil
+	ks := &e.kinds[kind]
+	ks.gen++
+	if ks.expiry != nil {
+		ks.expiry.Stop()
+		ks.expiry = nil
 	}
 	if r != nil {
 		// The UoT router logs each flow's destination at info, so it gets no logger.
 		r = uotrouter.New(r, sblog.NewNOPFactory().Logger())
-		gen := e.routerGen
-		e.expiry = time.AfterFunc(validUntil.Sub(e.now()), func() { e.expire(gen) })
+		gen := ks.gen
+		ks.expiry = time.AfterFunc(validUntil.Sub(e.now()), func() { e.expire(kind, gen) })
 	}
-	e.router, e.validUntil = r, validUntil
+	ks.router, ks.validUntil = r, validUntil
 	e.updateRevokedLocked()
 }
 
-// expire clears the router set by SetRouter call gen, unless a later one replaced it.
-func (e *Exit) expire(gen uint64) {
+// expire clears kind's router set by its SetRouter call gen, unless a later one replaced it.
+func (e *Exit) expire(kind Kind, gen uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.routerGen != gen {
+	ks := &e.kinds[kind]
+	if ks.gen != gen {
 		return
 	}
-	e.router, e.validUntil, e.expiry = nil, time.Time{}, nil
+	ks.router, ks.validUntil, ks.expiry = nil, time.Time{}, nil
 	e.updateRevokedLocked()
 }
 
@@ -129,51 +142,56 @@ func (e *Exit) Options() *UBClientcore.ExitOptions { return e.opts }
 func (e *Exit) Close() {
 	e.mu.Lock()
 	e.closed = true
-	if e.expiry != nil {
-		e.expiry.Stop()
-		e.expiry = nil
+	for k := range e.kinds {
+		if ks := &e.kinds[k]; ks.expiry != nil {
+			ks.expiry.Stop()
+			ks.expiry = nil
+		}
 	}
 	e.updateRevokedLocked()
 	e.mu.Unlock()
 	e.cancel()
 }
 
-// updateRevokedLocked closes revoked when the exit can't serve, and opens a new one when it
-// can again. Expiry revokes through the router it clears.
+// updateRevokedLocked closes each kind's revoked when the kind can't serve, and opens a new one
+// when it can again. Expiry revokes through the router it clears.
 func (e *Exit) updateRevokedLocked() {
-	servable := !e.closed && e.enabled && e.router != nil
-	select {
-	case <-e.revoked:
-		if servable {
-			e.revoked = make(chan struct{})
-		}
-	default:
-		if !servable {
-			close(e.revoked)
+	for k := range e.kinds {
+		ks := &e.kinds[k]
+		servable := !e.closed && e.enabled && ks.router != nil
+		select {
+		case <-ks.revoked:
+			if servable {
+				ks.revoked = make(chan struct{})
+			}
+		default:
+			if !servable {
+				close(ks.revoked)
+			}
 		}
 	}
 }
 
-func (e *Exit) ready() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return !e.closed && e.enabled && e.router != nil && e.now().Before(e.validUntil)
+func (e *Exit) ready(kind Kind) bool {
+	return e.currentRouter(kind) != nil
 }
 
-// currentRouter is the router to route a stream or flow through, or nil once the exit is off
-// or closed or its registration has run out. Revocation ends sessions asynchronously, and
-// expiry by timer, so a session can still open streams and flows in the meantime.
-func (e *Exit) currentRouter() adapter.ConnectionRouterEx {
+// currentRouter is the router to route a stream or flow of a kind's session through, or nil
+// once the exit is off or closed or the kind's registration has run out or been cleared.
+// Revocation ends sessions asynchronously, and expiry by timer, so a session can still open
+// streams and flows in the meantime.
+func (e *Exit) currentRouter(kind Kind) adapter.ConnectionRouterEx {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed || !e.enabled || !e.now().Before(e.validUntil) {
+	ks := &e.kinds[kind]
+	if e.closed || !e.enabled || ks.router == nil || !e.now().Before(ks.validUntil) {
 		return nil
 	}
-	return e.router
+	return ks.router
 }
 
-func (e *Exit) params() (pin, password string, ok bool) {
-	if !e.ready() {
+func (e *Exit) params(kind Kind) (pin, password string, ok bool) {
+	if !e.ready(kind) {
 		return "", "", false
 	}
 	b := make([]byte, 32)
@@ -183,12 +201,12 @@ func (e *Exit) params() (pin, password string, ok bool) {
 	return e.cert.pin, base64.RawURLEncoding.EncodeToString(b), true
 }
 
-// serve is clientcore's Serve hook: one Hysteria2 service for one session's path. It returns
-// once ctx ends, the path's reads fail, or the exit is revoked, having closed the service and
-// conn.
-func (e *Exit) serve(ctx context.Context, conn net.PacketConn, password string) {
+// serve is clientcore's Serve hook: one Hysteria2 service for one session's path, routing
+// through kind's router alone. It returns once ctx ends, the path's reads fail, or the kind is
+// revoked, having closed the service and conn.
+func (e *Exit) serve(ctx context.Context, conn net.PacketConn, password string, kind Kind) {
 	e.mu.Lock()
-	revoked := e.revoked
+	revoked := e.kinds[kind].revoked
 	e.mu.Unlock()
 	defer func() { _ = conn.Close() }()
 	select {
@@ -221,7 +239,7 @@ func (e *Exit) serve(ctx context.Context, conn net.PacketConn, password string) 
 		return
 	}
 	defer func() { _ = tlsConfig.Close() }()
-	svc, err := hysteria2.NewService[int](serviceOptions(ctx, tlsConfig, &handler{exit: e}))
+	svc, err := hysteria2.NewService[int](serviceOptions(ctx, tlsConfig, &handler{exit: e, kind: kind}))
 	if err != nil {
 		e.logger.WarnContext(ctx, "unbounded exit: service: ", err)
 		return
