@@ -531,6 +531,30 @@ func (s *hedgeStream) runMove() {
 
 func (s *hedgeStream) releaseLocked() { s.held = nil }
 
+// unkeepUnsent takes the n bytes of p that a timed-out write sent as the
+// last of the copy, giving back the rest, so the caller's retry of them
+// isn't held twice. It reports false when a move began or finished, which
+// delivers all of p. When the copy no longer ends with p, as after a
+// concurrent write, it can't be reconciled, so the connection stops being
+// replayable.
+func (s *hedgeStream) unkeepUnsent(p []byte, n int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.moving || !s.onFirst {
+		return false
+	}
+	if s.held == nil {
+		return true // released at commit: nothing to replay
+	}
+	if len(s.held) >= len(p) && bytes.Equal(s.held[len(s.held)-len(p):], p) {
+		s.held = s.held[:len(s.held)-len(p)+n]
+		return true
+	}
+	s.noReplay = true
+	s.held = nil
+	return true
+}
+
 // closeWrite half-closes c, or reports errors.ErrUnsupported when it can't,
 // so the caller closes it instead.
 func closeWrite(c net.Conn) error {
@@ -617,9 +641,15 @@ func (s *hedgeStream) Write(p []byte) (int, error) {
 		s.mu.Unlock()
 
 		n, err := c.Write(p)
+		if err == nil || !kept {
+			return n, err
+		}
 		// A write that ran out the caller's deadline is the caller's
-		// timeout, not First failing.
-		if err == nil || !kept || isTimeout(err) {
+		// timeout, not First failing. While still on First, the copy gives
+		// back what wasn't sent, so the caller's retry of it isn't held
+		// twice. A move already under way delivers all of p instead, as
+		// below.
+		if isTimeout(err) && s.unkeepUnsent(p, n) {
 			return n, err
 		}
 		// p is in the copy, so a move delivers it.
@@ -945,6 +975,22 @@ func (p *hedgePacket) runMove() {
 
 func (p *hedgePacket) releaseLocked() { p.held, p.heldBytes = nil, 0 }
 
+// unkeepUnsent drops b, a datagram whose write timed out unsent, from the
+// copy, so the caller's retry of it isn't held twice. It reports false when
+// a move began or finished, which delivers b.
+func (p *hedgePacket) unkeepUnsent(b []byte) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.moving || !p.onFirst {
+		return false
+	}
+	if last := len(p.held) - 1; last >= 0 && bytes.Equal(p.held[last].data, b) {
+		p.held = p.held[:last]
+		p.heldBytes -= len(b)
+	}
+	return true
+}
+
 func (p *hedgePacket) ReadFrom(b []byte) (int, net.Addr, error) {
 	for {
 		p.mu.Lock()
@@ -1027,7 +1073,12 @@ func (p *hedgePacket) write(b []byte, dest M.Socksaddr) error {
 		p.mu.Unlock()
 
 		err := writePacket(c, raw, b, dest)
-		if err == nil || !kept || isTimeout(err) {
+		if err == nil || !kept {
+			return err
+		}
+		// The caller's own timeout, as for streams: the datagram wasn't
+		// sent, so the copy gives it back.
+		if isTimeout(err) && p.unkeepUnsent(b) {
 			return err
 		}
 		p.move(lAdapter.UserFailureReset)

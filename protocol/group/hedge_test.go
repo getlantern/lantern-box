@@ -1547,3 +1547,42 @@ func TestHedgeRealResetsAfterAReplyStrikeBeforeTheClose(t *testing.T) {
 	}
 	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()), "two strikes, though each client closed at once")
 }
+
+// partialTimeoutConn sends the first k bytes of its first write and reports
+// the caller's deadline expiring; later writes go through whole.
+type partialTimeoutConn struct {
+	net.Conn
+	k    int
+	done bool
+}
+
+func (c *partialTimeoutConn) Write(p []byte) (int, error) {
+	if !c.done {
+		c.done = true
+		n := min(c.k, len(p))
+		return n, timeoutErr{}
+	}
+	return len(p), nil
+}
+
+// A write that times out partway, then the caller's retry of the rest, then
+// a fallback: Then gets the opening once, not with its tail twice.
+func TestHedgeTimedOutPartialWriteReplaysOnce(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn {
+		return &partialTimeoutConn{Conn: c, k: 4}
+	}}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+	opening := []byte(tlsRecord("client hello"))
+	n, err := c.Write(opening)
+	require.Error(t, err)
+	require.Equal(t, 4, n)
+	_, err = c.Write(opening[n:]) // the caller retries the rest
+	require.NoError(t, err)
+	buf := make([]byte, 64)
+	got, err := c.Read(buf) // First never answers, so the hedge moves
+	require.NoError(t, err)
+	require.Equal(t, "then:"+string(opening), string(buf[:got]))
+}
