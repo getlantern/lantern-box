@@ -36,7 +36,7 @@
 
 ## lantern-cloud contract (implemented in the lantern-cloud plan)
 
-`POST {APIURL}/peer/register` with body `{"mode":"webrtc","serve_pool":<bool>}` and no ports. `serve_pool` is the volunteer's "help strangers too" setting (`ExitConfig.ServePool`, read at each registration; unset means true, as radiance's `servePool` treats it). lantern-cloud admits the request as today: the feature flag, `X-Lantern-App: lantern-box`, or a paired volunteer. It refuses with 403 for a device that isn't volunteering for Unbounded, is blocked, or is in a censored or unknown country. A 200 response:
+`POST {APIURL}/peer/register` with body `{"mode":"webrtc","serve_pool":<bool>}` and no ports. `serve_pool` is the volunteer's "help strangers too" setting (`ExitConfig.ServePool`, read at each registration; unset means true, as radiance's `servePool` treats it). lantern-cloud admits an app's request by the unbounded feature flag or as a paired volunteer. It refuses `mode:"webrtc"` with 400 when `X-Lantern-App` is `lantern-box` (nodes never register in webrtc mode), so an app must override that default through `ExitConfig.Header`. A device that isn't volunteering at all gets the peer gate's 404; an admitted device refused for its country, the flag, or having nothing to serve gets 403. RunExit treats each as a failure, with back-off. radiance must send the same user ID in `ExitConfig.Header` as config-new receives, so the `direct_exit` flag's percentage stickiness agrees between config-new and registration. A 200 response:
 
 ```json
 {"server_config": "<pool policy JSON>", "personal_server_config": "<personal policy JSON>", "rotation_interval_seconds": 3600}
