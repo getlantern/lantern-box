@@ -444,6 +444,40 @@ func TestExitRoutesNothingAfterExpiry(t *testing.T) {
 	assert.Zero(t, r.count(), "nothing reaches the router")
 }
 
+// Revocation ends sessions asynchronously, so a stream or flow a session opens in the
+// meantime must find no router once the exit is off or closed.
+func TestExitRoutesNothingOnceRevoked(t *testing.T) {
+	for name, revoke := range map[string]func(*Exit){
+		"disabled": func(e *Exit) { e.SetEnabled(false) },
+		"closed":   func(e *Exit) { e.Close() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newEchoRouter(t)
+			e := readyExit(t, r)
+			revoke(e)
+			assert.Nil(t, e.currentRouter())
+			server, client := net.Pipe()
+			defer client.Close()
+			closed := make(chan error, 2)
+			h := &handler{exit: e}
+			h.NewConnectionEx(context.Background(), server, M.Socksaddr{}, M.ParseSocksaddr("example.com:80"),
+				func(err error) { closed <- err })
+			flow, _ := pathPair(t)
+			h.NewPacketConnectionEx(context.Background(), bufio.NewPacketConn(flow), M.Socksaddr{},
+				M.ParseSocksaddr("example.com:53"), func(err error) { closed <- err })
+			for range 2 {
+				select {
+				case err := <-closed:
+					assert.Error(t, err)
+				case <-time.After(5 * time.Second):
+					t.Fatal("a stream or flow was neither routed nor refused")
+				}
+			}
+			assert.Zero(t, r.count(), "nothing reaches the router")
+		})
+	}
+}
+
 // A later router replaces the earlier one's expiry.
 func TestExitExpiryIsTheCurrentRouters(t *testing.T) {
 	e := newTestExit(t)

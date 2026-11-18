@@ -160,12 +160,13 @@ func (e *Exit) ready() bool {
 	return !e.closed && e.enabled && e.router != nil && e.now().Before(e.validUntil)
 }
 
-// currentRouter is the router to route a stream or flow through, or nil once its registration
-// has run out, even before its expiry has cleared it.
+// currentRouter is the router to route a stream or flow through, or nil once the exit is off
+// or closed or its registration has run out. Revocation ends sessions asynchronously, and
+// expiry by timer, so a session can still open streams and flows in the meantime.
 func (e *Exit) currentRouter() adapter.ConnectionRouterEx {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if !e.now().Before(e.validUntil) {
+	if e.closed || !e.enabled || !e.now().Before(e.validUntil) {
 		return nil
 	}
 	return e.router
