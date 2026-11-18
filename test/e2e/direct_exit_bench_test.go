@@ -107,10 +107,10 @@ func startBenchRig(b *testing.B, path, server string, link *lossyLink) (string, 
 	case "ice":
 		c.widget = func(rtcOpt *UBClientcore.WebRTCOptions) {
 			serve := rtcOpt.Exit.Serve
-			rtcOpt.Exit.Serve = func(ctx context.Context, conn net.PacketConn, password string) {
+			rtcOpt.Exit.Serve = func(ctx context.Context, conn net.PacketConn, password string, personal bool) {
 				lc := newLossyConn(conn, link)
 				defer lc.Close()
-				serve(ctx, lc, password)
+				serve(ctx, lc, password, personal)
 			}
 		}
 	case "webrtc":
