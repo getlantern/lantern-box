@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"sync"
 	"time"
 
 	sbox "github.com/sagernet/sing-box"
@@ -125,8 +126,15 @@ type exitRunner struct {
 	minRetry time.Duration
 	maxRetry time.Duration
 
+	// Only the loop's goroutine writes boxes, and it holds mu to, so that a rule set callback,
+	// which reads them under mu, sets a kind's router only for its current box. The loop reads
+	// them without mu.
+	mu    sync.Mutex
+	boxes [2]kindBox // by exit.Kind
+	// served is whether each kind's box's router is the exit's for its kind: a box whose abuse
+	// rule sets an update has emptied is withdrawn until they hold rules again. Only under mu.
+	served [2]bool
 	// Only the loop's goroutine touches these.
-	boxes    [2]kindBox // by exit.Kind
 	rotation time.Duration
 	// registeredAt is when lantern-cloud last answered a registration.
 	registeredAt time.Time
@@ -137,11 +145,12 @@ type exitRunner struct {
 }
 
 // kindBox is the exit box serving one kind of session, the options it was built from, and when
-// its registration runs out.
+// its registration runs out. unwatch stops following its abuse rule sets.
 type kindBox struct {
 	box        ExitBox
 	options    string
 	validUntil time.Time
+	unwatch    func()
 }
 
 // exitKinds are the kinds of session, in the order RunExit launches their boxes.
@@ -315,8 +324,18 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse, r
 		}
 		kb := &r.boxes[kind]
 		if kb.box != nil && kb.options == options {
-			kb.validUntil = validUntil
+			// A renewal rechecks the sets: an update may have emptied them since.
+			if err := abuseRuleSetsLoaded(kb.box.Router()); err != nil {
+				r.mu.Lock()
+				r.withdrawLocked(kind)
+				r.mu.Unlock()
+				errs = append(errs, &exitStageError{stage: "check the " + kind.String() + " exit box's abuse rule sets", err: err, loggable: true})
+				continue
+			}
+			r.mu.Lock()
+			kb.validUntil, r.served[kind] = validUntil, true
 			r.exit.SetRouter(kind, kb.box.Router(), validUntil)
+			r.mu.Unlock()
 			continue
 		}
 		b, err := r.newBox(ctx, options)
@@ -338,14 +357,61 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse, r
 			errs = append(errs, &exitStageError{stage: "start the " + kind.String() + " exit box", err: errStartedTooLate, loggable: true})
 			continue
 		}
-		prev := kb.box
+		prev := *kb
+		r.mu.Lock()
 		*kb = kindBox{box: b, options: options, validUntil: validUntil}
-		r.exit.SetRouter(kind, b.Router(), kb.validUntil)
-		if prev != nil {
-			_ = prev.Close()
-		}
+		r.served[kind] = true
+		r.exit.SetRouter(kind, b.Router(), validUntil)
+		r.mu.Unlock()
+		// Its router passed abuseRuleSetsLoaded, so it has the lookup.
+		lookup := b.Router().(directexit.RuleSetLookup)
+		unwatch := directexit.WatchAbuseRuleSets(lookup, func() { r.ruleSetsUpdated(kind, b) })
+		r.mu.Lock()
+		kb.unwatch = unwatch
+		r.mu.Unlock()
+		// After watching, so an update between the check and the watch isn't missed.
+		r.ruleSetsUpdated(kind, b)
+		closeKindBox(prev)
 	}
 	return errors.Join(errs...)
+}
+
+// ruleSetsUpdated rechecks box b's abuse rule sets when one updates, withdrawing its kind while
+// any is empty and serving it again, until its registration runs out, once they all hold rules.
+// It does nothing once b is no longer its kind's box.
+func (r *exitRunner) ruleSetsUpdated(kind exit.Kind, b ExitBox) {
+	err := abuseRuleSetsLoaded(b.Router())
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kb := &r.boxes[kind]
+	if kb.box != b {
+		return
+	}
+	switch {
+	case err != nil && r.served[kind]:
+		log.Warn("direct exit: withdrawing the ", kind, " exit until its abuse rule sets hold rules again: ", err)
+		r.withdrawLocked(kind)
+	case err == nil && !r.served[kind] && time.Now().Before(kb.validUntil):
+		log.Info("direct exit: serving the ", kind, " exit again, its abuse rule sets hold rules")
+		r.served[kind] = true
+		r.exit.SetRouter(kind, b.Router(), kb.validUntil)
+	}
+}
+
+// withdrawLocked clears kind's router on the exit, ending its sessions, while keeping its box.
+func (r *exitRunner) withdrawLocked(kind exit.Kind) {
+	r.served[kind] = false
+	r.exit.SetRouter(kind, nil, time.Time{})
+}
+
+// closeKindBox stops following a box's rule sets and closes it.
+func closeKindBox(kb kindBox) {
+	if kb.unwatch != nil {
+		kb.unwatch()
+	}
+	if kb.box != nil {
+		_ = kb.box.Close()
+	}
 }
 
 // errRuleSetsUncheckable is a box whose router has no rule set lookup, so RunExit can't tell
@@ -494,13 +560,17 @@ func (r *exitRunner) close() {
 
 // closeKind clears kind's router on the exit before closing the box under it.
 func (r *exitRunner) closeKind(kind exit.Kind) {
-	kb := &r.boxes[kind]
+	r.mu.Lock()
+	kb := r.boxes[kind]
 	if kb.box == nil {
+		r.mu.Unlock()
 		return
 	}
 	r.exit.SetRouter(kind, nil, time.Time{})
-	_ = kb.box.Close()
-	*kb = kindBox{}
+	r.boxes[kind], r.served[kind] = kindBox{}, false
+	r.mu.Unlock()
+	// Outside mu: a rule set callback may be waiting on it.
+	closeKindBox(kb)
 }
 
 // exitStageError is a launch step that failed. Only a loggable error is logged whole: the
