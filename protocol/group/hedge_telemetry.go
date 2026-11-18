@@ -64,10 +64,12 @@ const (
 	hedgeOutcomeResetNotReplayable = "reset_not_replayable"
 	// hedgeOutcomeResetUnmoved is a replayable connection First reset that
 	// didn't move: the client closed before the move started, or a reply
-	// already on its way committed it.
+	// already on its way committed it. A reset before the client wrote
+	// anything counts here too.
 	hedgeOutcomeResetUnmoved = "reset_unmoved"
 	// hedgeOutcomeResetUndecided is a connection First reset while its
-	// opening was too short to tell whether it could be replayed.
+	// opening (one to three bytes) was too short to tell whether it could
+	// be replayed.
 	hedgeOutcomeResetUndecided = "reset_undecided"
 	// hedgeOutcomeMoveFailed is a connection whose move to Then failed: Then
 	// couldn't be dialed or didn't take the replayed opening.

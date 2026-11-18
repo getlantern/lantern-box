@@ -264,8 +264,10 @@ func (l *hedgeLeg) commit(release func()) bool {
 // client sees the error. firstFailed handles the reset later, on its own
 // goroutine, and by then the client may have closed, which stops a move. So
 // noteReset settles the site bad itself and records the reset: the outcome
-// a reset gets without a move (staticResetOutcomeLocked), or reset_unmoved
-// for an opening that may still move, which the move then replaces. Once
+// a reset gets when it can't move now (staticResetOutcomeLocked), or
+// reset_unmoved for a replayable opening. A move that follows, which an
+// undecided opening can still make once the rest of a handshake arrives,
+// replaces either. Once
 // the client has closed, settleLocked and the sealed record ignore it: an
 // error then can be the teardown itself. The watchdog calls this from the
 // IO path, which never holds mu.

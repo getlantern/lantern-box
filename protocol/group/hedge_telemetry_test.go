@@ -398,6 +398,10 @@ func TestHedgeResetOnAnUndecidedOpening(t *testing.T) {
 	}{
 		{"noted", func(s *hedgeStream) { s.noteReset() }},
 		{"handled", func(s *hedgeStream) { s.firstFailed(lAdapter.UserFailureReset, s.move) }},
+		{"noted then handled, as the watchdog does", func(s *hedgeStream) {
+			s.noteReset()
+			s.firstFailed(lAdapter.UserFailureReset, s.move)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := recordMetrics(t)
