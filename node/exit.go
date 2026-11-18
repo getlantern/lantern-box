@@ -28,17 +28,21 @@ type ExitConfig struct {
 	DeviceID   string
 	HTTPClient *http.Client // nil: http.DefaultClient
 	// Header, when set, is applied to every request after the defaults, so an app can send
-	// its own admission headers (X-Lantern-App and the rest) in place of lantern-box's.
+	// its own admission headers in place of lantern-box's. The defaults include
+	// X-Lantern-App: lantern-box, which lantern-cloud admits as a node, so an app must
+	// override it here. It must not drop X-Lantern-Device-Id or Content-Type.
 	Header  func(http.Header)
 	Version string
-	Exit    *exit.Exit
-	// NewBox builds and starts the exit box from options JSON. nil: sing-box in ctx.
+	// Exit is the volunteer's exit. RunExit only sets its router; it never calls SetEnabled.
+	Exit *exit.Exit
+	// NewBox builds and starts the exit box from options JSON. nil: sing-box in ctx. It is
+	// exported for tests, and for embedders that build boxes their own way.
 	NewBox func(ctx context.Context, options string) (ExitBox, error)
 	// RotationInterval overrides the interval lantern-cloud gives. 0: lantern-cloud's, or an hour.
 	RotationInterval time.Duration
 }
 
-// ExitBox is a running exit box.
+// ExitBox is a running exit box. It is exported for NewBox.
 type ExitBox interface {
 	Router() adapter.ConnectionRouterEx
 	Close() error
@@ -67,6 +71,10 @@ type exitRunner struct {
 // carry lantern-box's option registries, as box.BaseContext does. It returns an error only
 // for a config it can't run with; lantern-cloud and box failures are logged and retried.
 // Exit boxes don't share services with ctx: each gets its own clone of ctx's registry.
+//
+// RunExit never turns the exit on or off: the embedder drives cfg.Exit's SetEnabled, and
+// should cancel ctx while the exit is off, so RunExit stops registering every rotation. Each
+// rotation closes the previous box, which resets the streams still routed through it.
 func RunExit(ctx context.Context, cfg ExitConfig) error {
 	r, err := newExitRunner(cfg)
 	if err != nil {
