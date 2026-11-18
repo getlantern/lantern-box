@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,10 +30,16 @@ import (
 	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 )
 
-// validExitConfig carries the abuse rules peerrules requires, and a log section RunExit must
-// override.
+// validExitConfig carries the rules peerrules requires of a direct exit, and a log section and
+// listeners RunExit must override.
 const validExitConfig = `{
 	"log":{"level":"debug"},
+	"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":0}],
+	"endpoints":[{"type":"amnezia","tag":"wg"}],
+	"services":[{"type":"unbounded","tag":"unbounded-volunteer","discovery_srv":"https://freddie.test",
+		"egress_addr":"wss://egress.test","stun_servers":["stun:192.0.2.1:3478"]}],
+	"experimental":{"debug":{"listen":"127.0.0.1:6060"}},
+	"ntp":{"enabled":true,"server":"time.example"},
 	"outbounds":[{"type":"direct","tag":"direct"}],
 	"route":{
 		"rule_set":[
@@ -42,6 +49,8 @@ const validExitConfig = `{
 			{"type":"remote","tag":"geosite-cryptominers","format":"binary","url":"https://example/geosite-cryptominers.srs","download_detour":"direct"}
 		],
 		"rules":[
+			{"action":"resolve","server":"dns"},
+			{"action":"reject","ip_is_private":true},
 			{"action":"reject","rule_set":["geosite-malware"]},
 			{"action":"reject","rule_set":["geoip-malware"]},
 			{"action":"reject","rule_set":["geosite-phishing"]},
@@ -53,6 +62,13 @@ const validExitConfig = `{
 }`
 
 const exitConfigWithoutAbuseRules = `{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}`
+
+// exitConfigWithoutAResolve has the abuse rules, but no resolve, so its IP rules would never
+// see a domain's addresses.
+var exitConfigWithoutAResolve = strings.Replace(validExitConfig, `{"action":"resolve","server":"dns"},`, ``, 1)
+
+// exitConfigWithoutPrivateReject resolves, but doesn't refuse private addresses.
+var exitConfigWithoutPrivateReject = strings.Replace(validExitConfig, `{"action":"reject","ip_is_private":true},`, ``, 1)
 
 func exitCloud(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
@@ -118,6 +134,8 @@ type fakeExitBox struct {
 	builtAt             time.Time
 	autoDetectInterface bool
 	logDisabled         bool
+	// extras counts the inbounds, endpoints, services, experimental and NTP sections it got.
+	extras int
 
 	mu       sync.Mutex
 	closed   bool
@@ -159,6 +177,13 @@ func (f *fakeExitBoxes) new(ctx context.Context, options string) (ExitBox, error
 	b := &fakeExitBox{id: len(f.boxes) + 1, ev: f.ev, router: &fakeExitRouter{id: len(f.boxes) + 1}, builtAt: time.Now()}
 	b.autoDetectInterface = opts.Route != nil && opts.Route.AutoDetectInterface
 	b.logDisabled = opts.Log != nil && opts.Log.Disabled
+	b.extras = len(opts.Inbounds) + len(opts.Endpoints) + len(opts.Services)
+	if opts.Experimental != nil {
+		b.extras++
+	}
+	if opts.NTP != nil {
+		b.extras++
+	}
 	f.boxes = append(f.boxes, b)
 	f.ev.add("build %d", b.id)
 	return b, nil
@@ -251,6 +276,7 @@ func TestRunExitRegistersWebRTCOnly(t *testing.T) {
 	b := boxes.last()
 	assert.True(t, b.autoDetectInterface, "exit traffic leaves on the physical interface")
 	assert.True(t, b.logDisabled, "the exit box never logs strangers' destinations")
+	assert.Zero(t, b.extras, "the exit box opens no listeners and runs no services")
 	cancel()
 	waitDone(t, done)
 	assert.False(t, e.Options().Ready())
@@ -281,6 +307,34 @@ func TestRunExitRefusesConfigWithoutAbuseRules(t *testing.T) {
 	assert.False(t, e.Options().Ready())
 	cancel()
 	waitDone(t, done)
+}
+
+// sing-box's IP rules see a domain's addresses only after a resolve, so a direct exit's config
+// must resolve, then refuse private addresses.
+func TestRunExitRefusesConfigWithoutAResolveAndPrivateReject(t *testing.T) {
+	for name, config := range map[string]string{
+		"no resolve":        exitConfigWithoutAResolve,
+		"no private reject": exitConfigWithoutPrivateReject,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var registers atomic.Int32
+			srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+				registers.Add(1)
+				writeJSON(w, map[string]any{"server_config": config})
+			})
+			e := enabledExit(t)
+			ev := &exitEvents{}
+			boxes := &fakeExitBoxes{ev: ev}
+			ctx, cancel := context.WithCancel(box.BaseContext())
+			defer cancel()
+			done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", DeviceID: "dev", Exit: e, NewBox: boxes.new}, ev)
+			require.Eventually(t, func() bool { return registers.Load() >= 2 }, 5*time.Second, 5*time.Millisecond)
+			assert.Empty(t, boxes.all(), "no box is built from a config that skips IP rules for domains")
+			assert.False(t, e.Options().Ready())
+			cancel()
+			waitDone(t, done)
+		})
+	}
 }
 
 func TestRunExitRotatesWithoutAGap(t *testing.T) {

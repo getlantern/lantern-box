@@ -153,6 +153,14 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) e
 	if err := peerrules.ValidateAbuseRulesOptions(opts); err != nil {
 		return &exitStageError{stage: "check the exit config", err: err, loggable: true}
 	}
+	// Its errors are fixed text, naming no rule.
+	if err := peerrules.ValidateDirectExitRulesOptions(opts); err != nil {
+		return &exitStageError{stage: "check the exit config", err: err, loggable: true}
+	}
+	// The exit box only routes the exit's traffic: no listeners, and nothing else lantern-cloud's
+	// config carries, such as the debug listener of its peer configs.
+	opts.Inbounds, opts.Endpoints, opts.Services = nil, nil, nil
+	opts.Experimental, opts.NTP = nil, nil
 	// Exit traffic leaves on the physical interface, never through the volunteer's own tunnel.
 	opts.Route.AutoDetectInterface = true
 	// sing-box's router logs every routed connection's destination, and this box carries
