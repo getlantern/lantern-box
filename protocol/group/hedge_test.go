@@ -84,7 +84,13 @@ func (f *fakeOutbound) DialContext(ctx context.Context, network string, destinat
 	if f.dialErr != nil {
 		return nil, f.dialErr
 	}
-	time.Sleep(f.delay)
+	if f.delay > 0 {
+		select {
+		case <-time.After(f.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	client, server := net.Pipe()
 	go f.stream(server)
 	if f.ctxBound {
@@ -1606,9 +1612,37 @@ func TestHedgeWriteDeadlineDuringAMoveReportsTheWriteTaken(t *testing.T) {
 	n, err := c.Write(opening)
 	require.Error(t, err, "the caller's deadline ran out during the move")
 	require.Equal(t, len(opening), n, "the move replays all of it")
-	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+	var ne net.Error
+	require.ErrorAs(t, err, &ne)
+	require.True(t, ne.Timeout())
+	// Only a read deadline: the replay mustn't depend on the caller
+	// extending the write deadline that ran out.
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
 	buf := make([]byte, 64)
 	got, err := c.Read(buf)
 	require.NoError(t, err)
 	require.Equal(t, "then:"+string(opening), string(buf[:got]))
+}
+
+// A move that fails because Then's dial timed out isn't reported as a
+// timeout, so a caller that retries timeouts sees the connection is dead.
+func TestHedgeFailedMoveIsNotATimeout(t *testing.T) {
+	old := hedgeFailoverDialTimeout
+	hedgeFailoverDialTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { hedgeFailoverDialTimeout = old })
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{hang: true}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte(tlsRecord("hi")))
+	require.NoError(t, err)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(hedgeFailoverDialTimeout+5*time.Second)))
+	_, err = c.Read(make([]byte, 16))
+	require.Error(t, err)
+	var ne net.Error
+	if errors.As(err, &ne) {
+		require.False(t, ne.Timeout(), "a failed move isn't a timeout: %v", err)
+	}
+	var me *hedgeMoveError
+	require.ErrorAs(t, err, &me, "the move's failure, with its cause")
 }
