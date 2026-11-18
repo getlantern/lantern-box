@@ -927,10 +927,15 @@ func TestRunExitWithdrawsABoxItCanNoLongerMark(t *testing.T) {
 	refuse.Store(true)
 	reregister <- struct{}{}
 	require.Eventually(t, func() bool { return !o.Ready(false) && !o.Ready(true) }, 5*time.Second, time.Millisecond)
-	for _, b := range boxes.all() {
-		closed, _ := b.isClosed()
-		assert.True(t, closed, "box %d", b.id)
-	}
+	// The router is cleared before its box closes, so readiness alone doesn't mean closed.
+	require.Eventually(t, func() bool {
+		for _, b := range boxes.all() {
+			if closed, _ := b.isClosed(); !closed {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, time.Millisecond, "every box closes")
 	cancel()
 	waitDone(t, done)
 }
