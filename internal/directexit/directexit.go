@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/route/rule"
 )
 
 type checkedKey struct{}
@@ -60,13 +59,12 @@ type RuleSetLookup interface {
 // ErrAbuseRuleSetsNotLoaded is a box whose abuse rule sets haven't all loaded.
 var ErrAbuseRuleSetsNotLoaded = errors.New("the abuse rule sets haven't loaded")
 
-// AbuseRuleSetsLoaded reports whether each of router's abuse rule sets has loaded its rules. A
-// remote rule set whose download fails at start is no error to sing-box: the box starts with it
-// empty, so its rejects match nothing, and retries later. A direct exit must not serve until
-// they hold rules, or its rejects would let everything through to its final route. Inline and
-// local rule sets are loaded once the box has started; any other counts as loaded once it holds
-// a rule, so a remote list that downloads empty counts as not loaded. The error names only the
-// tags.
+// AbuseRuleSetsLoaded reports whether each of router's abuse rule sets holds rules. A remote
+// rule set whose download fails at start is no error to sing-box: the box starts with it empty,
+// so its rejects match nothing, and retries later. A later download, or a local file's reload,
+// can also replace a set's rules with none. A direct exit must not serve while any set is
+// empty, or its rejects would let everything through to its final route, so a set counts as
+// loaded only while it holds a rule, whatever its kind. The error names only the tags.
 func AbuseRuleSetsLoaded(router RuleSetLookup) error {
 	var missing []string
 	for _, tag := range AbuseRuleSetTags {
@@ -81,11 +79,29 @@ func AbuseRuleSetsLoaded(router RuleSetLookup) error {
 	return nil
 }
 
-// ruleSetLoaded reports whether set holds its rules: its metadata is built from them, and every
+// ruleSetLoaded reports whether set holds rules: its metadata is built from them, and every
 // rule sets one of its flags.
 func ruleSetLoaded(set adapter.RuleSet) bool {
-	if _, local := set.(*rule.LocalRuleSet); local {
-		return true
-	}
 	return set.Metadata() != (adapter.RuleSetMetadata{})
+}
+
+// WatchAbuseRuleSets calls f each time one of lookup's abuse rule sets updates, until the
+// returned stop is called, for a direct exit to recheck AbuseRuleSetsLoaded: sing-box replaces a
+// set's rules with each download or reload, which may hold none. f runs on the updating
+// goroutine, and may still be running, or about to, when stop returns.
+func WatchAbuseRuleSets(lookup RuleSetLookup, f func()) (stop func()) {
+	var stops []func()
+	for _, tag := range AbuseRuleSetTags {
+		set, ok := lookup.RuleSet(tag)
+		if !ok {
+			continue
+		}
+		el := set.RegisterCallback(func(adapter.RuleSet) { f() })
+		stops = append(stops, func() { set.UnregisterCallback(el) })
+	}
+	return func() {
+		for _, stop := range stops {
+			stop()
+		}
+	}
 }

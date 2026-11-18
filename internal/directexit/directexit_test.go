@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -54,8 +57,13 @@ func ruleSetServer(t *testing.T, failures int32) *httptest.Server {
 
 func startBox(t *testing.T, url string) *sbox.Box {
 	t.Helper()
+	return startBoxWith(t, fmt.Sprintf(ruleSetConfig, url))
+}
+
+func startBoxWith(t *testing.T, config string) *sbox.Box {
+	t.Helper()
 	ctx := service.ExtendContext(lbox.BaseContext())
-	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(fmt.Sprintf(ruleSetConfig, url)))
+	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(config))
 	require.NoError(t, err)
 	b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
 	require.NoError(t, err)
@@ -78,4 +86,29 @@ func TestAbuseRuleSetsNotLoaded(t *testing.T) {
 	assert.Contains(t, err.Error(), "geosite-malware")
 	assert.NotContains(t, err.Error(), "geoip-malware", "only the set that failed")
 	assert.NotContains(t, err.Error(), srv.URL)
+}
+
+// A local rule set file holding no rules loads as an empty set, which would match nothing.
+func TestAbuseRuleSetsLoadedRefusesAnEmptyLocalFile(t *testing.T) {
+	for name, tc := range map[string]struct {
+		content string
+		loaded  bool
+	}{
+		"empty":     {`{"version": 3, "rules": []}`, false},
+		"non-empty": {`{"version": 3, "rules": [{"domain": ["malware.test"]}]}`, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "malware.json")
+			require.NoError(t, os.WriteFile(path, []byte(tc.content), 0o600))
+			b := startBoxWith(t, strings.Replace(ruleSetConfig,
+				`{"type": "remote", "tag": "geosite-malware", "format": "source", "url": %q, "download_detour": "direct"}`,
+				fmt.Sprintf(`{"type": "local", "tag": "geosite-malware", "format": "source", "path": %q}`, path), 1))
+			err := directexit.AbuseRuleSetsLoaded(b.Router())
+			if tc.loaded {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorIs(t, err, directexit.ErrAbuseRuleSetsNotLoaded)
+			}
+		})
+	}
 }
