@@ -1740,8 +1740,7 @@ func TestHedgeMoveErrorHidesADeadlineCause(t *testing.T) {
 		"nor through a cause's own timeout")
 }
 
-// notTimeoutWrapper is an error that isn't a timeout itself but wraps one,
-// as crypto/tls's permanent errors do.
+// notTimeoutWrapper is an error that isn't a timeout itself but wraps one.
 type notTimeoutWrapper struct{ err error }
 
 func (w notTimeoutWrapper) Error() string   { return "permanent: " + w.err.Error() }
@@ -1798,5 +1797,19 @@ func TestHedgeReplayCutShortByTheTimerIsATimeout(t *testing.T) {
 	var me *hedgeMoveError
 	require.ErrorAs(t, err, &me)
 	require.ErrorIs(t, me.cause, os.ErrDeadlineExceeded, "the timer is the cause")
+	require.NotErrorIs(t, err, os.ErrDeadlineExceeded, "but the dead connection doesn't read as a timeout")
+	require.False(t, isTimeout(err))
 	require.Contains(t, err.Error(), "mux: stream closed", "the transport's own error is kept for diagnostics")
+	require.NotContains(t, err.Error(), "\n", "on one line")
+}
+
+// customIsTimeout reports a deadline only through its own Is method.
+type customIsTimeout struct{}
+
+func (customIsTimeout) Error() string        { return "custom deadline" }
+func (customIsTimeout) Is(target error) bool { return target == os.ErrDeadlineExceeded }
+
+// A cause that reads as a deadline only through its own Is is hidden too.
+func TestHedgeMoveErrorHidesACustomIsTimeout(t *testing.T) {
+	require.NotErrorIs(t, newHedgeMoveError(customIsTimeout{}), os.ErrDeadlineExceeded)
 }
