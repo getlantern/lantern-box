@@ -1263,6 +1263,39 @@ func TestRunExitDoesntRenewABoxWithAnEmptyList(t *testing.T) {
 	assert.Len(t, boxes.all(), 1)
 }
 
+// A kind whose config keeps failing makes RunExit back off, but never past the healthy kind's
+// renewal: with a back-off longer than the rotation, the healthy kind still renews in time.
+func TestRunExitRenewsAHealthyKindThroughTheOthersBackOff(t *testing.T) {
+	var registers atomic.Int32
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		registers.Add(1)
+		writeJSON(w, map[string]any{"server_config": validExitConfig, "personal_server_config": exitConfigWithoutAbuseRules})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	boxes := &fakeExitBoxes{ev: ev}
+	const rotation = 100 * time.Millisecond
+	r, err := newExitRunner(ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: boxes.new, RotationInterval: rotation})
+	require.NoError(t, err)
+	r.minRetry, r.maxRetry = 5*rotation, 5*rotation
+	r.exit = &recordingExit{Exit: e, ev: ev}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.loop(ctx) }()
+	o := e.Options()
+	require.Eventually(t, func() bool { return o.Ready(false) }, 5*time.Second, time.Millisecond)
+	until := time.Now().Add(8 * rotation)
+	for time.Now().Before(until) {
+		require.True(t, o.Ready(false), "the pool kind expired during the personal kind's back-off")
+		time.Sleep(2 * time.Millisecond)
+	}
+	assert.GreaterOrEqual(t, registers.Load(), int32(5), "registered every rotation")
+	cancel()
+	waitDone(t, done)
+}
+
 // holdOffs records what RunExit reports through OnHoldOff.
 type holdOffs struct {
 	mu    sync.Mutex

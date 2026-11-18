@@ -219,6 +219,7 @@ func (r *exitRunner) loop(ctx context.Context) error {
 	retry := r.minRetry
 	for {
 		var wait time.Duration
+		registeredBefore := r.registeredAt
 		if err := r.refresh(ctx); err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -228,6 +229,11 @@ func (r *exitRunner) loop(ctx context.Context) error {
 			if after, ok := busy(err); ok {
 				wait = max(wait, after)
 				r.holdOff(time.Now().Add(wait))
+			} else if r.registeredAt.After(registeredBefore) && r.serving() {
+				// lantern-cloud answered, and a kind's config failed, but the boxes this
+				// registration renewed are due again a rotation after it: a back-off longer
+				// than that would let them expire for the failing kind's sake.
+				wait = min(wait, max(time.Until(r.registeredAt.Add(r.rotation)), 0))
 			}
 			logExitFailure(err, wait)
 		} else {
@@ -240,6 +246,16 @@ func (r *exitRunner) loop(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// serving reports whether any kind has a box.
+func (r *exitRunner) serving() bool {
+	for _, kb := range r.boxes {
+		if kb.box != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // busy reports whether err is lantern-cloud answering busy, and the Retry-After it gave.
