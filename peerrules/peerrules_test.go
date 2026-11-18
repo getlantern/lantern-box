@@ -367,7 +367,7 @@ func TestValidateDirectExitRules(t *testing.T) {
 		"source private reject":           {rules: resolveRule + `,{"action":"reject","source_ip_is_private":true}`},
 		"rules between resolve and check": {rules: resolveRule + `,{"action":"reject","port":[22]},` + privateRejectRule, ok: true},
 		"unconditional route first":       {rules: finalRoute + `,` + resolveRule + `,` + privateRejectRule},
-		"probe route first":               {rules: `{"action":"route","outbound":"probe","domain":["api.test"],"port":[80]},` + resolveRule + `,` + privateRejectRule, ok: true},
+		"probe route, no probe outbound":  {rules: `{"action":"route","outbound":"probe","domain":["api.test"],"port":[80]},` + resolveRule + `,` + privateRejectRule},
 		"probe route by suffix":           {rules: `{"action":"route","outbound":"probe","domain_suffix":["api.test"]},` + resolveRule + `,` + privateRejectRule},
 		"probe route by IP too":           {rules: `{"action":"route","outbound":"probe","domain":["api.test"],"ip_cidr":["192.0.2.0/24"]},` + resolveRule + `,` + privateRejectRule},
 		"inverted probe route":            {rules: `{"action":"route","outbound":"probe","domain":["api.test"],"invert":true},` + resolveRule + `,` + privateRejectRule},
@@ -414,8 +414,12 @@ const (
 	cloudAllowed = `{"rule_set":["peer-allowlist"],"action":"route","outbound":"direct","udp_connect":true}`
 )
 
+// cloudOutbounds are peerExitOptions' direct outbound and injectBanditProbe's responder.
+const cloudOutbounds = `"outbounds":[{"type":"direct","tag":"direct"},` +
+	`{"type":"banditprobe","tag":"banditprobe","callback_url":"https://api.test/v1/bandit/callback","report_stalled":true}]`
+
 func cloudConfig(rules ...string) string {
-	return `{"route":{` + cloudRuleSets + `,"rules":[` + strings.Join(rules, ",") + `]}}`
+	return `{` + cloudOutbounds + `,"route":{` + cloudRuleSets + `,"rules":[` + strings.Join(rules, ",") + `]}}`
 }
 
 func TestValidateDirectExitRulesTakesLanternCloudConfigs(t *testing.T) {
@@ -456,9 +460,41 @@ func TestValidateDirectExitRulesNeedsOrderAndUDPConnect(t *testing.T) {
 		"no final and no terminal rule": cloudConfig(resolveRule, privateRejectRule, cloudAbuse, cloudAllowed),
 		"conditional last rule":         cloudConfig(resolveRule, privateRejectRule, cloudAbuse, `{"action":"reject","port":[22]}`),
 		"inverted last rule":            cloudConfig(resolveRule, privateRejectRule, cloudAbuse, `{"action":"reject","port":[22],"invert":true}`),
+		// The probe is exempt only because its responder answers locally and never dials.
+		"probe-shaped route to direct": cloudConfig(`{"domain":["private.test"],"port":[80],"action":"route","outbound":"direct"}`,
+			resolveRule, privateRejectRule, cloudAbuse, finalRoute),
+		"probe-shaped route to an unknown outbound": cloudConfig(`{"domain":["api.test"],"action":"route","outbound":"nowhere"}`,
+			resolveRule, privateRejectRule, cloudAbuse, finalRoute),
+		// A rewrite after the rejects sends traffic somewhere they never checked.
+		"route-options override address": cloudConfig(resolveRule, privateRejectRule, cloudAbuse,
+			`{"action":"route-options","override_address":"127.0.0.1"}`, finalRoute),
+		"route-options override port": cloudConfig(resolveRule, privateRejectRule, cloudAbuse,
+			`{"action":"route-options","override_port":25,"port":[443]}`, finalRoute),
+		"final route override address": cloudConfig(resolveRule, privateRejectRule, cloudAbuse,
+			`{"action":"route","outbound":"direct","udp_connect":true,"override_address":"10.0.0.1"}`),
+		"conditional route override port": cloudConfig(resolveRule, privateRejectRule, cloudAbuse,
+			`{"action":"route","outbound":"direct","udp_connect":true,"override_port":25,"port":[443]}`, finalRoute),
+		"probe override address": cloudConfig(`{"domain":["api.test"],"port":[80],"action":"route","outbound":"banditprobe","override_address":"127.0.0.1"}`,
+			resolveRule, privateRejectRule, cloudAbuse, finalRoute),
+		"bypass override port": cloudConfig(resolveRule, privateRejectRule, cloudAbuse,
+			`{"action":"bypass","outbound":"direct","udp_connect":true,"override_port":25,"port":[443]}`, finalRoute),
 	} {
 		t.Run(name, func(t *testing.T) {
 			assert.Error(t, ValidateDirectExitRulesOptions(parseOptions(t, cfg)))
+		})
+	}
+	// sing-box refuses these fields in a direct outbound's JSON, but not in options built in Go.
+	for name, override := range map[string]func(*option.DirectOutboundOptions){
+		"address": func(o *option.DirectOutboundOptions) { o.OverrideAddress = "127.0.0.1" }, //nolint:staticcheck
+		"port":    func(o *option.DirectOutboundOptions) { o.OverridePort = 25 },             //nolint:staticcheck
+	} {
+		t.Run("direct outbound override "+name, func(t *testing.T) {
+			opts := parseOptions(t, cloudConfig(cloudProbe, resolveRule, privateRejectRule, cloudAbuse, finalRoute))
+			require.NoError(t, ValidateDirectExitRulesOptions(opts))
+			direct, ok := opts.Outbounds[0].Options.(*option.DirectOutboundOptions)
+			require.True(t, ok)
+			override(direct)
+			assert.Error(t, ValidateDirectExitRulesOptions(opts))
 		})
 	}
 }

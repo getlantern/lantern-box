@@ -93,7 +93,10 @@ func ValidateAbuseRulesOptions(options option.Options) error {
 // destination given as a domain, so a name that resolves into a private or listed range would
 // pass them. sing-box stops at the first rule that routes a connection, so until all of those
 // have come, a rule may only reject, sniff or resolve, or be lantern-cloud's bandit probe: a
-// route by exact domain, and port, alone.
+// route by exact domain, and port, alone, to a banditprobe outbound.
+//
+// No rule or direct outbound may rewrite a destination's address or port: the rejects checked
+// the destination as it was.
 //
 // Every route must also set udp_connect: hysteria2 names a destination per UDP datagram, and
 // the rules see only a flow's first. Nothing may fall through to route.final or the default
@@ -104,6 +107,15 @@ func ValidateDirectExitRulesOptions(options option.Options) error {
 	if options.Route == nil {
 		return errors.New("launch_cfg is missing route block")
 	}
+	if rewritesDestination(options.Outbounds) {
+		return errors.New("outbounds has a direct outbound that overrides its destination (the rules checked another)")
+	}
+	probes := map[string]bool{}
+	for _, out := range options.Outbounds {
+		if out.Type == C.TypeBanditProbe {
+			probes[out.Tag] = true
+		}
+	}
 	rules := options.Route.Rules
 	var resolved, privateRejected, rfc1918, smtp bool
 	rejectedTags := map[string]bool{}
@@ -112,8 +124,11 @@ func ValidateDirectExitRulesOptions(options option.Options) error {
 	}
 	for _, r := range rules {
 		action := ruleAction(r)
+		if overridesDestination(action) {
+			return errors.New("route.rules has a rule that overrides the destination (the rules checked another)")
+		}
 		if !guarded() {
-			if !mayPrecedeSafeguards(r, action) {
+			if !mayPrecedeSafeguards(r, action, probes) {
 				return errors.New("route.rules has a rule that can route traffic before its resolve, ip_is_private reject and abuse rejects")
 			}
 			if isDefaultRule(r) {
@@ -137,7 +152,7 @@ func ValidateDirectExitRulesOptions(options option.Options) error {
 				}
 			}
 		}
-		if !pinsUDP(r, action) {
+		if !pinsUDP(r, action, probes) {
 			return errors.New("route.rules has a route without udp_connect (a UDP flow could change destination unchecked)")
 		}
 	}
@@ -173,19 +188,21 @@ func ruleAction(r option.Rule) option.RuleAction {
 
 // mayPrecedeSafeguards reports whether r may come before a direct exit's resolve and rejects:
 // it rejects, sniffs or resolves, which never sends traffic out, or it is a bandit probe.
-func mayPrecedeSafeguards(r option.Rule, action option.RuleAction) bool {
+func mayPrecedeSafeguards(r option.Rule, action option.RuleAction, probes map[string]bool) bool {
 	switch action.Action {
 	case constant.RuleActionTypeReject, constant.RuleActionTypeSniff, constant.RuleActionTypeResolve:
 		return true
 	}
-	return isBanditProbe(r, action)
+	return isBanditProbe(r, action, probes)
 }
 
 // isBanditProbe reports whether r is lantern-cloud's bandit probe rule: a route of exact
-// domains, on any or given ports, with no other match field and no invert. lantern-cloud puts
-// it first, ahead of the resolve, and it routes to an outbound that answers locally.
-func isBanditProbe(r option.Rule, action option.RuleAction) bool {
-	if !isDefaultRule(r) || action.Action != constant.RuleActionTypeRoute || len(r.DefaultOptions.Domain) == 0 {
+// domains, on any or given ports, with no other match field and no invert, to one of probes,
+// the tags of the banditprobe outbounds. lantern-cloud puts it first, ahead of the resolve, and
+// its outbound answers locally.
+func isBanditProbe(r option.Rule, action option.RuleAction, probes map[string]bool) bool {
+	if !isDefaultRule(r) || action.Action != constant.RuleActionTypeRoute || len(r.DefaultOptions.Domain) == 0 ||
+		!probes[action.RouteOptions.Outbound] {
 		return false
 	}
 	return reflect.DeepEqual(r.DefaultOptions.RawDefaultRule, option.RawDefaultRule{
@@ -196,16 +213,40 @@ func isBanditProbe(r option.Rule, action option.RuleAction) bool {
 
 // pinsUDP reports whether r, if it sends traffic out, pins a UDP flow to the destination the
 // rules checked. The bandit probe needn't: its outbound never dials.
-func pinsUDP(r option.Rule, action option.RuleAction) bool {
+func pinsUDP(r option.Rule, action option.RuleAction, probes map[string]bool) bool {
 	switch action.Action {
 	case constant.RuleActionTypeRoute:
-		return action.RouteOptions.UDPConnect || isBanditProbe(r, action)
+		return action.RouteOptions.UDPConnect || isBanditProbe(r, action, probes)
 	case constant.RuleActionTypeBypass:
 		return action.BypassOptions.UDPConnect
 	case constant.RuleActionTypeDirect:
 		return false
 	}
 	return true
+}
+
+// overridesDestination reports whether action rewrites a connection's address or port.
+func overridesDestination(action option.RuleAction) bool {
+	for _, o := range []option.RawRouteOptionsActionOptions{
+		action.RouteOptions.RawRouteOptionsActionOptions,
+		option.RawRouteOptionsActionOptions(action.RouteOptionsOptions),
+		action.BypassOptions.RawRouteOptionsActionOptions,
+	} {
+		if o.OverrideAddress != "" || o.OverridePort != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// rewritesDestination reports whether a direct outbound in outbounds overrides its
+// destination. sing-box refuses the fields in JSON, but not in options built in Go.
+func rewritesDestination(outbounds []option.Outbound) bool {
+	return slices.ContainsFunc(outbounds, func(out option.Outbound) bool {
+		direct, ok := out.Options.(*option.DirectOutboundOptions)
+		//nolint:staticcheck
+		return ok && (direct.OverrideAddress != "" || direct.OverridePort != 0)
+	})
 }
 
 // isTerminal reports whether r takes every connection that reaches it: a default rule with no
