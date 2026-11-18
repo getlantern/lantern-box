@@ -445,27 +445,63 @@ func (l *hedgeLeg) applyDeadlinesLocked(c deadlineCloser) {
 // hedgeMoveError is why a move to Then failed. It isn't a timeout, even
 // when its cause is, so a caller that retries timeouts sees the connection
 // is dead rather than retrying it forever. errors.Is and errors.As reach
-// its cause, except one that is a timeout, which would read as one.
-type hedgeMoveError struct{ cause error }
-
-func (e *hedgeMoveError) Error() string { return "hedge: move to then failed: " + e.cause.Error() }
-func (e *hedgeMoveError) Unwrap() error {
-	var ne net.Error
-	if errors.Is(e.cause, os.ErrDeadlineExceeded) || errors.Is(e.cause, context.DeadlineExceeded) ||
-		(errors.As(e.cause, &ne) && ne.Timeout()) {
-		return nil // any timeout, so nothing beneath reads as one
-	}
-	return e.cause
+// its cause, unless a timeout is anywhere in it, which would read as one.
+type hedgeMoveError struct {
+	cause error
+	// inner is what Unwrap returns: cause, or nil when it holds a timeout.
+	inner error
 }
 
+func newHedgeMoveError(cause error) *hedgeMoveError {
+	e := &hedgeMoveError{cause: cause}
+	if !holdsTimeout(cause) {
+		e.inner = cause
+	}
+	return e
+}
+
+// holdsTimeout reports whether a timeout is anywhere in err's tree,
+// including beneath an error that isn't one itself (crypto/tls wraps a
+// write's ETIMEDOUT in one) and in each branch of a joined error.
+func holdsTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == os.ErrDeadlineExceeded || err == context.DeadlineExceeded {
+		return true
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return true
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return holdsTimeout(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if holdsTimeout(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (e *hedgeMoveError) Error() string   { return "hedge: move to then failed: " + e.cause.Error() }
+func (e *hedgeMoveError) Unwrap() error   { return e.inner }
 func (e *hedgeMoveError) Timeout() bool   { return false }
 func (e *hedgeMoveError) Temporary() bool { return false }
 
-// timedOut is a move's error once dialTimer or replayTimer fired. Each
+// moveTimedOut is a move's error once dialTimer or replayTimer fired. Each
 // timer is stopped right after the call it bounds returns, so its having
 // fired means it caused whatever that call returned (a cancelled context,
-// a closed conn), which would otherwise read as a close.
-func timedOut() error { return os.ErrDeadlineExceeded }
+// a closed conn), which would otherwise read as a close. That error is kept
+// beside the timeout, for diagnostics.
+func moveTimedOut(err error) error {
+	if err == nil {
+		return os.ErrDeadlineExceeded
+	}
+	return errors.Join(os.ErrDeadlineExceeded, err)
+}
 
 // replayTimer closes c if the replay outlives the failover timeout, which
 // holds even for a conn that ignores deadlines. done reports whether the
@@ -495,7 +531,7 @@ func (l *hedgeLeg) finishMoveLocked(err error) {
 	case err != nil && l.closed:
 		err = net.ErrClosed
 	case err != nil:
-		err = &hedgeMoveError{cause: err}
+		err = newHedgeMoveError(err)
 	}
 	l.moveErr = err
 	switch {
@@ -590,7 +626,7 @@ func (s *hedgeStream) runMove() {
 			if err == nil {
 				conn.Close() // the timer cancelled the context it lives on
 			}
-			err = timedOut()
+			err = moveTimedOut(err)
 		}
 	}
 	if err == nil {
@@ -618,7 +654,7 @@ func (s *hedgeStream) runMove() {
 			}
 		}
 		if !done() {
-			err = timedOut()
+			err = moveTimedOut(err)
 		}
 		if err != nil {
 			conn.Close()
@@ -1062,7 +1098,7 @@ func (p *hedgePacket) runMove() {
 			if err == nil {
 				raw.Close() // the timer cancelled the context it lives on
 			}
-			err = timedOut()
+			err = moveTimedOut(err)
 		}
 		if err == nil {
 			conn = netPacketConn(raw)
@@ -1079,7 +1115,7 @@ func (p *hedgePacket) runMove() {
 				}
 			}
 			if !done() {
-				err = timedOut()
+				err = moveTimedOut(err)
 			}
 		}
 		if err != nil {
