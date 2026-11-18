@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 	"github.com/stretchr/testify/require"
 
@@ -41,7 +42,9 @@ type fakeOutbound struct {
 	// headroom in every buffer written to them, as SOCKS5 UDP does.
 	headroom int
 	// hang makes every dial wait for its context and return its error.
-	hang     bool
+	hang bool
+	// wrap, when set, wraps each dialed stream conn.
+	wrap     func(net.Conn) net.Conn
 	dialCtxs chan context.Context
 	dials    atomic.Int32
 	listens  atomic.Int32
@@ -78,6 +81,9 @@ func (f *fakeOutbound) DialContext(ctx context.Context, network string, destinat
 	}
 	client, server := net.Pipe()
 	go f.stream(server)
+	if f.wrap != nil {
+		return f.wrap(client), nil
+	}
 	return client, nil
 }
 
@@ -789,4 +795,266 @@ func TestHedgeClearedWriteDeadlineDuringReplay(t *testing.T) {
 	time.Sleep(500 * time.Millisecond) // past the deadline that was cleared
 	_, err = c.Write([]byte("later"))
 	require.NoError(t, err, "a deadline cleared during the replay must not survive on Then's leg")
+}
+
+// earlyConn waits for a first write before it can be read from, like the
+// client-info frame conn or a deferred-handshake proxy.
+type earlyConn struct {
+	net.Conn
+	wrote atomic.Bool
+}
+
+func (c *earlyConn) NeedHandshakeForWrite() bool { return !c.wrote.Load() }
+func (c *earlyConn) Write(p []byte) (int, error) {
+	c.wrote.Store(true)
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return c.Conn.Write(p)
+}
+
+func TestHedgeForwardsDeferredHandshake(t *testing.T) {
+	var early *earlyConn
+	first := &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn { early = &earlyConn{Conn: c}; return early }}
+	f := newHedgeFixture(t, first, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.True(t, N.NeedHandshakeForWrite(c), "the router must see First's pending handshake")
+	_, err = c.Write(nil) // the router's kick for a server-first protocol
+	require.NoError(t, err)
+	require.False(t, N.NeedHandshakeForWrite(c))
+	require.True(t, early.wrote.Load(), "the kick must reach First")
+	// The kick must not decide replayability: a handshake written next still moves.
+	require.Equal(t, "then:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+}
+
+// halfCloser records CloseWrite.
+type halfCloser struct {
+	net.Conn
+	closedWrite atomic.Bool
+}
+
+func (c *halfCloser) CloseWrite() error { c.closedWrite.Store(true); return nil }
+
+func TestHedgeHalfCloseOnFirst(t *testing.T) {
+	var hc *halfCloser
+	first := &fakeOutbound{stream: answer("first:"), wrap: func(c net.Conn) net.Conn { hc = &halfCloser{Conn: c}; return hc }}
+	f := newHedgeFixture(t, first, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.Equal(t, "first:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+	wc, ok := c.(N.WriteCloser)
+	require.True(t, ok)
+	require.NoError(t, wc.CloseWrite())
+	require.True(t, hc.closedWrite.Load())
+}
+
+func TestHedgeHalfCloseCarriesAcrossMove(t *testing.T) {
+	var thenConn *halfCloser
+	then := &fakeOutbound{stream: answer("then:"), wrap: func(c net.Conn) net.Conn { thenConn = &halfCloser{Conn: c}; return thenConn }}
+	first := &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn { return &halfCloser{Conn: c} }}
+	f := newHedgeFixture(t, first, then, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte(tlsRecord("request")))
+	require.NoError(t, err)
+	require.NoError(t, c.(N.WriteCloser).CloseWrite(), "half-close while still on First")
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "then:"+tlsRecord("request"), string(buf[:n]))
+	require.True(t, thenConn.closedWrite.Load(), "the half-close must be repeated on Then after the replay")
+}
+
+func TestHedgeCloseWriteUnsupported(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.ErrorIs(t, c.(N.WriteCloser).CloseWrite(), errors.ErrUnsupported,
+		"a leg that can't half-close must say so, so the relay closes instead")
+}
+
+// noDeadlineConn ignores deadlines, as samizdat-reverse's pipe does.
+type noDeadlineConn struct{ net.Conn }
+
+func (noDeadlineConn) SetDeadline(time.Time) error      { return os.ErrInvalid }
+func (noDeadlineConn) SetReadDeadline(time.Time) error  { return os.ErrInvalid }
+func (noDeadlineConn) SetWriteDeadline(time.Time) error { return os.ErrInvalid }
+
+func TestHedgeReplayBoundedWithoutDeadlines(t *testing.T) {
+	old := hedgeFailoverDialTimeout
+	hedgeFailoverDialTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { hedgeFailoverDialTimeout = old })
+	stuck := func(c net.Conn) { time.Sleep(10 * time.Second); c.Close() } // never reads the replay
+	then := &fakeOutbound{stream: stuck, wrap: func(c net.Conn) net.Conn { return noDeadlineConn{c} }}
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, then, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte(tlsRecord("hello")))
+	require.NoError(t, err)
+	start := time.Now()
+	_, err = c.Read(make([]byte, 64))
+	require.Error(t, err)
+	require.Less(t, time.Since(start), 3*time.Second, "a replay to a conn without deadlines must still end")
+}
+
+func TestHedgeWriteErrorMoveHonorsDeadline(t *testing.T) {
+	dropNow := make(chan struct{})
+	first := &fakeOutbound{stream: func(c net.Conn) { <-dropNow; c.Close() }}
+	f := newHedgeFixture(t, first, &fakeOutbound{hang: true},
+		func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) })
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	// Set before First's peer closes: net.Pipe refuses deadlines after that.
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(150*time.Millisecond)))
+	close(dropNow)
+	time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	_, err = c.Write([]byte(tlsRecord("hello")))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	require.Less(t, time.Since(start), 2*time.Second, "the write that triggers a move is bound by its deadline")
+}
+
+func TestHedgeWaitersSeeDeadlineChanges(t *testing.T) {
+	_, c, _ := startMoveToHangingThen(t)
+	defer c.Close()
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(150*time.Millisecond)))
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Read(make([]byte, 64))
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	require.NoError(t, c.SetReadDeadline(time.Time{}), "clearing the deadline must reach a waiting Read")
+	select {
+	case err := <-done:
+		t.Fatalf("Read returned %v at the old deadline", err)
+	case <-time.After(400 * time.Millisecond):
+	}
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(50*time.Millisecond)))
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded, "shortening it must too")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read missed the new deadline")
+	}
+}
+
+func TestHedgeDeadlineReachesPendingReplay(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	slowThen := func(c net.Conn) {
+		<-release
+		c.Close()
+	}
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: slowThen}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte(tlsRecord("hello")))
+	require.NoError(t, err)
+	s := c.(*hedgeStream)
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.pending != nil
+	}, 2*time.Second, 5*time.Millisecond, "the replay never started")
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(100*time.Millisecond)))
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	start := time.Now()
+	_, err = c.Read(make([]byte, 64))
+	require.Error(t, err, "a deadline set during the replay must interrupt it")
+	require.Less(t, time.Since(start), 2*time.Second)
+}
+
+// quicInitial builds a long-header packet with the given connection IDs.
+func quicInitial(dcid, scid []byte, payload string) []byte {
+	b := []byte{0xc0, 0, 0, 0, 1, byte(len(dcid))}
+	b = append(b, dcid...)
+	b = append(b, byte(len(scid)))
+	b = append(b, scid...)
+	return append(b, payload...)
+}
+
+// versionNegotiation builds a Version Negotiation packet addressed to dcid.
+func versionNegotiation(dcid []byte) []byte {
+	b := []byte{0x80, 0, 0, 0, 0, byte(len(dcid))}
+	b = append(b, dcid...)
+	return append(b, 0, 0, 0, 1)
+}
+
+func TestHedgeDecoyVersionNegotiationDoesNotCommit(t *testing.T) {
+	decoyCID := []byte{9, 9, 9, 9, 9, 9, 9, 9}
+	first := &fakeOutbound{packet: func([]byte) []byte { return versionNegotiation(decoyCID) }}
+	f := newHedgeFixture(t, first, &fakeOutbound{packet: echoPacket("then:")}, nil)
+	pc, err := f.hedge.ListenPacket(f.ctx, hedgeDest)
+	require.NoError(t, err)
+	defer pc.Close()
+	initial := quicInitial([]byte{1, 2, 3, 4, 5, 6, 7, 8}, []byte{7, 7, 7, 7}, "hello")
+	_, err = pc.WriteTo(initial, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443})
+	require.NoError(t, err)
+	require.NoError(t, pc.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 256)
+	n, _, err := pc.ReadFrom(buf)
+	require.NoError(t, err)
+	require.Equal(t, "then:"+string(initial), string(buf[:n]),
+		"a Version Negotiation answering only a decoy must not keep the flow on First")
+	require.EqualValues(t, 1, f.then.listens.Load())
+}
+
+func TestHedgeOwnVersionNegotiationIsDelivered(t *testing.T) {
+	scid := []byte{7, 7, 7, 7}
+	first := &fakeOutbound{packet: func([]byte) []byte { return versionNegotiation(scid) }}
+	f := newHedgeFixture(t, first, &fakeOutbound{packet: echoPacket("then:")}, nil)
+	pc, err := f.hedge.ListenPacket(f.ctx, hedgeDest)
+	require.NoError(t, err)
+	defer pc.Close()
+	_, err = pc.WriteTo(quicInitial([]byte{1, 2, 3, 4}, scid, "hello"), &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443})
+	require.NoError(t, err)
+	require.NoError(t, pc.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 256)
+	n, _, err := pc.ReadFrom(buf)
+	require.NoError(t, err)
+	require.Equal(t, string(versionNegotiation(scid)), string(buf[:n]), "the client's own Version Negotiation reaches it")
+	require.Zero(t, f.then.listens.Load())
+}
+
+func TestHedgeCacheDropsResultsFromBeforeANetworkChange(t *testing.T) {
+	c := newHedgeCache()
+	key := hedgeKey{site: "youtube.com", network: "tcp", gen: c.generation()}
+	c.clear()
+	c.mark(key, hedgeBad, time.Hour)
+	key.gen = c.generation()
+	require.Equal(t, hedgeUnknown, c.verdict(key), "a result learned on the old network must be dropped")
+	c.mark(key, hedgeBad, time.Hour)
+	require.Equal(t, hedgeBad, c.verdict(key))
+}
+
+func TestHedgeConnFromBeforeANetworkChangeDoesNotMark(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	f.hedge.InterfaceUpdated(context.Background())
+	require.Equal(t, "then:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+	require.Equal(t, hedgeUnknown, f.verdict("www.youtube.com:443"),
+		"First failing for a connection made on the old network says nothing about the new one")
+}
+
+func TestHedgeCacheDropsEmptyAddressBlocks(t *testing.T) {
+	c := newHedgeCache()
+	for i := range 100 {
+		prefix, _ := netip.AddrFrom4([4]byte{10, 0, byte(i), 1}).Prefix(24)
+		k := hedgeKey{site: "flaky.example", network: "tcp", prefix: prefix}
+		c.mark(k, hedgeBad, time.Hour)
+		c.mark(k, hedgeGood, time.Hour)
+	}
+	require.Empty(t, c.badSites, "a block whose last bad site recovered must be removed")
 }

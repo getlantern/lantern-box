@@ -31,10 +31,12 @@ const (
 	// hedgeMaxHeldPackets bounds the datagrams kept for replay; a QUIC
 	// handshake's first flight is a handful.
 	hedgeMaxHeldPackets = 64
-	// hedgeFailoverDialTimeout bounds the dial to Then when a connection
-	// moves. The original dial's context may be gone by then.
-	hedgeFailoverDialTimeout = 15 * time.Second
 )
+
+// hedgeFailoverDialTimeout bounds the dial to Then when a connection moves,
+// and the replay to it. The original dial's context may be gone by then. A
+// variable so tests can shorten it.
+var hedgeFailoverDialTimeout = 15 * time.Second
 
 func RegisterHedge(registry *outbound.Registry) {
 	outbound.Register[option.HedgeOutboundOptions](registry, constant.TypeHedge, NewHedge)
@@ -162,6 +164,7 @@ func (h *Hedge) useFirst(ctx context.Context, network string, destination M.Sock
 		return nil, hedgeKey{}, false
 	}
 	key := hedgeKeyFor(ctx, network, destination)
+	key.gen = h.cache.generation()
 	if h.cache.verdict(key) == hedgeBad {
 		return nil, key, false
 	}

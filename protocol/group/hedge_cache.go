@@ -50,6 +50,10 @@ type hedgeKey struct {
 	network string
 	// prefix is the destination's /24 (IPv4) or /48 (IPv6), when known.
 	prefix netip.Prefix
+	// gen is the cache generation the key was made in. A result from an
+	// earlier generation, a connection started on another network, is
+	// dropped.
+	gen uint64
 }
 
 // hedgeKeyFor builds the key for a dial. The name comes from the destination,
@@ -110,6 +114,7 @@ type hedgeCache struct {
 	now func() time.Time
 
 	mu    sync.Mutex
+	gen   uint64
 	sites map[hedgeSiteKey]hedgeEntry
 	// badSites holds, per address block, the sites in it that failed on
 	// First and when each failure expires.
@@ -177,12 +182,22 @@ func (c *hedgeCache) verdict(k hedgeKey) hedgeVerdict {
 	return hedgeUnknown
 }
 
+// generation returns the current generation, for stamping keys.
+func (c *hedgeCache) generation() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gen
+}
+
 func (c *hedgeCache) mark(k hedgeKey, v hedgeVerdict, ttl time.Duration) {
 	if k.site == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if k.gen != c.gen {
+		return // learned on a network the cache has since forgotten
+	}
 	expires := c.now().Add(ttl)
 	c.sites[hedgeSiteKey{k.site, k.network}] = hedgeEntry{verdict: v, expires: expires}
 	if k.prefix.IsValid() {
@@ -195,6 +210,9 @@ func (c *hedgeCache) mark(k hedgeKey, v hedgeVerdict, ttl time.Duration) {
 			c.badSites[pk][k.site] = expires
 		case hedgeGood:
 			delete(c.badSites[pk], k.site)
+			if len(c.badSites[pk]) == 0 {
+				delete(c.badSites, pk)
+			}
 		}
 	}
 	c.trimLocked()
@@ -246,10 +264,12 @@ func (c *hedgeCache) trimLocked() {
 }
 
 // clear forgets everything, for a network change: what is blocked differs
-// between networks.
+// between networks. It starts a new generation, so results from connections
+// made before it are dropped.
 func (c *hedgeCache) clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.gen++
 	c.sites = map[hedgeSiteKey]hedgeEntry{}
 	c.badSites = map[hedgePrefixKey]map[string]time.Time{}
 }
