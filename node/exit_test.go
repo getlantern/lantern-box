@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -67,6 +68,13 @@ const validExitConfig = `{
 // allowlist but the same rejects; its extra outbound only tells the fake box which it got.
 var personalExitConfig = strings.Replace(validExitConfig, `"outbounds":[{"type":"direct","tag":"direct"}]`,
 	`"outbounds":[{"type":"direct","tag":"direct"},{"type":"direct","tag":"personal-marker"}]`, 1)
+
+// rotatedConfig is validExitConfig with an outbound unique to n, so each registration's
+// config differs from the last, as a config with fresh settings does.
+func rotatedConfig(n int) string {
+	return strings.Replace(validExitConfig, `"outbounds":[{"type":"direct","tag":"direct"}]`,
+		fmt.Sprintf(`"outbounds":[{"type":"direct","tag":"direct"},{"type":"direct","tag":"rotation-%d"}]`, n), 1)
+}
 
 const exitConfigWithoutAbuseRules = `{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}`
 
@@ -364,8 +372,9 @@ func TestRunExitRefusesConfigWithoutAResolveAndPrivateReject(t *testing.T) {
 }
 
 func TestRunExitRotatesWithoutAGap(t *testing.T) {
+	var registers atomic.Int32
 	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{"server_config": validExitConfig, "rotation_interval_seconds": 3600})
+		writeJSON(w, map[string]any{"server_config": rotatedConfig(int(registers.Add(1))), "rotation_interval_seconds": 3600})
 	})
 	e := enabledExit(t)
 	ev := &exitEvents{}
@@ -469,9 +478,9 @@ func TestRunExitMarksTheExitBoxsSockets(t *testing.T) {
 		{"not on Linux", false, 0x2024, 0x2025, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			orig := isLinux
-			isLinux = tc.linux
-			t.Cleanup(func() { isLinux = orig })
+			orig, origProbe := isLinux, probeMark
+			isLinux, probeMark = tc.linux, func(uint32) error { return nil }
+			t.Cleanup(func() { isLinux, probeMark = orig, origProbe })
 			srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, map[string]any{"server_config": validExitConfig, "rotation_interval_seconds": 3600})
 			})
@@ -721,6 +730,124 @@ func TestRunExitReregistersOnRequest(t *testing.T) {
 	assert.EqualValues(t, 2, registers.Load(), "held off, a re-register waits")
 	cancel()
 	waitDone(t, done)
+}
+
+// While one kind's config keeps failing, RunExit retries on its back-off. A kind whose config
+// hasn't changed keeps its box, its registration extended, rather than a rebuild that would
+// reset its streams at every retry; a changed config still rebuilds it.
+func TestRunExitKeepsAnUnchangedBox(t *testing.T) {
+	var registers atomic.Int32
+	var poolConfig atomic.Value
+	poolConfig.Store(validExitConfig)
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		registers.Add(1)
+		writeJSON(w, map[string]any{"server_config": poolConfig.Load(), "personal_server_config": exitConfigWithoutAbuseRules})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	boxes := &fakeExitBoxes{ev: ev}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	const rotation = 100 * time.Millisecond
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: boxes.new, RotationInterval: rotation}, ev)
+	require.Eventually(t, func() bool { return registers.Load() >= 6 }, 5*time.Second, time.Millisecond)
+	first := boxes.last()
+	require.NotNil(t, first)
+	assert.Len(t, boxes.all(), 1, "the pool's unchanged config isn't rebuilt at each retry")
+	closed, _ := first.isClosed()
+	assert.False(t, closed)
+	time.Sleep(2*rotation + 50*time.Millisecond)
+	assert.True(t, e.Options().Ready(false), "its registration is extended, so it outlives the first one")
+	assert.Len(t, boxes.all(), 1)
+
+	poolConfig.Store(rotatedConfig(1))
+	require.Eventually(t, func() bool { return len(boxes.all()) == 2 }, 5*time.Second, time.Millisecond, "a changed config rebuilds")
+	require.Eventually(t, func() bool { closed, _ := first.isClosed(); return closed }, 5*time.Second, time.Millisecond)
+	assert.True(t, e.Options().Ready(false))
+	cancel()
+	waitDone(t, done)
+}
+
+// A routing mark the process can't set (no CAP_NET_ADMIN) would fail every dial of the box
+// while the exit offered it, so RunExit serves no box it can't mark.
+func TestRunExitRefusesAMarkItCantSet(t *testing.T) {
+	orig, origProbe := isLinux, probeMark
+	isLinux, probeMark = true, func(uint32) error { return errors.New("operation not permitted") }
+	t.Cleanup(func() { isLinux, probeMark = orig, origProbe })
+	var registers atomic.Int32
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		registers.Add(1)
+		writeJSON(w, map[string]any{"server_config": validExitConfig})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	boxes := &fakeExitBoxes{ev: ev}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: boxes.new, RoutingMark: 0x2024}, ev)
+	require.Eventually(t, func() bool { return registers.Load() >= 2 }, 5*time.Second, time.Millisecond)
+	assert.Empty(t, boxes.all())
+	assert.False(t, e.Options().Ready(false))
+	cancel()
+	waitDone(t, done)
+}
+
+// Every kind's failure is logged, not just the first.
+func TestRunExitLogsEachKindsFailure(t *testing.T) {
+	buf := &exitLogBuffer{}
+	factory := log.NewDefaultFactory(context.Background(), log.Formatter{}, buf, "", nil, false)
+	factory.SetLevel(log.LevelTrace)
+	require.NoError(t, factory.Start())
+	prev := log.StdLogger()
+	log.SetStdLogger(factory.Logger())
+	t.Cleanup(func() {
+		log.SetStdLogger(prev)
+		_ = factory.Close()
+	})
+	var registers atomic.Int32
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		registers.Add(1)
+		writeJSON(w, map[string]any{"server_config": exitConfigWithoutAbuseRules, "personal_server_config": exitConfigWithoutAResolve})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: (&fakeExitBoxes{ev: ev}).new}, ev)
+	require.Eventually(t, func() bool { return registers.Load() >= 2 }, 5*time.Second, time.Millisecond)
+	cancel()
+	waitDone(t, done)
+	out := buf.String()
+	assert.Contains(t, out, "check the pool exit config")
+	assert.Contains(t, out, "check the personal exit config")
+}
+
+// A successful registration ends a hold-off, even if a config then fails its checks.
+func TestRunExitClearsTheHoldOffOnRegistering(t *testing.T) {
+	var registers atomic.Int32
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		if registers.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, map[string]any{"server_config": exitConfigWithoutAbuseRules})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	held := &holdOffs{}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: (&fakeExitBoxes{ev: ev}).new, OnHoldOff: held.record}, ev)
+	require.Eventually(t, func() bool { return len(held.list()) >= 2 }, 5*time.Second, time.Millisecond)
+	cancel()
+	waitDone(t, done)
+	got := held.list()
+	assert.False(t, got[0].IsZero())
+	assert.True(t, got[1].IsZero(), "lantern-cloud answered, so the hold-off is over")
 }
 
 // holdOffs records what RunExit reports through OnHoldOff.

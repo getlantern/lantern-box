@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/control"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
 
@@ -85,6 +87,17 @@ type ExitConfig struct {
 	Reregister <-chan struct{}
 }
 
+// probeMark sets mark on a throwaway socket, failing as the exit box's dials would. A var so
+// tests can stand in for a process with or without CAP_NET_ADMIN.
+var probeMark = func(mark uint32) error {
+	lc := net.ListenConfig{Control: control.RoutingMark(mark)}
+	pc, err := lc.ListenPacket(context.Background(), "udp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	return pc.Close()
+}
+
 // isLinux is a var so tests can mark the exit box's sockets on any OS.
 var isLinux = runtime.GOOS == "linux"
 
@@ -118,9 +131,11 @@ type exitRunner struct {
 	holdOffUntil time.Time
 }
 
-// kindBox is the exit box serving one kind of session, and when its registration runs out.
+// kindBox is the exit box serving one kind of session, the options it was built from, and when
+// its registration runs out.
 type kindBox struct {
 	box        ExitBox
+	options    string
 	validUntil time.Time
 }
 
@@ -139,8 +154,10 @@ var exitKinds = []exit.Kind{exit.Pool, exit.Personal}
 // checks leaves its kind's current box serving until its own registration runs out.
 //
 // RunExit never turns the exit on or off: the embedder drives cfg.Exit's SetEnabled, and
-// should cancel ctx while the exit is off, so RunExit stops registering every rotation. Each
-// rotation closes the previous boxes, which resets the streams still routed through them.
+// should cancel ctx while the exit is off, so RunExit stops registering every rotation. A
+// rotation that brings a kind a changed config closes that kind's previous box, which resets
+// the streams still routed through it; an unchanged config keeps the box, its registration
+// extended.
 //
 // The embedder must not run RunExit where the device's country is unknown or censored, as
 // radiance's wantPairingRoute (backend/peer_pairings.go) gates its pairings-only route: the
@@ -207,9 +224,6 @@ func (r *exitRunner) loop(ctx context.Context) error {
 		} else {
 			wait = r.rotation
 			retry = r.minRetry
-			if r.heldOff {
-				r.holdOff(time.Time{})
-			}
 		}
 		if !r.wait(ctx, wait) {
 			return nil
@@ -239,6 +253,10 @@ func (r *exitRunner) refresh(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// lantern-cloud answered, so a hold-off it asked for is over, whatever the configs hold.
+	if r.heldOff {
+		r.holdOff(time.Time{})
+	}
 	return r.launch(ctx, resp)
 }
 
@@ -251,8 +269,11 @@ func (r *exitRunner) register(ctx context.Context) (*webrtcRegisterResponse, err
 
 // launch builds an exit box from each config in resp and swaps the exit onto its router for
 // that kind, then closes the kind's previous box, so its running sessions move to the new
-// router for their next stream. A kind with no config is cleared. A kind whose config fails
-// keeps its current box, and launch returns that failure, so RunExit retries soon.
+// router for their next stream. A kind whose box was built from the same options keeps it, its
+// registration extended, so its streams survive; this matters most while the other kind's
+// config keeps failing, when RunExit re-registers at every retry. A kind with no config is
+// cleared. A kind whose config fails keeps its current box, and launch returns that failure,
+// so RunExit retries soon.
 func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) error {
 	rotation := r.cfg.RotationInterval
 	if rotation <= 0 {
@@ -269,14 +290,24 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) e
 			r.closeKind(kind)
 			continue
 		}
-		b, err := r.build(ctx, kind, configs[kind])
+		options, err := r.prepare(ctx, kind, configs[kind])
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
 		kb := &r.boxes[kind]
+		if kb.box != nil && kb.options == options {
+			kb.validUntil = time.Now().Add(2 * rotation)
+			r.exit.SetRouter(kind, kb.box.Router(), kb.validUntil)
+			continue
+		}
+		b, err := r.newBox(ctx, options)
+		if err != nil {
+			errs = append(errs, &exitStageError{stage: "start the " + kind.String() + " exit box", err: err})
+			continue
+		}
 		prev := kb.box
-		kb.box, kb.validUntil = b, time.Now().Add(2*rotation)
+		*kb = kindBox{box: b, options: options, validUntil: time.Now().Add(2 * rotation)}
 		r.exit.SetRouter(kind, b.Router(), kb.validUntil)
 		if prev != nil {
 			_ = prev.Close()
@@ -285,20 +316,23 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) e
 	return errors.Join(errs...)
 }
 
-// build checks and sanitizes a kind's config and starts its exit box.
-func (r *exitRunner) build(ctx context.Context, kind exit.Kind, config string) (ExitBox, error) {
+// errMarkRefused is a routing mark the process may not set.
+var errMarkRefused = errors.New("could not set the routing mark on a socket (it needs CAP_NET_ADMIN)")
+
+// prepare checks and sanitizes a kind's config, returning the options for its box.
+func (r *exitRunner) prepare(ctx context.Context, kind exit.Kind, config string) (string, error) {
 	stage := func(what string) string { return what + " the " + kind.String() + " exit config" }
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(config))
 	if err != nil {
-		return nil, &exitStageError{stage: stage("parse"), err: err}
+		return "", &exitStageError{stage: stage("parse"), err: err}
 	}
 	// The personal policy has no allowlist, but the same abuse rejects as the pool's.
 	if err := peerrules.ValidateAbuseRulesOptions(opts); err != nil {
-		return nil, &exitStageError{stage: stage("check"), err: err, loggable: true}
+		return "", &exitStageError{stage: stage("check"), err: err, loggable: true}
 	}
 	// Its errors are fixed text, naming no rule.
 	if err := peerrules.ValidateDirectExitRulesOptions(opts); err != nil {
-		return nil, &exitStageError{stage: stage("check"), err: err, loggable: true}
+		return "", &exitStageError{stage: stage("check"), err: err, loggable: true}
 	}
 	// The exit box only routes the exit's traffic: no listeners, and nothing else lantern-cloud's
 	// config carries, such as the debug listener of its peer configs.
@@ -307,6 +341,11 @@ func (r *exitRunner) build(ctx context.Context, kind exit.Kind, config string) (
 	// Exit traffic leaves on the physical interface, never through the volunteer's own tunnel.
 	opts.Route.AutoDetectInterface = true
 	if mark := r.routingMark(ctx); mark != 0 {
+		// A box whose every dial fails to set its mark would be offered while it serves
+		// nothing, so a mark the process can't set serves no box of this kind.
+		if probeMark(mark) != nil {
+			return "", &exitStageError{stage: "mark the " + kind.String() + " exit box's sockets", err: errMarkRefused, loggable: true}
+		}
 		opts.Route.DefaultMark = option.FwMark(mark)
 	}
 	// sing-box's router logs every routed connection's destination, and this box carries
@@ -314,13 +353,9 @@ func (r *exitRunner) build(ctx context.Context, kind exit.Kind, config string) (
 	opts.Log = &option.LogOptions{Disabled: true}
 	options, err := json.MarshalContext(ctx, opts)
 	if err != nil {
-		return nil, &exitStageError{stage: stage("marshal"), err: err}
+		return "", &exitStageError{stage: stage("marshal"), err: err}
 	}
-	b, err := r.newBox(ctx, string(options))
-	if err != nil {
-		return nil, &exitStageError{stage: "start the " + kind.String() + " exit box", err: err}
-	}
-	return b, nil
+	return string(options), nil
 }
 
 // routingMark is the mark for the exit box's sockets on Linux (see ExitConfig.RoutingMark), or 0.
@@ -343,11 +378,20 @@ func (r *exitRunner) routingMark(ctx context.Context) uint32 {
 func (r *exitRunner) wait(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
+	var e *time.Timer
+	defer func() {
+		if e != nil {
+			e.Stop()
+		}
+	}()
 	for {
+		if e != nil {
+			e.Stop()
+			e = nil
+		}
 		var expiry <-chan time.Time
 		if next, ok := r.nextExpiry(); ok {
-			e := time.NewTimer(time.Until(next))
-			defer e.Stop()
+			e = time.NewTimer(time.Until(next))
 			expiry = e.C
 		}
 		select {
@@ -421,8 +465,15 @@ type exitStageError struct {
 func (e *exitStageError) Error() string { return e.stage + ": " + e.err.Error() }
 func (e *exitStageError) Unwrap() error { return e.err }
 
-// logExitFailure logs err without the device ID, a response body, the config or an address.
+// logExitFailure logs err without the device ID, a response body, the config or an address. A
+// launch's failures, one per kind, are each logged.
 func logExitFailure(err error, retry time.Duration) {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, err := range joined.Unwrap() {
+			logExitFailure(err, retry)
+		}
+		return
+	}
 	var ae *apiError
 	var se *exitStageError
 	switch {
