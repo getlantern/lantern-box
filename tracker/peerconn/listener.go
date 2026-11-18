@@ -18,6 +18,8 @@
 package peerconn
 
 import (
+	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 )
@@ -83,6 +85,33 @@ type Event struct {
 	// Bytes is the connection's running byte totals: the same Counter on
 	// its accept and its close, or nil if the inbound does not count bytes.
 	Bytes *Counter
+	// ShortID is the samizdat short ID the connection's session authenticated
+	// with, the same on its accept and its close, or zero if the inbound has
+	// none. Each personal-proxy pairing gets its own short ID, so it tells a
+	// listener which pairing a connection came through. A short ID identifies
+	// a friend relationship: it must never be logged, traced, or put in
+	// metrics, and String and LogValue leave it out.
+	ShortID [8]byte
+}
+
+// String formats evt without its ShortID, so %v and %+v of an Event never
+// print it.
+func (evt Event) String() string {
+	return fmt.Sprintf("{State:%d Source:%s Destination:%s Rejected:%t}",
+		evt.State, evt.Source, evt.Destination, evt.Rejected)
+}
+
+// GoString is String, so %#v leaves ShortID out too.
+func (evt Event) GoString() string { return "peerconn.Event" + evt.String() }
+
+// LogValue leaves out ShortID, so slog never records it.
+func (evt Event) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.Int("state", evt.State),
+		slog.String("source", evt.Source),
+		slog.String("destination", evt.Destination),
+		slog.Bool("rejected", evt.Rejected),
+	)
 }
 
 // Listener receives connection lifecycle notifications from lantern-box

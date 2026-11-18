@@ -35,9 +35,10 @@ func RegisterMutableSelector(registry *outbound.Registry) {
 
 var (
 	_ adapter.MutableOutboundGroup = (*MutableSelector)(nil)
+	_ adapter.MemberReplacer       = (*MutableSelector)(nil)
 	_ A.OutboundGroup              = (*MutableSelector)(nil)
-	_ A.ConnectionHandlerEx        = (*MutableSelector)(nil)
-	_ A.PacketConnectionHandlerEx  = (*MutableSelector)(nil)
+	_ A.ConnectionHandler          = (*MutableSelector)(nil)
+	_ A.PacketConnectionHandler    = (*MutableSelector)(nil)
 )
 
 type MutableSelector struct {
@@ -166,6 +167,42 @@ func (s *MutableSelector) Add(tags ...string) (n int, err error) {
 	return n, nil
 }
 
+// Replace re-resolves each given member tag from the outbound manager and swaps the new outbound
+// into the group in place, for an outbound recreated under the same tag, and returns the number of
+// members replaced. The tag never leaves the group and the selected tag never changes: if the
+// replaced member is selected, new connections go to the new outbound. No connections are
+// interrupted; the interrupt group spans every tag, and the old outbound is closed by its manager.
+// Tags not in the group are ignored; a member missing from the outbound manager keeps its current
+// outbound and is reported in the error.
+func (s *MutableSelector) Replace(tags ...string) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var missing []string
+	for _, tag := range tags {
+		old, exists := s.outbounds[tag]
+		if !exists {
+			continue
+		}
+		outbound, found := s.outboundMgr.Outbound(tag)
+		if !found {
+			missing = append(missing, tag)
+			continue
+		}
+		n++
+		if outbound == old {
+			continue
+		}
+		s.outbounds[tag] = outbound
+		s.selected.CompareAndSwap(old, outbound)
+		s.logger.Debug("replaced outbound ", tag)
+	}
+	if len(missing) > 0 {
+		return n, fmt.Errorf("%d outbounds not found: %v", len(missing), missing)
+	}
+	return n, nil
+}
+
 // Remove removes the given outbound tags from the group and returns the number of outbounds removed.
 // A random outbound will be selected if the currently selected outbound is removed.
 func (s *MutableSelector) Remove(tags ...string) (n int, err error) {
@@ -198,8 +235,8 @@ func (s *MutableSelector) DialContext(ctx context.Context, network string, desti
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.DialContext", trace.WithAttributes(
 		attribute.String("network", network),
 		attribute.StringSlice("supported_network_options", s.Network()),
-		attribute.String("outbound", s.Now()),
-		attribute.String("tag", s.Tag()),
+		tagAttr("outbound", s.Now()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
@@ -207,13 +244,13 @@ func (s *MutableSelector) DialContext(ctx context.Context, network string, desti
 	outbound := s.selected.Load()
 	if outbound == nil {
 		err := errors.New("no outbound available")
-		span.RecordError(err)
+		recordError(span, err)
 		return nil, err
 	}
 
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err != nil {
-		span.RecordError(err)
+		recordError(span, err)
 		return nil, err
 	}
 	conn = s.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx))
@@ -226,8 +263,8 @@ func (s *MutableSelector) DialContext(ctx context.Context, network string, desti
 func (s *MutableSelector) ListenPacket(ctx context.Context, destination metadata.Socksaddr) (net.PacketConn, error) {
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.ListenPacket", trace.WithAttributes(
 		attribute.StringSlice("supported_network_options", s.Network()),
-		attribute.String("outbound", s.Now()),
-		attribute.String("tag", s.Tag()),
+		tagAttr("outbound", s.Now()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
@@ -235,13 +272,13 @@ func (s *MutableSelector) ListenPacket(ctx context.Context, destination metadata
 	outbound := s.selected.Load()
 	if outbound == nil {
 		err := errors.New("no outbound available")
-		span.RecordError(err)
+		recordError(span, err)
 		return nil, err
 	}
 
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err != nil {
-		span.RecordError(err)
+		recordError(span, err)
 		return nil, err
 	}
 	conn = s.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx))
@@ -251,18 +288,18 @@ func (s *MutableSelector) ListenPacket(ctx context.Context, destination metadata
 	return adapter.NewTaggedPacketConn(conn, realTag(outbound)), nil
 }
 
-func (s *MutableSelector) NewConnectionEx(ctx context.Context, conn net.Conn, metadata A.InboundContext, onClose network.CloseHandlerFunc) {
-	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.NewConnectionEx", trace.WithAttributes(
-		attribute.String("inbound", s.Now()),
-		attribute.String("outbound", metadata.Outbound),
+func (s *MutableSelector) NewConnection(ctx context.Context, conn net.Conn, metadata A.InboundContext, onClose network.CloseHandlerFunc) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.NewConnection", trace.WithAttributes(
+		tagAttr("inbound", s.Now()),
+		tagAttr("outbound", metadata.Outbound),
 		attribute.String("protocol", metadata.Protocol),
-		attribute.String("tag", s.Tag()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
 
 	wrappedOnClose := func(it error) {
-		span.RecordError(it)
+		recordError(span, it)
 		if onClose != nil {
 			onClose(it)
 		}
@@ -274,25 +311,25 @@ func (s *MutableSelector) NewConnectionEx(ctx context.Context, conn net.Conn, me
 		wrappedOnClose(err)
 		return
 	}
-	if handler, isHandler := selected.(A.ConnectionHandlerEx); isHandler {
-		handler.NewConnectionEx(ctx, conn, metadata, wrappedOnClose)
+	if handler, isHandler := selected.(A.ConnectionHandler); isHandler {
+		handler.NewConnection(ctx, conn, metadata, wrappedOnClose)
 		return
 	}
 	s.connMgr.NewConnection(ctx, selected, conn, metadata, wrappedOnClose)
 }
 
-func (s *MutableSelector) NewPacketConnectionEx(ctx context.Context, conn network.PacketConn, metadata A.InboundContext, onClose network.CloseHandlerFunc) {
-	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.NewPacketConnectionEx", trace.WithAttributes(
-		attribute.String("inbound", s.Now()),
-		attribute.String("outbound", metadata.Outbound),
+func (s *MutableSelector) NewPacketConnection(ctx context.Context, conn network.PacketConn, metadata A.InboundContext, onClose network.CloseHandlerFunc) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableSelector.NewPacketConnection", trace.WithAttributes(
+		tagAttr("inbound", s.Now()),
+		tagAttr("outbound", metadata.Outbound),
 		attribute.String("protocol", metadata.Protocol),
-		attribute.String("tag", s.Tag()),
+		tagAttr("tag", s.Tag()),
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
 
 	wrappedOnClose := func(it error) {
-		span.RecordError(it)
+		recordError(span, it)
 		if onClose != nil {
 			onClose(it)
 		}
@@ -304,8 +341,8 @@ func (s *MutableSelector) NewPacketConnectionEx(ctx context.Context, conn networ
 		wrappedOnClose(err)
 		return
 	}
-	if handler, isHandler := selected.(A.PacketConnectionHandlerEx); isHandler {
-		handler.NewPacketConnectionEx(ctx, conn, metadata, wrappedOnClose)
+	if handler, isHandler := selected.(A.PacketConnectionHandler); isHandler {
+		handler.NewPacketConnection(ctx, conn, metadata, wrappedOnClose)
 		return
 	}
 	s.connMgr.NewPacketConnection(ctx, selected, conn, metadata, wrappedOnClose)

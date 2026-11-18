@@ -18,28 +18,6 @@ type TrafficUsage struct {
 	UnknownConnections int64 `json:"unknownConnections,omitempty"`
 }
 
-func trafficReport(category string, bytes int64, bidirectional bool) *TrafficUsage {
-	if category == "" {
-		return nil
-	}
-	u := &TrafficUsage{}
-	var count int64
-	if bidirectional {
-		count = 1
-	}
-	switch category {
-	case "lantern":
-		u.LanternBytes, u.LanternConnections = bytes, count
-	case "probe":
-		u.ProbeBytes, u.ProbeConnections = bytes, count
-	case "other":
-		u.OtherBytes, u.OtherConnections = bytes, count
-	default:
-		u.UnknownBytes, u.UnknownConnections = bytes, count
-	}
-	return u
-}
-
 // Only the requested hostname is examined, locally. This never resolves DNS,
 // inspects TLS/HTTP contents, or retains destinations in reports or labels.
 // Exact host matches deliberately avoid classifying unrelated subdomains.

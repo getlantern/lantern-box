@@ -14,12 +14,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"syscall"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -48,7 +50,7 @@ func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.BanditProbeOutboundOptions](registry, constant.TypeBanditProbe, NewOutbound)
 }
 
-var _ adapter.ConnectionHandlerEx = (*Outbound)(nil)
+var _ adapter.ConnectionHandler = (*Outbound)(nil)
 
 // Outbound only handles connections the router hands it; it never dials.
 type Outbound struct {
@@ -61,6 +63,25 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 	if err != nil {
 		return nil, err
 	}
+	// The callback goes out like any outbound's direct traffic, not through
+	// Go's default dialer and the system resolver. On a residential peer whose
+	// device also runs the Lantern VPN, only sing-box's dialer honours
+	// route.auto_detect_interface and keeps the callback, and the lookup of
+	// its host, off the VPN tunnel.
+	// An environment proxy may be named by hostname even when the callback
+	// host is an IP literal.
+	// The batch endpoint is dialed the same way, so its host counts too.
+	_, ipErr := netip.ParseAddr(cfg.callbackURL.Hostname())
+	resolve := ipErr != nil || options.UseProxyEnvironment
+	if cfg.batch.url != nil {
+		if _, err := netip.ParseAddr(cfg.batch.url.Hostname()); err != nil {
+			resolve = true
+		}
+	}
+	callbackDialer, err := dialer.New(ctx, options.DialerOptions, resolve)
+	if err != nil {
+		return nil, fmt.Errorf("banditprobe: callback dialer: %w", err)
+	}
 	pool := make([]byte, bodyPoolSize)
 	if _, err := rand.Read(pool); err != nil {
 		return nil, fmt.Errorf("filling body pool: %w", err)
@@ -70,20 +91,42 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		logger:     lg,
 		pool:       pool,
 		readState:  readSendState,
-		httpClient: newCallbackClient(),
+		httpClient: newCallbackClient(callbackDialer, callbackProxy(options)),
 		now:        time.Now,
 	}
+	if cfg.batch.url != nil {
+		r.batch = newBatcher(cfg.batch, r.httpClient, lg, r.now, r.sendCallback)
+	}
 	return &Outbound{
-		Adapter:   outbound.NewAdapter(constant.TypeBanditProbe, tag, []string{N.NetworkTCP}, nil),
+		Adapter:   outbound.NewAdapterWithDialerOptions(constant.TypeBanditProbe, tag, []string{N.NetworkTCP}, options.DialerOptions),
 		responder: r,
 	}, nil
 }
 
-// newCallbackClient never follows redirects: a redirect could move the token,
-// device ID and verdict off the validated https callback_url.
-func newCallbackClient() *http.Client {
+// callbackProxy honours proxy environment variables only when the options ask
+// for it, since a proxy changes where the callback leaves from.
+func callbackProxy(options option.BanditProbeOutboundOptions) func(*http.Request) (*url.URL, error) {
+	if options.UseProxyEnvironment {
+		return http.ProxyFromEnvironment
+	}
+	return nil
+}
+
+// newCallbackClient dials the callback, host unresolved, through d, or through
+// the proxy that proxy picks, itself dialed through d. It never follows
+// redirects: a redirect could move the token, device ID and verdict off the
+// validated https callback_url.
+func newCallbackClient(d N.Dialer, proxy func(*http.Request) (*url.URL, error)) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = proxy
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return d.DialContext(ctx, network, M.ParseSocksaddr(addr))
+	}
+	// A custom DialContext turns off HTTP/2 unless asked for explicitly.
+	transport.ForceAttemptHTTP2 = true
 	return &http.Client{
-		Timeout: callbackTimeout,
+		Transport: transport,
+		Timeout:   callbackTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -125,7 +168,19 @@ func newConfig(options option.BanditProbeOutboundOptions) (config, error) {
 	if cfg.maxWait > maxMaxWait {
 		return config{}, fmt.Errorf("banditprobe: max_wait %s exceeds %s", cfg.maxWait, maxMaxWait)
 	}
+	cfg.batch, err = newBatchConfig(options.BatchURL, options.BatchToken, time.Duration(options.BatchInterval), options.BatchMaxSize)
+	if err != nil {
+		return config{}, err
+	}
 	return cfg, nil
+}
+
+// Close sends the callbacks waiting for a batch.
+func (o *Outbound) Close() error {
+	if o.responder.batch != nil {
+		o.responder.batch.close()
+	}
+	return nil
 }
 
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -136,7 +191,7 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return nil, syscall.EPERM
 }
 
-func (o *Outbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (o *Outbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	// serve closes conn the same way; sharing the wrapper keeps the close
 	// below from blocking on a stuck stream write too.
 	conn = closeAsync(conn)

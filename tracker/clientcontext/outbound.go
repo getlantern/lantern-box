@@ -44,17 +44,19 @@ func (r *outboundRegistry) Upstream() any {
 
 // canWrapOutbound reports whether out's traffic flows only through DialContext and
 // ListenPacket and out implements no interface that [outbound] would hide.
-// Groups, including lantern-box's fallback, are excluded because they dial
-// through member outbounds, which are wrapped themselves.
+// Groups, including lantern-box's fallback and hedge, are excluded because they
+// dial through member outbounds, which are wrapped themselves. Wrapping a hedge
+// would also hide its adapter.Switchable.
 func canWrapOutbound(out adapter.Outbound) bool {
-	if out.Type() == lconstant.TypeFallback || out.Type() == lconstant.TypeUnbounded {
+	switch out.Type() {
+	case lconstant.TypeFallback, lconstant.TypeHedge, lconstant.TypeUnbounded:
 		return false
 	}
 	switch out.(type) {
 	case adapter.OutboundGroup,
-		adapter.ConnectionHandlerEx,
-		adapter.PacketConnectionHandlerEx,
-		adapter.DirectRouteOutbound,
+		adapter.ConnectionHandler,
+		adapter.PacketConnectionHandler,
+		adapter.FlowOutbound,
 		adapter.OutboundWithPreferredRoutes,
 		dialer.DirectDialer,
 		dialer.ParallelInterfaceDialer,
@@ -129,9 +131,9 @@ func (o *outbound) Close() error {
 	return common.Close(o.Outbound)
 }
 
-func (o *outbound) InterfaceUpdated() {
+func (o *outbound) InterfaceUpdated(ctx context.Context) {
 	if listener, ok := o.Outbound.(adapter.InterfaceUpdateListener); ok {
-		listener.InterfaceUpdated()
+		listener.InterfaceUpdated(ctx)
 	}
 }
 

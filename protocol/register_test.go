@@ -1,6 +1,7 @@
 package protocol_test
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/getlantern/lantern-box/protocol"
@@ -40,4 +41,16 @@ func TestSupportedProtocolsIncludesTwiddle(t *testing.T) {
 	}
 	t.Error(`protocol.SupportedProtocols() does not include "twiddle" — ` +
 		`add it to the supportedProtocols slice in protocol/register.go`)
+}
+
+// TestSupportedProtocolsIncludesSamizdatReverse guards the same regression for
+// the reverse direct mode types: the portal and bridge inbounds and the
+// reverse outbound.
+func TestSupportedProtocolsIncludesSamizdatReverse(t *testing.T) {
+	for _, want := range []string{"samizdat-portal", "samizdat-reverse", "samizdat-bridge"} {
+		if !slices.Contains(protocol.SupportedProtocols(), want) {
+			t.Errorf("protocol.SupportedProtocols() does not include %q — "+
+				"register it in protocol/register.go", want)
+		}
+	}
 }

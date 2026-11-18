@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/getlantern/geo"
+	semconv "github.com/getlantern/semconv"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -65,6 +66,11 @@ type metricsManager struct {
 	unidentifiedConns metric.Int64Counter
 	unidentifiedIO    metric.Int64Counter
 
+	// destinationIO counts bytes by client country and destination country
+	// (see destination.go).
+	destinationIO      metric.Int64Counter
+	destinationLookupC chan destinationLookupRequest
+
 	// track is the proxy's experiment track (from proxy-info). It is also an
 	// OTEL resource attribute (keyed "proxy.track"), but the metrics pipeline
 	// does not expose resource attrs as queryable labels, so it's re-emitted as
@@ -88,6 +94,8 @@ var metrics = &metricsManager{
 
 	unidentifiedConns: &noop.Int64Counter{},
 	unidentifiedIO:    &noop.Int64Counter{},
+
+	destinationIO: &noop.Int64Counter{},
 
 	countryLookup: geo.NoLookup{},
 	ispLookup:     geo.NoLookup{},
@@ -122,9 +130,12 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 	if err == nil {
 		metrics.duration = duration
 	}
-	// Track per-session download goodput (received bytes per second of connection
-	// lifetime), recorded once at close for any session that moved >0 bytes over a
-	// >0 duration (see recordGoodput; no byte floor). The bandit experiment
+	// Track per-session goodput, recorded once at close. Samples with
+	// network.io.direction='receive' are bytes received from the client per
+	// second of connection lifetime, for any session that moved >0 bytes over a
+	// >0 duration (see recordGoodput; no byte floor). Samples with 'transmit'
+	// are bytes sent to the client per second of active sending, for sessions
+	// that sent at least 8 MiB (see recordDownloadGoodput). The bandit experiment
 	// evaluator slices this by three QUERYABLE POINT attributes — "track"
 	// (the bare key, not the "proxy.track" resource attr), geo.country.iso_code,
 	// and network.io.direction='receive' — to compare a challenger track's
@@ -136,7 +147,7 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 	// spelling for consistency within this package's metrics.
 	goodput, err := meter.Float64Histogram("proxy.session.goodput",
 		metric.WithUnit("bytes/s"),
-		metric.WithDescription("Per-session download goodput: received bytes per second of connection lifetime"),
+		metric.WithDescription("Per-session goodput: for network.io.direction=receive, bytes received from the client per second of connection lifetime; for transmit, bytes sent to the client per second of active sending, for sessions that sent at least 8 MiB"),
 		metric.WithExplicitBucketBoundaries(goodputBucketBoundaries...))
 	if err == nil {
 		metrics.sessionGoodput = goodput
@@ -152,6 +163,15 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 		metrics.unidentifiedIO = c
 	}
 
+	// proxy.destination.io carries no client identifiers, unlike proxy.io,
+	// which has a series per device: one more attribute there would multiply
+	// its series by the number of countries each device reaches.
+	if c, err := meter.Int64Counter(semconv.ProxyMetricDestinationIO,
+		metric.WithUnit("bytes"),
+		metric.WithDescription("Bytes through the proxy by client country and destination country")); err == nil {
+		metrics.destinationIO = c
+	}
+
 	if countryLookup != nil {
 		metrics.countryLookup = countryLookup
 	}
@@ -159,6 +179,10 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 		metrics.countryLookupC = make(chan countryLookupRequest, 256)
 		for range countryLookupWorkers {
 			go countryLookupWorker(metrics.countryLookupC, metrics.countryLookup, metrics.ispLookup)
+		}
+		metrics.destinationLookupC = make(chan destinationLookupRequest, 256)
+		for range destinationLookupWorkers {
+			go destinationLookupWorker(metrics.destinationLookupC, metrics.countryLookup)
 		}
 	}
 

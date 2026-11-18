@@ -23,6 +23,19 @@ func (fakeGeo) CountryCode(net.IP) string { return "IR" }
 func (fakeGeo) ASN(net.IP) string         { return "AS197207" }
 func (fakeGeo) ISP(net.IP) string         { return "Mobile Communication Company of Iran" }
 
+// stopLookupWorkers stops the lookup workers SetupMetricsManager starts for a
+// real lookup and clears the lookups. Workers left running would outlive a
+// synctest bubble, which reports them as a deadlock, and later tests would
+// inherit the lookups.
+func stopLookupWorkers() {
+	close(metrics.countryLookupC)
+	metrics.countryLookupC = nil
+	close(metrics.destinationLookupC)
+	metrics.destinationLookupC = nil
+	metrics.countryLookup = geo.NoLookup{}
+	metrics.ispLookup = geo.NoLookup{}
+}
+
 // allPointAttrs returns the attributes of every data point of metric name.
 func allPointAttrs(t *testing.T, rm metricdata.ResourceMetrics, name string) []map[string]any {
 	t.Helper()
@@ -91,14 +104,7 @@ func TestProxyIOCarriesASNAndISP(t *testing.T) {
 
 		SetISPLookup(fakeGeo{})
 		SetupMetricsManager(fakeGeo{}, "")
-		// The lookup workers would outlive the bubble, which synctest reports
-		// as a deadlock, and later tests would inherit the lookups.
-		defer func() {
-			close(metrics.countryLookupC)
-			metrics.countryLookupC = nil
-			metrics.countryLookup = geo.NoLookup{}
-			metrics.ispLookup = geo.NoLookup{}
-		}()
+		defer stopLookupWorkers()
 
 		ctx := context.Background()
 		tracker := NewTracker(ctx)

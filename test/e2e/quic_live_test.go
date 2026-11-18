@@ -1,0 +1,189 @@
+//go:build with_quic
+
+package e2e
+
+import (
+	"cmp"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/protocol/socks"
+	"github.com/stretchr/testify/require"
+
+	box "github.com/getlantern/lantern-box"
+)
+
+// TestHysteria2XLiveQUICSites sends real HTTP/3 requests to QUIC sites
+// (YouTube, Google) through a hysteria2x client and a stock hysteria2 server,
+// so the inner QUIC rides the hysteria2 UDP relay. It reaches the internet, so
+// it only runs with QUIC_LIVE=1.
+func TestHysteria2XLiveQUICSites(t *testing.T) {
+	if os.Getenv("QUIC_LIVE") == "" {
+		t.Skip("set QUIC_LIVE=1 to run against live QUIC sites")
+	}
+	sites := []string{
+		"https://www.youtube.com/",
+		"https://www.google.com/generate_204",
+		"https://i.ytimg.com/generate_204",
+		"https://cloudflare-quic.com/",
+	}
+
+	t.Run("direct-control", func(t *testing.T) {
+		for _, u := range sites {
+			proto, n, err := h3Get(t, u, nil)
+			t.Logf("direct %s → proto=%s bytes=%d err=%v", u, proto, n, err)
+		}
+	})
+
+	for _, junk := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pre_initial_junk=%t", junk), func(t *testing.T) {
+			boxCtx := box.BaseContext()
+			serverPort := freeUDPPort(t)
+			clientPort := freePort(t)
+			startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
+				"log": {"level": "error"},
+				"inbounds": [{"type": "hysteria2", "listen": "127.0.0.1", "listen_port": %d,
+					"users": [{"password": "pw"}], "tls": {"enabled": true, "insecure": true}}],
+				"outbounds": [{"type": "direct"}]
+			}`, serverPort)))
+			startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
+				"log": {"level": "error"},
+				"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+				"outbounds": [{"type": "hysteria2x", "server": "127.0.0.1", "server_port": %d,
+					"password": "pw", "pre_initial_junk": %t,
+					"tls": {"enabled": true, "server_name": "example.com", "insecure": true}}]
+			}`, clientPort, serverPort, junk)))
+
+			sc := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
+			for _, u := range sites {
+				proto, n, err := h3Get(t, u, sc)
+				require.NoError(t, err, "%s over hysteria2x", u)
+				require.Equal(t, "HTTP/3.0", proto)
+				t.Logf("hysteria2x %s → proto=%s bytes=%d", u, proto, n)
+			}
+		})
+	}
+}
+
+// h3Get fetches u over HTTP/3 only. With sc set, the QUIC packets go through
+// the SOCKS5 UDP ASSOCIATE of the hysteria2x client's mixed inbound.
+func h3Get(t *testing.T, u string, sc *socks.Client) (string, int, error) {
+	t.Helper()
+	// quic.DialEarly doesn't own the packet conns it is given, so each
+	// SOCKS5 association is closed once the transport is done with it.
+	var pcs []net.PacketConn
+	defer func() {
+		for _, pc := range pcs {
+			pc.Close()
+		}
+	}()
+	tr := &http3.Transport{
+		TLSClientConfig: &tls.Config{},
+		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			if sc == nil {
+				return quic.DialAddrEarly(ctx, addr, tlsCfg, cfg)
+			}
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", host)
+			if err != nil {
+				return nil, err
+			}
+			portNum, err := strconv.Atoi(port)
+			if err != nil {
+				return nil, err
+			}
+			ua := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ips[0], uint16(portNum)))
+			pc, err := sc.ListenPacket(ctx, M.SocksaddrFromNet(ua))
+			if err != nil {
+				return nil, err
+			}
+			conn, err := quic.DialEarly(ctx, pc, ua, tlsCfg, cfg)
+			if err != nil {
+				pc.Close()
+				return nil, err
+			}
+			pcs = append(pcs, pc)
+			return conn, nil
+		},
+	}
+	defer tr.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	return resp.Proto, len(b), err
+}
+
+// TestOutlineLiveQUICSites sends real HTTP/3 requests to QUIC sites straight
+// from the proxyless outline outbound, with no proxy server. OUTLINE_UDP sets
+// the outbound's udp option and defaults to a single quicprelude decoy. It
+// reaches the internet, so it only runs with QUIC_LIVE=1.
+func TestOutlineLiveQUICSites(t *testing.T) {
+	if os.Getenv("QUIC_LIVE") == "" {
+		t.Skip("set QUIC_LIVE=1 to run against live QUIC sites")
+	}
+	boxCtx := box.BaseContext()
+	clientPort := freePort(t)
+	startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
+		"log": {"level": "error"},
+		"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+		"outbounds": [{"type": "outline", "domains": ["example.com"], "udp": %q}]
+	}`, clientPort, cmp.Or(os.Getenv("OUTLINE_UDP"), "quicprelude:count=1"))))
+	sc := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
+	for _, u := range []string{"https://www.youtube.com/", "https://i.ytimg.com/generate_204", "https://www.google.com/generate_204", "https://cloudflare-quic.com/"} {
+		proto, n, err := h3Get(t, u, sc)
+		require.NoError(t, err, u)
+		require.Equal(t, "HTTP/3.0", proto)
+		t.Logf("outline %s → proto=%s bytes=%d", u, proto, n)
+	}
+}
+
+// TestHedgeLiveQUICSites sends real HTTP/3 requests through a hedge whose
+// First is the outline outbound with quicprelude and whose Then is direct, so
+// the UDP hedge, including commit on the first reply, runs against real QUIC
+// servers. It reaches the internet, so it only runs with QUIC_LIVE=1.
+func TestHedgeLiveQUICSites(t *testing.T) {
+	if os.Getenv("QUIC_LIVE") == "" {
+		t.Skip("set QUIC_LIVE=1 to run against live QUIC sites")
+	}
+	boxCtx := box.BaseContext()
+	clientPort := freePort(t)
+	startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
+		"log": {"level": "error"},
+		"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+		"outbounds": [
+			{"type": "hedge", "tag": "smart", "first": "proxyless", "then": "direct"},
+			{"type": "outline", "tag": "proxyless", "domains": ["example.com"], "udp": "quicprelude:count=1"},
+			{"type": "direct", "tag": "direct"}
+		],
+		"route": {"final": "smart"}
+	}`, clientPort)))
+	sc := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
+	for _, u := range []string{"https://www.youtube.com/", "https://i.ytimg.com/generate_204", "https://www.google.com/generate_204", "https://cloudflare-quic.com/"} {
+		proto, n, err := h3Get(t, u, sc)
+		require.NoError(t, err, u)
+		require.Equal(t, "HTTP/3.0", proto)
+		t.Logf("hedge %s → proto=%s bytes=%d", u, proto, n)
+	}
+}

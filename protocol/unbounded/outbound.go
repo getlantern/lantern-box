@@ -24,19 +24,23 @@
 // # Options
 //
 // option.UnboundedOutboundOptions holds only JSON-serializable fields.
-// Runtime-only deps (HTTP transport for signaling, logger) come in via the
-// sing-box logger interface and the ctx, respectively.
+// Runtime-only deps (HTTP transport for signaling, helper pairing tickets,
+// logger) come in via the ctx and the sing-box logger interface.
 package unbounded
 
 import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	UBClientcore "github.com/getlantern/broflake/clientcore"
@@ -82,6 +86,13 @@ type Outbound struct {
 	ui           UBClientcore.UI
 	ql           *UBClientcore.QUICLayer
 	uot          *uot.Client
+	// consumerSlots reports broflake's WebRTC slots. A rooms-only consumer
+	// reads it before each dial so it can fail at once when no helper is
+	// connected.
+	consumerSlots func() []UBClientcore.ConsumerSlot
+	// path is what HelperPath reads, set at Start. Atomic because status
+	// readers may call HelperPath while Start is setting it.
+	path atomic.Pointer[helperPathSource]
 
 	// Constructed in NewOutbound; observes successful dial latencies and
 	// emits structured warnings when the current pairing's dials look
@@ -120,6 +131,11 @@ func NewOutbound(
 	setStringIfNonEmpty(&rtcOpt.Tag, opts.Tag)
 	setStringIfNonEmpty(&rtcOpt.ConsumerSessionID, opts.ConsumerSessionID)
 	setDurationSeconds(&rtcOpt.NATFailTimeout, opts.NATFailTimeout)
+	tuning, ignored := parseTuning(opts.Tuning)
+	rtcOpt.Tuning = tuning
+	if len(ignored) > 0 {
+		lg.WarnContext(ctx, "unbounded: ignoring unknown or invalid tuning options", "ignored", strings.Join(ignored, ","))
+	}
 	setDurationSeconds(&rtcOpt.Patience, opts.Patience)
 	setDurationSeconds(&rtcOpt.ErrorBackoff, opts.ErrorBackoff)
 	if opts.STUNBatchSize != 0 {
@@ -144,12 +160,28 @@ func NewOutbound(
 	if err != nil {
 		return nil, fmt.Errorf("unbounded: build sing-box dialer: %w", err)
 	}
-	rtcNet, err := newRTCNet(ctx, outboundDialer, lg)
+	rtcNet, err := newRTCNet(ctx, outboundDialer, lg, directFallbackAllowed(opts.DialerOptions))
 	if err != nil {
 		return nil, fmt.Errorf("unbounded: build pion net shim: %w", err)
 	}
 	rtcOpt.Net = rtcNet
 	rtcOpt.HTTPClient = signalingClient(ctx, outboundDialer, opts.InsecureDoNotVerifyDiscoveryCert)
+	// Helper pairing rooms: broflake reads the tickets at every subscribe, so
+	// radiance can renew them without restarting the outbound. Only the
+	// consumer lantern-cloud dedicates to the inviter's helpers presents
+	// them: the pool consumers the bandit assigns read the same context, and
+	// if they joined her rooms too she would hold up to twice her helpers'
+	// slots.
+	//
+	// That consumer is also rooms-only: it answers only her helpers' room
+	// genesis messages and never falls back to the stranger pool, which
+	// would route a personal proxy through strangers. With no helper online
+	// it has no connection; the bandit's pool outbounds cover that case.
+	if lbAdapter.IsHelperTag(tag) {
+		rtcOpt.RoomTicketSource = lbAdapter.RoomTicketSourceFromContext(ctx)
+		rtcOpt.ConsumerRoomsOnly = true
+		rtcOpt.ConsumerNoPathGrace = lbAdapter.HelperPathGrace
+	}
 
 	o := &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(
@@ -185,7 +217,7 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 
 	startCtx := context.Background()
 	o.logger.InfoContext(startCtx, "unbounded Start begin",
-		"tag", o.Tag(),
+		"tag", lbAdapter.RedactHelperTags(o.Tag()),
 		"discovery_srv", o.rtcOpt.DiscoverySrv,
 		"egress_addr", o.egOpt.Addr,
 		"ctable_size", o.bfOpt.CTableSize,
@@ -213,6 +245,8 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 
 	o.broflakeConn = bfConn
 	o.ui = ui
+	o.consumerSlots = ui.BroflakeEngine.ConsumerSlots
+	o.path.Store(&helperPathSource{connected: ui.BroflakeEngine.ConsumerConnected, started: startedAt})
 	o.ql = ql
 	o.dial = UBClientcore.CreateSOCKS5Dialer(ql)
 
@@ -248,6 +282,9 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	if o.dial == nil {
 		return nil, fmt.Errorf("unbounded: not started (DialContext called before Start)")
 	}
+	if err := o.checkHelperConnected(); err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	dest := destination.String()
 	switch N.NetworkName(network) {
@@ -255,6 +292,10 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		o.logger.DebugContext(ctx, "unbounded TCP dial start", "dest", dest)
 		conn, err := o.dial(ctx, network, dest)
 		if err != nil {
+			if err, ok := helperUnavailable(err); ok {
+				o.logger.DebugContext(ctx, "unbounded TCP dial failed: helper unavailable")
+				return nil, err
+			}
 			o.logger.ErrorContext(ctx, "unbounded TCP dial failed",
 				"dest", dest,
 				"elapsed", time.Since(started),
@@ -271,6 +312,10 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		o.logger.DebugContext(ctx, "unbounded UoT dial start", "dest", dest)
 		conn, err := o.uot.DialContext(ctx, network, destination)
 		if err != nil {
+			if err, ok := helperUnavailable(err); ok {
+				o.logger.DebugContext(ctx, "unbounded UoT dial failed: helper unavailable")
+				return nil, err
+			}
 			o.logger.ErrorContext(ctx, "unbounded UoT dial failed",
 				"dest", dest,
 				"elapsed", time.Since(started),
@@ -295,11 +340,18 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if o.dial == nil {
 		return nil, fmt.Errorf("unbounded: not started (ListenPacket called before Start)")
 	}
+	if err := o.checkHelperConnected(); err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	dest := destination.String()
 	o.logger.DebugContext(ctx, "unbounded UoT ListenPacket start", "dest", dest)
 	pc, err := o.uot.ListenPacket(ctx, destination)
 	if err != nil {
+		if err, ok := helperUnavailable(err); ok {
+			o.logger.DebugContext(ctx, "unbounded UoT ListenPacket failed: helper unavailable")
+			return nil, err
+		}
 		o.logger.ErrorContext(ctx, "unbounded UoT ListenPacket failed",
 			"dest", dest,
 			"elapsed", time.Since(started),
@@ -312,6 +364,77 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 		"elapsed", elapsed)
 	o.recordWatchdog(ctx, elapsed)
 	return pc, nil
+}
+
+// ErrNoHelperConnected is returned by a rooms-only (helper) outbound's dials
+// while none of its WebRTC slots is connected to a helper, and wraps
+// broflake's ErrNoConnectedPath when the path died under a dial already in
+// broflake's hands: either way the helper is unavailable.
+var ErrNoHelperConnected = errors.New("unbounded: no helper connected")
+
+// helperUnavailable returns err as ErrNoHelperConnected, and true, if
+// broflake failed it for want of a connected WebRTC path. Only a rooms-only
+// consumer's dials fail so; a pool consumer's wait for a peer.
+func helperUnavailable(err error) (error, bool) {
+	if !errors.Is(err, UBClientcore.ErrNoConnectedPath) {
+		return err, false
+	}
+	if errors.Is(err, ErrNoHelperConnected) {
+		return err, true
+	}
+	return fmt.Errorf("%w: %w", ErrNoHelperConnected, err), true
+}
+
+var _ lbAdapter.HelperPathReporter = (*Outbound)(nil)
+
+// helperPathSource is what a started consumer's HelperPath reads: broflake's
+// BroflakeEngine.ConsumerConnected, and when Start began, which is when a
+// consumer that never connects started looking for its helper. Each
+// outbound starts once; radiance restarts a consumer by recreating it.
+type helperPathSource struct {
+	connected func() (bool, time.Time)
+	started   time.Time
+}
+
+// HelperPath reports a rooms-only (helper) consumer's WebRTC path to its
+// helper, which is unavailable once no slot has been connected for
+// lbAdapter.HelperPathGrace, whether one was and dropped or none has been
+// since Start: then broflake resets its open streams and, unlike a pool
+// consumer, nothing will offer it another peer. The grace delays only that
+// reset and the "unavailable" report: new dials fail at once whenever no
+// slot is connected (checkHelperConnected), so a slot that drops and
+// reconnects within the grace still fails the flows dialed meanwhile, and
+// Available stays true through it only as a UI debounce. ok is
+// false for a pool consumer and before Start. It takes one mutex in
+// broflake, so a status poll may call it freely.
+func (o *Outbound) HelperPath() (lbAdapter.HelperPathStatus, bool) {
+	if !o.rtcOpt.ConsumerRoomsOnly {
+		return lbAdapter.HelperPathStatus{}, false
+	}
+	src := o.path.Load()
+	if src == nil {
+		return lbAdapter.HelperPathStatus{}, false
+	}
+	up, since := src.connected()
+	return lbAdapter.NewHelperPathStatus(up, since, src.started, time.Now()), true
+}
+
+// checkHelperConnected fails a rooms-only consumer's dial at once while no
+// slot is connected, including while one is still connecting. Broflake's
+// QUIC dial would otherwise wait for a peer until the caller's context ends,
+// and route dials have no deadline: a url-test group that picked this
+// outbound would hang instead of trying its other members. A pool consumer
+// keeps waiting, since the pool eventually provides a peer.
+func (o *Outbound) checkHelperConnected() error {
+	if !o.rtcOpt.ConsumerRoomsOnly || o.consumerSlots == nil {
+		return nil
+	}
+	for _, slot := range o.consumerSlots() {
+		if slot.Connected {
+			return nil
+		}
+	}
+	return ErrNoHelperConnected
 }
 
 // recordWatchdog feeds a successful dial's elapsed time into the per-outbound
@@ -348,9 +471,13 @@ func (o *Outbound) recordWatchdog(ctx context.Context, elapsed time.Duration) {
 //  2. Fall back to a plain transport that dials via the outbound's own dialer.
 //     This does NOT bypass the tunnel, so it's only suitable for standalone
 //     sing-box use and tests — not on-device production.
+//
+// Either way the client refuses redirects to another origin (see
+// checkSignalingRedirect), for every outbound: only helper outbounds carry
+// room tickets, but no outbound has a reason to follow freddie elsewhere.
 func signalingClient(ctx context.Context, fallback N.Dialer, insecureSkipDiscoveryVerify bool) *http.Client {
 	if rt := lbAdapter.DirectTransportFromContext(ctx); rt != nil {
-		return &http.Client{Transport: rt}
+		return &http.Client{Transport: rt, CheckRedirect: checkSignalingRedirect}
 	}
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -364,7 +491,46 @@ func signalingClient(ctx context.Context, fallback N.Dialer, insecureSkipDiscove
 		// is not a general-purpose TLS relaxation.
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
-	return &http.Client{Transport: tr}
+	return &http.Client{Transport: tr, CheckRedirect: checkSignalingRedirect}
+}
+
+// maxSignalingRedirects matches net/http's default redirect limit.
+const maxSignalingRedirects = 10
+
+// checkSignalingRedirect is the signaling client's CheckRedirect. It follows
+// a redirect only within the origin (scheme, host and port) of the request
+// it came from. net/http would otherwise forward broflake's custom headers,
+// among them the room tickets header, to whatever another origin names, even
+// over plain HTTP.
+func checkSignalingRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxSignalingRedirects {
+		return fmt.Errorf("unbounded: signaling: stopped after %d redirects", maxSignalingRedirects)
+	}
+	if len(via) > 0 && !sameOrigin(via[len(via)-1].URL, req.URL) {
+		return errors.New("unbounded: signaling: refusing a redirect to another origin")
+	}
+	return nil
+}
+
+// sameOrigin reports whether a and b share scheme, host and port, with each
+// scheme's default port made explicit.
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https", "wss":
+		return "443"
+	case "http", "ws":
+		return "80"
+	}
+	return ""
 }
 
 // randomSTUNBatch returns a batch-sampler closure over the given pool. Each

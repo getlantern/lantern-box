@@ -6,7 +6,7 @@ metadata:
     - "Lantern Team <dev@getlantern.org>"
   description: Lantern Box
   homepage: "https://github.com/getlantern/lantern-box"
-  license: "GPL"
+  license: "GPL-3.0-or-later"
 
 builds:
   - id: amd64
@@ -59,8 +59,31 @@ builds:
       - with_clash_api
     binary: lantern-box
 
+  # The macOS binaries need cgo (the Outline SDK's DNS lookups), so
+  # release.yaml builds them on a macOS runner and hands them over in
+  # DARWIN_BUILD_DIR, outside the checkout: GoReleaser refuses to release
+  # from a tree with untracked files.
+  - id: darwin
+    builder: prebuilt
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    goamd64:
+      - v1
+    prebuilt:
+      path: '{{ envOrDefault "DARWIN_BUILD_DIR" "build" }}/lantern-box-{{ .Os }}-{{ .Arch }}'
+    binary: lantern-box
+
 archives:
   - formats: ["tar.gz"]
+    # The node unit lets install.sh set up a tarball install as a service.
+    files:
+      - LICENSE
+      - README.md
+      - src: cmd/release/lantern-node.service
+        strip_parent: true
 
 changelog:
   sort: asc
@@ -72,6 +95,12 @@ changelog:
 
 release:
   replace_existing_artifacts: true
+  # Only a fleet release (see auto-tag.yaml) becomes GitHub's latest release,
+  # which is what lantern-cloud rolls the proxy fleet to. Any other release,
+  # including one built without FLEET_RELEASE set, stays off it. Set
+  # explicitly either way: GitHub only picks latest by itself for a release
+  # it's publishing, so a fleet run on an existing release must ask.
+  make_latest: '{{ if eq (envOrDefault "FLEET_RELEASE" "false") "true" }}true{{ else }}false{{ end }}'
 
 nfpms:
   - id: lantern-box
@@ -85,12 +114,16 @@ nfpms:
       Lantern Box
     vendor: "Brave New Software"
     homepage: "https://github.com/getlantern/lantern-box"
-    license: "GPL"
+    license: "GPL-3.0-or-later"
     contents:
       - src: cmd/release/lantern-box.service
         dst: /usr/lib/systemd/system/lantern-box.service
       - src: cmd/release/lantern-box@.service
         dst: /usr/lib/systemd/system/lantern-box@.service
+      - src: cmd/release/lantern-node.service
+        dst: /usr/lib/systemd/system/lantern-node.service
+      - src: LICENSE
+        dst: /usr/share/doc/lantern-box/LICENSE
 
   # Backward-compatible package for Gemfury consumers (e.g. private server feature).
   # Same binary and service files, just published under the old name.
@@ -105,12 +138,14 @@ nfpms:
       Lantern Box (legacy sing-box-extensions package name)
     vendor: "Brave New Software"
     homepage: "https://github.com/getlantern/lantern-box"
-    license: "GPL"
+    license: "GPL-3.0-or-later"
     contents:
       - src: cmd/release/lantern-box.service
         dst: /usr/lib/systemd/system/sing-box-extensions.service
       - src: cmd/release/lantern-box@.service
         dst: /usr/lib/systemd/system/sing-box-extensions@.service
+      - src: LICENSE
+        dst: /usr/share/doc/sing-box-extensions/LICENSE
 
 furies:
   - account: getlantern
@@ -121,9 +156,11 @@ furies:
 
 dockers:
   - image_templates:
-      - "getlantern/lantern-box:latest"
+      - '{{ if eq (envOrDefault "FLEET_RELEASE" "false") "true" }}getlantern/lantern-box:latest{{ end }}'
       - "getlantern/lantern-box:{{ .Tag }}"
     dockerfile: Dockerfile.goreleaser
+    extra_files:
+      - deploy/trust/
     ids: [amd64]
 
 dockerhub:
@@ -134,3 +171,60 @@ dockerhub:
     full_description:
       from_file:
         path: ./README.docker.md
+
+# Operators install it with `brew install getlantern/tap/lamplighter` and run
+# it as a node with `brew services start lamplighter`. A formula, not
+# a cask, so that brew services can run it and macOS doesn't quarantine it.
+# The formula is the Lamplighter release channel: only a Lamplighter release
+# (see auto-tag.yaml) updates it, and install.sh installs the version it names.
+# It's also skipped while HOMEBREW_TAP_TOKEN is unset, so a missing token can't
+# fail a release.
+brews:
+  # Named for what operators run, Lamplighter; it installs lantern-box, with a
+  # lamplighter command beside it.
+  - name: lamplighter
+    repository:
+      owner: getlantern
+      name: homebrew-tap
+      # Only .Env works here: the token field's templates lack envOrDefault.
+      # release.yaml always sets it, empty when the secret is missing, which
+      # skip_upload catches.
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    skip_upload: '{{ if and (eq (envOrDefault "LAMPLIGHTER_RELEASE" "false") "true") (ne (envOrDefault "HOMEBREW_TAP_TOKEN" "") "") }}false{{ else }}true{{ end }}'
+    directory: Formula
+    homepage: "https://lamplighter.lantern.io"
+    description: "Lamplighter: run a Lantern node that helps people around internet censorship"
+    license: "GPL-3.0-or-later"
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    install: |
+      bin.install "lantern-box"
+      bin.install_symlink bin/"lantern-box" => "lamplighter"
+    # The formula was named lantern-box, with the node's state in
+    # var/lantern-node. Move it, so a node upgraded from it keeps its identity
+    # and port. That formula never had a flags file.
+    post_install: |
+      (var/"lantern-node").rename(var/"lamplighter") if (var/"lantern-node").directory? && !(var/"lamplighter").exist?
+    # Both install bin/lantern-box, so installing one over the other fails up
+    # front rather than at the link step.
+    conflicts:
+      - lantern-box
+    # brew services can't pass flags, so lantern-box reads them from
+    # etc/lamplighter.args, which install.sh writes (serve --flags-file:
+    # whitespace-separated, # comments; a missing file means no flags, and one
+    # that can't be read stops the node). Run directly, with no shell between,
+    # the service shows as lantern-box rather than sh in macOS's Login Items.
+    service: |
+      run [opt_bin/"lantern-box", "serve", "--register", "--state-dir", var/"lamplighter", "--flags-file", etc/"lamplighter.args"]
+      keep_alive true
+      log_path var/"log/lamplighter.log"
+      error_log_path var/"log/lamplighter.log"
+    caveats: |
+      To light your lamp, now and at login:
+        brew services start lamplighter
+      To pass flags such as --bandwidth-limit 10mbit, put them in
+        #{etc}/lamplighter.args
+      and run: brew services restart lamplighter
+    test: |
+      assert_match "Lantern node", shell_output("#{bin}/lamplighter serve --help")

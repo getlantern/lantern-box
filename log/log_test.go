@@ -5,9 +5,11 @@ import (
 	"context"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/log"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLogging(t *testing.T) {
@@ -85,4 +87,46 @@ func TestLevel(t *testing.T) {
 			assert.Equal(t, tt.want, log.FormatLevel(got))
 		})
 	}
+}
+
+func TestSlogLoggerWithAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	f := NewFactory(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	t.Cleanup(func() { f.Close() })
+	parent := f.NewLogger("parent").(SLogger)
+
+	sub, _, err := f.Subscribe()
+	require.NoError(t, err)
+
+	parent.WithAttrs(slog.String("group", "g1")).Info("derived")
+	out := buf.String()
+	assert.Contains(t, out, "group=g1")
+	assert.Contains(t, out, "tag=parent")
+
+	select {
+	case entry := <-sub:
+		assert.Equal(t, "derived", entry.Message)
+	case <-time.After(time.Second):
+		t.Fatal("derived logger entry not delivered to parent factory's subscribers")
+	}
+
+	buf.Reset()
+	parent.Info("parent")
+	assert.NotContains(t, buf.String(), "group=g1", "WithAttrs must not modify the parent logger")
+}
+
+func TestSlogHandlerWithAttrsDoesNotMutate(t *testing.T) {
+	h := &slogHandler{}
+	derived := h.WithAttrs([]slog.Attr{slog.String("k", "v")})
+	assert.Empty(t, h.attrs)
+	assert.Contains(t, derived.(*slogHandler).attrs, "k:v")
+}
+
+func TestSlogHandlerWithGroupDoesNotAlias(t *testing.T) {
+	h := &slogHandler{groups: make([]string, 1, 4)}
+	a := h.WithGroup("a").(*slogHandler)
+	b := h.WithGroup("b").(*slogHandler)
+	assert.Equal(t, []string{"", "a"}, a.groups)
+	assert.Equal(t, []string{"", "b"}, b.groups)
+	assert.Len(t, h.groups, 1)
 }

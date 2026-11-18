@@ -79,11 +79,13 @@ func TestTrafficCollectionDefaultsOff(t *testing.T) {
 	tracker, err := NewDatacapTracker(Options{URL: "http://127.0.0.1:1"}, noopLogger)
 	require.NoError(t, err)
 	require.Nil(t, tracker.classify)
-	encoded, err := json.Marshal(DataCapReport{DeviceID: "device", BytesUsed: 123, TrafficUsage: trafficReport("", 123, true)})
+	encoded, err := json.Marshal(DataCapReport{DeviceID: "device", BytesUsed: 123, TrafficUsage: usageDelta{bytes: 123}.trafficUsage()})
 	require.NoError(t, err)
 	require.NotContains(t, string(encoded), "trafficUsage")
 	// UDP associations have no inferred bidirectional TCP connection count.
-	unknown := trafficReport("unknown", 123, false)
+	var d deviceUsage
+	d.addBytes(123, "unknown")
+	unknown := d.take().trafficUsage()
 	require.EqualValues(t, 123, unknown.UnknownBytes)
 	require.Zero(t, unknown.UnknownConnections)
 }

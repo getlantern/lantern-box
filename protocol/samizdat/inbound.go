@@ -14,13 +14,14 @@ import (
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/mux"
-	"github.com/sagernet/sing-box/common/uot"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/route/rule"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/protocol/internal/uotrouter"
 	"github.com/getlantern/lantern-box/tracker/peerconn"
 
 	samizdat "github.com/getlantern/samizdat"
@@ -40,6 +41,7 @@ type Inbound struct {
 	listener        *listener.Listener
 	tcpListener     net.Listener
 	server          *samizdat.Server
+	leanH2          bool          // whether the server runs samizdat's lean HTTP/2 server
 	shutdownTimeout time.Duration // time to wait for goroutines after ctx cancel; 0 = 5s
 }
 
@@ -57,18 +59,9 @@ func NewInbound(
 		return nil, fmt.Errorf("private_key must be 64 hex characters (32 bytes)")
 	}
 
-	if len(options.ShortIDs) < 1 {
-		return nil, fmt.Errorf("short_ids must contain at least one element")
-	}
-
-	// Decode hex short IDs
-	shortIDs := make([][8]byte, len(options.ShortIDs))
-	for i, sid := range options.ShortIDs {
-		b, decodeErr := hex.DecodeString(sid)
-		if decodeErr != nil || len(b) != 8 {
-			return nil, fmt.Errorf("short_ids[%d] must be 16 hex characters (8 bytes)", i)
-		}
-		copy(shortIDs[i][:], b)
+	shortIDs, err := decodeShortIDs(options.ShortIDs)
+	if err != nil {
+		return nil, err
 	}
 
 	// Validate and load TLS certificate/key pair
@@ -112,25 +105,31 @@ func NewInbound(
 			return nil, fmt.Errorf("parsing masquerade_max_duration: %w", err)
 		}
 	}
+	var replayWindow, maxClockSkew time.Duration
+	if options.ReplayWindow != "" {
+		replayWindow, err = time.ParseDuration(options.ReplayWindow)
+		if err != nil {
+			return nil, fmt.Errorf("parsing replay_window: %w", err)
+		}
+	}
+	if options.MaxClockSkew != "" {
+		maxClockSkew, err = time.ParseDuration(options.MaxClockSkew)
+		if err != nil {
+			return nil, fmt.Errorf("parsing max_clock_skew: %w", err)
+		}
+	}
 
 	ib := &Inbound{
 		Adapter: inbound.NewAdapter(constant.TypeSamizdat, tag),
 		ctx:     ctx,
 		logger:  logger,
-		router:  uot.NewRouter(router, logger),
+		router:  uotrouter.New(router, logger),
 		listener: listener.New(listener.Options{
 			Context: ctx,
 			Logger:  logger,
 			Listen:  options.ListenOptions,
 		}),
 	}
-
-	// Use sing-box's listener to create the TCP listener, honoring ListenOptions
-	tcpListener, err := ib.listener.ListenTCP()
-	if err != nil {
-		return nil, fmt.Errorf("creating TCP listener: %w", err)
-	}
-	ib.tcpListener = tcpListener
 
 	serverConfig := samizdat.ServerConfig{
 		PrivateKey:            privKey,
@@ -142,16 +141,31 @@ func NewInbound(
 		MasqueradeIdleTimeout: masqIdleTimeout,
 		MasqueradeMaxDuration: masqMaxDuration,
 		MaxConcurrentStreams:  options.MaxConcurrentStreams,
+		DisableShaping:        options.DisableShaping,
+		RequireAuthV2:         options.RequireAuthV2,
+		ReplayWindow:          replayWindow,
+		MaxClockSkew:          maxClockSkew,
+		LeanH2:                !options.DisableLeanH2,
 		Handler: func(ctx context.Context, conn net.Conn, destination string) {
 			ib.handleConnection(ctx, conn, destination)
 		},
 	}
 
+	// The server first: a config it refuses fails before any port is bound.
 	server, err := samizdat.NewServer(serverConfig)
 	if err != nil {
 		return nil, fmt.Errorf("creating samizdat server: %w", err)
 	}
 	ib.server = server
+	ib.leanH2 = serverConfig.LeanH2
+
+	// Use sing-box's listener to create the TCP listener, honoring ListenOptions
+	tcpListener, err := ib.listener.ListenTCP()
+	if err != nil {
+		server.Close()
+		return nil, fmt.Errorf("creating TCP listener: %w", err)
+	}
+	ib.tcpListener = tcpListener
 
 	return ib, nil
 }
@@ -197,9 +211,12 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	// can run without the callback having fired when shutdown times out.
 	var rejected atomic.Bool
 	if notify != nil {
-		notify(peerconn.Event{State: +1, Source: source, Destination: destination, Bytes: bytes})
+		// The short ID tells the listener which pairing, if any, this
+		// connection came through. Zero when the session has none.
+		shortID, _ := samizdat.ShortIDFromContext(ctx)
+		notify(peerconn.Event{State: +1, Source: source, Destination: destination, Bytes: bytes, ShortID: shortID})
 		defer func() {
-			evt := peerconn.Event{State: -1, Source: source, Bytes: bytes}
+			evt := peerconn.Event{State: -1, Source: source, Bytes: bytes, ShortID: shortID}
 			if rejected.Load() {
 				evt.Destination, evt.Rejected = destination, true
 			}
@@ -212,7 +229,11 @@ func (i *Inbound) handleConnection(ctx context.Context, conn net.Conn, destinati
 	i.router.RouteConnectionEx(ctx, conn, metadata, func(err error) {
 		if err != nil {
 			rejected.Store(rule.IsRejected(err))
-			i.logger.ErrorContext(ctx, err)
+			// A relay that ends because one side closed is a normal end, as
+			// sing-box's own connection logging treats it.
+			if !E.IsClosedOrCanceled(err) {
+				i.logger.ErrorContext(ctx, err)
+			}
 		}
 		close(done)
 	})
@@ -264,4 +285,32 @@ func (i *Inbound) Close() error {
 		listenerErr = i.listener.Close()
 	}
 	return errors.Join(serverErr, listenerErr)
+}
+
+// UpdateShortIDs replaces the short IDs the inbound accepts while it runs.
+// Connections that authenticated with an ID the new set leaves out are
+// closed. ids takes the form of the short_ids option and, like it, must not
+// be empty. On error the accepted set is unchanged.
+func (i *Inbound) UpdateShortIDs(ids []string) error {
+	shortIDs, err := decodeShortIDs(ids)
+	if err != nil {
+		return err
+	}
+	return i.server.SetShortIDs(shortIDs)
+}
+
+// decodeShortIDs parses short IDs of 16 hex characters each.
+func decodeShortIDs(ids []string) ([][8]byte, error) {
+	if len(ids) < 1 {
+		return nil, fmt.Errorf("short_ids must contain at least one element")
+	}
+	out := make([][8]byte, len(ids))
+	for i, sid := range ids {
+		b, err := hex.DecodeString(sid)
+		if err != nil || len(b) != 8 {
+			return nil, fmt.Errorf("short_ids[%d] must be 16 hex characters (8 bytes)", i)
+		}
+		copy(out[i][:], b)
+	}
+	return out, nil
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	boxService "github.com/sagernet/sing-box/adapter/service"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/libbox"
 	"github.com/sagernet/sing/common"
@@ -24,6 +25,7 @@ import (
 	"github.com/getlantern/lantern-box/protocol/outline"
 	"github.com/getlantern/lantern-box/protocol/reflex"
 	"github.com/getlantern/lantern-box/protocol/samizdat"
+	"github.com/getlantern/lantern-box/protocol/samizdatreverse"
 	"github.com/getlantern/lantern-box/protocol/twiddle"
 	"github.com/getlantern/lantern-box/protocol/unbounded"
 	"github.com/getlantern/lantern-box/protocol/water"
@@ -85,6 +87,11 @@ func RegisterProtocols(ctx context.Context) context.Context {
 			registerEndpoints(reg)
 		}
 	}
+	if registry := service.FromContext[adapter.ServiceRegistry](ctx); registry != nil {
+		if reg, ok := registry.(*boxService.Registry); ok {
+			registerServices(reg)
+		}
+	}
 	return ctx
 }
 
@@ -95,6 +102,7 @@ func registerInbounds(registry *inbound.Registry) {
 	meek.RegisterInbound(registry)
 	reflex.RegisterInbound(registry)
 	samizdat.RegisterInbound(registry)
+	samizdatreverse.RegisterInbounds(registry)
 	twiddle.RegisterInbound(registry)
 	water.RegisterInbound(registry)
 }
@@ -107,6 +115,7 @@ func registerOutbounds(registry *outbound.Registry) {
 	outline.RegisterOutbound(registry)
 	reflex.RegisterOutbound(registry)
 	samizdat.RegisterOutbound(registry)
+	samizdatreverse.RegisterOutbound(registry)
 	twiddle.RegisterOutbound(registry)
 	unbounded.RegisterOutbound(registry)
 	water.RegisterOutbound(registry)
@@ -114,6 +123,7 @@ func registerOutbounds(registry *outbound.Registry) {
 	// utility outbounds
 	banditprobe.RegisterOutbound(registry)
 	group.RegisterFallback(registry)
+	group.RegisterHedge(registry)
 	group.RegisterMutableSelector(registry)
 	group.RegisterMutableURLTest(registry)
 	group.RegisterMutableAutoSelect(registry)
@@ -121,6 +131,10 @@ func registerOutbounds(registry *outbound.Registry) {
 
 func registerEndpoints(registry *endpoint.Registry) {
 	amnezia.RegisterEndpoint(registry)
+}
+
+func registerServices(registry *boxService.Registry) {
+	unbounded.RegisterService(registry)
 }
 
 func SupportedProtocols() []string {

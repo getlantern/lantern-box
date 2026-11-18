@@ -13,6 +13,8 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/observable"
+
+	"github.com/getlantern/lantern-box/adapter"
 )
 
 const (
@@ -84,6 +86,10 @@ func (f *factory) Level() log.Level {
 // so this method is a no-op.
 func (f *factory) SetLevel(level log.Level) {}
 
+// AttachPlatformWriter implements the [Factory] interface. Output goes to the [slog.Handler], so
+// this method is a no-op.
+func (f *factory) AttachPlatformWriter(writer log.PlatformWriter) {}
+
 // Logger implements the [Factory] interface and returns a [log.ContextLogger] with an empty tag.
 func (f *factory) Logger() log.ContextLogger {
 	return &slogLogger{factory: f}
@@ -91,9 +97,12 @@ func (f *factory) Logger() log.ContextLogger {
 
 // NewLogger implements the [Factory] interface and returns a [log.ContextLogger] with the provided
 // tag.
+//
+// sing-box names outbound loggers after the outbound's tag, so a helper tag in
+// it is redacted (see adapter.RedactHelperTags), as it is in every message.
 func (f *factory) NewLogger(tag string) log.ContextLogger {
 	nf := f.clone()
-	return &slogLogger{factory: nf, tag: tag}
+	return &slogLogger{factory: nf, tag: adapter.RedactHelperTags(tag)}
 }
 
 func (f *factory) clone() *factory {
@@ -120,6 +129,7 @@ func (f *factory) SlogHandler() slog.Handler {
 type SLogger interface {
 	Factory
 	log.ContextLogger
+	WithAttrs(attrs ...slog.Attr) SLogger
 }
 
 var _ SLogger = (*slogLogger)(nil)
@@ -141,6 +151,13 @@ func (l *slogLogger) Log(ctx context.Context, level log.Level, args ...any) stri
 	return l.log(ctx, toSLevel(level), args)
 }
 
+// WithAttrs returns a logger that adds attrs to every record and shares l's tag and subscribers.
+func (l *slogLogger) WithAttrs(attrs ...slog.Attr) SLogger {
+	nf := l.clone()
+	nf.handler = l.handler.WithAttrs(attrs)
+	return &slogLogger{factory: nf, tag: l.tag}
+}
+
 func (l *slogLogger) log(ctx context.Context, level slog.Level, args []any) string {
 	if !l.handler.Enabled(ctx, level) {
 		return ""
@@ -153,7 +170,7 @@ func (l *slogLogger) log(ctx context.Context, level slog.Level, args []any) stri
 	}
 
 	format := strings.Join(slices.Repeat([]string{"%v"}, len(args)), " ")
-	message := fmt.Sprintf(format, args...)
+	message := adapter.RedactHelperTags(fmt.Sprintf(format, args...))
 	args = []any{}
 	if l.tag != "" {
 		args = append(args, slog.String("tag", l.tag))

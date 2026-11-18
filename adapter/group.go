@@ -21,9 +21,22 @@ type MutableOutboundGroup interface {
 	Remove(tags ...string) (n int, err error)
 }
 
+// MemberReplacer is implemented by outbound groups that can swap in an outbound recreated under a
+// member's tag without removing the member.
+type MemberReplacer interface {
+	Replace(tags ...string) (n int, err error)
+}
+
 // URLOverrideSetter is implemented by outbound groups that support per-outbound URL test overrides.
 type URLOverrideSetter interface {
 	SetURLOverrides(overrides map[string]string)
+}
+
+// ProbeTimeoutSetter is implemented by outbound groups whose per-protocol probe
+// timeouts can be replaced at runtime. See
+// option.MutableAutoSelectOutboundOptions.ProbeTimeoutsMs.
+type ProbeTimeoutSetter interface {
+	SetProbeTimeouts(timeoutsMs map[string]uint32)
 }
 
 // OutboundChecker is implemented by outbound groups that support on-demand URL testing.
@@ -32,9 +45,9 @@ type OutboundChecker interface {
 }
 
 // ExhaustionSignaler exposes a channel the host can select on to learn that
-// the group's reconnection ladder finished without finding a working
-// candidate. At most one value is sent per ladder run; the host decides
-// what to do (typically a rate-limited config refetch).
+// a full probe of the group's members found no working candidate. At most
+// one value is sent per probe; the host decides what to do (typically a
+// rate-limited config refetch).
 type ExhaustionSignaler interface {
 	ExhaustionSignal() <-chan struct{}
 }
@@ -118,3 +131,12 @@ func (c *TaggedPacketConn) Upstream() any {
 }
 
 var _ N.NetPacketConn = (*TaggedPacketConn)(nil)
+
+// Switchable is an outbound that can be turned off at runtime without
+// rebuilding the tunnel, for example from a server-side feature flag. What
+// "off" means is up to the outbound; for a hedge it sends every new
+// connection straight to its fallback. Connections already open keep going.
+type Switchable interface {
+	SetEnabled(enabled bool)
+	Enabled() bool
+}

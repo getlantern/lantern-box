@@ -313,7 +313,7 @@ func TestDataCapThrottleSpeedAdjustment(t *testing.T) {
 				CapLimit: tc.capLimit,
 			}
 
-			conn.updateThrottleState(status)
+			updateThrottleState(noopLogger, conn.throttler, status)
 
 			// Verify throttler state
 			if tc.expectedThrottle {
@@ -744,7 +744,7 @@ func TestDataCapThrottleDisableAfterEnable(t *testing.T) {
 		Throttle: true,
 		CapLimit: 10000000000,
 	}
-	conn.updateThrottleState(status1)
+	updateThrottleState(noopLogger, conn.throttler, status1)
 
 	assert.True(t, conn.throttler.IsEnabled(), "throttling should be enabled when data exhausted")
 
@@ -753,7 +753,7 @@ func TestDataCapThrottleDisableAfterEnable(t *testing.T) {
 		Throttle: false,
 		CapLimit: 0,
 	}
-	conn.updateThrottleState(status2)
+	updateThrottleState(noopLogger, conn.throttler, status2)
 
 	assert.False(t, conn.throttler.IsEnabled(), "throttling should be disabled when no datacap")
 }

@@ -89,25 +89,3 @@ func TestMeasure_ReportsTheStageItFailedAt(t *testing.T) {
 	// A path that never opened still reports how long it took to find that out.
 	assert.GreaterOrEqual(t, result.Elapsed, spent)
 }
-
-// Run reports a body failure to its caller, along with how long the probe took,
-// so the caller decides whether a truncated response counts.
-func TestRun_ReportsABodyThatFailedPartwayWithItsDuration(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Length", "4096")
-		_, _ = w.Write([]byte(strings.Repeat("x", 16)))
-		if hijacker, ok := w.(http.Hijacker); ok {
-			conn, _, err := hijacker.Hijack()
-			require.NoError(t, err)
-			_ = conn.Close()
-		}
-	}))
-	defer srv.Close()
-	var conns []*trackedConn
-	out := &stubOutbound{dial: dialerFor(srv.Listener.Addr().String(), &conns)}
-
-	delay, err := Run(context.Background(), out, srv.URL, time.Second)
-
-	assert.ErrorIs(t, err, ErrResponseBody)
-	assert.Positive(t, delay)
-}

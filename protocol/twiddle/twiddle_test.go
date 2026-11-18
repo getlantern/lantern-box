@@ -102,7 +102,7 @@ func TestOutboundRoutesTCPAndUDP(t *testing.T) {
 			t.Cleanup(func() { listener.Close() })
 			finished := make(chan struct{})
 			// serving holds the tunnel open for the body of the test. Under
-			// muxing NewConnectionEx hands the session to a goroutine and
+			// muxing NewConnection hands the session to a goroutine and
 			// returns at once, so a bare `defer conn.Close()` would tear the
 			// tunnel down before the client could open a stream on it -- and a
 			// deadline on conn would now bound the whole session rather than
@@ -115,7 +115,7 @@ func TestOutboundRoutesTCPAndUDP(t *testing.T) {
 					return
 				}
 				defer conn.Close()
-				ib.(*Inbound).NewConnectionEx(ctx, conn, adapter.InboundContext{}, func(error) {})
+				ib.(*Inbound).NewConnection(ctx, conn, adapter.InboundContext{}, func(error) {})
 				<-serving
 			}()
 			t.Cleanup(func() {

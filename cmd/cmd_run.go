@@ -77,24 +77,25 @@ func readConfig(path string) (option.Options, error) {
 	return options, nil
 }
 
-func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc, *option.DebugOptions, error) {
+// create builds and starts a box. closeTrackers must be called after the box
+// is closed.
+func create(configPath string, datacapURL string) (instance *box.Box, cancel context.CancelFunc, closeTrackers func(), debugOptions *option.DebugOptions, err error) {
 	options, err := readConfig(configPath)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("read config: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("read config: %w", err)
 	}
-	var debugOptions *option.DebugOptions
 	if options.Experimental != nil {
 		debugOptions = options.Experimental.Debug
 	}
 
 	ctx, cancel := context.WithCancel(globalCtx)
-	instance, err := box.New(box.Options{
+	instance, err = box.New(box.Options{
 		Context: ctx,
 		Options: options,
 	})
 	if err != nil {
 		cancel()
-		return nil, nil, debugOptions, fmt.Errorf("create service: %w", err)
+		return nil, nil, nil, debugOptions, fmt.Errorf("create service: %w", err)
 	}
 
 	clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
@@ -125,9 +126,12 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 		)
 		if err != nil {
 			cancel()
-			return nil, nil, debugOptions, fmt.Errorf("create datacap tracker: %w", err)
+			return nil, nil, nil, debugOptions, fmt.Errorf("create datacap tracker: %w", err)
 		}
 		instance.Router().AppendTracker(datacapTracker)
+		closeTrackers = datacapTracker.Close
+	} else {
+		closeTrackers = func() {}
 	}
 
 	osSignals := make(chan os.Signal, 1)
@@ -148,9 +152,10 @@ func create(configPath string, datacapURL string) (*box.Box, context.CancelFunc,
 	finishStart()
 	if err != nil {
 		cancel()
-		return nil, nil, debugOptions, E.Cause(err, "start service")
+		closeTrackers()
+		return nil, nil, nil, debugOptions, E.Cause(err, "start service")
 	}
-	return instance, cancel, debugOptions, nil
+	return instance, cancel, closeTrackers, debugOptions, nil
 }
 
 func closeMonitor(ctx context.Context) {
@@ -173,7 +178,7 @@ func run(configPath string, datacapURL string, memtuneFile string) error {
 	defer stopTuner()
 	tunerStarted := false
 	for {
-		instance, cancel, debugOptions, err := create(configPath, datacapURL)
+		instance, cancel, closeTrackers, debugOptions, err := create(configPath, datacapURL)
 		// Building the box applied the new config's debug options, even if
 		// it then failed to start.
 		tuner.Resync(debugOptions)
@@ -203,6 +208,9 @@ func run(configPath string, datacapURL string, memtuneFile string) error {
 			go closeMonitor(closeCtx)
 			err = instance.Close()
 			closed()
+			// After the box has closed its connections, so their last bytes
+			// are reported. Bounded by the tracker's final flush budget.
+			closeTrackers()
 			if osSignal != syscall.SIGHUP {
 				if err != nil {
 					log.Error(E.Cause(err, "sing-box did not closed properly"))

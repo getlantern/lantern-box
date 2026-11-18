@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
+	"github.com/sagernet/sing/common/bufio/deadline"
+	"github.com/sagernet/sing/common/debug"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
@@ -454,4 +457,319 @@ func TestReadPacketDrop(t *testing.T) {
 		assert.Equal(t, headroom, buffer.Start())
 		assert.Equal(t, "datagram", string(buffer.Bytes()))
 	})
+}
+
+// Behind sing-box's deadline reader, the stream after the head still arrives
+// unaltered, with or without a frame.
+func TestReadInfoBehindDeadlineConn(t *testing.T) {
+	for _, stream := range []string{clientInfoPrefix + testInfoJSON + testRequest, testRequest} {
+		client, server := net.Pipe()
+		go func() {
+			client.Write([]byte(stream))
+			client.Write([]byte("more"))
+			client.Close()
+		}()
+
+		c := &readConn{Conn: deadline.NewConn(server), reader: server}
+		_, err := readInfoWithin(t, c)
+		require.NoError(t, err)
+		rest, err := io.ReadAll(c)
+		require.NoError(t, err)
+		assert.Equal(t, testRequest+"more", string(rest))
+		server.Close()
+	}
+}
+
+// Reads bypass the deadline reader only once it has no deadline and no read in
+// flight, and then reach the connection it wraps directly.
+func TestStreamReaderBypassesDeadlineReader(t *testing.T) {
+	if debug.Enabled {
+		t.Skip("sing's debug build wraps the deadline reader, which keeps it")
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	conn := deadline.NewConn(server)
+	s := &streamReader{c: &readConn{Conn: conn}}
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Hour)))
+	go client.Write([]byte("ab"))
+	b := make([]byte, 2)
+	_, err := io.ReadFull(s, b)
+	require.NoError(t, err)
+	assert.Nil(t, s.upstream, "a deadline is set")
+
+	require.NoError(t, conn.SetReadDeadline(time.Time{}))
+	// The deadline reader's read goroutine hands over its result before it
+	// signals that it is done.
+	require.Eventually(t, conn.(*deadline.Conn).ReaderReplaceable, 5*time.Second, time.Millisecond)
+	go client.Write([]byte("cd"))
+	_, err = io.ReadFull(s, b)
+	require.NoError(t, err)
+	assert.Equal(t, "cd", string(b))
+	assert.NotNil(t, s.upstream, "no deadline and no read in flight")
+}
+
+// A read deadline set through the connection after the bypass still applies,
+// both to a read already blocked and to later reads, and clearing it resumes
+// the stream.
+func TestStreamReaderHonorsLaterDeadline(t *testing.T) {
+	if debug.Enabled {
+		t.Skip("sing's debug build wraps the deadline reader, which keeps it")
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	go client.Write([]byte("ab"))
+
+	c := &readConn{Conn: deadline.NewConn(server)}
+	c.reader = &streamReader{c: c}
+	b := make([]byte, 2)
+	_, err := io.ReadFull(c, b)
+	require.NoError(t, err)
+	require.NotNil(t, c.reader.(*streamReader).upstream, "reads bypass the deadline reader")
+
+	blocked := make(chan error, 1)
+	go func() {
+		_, err := c.Read(b)
+		blocked <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(20*time.Millisecond)))
+	select {
+	case err := <-blocked:
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the deadline did not interrupt a blocked read")
+	}
+	_, err = c.Read(b)
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+
+	require.NoError(t, c.SetReadDeadline(time.Time{}))
+	go client.Write([]byte("cd"))
+	_, err = io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "cd", string(b))
+}
+
+// A deadline set before the bypass stays on the deadline reader, so a read it
+// times out is still resumed once the deadline is cleared.
+func TestStreamReaderResumesTimedOutReadBeforeBypass(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &readConn{Conn: deadline.NewConn(server)}
+	c.reader = &streamReader{c: c}
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(20*time.Millisecond)))
+	b := make([]byte, 2)
+	_, err := c.Read(b)
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+
+	require.NoError(t, c.SetReadDeadline(time.Time{}))
+	go client.Write([]byte("ab"))
+	_, err = io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "ab", string(b))
+}
+
+// Sniffed bytes cached above the deadline reader are read first, and reads
+// bypass both once the cache is drained.
+func TestStreamReaderBypassesCachedDeadlineConn(t *testing.T) {
+	if debug.Enabled {
+		t.Skip("sing's debug build wraps the deadline reader, which keeps it")
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	cached := buf.New()
+	cached.WriteString("xy")
+	d := deadline.NewConn(server).(*deadline.Conn)
+	c := &readConn{Conn: bufio.NewCachedConn(d, cached)}
+	s := &streamReader{c: c}
+	c.reader = s
+
+	b := make([]byte, 2)
+	_, err := io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "xy", string(b))
+
+	// The cache is dropped by the read after it drains, which still goes
+	// through the deadline reader.
+	go client.Write([]byte("ab"))
+	_, err = io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "ab", string(b))
+
+	require.Eventually(t, d.ReaderReplaceable, 5*time.Second, time.Millisecond)
+	go client.Write([]byte("cd"))
+	_, err = io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "cd", string(b))
+	assert.NotNil(t, s.upstream, "reads bypass the drained cache and the deadline reader")
+}
+
+// When the head read times out behind the deadline reader, its read stays in
+// flight; the stream after a late frame still arrives once, in order, through
+// small reads that cross the switch past the deadline reader.
+func TestReadInfoTimeoutBehindDeadlineConn(t *testing.T) {
+	const payload = "USER alice\r\nPASS secret\r\n"
+	for _, tt := range []struct {
+		name  string
+		after []string
+		want  string
+	}{
+		{name: "late frame", after: []string{"CLIENT", "INFO2 " + testInfoJSON, payload[:5], payload[5:]}, want: payload},
+		{name: "no frame", after: []string{payload[:3], payload[3:]}, want: payload},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setReadInfoTimeout(t, 30*time.Millisecond)
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+
+			c := &readConn{Conn: deadline.NewConn(server)}
+			info, err := readInfoWithin(t, c)
+			require.NoError(t, err)
+			require.Zero(t, info)
+
+			go func() {
+				for _, part := range tt.after {
+					if _, err := client.Write([]byte(part)); err != nil {
+						return
+					}
+				}
+				client.Close()
+			}()
+			var got []byte
+			small := make([]byte, 3)
+			for {
+				n, err := c.Read(small)
+				got = append(got, small[:n]...)
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.want, string(got))
+		})
+	}
+}
+
+// Bytes cached in a reader that a wrapper reads through, rather than in the
+// wrapper itself, are delivered before reads bypass the deadline reader.
+func TestStreamReaderDrainsCachedReaderUnderAppendConn(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	cached := buf.New()
+	cached.WriteString(clientInfoPrefix + testInfoJSON + "xyz")
+	d := deadline.NewConn(server)
+	c := &readConn{Conn: bufio.NewAppendConn(d, bufio.NewExtendedReader(bufio.NewCachedReader(d, cached)), nil)}
+	info, err := readInfoWithin(t, c)
+	require.NoError(t, err)
+	assert.Equal(t, testInfo, info)
+
+	go func() {
+		client.Write([]byte("abc"))
+		client.Close()
+	}()
+	var got []byte
+	small := make([]byte, 2)
+	for {
+		n, err := c.Read(small)
+		got = append(got, small[:n]...)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+	assert.Equal(t, "xyzabc", string(got))
+}
+
+// noDeadlineConn rejects read deadlines, as sing-box's HTTP/2 and gRPC stream
+// conns do.
+type noDeadlineConn struct{ net.Conn }
+
+func (noDeadlineConn) SetReadDeadline(time.Time) error { return os.ErrInvalid }
+
+// A connection that cannot take read deadlines itself keeps the deadline
+// reader, so read deadlines still work on it.
+func TestStreamReaderKeepsDeadlineReaderWithoutNativeDeadlines(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &readConn{Conn: deadline.NewConn(noDeadlineConn{server})}
+	s := &streamReader{c: c}
+	c.reader = s
+	go client.Write([]byte("ab"))
+	b := make([]byte, 2)
+	_, err := io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Nil(t, s.upstream, "the deadline reader is kept")
+
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(20*time.Millisecond)))
+	_, err = c.Read(b)
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+}
+
+// A wrapper that reads through no separate reader does not stop reads.
+func TestStreamReaderUnderAppendConnWithoutReader(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &readConn{Conn: bufio.NewAppendConn(deadline.NewConn(server), nil, nil)}
+	c.reader = &streamReader{c: c}
+	go client.Write([]byte("ab"))
+	b := make([]byte, 2)
+	_, err := io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "ab", string(b))
+}
+
+// A deadline set with SetDeadline before the bypass still times out the read,
+// rather than being cleared when reads switch past the deadline reader.
+func TestStreamReaderKeepsSetDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &readConn{Conn: deadline.NewConn(server)}
+	c.reader = &streamReader{c: c}
+	require.NoError(t, c.SetDeadline(time.Now().Add(20*time.Millisecond)))
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Read(make([]byte, 2))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read ignored the deadline")
+	}
+}
+
+// A read deadline set with SetDeadline can be extended with SetReadDeadline.
+func TestSetReadDeadlineExtendsSetDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	c := &readConn{Conn: deadline.NewConn(server)}
+	c.reader = &streamReader{c: c}
+	require.NoError(t, c.SetDeadline(time.Now().Add(20*time.Millisecond)))
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(time.Hour)))
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		client.Write([]byte("ab"))
+	}()
+	b := make([]byte, 2)
+	_, err := io.ReadFull(c, b)
+	require.NoError(t, err)
+	assert.Equal(t, "ab", string(b))
 }

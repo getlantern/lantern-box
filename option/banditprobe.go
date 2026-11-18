@@ -1,6 +1,9 @@
 package option
 
-import "github.com/sagernet/sing/common/json/badoption"
+import (
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json/badoption"
+)
 
 // BanditProbeOutboundOptions configures the server-side responder for bandit
 // callback probes. Route a client's plain-HTTP callback request to this
@@ -8,13 +11,22 @@ import "github.com/sagernet/sing/common/json/badoption"
 // state, and forwards the callback to the API. Zero values fall back to the
 // defaults noted on each field.
 type BanditProbeOutboundOptions struct {
+	// DialerOptions control how the callback to CallbackURL is dialed and its
+	// host resolved, as for any other outbound (detour, bind_interface,
+	// domain_resolver, ...). Left empty, the callback goes out the way direct
+	// traffic does, honouring route.auto_detect_interface and
+	// route.default_domain_resolver.
+	option.DialerOptions
+
 	// CallbackURL is where the proxy sends the callback once it has a verdict,
 	// e.g. "https://api.iantem.io/v1/bandit/callback". It must be https: the
 	// callback carries the probe token and device ID across the open internet.
 	CallbackURL string `json:"callback_url"`
 
-	// BodySize is the number of random bytes sent back to the client. It has to
-	// exceed the point at which censors freeze a flow (default: 65536).
+	// BodySize is the least number of random bytes sent back to the client. It
+	// has to exceed the point at which censors freeze a flow (default: 65536).
+	// Each response adds a random amount of up to half again, so probe
+	// responses don't all share one length.
 	BodySize int `json:"body_size,omitempty"`
 
 	// StallTimeout is how long acknowledgements may stop advancing, with data
@@ -31,4 +43,28 @@ type BanditProbeOutboundOptions struct {
 	// otherwise a stalled probe is counted as a success, whereas a dropped
 	// callback is counted as a failure.
 	ReportStalled bool `json:"report_stalled,omitempty"`
+
+	// UseProxyEnvironment sends the callback through the proxy named by
+	// HTTPS_PROXY and NO_PROXY, reached through the dialer above. Use it where
+	// the callback host refuses the proxy's own address.
+	UseProxyEnvironment bool `json:"use_proxy_environment,omitempty"`
+
+	// BatchURL, when set with BatchToken, sends callbacks to the API's batch
+	// endpoint, e.g. "https://api.iantem.io/v1/bandit/callbacks", many per
+	// request, instead of one request each to CallbackURL. A batch the API
+	// refuses is sent as single callbacks. It must be https: the batch
+	// carries the fleet's token.
+	BatchURL string `json:"batch_url,omitempty"`
+
+	// BatchToken is the fleet's credential for the batch endpoint, sent as a
+	// bearer token.
+	BatchToken string `json:"batch_token,omitempty"`
+
+	// BatchInterval is the longest a callback waits for its batch
+	// (default: 1s, at most 4s; the API credits at most 5s of queue time).
+	BatchInterval badoption.Duration `json:"batch_interval,omitempty"`
+
+	// BatchMaxSize sends a batch early once it holds this many callbacks
+	// (default: 200, at most 1000).
+	BatchMaxSize int `json:"batch_max_size,omitempty"`
 }

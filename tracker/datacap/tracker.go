@@ -7,6 +7,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	tun "github.com/sagernet/sing-tun"
 	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
 
@@ -19,7 +20,7 @@ type DatacapTracker struct {
 	classify         func(string) string
 	client           *Client
 	logger           log.ContextLogger
-	reportInterval   time.Duration
+	reporter         *Reporter
 	throttleRegistry *ThrottleRegistry
 }
 
@@ -58,10 +59,11 @@ func NewDatacapTracker(options Options, logger log.ContextLogger) (*DatacapTrack
 	if options.TrafficCategories {
 		classify = newTrafficClassifier(options.LanternHosts, options.ProbeHosts)
 	}
+	client := NewClient(options.URL, httpTimeout)
 	return &DatacapTracker{
 		classify:         classify,
-		client:           NewClient(options.URL, httpTimeout),
-		reportInterval:   reportInterval,
+		client:           client,
+		reporter:         NewReporter(client, logger, reportInterval),
 		throttleRegistry: NewThrottleRegistry(),
 		logger:           logger,
 	}, nil
@@ -82,7 +84,7 @@ func (t *DatacapTracker) RoutedConnection(ctx context.Context, conn net.Conn, me
 		Client:          t.client,
 		Logger:          t.logger,
 		ClientInfo:      info,
-		ReportInterval:  t.reportInterval,
+		Reporter:        t.reporter,
 		Throttler:       t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
 }
@@ -98,9 +100,15 @@ func (t *DatacapTracker) RoutedPacketConnection(ctx context.Context, conn N.Pack
 		Client:            t.client,
 		Logger:            t.logger,
 		ClientInfo:        info,
-		ReportInterval:    t.reportInterval,
+		Reporter:          t.reporter,
 		Throttler:         t.throttleRegistry.GetOrCreate(info.DeviceID),
 	})
+}
+
+// Close reports pending usage once more and stops reporting. Call it after
+// the box has closed its connections, so their last bytes are included.
+func (t *DatacapTracker) Close() {
+	t.reporter.Close()
 }
 
 // capped returns the client info of conn if its usage counts against a data
@@ -119,4 +127,10 @@ func (t *DatacapTracker) capped(conn any) (clientcontext.ClientInfo, bool) {
 		return info, true
 	}
 	return clientcontext.ClientInfo{}, false
+}
+
+// RoutedFlow returns nil: L3-forwarded TUN flows carry no stream to wrap
+// and never reach a proxy server.
+func (t *DatacapTracker) RoutedFlow(ctx context.Context, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) tun.FlowTracker {
+	return nil
 }

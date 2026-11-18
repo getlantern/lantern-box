@@ -24,7 +24,7 @@ func TestReadSendState_DeliveredOverRealSocket(t *testing.T) {
 	resp, body, err := runProbe(t, r, server, client, probeTarget)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Len(t, body, 64*1024)
+	assertBodySize(t, body, 64*1024)
 	calls := rec.calls()
 	require.Len(t, calls, 1)
 	assert.Equal(t, "delivered", calls[0].Get("verdict"))

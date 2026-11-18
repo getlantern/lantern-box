@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service/pause"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestURLTestGroup_CloseStopsCheckLoop(t *testing.T) {
@@ -97,17 +99,81 @@ func TestSetURLOverrides(t *testing.T) {
 	assert.Equal(t, "https://default.example.com", g.testURLForTag("out2"))
 	assert.Equal(t, "https://out3-override.example.com", g.testURLForTag("out3"))
 
-	// Replace with different overrides
+	// Merge in different overrides
 	g.SetURLOverrides(map[string]string{
 		"out2": "https://out2-override.example.com",
+		"out3": "https://out3-new.example.com",
 	})
-	assert.Equal(t, "https://default.example.com", g.testURLForTag("out1"))
+	assert.Equal(t, "https://new-override.example.com", g.testURLForTag("out1"))
 	assert.Equal(t, "https://out2-override.example.com", g.testURLForTag("out2"))
+	assert.Equal(t, "https://out3-new.example.com", g.testURLForTag("out3"))
 
-	// Clear overrides
 	g.SetURLOverrides(nil)
+	assert.Equal(t, "https://new-override.example.com", g.testURLForTag("out1"))
+	assert.Equal(t, "https://out2-override.example.com", g.testURLForTag("out2"))
+}
+
+func TestSetURLOverrides_ClearsHistoryOnlyForChangedURLs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{"out1": nil, "out2": nil}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"out1", "out2"},
+		"https://default.example.com",
+		map[string]string{"out1": "https://out1.example.com", "out2": "https://out2.example.com"},
+		time.Minute, time.Minute, 50,
+	)
+	for _, tag := range []string{"out1", "out2"} {
+		g.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{Time: time.Now(), Delay: 100})
+	}
+
+	g.SetURLOverrides(map[string]string{
+		"out1": "https://out1.example.com",
+		"out2": "https://out2-new.example.com",
+	})
+
+	assert.NotNil(t, g.history.LoadURLTestHistory("out1"), "unchanged URL keeps its history")
+	assert.Nil(t, g.history.LoadURLTestHistory("out2"), "changed URL clears its history")
+}
+
+func TestNewURLTestGroup_DoesNotMutateOptionsMap(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opts := map[string]string{"out1": "https://out1.example.com"}
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{"out1": nil}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"out1"},
+		"https://default.example.com",
+		opts,
+		time.Minute, time.Minute, 50,
+	)
+
+	g.SetURLOverrides(map[string]string{"out1": "https://new.example.com"})
+	assert.Equal(t, "https://out1.example.com", opts["out1"])
+}
+
+func TestURLTestGroupRemove_DeletesURLOverride(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{"out1": nil}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"out1"},
+		"https://default.example.com",
+		map[string]string{"out1": "https://out1.example.com"},
+		time.Minute, time.Minute, 50,
+	)
+	g.outbounds.Store("out1", &mockOutbound{tag: "out1"})
+
+	n, err := g.Remove([]string{"out1"})
+	assert.NoError(t, err)
+	assert.Equal(t, 1, n)
 	assert.Equal(t, "https://default.example.com", g.testURLForTag("out1"))
-	assert.Equal(t, "https://default.example.com", g.testURLForTag("out2"))
 }
 
 func TestSetURLOverrides_DoesNotMutateCallerMap(t *testing.T) {
@@ -129,6 +195,32 @@ func TestSetURLOverrides_DoesNotMutateCallerMap(t *testing.T) {
 	// Mutating the caller's map after SetURLOverrides should not affect the group
 	callerMap["out1"] = "https://mutated.example.com"
 	assert.Equal(t, "https://original.example.com", g.testURLForTag("out1"))
+}
+
+func TestTestURLForTag_ConcurrentWithSetURLOverrides(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newURLTestGroup(
+		ctx,
+		&mockOutboundManager{outbounds: map[string]adapter.Outbound{"out1": nil}},
+		sboxLog.NewNOPFactory().Logger(),
+		[]string{"out1"},
+		"https://default.example.com",
+		nil,
+		time.Minute, time.Minute, 50,
+	)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 1000 {
+			g.SetURLOverrides(map[string]string{fmt.Sprintf("out%d", i): "https://override.example.com"})
+		}
+	}()
+	for range 1000 {
+		g.testURLForTag("out1")
+	}
+	<-done
 }
 
 func TestTestURLForTag_WithOverrides(t *testing.T) {
@@ -386,4 +478,61 @@ func TestAppendClientDelay_InvalidURL(t *testing.T) {
 	// Invalid URLs are returned unchanged
 	bad := "://not-a-url"
 	assert.Equal(t, bad, appendClientDelay(bad, 100*time.Millisecond))
+}
+
+// The first check, started by PostStart, runs while members are removed and
+// listed. Run with -race: the check must not read the member list unlocked.
+func TestURLTestGroup_RemoveDuringFirstCheck(t *testing.T) {
+	for range 10 {
+		ctx, cancel := context.WithCancel(context.Background())
+		link, dial := probeServer(t)
+		a := &mockOutbound{tag: "a", dial: dial}
+		b := &mockOutbound{tag: "b", dial: dial}
+		u := newTestURLTest(t, ctx, newSyncOutboundManager(a, b), link, "a", "b")
+		require.NoError(t, u.PostStart())
+
+		listed := make(chan []string)
+		go func() { listed <- u.All() }()
+		n, err := u.Remove("b")
+		require.NoError(t, err)
+		require.Equal(t, 1, n)
+		<-listed
+
+		require.Eventually(t, func() bool { return !u.group.checking.Load() }, 5*time.Second, time.Millisecond)
+		assert.Equal(t, []string{"a"}, u.All())
+		cancel()
+	}
+}
+
+// A deterministic form of TestURLTestGroup_RemoveDuringFirstCheck: the readers
+// run after Remove, ordered only by a sleep, which the race detector does not
+// count as synchronization.
+func TestURLTestGroup_ReadMembersAfterRemove(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	link, dial := probeServer(t)
+	a := &mockOutbound{tag: "a", dial: dial}
+	b := &mockOutbound{tag: "b", dial: dial}
+	u := newTestURLTest(t, ctx, newSyncOutboundManager(a, b), link, "a", "b")
+
+	done := make(chan []string)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_, _ = u.URLTest(ctx)
+		done <- u.All()
+	}()
+	_, err := u.Remove("b")
+	require.NoError(t, err)
+	<-done
+	assert.Equal(t, []string{"a"}, u.All())
+}
+
+func TestMutableURLTest_AllReturnsCopy(t *testing.T) {
+	a := &mockOutbound{tag: "a"}
+	b := &mockOutbound{tag: "b"}
+	u := newTestURLTest(t, context.Background(), newSyncOutboundManager(a, b), "", "a", "b")
+	all := u.All()
+	_, err := u.Remove("a")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b"}, all, "a removal must not rewrite a slice already returned")
 }

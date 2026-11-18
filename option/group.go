@@ -1,11 +1,59 @@
 package option
 
-import "github.com/sagernet/sing/common/json/badoption"
+import (
+	"encoding/json"
+
+	"github.com/sagernet/sing/common/json/badoption"
+)
 
 type FallbackOutboundOptions struct {
 	// Primary and Fallback are the tags of the primary and fallback outbounds.
 	Primary  string `json:"primary"`
 	Fallback string `json:"fallback"`
+}
+
+// HedgeOutboundOptions configure a hedge: each connection goes to First, and
+// moves to Then, replaying what the client sent, if First gives no reply.
+// Only a connection that opens with a TLS or QUIC handshake is replayed; any
+// other stays on First.
+// Whether First worked is remembered per site, so a site First can't reach
+// goes straight to Then until FailureTTL passes.
+type HedgeOutboundOptions struct {
+	// First and Then are outbound tags. First is typically a proxyless
+	// outbound, Then the proxy group. Bandit probes always go to Then.
+	First string `json:"first"`
+	Then  string `json:"then"`
+	// CommitTimeout is how long First may take to send its first byte after
+	// the client's first write before the connection moves to Then. It also
+	// bounds First's dial; a dial that runs out of time goes to Then without
+	// marking the site bad. Default 1s.
+	CommitTimeout badoption.Duration `json:"commit_timeout,omitempty"`
+	// FailureTTL is how long a site First failed for skips First. Default
+	// 5m, longer than the GFW's 180s residual block.
+	FailureTTL badoption.Duration `json:"failure_ttl,omitempty"`
+	// SuccessTTL is how long a site First worked for is remembered as good,
+	// which keeps the address-block prior below from sending it to Then.
+	// Default 1h.
+	SuccessTTL badoption.Duration `json:"success_ttl,omitempty"`
+	// Disabled starts the hedge switched off: every connection goes straight
+	// to Then until it is switched on through adapter.Switchable.
+	Disabled bool `json:"disabled,omitempty"`
+	// MaxHeldBytes bounds what is kept for replay before First replies, and
+	// UDP also keeps at most 64 datagrams. A connection that writes more
+	// can't move: if First fails or gives no reply within CommitTimeout, it
+	// is closed and its site marked bad, so the client's retry uses Then.
+	// Default 64 KiB.
+	MaxHeldBytes int `json:"max_held_bytes,omitempty"`
+	// ExploreRate is the fraction, from 0 to 1, of connections First could
+	// take that go to Then instead, so telemetry can compare the two paths on
+	// the same sites. Default 0.
+	ExploreRate float64 `json:"explore_rate,omitempty"`
+	// TelemetrySites are the registered domains hedge metrics may name in
+	// hedge.site. Every other site is reported as "other", and with none
+	// listed hedge.site is left out. The metrics' other attributes (path,
+	// outcome, transport, outbound tags) and byte and timing measurements
+	// are reported either way.
+	TelemetrySites []string `json:"telemetry_sites,omitempty"`
 }
 
 type MutableSelectorOutboundOptions struct {
@@ -28,9 +76,22 @@ type MutableAutoSelectOutboundOptions struct {
 	URL          string            `json:"url,omitempty"`
 	URLOverrides map[string]string `json:"url_overrides,omitempty"`
 
-	// SwitchToleranceMs is the delay improvement (in ms) a candidate must
-	// beat the current selection by before the group switches. Default 200.
+	// ProbeTimeoutsMs overrides the probe timeout, in milliseconds, for
+	// members of the given outbound types, e.g. {"hysteria2x": 5000}. A type
+	// not listed, or a value outside 250 to 60000, keeps its built-in
+	// timeout. SetProbeTimeouts replaces the set at runtime.
+	ProbeTimeoutsMs ProbeTimeoutsMs `json:"probe_timeouts_ms,omitempty"`
+
+	// SwitchToleranceMs is the minimum delay improvement (in ms) a
+	// candidate must have over the current selection before the group
+	// switches on delay. Default 100.
 	SwitchToleranceMs uint32 `json:"switch_tolerance_ms,omitempty"`
+
+	// SwitchTolerancePercent is the minimum delay improvement, as a
+	// percentage of the current selection's delay, a candidate must also
+	// have before the group switches on delay. Nil uses the default of 30;
+	// 0 disables the check. Values over 100 are rejected.
+	SwitchTolerancePercent *uint32 `json:"switch_tolerance_percent,omitempty"`
 
 	// ConsecutiveFailureLimit hard-demotes a member once probe failures
 	// reach this count, or once user-traffic failures within
@@ -54,38 +115,47 @@ type MutableAutoSelectOutboundOptions struct {
 	// Default 300 (5 min).
 	UserFailureWindowSeconds uint32 `json:"user_failure_window_seconds,omitempty"`
 
+	// UserFailureDedupeWindowSeconds drops a user-traffic failure that
+	// arrives within this long of the member's previous recorded failure,
+	// so a burst counts once toward the demote rule. Default 45.
+	UserFailureDedupeWindowSeconds uint32 `json:"user_failure_dedupe_window_seconds,omitempty"`
+
 	// MaxPersistedAgeSeconds caps the age of persisted TagHistory
 	// entries on hydrate. Entries with UpdatedAt older than this are
 	// dropped — bandit-driven candidate sets typically rotate every
 	// 60 s – 15 min, so a stale snapshot from a prior session would
-	// describe a member that may no longer exist. Default 3600 (1 h).
+	// describe a member that may no longer exist. Default 900 (15 min).
 	MaxPersistedAgeSeconds uint32 `json:"max_persisted_age_seconds,omitempty"`
 
-	// BackgroundIntervalSeconds is the active cadence for the low-priority
-	// probe cycle (when data has flowed recently — see
-	// IdleThresholdSeconds). Default 180.
+	// BackgroundIntervalSeconds is the background probe cadence while the
+	// group is in use. Default 180.
 	BackgroundIntervalSeconds uint32 `json:"background_interval_seconds,omitempty"`
 
-	// IdleIntervalSeconds is the cadence used when no data has flowed
-	// through a wrapped data-plane conn for IdleThresholdSeconds.
-	// Default 900 (15 min).
+	// Deprecated: IdleIntervalSeconds is ignored; background probing stops
+	// after IdleThresholdSeconds without use instead of slowing down.
 	IdleIntervalSeconds uint32 `json:"idle_interval_seconds,omitempty"`
 
-	// IdleThresholdSeconds is the no-data-plane-activity window after
-	// which the background probe cadence backs off from
-	// BackgroundIntervalSeconds to IdleIntervalSeconds. Default 600
-	// (10 min).
+	// IdleThresholdSeconds bounds inactivity before periodic probing stops.
+	// The next use immediately requests probes for members without a fresh
+	// outcome. Default 900.
 	IdleThresholdSeconds uint32 `json:"idle_threshold_seconds,omitempty"`
 
-	// LadderTotalBudgetSeconds is the total budget the reconnection ladder
-	// has before emitting the exhaustion signal. Default 10.
+	// LadderTotalBudgetSeconds bounds a ladder evaluation once its first
+	// slot is available. Expiration leaves probes running. Default 15.
 	LadderTotalBudgetSeconds uint32 `json:"ladder_total_budget_seconds,omitempty"`
 
 	// LadderCooldownSeconds is the minimum time after a ladder run before
-	// another ladder run can fire. Suppresses repeated full-fleet
-	// re-probes when stalls or dial errors arrive in quick succession on
-	// the same already-shuffled pool. Default 60.
+	// another can fire. A ladder runs when a dial or listen fails on the
+	// selected member and on its fast-failover alternate, or has no
+	// alternate. An interface update lifts the cooldown unless another
+	// arrived within the previous LadderCooldownSeconds. Default 60.
 	LadderCooldownSeconds uint32 `json:"ladder_cooldown_seconds,omitempty"`
+
+	// ConfirmedFailureSwitchCooldownSeconds is the minimum time between
+	// switches caused by failed confirmation probes, except when the
+	// member selected by the last such switch also fails confirmation.
+	// Default 60.
+	ConfirmedFailureSwitchCooldownSeconds uint32 `json:"confirmed_failure_switch_cooldown_seconds,omitempty"`
 
 	// DataPlaneIdleSeconds is the no-traffic threshold after which an
 	// established and proven tunnel is treated as a data-plane stall.
@@ -102,6 +172,36 @@ type MutableAutoSelectOutboundOptions struct {
 	// true; set false to count failures from every wrapped conn.
 	DemoteOnlySelectedTag *bool `json:"demote_only_selected_tag,omitempty"`
 
-	// ProbeConcurrency caps parallel member probes per batch. Default 6.
+	// ProbeConcurrency caps concurrent probes of ordinary members across the
+	// group; last-resort and failure-confirmation probes don't count toward
+	// it. Default 6.
 	ProbeConcurrency uint32 `json:"probe_concurrency,omitempty"`
+}
+
+// ProbeTimeoutsMs maps an outbound type to a probe timeout in milliseconds.
+// Decoding it never fails: the value comes from a server, and an entry the
+// client can't use must cost only that override, not the whole config.
+// Entries that aren't a plain integer in uint32 range are dropped, including
+// fractions and exponent forms such as 2.5, 3000.0 and 3e3, and so is a value
+// that isn't an object.
+type ProbeTimeoutsMs map[string]uint32
+
+func (p *ProbeTimeoutsMs) UnmarshalJSON(b []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		*p = nil
+		return nil
+	}
+	out := make(ProbeTimeoutsMs, len(raw))
+	for typ, v := range raw {
+		// Decoding into uint32 checks the JSON number's text exactly, so a
+		// fraction can't round to a whole number on the way in.
+		var ms *uint32
+		if json.Unmarshal(v, &ms) != nil || ms == nil {
+			continue
+		}
+		out[typ] = *ms
+	}
+	*p = out
+	return nil
 }

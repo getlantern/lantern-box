@@ -66,7 +66,7 @@ func (a *Inbound) Close() error {
 	return a.listener.Close()
 }
 
-func (a *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (a *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = a.Tag()
 	metadata.InboundType = a.Type()
 	wsConn, err := a.handshake(ctx, conn)
@@ -75,7 +75,7 @@ func (a *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		a.logger.ErrorContext(ctx, exceptions.Cause(err, "process connection from ", metadata.Source))
 		return
 	}
-	a.httpInbound.NewConnectionEx(ctx, wsConn, metadata, onClose)
+	a.httpInbound.NewConnection(ctx, wsConn, metadata, onClose)
 }
 
 // handshake processes the connection and upgrades it to a WebSocket connection. It recovers from

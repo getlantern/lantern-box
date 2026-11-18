@@ -1,0 +1,23 @@
+{
+	"log": {"disabled": true},
+	"inbounds": [
+		{
+			"type": "socks",
+			"tag": "socks-in",
+			"listen": "127.0.0.1",
+			"listen_port": SOCKS_PORT
+		},
+		{
+			"type": "samizdat-portal",
+			"tag": "samizdat-portal"
+		}
+	],
+	"outbounds": [
+		{
+			"type": "samizdat-reverse",
+			"tag": "helper-0123456789ab-r",
+			"portal": "samizdat-portal"
+		}
+	],
+	"route": {"final": "helper-0123456789ab-r"}
+}
