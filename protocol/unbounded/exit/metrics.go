@@ -107,12 +107,14 @@ func (c *countedConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// CloseWrite keeps half-close working through the wrapper.
+// CloseWrite keeps half-close working through the wrapper. A stream that can't half-close is
+// closed, as sing's copy closes a destination that isn't an N.WriteCloser: otherwise the user
+// never sees the end of a response its server ended by closing.
 func (c *countedConn) CloseWrite() error {
-	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+	if cw, ok := c.Conn.(N.WriteCloser); ok {
 		return cw.CloseWrite()
 	}
-	return nil
+	return c.Conn.Close()
 }
 
 // Upstream lets sing find the stream's handshake reporting. Without ReaderReplaceable, its

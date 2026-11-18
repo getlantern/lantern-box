@@ -297,6 +297,41 @@ func TestExitServesTCPThroughTheRouter(t *testing.T) {
 	assert.Equal(t, M.SocksaddrFromNet(placeholderAddr).Unwrap(), md.Source, "the session's placeholder, never the user's address")
 }
 
+// A destination that answers and closes, as an HTTP/1.0 server does to end its response,
+// ends the user's stream too: sing's copy half-closes the stream, which hysteria2's can't.
+func TestExitEndsTheStreamWhenTheDestinationCloses(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = c.Write([]byte("bye"))
+			_ = c.Close()
+		}
+	}()
+	e := readyExit(t, &dialRouter{dial: l.Addr().String()})
+	vConn, uConn := pathPair(t)
+	pin, password, _ := e.Options().Params()
+	serve(t, e, vConn, password)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := testClient(t, uConn, pin, password).DialConn(ctx, M.ParseSocksaddr("example.com:80"))
+	require.NoError(t, err)
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	// The client sends its request with its first write.
+	_, err = conn.Write([]byte("hi"))
+	require.NoError(t, err)
+	// hysteria2's client wraps the EOF, so io.ReadAll returns it.
+	got, err := io.ReadAll(conn)
+	require.ErrorIs(t, err, io.EOF, "the stream ends at EOF, not the deadline")
+	assert.Equal(t, "bye", string(got))
+}
+
 func TestExitRoutesThroughTheCurrentRouter(t *testing.T) {
 	r1, r2 := newEchoRouter(t), newEchoRouter(t)
 	e := readyExit(t, r1)
