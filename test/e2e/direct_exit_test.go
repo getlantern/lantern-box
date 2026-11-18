@@ -284,6 +284,8 @@ func startExitBox(t testing.TB) adapter.ConnectionRouterEx {
 	require.NoError(t, peerrules.ValidateAbuseRules(string(raw)), "the fixture's abuse rules")
 
 	ctx := service.ExtendContext(box.BaseContext())
+	// As node's exit boxes: a log factory of its own, never one from the context.
+	service.MustRegister[sblog.Factory](ctx, sblog.NewNOPFactory())
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, raw)
 	require.NoError(t, err, "parse the exit box's options")
 	require.Error(t, peerrules.ValidateDirectExitRulesOptions(opts), "the fixture's loopback route comes before its ip_is_private reject")

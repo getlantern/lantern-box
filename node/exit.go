@@ -276,9 +276,14 @@ func logExitFailure(err error, retry time.Duration) {
 
 // newExitSingBox is the default NewBox: sing-box in a clone of ctx's service registry, so it
 // keeps ctx's option registries and cancellation but registers its managers only in its own
-// registry, never over those of ctx's box or the previous exit box.
+// registry, never over those of ctx's box or the previous exit box. The clone gets a log
+// factory of its own that logs nothing: sing-box uses one it finds in its context over
+// log.disabled, so it would log strangers' destinations through the caller's, and close it
+// with the box.
 func newExitSingBox(ctx context.Context, options string) (ExitBox, error) {
-	b, err := startSingBox(service.ExtendContext(ctx), options)
+	ctx = service.ExtendContext(ctx)
+	service.MustRegister[log.Factory](ctx, log.NewNOPFactory())
+	b, err := startSingBox(ctx, options)
 	if err != nil {
 		return nil, err
 	}

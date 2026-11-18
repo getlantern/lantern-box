@@ -495,3 +495,31 @@ func TestNewExitSingBoxKeepsItsServicesToItself(t *testing.T) {
 	assert.Same(t, sentinel, service.FromContext[log.Factory](ctx), "the caller's log factory is still its own")
 	assert.Nil(t, service.FromContext[adapter.OutboundManager](ctx), "the exit box's managers stay out of the caller's registry")
 }
+
+// sentinelFactory is a caller's log factory that records whether anything used or closed it.
+type sentinelFactory struct {
+	log.Factory
+	used, closed atomic.Bool
+}
+
+func (f *sentinelFactory) Logger() log.ContextLogger { f.used.Store(true); return f.Factory.Logger() }
+func (f *sentinelFactory) NewLogger(tag string) log.ContextLogger {
+	f.used.Store(true)
+	return f.Factory.NewLogger(tag)
+}
+func (f *sentinelFactory) Close() error { f.closed.Store(true); return nil }
+
+// The exit box routes strangers' traffic, and sing-box would log it through a log factory it
+// finds in its context, ignoring log.disabled, and close that factory with the box. So it must
+// never take its caller's.
+func TestNewExitSingBoxNeverUsesTheCallersLogFactory(t *testing.T) {
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	sentinel := &sentinelFactory{Factory: log.NewNOPFactory()}
+	service.MustRegister[log.Factory](ctx, sentinel)
+	b, err := newExitSingBox(ctx, `{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	require.NoError(t, err)
+	require.NoError(t, b.Close())
+	assert.False(t, sentinel.used.Load(), "the exit box logs nothing through the caller's factory")
+	assert.False(t, sentinel.closed.Load(), "closing the exit box leaves the caller's factory open")
+}
