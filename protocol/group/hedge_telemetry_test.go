@@ -189,7 +189,7 @@ func TestHedgeTelemetryThenDialError(t *testing.T) {
 		_, err := f.hedge.ListenPacket(f.ctx, hedgeDest)
 		require.Error(t, err)
 		attrs := connectionRecord(t, reader)
-		require.Equal(t, hedgePathThenAfterMove, attrs["hedge.path"])
+		require.Equal(t, hedgePathFirst, attrs["hedge.path"], "no move happened")
 		require.Equal(t, hedgeOutcomeThenDialError, attrs["hedge.outcome"])
 		require.Equal(t, "udp", attrs["network.protocol.name"])
 	})

@@ -252,12 +252,14 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 		if !timedOut() {
 			h.markBad(ctx, key, err)
 		}
-		stats.set(hedgePathThenAfterMove, hedgeOutcomeMovedDialError)
+		// The path becomes then_after_move only once Then is dialed.
+		stats.set("", hedgeOutcomeMovedDialError)
 		conn, err := then.DialContext(ctx, network, destination)
 		if err != nil {
 			stats.thenDialed(err)
 			return nil, err
 		}
+		stats.set(hedgePathThenAfterMove, "")
 		return &statsStream{Conn: conn, stats: stats}, nil
 	}
 	return newHedgeStream(h, ctx, key, network, destination, conn, stats), nil
@@ -290,12 +292,13 @@ func (h *Hedge) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		if !timedOut() {
 			h.markBad(ctx, key, err)
 		}
-		stats.set(hedgePathThenAfterMove, hedgeOutcomeMovedDialError)
+		stats.set("", hedgeOutcomeMovedDialError)
 		conn, err := then.ListenPacket(ctx, destination)
 		if err != nil {
 			stats.thenDialed(err)
 			return nil, err
 		}
+		stats.set(hedgePathThenAfterMove, "")
 		return newStatsPacket(conn, stats), nil
 	}
 	return newHedgePacket(h, ctx, key, destination, conn, stats), nil
