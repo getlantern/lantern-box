@@ -52,6 +52,11 @@ var AbuseRuleSetTags = []string{
 	"geosite-cryptominers",
 }
 
+// RuleSetLookup is the part of sing-box's adapter.Router that finds a rule set by tag.
+type RuleSetLookup interface {
+	RuleSet(tag string) (adapter.RuleSet, bool)
+}
+
 // ErrAbuseRuleSetsNotLoaded is a box whose abuse rule sets haven't all loaded.
 var ErrAbuseRuleSetsNotLoaded = errors.New("the abuse rule sets haven't loaded")
 
@@ -62,7 +67,7 @@ var ErrAbuseRuleSetsNotLoaded = errors.New("the abuse rule sets haven't loaded")
 // local rule sets are loaded once the box has started; any other counts as loaded once it holds
 // a rule, so a remote list that downloads empty counts as not loaded. The error names only the
 // tags.
-func AbuseRuleSetsLoaded(router adapter.Router) error {
+func AbuseRuleSetsLoaded(router RuleSetLookup) error {
 	var missing []string
 	for _, tag := range AbuseRuleSetTags {
 		set, ok := router.RuleSet(tag)

@@ -102,7 +102,9 @@ var probeMark = func(mark uint32) error {
 // isLinux is a var so tests can mark the exit box's sockets on any OS.
 var isLinux = runtime.GOOS == "linux"
 
-// ExitBox is a running exit box. It is exported for NewBox.
+// ExitBox is a running exit box. It is exported for NewBox. Its Router must also look up rule
+// sets by tag, as sing-box's adapter.Router does (directexit.RuleSetLookup): RunExit serves a
+// box only once its abuse rule sets have loaded, and refuses one whose router can't tell it.
 type ExitBox interface {
 	Router() adapter.ConnectionRouterEx
 	// ResetNetwork resets the box's network, as sing-box's NetworkManager.ResetNetwork does.
@@ -319,9 +321,16 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse, r
 		}
 		b, err := r.newBox(ctx, options)
 		if err != nil {
-			// Unloaded rule sets are named by tag alone; other start errors can quote the config.
-			errs = append(errs, &exitStageError{stage: "start the " + kind.String() + " exit box", err: err,
-				loggable: errors.Is(err, directexit.ErrAbuseRuleSetsNotLoaded)})
+			errs = append(errs, &exitStageError{stage: "start the " + kind.String() + " exit box", err: err})
+			continue
+		}
+		// sing-box starts with a remote rule set it couldn't download empty, so the abuse
+		// rejects would match nothing ahead of the exit's final route. Whatever built the box,
+		// RunExit serves it only once those sets have loaded, retrying on its back-off while the
+		// kind's current box, if any, serves on.
+		if err := abuseRuleSetsLoaded(b.Router()); err != nil {
+			_ = b.Close()
+			errs = append(errs, &exitStageError{stage: "check the " + kind.String() + " exit box's abuse rule sets", err: err, loggable: true})
 			continue
 		}
 		if !time.Now().Before(validUntil) {
@@ -337,6 +346,20 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse, r
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// errRuleSetsUncheckable is a box whose router has no rule set lookup, so RunExit can't tell
+// whether its abuse rule sets loaded.
+var errRuleSetsUncheckable = errors.New("its router can't check its abuse rule sets (it has no RuleSet lookup)")
+
+// abuseRuleSetsLoaded checks the abuse rule sets of a box's router, which must be able to look
+// them up, as sing-box's adapter.Router can. Its errors name only tags.
+func abuseRuleSetsLoaded(router adapter.ConnectionRouterEx) error {
+	lookup, ok := router.(directexit.RuleSetLookup)
+	if !ok {
+		return errRuleSetsUncheckable
+	}
+	return directexit.AbuseRuleSetsLoaded(lookup)
 }
 
 // errStartedTooLate is a box that finished starting after its registration ran out.
@@ -534,13 +557,6 @@ func newExitSingBox(ctx context.Context, options string) (ExitBox, error) {
 	service.MustRegister[log.Factory](ctx, log.NewNOPFactory())
 	b, err := startSingBox(ctx, options)
 	if err != nil {
-		return nil, err
-	}
-	// sing-box starts with a remote rule set it couldn't download empty, so the abuse rejects
-	// would match nothing ahead of the exit's final route. RunExit retries such a box on its
-	// back-off, and the kind's current box, if any, serves on until then.
-	if err := directexit.AbuseRuleSetsLoaded(b.Router()); err != nil {
-		_ = b.Close()
 		return nil, err
 	}
 	return singExitBox{b: b, ctx: ctx}, nil

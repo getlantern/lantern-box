@@ -127,7 +127,26 @@ func (ev *exitEvents) list() []string {
 	return append([]string(nil), ev.events...)
 }
 
-type fakeExitRouter struct{ id int }
+type fakeExitRouter struct {
+	id int
+	// unloaded, when set, makes the abuse rule sets it reports hold no rules.
+	unloaded bool
+}
+
+// fakeRuleSet is a rule set whose metadata says whether it loaded rules.
+type fakeRuleSet struct {
+	adapter.RuleSet
+	loaded bool
+}
+
+func (s fakeRuleSet) Metadata() adapter.RuleSetMetadata {
+	return adapter.RuleSetMetadata{ContainsNonIPCIDRRule: s.loaded}
+}
+
+// RuleSet is sing-box's router lookup, which RunExit checks the abuse rule sets with.
+func (r *fakeExitRouter) RuleSet(string) (adapter.RuleSet, bool) {
+	return fakeRuleSet{loaded: !r.unloaded}, true
+}
 
 func (*fakeExitRouter) RouteConnection(context.Context, net.Conn, adapter.InboundContext) error {
 	return nil
@@ -1012,8 +1031,8 @@ const unloadedRuleSetConfig = `{
 }`
 
 // sing-box starts a box whose remote rule set failed to download with the set empty, so its
-// rejects match nothing. The default NewBox refuses such a box.
-func TestNewExitSingBoxRefusesUnloadedAbuseRuleSets(t *testing.T) {
+// rejects match nothing. The default NewBox's router lets RunExit tell.
+func TestNewExitSingBoxRuleSetsAreChecked(t *testing.T) {
 	for name, tc := range map[string]struct {
 		status int
 		ok     bool
@@ -1032,13 +1051,14 @@ func TestNewExitSingBoxRefusesUnloadedAbuseRuleSets(t *testing.T) {
 			ctx, cancel := context.WithCancel(box.BaseContext())
 			defer cancel()
 			b, err := newExitSingBox(ctx, fmt.Sprintf(unloadedRuleSetConfig, srv.URL))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = b.Close() })
+			err = abuseRuleSetsLoaded(b.Router())
 			if tc.ok {
-				require.NoError(t, err)
-				require.NoError(t, b.Close())
+				assert.NoError(t, err)
 				return
 			}
-			require.ErrorIs(t, err, directexit.ErrAbuseRuleSetsNotLoaded)
-			assert.Nil(t, b)
+			assert.ErrorIs(t, err, directexit.ErrAbuseRuleSetsNotLoaded)
 		})
 	}
 }
@@ -1065,10 +1085,11 @@ func TestRunExitKeepsTheBoxWhenRuleSetsDontLoad(t *testing.T) {
 	boxes := &fakeExitBoxes{ev: ev}
 	var builds atomic.Int32
 	newBox := func(ctx context.Context, options string) (ExitBox, error) {
-		if builds.Add(1) > 1 {
-			return nil, fmt.Errorf("start: %w: geosite-malware", directexit.ErrAbuseRuleSetsNotLoaded)
+		b, err := boxes.new(ctx, options)
+		if err == nil && builds.Add(1) > 1 {
+			b.(*fakeExitBox).router.unloaded = true
 		}
-		return boxes.new(ctx, options)
+		return b, err
 	}
 	reregister := make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(box.BaseContext())
@@ -1079,11 +1100,83 @@ func TestRunExitKeepsTheBoxWhenRuleSetsDontLoad(t *testing.T) {
 	reregister <- struct{}{}
 	require.Eventually(t, func() bool { return builds.Load() >= 3 }, 5*time.Second, time.Millisecond, "it retries")
 	assert.True(t, e.Options().Ready(false), "the current box keeps serving")
-	closed, _ := boxes.last().isClosed()
-	assert.False(t, closed)
+	closed, _ := boxes.all()[0].isClosed()
+	assert.False(t, closed, "the first box serves on")
 	cancel()
 	waitDone(t, done)
 	assert.Contains(t, buf.String(), "abuse rule sets haven't loaded: geosite-malware")
+}
+
+// uncheckableRouter routes but has no rule set lookup, so its abuse rule sets can't be checked.
+type uncheckableRouter struct{ adapter.ConnectionRouterEx }
+
+type uncheckableBox struct {
+	*fakeExitBox
+	router uncheckableRouter
+}
+
+func (b *uncheckableBox) Router() adapter.ConnectionRouterEx { return b.router }
+
+// RunExit checks every box's abuse rule sets, whatever NewBox built it, and serves no box whose
+// sets haven't loaded or whose router can't be checked.
+func TestRunExitChecksEveryBoxsRuleSets(t *testing.T) {
+	for name, tc := range map[string]struct {
+		wrap func(*fakeExitBox) ExitBox
+		log  string
+	}{
+		"unloaded": {
+			wrap: func(b *fakeExitBox) ExitBox { b.router.unloaded = true; return b },
+			log:  "abuse rule sets haven't loaded",
+		},
+		"uncheckable": {
+			wrap: func(b *fakeExitBox) ExitBox {
+				return &uncheckableBox{fakeExitBox: b, router: uncheckableRouter{b.router}}
+			},
+			log: "can't check",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			buf := &exitLogBuffer{}
+			factory := log.NewDefaultFactory(context.Background(), log.Formatter{}, buf, "", nil, false)
+			factory.SetLevel(log.LevelTrace)
+			require.NoError(t, factory.Start())
+			prev := log.StdLogger()
+			log.SetStdLogger(factory.Logger())
+			t.Cleanup(func() {
+				log.SetStdLogger(prev)
+				_ = factory.Close()
+			})
+			srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, map[string]any{"server_config": validExitConfig})
+			})
+			e := enabledExit(t)
+			ev := &exitEvents{}
+			boxes := &fakeExitBoxes{ev: ev}
+			custom := func(ctx context.Context, options string) (ExitBox, error) {
+				b, err := boxes.new(ctx, options)
+				if err != nil {
+					return nil, err
+				}
+				return tc.wrap(b.(*fakeExitBox)), nil
+			}
+			ctx, cancel := context.WithCancel(box.BaseContext())
+			defer cancel()
+			done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+				NewBox: custom}, ev)
+			require.Eventually(t, func() bool { return len(boxes.all()) >= 2 }, 5*time.Second, time.Millisecond, "it retries")
+			cancel()
+			waitDone(t, done)
+			assert.False(t, e.Options().Ready(false))
+			for _, b := range boxes.all() {
+				closed, _ := b.isClosed()
+				assert.True(t, closed, "box %d", b.id)
+			}
+			for _, event := range ev.list() {
+				assert.NotContains(t, event, "router", "a box whose rule sets weren't checked loaded was served")
+			}
+			assert.Contains(t, buf.String(), tc.log)
+		})
+	}
 }
 
 // holdOffs records what RunExit reports through OnHoldOff.
