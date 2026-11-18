@@ -148,4 +148,9 @@ type UnboundedVolunteerOptions struct {
 	// StatsInterval is how often the node logs what it served, in seconds. Zero means 60; a
 	// negative value turns the line off.
 	StatsInterval int `json:"stats_interval,omitempty"`
+
+	// DirectExit lets the volunteer exit censored users' traffic itself, over Hysteria2 on their
+	// WebRTC path, through its box's router and so under its box's route rules. A node drops it
+	// when lantern-cloud's rules fail the abuse check. The volunteer still relays to the egress.
+	DirectExit bool `json:"direct_exit,omitempty"`
 }

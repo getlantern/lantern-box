@@ -848,3 +848,45 @@ func TestBindsPort(t *testing.T) {
 		"digits inside an IPv6 address aren't the port")
 	assert.True(t, bindsPort(errors.New("listen tcp [fd00:443::1]:443: bind: address already in use"), 443))
 }
+
+// abuseRoute is a route that passes peerrules' abuse check, as peerrules' tests build it.
+const abuseRoute = `"route":{
+	"rule_set":[
+		{"type":"remote","tag":"geosite-malware","format":"binary","url":"https://example/geosite-malware.srs","download_detour":"direct"},
+		{"type":"remote","tag":"geoip-malware","format":"binary","url":"https://example/geoip-malware.srs","download_detour":"direct"},
+		{"type":"remote","tag":"geosite-phishing","format":"binary","url":"https://example/geosite-phishing.srs","download_detour":"direct"},
+		{"type":"remote","tag":"geosite-cryptominers","format":"binary","url":"https://example/geosite-cryptominers.srs","download_detour":"direct"}
+	],
+	"rules":[
+		{"action":"reject","rule_set":["geosite-malware"]},
+		{"action":"reject","rule_set":["geoip-malware"]},
+		{"action":"reject","rule_set":["geosite-phishing"]},
+		{"action":"reject","rule_set":["geosite-cryptominers"]},
+		{"action":"reject","ip_cidr":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","::1/128","fc00::/7","fe80::/10"]},
+		{"action":"reject","port":[25,465,587,2525,6660,6661,6662,6663,6664,6665,6666,6667,6668,6669,6697]}
+	]
+}`
+
+// A volunteer exits Unbounded traffic directly only under the node's abuse rules, which are
+// global in its box: without them, the node drops direct_exit and still serves as a relay.
+func TestApplyOperatorLimitsDropsDirectExitWithoutRules(t *testing.T) {
+	const volunteer = `"services":[{"type":"unbounded","tag":"unbounded-volunteer","discovery_srv":"https://freddie.test",` +
+		`"egress_addr":"wss://egress.test","stun_servers":["stun:192.0.2.1:3478"],"direct_exit":true}]`
+	for name, tc := range map[string]struct {
+		config string
+		want   bool
+	}{
+		"no route":     {config: `{` + volunteer + `}`, want: false},
+		"no abuse set": {config: `{"route":{"rules":[{"action":"reject","port":[25]}]},` + volunteer + `}`, want: false},
+		"abuse rules":  {config: `{` + abuseRoute + `,` + volunteer + `}`, want: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, found, err := applyOperatorLimits(box.BaseContext(), tc.config, 0, "")
+			require.NoError(t, err)
+			require.True(t, found)
+			vol := volunteerOf(t, out)
+			assert.Equal(t, tc.want, vol.DirectExit)
+			assert.Equal(t, "https://freddie.test", vol.DiscoverySrv, "the volunteer still relays")
+		})
+	}
+}

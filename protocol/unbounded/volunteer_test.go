@@ -2,6 +2,7 @@ package unbounded
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 )
 
 func validVolunteerOptions() option.UnboundedVolunteerOptions {
@@ -304,4 +306,78 @@ func TestUnknownTuningLogsWithoutPanicking(t *testing.T) {
 	b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
 	require.NoError(t, err)
 	require.NoError(t, b.Close())
+}
+
+// With direct_exit, the volunteer serves exits through its own box's router, so broflake
+// offers them; the box's route (here the static abuse canaries) applies to them as to every
+// other inbound. Without with_quic there is no exit and the volunteer serves as before.
+func TestVolunteerDirectExitHooksIntoBroflake(t *testing.T) {
+	probe, err := exit.New(context.Background(), sblog.NewNOPFactory().Logger())
+	available := !errors.Is(err, exit.ErrUnavailable)
+	if probe != nil {
+		probe.Close()
+	}
+	unreachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(unreachable.Close)
+
+	for _, directExit := range []bool{true, false} {
+		t.Run(fmt.Sprintf("direct_exit=%v", directExit), func(t *testing.T) {
+			ctx := newVolunteerBoxContext(t)
+			opts, err := json.UnmarshalExtendedContext[sbOption.Options](ctx, []byte(fmt.Sprintf(`{
+				"log": {"disabled": true},
+				"route": {"rules": [
+					{"action": "reject", "ip_cidr": ["10.0.0.0/8", "127.0.0.0/8"]},
+					{"action": "reject", "port": [25, 465, 587]}
+				]},
+				"services": [{
+					"type": "unbounded",
+					"tag": "volunteer",
+					"discovery_srv": %q,
+					"egress_addr": %q,
+					"stun_servers": ["stun:127.0.0.1:9"],
+					"stats_interval": -1,
+					"direct_exit": %v
+				}]
+			}`, unreachable.URL, "ws"+unreachable.URL[len("http"):], directExit)))
+			require.NoError(t, err)
+			got, ok := opts.Services[0].Options.(*option.UnboundedVolunteerOptions)
+			require.True(t, ok)
+			require.Equal(t, directExit, got.DirectExit)
+
+			b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
+			require.NoError(t, err)
+			closed := false
+			closeBox := func() {
+				if closed {
+					return
+				}
+				closed = true
+				done := make(chan error, 1)
+				go func() { done <- b.Close() }()
+				select {
+				case err := <-done:
+					assert.NoError(t, err)
+				case <-time.After(20 * time.Second):
+					t.Error("closing the box hung")
+				}
+			}
+			t.Cleanup(closeBox)
+			require.NoError(t, b.Start())
+
+			svc, ok := service.FromContext[adapter.ServiceManager](ctx).Get("volunteer")
+			require.True(t, ok)
+			v := svc.(*Volunteer)
+			if !directExit || !available {
+				assert.Nil(t, v.rtcOpt.Exit, "no exit: the volunteer serves as before")
+				return
+			}
+			require.NotNil(t, v.rtcOpt.Exit)
+			assert.True(t, v.rtcOpt.Exit.Ready(), "the exit is on, with the box's router")
+			ready := v.rtcOpt.Exit.Ready
+			closeBox()
+			assert.False(t, ready(), "closing the volunteer closes its exit")
+		})
+	}
 }

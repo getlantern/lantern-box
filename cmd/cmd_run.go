@@ -21,6 +21,7 @@ import (
 
 	"github.com/getlantern/lantern-box/internal/memtune"
 	lbotel "github.com/getlantern/lantern-box/otel"
+	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
 	"github.com/getlantern/lantern-box/tracker/metrics"
@@ -77,6 +78,17 @@ func readConfig(path string) (option.Options, error) {
 	return options, nil
 }
 
+// clientContextBounds reads a client-info frame from every routed connection
+// but a volunteer's direct exit streams, which carry a user's own traffic and
+// would stall waiting for one.
+func clientContextBounds() clientcontext.MatchBounds {
+	return clientcontext.MatchBounds{
+		Inbound:        []string{""},
+		Outbound:       []string{""},
+		ExcludeInbound: []string{exit.InboundTag},
+	}
+}
+
 // create builds and starts a box. closeTrackers must be called after the box
 // is closed.
 func create(configPath string, datacapURL string) (instance *box.Box, cancel context.CancelFunc, closeTrackers func(), debugOptions *option.DebugOptions, err error) {
@@ -98,10 +110,7 @@ func create(configPath string, datacapURL string) (instance *box.Box, cancel con
 		return nil, nil, nil, debugOptions, fmt.Errorf("create service: %w", err)
 	}
 
-	clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
-		Inbound:  []string{""},
-		Outbound: []string{""},
-	}, log.StdLogger())
+	clientCtxMgr := clientcontext.NewManager(clientContextBounds(), log.StdLogger())
 	// Register Manager before trackers that call clientcontext.InfoFromConn,
 	// because it wraps the connection they inspect.
 	instance.Router().AppendTracker(clientCtxMgr)

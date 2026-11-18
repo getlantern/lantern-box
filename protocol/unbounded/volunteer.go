@@ -19,9 +19,11 @@ import (
 	"github.com/sagernet/sing-box/common/dialer"
 	sblog "github.com/sagernet/sing-box/log"
 	sbOption "github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/service"
 
 	C "github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 )
 
 // RegisterService registers the Unbounded volunteer with the given sing-box ServiceRegistry. It
@@ -32,6 +34,10 @@ func RegisterService(registry *boxService.Registry) {
 
 const (
 	defaultStatsInterval = time.Minute
+
+	// directExitLifetime is how long a node's direct exit stays servable. The node's rotation
+	// rebuilds the box, and the volunteer with it, so the exit lives as long as its box.
+	directExitLifetime = 100 * 365 * 24 * time.Hour
 
 	// natFailTimeoutKey is the tuning key lantern-cloud's unbounded_volunteer_tuning uses for the
 	// volunteer's NAT fail timeout, as radiance's widget reads it.
@@ -52,6 +58,7 @@ type Volunteer struct {
 	ctx                   context.Context
 	dialerOptions         sbOption.DialerOptions
 	insecureDiscoveryCert bool
+	directExit            bool
 
 	bfOpt         *UBClientcore.BroflakeOptions
 	rtcOpt        *UBClientcore.WebRTCOptions
@@ -63,6 +70,7 @@ type Volunteer struct {
 
 	mu     sync.Mutex
 	ui     *UBClientcore.UIImpl
+	exit   *exit.Exit
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -100,6 +108,7 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 		ctx:                   ctx,
 		dialerOptions:         opts.DialerOptions,
 		insecureDiscoveryCert: opts.InsecureDoNotVerifyDiscoveryCert,
+		directExit:            opts.DirectExit,
 	}
 
 	bfOpt := UBClientcore.NewDefaultBroflakeOptions()
@@ -187,11 +196,19 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 		return fmt.Errorf("unbounded volunteer: build signaling dialer: %w", err)
 	}
 	v.rtcOpt.HTTPClient = signalingClient(v.ctx, signalingDialer, v.insecureDiscoveryCert)
+	e := v.startExit()
+	if e != nil {
+		v.rtcOpt.Exit = e.Options()
+	}
 	_, ui, err := UBClientcore.NewBroflake(v.bfOpt, v.rtcOpt, v.egOpt)
 	if err != nil {
+		if e != nil {
+			e.Close()
+			v.rtcOpt.Exit = nil
+		}
 		return fmt.Errorf("unbounded volunteer: start broflake: %w", err)
 	}
-	v.ui = ui
+	v.ui, v.exit = ui, e
 	v.logger.InfoContext(context.Background(), "unbounded volunteer started",
 		"discovery_srv", v.rtcOpt.DiscoverySrv,
 		"egress_addr", v.egOpt.Addr,
@@ -200,6 +217,7 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 		"target_countries", strings.Join(v.rtcOpt.TargetCountries, ","),
 		"nat_fail_timeout", v.rtcOpt.NATFailTimeout,
 		"bandwidth_limit", v.bandwidth.String(),
+		"direct_exit", e != nil,
 	)
 	if v.statsInterval > 0 {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -211,8 +229,8 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 
 func (v *Volunteer) Close() error {
 	v.mu.Lock()
-	ui, cancel, done := v.ui, v.cancel, v.done
-	v.ui, v.cancel, v.done = nil, nil, nil
+	ui, e, cancel, done := v.ui, v.exit, v.cancel, v.done
+	v.ui, v.exit, v.cancel, v.done = nil, nil, nil, nil
 	v.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -221,7 +239,32 @@ func (v *Volunteer) Close() error {
 	if ui != nil {
 		ui.Stop()
 	}
+	if e != nil {
+		e.Close()
+	}
 	return nil
+}
+
+// startExit makes the volunteer's direct exit, served through its box's router, so the box's
+// route rules apply to every stream and flow. It returns nil when the volunteer has no direct
+// exit, or can't make one, in which case it serves as a relay only.
+func (v *Volunteer) startExit() *exit.Exit {
+	if !v.directExit {
+		return nil
+	}
+	router := service.FromContext[adapter.Router](v.ctx)
+	if router == nil {
+		v.logger.WarnContext(v.ctx, "unbounded volunteer: no router in the box, so no direct exit")
+		return nil
+	}
+	e, err := exit.New(v.ctx, v.logger)
+	if err != nil {
+		v.logger.WarnContext(v.ctx, "unbounded volunteer: no direct exit: ", err)
+		return nil
+	}
+	e.SetEnabled(true)
+	e.SetRouter(router, time.Now().Add(directExitLifetime))
+	return e
 }
 
 // stunPreflight logs STUN checks that fail. A node that can't reach any STUN server stops taking

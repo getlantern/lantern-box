@@ -26,16 +26,19 @@ import (
 )
 
 // MatchBounds specifies inbound and outbound matching rules.
-// The empty string and "any" are treated as a wildcard.
+// The empty string and "any" are treated as a wildcard. ExcludeInbound names
+// inbounds that never match, wildcard or not.
 type MatchBounds struct {
-	Inbound  []string
-	Outbound []string
+	Inbound        []string
+	Outbound       []string
+	ExcludeInbound []string
 }
 
 func (mb MatchBounds) clone() MatchBounds {
 	return MatchBounds{
-		Inbound:  slices.Clone(mb.Inbound),
-		Outbound: slices.Clone(mb.Outbound),
+		Inbound:        slices.Clone(mb.Inbound),
+		Outbound:       slices.Clone(mb.Outbound),
+		ExcludeInbound: slices.Clone(mb.ExcludeInbound),
 	}
 }
 
@@ -87,19 +90,21 @@ func InfoFromConn(conn any) (ClientInfo, bool) {
 type Manager struct {
 	logger log.ContextLogger
 
-	matchBounds  MatchBounds
-	inboundRule  *boundsRule
-	outboundRule *boundsRule
-	ruleMu       sync.RWMutex
+	matchBounds     MatchBounds
+	inboundRule     *boundsRule
+	outboundRule    *boundsRule
+	excludedInbound []string
+	ruleMu          sync.RWMutex
 }
 
 // NewManager returns a new Manager.
 func NewManager(bounds MatchBounds, logger log.ContextLogger) *Manager {
 	return &Manager{
-		logger:       logger,
-		matchBounds:  bounds,
-		inboundRule:  newBoundsRule(bounds.Inbound),
-		outboundRule: newBoundsRule(bounds.Outbound),
+		logger:          logger,
+		matchBounds:     bounds.clone(),
+		inboundRule:     newBoundsRule(bounds.Inbound),
+		outboundRule:    newBoundsRule(bounds.Outbound),
+		excludedInbound: slices.Clone(bounds.ExcludeInbound),
 	}
 }
 
@@ -132,14 +137,16 @@ func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn,
 func (m *Manager) match(inbound, outbound string) bool {
 	m.ruleMu.RLock()
 	defer m.ruleMu.RUnlock()
-	return m.inboundRule.match(inbound) && m.outboundRule.match(outbound)
+	return !slices.Contains(m.excludedInbound, inbound) &&
+		m.inboundRule.match(inbound) && m.outboundRule.match(outbound)
 }
 
 func (m *Manager) SetBounds(bounds MatchBounds) {
 	m.ruleMu.Lock()
-	m.matchBounds = bounds
+	m.matchBounds = bounds.clone()
 	m.inboundRule = newBoundsRule(bounds.Inbound)
 	m.outboundRule = newBoundsRule(bounds.Outbound)
+	m.excludedInbound = slices.Clone(bounds.ExcludeInbound)
 	m.ruleMu.Unlock()
 }
 

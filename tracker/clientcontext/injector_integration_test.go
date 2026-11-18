@@ -130,7 +130,7 @@ func startServerBox(t *testing.T, ctx context.Context, opts option.Options) *moc
 	serverBox, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
 	require.NoError(t, err)
 	tracker := &mockTracker{}
-	serverBox.Router().AppendTracker(NewManager(MatchBounds{[]string{"any"}, []string{"any"}}, log.NewNOPFactory().NewLogger("")))
+	serverBox.Router().AppendTracker(NewManager(MatchBounds{Inbound: []string{"any"}, Outbound: []string{"any"}}, log.NewNOPFactory().NewLogger("")))
 	serverBox.Router().AppendTracker(tracker)
 	require.NoError(t, serverBox.Start())
 	t.Cleanup(func() { serverBox.Close() })

@@ -30,6 +30,7 @@ import (
 
 	C "github.com/getlantern/lantern-box/constant"
 	LO "github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/peerrules"
 	"github.com/getlantern/lantern-box/portforward"
 	"github.com/getlantern/lantern-box/protocol/unbounded"
 	"github.com/getlantern/lantern-box/tracker/peerconn"
@@ -527,7 +528,9 @@ func (n *node) deregister(routeID string) {
 }
 
 // applyOperatorLimits sets the operator's limits on the Unbounded volunteer
-// service in options, and reports whether there is one. ctx carries the
+// service in options, and reports whether there is one. It also turns off the
+// volunteer's direct exit unless options carry the abuse rules, which are
+// global in the box and so apply to its exit streams too. ctx carries the
 // option registries.
 func applyOperatorLimits(ctx context.Context, options string, maxPeers int, bandwidthLimit string) (string, bool, error) {
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(options))
@@ -546,6 +549,11 @@ func applyOperatorLimits(ctx context.Context, options string, maxPeers int, band
 		}
 		if bandwidthLimit != "" {
 			vol.BandwidthLimit = bandwidthLimit
+		}
+		// The rules aren't logged: the error names them.
+		if vol.DirectExit && peerrules.ValidateAbuseRulesOptions(opts) != nil {
+			vol.DirectExit = false
+			log.Warn("node: lantern-cloud's rules failed the abuse check, so this node won't exit Unbounded traffic directly")
 		}
 	}
 	if !found {
