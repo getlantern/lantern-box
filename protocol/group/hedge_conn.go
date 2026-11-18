@@ -257,6 +257,28 @@ func (l *hedgeLeg) commit(release func()) bool {
 	return true
 }
 
+// noteReset records, as the watchdog charges a reset on First, the outcome
+// no move can change: a reset after the commit, or on an opening that can't
+// be replayed. firstFailed handles the reset later, on its own goroutine,
+// possibly after the client has closed and the record is finished. A
+// replayable opening is left to its move. The watchdog calls this from the
+// IO path, which never holds mu.
+func (l *hedgeLeg) noteReset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.onFirst || l.moving {
+		return
+	}
+	switch {
+	case l.committed:
+		l.stats.set("", hedgeOutcomeResetAfterCommit)
+	case l.overflow:
+		l.stats.set("", hedgeOutcomeOverflowFailed)
+	case l.noReplay || l.undecidedKept:
+		l.stats.set("", hedgeOutcomeResetNotReplayable)
+	}
+}
+
 // firstFailed handles a failure the watchdog saw on First: before a commit it
 // moves the connection, after one it only marks the site bad, since the
 // client has already seen First's bytes.
@@ -408,7 +430,7 @@ func newHedgeStream(h *Hedge, ctx context.Context, key hedgeKey, network string,
 	s.init(h, ctx, key, network, dest, stats)
 	w := newDataPlaneStream(first, defaultDataPlaneIdle, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
 		onFailure: func(kind lAdapter.UserFailureKind) { s.firstFailed(kind, s.move) },
-		onReset:   s.stats.noteReset,
+		onReset:   s.noteReset,
 	})
 	s.cur = w
 	return s
@@ -729,7 +751,7 @@ func newHedgePacket(h *Hedge, ctx context.Context, key hedgeKey, dest M.Socksadd
 	filtered := &vnFilter{PacketConn: first, ours: p.ownsCID}
 	w := newDataPlanePacket(filtered, defaultDataPlaneIdle, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
 		onFailure: func(kind lAdapter.UserFailureKind) { p.firstFailed(kind, p.move) },
-		onReset:   p.stats.noteReset,
+		onReset:   p.noteReset,
 	})
 	p.cur, p.curRaw = w, w
 	return p
