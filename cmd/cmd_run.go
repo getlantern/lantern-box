@@ -21,6 +21,7 @@ import (
 
 	"github.com/getlantern/lantern-box/internal/memtune"
 	lbotel "github.com/getlantern/lantern-box/otel"
+	"github.com/getlantern/lantern-box/peerrules"
 	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
@@ -66,6 +67,8 @@ var runCmd = &cobra.Command{
 	},
 }
 
+// readConfig reads and parses a config, turning off an Unbounded volunteer's direct exit unless
+// the config carries the rules that check strangers' traffic, as node does for lantern-cloud's.
 func readConfig(path string) (option.Options, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -74,6 +77,9 @@ func readConfig(path string) (option.Options, error) {
 	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, content)
 	if err != nil {
 		return option.Options{}, fmt.Errorf("parsing config file: %w", err)
+	}
+	if peerrules.StripUnsafeDirectExit(&options) {
+		log.Warn("the config's rules failed the direct exit check, so its Unbounded volunteer won't exit traffic directly")
 	}
 	return options, nil
 }

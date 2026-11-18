@@ -5,8 +5,12 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	box "github.com/getlantern/lantern-box"
+	LO "github.com/getlantern/lantern-box/option"
 )
 
 // minimalValidLaunchCfg returns a launch_cfg JSON that passes
@@ -320,4 +324,95 @@ func TestValidateAbuseRulesOptionsNeedsRoute(t *testing.T) {
 	err := ValidateAbuseRulesOptions(option.Options{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "route")
+}
+
+// directExitRules puts a resolve and a private-address reject ahead of minimalValidLaunchCfg's
+// rules, as lantern-cloud's peer configs do.
+func directExitRules(rules string) string {
+	return strings.Replace(minimalValidLaunchCfg, `"rules":[`, `"rules":[`+rules+`,`, 1)
+}
+
+const (
+	resolveRule         = `{"action":"resolve","server":"dns"}`
+	privateRejectRule   = `{"action":"reject","ip_is_private":true}`
+	volunteerDirectExit = `"services":[{"type":"unbounded","tag":"unbounded-volunteer","discovery_srv":"https://freddie.test",` +
+		`"egress_addr":"wss://egress.test","stun_servers":["stun:192.0.2.1:3478"],"direct_exit":true}]`
+)
+
+func parseOptions(t *testing.T, cfg string) option.Options {
+	t.Helper()
+	opts, err := json.UnmarshalExtendedContext[option.Options](box.BaseContext(), []byte(cfg))
+	require.NoError(t, err)
+	return opts
+}
+
+func TestValidateDirectExitRules(t *testing.T) {
+	for name, tc := range map[string]struct {
+		rules string
+		ok    bool
+	}{
+		"resolve then private reject":     {rules: resolveRule + `,` + privateRejectRule, ok: true},
+		"resolve with no options":         {rules: `{"action":"resolve"},` + privateRejectRule, ok: true},
+		"no resolve":                      {rules: privateRejectRule},
+		"no private reject":               {rules: resolveRule},
+		"private reject before resolve":   {rules: privateRejectRule + `,` + resolveRule},
+		"conditional resolve":             {rules: `{"action":"resolve","domain_suffix":["example.com"]},` + privateRejectRule},
+		"conditional private reject":      {rules: resolveRule + `,{"action":"reject","ip_is_private":true,"port":[80]}`},
+		"inverted private reject":         {rules: resolveRule + `,{"action":"reject","ip_is_private":true,"invert":true}`},
+		"private route, not reject":       {rules: resolveRule + `,{"action":"route","outbound":"direct","ip_is_private":true}`},
+		"source private reject":           {rules: resolveRule + `,{"action":"reject","source_ip_is_private":true}`},
+		"rules between resolve and check": {rules: resolveRule + `,{"action":"reject","port":[22]},` + privateRejectRule, ok: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateDirectExitRulesOptions(parseOptions(t, directExitRules(tc.rules)))
+			if tc.ok {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+			}
+		})
+	}
+	assert.Error(t, ValidateDirectExitRulesOptions(option.Options{}), "no route")
+}
+
+func volunteerOptions(t *testing.T, opts option.Options) *LO.UnboundedVolunteerOptions {
+	t.Helper()
+	require.Len(t, opts.Services, 1)
+	vol, ok := opts.Services[0].Options.(*LO.UnboundedVolunteerOptions)
+	require.True(t, ok)
+	return vol
+}
+
+// A volunteer exits strangers' traffic directly only under rules that check it: the abuse
+// rules, and a resolve before a private-address reject so the IP rules see domains too.
+func TestStripUnsafeDirectExit(t *testing.T) {
+	withVolunteer := func(cfg string) string {
+		return strings.Replace(cfg, `"inbounds":[{"type":"samizdat","tag":"samizdat-in"}],`, volunteerDirectExit+`,`, 1)
+	}
+	for name, tc := range map[string]struct {
+		config   string
+		stripped bool
+	}{
+		"every rule":       {config: withVolunteer(directExitRules(resolveRule + `,` + privateRejectRule))},
+		"abuse rules only": {config: withVolunteer(minimalValidLaunchCfg), stripped: true},
+		"no route":         {config: `{` + volunteerDirectExit + `}`, stripped: true},
+		"no abuse rules":   {config: `{"route":{"rules":[` + resolveRule + `,` + privateRejectRule + `]},` + volunteerDirectExit + `}`, stripped: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := parseOptions(t, tc.config)
+			assert.Equal(t, tc.stripped, StripUnsafeDirectExit(&opts))
+			vol := volunteerOptions(t, opts)
+			assert.Equal(t, !tc.stripped, vol.DirectExit)
+			assert.Equal(t, "https://freddie.test", vol.DiscoverySrv, "the volunteer still relays")
+		})
+	}
+	t.Run("no direct exit", func(t *testing.T) {
+		opts := parseOptions(t, `{`+strings.Replace(volunteerDirectExit, `,"direct_exit":true`, ``, 1)+`}`)
+		assert.False(t, StripUnsafeDirectExit(&opts))
+		assert.False(t, volunteerOptions(t, opts).DirectExit)
+	})
+	t.Run("no volunteer", func(t *testing.T) {
+		opts := parseOptions(t, `{}`)
+		assert.False(t, StripUnsafeDirectExit(&opts))
+	})
 }

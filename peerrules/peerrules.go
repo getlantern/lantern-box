@@ -10,6 +10,9 @@ import (
 	"github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
+
+	C "github.com/getlantern/lantern-box/constant"
+	LO "github.com/getlantern/lantern-box/option"
 )
 
 // abuseRuleSetTags is the canonical list of abuse rule_set tags that
@@ -79,6 +82,60 @@ func ValidateAbuseRulesOptions(options option.Options) error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// ValidateDirectExitRulesOptions checks what a config that exits strangers' traffic directly
+// needs on top of the abuse rules: an unconditional resolve, and after it an unconditional
+// reject of private addresses. Before a resolve, sing-box's IP rules don't match a destination
+// given as a domain, so a name that resolves into a private or listed range would pass them.
+//
+// Like ValidateAbuseRulesOptions, it is structural only, and its errors name no rule.
+func ValidateDirectExitRulesOptions(options option.Options) error {
+	if options.Route == nil {
+		return errors.New("launch_cfg is missing route block")
+	}
+	resolved := false
+	for _, r := range options.Route.Rules {
+		switch {
+		case isUnconditionalResolve(r.DefaultOptions):
+			resolved = true
+		case resolved && r.DefaultOptions.IPIsPrivate && isUnconditionalReject(r.DefaultOptions, "ip_is_private"):
+			return nil
+		}
+	}
+	if !resolved {
+		return errors.New("route.rules has no unconditional resolve (IP rules would not see a domain's addresses)")
+	}
+	return errors.New("route.rules has no unconditional ip_is_private reject after its resolve")
+}
+
+// StripUnsafeDirectExit turns off direct_exit on every Unbounded volunteer service in options
+// unless options pass ValidateAbuseRulesOptions and ValidateDirectExitRulesOptions: a
+// volunteer's direct exit routes strangers' traffic through its box's route rules. It reports
+// whether it turned any off. The volunteer still relays.
+func StripUnsafeDirectExit(options *option.Options) bool {
+	var exits []*LO.UnboundedVolunteerOptions
+	for _, svc := range options.Services {
+		if vol, ok := svc.Options.(*LO.UnboundedVolunteerOptions); ok && svc.Type == C.TypeUnbounded && vol.DirectExit {
+			exits = append(exits, vol)
+		}
+	}
+	if len(exits) == 0 {
+		return false
+	}
+	if ValidateAbuseRulesOptions(*options) == nil && ValidateDirectExitRulesOptions(*options) == nil {
+		return false
+	}
+	for _, vol := range exits {
+		vol.DirectExit = false
+	}
+	return true
+}
+
+// isUnconditionalResolve reports whether rule resolves every destination: a resolve action,
+// whatever its options, with no match field and no invert.
+func isUnconditionalResolve(rule option.DefaultRule) bool {
+	return rule.Action == constant.RuleActionTypeResolve && reflect.DeepEqual(rule.RawDefaultRule, option.RawDefaultRule{})
 }
 
 // validateAbuseRuleSetTags asserts every entry in abuseRuleSetTags is
@@ -186,6 +243,8 @@ func isUnconditionalReject(rule option.DefaultRule, onField string) bool {
 		defaultValue.IPCIDR = rule.IPCIDR
 	case "port":
 		defaultValue.Port = rule.Port
+	case "ip_is_private":
+		defaultValue.IPIsPrivate = rule.IPIsPrivate
 	default:
 		return false
 	}

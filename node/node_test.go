@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -850,6 +851,7 @@ func TestBindsPort(t *testing.T) {
 }
 
 // abuseRoute is a route that passes peerrules' abuse check, as peerrules' tests build it.
+// directExitRoute adds the resolve and private-address reject a direct exit also needs.
 const abuseRoute = `"route":{
 	"rule_set":[
 		{"type":"remote","tag":"geosite-malware","format":"binary","url":"https://example/geosite-malware.srs","download_detour":"direct"},
@@ -867,8 +869,12 @@ const abuseRoute = `"route":{
 	]
 }`
 
+var directExitRoute = strings.Replace(abuseRoute, `"rules":[`,
+	`"rules":[{"action":"resolve","server":"dns"},{"action":"reject","ip_is_private":true},`, 1)
+
 // A volunteer exits Unbounded traffic directly only under the node's abuse rules, which are
-// global in its box: without them, the node drops direct_exit and still serves as a relay.
+// global in its box, with a resolve ahead of a private-address reject: without them, the node
+// drops direct_exit and still serves as a relay.
 func TestApplyOperatorLimitsDropsDirectExitWithoutRules(t *testing.T) {
 	const volunteer = `"services":[{"type":"unbounded","tag":"unbounded-volunteer","discovery_srv":"https://freddie.test",` +
 		`"egress_addr":"wss://egress.test","stun_servers":["stun:192.0.2.1:3478"],"direct_exit":true}]`
@@ -876,9 +882,10 @@ func TestApplyOperatorLimitsDropsDirectExitWithoutRules(t *testing.T) {
 		config string
 		want   bool
 	}{
-		"no route":     {config: `{` + volunteer + `}`, want: false},
-		"no abuse set": {config: `{"route":{"rules":[{"action":"reject","port":[25]}]},` + volunteer + `}`, want: false},
-		"abuse rules":  {config: `{` + abuseRoute + `,` + volunteer + `}`, want: true},
+		"no route":         {config: `{` + volunteer + `}`, want: false},
+		"no abuse set":     {config: `{"route":{"rules":[{"action":"reject","port":[25]}]},` + volunteer + `}`, want: false},
+		"abuse rules only": {config: `{` + abuseRoute + `,` + volunteer + `}`, want: false},
+		"every rule":       {config: `{` + directExitRoute + `,` + volunteer + `}`, want: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			out, found, err := applyOperatorLimits(box.BaseContext(), tc.config, 0, "")
