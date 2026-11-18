@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	sbox "github.com/sagernet/sing-box"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/protocol/socks"
@@ -81,6 +82,9 @@ func TestOutlineQUICPrelude(t *testing.T) {
 // TestOutlineQUICPreludeHandshake completes a QUIC handshake through the
 // outline outbound against a real QUIC server, a stock hysteria2 inbound, so
 // the server must tolerate the decoy and replies must find their way back.
+// It drives the outbound's ListenPacket directly: sing's SOCKS5 UDP server
+// races between its read and write paths under -race, and the routed path is
+// covered by TestOutlineQUICPrelude.
 func TestOutlineQUICPreludeHandshake(t *testing.T) {
 	for _, udp := range []string{"quicprelude:count=1", "quicprelude:count=3&version=draft", ""} {
 		t.Run(fmt.Sprintf("udp=%q", udp), func(t *testing.T) {
@@ -92,18 +96,20 @@ func TestOutlineQUICPreludeHandshake(t *testing.T) {
 					"users": [{"password": "pw"}], "tls": {"enabled": true, "insecure": true}}],
 				"outbounds": [{"type": "direct"}]
 			}`, serverPort)))
-			clientPort := freePort(t)
-			startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
+			client, err := sbox.New(sbox.Options{Context: boxCtx, Options: mustOptions(boxCtx, t, fmt.Sprintf(`{
 				"log": {"level": "error"},
-				"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
-				"outbounds": [{"type": "outline", "domains": ["example.com"], "udp": %q}]
-			}`, clientPort, udp)))
+				"outbounds": [{"type": "outline", "tag": "proxyless", "domains": ["example.com"], "udp": %q}]
+			}`, udp))})
+			require.NoError(t, err)
+			require.NoError(t, client.Start())
+			t.Cleanup(func() { client.Close() })
+			out, ok := client.Outbound().Outbound("proxyless")
+			require.True(t, ok)
 
-			sc := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
 			server := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(serverPort)}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			pc, err := sc.ListenPacket(ctx, M.SocksaddrFromNet(server))
+			pc, err := out.ListenPacket(ctx, M.SocksaddrFromNet(server))
 			require.NoError(t, err)
 			defer pc.Close()
 			conn, err := quic.DialEarly(ctx, pc, server,
