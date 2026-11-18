@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1728,6 +1729,12 @@ func TestHedgeMoveErrorHidesADeadlineCause(t *testing.T) {
 		require.NotErrorIs(t, err, context.DeadlineExceeded)
 	}
 	require.ErrorIs(t, &hedgeMoveError{cause: errors.ErrUnsupported}, errors.ErrUnsupported, "other causes stay reachable")
+	var opReset *net.OpError
+	require.True(t, errors.As(&hedgeMoveError{cause: &net.OpError{Op: "write", Err: syscall.ECONNRESET}}, &opReset),
+		"a cause that isn't a timeout keeps its details")
+	var opTimeout *net.OpError
+	require.False(t, errors.As(&hedgeMoveError{cause: &net.OpError{Op: "dial", Err: syscall.ETIMEDOUT}}, &opTimeout),
+		"any cause that is a timeout is hidden, not only the deadline sentinels")
 	var op *net.OpError
 	require.False(t, errors.As(&hedgeMoveError{cause: &net.OpError{Op: "write", Err: os.ErrDeadlineExceeded}}, &op),
 		"nor through a cause's own timeout")

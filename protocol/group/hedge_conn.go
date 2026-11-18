@@ -379,14 +379,16 @@ func (l *hedgeLeg) applyDeadlinesLocked(c deadlineCloser) {
 
 // hedgeMoveError is why a move to Then failed. It isn't a timeout, even
 // when its cause is, so a caller that retries timeouts sees the connection
-// is dead rather than retrying it forever. errors.Is reaches its cause,
-// except a deadline, which would read as a timeout.
+// is dead rather than retrying it forever. errors.Is and errors.As reach
+// its cause, except one that is a timeout, which would read as one.
 type hedgeMoveError struct{ cause error }
 
 func (e *hedgeMoveError) Error() string { return "hedge: move to then failed: " + e.cause.Error() }
 func (e *hedgeMoveError) Unwrap() error {
-	if errors.Is(e.cause, os.ErrDeadlineExceeded) || errors.Is(e.cause, context.DeadlineExceeded) {
-		return nil
+	var ne net.Error
+	if errors.Is(e.cause, os.ErrDeadlineExceeded) || errors.Is(e.cause, context.DeadlineExceeded) ||
+		(errors.As(e.cause, &ne) && ne.Timeout()) {
+		return nil // any timeout, so nothing beneath reads as one
 	}
 	return e.cause
 }
@@ -394,11 +396,11 @@ func (e *hedgeMoveError) Unwrap() error {
 func (e *hedgeMoveError) Timeout() bool   { return false }
 func (e *hedgeMoveError) Temporary() bool { return false }
 
-// closedByTimer reports whether err is what an operation returns when its
-// conn was closed under it, as replayTimer does.
-func closedByTimer(err error) bool {
-	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
-}
+// timedOut is a move's error once dialTimer or replayTimer fired. Each
+// timer is stopped right after the call it bounds returns, so its having
+// fired means it caused whatever that call returned (a cancelled context,
+// a closed conn), which would otherwise read as a close.
+func timedOut() error { return os.ErrDeadlineExceeded }
 
 // replayTimer closes c if the replay outlives the failover timeout, which
 // holds even for a conn that ignores deadlines. done reports whether the
@@ -510,15 +512,11 @@ func (s *hedgeStream) runMove() {
 	if err == nil {
 		stop := s.dialTimer()
 		conn, err = then.DialContext(ctx, s.network, s.dest)
-		// The timer firing is the cause when the dial failed only from
-		// the cancelled context, or succeeded too late.
 		if !stop() {
 			if err == nil {
 				conn.Close() // the timer cancelled the context it lives on
 			}
-			if err == nil || errors.Is(err, context.Canceled) {
-				err = os.ErrDeadlineExceeded
-			}
+			err = timedOut()
 		}
 	}
 	if err == nil {
@@ -545,10 +543,8 @@ func (s *hedgeStream) runMove() {
 				err = closeWrite(conn)
 			}
 		}
-		// The timer firing is the cause when the write failed only from the
-		// conn it closed, rather than a reset of Then's own.
-		if !done() && (err == nil || closedByTimer(err)) {
-			err = os.ErrDeadlineExceeded
+		if !done() {
+			err = timedOut()
 		}
 		if err != nil {
 			conn.Close()
@@ -979,9 +975,7 @@ func (p *hedgePacket) runMove() {
 			if err == nil {
 				raw.Close() // the timer cancelled the context it lives on
 			}
-			if err == nil || errors.Is(err, context.Canceled) {
-				err = os.ErrDeadlineExceeded
-			}
+			err = timedOut()
 		}
 		if err == nil {
 			conn = netPacketConn(raw)
@@ -997,8 +991,8 @@ func (p *hedgePacket) runMove() {
 					break
 				}
 			}
-			if !done() && (err == nil || closedByTimer(err)) {
-				err = os.ErrDeadlineExceeded
+			if !done() {
+				err = timedOut()
 			}
 		}
 		if err != nil {
