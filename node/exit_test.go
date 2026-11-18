@@ -421,6 +421,149 @@ func TestRunExitKeepsServingUntilExpiryWhenRefused(t *testing.T) {
 	assert.Equal(t, []string{"build 1", "router 1", "router nil", "close 1"}, ev.list(), "nothing is left to close")
 }
 
+// holdOffs records what RunExit reports through OnHoldOff.
+type holdOffs struct {
+	mu    sync.Mutex
+	until []time.Time
+}
+
+func (h *holdOffs) record(until time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.until = append(h.until, until)
+}
+
+func (h *holdOffs) list() []time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]time.Time(nil), h.until...)
+}
+
+// lantern-cloud's Retry-After on a 429 or 503 is the least RunExit waits, and RunExit reports
+// the hold-off so the embedder can keep it across a restart. A success clears it.
+func TestRunExitHonorsRetryAfter(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var mu sync.Mutex
+			var at []time.Time
+			srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				at = append(at, time.Now())
+				n := len(at)
+				mu.Unlock()
+				if n == 1 {
+					w.Header().Set("Retry-After", "1")
+					w.WriteHeader(status)
+					return
+				}
+				writeJSON(w, map[string]any{"server_config": validExitConfig, "rotation_interval_seconds": 3600})
+			})
+			e := enabledExit(t)
+			ev := &exitEvents{}
+			held := &holdOffs{}
+			ctx, cancel := context.WithCancel(box.BaseContext())
+			defer cancel()
+			started := time.Now()
+			done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+				NewBox: (&fakeExitBoxes{ev: ev}).new, OnHoldOff: held.record}, ev)
+			require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, 5*time.Millisecond)
+			mu.Lock()
+			require.Len(t, at, 2)
+			gap := at[1].Sub(at[0])
+			mu.Unlock()
+			assert.GreaterOrEqual(t, gap, 950*time.Millisecond, "the retry waits out Retry-After, not the 10ms back-off")
+			got := held.list()
+			require.Len(t, got, 2)
+			assert.WithinDuration(t, started.Add(time.Second), got[0], 500*time.Millisecond)
+			assert.True(t, got[1].IsZero(), "a registration clears the hold-off")
+			cancel()
+			waitDone(t, done)
+		})
+	}
+}
+
+// A busy answer without Retry-After still holds off, for the back-off, and reports it. Other
+// failures hold off nothing beyond this run.
+func TestRunExitReportsTheBusyBackOff(t *testing.T) {
+	var registers atomic.Int32
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		if registers.Add(1)%2 == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	held := &holdOffs{}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: (&fakeExitBoxes{ev: ev}).new, OnHoldOff: held.record}, ev)
+	require.Eventually(t, func() bool { return registers.Load() >= 4 }, 5*time.Second, 5*time.Millisecond)
+	cancel()
+	waitDone(t, done)
+	got := held.list()
+	require.NotEmpty(t, got)
+	assert.LessOrEqual(t, len(got), int(registers.Load()+1)/2, "only the 503s hold off")
+	for _, until := range got {
+		assert.False(t, until.IsZero())
+	}
+}
+
+// NotBefore carries a hold-off across a restart: RunExit calls lantern-cloud no sooner.
+func TestRunExitWaitsForNotBefore(t *testing.T) {
+	var mu sync.Mutex
+	var first time.Time
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if first.IsZero() {
+			first = time.Now()
+		}
+		mu.Unlock()
+		writeJSON(w, map[string]any{"server_config": validExitConfig, "rotation_interval_seconds": 3600})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	notBefore := time.Now().Add(300 * time.Millisecond)
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: (&fakeExitBoxes{ev: ev}).new, NotBefore: notBefore}, ev)
+	require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, 5*time.Millisecond)
+	mu.Lock()
+	assert.False(t, first.Before(notBefore), "registered before NotBefore")
+	mu.Unlock()
+	cancel()
+	waitDone(t, done)
+
+	// Canceled while waiting, it returns without calling lantern-cloud.
+	var calls atomic.Int32
+	srv2 := exitCloud(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1) })
+	ctx2, cancel2 := context.WithCancel(box.BaseContext())
+	done = runExitAsync(t, ctx2, ExitConfig{APIURL: srv2.URL + "/v1", HTTPClient: srv2.Client(), DeviceID: "dev", Exit: e,
+		NewBox: (&fakeExitBoxes{ev: ev}).new, NotBefore: time.Now().Add(time.Hour)}, ev)
+	time.Sleep(50 * time.Millisecond)
+	cancel2()
+	waitDone(t, done)
+	assert.Zero(t, calls.Load())
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	for in, want := range map[string]time.Duration{
+		"":                              0,
+		"7":                             7 * time.Second,
+		"-3":                            0,
+		"soon":                          0,
+		"Wed, 18 Nov 2026 12:00:30 GMT": 30 * time.Second,
+		"Wed, 18 Nov 2026 11:00:00 GMT": 0,
+		"999999999999":                  maxHoldOff,
+	} {
+		assert.Equal(t, want, parseRetryAfter(in, now), in)
+	}
+}
+
 type exitLogBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer

@@ -48,6 +48,15 @@ type ExitConfig struct {
 	NewBox func(ctx context.Context, options string) (ExitBox, error)
 	// RotationInterval overrides the interval lantern-cloud gives. 0: lantern-cloud's, or an hour.
 	RotationInterval time.Duration
+	// NotBefore, when in the future, is when RunExit first calls lantern-cloud: the hold-off
+	// OnHoldOff last reported, which the embedder keeps across a restart so that restarting
+	// RunExit can't cut it short.
+	NotBefore time.Time
+	// OnHoldOff, when set, is called with the time before which RunExit won't call
+	// lantern-cloud again each time lantern-cloud answers busy (429 or 503), and with the
+	// zero time once a registration succeeds after that. The wait is RunExit's back-off, or
+	// the response's Retry-After when longer. Other failures hold off only within a run.
+	OnHoldOff func(until time.Time)
 }
 
 // ExitBox is a running exit box. It is exported for NewBox.
@@ -73,6 +82,8 @@ type exitRunner struct {
 	box        ExitBox
 	validUntil time.Time
 	rotation   time.Duration
+	// heldOff is whether OnHoldOff last reported a hold-off.
+	heldOff bool
 }
 
 // RunExit keeps a WebRTC-only registration and its exit box current until ctx ends. ctx must
@@ -128,6 +139,9 @@ func newExitRunner(cfg ExitConfig) (*exitRunner, error) {
 // returns once ctx ends, with the router cleared and the box closed.
 func (r *exitRunner) loop(ctx context.Context) error {
 	defer r.close()
+	if wait := time.Until(r.cfg.NotBefore); wait > 0 && !r.wait(ctx, wait) {
+		return nil
+	}
 	retry := r.minRetry
 	for {
 		var wait time.Duration
@@ -135,16 +149,40 @@ func (r *exitRunner) loop(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			logExitFailure(err, retry)
 			wait = retry
 			retry = min(retry*2, r.maxRetry)
+			if after, ok := busy(err); ok {
+				wait = max(wait, after)
+				r.holdOff(time.Now().Add(wait))
+			}
+			logExitFailure(err, wait)
 		} else {
 			wait = r.rotation
 			retry = r.minRetry
+			if r.heldOff {
+				r.holdOff(time.Time{})
+			}
 		}
 		if !r.wait(ctx, wait) {
 			return nil
 		}
+	}
+}
+
+// busy reports whether err is lantern-cloud answering busy, and the Retry-After it gave.
+func busy(err error) (time.Duration, bool) {
+	var ae *apiError
+	if !errors.As(err, &ae) || (ae.status != http.StatusTooManyRequests && ae.status != http.StatusServiceUnavailable) {
+		return 0, false
+	}
+	return ae.retryAfter, true
+}
+
+// holdOff reports a hold-off to the embedder, or its end with the zero time.
+func (r *exitRunner) holdOff(until time.Time) {
+	r.heldOff = !until.IsZero()
+	if r.cfg.OnHoldOff != nil {
+		r.cfg.OnHoldOff(until)
 	}
 }
 

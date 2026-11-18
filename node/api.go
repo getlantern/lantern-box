@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"runtime"
+	"strconv"
+	"time"
 )
 
 // registerRequest asks lantern-cloud for a route and the config to serve it
@@ -50,6 +52,8 @@ type heartbeatRequest struct {
 type apiError struct {
 	status int
 	body   string
+	// retryAfter is what the response's Retry-After asked for, or zero.
+	retryAfter time.Duration
 }
 
 func (e *apiError) Error() string {
@@ -197,7 +201,8 @@ func (a *api) do(ctx context.Context, path string, body, out any) error {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return &apiError{status: resp.StatusCode, body: string(bytes.TrimSpace(b))}
+		return &apiError{status: resp.StatusCode, body: string(bytes.TrimSpace(b)),
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())}
 	}
 	if out != nil {
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
@@ -205,4 +210,29 @@ func (a *api) do(ctx context.Context, path string, body, out any) error {
 		}
 	}
 	return nil
+}
+
+// maxHoldOff bounds the Retry-After lantern-cloud can ask for, so a bad header can't park a
+// device for days. Its admission windows are seconds long.
+const maxHoldOff = time.Hour
+
+// parseRetryAfter returns how long a Retry-After header, in seconds or as an HTTP date, asks
+// to wait from now, at most maxHoldOff. It is zero for a missing, malformed or past value.
+func parseRetryAfter(v string, now time.Time) time.Duration {
+	if v == "" {
+		return 0
+	}
+	var d time.Duration
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		d = maxHoldOff
+		if secs < int64(maxHoldOff/time.Second) {
+			d = time.Duration(secs) * time.Second
+		}
+	} else if t, err := http.ParseTime(v); err == nil {
+		d = t.Sub(now)
+	}
+	return min(max(d, 0), maxHoldOff)
 }
