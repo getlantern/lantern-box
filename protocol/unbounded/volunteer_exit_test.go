@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -231,4 +233,47 @@ func TestVolunteerDirectExitWaitsForItsAbuseRuleSets(t *testing.T) {
 				"the direct exit once its abuse rule sets loaded")
 		})
 	}
+}
+
+// A rule set's later reload can leave it empty, as a local file emptied, or a download of an
+// empty list, does. The volunteer withdraws its direct exit while any abuse rule set is empty,
+// and offers it again once the set holds rules.
+func TestVolunteerDirectExitFollowsItsAbuseRuleSets(t *testing.T) {
+	probe, err := exit.New(context.Background(), sblog.NewNOPFactory().Logger())
+	if errors.Is(err, exit.ErrUnavailable) {
+		t.Skip("built without with_quic")
+	}
+	probe.Close()
+	unreachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(unreachable.Close)
+	const full, empty = `{"version": 3, "rules": [{"domain": ["malware.test"]}]}`, `{"version": 3, "rules": []}`
+	path := filepath.Join(t.TempDir(), "malware.json")
+	require.NoError(t, os.WriteFile(path, []byte(full), 0o600))
+	config := strings.Replace(directExitBoxConfig,
+		`{"type": "inline", "tag": "geosite-malware", "rules": [{"domain": ["malware.test"]}]}`,
+		fmt.Sprintf(`{"type": "local", "tag": "geosite-malware", "format": "source", "path": %q}`, path), 1)
+	ctx := service.ExtendContext(lbox.BaseContext())
+	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(fmt.Sprintf(config,
+		unreachable.URL, "ws"+unreachable.URL[len("http"):], true)))
+	require.NoError(t, err)
+	ctx, stripped := peerrules.CheckDirectExit(ctx, &opts)
+	require.False(t, stripped)
+	b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Close() })
+	require.NoError(t, b.Start())
+	svc, ok := service.FromContext[adapter.ServiceManager](ctx).Get("volunteer")
+	require.True(t, ok)
+	e := unbounded.VolunteerExit(svc)
+	require.NotNil(t, e)
+	require.True(t, e.Ready(false))
+
+	require.NoError(t, os.WriteFile(path, []byte(empty), 0o600))
+	assert.Eventually(t, func() bool { return !e.Ready(false) }, 10*time.Second, 20*time.Millisecond,
+		"the direct exit is withdrawn once a set is empty")
+	require.NoError(t, os.WriteFile(path, []byte(full), 0o600))
+	assert.Eventually(t, func() bool { return e.Ready(false) }, 10*time.Second, 20*time.Millisecond,
+		"and offered again once it holds rules")
 }

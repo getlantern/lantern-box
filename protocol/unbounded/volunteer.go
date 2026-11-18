@@ -284,40 +284,45 @@ func (v *Volunteer) startExit() *exit.Exit {
 	// A node's box carries one policy, and nodes register to serve the pool, so it serves pool
 	// sessions alone: its friends' room sessions, if any, relay to the egress as before rather
 	// than exit through a policy that isn't theirs.
-	serve := func() { e.SetRouter(exit.Pool, router, validUntil) }
-	if err := directexit.AbuseRuleSetsLoaded(router); err != nil {
-		// sing-box started the box with the rule sets it couldn't download empty, so the abuse
-		// rejects would match nothing. The volunteer relays only until they load, which sing-box
-		// retries on its own back-off.
-		v.logger.WarnContext(v.ctx, "unbounded volunteer: no direct exit until its abuse rule sets load: ", err)
-		v.unwatch = whenAbuseRuleSetsLoad(router, serve)
-		return e
-	}
-	serve()
+	v.unwatch = []func(){followAbuseRuleSets(v.ctx, v.logger, router, func(loaded bool) {
+		if loaded {
+			e.SetRouter(exit.Pool, router, validUntil)
+		} else {
+			e.SetRouter(exit.Pool, nil, time.Time{})
+		}
+	})}
 	return e
 }
 
-// whenAbuseRuleSetsLoad calls f once router's abuse rule sets have all loaded, as they update,
-// and returns the funcs that stop it waiting.
-func whenAbuseRuleSetsLoad(router adapter.Router, f func()) []func() {
-	var once sync.Once
+// followAbuseRuleSets calls serve(true) while router's abuse rule sets all hold rules, and
+// serve(false) when one stops, each time that changes, starting with their state now, until
+// the returned stop is called. sing-box starts a box with a remote set it couldn't download
+// empty, and a later download or reload can empty a set too, so the abuse rejects would match
+// nothing; the volunteer relays only until the sets hold rules again, which sing-box's own
+// retries and reloads bring.
+func followAbuseRuleSets(ctx context.Context, lg sblog.ContextLogger, router adapter.Router, serve func(loaded bool)) (stop func()) {
+	var mu sync.Mutex
+	var started, serving bool
 	check := func() {
-		if directexit.AbuseRuleSetsLoaded(router) == nil {
-			once.Do(f)
+		err := directexit.AbuseRuleSetsLoaded(router)
+		mu.Lock()
+		defer mu.Unlock()
+		loaded := err == nil
+		if started && loaded == serving {
+			return
 		}
-	}
-	var unwatch []func()
-	for _, tag := range directexit.AbuseRuleSetTags {
-		set, ok := router.RuleSet(tag)
-		if !ok {
-			continue
+		if !loaded {
+			lg.WarnContext(ctx, "unbounded volunteer: no direct exit until its abuse rule sets hold rules: ", err)
+		} else if started {
+			lg.InfoContext(ctx, "unbounded volunteer: direct exit on again, its abuse rule sets hold rules")
 		}
-		el := set.RegisterCallback(func(adapter.RuleSet) { check() })
-		unwatch = append(unwatch, func() { set.UnregisterCallback(el) })
+		started, serving = true, loaded
+		serve(loaded)
 	}
-	// A set that loaded before its callback was registered.
+	stop = directexit.WatchAbuseRuleSets(router, check)
+	// After registering, so an update between the two isn't missed.
 	check()
-	return unwatch
+	return stop
 }
 
 // stunPreflight logs STUN checks that fail. A node that can't reach any STUN server stops taking
