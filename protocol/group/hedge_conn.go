@@ -56,7 +56,12 @@ type hedgeLeg struct {
 	decided  bool
 	noReplay bool
 	overflow bool
-	moveErr  error // why the move to Then failed
+	// undecidedKept is set while bytes are kept before there are enough to
+	// decide; such a prefix is never replayed.
+	undecidedKept bool
+	// commitTimer is the commit timeout, armed before the first write.
+	commitTimer *time.Timer
+	moveErr     error // why the move to Then failed
 	// moveCtx is what Then is dialed with (see moveContext). cancel ends
 	// it, when the move fails or the connection closes, never after a
 	// successful move.
@@ -92,19 +97,26 @@ func (l *hedgeLeg) tentativeLocked() bool {
 	return l.onFirst && !l.committed
 }
 
-// keepLocked decides whether b, about to be written, is kept for replay. The
-// first non-empty write decides whether the connection is replayable at all;
-// an empty write, which the router uses to kick a deferred handshake, decides
-// nothing. Caller holds mu.
-func (l *hedgeLeg) keepLocked(b []byte, opensHandshake func([]byte) bool, fits bool) bool {
+// keepLocked decides whether b, about to be written, is kept for replay.
+// Whether the connection is replayable at all is decided once minLen bytes
+// have been written, from keptSoFar followed by b, so a handshake split over
+// writes is still recognised. An empty write, which the router uses to kick
+// a deferred handshake, decides nothing. Caller holds mu.
+func (l *hedgeLeg) keepLocked(b, keptSoFar []byte, opensHandshake func([]byte) bool, minLen int, fits bool) bool {
 	if len(b) == 0 || !l.tentativeLocked() || l.noReplay || l.overflow {
 		return false
 	}
 	if !l.decided {
-		l.decided = true
-		if !opensHandshake(b) {
-			l.noReplay = true
-			return false
+		opening := append(append([]byte(nil), keptSoFar...), b...)
+		if len(opening) >= minLen {
+			l.decided = true
+			l.undecidedKept = false
+			if !opensHandshake(opening) {
+				l.noReplay = true
+				return false
+			}
+		} else {
+			l.undecidedKept = true
 		}
 	}
 	if !fits {
@@ -112,6 +124,30 @@ func (l *hedgeLeg) keepLocked(b []byte, opensHandshake func([]byte) bool, fits b
 		return false
 	}
 	return true
+}
+
+// armCommitLocked starts the commit timeout at the first non-empty write,
+// before the write runs, so a write that blocks on First is bounded too.
+// Expiry moves the connection unless it committed or moved meanwhile.
+// Caller holds mu.
+func (l *hedgeLeg) armCommitLocked(n int, move func(lAdapter.UserFailureKind)) {
+	if n == 0 || l.commitTimer != nil || !l.tentativeLocked() {
+		return
+	}
+	l.commitTimer = time.AfterFunc(l.h.cfg.commitTimeout, func() {
+		l.mu.Lock()
+		waiting := l.tentativeLocked() && !l.moving
+		l.mu.Unlock()
+		if waiting {
+			move(lAdapter.UserFailureNoResponse)
+		}
+	})
+}
+
+func (l *hedgeLeg) stopCommitLocked() {
+	if l.commitTimer != nil {
+		l.commitTimer.Stop()
+	}
 }
 
 // awaitMove waits out a move in progress. It reports whether the connection
@@ -187,6 +223,7 @@ func (l *hedgeLeg) commit(release func()) bool {
 	}
 	first := !l.committed
 	l.committed = true
+	l.stopCommitLocked()
 	release()
 	l.mu.Unlock()
 	if first {
@@ -221,8 +258,8 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 		l.mu.Unlock()
 		return false
 	}
-	if l.noReplay || l.overflow {
-		slowOnly := l.noReplay && why == lAdapter.UserFailureNoResponse
+	if notReplayable := l.noReplay || l.undecidedKept; notReplayable || l.overflow {
+		slowOnly := notReplayable && why == lAdapter.UserFailureNoResponse
 		l.mu.Unlock()
 		if !slowOnly {
 			l.h.markBad(l.ctx, l.key, why)
@@ -279,6 +316,7 @@ func (l *hedgeLeg) finishMoveLocked(err error) {
 	l.onFirst = false
 	l.moving = false
 	l.pending = nil
+	l.stopCommitLocked()
 	if err != nil {
 		l.cancel()
 	}
@@ -289,6 +327,7 @@ func (l *hedgeLeg) finishMoveLocked(err error) {
 // with it. Caller holds mu.
 func (l *hedgeLeg) closeLocked() (cancel context.CancelFunc, pending io.Closer) {
 	l.closed = true
+	l.stopCommitLocked()
 	if l.pending == nil {
 		return l.cancel, nil
 	}
@@ -321,7 +360,6 @@ func newHedgeStream(h *Hedge, ctx context.Context, key hedgeKey, network string,
 	w := newDataPlaneStream(first, defaultDataPlaneIdle, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
 		onFailure: func(kind lAdapter.UserFailureKind) { s.firstFailed(kind, s.move) },
 	})
-	w.firstResponseTimeout = h.cfg.commitTimeout
 	s.cur = w
 	return s
 }
@@ -357,7 +395,10 @@ func (s *hedgeStream) runMove() {
 		switch {
 		case !s.startReplay(conn):
 			err = net.ErrClosed
-		case len(held) > 0:
+		case len(held) > 0 || N.NeedHandshakeForWrite(conn):
+			// With nothing to replay, an empty write still kicks a
+			// deferred handshake on Then, which a server-first protocol
+			// would otherwise wait on forever.
 			done := replayTimer(conn)
 			_, err = conn.Write(held)
 			if !done() && err == nil {
@@ -462,10 +503,11 @@ func (s *hedgeStream) Write(p []byte) (int, error) {
 			s.mu.Unlock()
 			return 0, err
 		}
-		kept := s.keepLocked(p, opensTLS, len(s.held)+len(p) <= s.h.cfg.maxHeldBytes)
+		s.armCommitLocked(len(p), s.move)
+		kept := s.keepLocked(p, s.held, opensTLS, 3, len(s.held)+len(p) <= s.h.cfg.maxHeldBytes)
 		if kept {
 			s.held = append(s.held, p...)
-		} else if s.overflow {
+		} else if s.overflow || s.noReplay {
 			s.held = nil
 		}
 		c := s.cur
@@ -610,7 +652,6 @@ func newHedgePacket(h *Hedge, ctx context.Context, key hedgeKey, dest M.Socksadd
 	w := newDataPlanePacket(filtered, defaultDataPlaneIdle, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
 		onFailure: func(kind lAdapter.UserFailureKind) { p.firstFailed(kind, p.move) },
 	})
-	w.firstResponseTimeout = h.cfg.commitTimeout
 	p.cur, p.curRaw = w, w
 	return p
 }
@@ -861,7 +902,8 @@ func (p *hedgePacket) write(b []byte, dest M.Socksaddr) error {
 			p.noteCIDLocked(b)
 		}
 		fits := len(p.held) < hedgeMaxHeldPackets && p.heldBytes+len(b) <= p.h.cfg.maxHeldBytes
-		kept := p.keepLocked(b, opensQUIC, fits)
+		p.armCommitLocked(len(b), p.move)
+		kept := p.keepLocked(b, nil, opensQUIC, 1, fits)
 		if kept {
 			p.held = append(p.held, heldPacket{data: append([]byte(nil), b...), dest: dest})
 			p.heldBytes += len(b)

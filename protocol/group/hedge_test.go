@@ -814,6 +814,18 @@ type earlyConn struct {
 }
 
 func (c *earlyConn) NeedHandshakeForWrite() bool { return !c.wrote.Load() }
+
+// Read waits for the first write, as a deferred-handshake conn does, up to a
+// bound that fails a test rather than hanging it.
+func (c *earlyConn) Read(p []byte) (int, error) {
+	for deadline := time.Now().Add(3 * time.Second); !c.wrote.Load(); {
+		if time.Now().After(deadline) {
+			return 0, os.ErrDeadlineExceeded
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return c.Conn.Read(p)
+}
 func (c *earlyConn) Write(p []byte) (int, error) {
 	c.wrote.Store(true)
 	if len(p) == 0 {
@@ -1124,4 +1136,67 @@ func TestHedgeMoveKeepsThenAliveOnItsDialContext(t *testing.T) {
 	time.Sleep(3 * hedgeFailoverDialTimeout)
 	require.Equal(t, "then:later", exchange(t, c, "later"),
 		"nor may that context expire with the failover timeout")
+}
+
+func TestHedgeRecognisesASplitTLSHeader(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	record := tlsRecord("client-hello")
+	_, err = c.Write([]byte(record[:1]))
+	require.NoError(t, err)
+	_, err = c.Write([]byte(record[1:]))
+	require.NoError(t, err)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "then:"+record, string(buf[:n]),
+		"a TLS header split over writes must still move, replaying both writes in one")
+}
+
+func TestHedgeNeverReplaysAnUndecidedPrefix(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte{0x16}) // too short to tell a handshake from anything else
+	require.NoError(t, err)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(400*time.Millisecond)))
+	_, err = c.Read(make([]byte, 64))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	require.Zero(t, f.then.dials.Load(), "a prefix too short to classify must not be replayed")
+}
+
+func TestHedgeMoveWithNothingHeldKicksThensHandshake(t *testing.T) {
+	banner := func(c net.Conn) { _, _ = c.Write([]byte("220 banner")); blackhole(c) }
+	then := &fakeOutbound{stream: banner, wrap: func(c net.Conn) net.Conn { return &earlyConn{Conn: c} }}
+	f := newHedgeFixture(t, &fakeOutbound{stream: dropBeforeRead}, then, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	// A server-first protocol reads before writing anything; First drops.
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	require.NoError(t, err, "Then's deferred handshake must be kicked when there is nothing to replay")
+	require.Equal(t, "220 banner", string(buf[:n]))
+}
+
+func TestHedgeCommitTimeoutBoundsABlockedWrite(t *testing.T) {
+	stuck := func(c net.Conn) { time.Sleep(10 * time.Second); c.Close() } // never reads
+	f := newHedgeFixture(t, &fakeOutbound{stream: stuck}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	start := time.Now()
+	n, err := c.Write([]byte(tlsRecord("hello")))
+	require.NoError(t, err, "a write blocked on First must be moved by the commit timeout")
+	require.Equal(t, len(tlsRecord("hello")), n)
+	require.Less(t, time.Since(start), 2*time.Second)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 64)
+	n, err = c.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "then:"+tlsRecord("hello"), string(buf[:n]))
 }
