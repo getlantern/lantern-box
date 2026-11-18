@@ -66,7 +66,15 @@ type kindState struct {
 	// revoked is closed when the kind stops being servable, ending its sessions. A new
 	// channel replaces it once it is servable again.
 	revoked chan struct{}
+	// minted holds the passwords params minted for the kind since it last became servable, and
+	// when, until serve takes them. Revocation drops them all, so a password minted before a
+	// withdrawal can't be served after the kind is restored.
+	minted map[string]time.Time
 }
+
+// mintTTL bounds how long a minted password waits for its session to be served: broflake serves
+// it once the session's ICE connects, within its NAT fail timeout, seconds after minting.
+const mintTTL = 5 * time.Minute
 
 // New makes an exit, off and with no routers, and its certificate, which it keeps for its life.
 func New(ctx context.Context, lg logger.ContextLogger) (*Exit, error) {
@@ -186,6 +194,7 @@ func (e *Exit) updateRevokedLocked() {
 		default:
 			if !servable {
 				close(ks.revoked)
+				ks.minted = nil
 			}
 		}
 	}
@@ -205,18 +214,37 @@ func (e *Exit) ready(kind Kind) bool {
 // after the fact. A set emptied between this check and the routing still passes the one stream
 // being routed; that window is the residue of checking at the point of use.
 func (e *Exit) currentRouter(kind Kind) adapter.ConnectionRouterEx {
-	e.mu.Lock()
-	ks := e.kinds[kind]
-	usable := !e.closed && e.enabled && ks.router != nil && e.now().Before(ks.validUntil)
-	e.mu.Unlock()
-	// Outside mu: it takes the rule sets' locks.
-	if !usable || ks.ready == nil || ks.ready() != nil {
-		return nil
+	// A router set while the check ran is checked in turn, a few times at most.
+	for range 3 {
+		e.mu.Lock()
+		ks := e.kinds[kind]
+		usable := !e.closed && e.enabled && ks.router != nil && e.now().Before(ks.validUntil)
+		e.mu.Unlock()
+		// Outside mu: it takes the rule sets' locks.
+		if !usable || ks.ready == nil || ks.ready() != nil {
+			return nil
+		}
+		// The kind may have changed while the check ran.
+		e.mu.Lock()
+		cur := e.kinds[kind]
+		still := !e.closed && e.enabled && e.now().Before(cur.validUntil)
+		e.mu.Unlock()
+		switch {
+		case cur.gen != ks.gen:
+			continue
+		case !still:
+			return nil
+		}
+		return ks.router
 	}
-	return ks.router
+	return nil
 }
 
+// params mints a session's credentials for kind, recording the password for serve.
 func (e *Exit) params(kind Kind) (pin, password string, ok bool) {
+	e.mu.Lock()
+	revoked := e.kinds[kind].revoked
+	e.mu.Unlock()
 	if !e.ready(kind) {
 		return "", "", false
 	}
@@ -224,17 +252,52 @@ func (e *Exit) params(kind Kind) (pin, password string, ok bool) {
 	if _, err := rand.Read(b); err != nil {
 		return "", "", false
 	}
-	return e.cert.pin, base64.RawURLEncoding.EncodeToString(b), true
+	password = base64.RawURLEncoding.EncodeToString(b)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ks := &e.kinds[kind]
+	// Withdrawn, and perhaps restored, since the check: the password would outlive it.
+	if ks.revoked != revoked || isClosed(revoked) {
+		return "", "", false
+	}
+	now := e.now()
+	for pw, at := range ks.minted {
+		if now.Sub(at) > mintTTL {
+			delete(ks.minted, pw)
+		}
+	}
+	if ks.minted == nil {
+		ks.minted = make(map[string]time.Time)
+	}
+	ks.minted[password] = now
+	return e.cert.pin, password, true
+}
+
+func isClosed(c chan struct{}) bool {
+	select {
+	case <-c:
+		return true
+	default:
+		return false
+	}
 }
 
 // serve is clientcore's Serve hook: one Hysteria2 service for one session's path, routing
-// through kind's router alone. It returns once ctx ends, the path's reads fail, or the kind is
+// through kind's router alone, for a password params minted for kind in its current stretch of
+// serving. It returns once ctx ends, the path's reads fail, or the kind is
 // revoked, having closed the service and conn.
 func (e *Exit) serve(ctx context.Context, conn net.PacketConn, password string, kind Kind) {
 	e.mu.Lock()
-	revoked := e.kinds[kind].revoked
+	ks := &e.kinds[kind]
+	revoked := ks.revoked
+	// Only a password params minted for this kind since it last became servable, once.
+	_, minted := ks.minted[password]
+	delete(ks.minted, password)
 	e.mu.Unlock()
 	defer func() { _ = conn.Close() }()
+	if !minted {
+		return
+	}
 	select {
 	case <-revoked:
 		return

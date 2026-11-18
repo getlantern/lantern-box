@@ -962,8 +962,14 @@ func TestExitNeedsAReadyCheck(t *testing.T) {
 // then current, once the header has arrived, so a header held back while a set empties is
 // refused.
 func TestExitChecksReadinessAfterTheUoTHeader(t *testing.T) {
-	var empty atomic.Bool
+	var empty, armed atomic.Bool
+	// checked is signalled by the ready check the handler runs before handing the stream to
+	// the UoT router, which then waits for the header.
+	checked := make(chan struct{}, 1)
 	ready := func() error {
+		if armed.CompareAndSwap(true, false) {
+			checked <- struct{}{}
+		}
 		if empty.Load() {
 			return errors.New("emptied")
 		}
@@ -986,13 +992,25 @@ func TestExitChecksReadinessAfterTheUoTHeader(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 	// The stream's request goes with the first byte; the rest of the header waits.
+	armed.Store(true)
 	_, err = conn.Write(header.Bytes()[:1])
 	require.NoError(t, err)
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-checked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream never reached the exit's handler")
+	}
 	empty.Store(true)
 	_, err = conn.Write(header.Bytes()[1:])
 	require.NoError(t, err)
-	time.Sleep(300 * time.Millisecond)
+	// The refusal closes the stream.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err = conn.Read(make([]byte, 1))
+	require.Error(t, err)
+	var ne net.Error
+	if errors.As(err, &ne) {
+		require.False(t, ne.Timeout(), "the stream wasn't refused")
+	}
 	assert.Zero(t, r.count(), "a UoT flow whose header came after a set emptied reached the router")
 
 	empty.Store(false)
@@ -1003,4 +1021,65 @@ func TestExitChecksReadinessAfterTheUoTHeader(t *testing.T) {
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return r.count() == 1 }, 5*time.Second, 10*time.Millisecond,
 		"a new UoT flow routes once the set holds rules")
+}
+
+// A password belongs to the kind, and the stretch of serving, it was minted in: a kind that was
+// withdrawn and restored since, or another kind, refuses it.
+func TestExitRefusesAPasswordFromBeforeAWithdrawal(t *testing.T) {
+	r := newEchoRouter(t)
+	e := newTestExit(t)
+	e.SetEnabled(true)
+	e.SetRouter(Pool, r, time.Now().Add(time.Hour), alwaysReady)
+	e.SetRouter(Personal, r, time.Now().Add(time.Hour), alwaysReady)
+	_, stale, ok := e.Options().Params(false)
+	require.True(t, ok)
+	_, personal, ok := e.Options().Params(true)
+	require.True(t, ok)
+	e.SetRouter(Pool, nil, time.Time{}, nil)
+	e.SetRouter(Pool, r, time.Now().Add(time.Hour), alwaysReady)
+
+	for name, tc := range map[string]struct {
+		password string
+		kind     Kind
+	}{
+		"minted before a withdrawal": {stale, Pool},
+		"minted for the other kind":  {personal, Pool},
+		"never minted":               {"made-up", Pool},
+	} {
+		t.Run(name, func(t *testing.T) {
+			vConn, _ := pathPair(t)
+			done := serveKind(t, e, vConn, tc.password, tc.kind)
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("serve took a password the kind didn't mint for it")
+			}
+		})
+	}
+
+	// A fresh password, minted now, serves.
+	vConn, uConn := pathPair(t)
+	pin, password, _ := e.Options().Params(false)
+	serve(t, e, vConn, password)
+	echo(t, testClient(t, uConn, pin, password))
+}
+
+// The exit checks the kind's state again once the ready check returns, outside its lock, and
+// routes nothing if the kind changed meanwhile.
+func TestExitRechecksAfterTheReadyCheck(t *testing.T) {
+	e := newTestExit(t)
+	e.SetEnabled(true)
+	var during func()
+	ready := func() error {
+		if during != nil {
+			during()
+		}
+		return nil
+	}
+	e.SetRouter(Pool, &dialRouter{}, time.Now().Add(time.Hour), ready)
+	during = func() { e.SetEnabled(false) }
+	assert.Nil(t, e.currentRouter(Pool), "the exit was turned off during the check")
+	e.SetEnabled(true)
+	during = func() { e.SetRouter(Pool, nil, time.Time{}, nil) }
+	assert.Nil(t, e.currentRouter(Pool), "the router was cleared during the check")
 }
