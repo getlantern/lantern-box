@@ -497,12 +497,16 @@ func (o *Outbound) HelperPath() (lbAdapter.HelperPathStatus, bool) {
 // and route dials have no deadline: a url-test group that picked this
 // outbound would hang instead of trying its other members. A pool consumer
 // keeps waiting, since the pool eventually provides a peer.
+//
+// A direct exit slot doesn't count: it carries no QUIC, so broflake's
+// no-path guard ignores it too, and a dial gets here only once dialExit
+// found no live exit path. HelperPath still counts it as connected.
 func (o *Outbound) checkHelperConnected() error {
 	if !o.rtcOpt.ConsumerRoomsOnly || o.consumerSlots == nil {
 		return nil
 	}
 	for _, slot := range o.consumerSlots() {
-		if slot.Connected {
+		if slot.Connected && !slot.DirectExit {
 			return nil
 		}
 	}
