@@ -303,12 +303,12 @@ func (l *hedgeLeg) settleLocked(v hedgeVerdict, why any) {
 	}
 }
 
-// staticResetOutcomeLocked returns the outcome of a reset on First that no
-// move follows: after the commit, on an opening whose copy overflowed or
-// that isn't a handshake, so can't be replayed, or on one still too short
-// to tell (reset_unmoved; it isn't known to be unreplayable). It returns ""
-// for a replayable opening, whose move records its own outcome. Caller
-// holds mu.
+// staticResetOutcomeLocked returns the outcome of a reset on First that
+// can't move now: after the commit, on an opening whose copy overflowed or
+// that isn't a handshake, or on one still too short to tell
+// (reset_undecided; if the rest of a handshake arrives, a later move
+// records its own outcome). It returns "" for a replayable opening, whose
+// move records its own outcome. Caller holds mu.
 func (l *hedgeLeg) staticResetOutcomeLocked() string {
 	switch {
 	case l.committed:
@@ -318,7 +318,7 @@ func (l *hedgeLeg) staticResetOutcomeLocked() string {
 	case l.noReplay:
 		return hedgeOutcomeResetNotReplayable
 	case l.undecidedKept:
-		return hedgeOutcomeResetUnmoved
+		return hedgeOutcomeResetUndecided
 	}
 	return ""
 }
@@ -355,8 +355,8 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 		l.mu.Unlock()
 		return false
 	}
-	if notReplayable := l.noReplay || l.undecidedKept; notReplayable || l.overflow {
-		slowOnly := notReplayable && why == lAdapter.UserFailureNoResponse
+	if unreplayableNow := l.noReplay || l.undecidedKept; unreplayableNow || l.overflow {
+		slowOnly := unreplayableNow && why == lAdapter.UserFailureNoResponse
 		if !slowOnly {
 			l.stats.set("", l.staticResetOutcomeLocked())
 			l.settleLocked(hedgeBad, why)

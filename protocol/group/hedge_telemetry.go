@@ -62,11 +62,13 @@ const (
 	hedgeOutcomeStalledAfterCommit = "stalled_after_commit"
 	hedgeOutcomeResetAfterCommit   = "reset_after_commit"
 	hedgeOutcomeResetNotReplayable = "reset_not_replayable"
-	// hedgeOutcomeResetUnmoved is a connection First reset that didn't move:
-	// the client closed before the move started, a reply already on its way
-	// committed it, or its opening was still too short to tell whether it
-	// could be replayed.
+	// hedgeOutcomeResetUnmoved is a replayable connection First reset that
+	// didn't move: the client closed before the move started, or a reply
+	// already on its way committed it.
 	hedgeOutcomeResetUnmoved = "reset_unmoved"
+	// hedgeOutcomeResetUndecided is a connection First reset while its
+	// opening was too short to tell whether it could be replayed.
+	hedgeOutcomeResetUndecided = "reset_undecided"
 	// hedgeOutcomeMoveFailed is a connection whose move to Then failed: Then
 	// couldn't be dialed or didn't take the replayed opening.
 	hedgeOutcomeMoveFailed = "move_failed"

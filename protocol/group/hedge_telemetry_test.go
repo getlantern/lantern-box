@@ -389,23 +389,30 @@ func TestHedgeEventsBetweenCloseAndRecordChangeNothing(t *testing.T) {
 	}
 }
 
-// A reset on an opening not yet long enough to classify isn't recorded as
-// not replayable: it may still become a handshake and move.
+// A reset on an opening not yet long enough to classify is labelled
+// reset_undecided, whether noteReset or firstFailed's move records it.
 func TestHedgeResetOnAnUndecidedOpening(t *testing.T) {
-	reader := recordMetrics(t)
-	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")},
-		func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) })
-	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
-	require.NoError(t, err)
-	_, err = c.Write([]byte("\x16"))
-	require.NoError(t, err)
-	s := c.(*hedgeStream)
-	s.noteReset()
-	s.firstFailed(lAdapter.UserFailureReset, s.move) // and its handling, before the close
-	c.Close()
-	require.Equal(t, hedgeOutcomeResetUnmoved, connectionRecord(t, reader)["hedge.outcome"],
-		"the same label whether or not the handling ran before the close")
-	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
+	for _, tc := range []struct {
+		name  string
+		event func(s *hedgeStream)
+	}{
+		{"noted", func(s *hedgeStream) { s.noteReset() }},
+		{"handled", func(s *hedgeStream) { s.firstFailed(lAdapter.UserFailureReset, s.move) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := recordMetrics(t)
+			f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")},
+				func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) })
+			c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+			require.NoError(t, err)
+			_, err = c.Write([]byte("\x16"))
+			require.NoError(t, err)
+			tc.event(c.(*hedgeStream))
+			c.Close()
+			require.Equal(t, hedgeOutcomeResetUndecided, connectionRecord(t, reader)["hedge.outcome"])
+			require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
+		})
+	}
 }
 
 // A reset on a replayable opening whose client closes before the move
