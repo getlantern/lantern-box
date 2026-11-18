@@ -386,6 +386,25 @@ func TestExitPathsBackOffAfterRepeatedFailures(t *testing.T) {
 	assert.True(t, p.takeExit())
 }
 
+// Dials that race on one path that fails count one failure: one bad volunteer must not start
+// the back-off on its own.
+func TestExitPathsCountAPathsFailureOnce(t *testing.T) {
+	v := newVolunteerExit(t)
+	p := newTestExitPaths(t)
+	p.onExitPath(v.badPinSession(t).ep)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr("example.com:80"))
+		}()
+	}
+	wg.Wait()
+	assert.Equal(t, 1, p.failureCount())
+	assert.True(t, p.takeExit())
+}
+
 func TestExitPathsKeepAPathAfterADestinationError(t *testing.T) {
 	v := newVolunteerExit(t)
 	v.r.refuse = "refused.example.com:443"

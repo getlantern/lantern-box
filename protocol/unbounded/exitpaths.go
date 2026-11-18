@@ -78,6 +78,8 @@ type exitPath struct {
 	// succeeded is set once the path has carried a dial, which proves its QUIC handshake, pin
 	// and password. After that, an error is the destination's, not the path's.
 	succeeded atomic.Bool
+	// failed is set by the first dial to find the path failed: dials racing on it count it once.
+	failed    atomic.Bool
 	closeOnce sync.Once
 }
 
@@ -231,8 +233,10 @@ func usePath[T any](p *exitPaths, ctx context.Context, f func(*hysteria2.Client)
 		switch {
 		case !path.succeeded.Load():
 			p.drop(path)
-			p.fail()
-			p.logger.DebugContext(ctx, "unbounded direct exit path failed")
+			if path.failed.CompareAndSwap(false, true) {
+				p.fail()
+				p.logger.DebugContext(ctx, "unbounded direct exit path failed")
+			}
 		case path.dead():
 			p.drop(path)
 		default:
