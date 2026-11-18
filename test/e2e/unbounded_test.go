@@ -135,7 +135,7 @@ func TestUnboundedE2E(t *testing.T) {
 // asynchronously once the consumer comes online.
 //
 // Each configure func adjusts the widget's options before it starts.
-func startWidget(t *testing.T, ctx context.Context, freddieURL, egressURL string,
+func startWidget(t testing.TB, ctx context.Context, freddieURL, egressURL string,
 	configure ...func(*UBClientcore.BroflakeOptions, *UBClientcore.WebRTCOptions)) {
 	t.Helper()
 
@@ -196,7 +196,7 @@ func startConsumers(t *testing.T, ctx context.Context, freddieURL, egressURL str
 
 // startConsumersWith is startConsumers with configure, if not nil, adjusting each
 // outbound's options before the box starts.
-func startConsumersWith(t *testing.T, ctx context.Context, freddieURL, egressURL string, tags []string,
+func startConsumersWith(t testing.TB, ctx context.Context, freddieURL, egressURL string, tags []string,
 	configure func(*lbOption.UnboundedOutboundOptions), roomTickets ...string) map[string]string {
 	t.Helper()
 
@@ -273,7 +273,7 @@ func startConsumersWith(t *testing.T, ctx context.Context, freddieURL, egressURL
 
 // waitForHTTP polls the given URL until it returns any response (even an
 // error status) or the deadline passes. Used as a readiness gate for freddie.
-func waitForHTTP(t *testing.T, target string, timeout time.Duration) {
+func waitForHTTP(t testing.TB, target string, timeout time.Duration) {
 	t.Helper()
 	client := &http.Client{Timeout: 1 * time.Second}
 	deadline := time.Now().Add(timeout)
@@ -410,7 +410,7 @@ func startEgress(t *testing.T, ctx context.Context) string {
 
 // startCountingEgress is startEgress, with dials, if not nil, counting the
 // SOCKS5 server's dials out: one per proxied connection the egress carried.
-func startCountingEgress(t *testing.T, ctx context.Context, dials *atomic.Int64) string {
+func startCountingEgress(t testing.TB, ctx context.Context, dials *atomic.Int64) string {
 	t.Helper()
 	egL, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err, "listen for egress")
@@ -452,7 +452,7 @@ func proxiedGetOK(proxyAddr, target string, timeout time.Duration) bool {
 
 // requireProxies fails unless a request through proxyAddr reaches target
 // within the deadline: matchmaking, ICE, DTLS, QUIC and SOCKS5 all take time.
-func requireProxies(t *testing.T, proxyAddr, target string, within time.Duration) {
+func requireProxies(t testing.TB, proxyAddr, target string, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {

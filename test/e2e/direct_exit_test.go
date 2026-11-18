@@ -163,9 +163,11 @@ func TestDirectExitFallsBackToEgress(t *testing.T) {
 }
 
 // directExitCase is what a direct exit rig sets up: whether the volunteer's exit is enabled
-// and has an exit box (a registration), and whether the consumer takes direct exits.
+// and has an exit box (a registration), and whether the consumer takes direct exits. widget,
+// if not nil, adjusts the widget's WebRTC options, its Exit already set, before it starts.
 type directExitCase struct {
 	enabled, router, consumerDirectExit bool
+	widget                              func(*UBClientcore.WebRTCOptions)
 }
 
 // directExitRig is a running freddie, egress, volunteer widget with an exit, and consumer.
@@ -180,7 +182,7 @@ type directExitRig struct {
 	router *countingRouter
 }
 
-func startDirectExitRig(t *testing.T, c directExitCase) *directExitRig {
+func startDirectExitRig(t testing.TB, c directExitCase) *directExitRig {
 	t.Helper()
 	UBCommon.SetDebugLogger(stdlog.New(io.Discard, "", 0))
 	ctx, cancel := context.WithCancel(context.Background())
@@ -219,6 +221,9 @@ func startDirectExitRig(t *testing.T, c directExitCase) *directExitRig {
 	}
 	startWidget(t, ctx, freddieURL, egressURL, func(_ *UBClientcore.BroflakeOptions, rtcOpt *UBClientcore.WebRTCOptions) {
 		rtcOpt.Exit = &exitOpts
+		if c.widget != nil {
+			c.widget(rtcOpt)
+		}
 	})
 
 	tag := "unbounded-out"
@@ -233,7 +238,7 @@ func startDirectExitRig(t *testing.T, c directExitCase) *directExitRig {
 
 // startExitBox checks testdata/direct_exit_server.json's abuse rules and starts an exit box
 // from it, in its own service registry as node's exit boxes are, and returns its router.
-func startExitBox(t *testing.T) adapter.ConnectionRouterEx {
+func startExitBox(t testing.TB) adapter.ConnectionRouterEx {
 	t.Helper()
 	raw, err := os.ReadFile("testdata/direct_exit_server.json")
 	require.NoError(t, err)
