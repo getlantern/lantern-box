@@ -125,6 +125,8 @@ type exitRunner struct {
 	// Only the loop's goroutine touches these.
 	boxes    [2]kindBox // by exit.Kind
 	rotation time.Duration
+	// registeredAt is when lantern-cloud last answered a registration.
+	registeredAt time.Time
 	// heldOff is whether OnHoldOff last reported a hold-off, and holdOffUntil its end, before
 	// which Reregister waits.
 	heldOff      bool
@@ -199,7 +201,8 @@ func newExitRunner(cfg ExitConfig) (*exitRunner, error) {
 	}, nil
 }
 
-// loop registers and launches, then waits a rotation, or backs off after a failure. It
+// loop registers and launches, then waits until a rotation after the registration, or backs off
+// after a failure. It
 // returns once ctx ends, with the router cleared and the box closed.
 func (r *exitRunner) loop(ctx context.Context) error {
 	defer r.close()
@@ -222,7 +225,9 @@ func (r *exitRunner) loop(ctx context.Context) error {
 			}
 			logExitFailure(err, wait)
 		} else {
-			wait = r.rotation
+			// The next registration is due a rotation after this one, however long its boxes
+			// took to start, so they're renewed before their two rotations run out.
+			wait = max(time.Until(r.registeredAt.Add(r.rotation)), 0)
 			retry = r.minRetry
 		}
 		if !r.wait(ctx, wait) {
@@ -255,6 +260,7 @@ func (r *exitRunner) refresh(ctx context.Context) error {
 	}
 	// The registration lasts from lantern-cloud's answer, however long its boxes take to start.
 	registeredAt := time.Now()
+	r.registeredAt = registeredAt
 	// lantern-cloud answered, so a hold-off it asked for is over, whatever the configs hold.
 	if r.heldOff {
 		r.holdOff(time.Time{})

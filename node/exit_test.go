@@ -935,6 +935,39 @@ func TestRunExitWithdrawsABoxItCanNoLongerMark(t *testing.T) {
 	waitDone(t, done)
 }
 
+// The next registration is due a rotation after the last one, not a rotation after its boxes
+// finished starting, so a startup slower than a rotation still renews them before they expire.
+func TestRunExitRenewsOnTimeAfterASlowStart(t *testing.T) {
+	var registers atomic.Int32
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		registers.Add(1)
+		writeJSON(w, map[string]any{"server_config": validExitConfig})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	boxes := &fakeExitBoxes{ev: ev}
+	const rotation = 200 * time.Millisecond
+	slow := func(ctx context.Context, options string) (ExitBox, error) {
+		time.Sleep(rotation * 3 / 2)
+		return boxes.new(ctx, options)
+	}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: slow, RotationInterval: rotation}, ev)
+	o := e.Options()
+	require.Eventually(t, func() bool { return o.Ready(false) }, 5*time.Second, time.Millisecond)
+	until := time.Now().Add(4 * rotation)
+	for time.Now().Before(until) {
+		require.True(t, o.Ready(false), "the box expired before its renewal")
+		time.Sleep(2 * time.Millisecond)
+	}
+	assert.GreaterOrEqual(t, registers.Load(), int32(4), "renewed every rotation")
+	assert.Len(t, boxes.all(), 1, "an unchanged config is renewed, not rebuilt")
+	cancel()
+	waitDone(t, done)
+}
+
 // holdOffs records what RunExit reports through OnHoldOff.
 type holdOffs struct {
 	mu    sync.Mutex
