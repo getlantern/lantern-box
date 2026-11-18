@@ -1200,3 +1200,79 @@ func TestHedgeCommitTimeoutBoundsABlockedWrite(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "then:"+tlsRecord("hello"), string(buf[:n]))
 }
+
+func TestHedgeFailedHalfCloseOnThenFailsTheMove(t *testing.T) {
+	first := &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn { return &halfCloser{Conn: c} }}
+	f := newHedgeFixture(t, first, &fakeOutbound{stream: answer("then:")}, nil) // Then can't half-close
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte(tlsRecord("request")))
+	require.NoError(t, err)
+	require.NoError(t, c.(N.WriteCloser).CloseWrite())
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = c.Read(make([]byte, 64))
+	require.ErrorIs(t, err, errors.ErrUnsupported,
+		"a Then that can't repeat the client's half-close must fail the move, not hide the EOF")
+}
+
+func TestHedgeRearmsCommitTimeoutOnceAPrefixClassifies(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	record := tlsRecord("client-hello")
+	_, err = c.Write([]byte(record[:1]))
+	require.NoError(t, err)
+	time.Sleep(250 * time.Millisecond) // the first commit timeout expires while undecided
+	_, err = c.Write([]byte(record[1:]))
+	require.NoError(t, err)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	require.NoError(t, err, "a connection that became replayable must get a fresh commit timeout")
+	require.Equal(t, "then:"+record, string(buf[:n]))
+}
+
+// deadlineRecorder records the last read deadline set on it.
+type deadlineRecorder struct {
+	net.Conn
+	mu   sync.Mutex
+	last time.Time
+}
+
+func (d *deadlineRecorder) SetReadDeadline(t time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.last = t
+	return d.Conn.SetReadDeadline(t)
+}
+
+func TestHedgeConcurrentDeadlineSettersAgree(t *testing.T) {
+	var rec *deadlineRecorder
+	first := &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn { rec = &deadlineRecorder{Conn: c}; return rec }}
+	f := newHedgeFixture(t, first, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	s := c.(*hedgeStream)
+	base := time.Now().Add(time.Hour)
+	for round := range 50 {
+		var wg sync.WaitGroup
+		for i := range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_ = c.SetReadDeadline(base.Add(time.Duration(round*8+i) * time.Millisecond))
+			}()
+		}
+		wg.Wait()
+		s.mu.Lock()
+		stored := s.readDeadline
+		s.mu.Unlock()
+		rec.mu.Lock()
+		applied := rec.last
+		rec.mu.Unlock()
+		require.True(t, stored.Equal(applied), "round %d: stored %v but First holds %v", round, stored, applied)
+	}
+}

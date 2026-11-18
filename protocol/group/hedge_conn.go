@@ -59,9 +59,14 @@ type hedgeLeg struct {
 	noReplay      bool
 	overflow      bool
 	undecidedKept bool
-	// commitTimer is the commit timeout, armed before the first write.
+	// commitTimer is the commit timeout, armed before the first write;
+	// commitFired records that it expired.
 	commitTimer *time.Timer
-	moveErr     error // why the move to Then failed
+	commitFired bool
+	// deadlineMu orders deadline setters, so the deadline a leg holds is the
+	// last one stored. It is never held while waiting on I/O.
+	deadlineMu sync.Mutex
+	moveErr    error // why the move to Then failed
 	// moveCtx is what Then is dialed with (see moveContext). cancel ends
 	// it, when the move fails or the connection closes, never after a
 	// successful move.
@@ -136,12 +141,25 @@ func (l *hedgeLeg) armCommitLocked(n int, move func(lAdapter.UserFailureKind)) {
 	}
 	l.commitTimer = time.AfterFunc(l.h.cfg.commitTimeout, func() {
 		l.mu.Lock()
+		l.commitFired = true
 		waiting := l.tentativeLocked() && !l.moving
 		l.mu.Unlock()
 		if waiting {
 			move(lAdapter.UserFailureNoResponse)
 		}
 	})
+}
+
+// rearmCommitLocked gives a fresh commit timeout to a connection whose
+// first one expired while its opening was too short to classify, and which
+// has since turned out replayable: that expiry was ignored, and without a
+// new one a silent First would hold it forever. Caller holds mu.
+func (l *hedgeLeg) rearmCommitLocked(move func(lAdapter.UserFailureKind)) {
+	if !l.commitFired || !l.decided || l.noReplay || l.moving || !l.tentativeLocked() {
+		return
+	}
+	l.commitTimer, l.commitFired = nil, false
+	l.armCommitLocked(1, move)
 }
 
 func (l *hedgeLeg) stopCommitLocked() {
@@ -405,6 +423,17 @@ func (s *hedgeStream) runMove() {
 				err = os.ErrDeadlineExceeded
 			}
 		}
+		// Repeat the client's half-close. CloseWrite waits out a move, so
+		// writeClosed can't change now. Then failing to half-close fails
+		// the move: the server would otherwise never see the client's EOF.
+		if err == nil {
+			s.mu.Lock()
+			writeClosed := s.writeClosed
+			s.mu.Unlock()
+			if writeClosed {
+				err = closeWrite(conn)
+			}
+		}
 		if err != nil {
 			conn.Close()
 		}
@@ -419,9 +448,6 @@ func (s *hedgeStream) runMove() {
 		err = net.ErrClosed
 	default:
 		s.cur = conn
-		if s.writeClosed {
-			_ = closeWrite(conn)
-		}
 	}
 	s.held = nil
 	s.finishMoveLocked(err)
@@ -505,6 +531,7 @@ func (s *hedgeStream) Write(p []byte) (int, error) {
 		}
 		s.armCommitLocked(len(p), s.move)
 		kept := s.keepLocked(p, s.held, opensTLS, 3, len(s.held)+len(p) <= s.h.cfg.maxHeldBytes)
+		s.rearmCommitLocked(s.move)
 		if kept {
 			s.held = append(s.held, p...)
 		} else if s.overflow || s.noReplay {
@@ -593,6 +620,8 @@ func (s *hedgeStream) RemoteAddr() net.Addr {
 }
 
 func (s *hedgeStream) SetDeadline(t time.Time) error {
+	s.deadlineMu.Lock()
+	defer s.deadlineMu.Unlock()
 	if s.setDeadlines(&t, &t) {
 		return nil
 	}
@@ -600,6 +629,8 @@ func (s *hedgeStream) SetDeadline(t time.Time) error {
 }
 
 func (s *hedgeStream) SetReadDeadline(t time.Time) error {
+	s.deadlineMu.Lock()
+	defer s.deadlineMu.Unlock()
 	if s.setDeadlines(&t, nil) {
 		return nil
 	}
@@ -607,6 +638,8 @@ func (s *hedgeStream) SetReadDeadline(t time.Time) error {
 }
 
 func (s *hedgeStream) SetWriteDeadline(t time.Time) error {
+	s.deadlineMu.Lock()
+	defer s.deadlineMu.Unlock()
 	if s.setDeadlines(nil, &t) {
 		return nil
 	}
@@ -904,6 +937,7 @@ func (p *hedgePacket) write(b []byte, dest M.Socksaddr) error {
 		fits := len(p.held) < hedgeMaxHeldPackets && p.heldBytes+len(b) <= p.h.cfg.maxHeldBytes
 		p.armCommitLocked(len(b), p.move)
 		kept := p.keepLocked(b, nil, opensQUIC, 1, fits)
+		p.rearmCommitLocked(p.move)
 		if kept {
 			p.held = append(p.held, heldPacket{data: append([]byte(nil), b...), dest: dest})
 			p.heldBytes += len(b)
@@ -968,6 +1002,8 @@ func (p *hedgePacket) LocalAddr() net.Addr {
 }
 
 func (p *hedgePacket) SetDeadline(t time.Time) error {
+	p.deadlineMu.Lock()
+	defer p.deadlineMu.Unlock()
 	if p.setDeadlines(&t, &t) {
 		return nil
 	}
@@ -975,6 +1011,8 @@ func (p *hedgePacket) SetDeadline(t time.Time) error {
 }
 
 func (p *hedgePacket) SetReadDeadline(t time.Time) error {
+	p.deadlineMu.Lock()
+	defer p.deadlineMu.Unlock()
 	if p.setDeadlines(&t, nil) {
 		return nil
 	}
@@ -982,6 +1020,8 @@ func (p *hedgePacket) SetReadDeadline(t time.Time) error {
 }
 
 func (p *hedgePacket) SetWriteDeadline(t time.Time) error {
+	p.deadlineMu.Lock()
+	defer p.deadlineMu.Unlock()
 	if p.setDeadlines(nil, &t) {
 		return nil
 	}
