@@ -54,6 +54,9 @@ type hedgeLeg struct {
 	// decided and written under mu (settleLocked): unset, good on First's
 	// first reply, bad on any failure of First. Bad is final.
 	verdict hedgeVerdict
+	// struck is set once a reset after the commit counted against the site
+	// (failedAfterCommitLocked).
+	struck bool
 	// decided is set once enough bytes have been written, across writes, to
 	// tell whether the connection can be replayed (see keepLocked); until
 	// then undecidedKept marks a kept prefix that must not be replayed.
@@ -276,6 +279,11 @@ func (l *hedgeLeg) noteReset() {
 	if !l.onFirst || l.moving {
 		return
 	}
+	if l.committed {
+		// A strike, not a block (failedAfterCommitLocked).
+		l.failedAfterCommitLocked(lAdapter.UserFailureReset)
+		return
+	}
 	if outcome := l.staticResetOutcomeLocked(); outcome != "" {
 		l.stats.set("", outcome)
 	} else {
@@ -330,18 +338,45 @@ func (l *hedgeLeg) staticResetOutcomeLocked() string {
 func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter.UserFailureKind)) {
 	l.mu.Lock()
 	if l.committed {
-		outcome := hedgeOutcomeResetAfterCommit
-		if kind == lAdapter.UserFailureStall {
-			outcome = hedgeOutcomeStalledAfterCommit
-		}
-		// A reset recorded before the commit keeps its outcome.
-		l.stats.replaceOutcome(hedgeOutcomeCommitted, outcome)
-		l.settleLocked(hedgeBad, kind)
+		l.failedAfterCommitLocked(kind)
 		l.mu.Unlock()
 		return
 	}
 	l.mu.Unlock()
 	move(kind)
+}
+
+// failedAfterCommitLocked handles First failing after it replied. A stall
+// marks the site bad. A reset is one strike against it, at most one per
+// connection: hedgeResetStrikes of them, with no clean connection between,
+// mark it bad, since a lone reset after a reply is usually teardown. Caller
+// holds mu.
+func (l *hedgeLeg) failedAfterCommitLocked(why lAdapter.UserFailureKind) {
+	if l.closed {
+		return
+	}
+	// Recorded on every strike, so telemetry shows how often a reset after
+	// a reply comes before a real block. A reset recorded before the
+	// commit keeps its outcome.
+	outcome := hedgeOutcomeResetAfterCommit
+	if why == lAdapter.UserFailureStall {
+		outcome = hedgeOutcomeStalledAfterCommit
+	}
+	l.stats.replaceOutcome(hedgeOutcomeCommitted, outcome)
+	if l.verdict == hedgeBad {
+		return
+	}
+	if why != lAdapter.UserFailureReset {
+		l.settleLocked(hedgeBad, why)
+		return
+	}
+	if l.struck {
+		return
+	}
+	l.struck = true
+	if l.h.cache.strike(l.key, l.h.cfg.failureTTL) {
+		l.settleLocked(hedgeBad, why)
+	}
 }
 
 // beginMove claims the move. It returns false when the connection already
@@ -356,12 +391,7 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 		// A failure that saw the connection uncommitted, then lost the race
 		// to a reply: it's a failure after the commit, as firstFailed
 		// would have handled it.
-		outcome := hedgeOutcomeResetAfterCommit
-		if why == lAdapter.UserFailureStall {
-			outcome = hedgeOutcomeStalledAfterCommit
-		}
-		l.stats.replaceOutcome(hedgeOutcomeCommitted, outcome)
-		l.settleLocked(hedgeBad, why)
+		l.failedAfterCommitLocked(why)
 	}
 	if l.moving || !l.onFirst || l.committed || l.closed {
 		l.mu.Unlock()
@@ -451,6 +481,11 @@ func (l *hedgeLeg) finishMoveLocked(err error) {
 // closeLocked marks the connection closed and returns what must be closed
 // with it. Caller holds mu.
 func (l *hedgeLeg) closeLocked() (cancel context.CancelFunc, pending io.Closer) {
+	if !l.closed && l.verdict == hedgeGood && !l.struck {
+		// First replied and nothing failed: the site's earlier strikes
+		// were teardown, not blocking.
+		l.h.cache.clearStrikes(l.key)
+	}
 	l.closed = true
 	// Under mu with closed, so nothing noted after the close changes the
 	// record (see settleLocked for the cache).

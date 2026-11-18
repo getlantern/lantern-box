@@ -19,6 +19,13 @@ import (
 // this learns it without paying the commit timeout once per name.
 const hedgePrefixBadSites = 2
 
+// hedgeResetStrikes is how many connections to a site must each be reset
+// after First replied, with no connection closing cleanly in between, before
+// the site counts as failing on First. One such reset is usually teardown (a
+// server or load balancer closing with unread data); censorship that resets
+// after a reply does it to every connection.
+const hedgeResetStrikes = 2
+
 // hedgeMaxEntries bounds the cache; past it, expired entries are dropped,
 // then arbitrary ones.
 const hedgeMaxEntries = 4096
@@ -107,6 +114,11 @@ type hedgeEntry struct {
 	expires time.Time
 }
 
+type hedgeStrikes struct {
+	count   int
+	expires time.Time
+}
+
 // hedgeCache remembers which sites First worked for. One cache is shared by
 // every hedge in a box, since whether a site needs a proxy depends on the site
 // and the network, not on which hedge asked.
@@ -119,6 +131,9 @@ type hedgeCache struct {
 	// badSites holds, per address block, the sites in it that failed on
 	// First and when each failure expires.
 	badSites map[hedgePrefixKey]map[string]time.Time
+	// strikes counts, per site, connections reset after First replied
+	// (hedgeResetStrikes).
+	strikes map[hedgeSiteKey]hedgeStrikes
 }
 
 func newHedgeCache() *hedgeCache {
@@ -126,6 +141,7 @@ func newHedgeCache() *hedgeCache {
 		now:      time.Now,
 		sites:    map[hedgeSiteKey]hedgeEntry{},
 		badSites: map[hedgePrefixKey]map[string]time.Time{},
+		strikes:  map[hedgeSiteKey]hedgeStrikes{},
 	}
 }
 
@@ -272,4 +288,51 @@ func (c *hedgeCache) clear() {
 	c.gen++
 	c.sites = map[hedgeSiteKey]hedgeEntry{}
 	c.badSites = map[hedgePrefixKey]map[string]time.Time{}
+	c.strikes = map[hedgeSiteKey]hedgeStrikes{}
+}
+
+// strike records a connection to k's site reset after First replied, and
+// reports whether that makes hedgeResetStrikes within window, when the site
+// should be marked bad. The count then starts over.
+func (c *hedgeCache) strike(k hedgeKey, window time.Duration) bool {
+	if k.site == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if k.gen != c.gen {
+		return false
+	}
+	now := c.now()
+	sk := hedgeSiteKey{k.site, k.network}
+	s := c.strikes[sk]
+	if !now.Before(s.expires) {
+		s = hedgeStrikes{}
+	}
+	s.count++
+	if s.count >= hedgeResetStrikes {
+		delete(c.strikes, sk)
+		return true
+	}
+	s.expires = now.Add(window)
+	c.strikes[sk] = s
+	if len(c.strikes) > hedgeMaxEntries {
+		for k, s := range c.strikes {
+			if !now.Before(s.expires) || len(c.strikes) > hedgeMaxEntries {
+				delete(c.strikes, k)
+			}
+		}
+	}
+	return false
+}
+
+// clearStrikes forgets k's site's strikes: a connection to it closed cleanly
+// after First replied.
+func (c *hedgeCache) clearStrikes(k hedgeKey) {
+	if k.site == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.strikes, hedgeSiteKey{k.site, k.network})
 }

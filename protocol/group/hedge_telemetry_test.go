@@ -292,7 +292,7 @@ func TestHedgeTelemetryResetNotedBeforeItIsHandled(t *testing.T) {
 			c.(*hedgeStream).noteReset() // as the watchdog does, before firstFailed runs
 			c.Close()
 			require.Equal(t, tc.outcome, connectionRecord(t, reader)["hedge.outcome"])
-			require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()),
+			require.Equal(t, wantVerdict(tc.outcome), f.verdict(hedgeDest.String()),
 				"the site is marked bad though the client closed before firstFailed ran")
 		})
 	}
@@ -689,5 +689,30 @@ func TestHedgeTelemetryFailureLosingToACommit(t *testing.T) {
 	s.beginMove(lAdapter.UserFailureReset, func() error { return nil })
 	c.Close()
 	require.Equal(t, hedgeOutcomeResetAfterCommit, connectionRecord(t, reader)["hedge.outcome"])
-	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
+	require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()), "recorded, but one reset after a reply is only a strike")
+}
+
+// wantVerdict is the site's verdict after one reset with outcome: a reset
+// after a reply is only a strike (hedgeResetStrikes), any other marks it bad.
+func wantVerdict(outcome string) hedgeVerdict {
+	if outcome == hedgeOutcomeResetAfterCommit {
+		return hedgeGood
+	}
+	return hedgeBad
+}
+
+// The watchdog's synchronous reset note goes through the strikes too: the
+// first reset after a reply records it but leaves the site good, the second
+// connection's marks it bad.
+func TestHedgeNotedResetsAfterAReplyTakeTwoStrikes(t *testing.T) {
+	recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	for i, want := range []hedgeVerdict{hedgeGood, hedgeBad} {
+		c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+		require.NoError(t, err)
+		require.Equal(t, "first:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+		c.(*hedgeStream).noteReset()
+		c.Close()
+		require.Equal(t, want, f.verdict(hedgeDest.String()), "after connection %d", i+1)
+	}
 }
