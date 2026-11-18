@@ -109,6 +109,16 @@ type echoRouter struct {
 	echo   string
 	refuse string
 	routed atomic.Int32
+
+	mu    sync.Mutex
+	dests []string
+}
+
+// destinations returns the destinations routed so far, in order.
+func (r *echoRouter) destinations() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.dests)
 }
 
 func (r *echoRouter) RouteConnection(context.Context, net.Conn, adapter.InboundContext) error {
@@ -121,6 +131,9 @@ func (r *echoRouter) RoutePacketConnection(context.Context, N.PacketConn, adapte
 
 func (r *echoRouter) RouteConnectionEx(ctx context.Context, conn net.Conn, md adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	r.routed.Add(1)
+	r.mu.Lock()
+	r.dests = append(r.dests, md.Destination.String())
+	r.mu.Unlock()
 	if r.refuse != "" && md.Destination.String() == r.refuse {
 		_ = N.CloseOnHandshakeFailure(conn, onClose, &rule.RejectedError{Cause: errors.New("refused")})
 		return
@@ -291,16 +304,101 @@ func TestExitPathsNoPath(t *testing.T) {
 	p := newTestExitPaths(t)
 	_, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr("example.com:80"))
 	assert.ErrorIs(t, err, errNoExitPath)
-	_, err = p.listenPacket(dialTimeout(t))
+	_, err = p.listenPacket(dialTimeout(t), M.ParseSocksaddr("example.com:53"))
 	assert.ErrorIs(t, err, errNoExitPath)
 	assert.True(t, p.takeExit())
+}
+
+func withDomain(ctx context.Context, domain string) context.Context {
+	return adapter.WithContext(ctx, &adapter.InboundContext{Domain: domain})
+}
+
+// The volunteer's exit admits only allowlisted hostnames and rejects IP literals before DNS,
+// so a TCP dial to an IP names the host sniffed from the connection instead, with the IP's
+// port. Mirrors samizdatreverse's TestReverseSendsSniffedHost.
+func TestExitPathsSendTheSniffedHostForAnIP(t *testing.T) {
+	v := newVolunteerExit(t)
+	p := newTestExitPaths(t)
+	p.onExitPath(v.path(t))
+	for _, tc := range []struct {
+		name, domain, dest, want string
+	}{
+		{"sniffed host for an IPv4", "example.com", "10.11.12.13:443", "example.com:443"},
+		{"sniffed host for an IPv6", "example.com", "[2001:db8::1]:8443", "example.com:8443"},
+		{"no sniffed host", "", "10.11.12.13:443", "10.11.12.13:443"},
+		{"sniffed text that is no domain", "not a domain", "10.11.12.13:443", "10.11.12.13:443"},
+		{"a domain destination kept", "other.example.com", "example.com:443", "example.com:443"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := p.dial(withDomain(dialTimeout(t), tc.domain), "tcp", M.ParseSocksaddr(tc.dest))
+			require.NoError(t, err)
+			echoes(t, conn)
+			dests := v.r.destinations()
+			require.NotEmpty(t, dests)
+			assert.Equal(t, tc.want, dests[len(dests)-1])
+		})
+	}
+}
+
+// QUIC to an IP carries no hostname the exit's allowlist can admit, so it goes to a black hole
+// rather than failing: the browser falls back to TCP, which carries the sniffed host, and the
+// group doesn't count a policy decision as the outbound's failure. Mirrors samizdatreverse's
+// TestReverseBlackHolesQUIC.
+func TestExitPathsBlackHoleQUICToAnIP(t *testing.T) {
+	v := newVolunteerExit(t)
+	p := newTestExitPaths(t)
+	dest := M.ParseSocksaddr("10.11.12.13:443")
+
+	// With no path, today's path carries it.
+	_, err := p.dial(withDomain(dialTimeout(t), "example.com"), "udp", dest)
+	assert.ErrorIs(t, err, errNoExitPath)
+	_, err = p.listenPacket(withDomain(dialTimeout(t), "example.com"), dest)
+	assert.ErrorIs(t, err, errNoExitPath)
+
+	s := v.session(t)
+	p.onExitPath(s.ep)
+	conn, err := p.dial(withDomain(dialTimeout(t), "example.com"), "udp", dest)
+	require.NoError(t, err)
+	defer conn.Close()
+	pc, err := p.listenPacket(dialTimeout(t), dest)
+	require.NoError(t, err)
+	defer pc.Close()
+	assert.Equal(t, dest.String(), conn.RemoteAddr().String())
+	n, err := conn.Write([]byte("initial"))
+	require.NoError(t, err)
+	assert.Equal(t, 7, n)
+	n, err = pc.WriteTo([]byte("initial"), dest.UDPAddr())
+	require.NoError(t, err)
+	assert.Equal(t, 7, n)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(50*time.Millisecond)))
+	_, err = conn.Read(make([]byte, 16))
+	var ne net.Error
+	require.ErrorAs(t, err, &ne)
+	assert.True(t, ne.Timeout())
+
+	// Neither touched the path: it has carried nothing, so no dial proved it.
+	p.mu.Lock()
+	proved := p.paths[0].succeeded.Load()
+	p.mu.Unlock()
+	assert.False(t, proved, "a black-holed dial used the path")
+
+	// QUIC to a hostname, and other UDP to an IP, still go through the path.
+	for _, d := range []string{"example.com:443", "10.11.12.13:53"} {
+		conn, err := p.dial(dialTimeout(t), "udp", M.ParseSocksaddr(d))
+		require.NoError(t, err)
+		_ = conn.Close()
+	}
+	p.mu.Lock()
+	proved = p.paths[0].succeeded.Load()
+	p.mu.Unlock()
+	assert.True(t, proved)
 }
 
 func TestExitPathsListenPacket(t *testing.T) {
 	v := newVolunteerExit(t)
 	p := newTestExitPaths(t)
 	p.onExitPath(v.path(t))
-	pc, err := p.listenPacket(dialTimeout(t))
+	pc, err := p.listenPacket(dialTimeout(t), M.ParseSocksaddr("example.com:53"))
 	require.NoError(t, err)
 	_ = pc.Close()
 	conn, err := p.dial(dialTimeout(t), "udp", M.ParseSocksaddr("example.com:53"))

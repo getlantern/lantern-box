@@ -21,5 +21,7 @@ func (*exitPaths) takeExit() bool                      { return false }
 func (*exitPaths) dial(context.Context, string, M.Socksaddr) (net.Conn, error) {
 	return nil, errNoExitPath
 }
-func (*exitPaths) listenPacket(context.Context) (net.PacketConn, error) { return nil, errNoExitPath }
-func (*exitPaths) close()                                               {}
+func (*exitPaths) listenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, errNoExitPath
+}
+func (*exitPaths) close() {}

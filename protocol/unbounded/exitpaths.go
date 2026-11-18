@@ -14,6 +14,7 @@ import (
 	"time"
 
 	UBClientcore "github.com/getlantern/broflake/clientcore"
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
 	sblog "github.com/sagernet/sing-box/log"
 	sbOption "github.com/sagernet/sing-box/option"
@@ -29,6 +30,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 
+	"github.com/getlantern/lantern-box/protocol/internal/blackhole"
 	"github.com/getlantern/lantern-box/protocol/internal/quicjunk"
 )
 
@@ -178,14 +180,22 @@ func (p *exitPaths) takeExit() bool {
 }
 
 // dial dials destination through the newest live path. It returns errNoExitPath when there is
-// none.
+// none. TCP to an IP names the host sniffed from the connection instead (sniffedDestination),
+// and QUIC to an IP goes to a black hole (quicToIP).
 func (p *exitPaths) dial(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
+		sent := sniffedDestination(ctx, destination)
 		return usePath(p, ctx, func(c *hysteria2.Client) (net.Conn, error) {
-			return c.DialConn(ctx, destination)
+			return c.DialConn(ctx, sent)
 		})
 	case N.NetworkUDP:
+		if quicToIP(destination) {
+			if p.newest() == nil {
+				return nil, errNoExitPath
+			}
+			return blackhole.New(destination), nil
+		}
 		return usePath(p, ctx, func(c *hysteria2.Client) (net.Conn, error) {
 			pc, err := c.ListenPacket(ctx)
 			if err != nil {
@@ -198,10 +208,42 @@ func (p *exitPaths) dial(ctx context.Context, network string, destination M.Sock
 }
 
 // listenPacket opens a UDP session through the newest live path, or returns errNoExitPath.
-func (p *exitPaths) listenPacket(ctx context.Context) (net.PacketConn, error) {
+// QUIC to an IP goes to a black hole, as in dial.
+func (p *exitPaths) listenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	if quicToIP(destination) {
+		if p.newest() == nil {
+			return nil, errNoExitPath
+		}
+		return blackhole.New(destination), nil
+	}
 	return usePath(p, ctx, func(c *hysteria2.Client) (net.PacketConn, error) {
 		return c.ListenPacket(ctx)
 	})
+}
+
+// sniffedDestination swaps an IP TCP destination for the host sniffed from the connection (TLS
+// SNI or HTTP Host), as sing-box's sniff_override_destination does: the volunteer's exit
+// rejects IP literals before DNS and admits only allowlisted hostnames. A claimed host never
+// unlocks the original IP, since the exit resolves the name itself and dials the address it
+// resolved. Copied from protocol/samizdatreverse.
+func sniffedDestination(ctx context.Context, destination M.Socksaddr) M.Socksaddr {
+	if !destination.IsIP() {
+		return destination
+	}
+	metadata := adapter.ContextFrom(ctx)
+	if metadata == nil || !M.IsDomainName(metadata.Domain) {
+		return destination
+	}
+	return M.Socksaddr{Fqdn: metadata.Domain, Port: destination.Port}
+}
+
+// quicToIP reports whether UDP to destination is QUIC to an IP, which the volunteer's exit
+// refuses: its allowlist grants UDP 443 only to hostnames, and QUIC carries none we can rely
+// on. A black hole, rather than an error, sends the browser back to TCP, which carries the
+// sniffed host, without a group counting a policy decision as the outbound's failure. With no
+// live path the flow takes today's path, which carries IPs.
+func quicToIP(destination M.Socksaddr) bool {
+	return destination.IsIP() && destination.Port == 443
 }
 
 // usePath runs f on the newest live path's client. sing-quic's DialConn and ListenPacket finish

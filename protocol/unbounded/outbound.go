@@ -355,7 +355,7 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	md.Outbound = o.Tag()
 	md.Destination = destination
 
-	if pc, ok, err := o.listenExit(ctx); ok {
+	if pc, ok, err := o.listenExit(ctx, destination); ok {
 		return pc, err
 	}
 	if o.dial == nil {
@@ -408,12 +408,12 @@ func (o *Outbound) dialExit(ctx context.Context, network string, destination M.S
 }
 
 // listenExit is ListenPacket's dialExit.
-func (o *Outbound) listenExit(ctx context.Context) (net.PacketConn, bool, error) {
+func (o *Outbound) listenExit(ctx context.Context, destination M.Socksaddr) (net.PacketConn, bool, error) {
 	if o.exits == nil {
 		return nil, false, nil
 	}
 	started := time.Now()
-	pc, err := o.exits.listenPacket(ctx)
+	pc, err := o.exits.listenPacket(ctx, destination)
 	if errors.Is(err, errNoExitPath) {
 		return nil, false, nil
 	}
