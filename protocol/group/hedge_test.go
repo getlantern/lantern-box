@@ -1660,7 +1660,13 @@ func TestHedgeFailedMoveIsNotATimeout(t *testing.T) {
 // A deadline the caller sets while the move is under way, even one already
 // passed, doesn't fail the replay of writes it took.
 func TestHedgeDeadlineSetDuringTheMoveSparesTheReplay(t *testing.T) {
-	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:"), delay: 300 * time.Millisecond}, nil)
+	// Then reads late, so the replay's write is blocked when the deadline
+	// is set.
+	slowReader := func(c net.Conn) {
+		time.Sleep(300 * time.Millisecond)
+		answer("then:")(c)
+	}
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: slowReader}, nil)
 	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
 	require.NoError(t, err)
 	defer c.Close()
@@ -1671,8 +1677,8 @@ func TestHedgeDeadlineSetDuringTheMoveSparesTheReplay(t *testing.T) {
 	require.Eventually(t, func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.moving
-	}, 2*time.Second, 5*time.Millisecond, "the move never started")
+		return s.pending != nil
+	}, 2*time.Second, 5*time.Millisecond, "the replay never started")
 	require.NoError(t, c.SetWriteDeadline(time.Now().Add(-time.Second))) // already passed
 	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
 	buf := make([]byte, 64)
@@ -1691,4 +1697,15 @@ func TestHedgeCloseDuringTheMoveIsNotAMoveFailure(t *testing.T) {
 	var me *hedgeMoveError
 	require.False(t, errors.As(s.moveErr, &me))
 	require.ErrorIs(t, s.moveErr, net.ErrClosed)
+}
+
+// A failed move whose cause is a deadline doesn't read as a timeout to
+// errors.Is either.
+func TestHedgeMoveErrorHidesADeadlineCause(t *testing.T) {
+	for _, cause := range []error{os.ErrDeadlineExceeded, context.DeadlineExceeded} {
+		err := error(&hedgeMoveError{cause: cause})
+		require.NotErrorIs(t, err, os.ErrDeadlineExceeded)
+		require.NotErrorIs(t, err, context.DeadlineExceeded)
+	}
+	require.ErrorIs(t, &hedgeMoveError{cause: errors.ErrUnsupported}, errors.ErrUnsupported, "other causes stay reachable")
 }
