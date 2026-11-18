@@ -191,6 +191,14 @@ func startConsumer(t *testing.T, ctx context.Context, freddieURL, egressURL stri
 // call.
 func startConsumers(t *testing.T, ctx context.Context, freddieURL, egressURL string, tags []string, roomTickets ...string) map[string]string {
 	t.Helper()
+	return startConsumersWith(t, ctx, freddieURL, egressURL, tags, nil, roomTickets...)
+}
+
+// startConsumersWith is startConsumers with configure, if not nil, adjusting each
+// outbound's options before the box starts.
+func startConsumersWith(t *testing.T, ctx context.Context, freddieURL, egressURL string, tags []string,
+	configure func(*lbOption.UnboundedOutboundOptions), roomTickets ...string) map[string]string {
+	t.Helper()
 
 	boxCtx := box.BaseContext()
 	// Registers lantern-box's custom protocols (including unbounded) against
@@ -223,17 +231,21 @@ func startConsumers(t *testing.T, ctx context.Context, freddieURL, egressURL str
 				},
 			},
 		})
+		outOpts := &lbOption.UnboundedOutboundOptions{
+			InsecureDoNotVerifyClientCert: true,
+			DiscoverySrv:                  freddieURL,
+			EgressAddr:                    egressURL,
+			STUNServers:                   []string{"stun:stun.l.google.com:19302"},
+			STUNBatchSize:                 1,
+			ConsumerSessionID:             fmt.Sprintf("e2e-consumer-%d", consumerSeq.Add(1)),
+		}
+		if configure != nil {
+			configure(outOpts)
+		}
 		opts.Outbounds = append(opts.Outbounds, option.Outbound{
-			Type: "unbounded",
-			Tag:  tag,
-			Options: &lbOption.UnboundedOutboundOptions{
-				InsecureDoNotVerifyClientCert: true,
-				DiscoverySrv:                  freddieURL,
-				EgressAddr:                    egressURL,
-				STUNServers:                   []string{"stun:stun.l.google.com:19302"},
-				STUNBatchSize:                 1,
-				ConsumerSessionID:             fmt.Sprintf("e2e-consumer-%d", consumerSeq.Add(1)),
-			},
+			Type:    "unbounded",
+			Tag:     tag,
+			Options: outOpts,
 		})
 		opts.Route.Rules = append(opts.Route.Rules, option.Rule{
 			Type: C.RuleTypeDefault,
@@ -393,6 +405,13 @@ func TestUnboundedRoomE2E(t *testing.T) {
 // insecure because the widget-side peer presents a self-signed QUIC cert.
 func startEgress(t *testing.T, ctx context.Context) string {
 	t.Helper()
+	return startCountingEgress(t, ctx, nil)
+}
+
+// startCountingEgress is startEgress, with dials, if not nil, counting the
+// SOCKS5 server's dials out: one per proxied connection the egress carried.
+func startCountingEgress(t *testing.T, ctx context.Context, dials *atomic.Int64) string {
+	t.Helper()
 	egL, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err, "listen for egress")
 	egressWrapped, err := egress.NewListener(ctx, egL, &tls.Config{
@@ -402,7 +421,14 @@ func startEgress(t *testing.T, ctx context.Context) string {
 	require.NoError(t, err, "egress.NewListener")
 	t.Cleanup(func() { _ = egressWrapped.Close() })
 
-	socksServer, err := socks5.New(&socks5.Config{})
+	socksConf := &socks5.Config{}
+	if dials != nil {
+		socksConf.Dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dials.Add(1)
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		}
+	}
+	socksServer, err := socks5.New(socksConf)
 	require.NoError(t, err, "socks5.New")
 	go func() { _ = socksServer.Serve(egressWrapped) }()
 	return "ws://" + egL.Addr().String()
