@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"io"
 	stdlog "log"
@@ -18,6 +19,7 @@ import (
 
 	UBClientcore "github.com/getlantern/broflake/clientcore"
 	UBCommon "github.com/getlantern/broflake/common"
+	"github.com/getlantern/broflake/common/helperticket"
 	"github.com/getlantern/broflake/freddie"
 	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
@@ -192,6 +194,84 @@ func TestDirectExitFallsBackToEgress(t *testing.T) {
 			require.Zero(t, rig.router.routed.Load(), "the exit box routed traffic")
 		})
 	}
+}
+
+// TestDirectExitPersonalAndPoolSessions checks that a volunteer serving both its room and the
+// pool exits each session through its own kind's router: a stranger's pool consumer through the
+// pool one, and the inviter's helper consumer, on the room slot's rooms-only genesis, through
+// the personal one.
+func TestDirectExitPersonalAndPoolSessions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e (requires live WebRTC bootstrap)")
+	}
+	UBCommon.SetDebugLogger(stdlog.New(io.Discard, "", 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var originHits atomic.Int64
+	origin := httptest.NewServer(countingHandler(&originHits))
+	t.Cleanup(origin.Close)
+
+	// This test's stand-in for lantern-cloud's ticket key. Tickets are credentials: never log
+	// them, even here.
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	keys := []helperticket.Key{helperticket.NewKey(priv.Public().(ed25519.PublicKey))}
+	ticket := func(role helperticket.Role) string {
+		tk, err := helperticket.Sign(priv, helperticket.Ticket{PairingID: "6f1c2b0e-8a7d-4c1e-9f00-0123456789ab",
+			Role: role, Expires: time.Now().Add(15 * time.Minute)})
+		require.NoError(t, err)
+		return tk
+	}
+
+	freddieAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	f, err := freddie.New(ctx, freddieAddr)
+	require.NoError(t, err, "freddie.New")
+	t.Cleanup(func() { cancel(); _ = f.Shutdown() })
+	f.RoomTicket = helperticket.RoomFunc(func() []helperticket.Key { return keys }, time.Now)
+	go func() { _ = f.ListenAndServe() }()
+	freddieURL := "http://" + freddieAddr
+	waitForHTTP(t, freddieURL+"/v1/", 5*time.Second)
+
+	var egressDials atomic.Int64
+	egressURL := startCountingEgress(t, ctx, &egressDials)
+
+	// One exit box, behind a counter per kind: which counter a session's streams reach is the
+	// router the exit picked for it.
+	exitBox := startExitBox(t)
+	personal := &countingRouter{ConnectionRouterEx: exitBox}
+	pool := &countingRouter{ConnectionRouterEx: exitBox}
+	e, err := exit.New(ctx, sblog.NewNOPFactory().Logger())
+	require.NoError(t, err, "exit.New")
+	t.Cleanup(e.Close)
+	e.SetEnabled(true)
+	e.SetRouter(exit.Personal, personal, time.Now().Add(time.Hour))
+	e.SetRouter(exit.Pool, pool, time.Now().Add(time.Hour))
+	startWidget(t, ctx, freddieURL, egressURL, func(_ *UBClientcore.BroflakeOptions, rtcOpt *UBClientcore.WebRTCOptions) {
+		rtcOpt.Exit = e.Options()
+		rtcOpt.SetRoomTickets([]string{ticket(helperticket.RoleVolunteer)})
+		rtcOpt.SetServePool(true)
+	})
+	directExit := func(o *lbOption.UnboundedOutboundOptions) {
+		o.DirectExit = &lbOption.UnboundedDirectExitOptions{ServerName: "www.example.com"}
+	}
+
+	// The stranger first: it can answer only the pool slot's genesis, which isn't rooms-only.
+	// A friend could answer that one too, and would then get a pool session, as broflake
+	// counts any genesis a stranger could reach, so the friend comes second and finds only
+	// the room slot free.
+	stranger := startConsumersWith(t, ctx, freddieURL, egressURL, []string{e2ePoolTag}, directExit)[e2ePoolTag]
+	requireProxies(t, stranger, origin.URL, 60*time.Second)
+	require.Positive(t, pool.routed.Load(), "the pool session exited through the pool router")
+	require.Zero(t, personal.routed.Load(), "the pool session reached the personal router")
+
+	poolBefore := pool.routed.Load()
+	friend := startConsumersWith(t, ctx, freddieURL, egressURL, []string{e2eHelperTag}, directExit,
+		ticket(helperticket.RoleInviter))[e2eHelperTag]
+	requireProxies(t, friend, origin.URL, 60*time.Second)
+	require.Positive(t, personal.routed.Load(), "the room session exited through the personal router")
+	require.Equal(t, poolBefore, pool.routed.Load(), "the room session reached the pool router")
+	require.Zero(t, egressDials.Load(), "the egress carried a direct exit's traffic")
 }
 
 // directExitCase is what a direct exit rig sets up: whether the volunteer's exit is enabled
