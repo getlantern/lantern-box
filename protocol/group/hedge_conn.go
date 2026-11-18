@@ -52,7 +52,8 @@ type hedgeLeg struct {
 	moved     chan struct{} // closed when a move finishes
 	closed    bool
 	// verdict is what this connection taught the cache about its site,
-	// decided and written under mu (settleLocked).
+	// decided and written under mu (settleLocked): unset, good on First's
+	// first reply, bad on any failure of First. Bad is final.
 	verdict hedgeVerdict
 	// struck is set once a reset after the commit counted against the site
 	// (failedAfterCommitLocked).
@@ -88,6 +89,8 @@ type hedgeLeg struct {
 	// either changes, waking waiters to re-read them.
 	readDeadline, writeDeadline time.Time
 	deadlineChanged             chan struct{}
+
+	stats *hedgeStats
 }
 
 type deadlineCloser interface {
@@ -96,8 +99,8 @@ type deadlineCloser interface {
 	SetWriteDeadline(time.Time) error
 }
 
-func (l *hedgeLeg) init(h *Hedge, ctx context.Context, key hedgeKey, network string, dest M.Socksaddr) {
-	l.h, l.ctx, l.key, l.network, l.dest = h, ctx, key, network, dest
+func (l *hedgeLeg) init(h *Hedge, ctx context.Context, key hedgeKey, network string, dest M.Socksaddr, stats *hedgeStats) {
+	l.h, l.ctx, l.key, l.network, l.dest, l.stats = h, ctx, key, network, dest, stats
 	l.onFirst = true
 	l.moved = make(chan struct{})
 	l.deadlineChanged = make(chan struct{})
@@ -237,21 +240,58 @@ func (l *hedgeLeg) commit(release func()) bool {
 		l.mu.Unlock()
 		return false
 	}
+	first := !l.committed
 	l.committed = true
-	l.settleLocked(hedgeGood, nil)
+	if first {
+		// Under mu, so a failure seen after the commit (stalled or reset
+		// after commit) always replaces it, never the other way round. A
+		// reset noteReset already recorded is kept: it came first.
+		l.stats.setOutcomeIfUnset(hedgeOutcomeCommitted)
+		l.settleLocked(hedgeGood, nil)
+	}
 	l.stopCommitLocked()
 	release()
 	l.mu.Unlock()
 	return true
 }
 
+// noteReset runs as the watchdog charges a reset on First, before the
+// client sees the error. firstFailed handles the reset later, on its own
+// goroutine, and by then the client may have closed, which stops a move. So
+// noteReset settles the site bad itself and records the reset: the outcome
+// a reset gets when it can't move now (staticResetOutcomeLocked), or
+// reset_unmoved for a replayable opening. A move that follows, which an
+// undecided opening can still make once the rest of a handshake arrives,
+// replaces either. Once the client has closed, settleLocked and the sealed
+// record ignore it: an error then can be the teardown itself. The watchdog calls this from the
+// IO path, which never holds mu.
+func (l *hedgeLeg) noteReset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.onFirst || l.moving {
+		return
+	}
+	if l.committed {
+		// A strike, not a block (failedAfterCommitLocked).
+		l.failedAfterCommitLocked(lAdapter.UserFailureReset)
+		return
+	}
+	if outcome := l.staticResetOutcomeLocked(); outcome != "" {
+		l.stats.set("", outcome)
+	} else {
+		// Replaced by the move's outcome if it moves. If the client closes
+		// first, or a reply commits it, the reset still shows.
+		l.stats.setOutcomeIfUnset(hedgeOutcomeResetUnmoved)
+	}
+	l.settleLocked(hedgeBad, lAdapter.UserFailureReset)
+}
+
 // settleLocked records what this connection teaches the cache about its
-// site, and writes it to the cache, under mu, so the commit and every
-// failure path agree on one verdict whatever order they run in: good only
-// while nothing is decided, bad over anything, nothing after bad, and
-// nothing once the client closed, when an error can be the teardown
-// itself. The cache's lock is never held while taking a leg's, so writing
-// it under mu can't deadlock. Caller holds mu.
+// site, and writes it to the cache, all under mu so every path agrees on
+// one verdict: good only while nothing is decided, bad over anything, and
+// nothing after bad, and nothing once the client closed, when an error can
+// be the teardown itself. The cache's lock is never held while taking a
+// leg's, so writing it under mu can't deadlock. Caller holds mu.
 func (l *hedgeLeg) settleLocked(v hedgeVerdict, why any) {
 	if l.closed || l.verdict == hedgeBad || (v == hedgeGood && l.verdict != hedgeUnknown) {
 		return
@@ -262,6 +302,26 @@ func (l *hedgeLeg) settleLocked(v hedgeVerdict, why any) {
 	} else {
 		l.h.markGood(l.key)
 	}
+}
+
+// staticResetOutcomeLocked returns the outcome of a reset on First that
+// can't move now: after the commit, on an opening whose copy overflowed or
+// that isn't a handshake, or on one still too short to tell
+// (reset_undecided; if the rest of a handshake arrives, a later move
+// records its own outcome). It returns "" for a replayable opening, whose
+// move records its own outcome. Caller holds mu.
+func (l *hedgeLeg) staticResetOutcomeLocked() string {
+	switch {
+	case l.committed:
+		return hedgeOutcomeResetAfterCommit
+	case l.overflow:
+		return hedgeOutcomeOverflowFailed
+	case l.noReplay:
+		return hedgeOutcomeResetNotReplayable
+	case l.undecidedKept:
+		return hedgeOutcomeResetUndecided
+	}
+	return ""
 }
 
 // firstFailed handles a failure the watchdog saw on First: before a commit it
@@ -282,27 +342,24 @@ func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter
 	move(kind)
 }
 
-// noteReset runs as the watchdog charges a reset on First, before the
-// client sees the error. A reset after the commit is counted here, since
-// firstFailed handles it later on its own goroutine, possibly after the
-// client closed and the close was taken as clean. A reset before the commit
-// is left to firstFailed's move. The watchdog calls this from the IO path,
-// which never holds mu.
-func (l *hedgeLeg) noteReset() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.committed && l.onFirst && !l.moving {
-		l.failedAfterCommitLocked(lAdapter.UserFailureReset)
-	}
-}
-
 // failedAfterCommitLocked handles First failing after it replied. A stall
 // marks the site bad. A reset is one strike against it, at most one per
 // connection: hedgeResetStrikes of them, with no clean connection between,
 // mark it bad, since a lone reset after a reply is usually teardown. Caller
 // holds mu.
 func (l *hedgeLeg) failedAfterCommitLocked(why lAdapter.UserFailureKind) {
-	if l.closed || l.verdict == hedgeBad {
+	if l.closed {
+		return
+	}
+	// Recorded on every strike, so telemetry shows how often a reset after
+	// a reply comes before a real block. A reset recorded before the
+	// commit keeps its outcome.
+	outcome := hedgeOutcomeResetAfterCommit
+	if why == lAdapter.UserFailureStall {
+		outcome = hedgeOutcomeStalledAfterCommit
+	}
+	l.stats.replaceOutcome(hedgeOutcomeCommitted, outcome)
+	if l.verdict == hedgeBad {
 		return
 	}
 	if why != lAdapter.UserFailureReset {
@@ -336,9 +393,10 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 		l.mu.Unlock()
 		return false
 	}
-	if notReplayable := l.noReplay || l.undecidedKept; notReplayable || l.overflow {
-		slowOnly := notReplayable && why == lAdapter.UserFailureNoResponse
+	if unreplayableNow := l.noReplay || l.undecidedKept; unreplayableNow || l.overflow {
+		slowOnly := unreplayableNow && why == lAdapter.UserFailureNoResponse
 		if !slowOnly {
+			l.stats.set("", l.staticResetOutcomeLocked())
 			l.settleLocked(hedgeBad, why)
 		}
 		l.mu.Unlock()
@@ -349,6 +407,13 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 	}
 	l.moving = true
 	l.moveCtx, l.cancel = moveContext(l.ctx)
+	outcome := hedgeOutcomeMovedReset
+	if why == lAdapter.UserFailureNoResponse {
+		outcome = hedgeOutcomeMovedNoReply
+	}
+	// The path becomes then_after_move only once the move succeeds
+	// (finishMoveLocked).
+	l.stats.set("", outcome)
 	l.settleLocked(hedgeBad, why)
 	l.mu.Unlock()
 	_ = closeFirst()
@@ -464,6 +529,12 @@ func (l *hedgeLeg) finishMoveLocked(err error) {
 		err = newHedgeMoveError(err)
 	}
 	l.moveErr = err
+	switch {
+	case err == nil:
+		l.stats.set(hedgePathThenAfterMove, "")
+	case !l.closed:
+		l.stats.set("", hedgeOutcomeMoveFailed)
+	}
 	l.onFirst = false
 	l.moving = false
 	l.pending = nil
@@ -483,6 +554,9 @@ func (l *hedgeLeg) closeLocked() (cancel context.CancelFunc, pending io.Closer) 
 		l.h.cache.clearStrikes(l.key)
 	}
 	l.closed = true
+	// Under mu with closed, so nothing noted after the close changes the
+	// record (see settleLocked for the cache).
+	l.stats.seal()
 	l.stopCommitLocked()
 	if l.pending == nil {
 		return l.cancel, nil
@@ -510,9 +584,9 @@ type hedgeStream struct {
 	writeClosed bool
 }
 
-func newHedgeStream(h *Hedge, ctx context.Context, key hedgeKey, network string, dest M.Socksaddr, first net.Conn) *hedgeStream {
+func newHedgeStream(h *Hedge, ctx context.Context, key hedgeKey, network string, dest M.Socksaddr, first net.Conn, stats *hedgeStats) *hedgeStream {
 	s := &hedgeStream{}
-	s.init(h, ctx, key, network, dest)
+	s.init(h, ctx, key, network, dest, stats)
 	w := newDataPlaneStream(first, defaultDataPlaneIdle, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
 		onFailure: func(kind lAdapter.UserFailureKind) { s.firstFailed(kind, s.move) },
 		onReset:   s.noteReset,
@@ -633,6 +707,12 @@ func closeWrite(c net.Conn) error {
 }
 
 func (s *hedgeStream) Read(p []byte) (int, error) {
+	n, err := s.read(p)
+	s.stats.read(n)
+	return n, err
+}
+
+func (s *hedgeStream) read(p []byte) (int, error) {
 	for {
 		s.mu.Lock()
 		if s.moving {
@@ -679,6 +759,12 @@ func (s *hedgeStream) Read(p []byte) (int, error) {
 }
 
 func (s *hedgeStream) Write(p []byte) (int, error) {
+	n, err := s.write(p)
+	s.stats.wrote(n)
+	return n, err
+}
+
+func (s *hedgeStream) write(p []byte) (int, error) {
 	for {
 		s.mu.Lock()
 		if s.closed {
@@ -778,6 +864,7 @@ func (s *hedgeStream) Close() error {
 	cancel, pending := s.closeLocked()
 	c := s.cur
 	s.mu.Unlock()
+	s.stats.finish(true)
 	cancel()
 	if pending != nil {
 		_ = pending.Close()
@@ -854,9 +941,9 @@ type heldPacket struct {
 // client uses one or two before its handshake completes.
 const hedgeMaxCIDs = 8
 
-func newHedgePacket(h *Hedge, ctx context.Context, key hedgeKey, dest M.Socksaddr, first net.PacketConn) *hedgePacket {
+func newHedgePacket(h *Hedge, ctx context.Context, key hedgeKey, dest M.Socksaddr, first net.PacketConn, stats *hedgeStats) *hedgePacket {
 	p := &hedgePacket{}
-	p.init(h, ctx, key, N.NetworkUDP, dest)
+	p.init(h, ctx, key, N.NetworkUDP, dest, stats)
 	// The filter sits under the watchdog, so a decoy's Version Negotiation
 	// neither commits the connection nor counts as First's reply.
 	filtered := &vnFilter{PacketConn: first, ours: p.ownsCID}
@@ -1065,6 +1152,14 @@ func (p *hedgePacket) unkeepUnsent(b []byte) bool {
 }
 
 func (p *hedgePacket) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := p.readFrom(b)
+	if err == nil {
+		p.stats.read(n)
+	}
+	return n, addr, err
+}
+
+func (p *hedgePacket) readFrom(b []byte) (int, net.Addr, error) {
 	for {
 		p.mu.Lock()
 		if p.moving {
@@ -1111,6 +1206,16 @@ func (p *hedgePacket) ReadFrom(b []byte) (int, net.Addr, error) {
 }
 
 func (p *hedgePacket) write(b []byte, dest M.Socksaddr) error {
+	err := p.writeLeg(b, dest)
+	// A datagram taken for a move (errTakenTimeout) is sent by its replay,
+	// so it counts as written, as WriteTo and WritePacket report it.
+	if err == nil || err == errTakenTimeout {
+		p.stats.wrote(len(b))
+	}
+	return err
+}
+
+func (p *hedgePacket) writeLeg(b []byte, dest M.Socksaddr) error {
 	for {
 		p.mu.Lock()
 		if p.closed {
@@ -1215,6 +1320,7 @@ func (p *hedgePacket) Close() error {
 	cancel, pending := p.closeLocked()
 	c := p.cur
 	p.mu.Unlock()
+	p.stats.finish(true)
 	cancel()
 	if pending != nil {
 		_ = pending.Close()

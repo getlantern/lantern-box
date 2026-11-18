@@ -1194,6 +1194,21 @@ func TestDataPlaneStream_MidStreamReset_ConnReset_AttributesFailure(t *testing.T
 		"mid-stream reset on an unproven conn must attribute exactly one failure")
 }
 
+// onReset runs before the reset's error reaches the reader, unlike
+// onFailure, which runs on its own goroutine.
+func TestDataPlaneStream_ResetNotedSynchronously(t *testing.T) {
+	var noted atomic.Bool
+	c := &failingConn{err: connResetErr(), firstN: 16}
+	d := newDataPlaneStream(c, time.Hour, 1<<20, dataPlaneHooks{onReset: func() { noted.Store(true) }})
+	defer d.Close()
+	buf := make([]byte, 32)
+	_, err := d.Read(buf)
+	require.NoError(t, err)
+	_, err = d.Read(buf)
+	require.Error(t, err)
+	require.True(t, noted.Load(), "the reset is noted by the time Read returns it")
+}
+
 func TestDataPlaneStream_MidStreamReset_AttributesResetKind(t *testing.T) {
 	// fireResetFailure must report the failure as a reset, not a stall, so the two
 	// mid-stream failure modes stay separable downstream.

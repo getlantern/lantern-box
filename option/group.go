@@ -44,6 +44,16 @@ type HedgeOutboundOptions struct {
 	// is closed and its site marked bad, so the client's retry uses Then.
 	// Default 64 KiB.
 	MaxHeldBytes int `json:"max_held_bytes,omitempty"`
+	// ExploreRate is the fraction, from 0 to 1, of connections First could
+	// take that go to Then instead, so telemetry can compare the two paths on
+	// the same sites. Default 0.
+	ExploreRate float64 `json:"explore_rate,omitempty"`
+	// TelemetrySites are the registered domains hedge metrics may name in
+	// hedge.site. Every other site is reported as "other", and with none
+	// listed hedge.site is left out. The metrics' other attributes (path,
+	// outcome, transport, outbound tags) and byte and timing measurements
+	// are reported either way.
+	TelemetrySites []string `json:"telemetry_sites,omitempty"`
 }
 
 type MutableSelectorOutboundOptions struct {
