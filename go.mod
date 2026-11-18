@@ -18,6 +18,11 @@ replace github.com/refraction-networking/water => github.com/getlantern/water v0
 
 replace github.com/quic-go/quic-go => github.com/getlantern/quic-go-unbounded-fork v0.62.1-unbounded
 
+// x/v0.3.0 plus a one-line fix so x/httpconnect builds against quic-go >= v0.53
+// (quic.EarlyConnection became *quic.Conn), which the quic-go replace above
+// resolves to. Drop once an upstream x release includes OutlineFoundation/outline-sdk#657.
+replace golang.getoutline.org/sdk/x => github.com/getlantern/outline-sdk/x v0.3.0-lantern.1
+
 // sing-box/sing-tun/tailscale need gvisor's v0.0.0-20260727.0-sing-box-mod.1
 // API (WritePacketDirect, the new udp.NewForwarder signature). That tag's first
 // pre-release identifier is purely numeric, which semver ranks below the
@@ -43,6 +48,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/pion/stun/v4 v4.0.1
 	github.com/pion/transport/v5 v5.1.1
+	github.com/quic-go/quic-go v0.62.0
 	github.com/refraction-networking/water v0.7.1-alpha
 	github.com/sagernet/quic-go v0.61.0-sing-box-mod.7
 	github.com/sagernet/sing v0.9.6-0.20260922013354-87c33f17688f
@@ -64,8 +70,8 @@ require (
 	go.opentelemetry.io/otel/sdk/log v0.16.0
 	go.opentelemetry.io/otel/sdk/metric v1.41.0
 	go.opentelemetry.io/otel/trace v1.41.0
-	golang.getoutline.org/sdk v0.0.21
-	golang.getoutline.org/sdk/x v0.1.0
+	golang.getoutline.org/sdk v0.1.0
+	golang.getoutline.org/sdk/x v0.3.0
 	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0
 	gopkg.in/ini.v1 v1.67.1
@@ -257,7 +263,6 @@ require (
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/protolambda/ctxlock v0.1.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.62.0 // indirect
 	github.com/refraction-networking/utls v1.8.2 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rs/dnscache v0.0.0-20211102005908-e0241e321417 // indirect

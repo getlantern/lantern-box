@@ -131,3 +131,12 @@ func (c *TaggedPacketConn) Upstream() any {
 }
 
 var _ N.NetPacketConn = (*TaggedPacketConn)(nil)
+
+// Switchable is an outbound that can be turned off at runtime without
+// rebuilding the tunnel, for example from a server-side feature flag. What
+// "off" means is up to the outbound; for a hedge it sends every new
+// connection straight to its fallback. Connections already open keep going.
+type Switchable interface {
+	SetEnabled(enabled bool)
+	Enabled() bool
+}
