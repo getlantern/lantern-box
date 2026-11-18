@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -43,6 +44,8 @@ func RegisterHedge(registry *outbound.Registry) {
 // answer, moves it to Then by replaying the bytes the client sent. Until the
 // first reply nothing from First has reached the client, so the client's TLS
 // or QUIC session, which runs end to end, cannot tell the two paths apart.
+// Only connections that open with a TLS or QUIC handshake are replayed (see
+// hedgeLeg); the rest stay on First.
 //
 // Whether First worked is remembered per site in a cache shared by every hedge
 // in the box: a site First failed for goes straight to Then, with no timeout,
@@ -171,12 +174,16 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 	if !ok {
 		return then.DialContext(ctx, network, destination)
 	}
-	conn, err := first.DialContext(ctx, network, destination)
+	dialCtx, timedOut, stop := h.firstDialContext(ctx)
+	conn, err := first.DialContext(dialCtx, network, destination)
+	stop()
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, err
 		}
-		h.markBad(ctx, key, err)
+		if !timedOut() {
+			h.markBad(ctx, key, err)
+		}
 		return then.DialContext(ctx, network, destination)
 	}
 	return newHedgeStream(h, ctx, key, network, destination, conn), nil
@@ -191,15 +198,35 @@ func (h *Hedge) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	if !ok {
 		return then.ListenPacket(ctx, destination)
 	}
-	conn, err := first.ListenPacket(ctx, destination)
+	dialCtx, timedOut, stop := h.firstDialContext(ctx)
+	conn, err := first.ListenPacket(dialCtx, destination)
+	stop()
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, err
 		}
-		h.markBad(ctx, key, err)
+		if !timedOut() {
+			h.markBad(ctx, key, err)
+		}
 		return then.ListenPacket(ctx, destination)
 	}
 	return newHedgePacket(h, ctx, key, destination, conn), nil
+}
+
+// firstDialContext bounds First's dial by the commit timeout, so a slow
+// dial, such as the outline outbound's first strategy search, falls back to
+// Then instead of holding the connection. A dial that ran out of time is
+// slow, not blocked, so it doesn't mark the site bad. The context is
+// cancelled only on that timeout: some outbounds tie a connection's life to
+// the context it was dialed with. stop must be called once the dial returns.
+func (h *Hedge) firstDialContext(ctx context.Context) (dialCtx context.Context, timedOut func() bool, stop func()) {
+	dialCtx, cancel := context.WithCancel(ctx)
+	var fired atomic.Bool
+	timer := time.AfterFunc(h.cfg.commitTimeout, func() {
+		fired.Store(true)
+		cancel()
+	})
+	return dialCtx, fired.Load, func() { timer.Stop() }
 }
 
 // failoverContext detaches from the dial's context, which may end once the

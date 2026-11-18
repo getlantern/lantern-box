@@ -125,6 +125,51 @@ func TestOutlineQUICPreludeHandshake(t *testing.T) {
 	}
 }
 
+// TestOutlineUDPToDomain sends UDP to a domain-name destination through the
+// outline outbound, as a SOCKS5 or HTTP inbound does: the outbound must
+// resolve it rather than write to an empty address.
+func TestOutlineUDPToDomain(t *testing.T) {
+	echo, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer echo.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := echo.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = echo.WriteTo(buf[:n], from)
+		}
+	}()
+	boxCtx := box.BaseContext()
+	client, err := sbox.New(sbox.Options{Context: boxCtx, Options: mustOptions(boxCtx, t, `{
+		"log": {"level": "error"},
+		"dns": {"servers": [{"type": "local", "tag": "local"}]},
+		"outbounds": [{"type": "outline", "tag": "proxyless", "domains": ["example.com"], "udp": "",
+			"domain_resolver": {"server": "local", "strategy": "ipv4_only"}}]
+	}`)})
+	require.NoError(t, err)
+	require.NoError(t, client.Start())
+	t.Cleanup(func() { client.Close() })
+	out, ok := client.Outbound().Outbound("proxyless")
+	require.True(t, ok)
+
+	dest := M.ParseSocksaddrHostPort("localhost", uint16(echo.LocalAddr().(*net.UDPAddr).Port))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := out.DialContext(ctx, "udp", dest)
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.Write([]byte("ping"))
+	require.NoError(t, err)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "ping", string(buf[:n]))
+}
+
 // isReservedVersionLongHeader reports whether b is a long-header packet whose
 // version is a reserved 0x?a?a?a?a codepoint (RFC 9000 §15).
 func isReservedVersionLongHeader(b []byte) bool {

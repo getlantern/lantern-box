@@ -200,24 +200,48 @@ func (c *hedgeCache) mark(k hedgeKey, v hedgeVerdict, ttl time.Duration) {
 	c.trimLocked()
 }
 
+// trimLocked bounds both indexes. They grow independently: one site failing
+// across many address blocks adds a block group each time but only one site
+// entry. Caller holds mu.
 func (c *hedgeCache) trimLocked() {
-	if len(c.sites) <= hedgeMaxEntries {
-		return
-	}
 	now := c.now()
-	for k, e := range c.sites {
-		if !now.Before(e.expires) {
+	if len(c.sites) > hedgeMaxEntries {
+		for k, e := range c.sites {
+			if !now.Before(e.expires) {
+				delete(c.sites, k)
+			}
+		}
+		for k := range c.sites {
+			if len(c.sites) <= hedgeMaxEntries {
+				break
+			}
 			delete(c.sites, k)
 		}
 	}
-	for k := range c.sites {
-		if len(c.sites) <= hedgeMaxEntries {
+	records := 0
+	for _, sites := range c.badSites {
+		records += len(sites)
+	}
+	if records <= hedgeMaxEntries {
+		return
+	}
+	for pk, sites := range c.badSites {
+		for site, expires := range sites {
+			if !now.Before(expires) {
+				delete(sites, site)
+				records--
+			}
+		}
+		if len(sites) == 0 {
+			delete(c.badSites, pk)
+		}
+	}
+	for pk, sites := range c.badSites {
+		if records <= hedgeMaxEntries {
 			break
 		}
-		delete(c.sites, k)
-	}
-	if len(c.badSites) > hedgeMaxEntries {
-		c.badSites = map[hedgePrefixKey]map[string]time.Time{}
+		records -= len(sites)
+		delete(c.badSites, pk)
 	}
 }
 

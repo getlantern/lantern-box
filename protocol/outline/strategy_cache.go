@@ -37,6 +37,11 @@ func newFileStrategyCache(path string, logger logger.ContextLogger) *fileStrateg
 			c.warn("outline: discard unreadable strategy cache: ", err)
 			c.entries = map[string][]byte{}
 		}
+		// A file holding JSON null decodes to a nil map, which Put would
+		// write to.
+		if c.entries == nil {
+			c.entries = map[string][]byte{}
+		}
 	}
 	return c
 }

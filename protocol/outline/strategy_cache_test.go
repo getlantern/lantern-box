@@ -40,4 +40,13 @@ func TestFileStrategyCache(t *testing.T) {
 	if got, ok := newFileStrategyCache(path, nil).Get("winner"); !ok || string(got) != "y" {
 		t.Fatalf("cache did not recover from a corrupt file: %q, %v", got, ok)
 	}
+
+	if err := os.WriteFile(path, []byte("null"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	null := newFileStrategyCache(path, nil)
+	null.Put("winner", []byte("z")) // must not panic on a nil map
+	if got, ok := newFileStrategyCache(path, nil).Get("winner"); !ok || string(got) != "z" {
+		t.Fatalf("cache did not recover from a null file: %q, %v", got, ok)
+	}
 }

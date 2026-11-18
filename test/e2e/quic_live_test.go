@@ -80,6 +80,14 @@ func TestHysteria2XLiveQUICSites(t *testing.T) {
 // the SOCKS5 UDP ASSOCIATE of the hysteria2x client's mixed inbound.
 func h3Get(t *testing.T, u string, sc *socks.Client) (string, int, error) {
 	t.Helper()
+	// quic.DialEarly doesn't own the packet conns it is given, so each
+	// SOCKS5 association is closed once the transport is done with it.
+	var pcs []net.PacketConn
+	defer func() {
+		for _, pc := range pcs {
+			pc.Close()
+		}
+	}()
 	tr := &http3.Transport{
 		TLSClientConfig: &tls.Config{},
 		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
@@ -94,7 +102,13 @@ func h3Get(t *testing.T, u string, sc *socks.Client) (string, int, error) {
 			if err != nil {
 				return nil, err
 			}
-			return quic.DialEarly(ctx, pc, ua, tlsCfg, cfg)
+			conn, err := quic.DialEarly(ctx, pc, ua, tlsCfg, cfg)
+			if err != nil {
+				pc.Close()
+				return nil, err
+			}
+			pcs = append(pcs, pc)
+			return conn, nil
 		},
 	}
 	defer tr.Close()

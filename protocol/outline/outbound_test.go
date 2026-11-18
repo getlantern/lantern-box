@@ -321,3 +321,44 @@ func TestNewOutboundOptions(t *testing.T) {
 		})
 	}
 }
+
+func TestDialContextUDPRoundTrip(t *testing.T) {
+	echo, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := echo.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = echo.WriteTo(buf[:n], from)
+		}
+	}()
+	for _, udp := range []string{"", "quicprelude:count=1"} {
+		t.Run(udp, func(t *testing.T) {
+			out, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "outline",
+				option.OutboundOutlineOptions{Domains: []string{"example.com"}, UDP: &udp})
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn, err := out.DialContext(context.Background(), "udp", metadata.SocksaddrFromNet(echo.LocalAddr()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, err := conn.Write([]byte("ping")); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			buf := make([]byte, 64)
+			n, err := conn.Read(buf)
+			if err != nil || string(buf[:n]) != "ping" {
+				t.Fatalf("Read = %q, %v", buf[:n], err)
+			}
+		})
+	}
+}

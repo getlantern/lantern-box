@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 	"golang.getoutline.org/sdk/transport"
 	"golang.getoutline.org/sdk/x/configurl"
 	"golang.getoutline.org/sdk/x/smart"
@@ -75,7 +76,23 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 	if err != nil {
 		return nil, err
 	}
-	registry := newRegistry(&outboundDialer{dialer: sDialer, logger: log})
+	packetDialer := N.Dialer(sDialer)
+	if options.UDP != nil && service.FromContext[adapter.NetworkManager](ctx) != nil {
+		// UDP destinations can be domain names, as from a SOCKS5 or HTTP
+		// inbound, so the UDP base resolves them the way the direct outbound
+		// does. TCP keeps sDialer: the smart dialer picks its own resolver.
+		// Resolving needs the box's network manager, which a bare context
+		// in tests lacks.
+		packetDialer, err = dialer.NewWithOptions(dialer.Options{
+			Context:        ctx,
+			Options:        options.DialerOptions,
+			RemoteIsDomain: true,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	registry := newRegistry(&outboundDialer{dialer: sDialer, packetDialer: packetDialer, logger: log})
 
 	finderConfig := smart.NewFinderConfig().
 		SetConfigURLRegistry(registry).
@@ -156,7 +173,13 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		if err != nil {
 			return nil, err
 		}
-		return bufio.NewBindPacketConn(conn, destination), nil
+		// A plain UDP socket takes only *net.UDPAddr; a domain name is
+		// kept for the resolving dialer to map.
+		var remote net.Addr = destination
+		if destination.IsIP() {
+			remote = destination.UDPAddr()
+		}
+		return bufio.NewBindPacketConn(conn, remote), nil
 	}
 
 	ctx, md := adapter.ExtendContext(ctx)
@@ -245,14 +268,17 @@ func contextWithDestination(ctx context.Context, destination metadata.Socksaddr)
 // ListenPacket implements transport.PacketListener for the registry base.
 func (s *outboundDialer) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 	destination, _ := ctx.Value(destinationKey{}).(metadata.Socksaddr)
-	return s.dialer.ListenPacket(ctx, destination)
+	return s.packetDialer.ListenPacket(ctx, destination)
 }
 
 // wrapper around sing-box's N.Dialer to implement streamDialer interface to pass to a
 // stream dialer as innerSD
 type outboundDialer struct {
 	dialer N.Dialer
-	logger log.ContextLogger
+	// packetDialer opens the UDP listener's sockets; it resolves domain
+	// names when the box can.
+	packetDialer N.Dialer
+	logger       log.ContextLogger
 }
 
 func (s *outboundDialer) DialStream(ctx context.Context, addr string) (transport.StreamConn, error) {

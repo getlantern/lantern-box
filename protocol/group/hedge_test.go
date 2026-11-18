@@ -14,6 +14,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/service"
@@ -34,9 +35,27 @@ type fakeOutbound struct {
 	// dialErr fails every dial.
 	dialErr error
 	// packet answers each datagram; nil drops it.
-	packet  func(p []byte) []byte
-	dials   atomic.Int32
-	listens atomic.Int32
+	packet func(p []byte) []byte
+	// headroom, when set, makes packet conns require that much front
+	// headroom in every buffer written to them, as SOCKS5 UDP does.
+	headroom int
+	// hang makes every dial wait for its context and return its error.
+	hang     bool
+	dialCtxs chan context.Context
+	dials    atomic.Int32
+	listens  atomic.Int32
+}
+
+func (f *fakeOutbound) hangUntilDone(ctx context.Context) error {
+	if f.dialCtxs != nil {
+		f.dialCtxs <- ctx
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(5 * time.Second): // fail a test that never cancels, rather than hang it
+		return errors.New("fake dial was never cancelled")
+	}
 }
 
 func (f *fakeOutbound) Tag() string  { return f.tag }
@@ -50,6 +69,9 @@ func (f *fakeOutbound) Network() []string {
 
 func (f *fakeOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	f.dials.Add(1)
+	if f.hang {
+		return nil, f.hangUntilDone(ctx)
+	}
 	if f.dialErr != nil {
 		return nil, f.dialErr
 	}
@@ -60,8 +82,14 @@ func (f *fakeOutbound) DialContext(ctx context.Context, network string, destinat
 
 func (f *fakeOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	f.listens.Add(1)
+	if f.hang {
+		return nil, f.hangUntilDone(ctx)
+	}
 	if f.dialErr != nil {
 		return nil, f.dialErr
+	}
+	if f.headroom > 0 {
+		return &headroomPacketConn{fakePacketConn: newFakePacketConn(f.packet), front: f.headroom}, nil
 	}
 	return newFakePacketConn(f.packet), nil
 }
@@ -155,6 +183,31 @@ func (c *fakePacketConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
+// headroomPacketConn panics, as sing's SOCKS5 and Shadowsocks packet conns
+// do, when a buffer lacks the front headroom it declares.
+type headroomPacketConn struct {
+	*fakePacketConn
+	front int
+}
+
+func (c *headroomPacketConn) FrontHeadroom() int { return c.front }
+
+func (c *headroomPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	defer buffer.Release()
+	buffer.ExtendHeader(c.front) // panics without room
+	_, err := c.WriteTo(buffer.From(c.front), destination.UDPAddr())
+	return err
+}
+
+func (c *headroomPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	_, addr, err := buffer.ReadPacketFrom(c)
+	return M.SocksaddrFromNet(addr), err
+}
+
+// dropBeforeRead closes the conn before reading, so the client's first
+// write fails.
+func dropBeforeRead(c net.Conn) { c.Close() }
+
 func echoPacket(prefix string) func([]byte) []byte {
 	return func(p []byte) []byte { return append([]byte(prefix), p...) }
 }
@@ -197,6 +250,11 @@ func exchange(t *testing.T, c net.Conn, req string) string {
 
 var hedgeDest = M.ParseSocksaddr("www.youtube.com:443")
 
+// tlsRecord and quicPacket dress a payload as the opening of a TLS or QUIC
+// handshake, the only connections a hedge replays.
+func tlsRecord(s string) string  { return "\x16\x03\x01" + s }
+func quicPacket(s string) string { return "\xc0\x00\x00\x00\x01" + s }
+
 func (f *hedgeFixture) verdict(host string) hedgeVerdict {
 	return f.hedge.cache.verdict(hedgeKeyFor(context.Background(), "tcp", M.ParseSocksaddr(host)))
 }
@@ -219,13 +277,13 @@ func TestHedgeMovesWhenFirstNeverAnswers(t *testing.T) {
 	defer c.Close()
 
 	start := time.Now()
-	_, err = c.Write([]byte("client-hello"))
+	_, err = c.Write([]byte(tlsRecord("client-hello")))
 	require.NoError(t, err)
 	buf := make([]byte, 4096)
 	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
 	n, err := c.Read(buf)
 	require.NoError(t, err)
-	require.Equal(t, "then:client-hello", string(buf[:n]), "Then must receive the replayed bytes")
+	require.Equal(t, "then:"+tlsRecord("client-hello"), string(buf[:n]), "Then must receive the replayed bytes")
 	require.Less(t, time.Since(start), 2*time.Second)
 	require.Equal(t, "then:more", exchange(t, c, "more"), "later writes go to Then")
 	require.EqualValues(t, 1, f.then.dials.Load())
@@ -246,7 +304,7 @@ func TestHedgeMovesOnResetWithoutWaiting(t *testing.T) {
 	require.NoError(t, err)
 	defer c.Close()
 	start := time.Now()
-	require.Equal(t, "then:hi", exchange(t, c, "hi"))
+	require.Equal(t, "then:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
 	require.Less(t, time.Since(start), 2*time.Second, "a reset must move at once, not after the commit timeout")
 	require.Equal(t, hedgeBad, f.verdict("www.youtube.com:443"))
 }
@@ -306,7 +364,7 @@ func TestHedgeOverflowStaysOnFirst(t *testing.T) {
 	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
 	require.NoError(t, err)
 	defer c.Close()
-	_, err = c.Write([]byte("more than four bytes"))
+	_, err = c.Write([]byte(tlsRecord("more than four bytes")))
 	require.NoError(t, err)
 	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
 	_, err = c.Read(make([]byte, 64))
@@ -333,13 +391,13 @@ func TestHedgeUDPMovesAndReplays(t *testing.T) {
 	require.NoError(t, err)
 	defer pc.Close()
 	dest := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443}
-	for _, p := range []string{"initial-1", "initial-2"} {
+	for _, p := range []string{quicPacket("initial-1"), quicPacket("initial-2")} {
 		_, err = pc.WriteTo([]byte(p), dest)
 		require.NoError(t, err)
 	}
 	require.NoError(t, pc.SetReadDeadline(time.Now().Add(5*time.Second)))
 	buf := make([]byte, 64)
-	for _, want := range []string{"then:initial-1", "then:initial-2"} {
+	for _, want := range []string{"then:" + quicPacket("initial-1"), "then:" + quicPacket("initial-2")} {
 		n, _, err := pc.ReadFrom(buf)
 		require.NoError(t, err)
 		require.Equal(t, want, string(buf[:n]))
@@ -452,6 +510,188 @@ func TestHedgeReplyRacingMoveIsDiscarded(t *testing.T) {
 	s.mu.Lock()
 	s.moving = true
 	s.mu.Unlock()
-	require.False(t, s.commit(), "a reply racing a move must be discarded")
+	require.False(t, s.commit(s.releaseLocked), "a reply racing a move must be discarded")
 	require.Equal(t, hedgeUnknown, f.verdict("www.youtube.com:443"))
+}
+
+func TestHedgeKeepsPlaintextOnFirst(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte("POST /pay HTTP/1.1\r\n\r\n"))
+	require.NoError(t, err)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(400*time.Millisecond)))
+	_, err = c.Read(make([]byte, 64))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded, "a slow plaintext reply is left to the client's own timeout")
+	require.Zero(t, f.then.dials.Load(), "plaintext must never be replayed to Then")
+	require.Equal(t, hedgeUnknown, f.verdict("www.youtube.com:443"), "a slow reply is not a block")
+}
+
+func TestHedgePlaintextResetMarksBadWithoutMoving(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: reset}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	// net.Pipe refuses deadlines once its peer closed, so none is set; the
+	// peer's close ends the Read.
+	_, err = c.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
+	require.NoError(t, err)
+	_, err = c.Read(make([]byte, 64))
+	require.Error(t, err)
+	require.Zero(t, f.then.dials.Load())
+	require.Eventually(t, func() bool { return f.verdict("www.youtube.com:443") == hedgeBad },
+		time.Second, 10*time.Millisecond, "the client's retry must go to Then")
+}
+
+func TestHedgeMovesWhenWriteToFirstFails(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: dropBeforeRead}, &fakeOutbound{stream: answer("then:")},
+		func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) })
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	time.Sleep(20 * time.Millisecond) // let First's peer close
+	n, err := c.Write([]byte(tlsRecord("hello")))
+	require.NoError(t, err, "a failed write moves the connection; the replay delivers it")
+	require.Equal(t, len(tlsRecord("hello")), n)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 64)
+	n, err = c.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "then:"+tlsRecord("hello"), string(buf[:n]))
+	require.EqualValues(t, 1, f.then.dials.Load())
+}
+
+func TestHedgeReturnsThenDialError(t *testing.T) {
+	errThen := errors.New("then unreachable")
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{dialErr: errThen}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte(tlsRecord("hello")))
+	require.NoError(t, err)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = c.Read(make([]byte, 64))
+	require.ErrorIs(t, err, errThen)
+	_, err = c.Write([]byte("more"))
+	require.ErrorIs(t, err, errThen)
+}
+
+// startMoveToHangingThen starts a move whose dial to Then hangs, and returns
+// the hedged conn and the dial's context.
+func startMoveToHangingThen(t *testing.T) (*hedgeFixture, net.Conn, context.Context) {
+	t.Helper()
+	then := &fakeOutbound{hang: true, dialCtxs: make(chan context.Context, 1)}
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, then, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	_, err = c.Write([]byte(tlsRecord("hello")))
+	require.NoError(t, err)
+	select {
+	case ctx := <-then.dialCtxs:
+		return f, c, ctx
+	case <-time.After(5 * time.Second):
+		t.Fatal("the move never dialed Then")
+	}
+	return nil, nil, nil
+}
+
+func TestHedgeCloseDuringMoveCancelsThenDial(t *testing.T) {
+	_, c, dialCtx := startMoveToHangingThen(t)
+	done := make(chan error, 1)
+	go func() { done <- c.Close() }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close blocked on a move in progress")
+	}
+	select {
+	case <-dialCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not cancel the dial to Then")
+	}
+	_, err := c.Write([]byte("x"))
+	require.ErrorIs(t, err, net.ErrClosed)
+}
+
+func TestHedgeReadDeadlineBoundsWaitForMove(t *testing.T) {
+	_, c, _ := startMoveToHangingThen(t)
+	defer c.Close()
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
+	start := time.Now()
+	_, err := c.Read(make([]byte, 64))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	require.Less(t, time.Since(start), 2*time.Second, "a Read must not outlive its deadline waiting for Then")
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(100*time.Millisecond)))
+	_, err = c.Write([]byte("x"))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+}
+
+func TestHedgeReappliesReadDeadlineToThen(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: blackhole}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(600*time.Millisecond)))
+	_, err = c.Write([]byte(tlsRecord("hello")))
+	require.NoError(t, err)
+	start := time.Now()
+	_, err = c.Read(make([]byte, 64))
+	require.True(t, isTimeout(err), "got %v", err)
+	require.Less(t, time.Since(start), 3*time.Second, "Then's leg must carry the caller's read deadline")
+	require.EqualValues(t, 1, f.then.dials.Load())
+}
+
+func TestHedgeReleasesCopyAtCommit(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.Equal(t, "first:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+	s := c.(*hedgeStream)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	require.Nil(t, s.held, "a committed connection must not keep its copy")
+}
+
+func TestHedgeUDPReplayGivesThenHeadroom(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{}, &fakeOutbound{packet: echoPacket("then:"), headroom: 10}, nil)
+	pc, err := f.hedge.ListenPacket(f.ctx, hedgeDest)
+	require.NoError(t, err)
+	defer pc.Close()
+	dest := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443}
+	_, err = pc.WriteTo([]byte(quicPacket("initial")), dest)
+	require.NoError(t, err)
+	require.NoError(t, pc.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 64)
+	n, _, err := pc.ReadFrom(buf)
+	require.NoError(t, err)
+	require.Equal(t, "then:"+quicPacket("initial"), string(buf[:n]))
+	_, err = pc.WriteTo([]byte("after"), dest)
+	require.NoError(t, err, "writes after the move need headroom too")
+}
+
+func TestHedgeSlowFirstDialFallsBackWithoutMarkingBad(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{hang: true}, &fakeOutbound{stream: answer("then:")}, nil)
+	start := time.Now()
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	require.Less(t, time.Since(start), 2*time.Second, "First's dial is bounded by the commit timeout")
+	require.Equal(t, "then:hi", exchange(t, c, "hi"))
+	require.Equal(t, hedgeUnknown, f.verdict("www.youtube.com:443"), "a slow dial is not a block")
+}
+
+func TestHedgeCacheBoundsAddressBlockIndex(t *testing.T) {
+	c := newHedgeCache()
+	for i := range hedgeMaxEntries + 500 {
+		addr := netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 1})
+		prefix, _ := addr.Prefix(24)
+		c.mark(hedgeKey{site: "flaky.example", network: "tcp", prefix: prefix}, hedgeBad, time.Hour)
+	}
+	records := 0
+	for _, sites := range c.badSites {
+		records += len(sites)
+	}
+	require.LessOrEqual(t, records, hedgeMaxEntries, "one site failing across many blocks must stay bounded")
 }
