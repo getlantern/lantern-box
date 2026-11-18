@@ -50,14 +50,14 @@ type hedgeLeg struct {
 	moving    bool
 	moved     chan struct{} // closed when a move finishes
 	closed    bool
-	// decided is set at the first non-empty write, which tells whether the
-	// connection can be replayed. noReplay is set when it can't, and
-	// overflow when the copy outgrew its bound.
-	decided  bool
-	noReplay bool
-	overflow bool
-	// undecidedKept is set while bytes are kept before there are enough to
-	// decide; such a prefix is never replayed.
+	// decided is set once enough bytes have been written, across writes, to
+	// tell whether the connection can be replayed (see keepLocked); until
+	// then undecidedKept marks a kept prefix that must not be replayed.
+	// noReplay is set when the connection can't be replayed, and overflow
+	// when the copy outgrew its bound.
+	decided       bool
+	noReplay      bool
+	overflow      bool
 	undecidedKept bool
 	// commitTimer is the commit timeout, armed before the first write.
 	commitTimer *time.Timer
