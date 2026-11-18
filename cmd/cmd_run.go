@@ -69,19 +69,21 @@ var runCmd = &cobra.Command{
 
 // readConfig reads and parses a config, turning off an Unbounded volunteer's direct exit unless
 // the config carries the rules that check strangers' traffic, as node does for lantern-cloud's.
-func readConfig(path string) (option.Options, error) {
+// The box must be built with the context it returns, which the volunteer needs to run the exit.
+func readConfig(path string) (context.Context, option.Options, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return option.Options{}, fmt.Errorf("reading config file: %w", err)
+		return nil, option.Options{}, fmt.Errorf("reading config file: %w", err)
 	}
 	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, content)
 	if err != nil {
-		return option.Options{}, fmt.Errorf("parsing config file: %w", err)
+		return nil, option.Options{}, fmt.Errorf("parsing config file: %w", err)
 	}
-	if peerrules.StripUnsafeDirectExit(&options) {
+	ctx, stripped := peerrules.CheckDirectExit(globalCtx, &options)
+	if stripped {
 		log.Warn("the config's rules failed the direct exit check, so its Unbounded volunteer won't exit traffic directly")
 	}
-	return options, nil
+	return ctx, options, nil
 }
 
 // clientContextBounds reads a client-info frame from every routed connection
@@ -98,7 +100,7 @@ func clientContextBounds() clientcontext.MatchBounds {
 // create builds and starts a box. closeTrackers must be called after the box
 // is closed.
 func create(configPath string, datacapURL string) (instance *box.Box, cancel context.CancelFunc, closeTrackers func(), debugOptions *option.DebugOptions, err error) {
-	options, err := readConfig(configPath)
+	boxCtx, options, err := readConfig(configPath)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("read config: %w", err)
 	}
@@ -106,7 +108,7 @@ func create(configPath string, datacapURL string) (instance *box.Box, cancel con
 		debugOptions = options.Experimental.Debug
 	}
 
-	ctx, cancel := context.WithCancel(globalCtx)
+	ctx, cancel := context.WithCancel(boxCtx)
 	instance, err = box.New(box.Options{
 		Context: ctx,
 		Options: options,

@@ -398,7 +398,7 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 	if resp.ServerConfig == "" {
 		return nil, errors.New("register: response has no config")
 	}
-	options, volunteer, err := applyOperatorLimits(ctx, resp.ServerConfig, n.cfg.MaxPeers, n.cfg.BandwidthLimit)
+	boxCtx, options, volunteer, err := applyOperatorLimits(ctx, resp.ServerConfig, n.cfg.MaxPeers, n.cfg.BandwidthLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -410,7 +410,7 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 	if err := n.checkPort(); err != nil {
 		return nil, err
 	}
-	b, err := n.newBox(ctx, options)
+	b, err := n.newBox(boxCtx, options)
 	if err != nil {
 		if addrInUse(err) && bindsPort(err, n.port) {
 			err = fmt.Errorf("%w: %w", errPortInUse, err)
@@ -530,12 +530,13 @@ func (n *node) deregister(routeID string) {
 // applyOperatorLimits sets the operator's limits on the Unbounded volunteer
 // service in options, and reports whether there is one. It also turns off the
 // volunteer's direct exit unless options carry the rules peerrules checks for
-// one, which are global in the box and so apply to its exit streams too. ctx
-// carries the option registries.
-func applyOperatorLimits(ctx context.Context, options string, maxPeers int, bandwidthLimit string) (string, bool, error) {
+// one, which are global in the box and so apply to its exit streams too, and
+// returns the context to build the box with, which the volunteer needs to run
+// the exit. ctx carries the option registries.
+func applyOperatorLimits(ctx context.Context, options string, maxPeers int, bandwidthLimit string) (context.Context, string, bool, error) {
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(options))
 	if err != nil {
-		return "", false, fmt.Errorf("parse server config: %w", err)
+		return nil, "", false, fmt.Errorf("parse server config: %w", err)
 	}
 	found := false
 	for _, svc := range opts.Services {
@@ -552,17 +553,18 @@ func applyOperatorLimits(ctx context.Context, options string, maxPeers int, band
 		}
 	}
 	if !found {
-		return options, false, nil
+		return ctx, options, false, nil
 	}
+	boxCtx, stripped := peerrules.CheckDirectExit(ctx, &opts)
 	// The rules aren't logged: they name hosts.
-	if peerrules.StripUnsafeDirectExit(&opts) {
+	if stripped {
 		log.Warn("node: lantern-cloud's rules failed the direct exit check, so this node won't exit Unbounded traffic directly")
 	}
 	b, err := json.MarshalContext(ctx, opts)
 	if err != nil {
-		return "", false, fmt.Errorf("marshal server config: %w", err)
+		return nil, "", false, fmt.Errorf("marshal server config: %w", err)
 	}
-	return string(b), true, nil
+	return boxCtx, string(b), true, nil
 }
 
 func newSingBox(ctx context.Context, options string) (boxService, error) {

@@ -29,11 +29,11 @@ func init() {
 }
 
 func check(configPath string) error {
-	options, err := readConfig(configPath)
+	boxCtx, options, err := readConfig(configPath)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(globalCtx)
+	ctx, cancel := context.WithCancel(boxCtx)
 	instance, err := box.New(box.Options{
 		Context: ctx,
 		Options: options,

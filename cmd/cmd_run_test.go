@@ -16,6 +16,7 @@ import (
 
 	lbox "github.com/getlantern/lantern-box"
 	LO "github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/peerrules"
 	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 )
@@ -105,8 +106,9 @@ func TestReadConfigDropsUncheckedDirectExit(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.json")
 			require.NoError(t, os.WriteFile(path, []byte(tc.config), 0o600))
-			opts, err := readConfig(path)
+			ctx, opts, err := readConfig(path)
 			require.NoError(t, err)
+			assert.Equal(t, tc.want, peerrules.DirectExitChecked(ctx), "the box's context lets the volunteer exit")
 			require.Len(t, opts.Services, 1)
 			vol, ok := opts.Services[0].Options.(*LO.UnboundedVolunteerOptions)
 			require.True(t, ok)

@@ -22,6 +22,7 @@ import (
 	"github.com/sagernet/sing/service"
 
 	C "github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/internal/directexit"
 	"github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 )
@@ -247,9 +248,15 @@ func (v *Volunteer) Close() error {
 
 // startExit makes the volunteer's direct exit, served through its box's router, so the box's
 // route rules apply to every stream and flow. It returns nil when the volunteer has no direct
-// exit, or can't make one, in which case it serves as a relay only.
+// exit, or can't make one, in which case it serves as a relay only. The box must have been
+// built with the context peerrules.CheckDirectExit returned for its options: those rules are
+// all that checks strangers' traffic.
 func (v *Volunteer) startExit() *exit.Exit {
 	if !v.directExit {
+		return nil
+	}
+	if !directexit.Checked(v.ctx) {
+		v.logger.WarnContext(v.ctx, "unbounded volunteer: the box's rules weren't checked for a direct exit, so no direct exit")
 		return nil
 	}
 	router := service.FromContext[adapter.Router](v.ctx)

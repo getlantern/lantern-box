@@ -1,6 +1,7 @@
 package peerrules
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -502,4 +503,41 @@ func TestStripUnsafeDirectExit(t *testing.T) {
 		opts := parseOptions(t, `{}`)
 		assert.False(t, StripUnsafeDirectExit(&opts))
 	})
+}
+
+// CheckDirectExit strips as StripUnsafeDirectExit does, and marks the context only when a
+// direct exit is left, so a box's volunteer runs one only from options checked for it.
+func TestCheckDirectExit(t *testing.T) {
+	withVolunteer := func(cfg string) string {
+		return strings.Replace(cfg, `"inbounds":[{"type":"samizdat","tag":"samizdat-in"}],`, volunteerDirectExit+`,`, 1)
+	}
+	noExit := `{` + strings.Replace(volunteerDirectExit, `,"direct_exit":true`, ``, 1) + `}`
+	assert.False(t, DirectExitChecked(context.Background()), "an unchecked context")
+	for name, tc := range map[string]struct {
+		config            string
+		stripped, checked bool
+	}{
+		"every rule":       {config: withVolunteer(directExitRules(resolveRule + `,` + privateRejectRule)), checked: true},
+		"abuse rules only": {config: withVolunteer(minimalValidLaunchCfg), stripped: true},
+		"no direct exit":   {config: noExit},
+		"no volunteer":     {config: `{}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := parseOptions(t, tc.config)
+			ctx, stripped := CheckDirectExit(context.Background(), &opts)
+			assert.Equal(t, tc.stripped, stripped)
+			assert.Equal(t, tc.checked, DirectExitChecked(ctx))
+			if len(opts.Services) > 0 {
+				assert.Equal(t, tc.checked, volunteerOptions(t, opts).DirectExit)
+			}
+
+			// A context checked for other options doesn't carry over.
+			checkedOpts := parseOptions(t, withVolunteer(directExitRules(resolveRule+`,`+privateRejectRule)))
+			marked, _ := CheckDirectExit(context.Background(), &checkedOpts)
+			require.True(t, DirectExitChecked(marked))
+			opts = parseOptions(t, tc.config)
+			ctx, _ = CheckDirectExit(marked, &opts)
+			assert.Equal(t, tc.checked, DirectExitChecked(ctx))
+		})
+	}
 }

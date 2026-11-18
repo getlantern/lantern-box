@@ -27,6 +27,7 @@ import (
 	box "github.com/getlantern/lantern-box"
 	C "github.com/getlantern/lantern-box/constant"
 	LO "github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/peerrules"
 	"github.com/getlantern/lantern-box/portforward"
 	"github.com/getlantern/lantern-box/tracker/peerconn"
 )
@@ -466,7 +467,7 @@ func TestNodeRetriesAfterFailedVerify(t *testing.T) {
 // censored country, is served as it is.
 func TestApplyOperatorLimitsWithoutVolunteer(t *testing.T) {
 	in := `{"inbounds":[{"type":"direct","tag":"in","listen":"127.0.0.1","listen_port":30001}]}`
-	out, found, err := applyOperatorLimits(box.BaseContext(), in, 7, "10mbit")
+	_, out, found, err := applyOperatorLimits(box.BaseContext(), in, 7, "10mbit")
 	require.NoError(t, err)
 	assert.False(t, found)
 	assert.Equal(t, in, out)
@@ -531,7 +532,7 @@ func TestNewSingBoxRunsVolunteer(t *testing.T) {
 	options := fmt.Sprintf(`{"inbounds":[{"type":"direct","tag":"in","listen":"127.0.0.1","listen_port":0}],`+
 		`"services":[{"type":"unbounded","tag":"unbounded-volunteer","discovery_srv":%q,"egress_addr":%q,"stun_servers":["stun:127.0.0.1:9"]}]}`,
 		unreachable.URL, "ws"+unreachable.URL[len("http"):])
-	limited, found, err := applyOperatorLimits(box.BaseContext(), options, 3, "1mbit")
+	_, limited, found, err := applyOperatorLimits(box.BaseContext(), options, 3, "1mbit")
 	require.NoError(t, err)
 	require.True(t, found)
 
@@ -870,6 +871,10 @@ const abuseRoute = `"route":{
 	]
 }`
 
+// directExitVolunteer is lantern-cloud's volunteer service, asking to exit directly.
+const directExitVolunteer = `"services":[{"type":"unbounded","tag":"unbounded-volunteer","discovery_srv":"https://freddie.test",` +
+	`"egress_addr":"wss://egress.test","stun_servers":["stun:192.0.2.1:3478"],"direct_exit":true}]`
+
 var directExitRoute = strings.Replace(strings.Replace(abuseRoute, `"rules":[`,
 	`"rules":[{"action":"resolve","server":"dns"},{"action":"reject","ip_is_private":true},`, 1),
 	`6697]}`, `6697]},{"action":"route","outbound":"direct","udp_connect":true}`, 1)
@@ -878,24 +883,58 @@ var directExitRoute = strings.Replace(strings.Replace(abuseRoute, `"rules":[`,
 // global in its box, with a resolve ahead of a private-address reject: without them, the node
 // drops direct_exit and still serves as a relay.
 func TestApplyOperatorLimitsDropsDirectExitWithoutRules(t *testing.T) {
-	const volunteer = `"services":[{"type":"unbounded","tag":"unbounded-volunteer","discovery_srv":"https://freddie.test",` +
-		`"egress_addr":"wss://egress.test","stun_servers":["stun:192.0.2.1:3478"],"direct_exit":true}]`
 	for name, tc := range map[string]struct {
 		config string
 		want   bool
 	}{
-		"no route":         {config: `{` + volunteer + `}`, want: false},
-		"no abuse set":     {config: `{"route":{"rules":[{"action":"reject","port":[25]}]},` + volunteer + `}`, want: false},
-		"abuse rules only": {config: `{` + abuseRoute + `,` + volunteer + `}`, want: false},
-		"every rule":       {config: `{` + directExitRoute + `,` + volunteer + `}`, want: true},
+		"no route":         {config: `{` + directExitVolunteer + `}`, want: false},
+		"no abuse set":     {config: `{"route":{"rules":[{"action":"reject","port":[25]}]},` + directExitVolunteer + `}`, want: false},
+		"abuse rules only": {config: `{` + abuseRoute + `,` + directExitVolunteer + `}`, want: false},
+		"every rule":       {config: `{` + directExitRoute + `,` + directExitVolunteer + `}`, want: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			out, found, err := applyOperatorLimits(box.BaseContext(), tc.config, 0, "")
+			ctx, out, found, err := applyOperatorLimits(box.BaseContext(), tc.config, 0, "")
 			require.NoError(t, err)
 			require.True(t, found)
 			vol := volunteerOf(t, out)
 			assert.Equal(t, tc.want, vol.DirectExit)
+			assert.Equal(t, tc.want, peerrules.DirectExitChecked(ctx), "the box's context lets the volunteer exit")
 			assert.Equal(t, "https://freddie.test", vol.DiscoverySrv, "the volunteer still relays")
+		})
+	}
+}
+
+// The node builds its box with the context peerrules.CheckDirectExit returned, which its
+// volunteer needs to run a direct exit, only when lantern-cloud's rules pass the check.
+func TestNodeBuildsTheBoxWithTheDirectExitCheck(t *testing.T) {
+	for name, tc := range map[string]struct {
+		config  string
+		checked bool
+	}{
+		"every rule":       {config: `{` + directExitRoute + `,` + directExitVolunteer + `}`, checked: true},
+		"abuse rules only": {config: `{` + abuseRoute + `,` + directExitVolunteer + `}`},
+		"no direct exit":   {config: volunteerConfig},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cloud := &fakeCloud{t: t, config: tc.config}
+			boxes := &fakeBoxes{}
+			n := newTestNode(t, cloud, boxes, Config{})
+			checked := make(chan bool, 1)
+			n.newBox = func(ctx context.Context, options string) (boxService, error) {
+				select {
+				case checked <- peerrules.DirectExitChecked(ctx):
+				default:
+				}
+				return boxes.factory(ctx, options)
+			}
+			stop := runNode(t, n)
+			defer stop()
+			select {
+			case got := <-checked:
+				assert.Equal(t, tc.checked, got)
+			case <-time.After(5 * time.Second):
+				t.Fatal("no box built")
+			}
 		})
 	}
 }

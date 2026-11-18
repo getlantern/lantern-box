@@ -1,6 +1,7 @@
 package peerrules
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"github.com/sagernet/sing/common/json"
 
 	C "github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/internal/directexit"
 	LO "github.com/getlantern/lantern-box/option"
 )
 
@@ -220,7 +222,8 @@ func isTerminal(r option.Rule) bool {
 // StripUnsafeDirectExit turns off direct_exit on every Unbounded volunteer service in options
 // unless options pass ValidateAbuseRulesOptions and ValidateDirectExitRulesOptions: a
 // volunteer's direct exit routes strangers' traffic through its box's route rules. It reports
-// whether it turned any off. The volunteer still relays.
+// whether it turned any off. The volunteer still relays. A box runs a direct exit only when
+// built with the context CheckDirectExit returns.
 func StripUnsafeDirectExit(options *option.Options) bool {
 	var exits []*LO.UnboundedVolunteerOptions
 	for _, svc := range options.Services {
@@ -238,6 +241,24 @@ func StripUnsafeDirectExit(options *option.Options) bool {
 		vol.DirectExit = false
 	}
 	return true
+}
+
+// CheckDirectExit is StripUnsafeDirectExit for a box built with the context it returns, and
+// reports whether it turned any direct exit off. The volunteer service runs a direct exit only
+// in a box whose context CheckDirectExit marked, so it must check the options the box is built
+// from, after any other change to them.
+func CheckDirectExit(ctx context.Context, options *option.Options) (context.Context, bool) {
+	stripped := StripUnsafeDirectExit(options)
+	kept := slices.ContainsFunc(options.Services, func(svc option.Service) bool {
+		vol, ok := svc.Options.(*LO.UnboundedVolunteerOptions)
+		return ok && svc.Type == C.TypeUnbounded && vol.DirectExit
+	})
+	return directexit.WithChecked(ctx, kept), stripped
+}
+
+// DirectExitChecked reports whether ctx came from CheckDirectExit with a direct exit kept.
+func DirectExitChecked(ctx context.Context) bool {
+	return directexit.Checked(ctx)
 }
 
 // isUnconditionalResolve reports whether rule resolves every destination: a resolve action,
