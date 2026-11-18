@@ -23,17 +23,27 @@ const defaultDataPlaneResetQuiet = 5 * time.Second
 
 const defaultFirstResponseTimeout = 10 * time.Second
 
+// responseClockStep is how stale a member's last-read time may be. It skips
+// most stores to a clock every connection on the member shares.
+const responseClockStep = 100 * time.Millisecond
+
 type dataPlaneHooks struct {
 	onFailure func(adapter.UserFailureKind)
 	// onError runs on the IO goroutine, outside the watchdog's lock.
 	onError    func(err error, state dataPlaneIO, excused bool)
 	onActivity func(time.Time)
+	// onResponse runs on every non-empty read.
+	onResponse func(time.Time)
+	// answeredSince reports whether the member read data on any connection
+	// at or after the given time.
+	answeredSince func(time.Time) bool
 }
 
 // makeHooks records chargeable failures and starts recovery. Only primary TCP
 // resets and unanswered writes trigger selection confirmation.
 func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind, generation uint64) dataPlaneHooks {
 	confirms := network == N.NetworkTCP && route == primaryRoute
+	clock := s.responseClock(outerTag)
 	return dataPlaneHooks{
 		onFailure: func(kind adapter.UserFailureKind) {
 			if !s.chargeable(outerTag, route) {
@@ -62,7 +72,28 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 				" err=", err, " quiet=", state.quiet, " last=", last, " proven=", state.proven)
 		},
 		onActivity: s.noteDataActivity,
+		onResponse: func(now time.Time) {
+			if n := now.UnixNano(); n-clock.Load() >= int64(responseClockStep) {
+				clock.Store(n)
+			}
+		},
+		answeredSince: func(t time.Time) bool {
+			if clock.Load() < t.UnixNano() {
+				return false
+			}
+			s.logger.Debug("no response excused: tag=", outerTag, " answered another connection")
+			return true
+		},
 	}
+}
+
+// responseClock returns tag's last-read time, shared by all its connections.
+func (s *MutableAutoSelect) responseClock(tag string) *atomic.Int64 {
+	if c, ok := s.lastResponse.Load(tag); ok {
+		return c
+	}
+	c, _ := s.lastResponse.LoadOrStore(tag, new(atomic.Int64))
+	return c
 }
 
 type dataPlaneIO struct {
@@ -79,6 +110,8 @@ type dataPlaneIO struct {
 // A non-zero firstResponseTimeout starts after the first non-empty write,
 // independently of provedReadBytes. Read bytes or a non-timeout read error
 // (including EOF) disarm it. Set firstResponseTimeout before the first IO.
+// It isn't charged if the member read data on another connection while this
+// one waited: the member works, so the destination is what's silent.
 type dataPlaneWatchdog struct {
 	idle                 time.Duration
 	firstResponseTimeout time.Duration
@@ -89,6 +122,7 @@ type dataPlaneWatchdog struct {
 	lastIO               time.Time   // guarded by ioMu
 	lastWasWrite         bool        // guarded by ioMu
 	firstResponseTimer   *time.Timer // guarded by ioMu
+	waitStart            time.Time   // guarded by ioMu
 	readBytes            atomic.Uint64
 	responded            atomic.Bool
 	proven               atomic.Bool
@@ -133,6 +167,9 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 		// traffic that resumes on it is still use of the group.
 		if w.hooks.onActivity != nil {
 			w.hooks.onActivity(now)
+		}
+		if isRead && w.hooks.onResponse != nil {
+			w.hooks.onResponse(now)
 		}
 	}
 	// Short-circuit once stalled: a late noteIO must not re-arm the
@@ -224,6 +261,7 @@ func (w *dataPlaneWatchdog) startFirstResponseTimer() {
 	if w.firstResponseTimer != nil || w.responded.Load() || w.stalled.Load() {
 		return
 	}
+	w.waitStart = time.Now()
 	w.firstResponseTimer = time.AfterFunc(w.firstResponseTimeout, w.fireNoResponse)
 }
 
@@ -249,8 +287,12 @@ func (w *dataPlaneWatchdog) stopFirstResponseTimer() {
 func (w *dataPlaneWatchdog) fireNoResponse() {
 	w.ioMu.Lock()
 	charge := !w.responded.Load() && w.stalled.CompareAndSwap(false, true)
+	start := w.waitStart
 	w.ioMu.Unlock()
 	if !charge {
+		return
+	}
+	if w.hooks.answeredSince != nil && w.hooks.answeredSince(start) {
 		return
 	}
 	if !w.fired.CompareAndSwap(false, true) {

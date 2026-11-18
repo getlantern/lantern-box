@@ -380,3 +380,126 @@ func TestDialContext_NoResponseChargedOnTCPOnly(t *testing.T) {
 		})
 	}
 }
+
+// A member that answers other connections works, so a connection it carries
+// that hears nothing back is waiting on a silent destination, like a P2P peer.
+func TestMakeHooks_NoResponseExcusedWhileMemberAnswersOthers(t *testing.T) {
+	const timeout = 10 * time.Second
+	tests := []struct {
+		name    string
+		run     func(silent, other *dataPlaneWatchdog)
+		charged bool
+	}{
+		{"no other traffic", func(silent, _ *dataPlaneWatchdog) {
+			silent.noteIO(8, nil, false)
+			time.Sleep(timeout)
+		}, true},
+		{"other connection answered during the wait", func(silent, other *dataPlaneWatchdog) {
+			silent.noteIO(8, nil, false)
+			time.Sleep(timeout / 2)
+			other.noteIO(5, nil, true)
+			time.Sleep(timeout / 2)
+		}, false},
+		{"other connection answered only before the wait", func(silent, other *dataPlaneWatchdog) {
+			other.noteIO(5, nil, true)
+			time.Sleep(time.Second)
+			silent.noteIO(8, nil, false)
+			time.Sleep(timeout)
+		}, true},
+		{"other connection only wrote", func(silent, other *dataPlaneWatchdog) {
+			silent.noteIO(8, nil, false)
+			time.Sleep(timeout / 2)
+			other.noteIO(5, nil, false)
+			time.Sleep(timeout / 2)
+		}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, _ := newTestMUR(t, "a")
+				s.stickyTag.tcp.Store("a")
+				s.cfg.ladderCooldown = time.Hour
+				s.lastLadderAt.Store(time.Now().UnixNano())
+				var silent, other dataPlaneWatchdog
+				for _, w := range []*dataPlaneWatchdog{&silent, &other} {
+					w.init(time.Hour, defaultDataPlaneProvedReadBytes,
+						s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()))
+					w.firstResponseTimeout = timeout
+					defer w.closeWatchdog()
+				}
+				tt.run(&silent, &other)
+				synctest.Wait()
+
+				uf, _ := userFailures(s, "a")
+				if tt.charged {
+					require.Len(t, uf, 1)
+					assert.Equal(t, adapter.UserFailureNoResponse, uf[0].Kind)
+				} else {
+					assert.Empty(t, uf)
+				}
+			})
+		})
+	}
+}
+
+func TestDialContext_NoResponseNotChargedWhenMemberAnswersOthers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newTestMUR(t, "a")
+		recordSuccess(s, "a", 10)
+		s.cfg.dataPlaneFirstResponseTimeout = defaultFirstResponseTimeout
+		s.cfg.ladderCooldown = time.Hour
+		s.lastLadderAt.Store(time.Now().UnixNano())
+		var dials atomic.Int32
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			if dials.Add(1) == 1 {
+				return blackholeConn(), nil
+			}
+			client, server := net.Pipe()
+			go func() {
+				defer server.Close()
+				buf := make([]byte, 64)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					if _, err := server.Write(buf[:n]); err != nil {
+						return
+					}
+				}
+			}()
+			return client, nil
+		}
+
+		silent, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		defer silent.Close()
+		_, err = silent.Write([]byte("BitTorrent protocol"))
+		require.NoError(t, err)
+		go io.ReadFull(silent, make([]byte, 2))
+
+		time.Sleep(defaultFirstResponseTimeout / 2)
+		web, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		defer web.Close()
+		_, err = web.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
+		require.NoError(t, err)
+		_, err = io.ReadFull(web, make([]byte, 4))
+		require.NoError(t, err)
+
+		time.Sleep(defaultFirstResponseTimeout)
+		synctest.Wait()
+
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf)
+	})
+}
+
+func TestRemove_DropsResponseClock(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	s.responseClock("a").Store(1)
+	_, err := s.Remove("a")
+	require.NoError(t, err)
+	_, ok := s.lastResponse.Load("a")
+	assert.False(t, ok)
+}

@@ -128,6 +128,9 @@ type MutableAutoSelect struct {
 	probing    bool
 	// Unix-nano of the most recent non-empty data-plane Read or Write.
 	lastDataAt atomic.Int64
+	// lastResponse is each member's Unix-nano time of its latest non-empty
+	// Read on any connection.
+	lastResponse isync.TypedMap[string, *atomic.Int64]
 	// networkGeneration fences work across interface changes; written under access.
 	networkGeneration atomic.Uint64
 
@@ -473,6 +476,7 @@ func (s *MutableAutoSelect) Remove(tags ...string) (n int, err error) {
 		delete(s.probeMembers, tag)
 		delete(s.urlOverrides, tag)
 		delete(s.histories, tag)
+		s.lastResponse.Delete(tag)
 		if s.history != nil {
 			s.history.Delete(tag)
 		}
