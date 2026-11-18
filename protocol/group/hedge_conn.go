@@ -350,20 +350,6 @@ func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter
 	move(kind)
 }
 
-// noteReset runs as the watchdog charges a reset on First, before the
-// client sees the error. A reset after the commit is counted here, since
-// firstFailed handles it later on its own goroutine, possibly after the
-// client closed and the close was taken as clean. A reset before the commit
-// is left to firstFailed's move. The watchdog calls this from the IO path,
-// which never holds mu.
-func (l *hedgeLeg) noteReset() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.committed && l.onFirst && !l.moving {
-		l.failedAfterCommitLocked(lAdapter.UserFailureReset)
-	}
-}
-
 // failedAfterCommitLocked handles First failing after it replied. A stall
 // marks the site bad. A reset is one strike against it, at most one per
 // connection: hedgeResetStrikes of them, with no clean connection between,
