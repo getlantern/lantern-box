@@ -355,7 +355,7 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	md.Outbound = o.Tag()
 	md.Destination = destination
 
-	if pc, ok, err := o.listenExit(ctx, destination); ok {
+	if pc, ok, err := o.listenExit(ctx); ok {
 		return pc, err
 	}
 	if o.dial == nil {
@@ -403,12 +403,12 @@ func (o *Outbound) dialExit(ctx context.Context, network string, destination M.S
 	if errors.Is(err, errNoExitPath) {
 		return nil, false, nil
 	}
-	o.logExit(ctx, "unbounded dial", network, destination, started, err)
+	o.logExit(ctx, "unbounded dial", network, started, err)
 	return conn, true, err
 }
 
 // listenExit is ListenPacket's dialExit.
-func (o *Outbound) listenExit(ctx context.Context, destination M.Socksaddr) (net.PacketConn, bool, error) {
+func (o *Outbound) listenExit(ctx context.Context) (net.PacketConn, bool, error) {
 	if o.exits == nil {
 		return nil, false, nil
 	}
@@ -417,15 +417,16 @@ func (o *Outbound) listenExit(ctx context.Context, destination M.Socksaddr) (net
 	if errors.Is(err, errNoExitPath) {
 		return nil, false, nil
 	}
-	o.logExit(ctx, "unbounded ListenPacket", N.NetworkUDP, destination, started, err)
+	o.logExit(ctx, "unbounded ListenPacket", N.NetworkUDP, started, err)
 	return pc, true, err
 }
 
-func (o *Outbound) logExit(ctx context.Context, what, network string, destination M.Socksaddr, started time.Time, err error) {
+// logExit logs a direct exit dial without its destination: the traffic is a stranger's, carried
+// by a volunteer.
+func (o *Outbound) logExit(ctx context.Context, what, network string, started time.Time, err error) {
 	if err != nil {
 		o.logger.ErrorContext(ctx, what+" failed",
 			"network", network,
-			"dest", destination.String(),
 			"path", "direct_exit",
 			"elapsed", time.Since(started),
 			"err", failureclass.Of(err))
@@ -433,7 +434,6 @@ func (o *Outbound) logExit(ctx context.Context, what, network string, destinatio
 	}
 	o.logger.DebugContext(ctx, what+" ok",
 		"network", network,
-		"dest", destination.String(),
 		"path", "direct_exit",
 		"elapsed", time.Since(started))
 }

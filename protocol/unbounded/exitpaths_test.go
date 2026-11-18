@@ -268,6 +268,24 @@ func TestExitPathsDialThroughTheNewestPath(t *testing.T) {
 	assert.Equal(t, 2, p.live())
 }
 
+// A newest path whose volunteer never answers costs a dial the QUIC handshake timeout, not
+// sing-box's 15s TLS default, before the dial moves to the next path.
+func TestExitPathsFailOverFromASilentPath(t *testing.T) {
+	v := newVolunteerExit(t)
+	p := newTestExitPaths(t)
+	p.onExitPath(v.path(t))
+	_, uConn := pathPair(t)
+	pin, _, _ := v.e.Options().Params()
+	p.onExitPath(UBClientcore.ExitPath{Conn: &trackedConn{placeholderConn: uConn}, CertPin: pin, Password: "x"})
+	started := time.Now()
+	conn, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr("example.com:80"))
+	require.NoError(t, err)
+	assert.Less(t, time.Since(started), 7*time.Second)
+	echoes(t, conn)
+	assert.EqualValues(t, 1, v.r.routed.Load(), "the older path carried the dial")
+	assert.Equal(t, 1, p.live(), "the silent path was dropped")
+}
+
 func TestExitPathsNoPath(t *testing.T) {
 	p := newTestExitPaths(t)
 	_, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr("example.com:80"))
@@ -542,4 +560,41 @@ func TestOutboundDialsThroughADirectExit(t *testing.T) {
 
 	require.NoError(t, o.Close())
 	assert.True(t, s.user.closed.Load(), "Close closes the paths")
+}
+
+// A direct exit carries a stranger's traffic through a volunteer, so its dials' log lines name
+// no destination.
+func TestOutboundDirectExitLogsNoDestination(t *testing.T) {
+	logs := &syncBuffer{}
+	factory := sblog.NewDefaultFactory(context.Background(), sblog.Formatter{}, logs, "", nil, false)
+	factory.SetLevel(sblog.LevelTrace)
+	require.NoError(t, factory.Start())
+	t.Cleanup(func() { _ = factory.Close() })
+	out, err := NewOutbound(context.Background(), nil, factory.Logger(), "unbounded-test", option.UnboundedOutboundOptions{
+		DirectExit: &option.UnboundedDirectExitOptions{ServerName: "www.example.com"},
+	})
+	require.NoError(t, err)
+	o := out.(*Outbound)
+	t.Cleanup(func() { _ = o.Close() })
+	v := newVolunteerExit(t)
+
+	o.rtcOpt.OnExitPath(v.path(t))
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = o.DialContext(canceled, "tcp", M.ParseSocksaddr("failed-dest.example:80"))
+	require.Error(t, err)
+
+	o.rtcOpt.OnExitPath(v.path(t))
+	conn, err := o.DialContext(dialTimeout(t), "tcp", M.ParseSocksaddr("tcp-dest.example:80"))
+	require.NoError(t, err)
+	echoes(t, conn)
+	pc, err := o.ListenPacket(dialTimeout(t), M.ParseSocksaddr("udp-dest.example:53"))
+	require.NoError(t, err)
+	_ = pc.Close()
+
+	got := logs.String()
+	assert.Contains(t, got, "unbounded dial failed")
+	assert.Contains(t, got, "unbounded dial ok")
+	assert.Contains(t, got, "unbounded ListenPacket ok")
+	assert.NotContains(t, got, "dest.example")
 }

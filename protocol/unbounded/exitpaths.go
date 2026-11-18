@@ -35,6 +35,8 @@ const (
 	// exitFailureLimit path failures in a row turn direct exits off for exitBackoff.
 	exitFailureLimit = 3
 	exitBackoff      = 10 * time.Minute
+	// exitHandshakeTimeout bounds a path's QUIC handshake, after which a dial tries the next path.
+	exitHandshakeTimeout = 5 * time.Second
 )
 
 var (
@@ -123,6 +125,9 @@ func (p *exitPaths) onExitPath(ep UBClientcore.ExitPath) {
 		ServerName:                 p.serverName,
 		ALPN:                       badoption.Listable[string]{"h3"},
 		CertificatePublicKeySHA256: badoption.Listable[[]byte]{pin},
+		// sing-quic takes this as the QUIC handshake's idle timeout. sing-box's default, 15s,
+		// would stall every dial that long on a newest path whose volunteer has gone quiet.
+		HandshakeTimeout: badoption.Duration(exitHandshakeTimeout),
 	})
 	if err != nil {
 		path.close()
