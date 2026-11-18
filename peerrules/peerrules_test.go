@@ -326,15 +326,18 @@ func TestValidateAbuseRulesOptionsNeedsRoute(t *testing.T) {
 	assert.Contains(t, err.Error(), "route")
 }
 
-// directExitRules puts a resolve and a private-address reject ahead of minimalValidLaunchCfg's
-// rules, as lantern-cloud's peer configs do.
+// directExitRules puts rules, such as a resolve and a private-address reject, ahead of
+// minimalValidLaunchCfg's rules, and a final route with udp_connect after them, as
+// lantern-cloud's peer configs do.
 func directExitRules(rules string) string {
-	return strings.Replace(minimalValidLaunchCfg, `"rules":[`, `"rules":[`+rules+`,`, 1)
+	cfg := strings.Replace(minimalValidLaunchCfg, `"rules":[`, `"rules":[`+rules+`,`, 1)
+	return strings.Replace(cfg, `6697]}`, `6697]},`+finalRoute, 1)
 }
 
 const (
 	resolveRule         = `{"action":"resolve","server":"dns"}`
 	privateRejectRule   = `{"action":"reject","ip_is_private":true}`
+	finalRoute          = `{"action":"route","outbound":"direct","udp_connect":true}`
 	volunteerDirectExit = `"services":[{"type":"unbounded","tag":"unbounded-volunteer","discovery_srv":"https://freddie.test",` +
 		`"egress_addr":"wss://egress.test","stun_servers":["stun:192.0.2.1:3478"],"direct_exit":true}]`
 )
@@ -362,6 +365,18 @@ func TestValidateDirectExitRules(t *testing.T) {
 		"private route, not reject":       {rules: resolveRule + `,{"action":"route","outbound":"direct","ip_is_private":true}`},
 		"source private reject":           {rules: resolveRule + `,{"action":"reject","source_ip_is_private":true}`},
 		"rules between resolve and check": {rules: resolveRule + `,{"action":"reject","port":[22]},` + privateRejectRule, ok: true},
+		"unconditional route first":       {rules: finalRoute + `,` + resolveRule + `,` + privateRejectRule},
+		"probe route first":               {rules: `{"action":"route","outbound":"probe","domain":["api.test"],"port":[80]},` + resolveRule + `,` + privateRejectRule, ok: true},
+		"probe route by suffix":           {rules: `{"action":"route","outbound":"probe","domain_suffix":["api.test"]},` + resolveRule + `,` + privateRejectRule},
+		"probe route by IP too":           {rules: `{"action":"route","outbound":"probe","domain":["api.test"],"ip_cidr":["192.0.2.0/24"]},` + resolveRule + `,` + privateRejectRule},
+		"inverted probe route":            {rules: `{"action":"route","outbound":"probe","domain":["api.test"],"invert":true},` + resolveRule + `,` + privateRejectRule},
+		"route before private reject":     {rules: resolveRule + `,{"action":"route","outbound":"direct","udp_connect":true,"ip_cidr":["127.0.0.1/32"]},` + privateRejectRule},
+		"route-options first":             {rules: `{"action":"route-options","udp_connect":true},` + resolveRule + `,` + privateRejectRule},
+		"hijack-dns first":                {rules: `{"action":"hijack-dns","port":[53]},` + resolveRule + `,` + privateRejectRule},
+		"logical route first": {rules: `{"type":"logical","mode":"or","rules":[{"domain":["a.test"]},{"port":[80]}],` +
+			`"action":"route","outbound":"direct","udp_connect":true},` + resolveRule + `,` + privateRejectRule},
+		"sniff and rejects first": {rules: `{"action":"sniff","port":[80]},{"action":"reject","rule_set":["geosite-malware"],"invert":true},` +
+			resolveRule + `,` + privateRejectRule, ok: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := ValidateDirectExitRulesOptions(parseOptions(t, directExitRules(tc.rules)))
@@ -373,6 +388,78 @@ func TestValidateDirectExitRules(t *testing.T) {
 		})
 	}
 	assert.Error(t, ValidateDirectExitRulesOptions(option.Options{}), "no route")
+}
+
+// lantern-cloud's peer configs, as cmd/api/pcfg builds them: peerExitOptions' abuse and
+// static rejects, under applyPeerAllowlist (the pool's) or applyPersonalExit (a personal
+// exit's), with injectBanditProbe's rules ahead of them. Its sniff comes only with endpoints.
+const (
+	cloudRuleSets = `"rule_set":[
+		{"type":"inline","tag":"peer-allowlist","rules":[{"network":["tcp"],"domain":["allowed.test"],"port":[80,443]}]},
+		{"type":"remote","tag":"geosite-malware","format":"binary","url":"https://example/geosite-malware.srs","download_detour":"direct"},
+		{"type":"remote","tag":"geoip-malware","format":"binary","url":"https://example/geoip-malware.srs","download_detour":"direct"},
+		{"type":"remote","tag":"geosite-phishing","format":"binary","url":"https://example/geosite-phishing.srs","download_detour":"direct"},
+		{"type":"remote","tag":"geosite-cryptominers","format":"binary","url":"https://example/geosite-cryptominers.srs","download_detour":"direct"}
+	]`
+	cloudProbeSniff = `{"port":[80],"action":"sniff","sniffer":["http"]}`
+	cloudProbe      = `{"domain":["api.test"],"port":[80],"action":"route","outbound":"banditprobe"}`
+	cloudNotAllowed = `{"rule_set":["peer-allowlist"],"invert":true,"action":"reject"}`
+	cloudAbuse      = `{"rule_set":["geosite-malware"],"action":"reject"},
+		{"rule_set":["geoip-malware"],"action":"reject"},
+		{"rule_set":["geosite-phishing"],"action":"reject"},
+		{"rule_set":["geosite-cryptominers"],"action":"reject"},
+		{"ip_cidr":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","::1/128","fc00::/7","fe80::/10"],"action":"reject"},
+		{"port":[25,465,587,2525,6660,6661,6662,6663,6664,6665,6666,6667,6668,6669,6697],"action":"reject"}`
+	cloudAllowed = `{"rule_set":["peer-allowlist"],"action":"route","outbound":"direct","udp_connect":true}`
+)
+
+func cloudConfig(rules ...string) string {
+	return `{"route":{` + cloudRuleSets + `,"rules":[` + strings.Join(rules, ",") + `]}}`
+}
+
+func TestValidateDirectExitRulesTakesLanternCloudConfigs(t *testing.T) {
+	pool := cloudConfig(cloudProbeSniff, cloudProbe, cloudNotAllowed, resolveRule, privateRejectRule, cloudAbuse, cloudAllowed, `{"action":"reject"}`)
+	personal := cloudConfig(cloudProbe, resolveRule, privateRejectRule, cloudAbuse, finalRoute)
+	for name, cfg := range map[string]string{
+		"pool":                  pool,
+		"personal":              personal,
+		"personal, with sniff":  cloudConfig(cloudProbeSniff, cloudProbe, resolveRule, privateRejectRule, cloudAbuse, finalRoute),
+		"personal, no probe":    cloudConfig(resolveRule, privateRejectRule, cloudAbuse, finalRoute),
+		"pool, rejecting final": strings.Replace(pool, `]}}`, `],"final":"direct"}}`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := parseOptions(t, cfg)
+			require.NoError(t, ValidateAbuseRulesOptions(opts))
+			assert.NoError(t, ValidateDirectExitRulesOptions(opts))
+		})
+	}
+}
+
+// The rules must come in the order sing-box needs them: it stops at the first rule that routes
+// a connection, and IP rules don't see a domain's addresses before a resolve. Every route
+// pins a UDP flow to its first destination, which is all the rules check.
+func TestValidateDirectExitRulesNeedsOrderAndUDPConnect(t *testing.T) {
+	for name, cfg := range map[string]string{
+		"unconditional route before the rejects": cloudConfig(finalRoute, resolveRule, privateRejectRule, cloudAbuse, finalRoute),
+		"logical rule before the rejects": cloudConfig(`{"type":"logical","mode":"and","rules":[{"network":["tcp"]},{"port":[443]}],"action":"route","outbound":"direct","udp_connect":true}`,
+			resolveRule, privateRejectRule, cloudAbuse, finalRoute),
+		"abuse rejects only before the resolve":    cloudConfig(cloudAbuse, resolveRule, privateRejectRule, finalRoute),
+		"allowlist route before the abuse rejects": cloudConfig(cloudNotAllowed, resolveRule, privateRejectRule, cloudAllowed, cloudAbuse, `{"action":"reject"}`),
+		"route without udp_connect":                cloudConfig(cloudProbe, resolveRule, privateRejectRule, cloudAbuse, `{"action":"route","outbound":"direct"}`),
+		"conditional route without udp_connect": cloudConfig(resolveRule, privateRejectRule, cloudAbuse,
+			`{"rule_set":["peer-allowlist"],"action":"route","outbound":"direct"}`, `{"action":"reject"}`),
+		"bypass without udp_connect":  cloudConfig(resolveRule, privateRejectRule, cloudAbuse, `{"action":"bypass","outbound":"direct","port":[443]}`, finalRoute),
+		"direct action":               cloudConfig(resolveRule, privateRejectRule, cloudAbuse, `{"action":"direct","port":[443]}`, finalRoute),
+		"final with no terminal rule": strings.Replace(cloudConfig(resolveRule, privateRejectRule, cloudAbuse, cloudAllowed), `]}}`, `],"final":"direct"}}`, 1),
+		// With no final, sing-box sends what no rule matched to its first outbound.
+		"no final and no terminal rule": cloudConfig(resolveRule, privateRejectRule, cloudAbuse, cloudAllowed),
+		"conditional last rule":         cloudConfig(resolveRule, privateRejectRule, cloudAbuse, `{"action":"reject","port":[22]}`),
+		"inverted last rule":            cloudConfig(resolveRule, privateRejectRule, cloudAbuse, `{"action":"reject","port":[22],"invert":true}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Error(t, ValidateDirectExitRulesOptions(parseOptions(t, cfg)))
+		})
+	}
 }
 
 func volunteerOptions(t *testing.T, opts option.Options) *LO.UnboundedVolunteerOptions {

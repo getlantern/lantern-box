@@ -63,7 +63,8 @@ func TestClientContextSkipsUnboundedExit(t *testing.T) {
 const runVolunteer = `"services":[{"type":"unbounded","tag":"unbounded-volunteer","discovery_srv":"https://freddie.test",` +
 	`"egress_addr":"wss://egress.test","stun_servers":["stun:192.0.2.1:3478"],"direct_exit":true}]`
 
-// runAbuseRoute is a route with the abuse rules, with rules ahead of them.
+// runAbuseRoute is a route with the abuse rules, with rules ahead of them, and a final route
+// with udp_connect after.
 func runAbuseRoute(rules string) string {
 	return `"route":{
 		"rule_set":[
@@ -78,7 +79,8 @@ func runAbuseRoute(rules string) string {
 			{"action":"reject","rule_set":["geosite-phishing"]},
 			{"action":"reject","rule_set":["geosite-cryptominers"]},
 			{"action":"reject","ip_cidr":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"]},
-			{"action":"reject","port":[25,465,587]}
+			{"action":"reject","port":[25,465,587]},
+			{"action":"route","outbound":"direct","udp_connect":true}
 		]
 	}`
 }

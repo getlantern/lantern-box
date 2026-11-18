@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -274,7 +275,8 @@ func startDirectExitRig(t testing.TB, c directExitCase) *directExitRig {
 // The fixture is shaped as lantern-cloud's direct exit configs must be: a resolve first, the
 // rejects, an ip_is_private reject and a final route with udp_connect. Only its route of
 // 127.0.0.1, ahead of the ip_is_private reject, is the test's: every server here is on
-// loopback, which ip_is_private refuses.
+// loopback, which ip_is_private refuses. That route fails the direct exit check, which allows
+// no route before the ip_is_private reject, so the check runs on the fixture without it.
 func startExitBox(t testing.TB) adapter.ConnectionRouterEx {
 	t.Helper()
 	raw, err := os.ReadFile("testdata/direct_exit_server.json")
@@ -284,7 +286,15 @@ func startExitBox(t testing.TB) adapter.ConnectionRouterEx {
 	ctx := service.ExtendContext(box.BaseContext())
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, raw)
 	require.NoError(t, err, "parse the exit box's options")
-	require.NoError(t, peerrules.ValidateDirectExitRulesOptions(opts), "the fixture's resolve and private reject")
+	require.Error(t, peerrules.ValidateDirectExitRulesOptions(opts), "the fixture's loopback route comes before its ip_is_private reject")
+	checked := opts
+	route := *opts.Route
+	route.Rules = slices.DeleteFunc(slices.Clone(route.Rules), func(r option.Rule) bool {
+		return slices.Equal(r.DefaultOptions.IPCIDR, []string{"127.0.0.1/32"})
+	})
+	require.Len(t, route.Rules, len(opts.Route.Rules)-1, "the fixture's loopback route")
+	checked.Route = &route
+	require.NoError(t, peerrules.ValidateDirectExitRulesOptions(checked), "the fixture's rules but its loopback route")
 	b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
 	require.NoError(t, err, "exit box New")
 	require.NoError(t, b.Start(), "exit box Start")

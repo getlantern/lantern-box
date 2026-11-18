@@ -85,28 +85,136 @@ func ValidateAbuseRulesOptions(options option.Options) error {
 }
 
 // ValidateDirectExitRulesOptions checks what a config that exits strangers' traffic directly
-// needs on top of the abuse rules: an unconditional resolve, and after it an unconditional
-// reject of private addresses. Before a resolve, sing-box's IP rules don't match a destination
-// given as a domain, so a name that resolves into a private or listed range would pass them.
+// needs on top of the abuse rules, in the order sing-box needs it: an unconditional resolve,
+// then an unconditional reject of private addresses and the abuse and static rejects
+// ValidateAbuseRulesOptions looks for. Before a resolve, sing-box's IP rules don't match a
+// destination given as a domain, so a name that resolves into a private or listed range would
+// pass them. sing-box stops at the first rule that routes a connection, so until all of those
+// have come, a rule may only reject, sniff or resolve, or be lantern-cloud's bandit probe: a
+// route by exact domain, and port, alone.
+//
+// Every route must also set udp_connect: hysteria2 names a destination per UDP datagram, and
+// the rules see only a flow's first. Nothing may fall through to route.final or the default
+// outbound, which can't set it, so the last rule must reject or route everything.
 //
 // Like ValidateAbuseRulesOptions, it is structural only, and its errors name no rule.
 func ValidateDirectExitRulesOptions(options option.Options) error {
 	if options.Route == nil {
 		return errors.New("launch_cfg is missing route block")
 	}
-	resolved := false
-	for _, r := range options.Route.Rules {
-		switch {
-		case isUnconditionalResolve(r.DefaultOptions):
-			resolved = true
-		case resolved && r.DefaultOptions.IPIsPrivate && isUnconditionalReject(r.DefaultOptions, "ip_is_private"):
-			return nil
+	rules := options.Route.Rules
+	var resolved, privateRejected, rfc1918, smtp bool
+	rejectedTags := map[string]bool{}
+	guarded := func() bool {
+		return privateRejected && rfc1918 && smtp && len(rejectedTags) == len(abuseRuleSetTags)
+	}
+	for _, r := range rules {
+		action := ruleAction(r)
+		if !guarded() {
+			if !mayPrecedeSafeguards(r, action) {
+				return errors.New("route.rules has a rule that can route traffic before its resolve, ip_is_private reject and abuse rejects")
+			}
+			if isDefaultRule(r) {
+				d := r.DefaultOptions
+				switch {
+				case isUnconditionalResolve(d):
+					resolved = true
+				case !resolved:
+				case d.IPIsPrivate && isUnconditionalReject(d, "ip_is_private"):
+					privateRejected = true
+				case isUnconditionalReject(d, "rule_set"):
+					for _, tag := range d.RuleSet {
+						if slices.Contains(abuseRuleSetTags, tag) {
+							rejectedTags[tag] = true
+						}
+					}
+				case isUnconditionalReject(d, "ip_cidr"):
+					rfc1918 = rfc1918 || slices.Contains(d.IPCIDR, rfc1918CanaryCIDR)
+				case isUnconditionalReject(d, "port"):
+					smtp = smtp || slices.Contains(d.Port, smtpCanaryPort)
+				}
+			}
+		}
+		if !pinsUDP(r, action) {
+			return errors.New("route.rules has a route without udp_connect (a UDP flow could change destination unchecked)")
 		}
 	}
-	if !resolved {
+	switch {
+	case !resolved:
 		return errors.New("route.rules has no unconditional resolve (IP rules would not see a domain's addresses)")
+	case !privateRejected:
+		return errors.New("route.rules has no unconditional ip_is_private reject after its resolve")
+	case !guarded():
+		return errors.New("route.rules has no abuse or static rejects after its resolve (IP rules before it would not see a domain's addresses)")
+	case len(rules) == 0 || !isTerminal(rules[len(rules)-1]):
+		return errors.New("route.rules does not end in an unconditional reject or route with udp_connect (traffic would fall through to an outbound without it)")
 	}
-	return errors.New("route.rules has no unconditional ip_is_private reject after its resolve")
+	return nil
+}
+
+// isDefaultRule reports whether r is a default rule, which sing-box takes an empty type for.
+func isDefaultRule(r option.Rule) bool {
+	return r.Type == "" || r.Type == constant.RuleTypeDefault
+}
+
+// ruleAction is r's action, with sing-box's default of route for an empty one.
+func ruleAction(r option.Rule) option.RuleAction {
+	action := r.LogicalOptions.RuleAction
+	if isDefaultRule(r) {
+		action = r.DefaultOptions.RuleAction
+	}
+	if action.Action == "" {
+		action.Action = constant.RuleActionTypeRoute
+	}
+	return action
+}
+
+// mayPrecedeSafeguards reports whether r may come before a direct exit's resolve and rejects:
+// it rejects, sniffs or resolves, which never sends traffic out, or it is a bandit probe.
+func mayPrecedeSafeguards(r option.Rule, action option.RuleAction) bool {
+	switch action.Action {
+	case constant.RuleActionTypeReject, constant.RuleActionTypeSniff, constant.RuleActionTypeResolve:
+		return true
+	}
+	return isBanditProbe(r, action)
+}
+
+// isBanditProbe reports whether r is lantern-cloud's bandit probe rule: a route of exact
+// domains, on any or given ports, with no other match field and no invert. lantern-cloud puts
+// it first, ahead of the resolve, and it routes to an outbound that answers locally.
+func isBanditProbe(r option.Rule, action option.RuleAction) bool {
+	if !isDefaultRule(r) || action.Action != constant.RuleActionTypeRoute || len(r.DefaultOptions.Domain) == 0 {
+		return false
+	}
+	return reflect.DeepEqual(r.DefaultOptions.RawDefaultRule, option.RawDefaultRule{
+		Domain: r.DefaultOptions.Domain,
+		Port:   r.DefaultOptions.Port,
+	})
+}
+
+// pinsUDP reports whether r, if it sends traffic out, pins a UDP flow to the destination the
+// rules checked. The bandit probe needn't: its outbound never dials.
+func pinsUDP(r option.Rule, action option.RuleAction) bool {
+	switch action.Action {
+	case constant.RuleActionTypeRoute:
+		return action.RouteOptions.UDPConnect || isBanditProbe(r, action)
+	case constant.RuleActionTypeBypass:
+		return action.BypassOptions.UDPConnect
+	case constant.RuleActionTypeDirect:
+		return false
+	}
+	return true
+}
+
+// isTerminal reports whether r takes every connection that reaches it: a default rule with no
+// match field and no invert, which rejects, or routes with udp_connect.
+func isTerminal(r option.Rule) bool {
+	if !isDefaultRule(r) || !reflect.DeepEqual(r.DefaultOptions.RawDefaultRule, option.RawDefaultRule{}) {
+		return false
+	}
+	action := ruleAction(r)
+	return action.Action == constant.RuleActionTypeReject ||
+		action.Action == constant.RuleActionTypeRoute && action.RouteOptions.UDPConnect
 }
 
 // StripUnsafeDirectExit turns off direct_exit on every Unbounded volunteer service in options

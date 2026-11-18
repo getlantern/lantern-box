@@ -851,7 +851,8 @@ func TestBindsPort(t *testing.T) {
 }
 
 // abuseRoute is a route that passes peerrules' abuse check, as peerrules' tests build it.
-// directExitRoute adds the resolve and private-address reject a direct exit also needs.
+// directExitRoute adds the resolve and private-address reject a direct exit also needs, and a
+// final route with udp_connect.
 const abuseRoute = `"route":{
 	"rule_set":[
 		{"type":"remote","tag":"geosite-malware","format":"binary","url":"https://example/geosite-malware.srs","download_detour":"direct"},
@@ -869,8 +870,9 @@ const abuseRoute = `"route":{
 	]
 }`
 
-var directExitRoute = strings.Replace(abuseRoute, `"rules":[`,
-	`"rules":[{"action":"resolve","server":"dns"},{"action":"reject","ip_is_private":true},`, 1)
+var directExitRoute = strings.Replace(strings.Replace(abuseRoute, `"rules":[`,
+	`"rules":[{"action":"resolve","server":"dns"},{"action":"reject","ip_is_private":true},`, 1),
+	`6697]}`, `6697]},{"action":"route","outbound":"direct","udp_connect":true}`, 1)
 
 // A volunteer exits Unbounded traffic directly only under the node's abuse rules, which are
 // global in its box, with a resolve ahead of a private-address reject: without them, the node

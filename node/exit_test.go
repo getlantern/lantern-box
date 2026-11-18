@@ -56,7 +56,8 @@ const validExitConfig = `{
 			{"action":"reject","rule_set":["geosite-phishing"]},
 			{"action":"reject","rule_set":["geosite-cryptominers"]},
 			{"action":"reject","ip_cidr":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"]},
-			{"action":"reject","port":[25,465,587]}
+			{"action":"reject","port":[25,465,587]},
+			{"action":"route","outbound":"direct","udp_connect":true}
 		]
 	}
 }`
