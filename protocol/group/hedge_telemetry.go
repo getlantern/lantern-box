@@ -183,6 +183,15 @@ func (s *hedgeStats) set(path, outcome string) {
 	}
 }
 
+// replaceOutcome sets outcome when the current one is from, or unset.
+func (s *hedgeStats) replaceOutcome(from, outcome string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.outcome == "" || s.outcome == from {
+		s.outcome = outcome
+	}
+}
+
 // setOutcomeIfUnset keeps an earlier, more specific outcome.
 func (s *hedgeStats) setOutcomeIfUnset(outcome string) {
 	s.mu.Lock()

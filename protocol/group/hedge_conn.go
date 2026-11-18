@@ -245,8 +245,9 @@ func (l *hedgeLeg) commit(release func()) bool {
 	l.committed = true
 	if first {
 		// Under mu, so a failure seen after the commit (stalled or reset
-		// after commit) always replaces it, never the other way round.
-		l.stats.set("", hedgeOutcomeCommitted)
+		// after commit) always replaces it, never the other way round. A
+		// reset noteReset already recorded is kept: it came first.
+		l.stats.setOutcomeIfUnset(hedgeOutcomeCommitted)
 	}
 	l.stopCommitLocked()
 	release()
@@ -257,26 +258,42 @@ func (l *hedgeLeg) commit(release func()) bool {
 	return true
 }
 
-// noteReset records, as the watchdog charges a reset on First, the outcome
-// no move can change: a reset after the commit, or on an opening that can't
-// be replayed. firstFailed handles the reset later, on its own goroutine,
-// possibly after the client has closed and the record is finished. A
-// replayable opening is left to its move. The watchdog calls this from the
-// IO path, which never holds mu.
+// noteReset runs as the watchdog charges a reset on First, before the
+// client sees the error. firstFailed handles the reset later, on its own
+// goroutine, and by then the client may have closed, which stops a move. So
+// noteReset marks the site bad itself, and records the outcome a reset gets
+// without a move (staticResetOutcomeLocked). A replayable opening is left
+// for its move to record. The watchdog calls this from the IO path, which
+// never holds mu.
 func (l *hedgeLeg) noteReset() {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if !l.onFirst || l.moving {
+		l.mu.Unlock()
 		return
 	}
+	if outcome := l.staticResetOutcomeLocked(); outcome != "" {
+		l.stats.set("", outcome)
+	}
+	l.mu.Unlock()
+	l.h.markBad(l.ctx, l.key, lAdapter.UserFailureReset)
+}
+
+// staticResetOutcomeLocked returns the outcome of a reset on First that no
+// move follows: after the commit, or on an opening whose copy overflowed or
+// that isn't a handshake, so can't be replayed. It returns "" for a
+// replayable opening. An opening still undecided can become replayable as
+// more of it arrives, and a move then records its own outcome. Caller holds
+// mu.
+func (l *hedgeLeg) staticResetOutcomeLocked() string {
 	switch {
 	case l.committed:
-		l.stats.set("", hedgeOutcomeResetAfterCommit)
+		return hedgeOutcomeResetAfterCommit
 	case l.overflow:
-		l.stats.set("", hedgeOutcomeOverflowFailed)
+		return hedgeOutcomeOverflowFailed
 	case l.noReplay || l.undecidedKept:
-		l.stats.set("", hedgeOutcomeResetNotReplayable)
+		return hedgeOutcomeResetNotReplayable
 	}
+	return ""
 }
 
 // firstFailed handles a failure the watchdog saw on First: before a commit it
@@ -291,7 +308,8 @@ func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter
 		if kind == lAdapter.UserFailureStall {
 			outcome = hedgeOutcomeStalledAfterCommit
 		}
-		l.stats.set("", outcome)
+		// A reset recorded before the commit (noteReset) keeps its outcome.
+		l.stats.replaceOutcome(hedgeOutcomeCommitted, outcome)
 		l.h.markBad(l.ctx, l.key, kind)
 		return
 	}
@@ -312,13 +330,9 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 	}
 	if notReplayable := l.noReplay || l.undecidedKept; notReplayable || l.overflow {
 		slowOnly := notReplayable && why == lAdapter.UserFailureNoResponse
-		overflowed := l.overflow
+		outcome := l.staticResetOutcomeLocked()
 		l.mu.Unlock()
 		if !slowOnly {
-			outcome := hedgeOutcomeOverflowFailed
-			if !overflowed {
-				outcome = hedgeOutcomeResetNotReplayable
-			}
 			l.stats.set("", outcome)
 			l.h.markBad(l.ctx, l.key, why)
 			_ = closeFirst()

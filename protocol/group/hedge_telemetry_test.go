@@ -292,8 +292,45 @@ func TestHedgeTelemetryResetNotedBeforeItIsHandled(t *testing.T) {
 			c.(*hedgeStream).noteReset() // as the watchdog does, before firstFailed runs
 			c.Close()
 			require.Equal(t, tc.outcome, connectionRecord(t, reader)["hedge.outcome"])
+			require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()),
+				"the site is marked bad though the client closed before firstFailed ran")
 		})
 	}
+}
+
+// A reply that lands after a reset was noted doesn't turn the record into
+// a commit: the reset came first.
+func TestHedgeTelemetryCommitKeepsAnEarlierReset(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = c.Write([]byte("hello"))
+	require.NoError(t, err)
+	c.(*hedgeStream).noteReset()
+	_, err = c.Read(make([]byte, 64))
+	require.NoError(t, err, "First's reply commits the connection")
+	c.Close()
+	require.Equal(t, hedgeOutcomeResetNotReplayable, connectionRecord(t, reader)["hedge.outcome"])
+}
+
+// A real reset on First, through the watchdog's hook: a write that isn't a
+// handshake fails, the client closes at once, and the record and the cache
+// still show it.
+func TestHedgeTelemetryResetOnWriteEndToEnd(t *testing.T) {
+	reader := recordMetrics(t)
+	first := &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn {
+		return &failingConn{Conn: c, err: connResetErr(), failWrite: true}
+	}}
+	f := newHedgeFixture(t, first, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	_, err = c.Write([]byte("hello"))
+	require.Error(t, err)
+	c.Close()
+	require.Equal(t, hedgeOutcomeResetNotReplayable, connectionRecord(t, reader)["hedge.outcome"])
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
 }
 
 // A hedge built before the meter provider is replaced, as radiance does when
