@@ -29,6 +29,7 @@ import (
 	"github.com/sagernet/sing/common/json"
 
 	C "github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/internal/directexit"
 	LO "github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/peerrules"
 	"github.com/getlantern/lantern-box/portforward"
@@ -402,6 +403,9 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 	if err != nil {
 		return nil, err
 	}
+	// The volunteer's direct exit stops two rotations after this registration, as RunExit's
+	// does: a rotation lantern-cloud refuses keeps this box, but not its exit, running.
+	boxCtx = directexit.WithValidUntil(boxCtx, time.Now().Add(2*n.rotation))
 	if !volunteer {
 		log.Warn("node: lantern-cloud sent no Unbounded volunteer service, so this node serves only its inbound")
 	}

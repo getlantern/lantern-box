@@ -26,6 +26,7 @@ import (
 
 	box "github.com/getlantern/lantern-box"
 	C "github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/internal/directexit"
 	LO "github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/peerrules"
 	"github.com/getlantern/lantern-box/portforward"
@@ -936,5 +937,37 @@ func TestNodeBuildsTheBoxWithTheDirectExitCheck(t *testing.T) {
 				t.Fatal("no box built")
 			}
 		})
+	}
+}
+
+// A node's direct exit lasts as long as the registration its box was built from vouches for
+// it: two rotations, as RunExit's. Every successful registration builds a new box, and so
+// renews it; a refused one keeps the old box, which then stops exiting.
+func TestNodeBoxesCarryTheirRegistrationsDeadline(t *testing.T) {
+	cloud := &fakeCloud{t: t, config: `{` + directExitRoute + `,` + directExitVolunteer + `}`}
+	boxes := &fakeBoxes{}
+	n := newTestNode(t, cloud, boxes, Config{})
+	type built struct {
+		deadline time.Time
+		ok       bool
+	}
+	got := make(chan built, 1)
+	n.newBox = func(ctx context.Context, options string) (boxService, error) {
+		deadline, ok := directexit.ValidUntil(ctx)
+		select {
+		case got <- built{deadline, ok}:
+		default:
+		}
+		return boxes.factory(ctx, options)
+	}
+	start := time.Now()
+	stop := runNode(t, n)
+	defer stop()
+	select {
+	case b := <-got:
+		require.True(t, b.ok, "the box's context carries a deadline")
+		assert.WithinRange(t, b.deadline, start.Add(2*n.rotation), time.Now().Add(2*n.rotation))
+	case <-time.After(5 * time.Second):
+		t.Fatal("no box built")
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	lbox "github.com/getlantern/lantern-box"
+	"github.com/getlantern/lantern-box/internal/directexit"
 	LO "github.com/getlantern/lantern-box/option"
 	"github.com/getlantern/lantern-box/peerrules"
 	"github.com/getlantern/lantern-box/protocol/unbounded"
@@ -125,6 +126,49 @@ func TestVolunteerDirectExitHooksIntoBroflake(t *testing.T) {
 			assert.True(t, e.Ready(), "the exit is on, with the box's router")
 			closeBox()
 			assert.False(t, e.Ready(), "closing the volunteer closes its exit")
+		})
+	}
+}
+
+// A box whose context carries the deadline of the registration behind it, as a node's does,
+// exits only until then. The exit itself ends its sessions at the deadline.
+func TestVolunteerDirectExitEndsAtItsDeadline(t *testing.T) {
+	probe, err := exit.New(context.Background(), sblog.NewNOPFactory().Logger())
+	if errors.Is(err, exit.ErrUnavailable) {
+		t.Skip("built without with_quic")
+	}
+	probe.Close()
+	unreachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(unreachable.Close)
+
+	for name, tc := range map[string]struct {
+		deadline time.Duration
+		ready    bool
+	}{
+		"passed":   {deadline: -time.Second},
+		"upcoming": {deadline: 500 * time.Millisecond, ready: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := service.ExtendContext(lbox.BaseContext())
+			opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(fmt.Sprintf(directExitBoxConfig,
+				unreachable.URL, "ws"+unreachable.URL[len("http"):], true)))
+			require.NoError(t, err)
+			ctx, _ = peerrules.CheckDirectExit(ctx, &opts)
+			ctx = directexit.WithValidUntil(ctx, time.Now().Add(tc.deadline))
+			b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = b.Close() })
+			require.NoError(t, b.Start())
+
+			svc, ok := service.FromContext[adapter.ServiceManager](ctx).Get("volunteer")
+			require.True(t, ok)
+			e := unbounded.VolunteerExit(svc)
+			require.NotNil(t, e)
+			assert.Equal(t, tc.ready, e.Ready())
+			assert.Eventually(t, func() bool { return !e.Ready() }, 5*time.Second, 20*time.Millisecond,
+				"the exit stops at the deadline")
 		})
 	}
 }

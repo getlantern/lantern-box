@@ -4,7 +4,10 @@
 // it.
 package directexit
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type checkedKey struct{}
 
@@ -17,4 +20,19 @@ func WithChecked(ctx context.Context, checked bool) context.Context {
 func Checked(ctx context.Context) bool {
 	checked, _ := ctx.Value(checkedKey{}).(bool)
 	return checked
+}
+
+type validUntilKey struct{}
+
+// WithValidUntil returns ctx carrying when its box's direct exits must stop: the end of the
+// registration that vouched for them.
+func WithValidUntil(ctx context.Context, t time.Time) context.Context {
+	return context.WithValue(ctx, validUntilKey{}, t)
+}
+
+// ValidUntil is the deadline WithValidUntil put in ctx, if any. A box without one, such as
+// `lantern-box run`'s, which its operator manages, keeps its direct exits.
+func ValidUntil(ctx context.Context) (time.Time, bool) {
+	t, ok := ctx.Value(validUntilKey{}).(time.Time)
+	return t, ok
 }

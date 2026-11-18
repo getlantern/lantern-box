@@ -36,8 +36,8 @@ func RegisterService(registry *boxService.Registry) {
 const (
 	defaultStatsInterval = time.Minute
 
-	// directExitLifetime is how long a node's direct exit stays servable. The node's rotation
-	// rebuilds the box, and the volunteer with it, so the exit lives as long as its box.
+	// directExitLifetime is how long a direct exit stays servable in a box whose context
+	// carries no deadline, such as `lantern-box run`'s: as long as the box.
 	directExitLifetime = 100 * 365 * 24 * time.Hour
 
 	// natFailTimeoutKey is the tuning key lantern-cloud's unbounded_volunteer_tuning uses for the
@@ -269,8 +269,14 @@ func (v *Volunteer) startExit() *exit.Exit {
 		v.logger.WarnContext(v.ctx, "unbounded volunteer: no direct exit: ", err)
 		return nil
 	}
+	// A node's box carries the end of the registration it was built from, and the exit stops
+	// there. Without one, as for `lantern-box run`, the exit lasts as long as the box.
+	validUntil, ok := directexit.ValidUntil(v.ctx)
+	if !ok {
+		validUntil = time.Now().Add(directExitLifetime)
+	}
 	e.SetEnabled(true)
-	e.SetRouter(router, time.Now().Add(directExitLifetime))
+	e.SetRouter(router, validUntil)
 	return e
 }
 
