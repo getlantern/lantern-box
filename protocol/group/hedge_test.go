@@ -1347,18 +1347,86 @@ func TestHedgeLoopThroughFirstEnds(t *testing.T) {
 	pc.Close()
 }
 
-// A failure that saw the connection uncommitted, then lost the race to a
-// reply, still marks the site bad.
-func TestHedgeFailureLosingToACommitStillMarksBad(t *testing.T) {
+// commitThenReset opens a connection, lets First reply, then has a reset
+// reach it as a failure after the commit, as the watchdog's would.
+func commitThenReset(t *testing.T, f *hedgeFixture, viaMove bool) net.Conn {
+	t.Helper()
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.Equal(t, "first:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
+	s := c.(*hedgeStream)
+	if viaMove {
+		// A failure that saw the connection uncommitted, then lost the
+		// race to the reply.
+		s.beginMove(lAdapter.UserFailureReset, func() error { return nil })
+	} else {
+		s.firstFailed(lAdapter.UserFailureReset, s.move)
+	}
+	return c
+}
+
+// A reset after First replied is a strike against the site: one is usually
+// teardown, so only the second, with no clean connection between, marks it
+// bad. Both ways a reset after the commit arrives count.
+func TestHedgeResetsAfterAReplyTakeTwoStrikes(t *testing.T) {
+	for _, viaMove := range []bool{false, true} {
+		f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+		c := commitThenReset(t, f, viaMove)
+		require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()), "one reset after a reply is a strike, not a block")
+		c.Close()
+		c = commitThenReset(t, f, viaMove)
+		require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()), "the second marks the site bad")
+		c.Close()
+	}
+}
+
+// A connection that closes cleanly after First replied clears the strikes.
+func TestHedgeCleanConnectionClearsStrikes(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	commitThenReset(t, f, false).Close()
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.Equal(t, "first:"+tlsRecord("ok"), exchange(t, c, tlsRecord("ok")))
+	c.Close() // clean
+	commitThenReset(t, f, false).Close()
+	require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()), "the clean connection wiped the first strike")
+}
+
+// One connection strikes once, however many paths see its reset.
+func TestHedgeOneConnectionStrikesOnce(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c := commitThenReset(t, f, true)
+	s := c.(*hedgeStream)
+	s.firstFailed(lAdapter.UserFailureReset, s.move) // the same reset, handled
+	require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()))
+	c.Close()
+}
+
+// A stall after a reply isn't teardown: it marks the site bad at once.
+func TestHedgeStallAfterAReplyMarksBad(t *testing.T) {
 	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
 	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
 	require.NoError(t, err)
 	defer c.Close()
 	require.Equal(t, "first:"+tlsRecord("hi"), exchange(t, c, tlsRecord("hi")))
-	require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()))
 	s := c.(*hedgeStream)
-	s.beginMove(lAdapter.UserFailureReset, func() error { return nil }) // as the failure's move would
+	s.firstFailed(lAdapter.UserFailureStall, s.move)
 	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
+}
+
+// Strikes expire with the failure TTL.
+func TestHedgeCacheStrikesExpire(t *testing.T) {
+	c := newHedgeCache()
+	now := time.Now()
+	c.now = func() time.Time { return now }
+	k := hedgeKey{site: "example.com", network: "tcp"}
+	require.False(t, c.strike(k, time.Minute))
+	now = now.Add(2 * time.Minute)
+	require.False(t, c.strike(k, time.Minute), "the first strike expired, so this is the first again")
+	require.True(t, c.strike(k, time.Minute))
+	require.False(t, c.strike(k, time.Minute), "the count starts over after marking")
+	c.clearStrikes(k)
+	require.False(t, c.strike(k, time.Minute))
 }
 
 // A reply that lands after a failure doesn't mark the site good again.
