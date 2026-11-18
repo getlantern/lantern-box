@@ -263,11 +263,12 @@ func (l *hedgeLeg) commit(release func()) bool {
 // noteReset runs as the watchdog charges a reset on First, before the
 // client sees the error. firstFailed handles the reset later, on its own
 // goroutine, and by then the client may have closed, which stops a move. So
-// noteReset settles the site bad itself, and records the outcome a reset
-// gets without a move (staticResetOutcomeLocked). A replayable opening is
-// left for its move to record. A connection the client already closed is
-// left alone: an error then can be the teardown itself. The watchdog calls
-// this from the IO path, which never holds mu.
+// noteReset settles the site bad itself and records the reset: the outcome
+// a reset gets without a move (staticResetOutcomeLocked), or reset_unmoved
+// for an opening that may still move, which the move then replaces. Once
+// the client has closed, settleLocked and the sealed record ignore it: an
+// error then can be the teardown itself. The watchdog calls this from the
+// IO path, which never holds mu.
 func (l *hedgeLeg) noteReset() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -277,9 +278,9 @@ func (l *hedgeLeg) noteReset() {
 	if outcome := l.staticResetOutcomeLocked(); outcome != "" {
 		l.stats.set("", outcome)
 	} else {
-		// A replayable opening: its move records moved_reset too. If the
-		// client closes first, or a reply commits it, the reset still shows.
-		l.stats.setOutcomeIfUnset(hedgeOutcomeMovedReset)
+		// Replaced by the move's outcome if it moves. If the client closes
+		// first, or a reply commits it, the reset still shows.
+		l.stats.setOutcomeIfUnset(hedgeOutcomeResetUnmoved)
 	}
 	l.settleLocked(hedgeBad, lAdapter.UserFailureReset)
 }

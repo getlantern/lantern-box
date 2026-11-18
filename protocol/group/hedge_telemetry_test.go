@@ -333,8 +333,8 @@ func TestHedgeTelemetryResetAndReplyAgree(t *testing.T) {
 	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()), "the reply doesn't undo the reset")
 	s.firstFailed(lAdapter.UserFailureReset, s.move)
 	c.Close()
-	require.Equal(t, hedgeOutcomeMovedReset, connectionRecord(t, reader)["hedge.outcome"],
-		"a reset before the reply isn't relabelled as one after it")
+	require.Equal(t, hedgeOutcomeResetUnmoved, connectionRecord(t, reader)["hedge.outcome"],
+		"a reset before the reply isn't relabelled as one after it, nor as a move")
 	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
 }
 
@@ -373,7 +373,7 @@ func TestHedgeEventsBetweenCloseAndRecordChangeNothing(t *testing.T) {
 		func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) })
 	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
 	require.NoError(t, err)
-	_, err = c.Write([]byte("hello"))
+	_, err = c.Write([]byte(tlsRecord("hi")))
 	require.NoError(t, err)
 	s := c.(*hedgeStream)
 	s.mu.Lock()
@@ -399,8 +399,43 @@ func TestHedgeResetBeforeTheMoveShows(t *testing.T) {
 	c.Close()
 	attrs := connectionRecord(t, reader)
 	require.Equal(t, hedgePathFirst, attrs["hedge.path"])
-	require.Equal(t, hedgeOutcomeMovedReset, attrs["hedge.outcome"])
+	require.Equal(t, hedgeOutcomeResetUnmoved, attrs["hedge.outcome"])
 	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
+}
+
+// A committed connection whose failure arrives after the close keeps its
+// record and its good verdict.
+func TestHedgeCommittedFailureAfterCloseChangesNothing(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.Equal(t, "first:hi", exchange(t, c, "hi"))
+	s := c.(*hedgeStream)
+	s.mu.Lock()
+	s.closeLocked() // Close's first step
+	s.mu.Unlock()
+	s.firstFailed(lAdapter.UserFailureReset, s.move)
+	s.noteReset()
+	c.Close()
+	require.Equal(t, hedgeOutcomeCommitted, connectionRecord(t, reader)["hedge.outcome"])
+	require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()))
+}
+
+// A reply whose bytes reached the client is a commit, though the close won
+// the race to record.
+func TestHedgeReplyRacingCloseIsCommitted(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	s := c.(*hedgeStream)
+	s.mu.Lock()
+	s.closeLocked() // the close lands first
+	s.mu.Unlock()
+	s.stats.read(5) // then the reply's bytes; its commit is ignored
+	c.Close()
+	require.Equal(t, hedgeOutcomeCommitted, connectionRecord(t, reader)["hedge.outcome"])
 }
 
 // A real reset on First, through the watchdog's hook: a write that isn't a

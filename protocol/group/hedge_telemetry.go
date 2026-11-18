@@ -62,6 +62,10 @@ const (
 	hedgeOutcomeStalledAfterCommit = "stalled_after_commit"
 	hedgeOutcomeResetAfterCommit   = "reset_after_commit"
 	hedgeOutcomeResetNotReplayable = "reset_not_replayable"
+	// hedgeOutcomeResetUnmoved is a connection First reset that didn't move:
+	// the client closed before the move started, or a reply already on its
+	// way committed it.
+	hedgeOutcomeResetUnmoved = "reset_unmoved"
 	// hedgeOutcomeMoveFailed is a connection whose move to Then failed: Then
 	// couldn't be dialed or didn't take the replayed opening.
 	hedgeOutcomeMoveFailed = "move_failed"
@@ -267,7 +271,12 @@ func (s *hedgeStats) finish(tried bool) {
 		firstByte, up, down := s.firstByte.Load(), s.up.Load(), s.down.Load()
 		s.mu.Unlock()
 		if tried && outcome == "" {
+			// First's bytes reached the client, so it replied, though the
+			// close beat the commit that would have said so.
 			outcome = hedgeOutcomeAbandoned
+			if firstByte > 0 {
+				outcome = hedgeOutcomeCommitted
+			}
 		}
 		attrs := []attribute.KeyValue{
 			semconv.NetworkProtocolNameKey.String(s.network),
