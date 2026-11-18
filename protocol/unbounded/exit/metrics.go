@@ -19,8 +19,10 @@ import (
 // host as an attribute.
 type exitMetrics struct {
 	// provider is the meter provider; nil means the global one, looked up at each measurement
-	// so that it is whatever the embedder installed last.
+	// through lookup (nil: otel.GetMeterProvider) so that it is whatever the embedder installed
+	// last. Tests set lookup rather than OpenTelemetry's global.
 	provider metric.MeterProvider
+	lookup   func() metric.MeterProvider
 
 	// current holds the instruments of the provider they were made from.
 	current atomic.Pointer[exitInstruments]
@@ -47,12 +49,16 @@ func newExitMetrics() *exitMetrics { return &exitMetrics{} }
 // embedder that swaps or shuts down its provider would otherwise lose every later measurement.
 func (m *exitMetrics) instruments() *exitInstruments {
 	p := m.provider
-	if p == nil {
+	switch {
+	case p != nil:
+	case m.lookup != nil:
+		p = m.lookup()
+	default:
 		p = otel.GetMeterProvider()
 	}
-	// A provider whose type can't be compared would make == panic; it gets fresh instruments
-	// at every measurement instead.
-	comparable := reflect.TypeOf(p).Comparable()
+	// A provider that can't be compared, by its type or by what its value holds, would make ==
+	// panic; it gets fresh instruments at every measurement instead.
+	comparable := reflect.ValueOf(p).Comparable()
 	if cur := m.current.Load(); cur != nil && comparable && cur.provider == p {
 		return cur
 	}

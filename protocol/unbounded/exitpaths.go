@@ -429,9 +429,11 @@ func (c *packetConnAsConn) Close() error {
 
 // exitPathMetrics counts the direct exit paths the outbound takes. Never an address.
 type exitPathMetrics struct {
-	// provider is the meter provider; nil means the global one, looked up at each path so that
-	// it is whatever the embedder installed last.
+	// provider is the meter provider; nil means the global one, looked up at each path through
+	// lookup (nil: otel.GetMeterProvider) so that it is whatever the embedder installed last.
+	// Tests set lookup rather than OpenTelemetry's global.
 	provider metric.MeterProvider
+	lookup   func() metric.MeterProvider
 
 	// current holds the counter of the provider it was made from.
 	current atomic.Pointer[exitPathCounter]
@@ -460,12 +462,16 @@ func (m *exitPathMetrics) path(relayed bool) {
 // the last path, as protocol/group's currentHedgeTelemetry does.
 func (m *exitPathMetrics) counter() *exitPathCounter {
 	pr := m.provider
-	if pr == nil {
+	switch {
+	case pr != nil:
+	case m.lookup != nil:
+		pr = m.lookup()
+	default:
 		pr = otel.GetMeterProvider()
 	}
-	// A provider whose type can't be compared would make == panic; it gets a fresh counter at
-	// every path instead.
-	comparable := reflect.TypeOf(pr).Comparable()
+	// A provider that can't be compared, by its type or by what its value holds, would make ==
+	// panic; it gets a fresh counter at every path instead.
+	comparable := reflect.ValueOf(pr).Comparable()
 	if cur := m.current.Load(); cur != nil && comparable && cur.provider == pr {
 		return cur
 	}
