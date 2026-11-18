@@ -1,0 +1,193 @@
+package peerrules
+
+import (
+	"errors"
+	"fmt"
+	"reflect"
+	"slices"
+
+	box "github.com/getlantern/lantern-box"
+	"github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json"
+)
+
+// abuseRuleSetTags is the canonical list of abuse rule_set tags that
+// the peer launch_cfg MUST carry. Mirrors the server-side abuseTags
+// list that emits the rule_set entries into the registration response.
+// If the server-side list grows or renames a tag, this list grows
+// with it — the server-side test asserts the emit side; this list
+// asserts the client side sees the same shape after registration.
+var abuseRuleSetTags = []string{
+	"geosite-malware",
+	"geoip-malware",
+	"geosite-phishing",
+	"geosite-cryptominers",
+}
+
+// rfc1918CanaryCIDR and smtpCanaryPort are sentinel values that, if
+// missing from the launch_cfg's reject rules, indicate the server-
+// side static peer-egress-block list was dropped or mutated. We pick
+// one IP-CIDR and one port from each block as a low-cost smoke test;
+// a full structural check would be brittle to upstream additions.
+const (
+	rfc1918CanaryCIDR = "10.0.0.0/8"
+	smtpCanaryPort    = 25
+)
+
+// ValidateAbuseRules is ValidateAbuseRulesOptions on sing-box options in JSON, such as a peer
+// registration's server_config.
+func ValidateAbuseRules(optionsJSON string) error {
+	ctx := box.BaseContext()
+	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(optionsJSON))
+	if err != nil {
+		return fmt.Errorf("parse launch_cfg JSON: %w", err)
+	}
+	return ValidateAbuseRulesOptions(options)
+}
+
+// ValidateAbuseRulesOptions is a defence-in-depth check on the options a peer registration
+// returns. The server is supposed to embed a set of route.rule_set +
+// route.rules entries that block the peer from forwarding traffic to
+// known-malicious destinations, RFC1918 CIDRs, and abuse-prone ports.
+//
+// If a future server-side regression ships a launch_cfg without those
+// rules, every newly-registered peer would silently turn into an open
+// residential proxy until someone noticed. This validator blocks
+// Start before sing-box runs an unsafe config; the peer prefers to fail
+// to share at all rather than share unsafely.
+//
+// The check is structural-only — it confirms the expected rule_set
+// tags appear in both route.rule_set and route.rules (as an
+// unconditional reject), plus two canary entries from the static
+// reject block. It does NOT verify the .srs files at the rule_set
+// URLs are uncorrupted or that the URLs themselves are trustworthy;
+// those are separate supply-chain concerns and are not in scope for
+// this gate.
+func ValidateAbuseRulesOptions(options option.Options) error {
+	if options.Route == nil {
+		return errors.New("launch_cfg is missing route block — peer would have no abuse blocking at all")
+	}
+	var errs []error
+	if err := validateAbuseRuleSetTags(options.Route.RuleSet); err != nil {
+		errs = append(errs, err)
+	}
+	if err := validateAbuseRejectRules(options.Route.Rules); err != nil {
+		errs = append(errs, err)
+	}
+	if err := validateStaticRejectCanaries(options.Route.Rules); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// validateAbuseRuleSetTags asserts every entry in abuseRuleSetTags is
+// declared in route.rule_set. Missing entries mean sing-box won't even
+// download the abuse list, so no destination check ever happens.
+func validateAbuseRuleSetTags(rulesets []option.RuleSet) error {
+	missing := make([]string, 0, len(abuseRuleSetTags))
+	for _, tag := range abuseRuleSetTags {
+		if !slices.ContainsFunc(rulesets, func(rs option.RuleSet) bool { return slices.Contains(rs.Tag, tag) }) {
+			missing = append(missing, tag)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("route.rule_set is missing abuse tags: %v (peer would not block matching destinations)", missing)
+	}
+	return nil
+}
+
+// validateAbuseRejectRules asserts every abuseRuleSetTags entry also
+// has a matching reject rule in route.rules. A rule_set without a
+// matching reject is a no-op — sing-box downloads the list and does
+// nothing with it.
+//
+// Only counts *unconditional* rejects (see isUnconditionalReject):
+// a reject rule with an extra match constraint (port, domain, source
+// IP, etc.) or with invert=true would let traffic in the abuse list
+// through under most conditions; counting it as covering the tag
+// would mask a misconfigured launch_cfg.
+func validateAbuseRejectRules(rules []option.Rule) error {
+	rejectedTags := map[string]bool{}
+	for _, r := range rules {
+		if !isUnconditionalReject(r.DefaultOptions, "rule_set") {
+			continue
+		}
+		for _, tag := range r.DefaultOptions.RuleSet {
+			rejectedTags[tag] = true
+		}
+	}
+	missing := make([]string, 0, len(abuseRuleSetTags))
+	for _, want := range abuseRuleSetTags {
+		if !rejectedTags[want] {
+			missing = append(missing, want)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("route.rules has no unconditional reject for abuse tags: %v (rule_sets would download but not unconditionally block)", missing)
+	}
+	return nil
+}
+
+// validateStaticRejectCanaries spot-checks that the static
+// destination-based reject rules (RFC1918 CIDRs + abuse ports) are
+// present. Picks one canary from each block rather than asserting the
+// full set so legitimate additions to the rules don't break this
+// check.
+func validateStaticRejectCanaries(rules []option.Rule) error {
+	gotRFC1918 := false
+	gotSMTP := false
+	for _, r := range rules {
+		if isUnconditionalReject(r.DefaultOptions, "ip_cidr") {
+			gotRFC1918 = gotRFC1918 || slices.ContainsFunc(r.DefaultOptions.IPCIDR,
+				func(cidr string) bool { return cidr == rfc1918CanaryCIDR },
+			)
+		}
+		if isUnconditionalReject(r.DefaultOptions, "port") {
+			gotSMTP = gotSMTP || slices.ContainsFunc(r.DefaultOptions.Port,
+				func(p uint16) bool { return p == smtpCanaryPort },
+			)
+		}
+	}
+	var missing []string
+	if !gotRFC1918 {
+		missing = append(missing, fmt.Sprintf("RFC1918 reject (canary %s)", rfc1918CanaryCIDR))
+	}
+	if !gotSMTP {
+		missing = append(missing, fmt.Sprintf("SMTP-port reject (canary :%d)", smtpCanaryPort))
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("route.rules is missing static abuse blocks: %v", missing)
+	}
+	return nil
+}
+
+// isUnconditionalReject reports whether rule is a plain reject scoped by
+// onField alone — no other match field and no invert.
+//
+// It builds the exact rule that a bare reject-on-onField would produce
+// (reject action, default method, only onField copied over) and compares
+// the whole struct with reflect.DeepEqual. Any extra match field, an
+// invert, or a non-default action/method leaves some other field non-zero,
+// so the structs differ and the rule is not credited as covering the abuse
+// class.
+func isUnconditionalReject(rule option.DefaultRule, onField string) bool {
+	var defaultValue option.DefaultRule
+	defaultValue.RuleAction = option.RuleAction{
+		Action: constant.RuleActionTypeReject,
+		RejectOptions: option.RejectActionOptions{
+			Method: constant.RuleActionRejectMethodDefault,
+		},
+	}
+	switch onField {
+	case "rule_set":
+		defaultValue.RuleSet = rule.RuleSet
+	case "ip_cidr":
+		defaultValue.IPCIDR = rule.IPCIDR
+	case "port":
+		defaultValue.Port = rule.Port
+	default:
+		return false
+	}
+	return reflect.DeepEqual(rule, defaultValue)
+}

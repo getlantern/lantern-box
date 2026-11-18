@@ -1,0 +1,323 @@
+package peerrules
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/sagernet/sing-box/option"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// minimalValidLaunchCfg returns a launch_cfg JSON that passes
+// ValidateAbuseRules: the four abuse rule_set tags (each as a
+// "remote" rule_set + a matching unconditional reject rule), plus
+// one RFC1918 and one SMTP canary in reject rules. Shared by the
+// stub server used in Start-path tests so the existing tests do not
+// regress on the new check.
+const minimalValidLaunchCfg = `{
+	"inbounds":[{"type":"samizdat","tag":"samizdat-in"}],
+	"route":{
+		"rule_set":[
+			{"type":"remote","tag":"geosite-malware","format":"binary","url":"https://example/geosite-malware.srs","download_detour":"direct"},
+			{"type":"remote","tag":"geoip-malware","format":"binary","url":"https://example/geoip-malware.srs","download_detour":"direct"},
+			{"type":"remote","tag":"geosite-phishing","format":"binary","url":"https://example/geosite-phishing.srs","download_detour":"direct"},
+			{"type":"remote","tag":"geosite-cryptominers","format":"binary","url":"https://example/geosite-cryptominers.srs","download_detour":"direct"}
+		],
+		"rules":[
+			{"action":"reject","rule_set":["geosite-malware"]},
+			{"action":"reject","rule_set":["geoip-malware"]},
+			{"action":"reject","rule_set":["geosite-phishing"]},
+			{"action":"reject","rule_set":["geosite-cryptominers"]},
+			{"action":"reject","ip_cidr":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","::1/128","fc00::/7","fe80::/10"]},
+			{"action":"reject","port":[25,465,587,2525,6660,6661,6662,6663,6664,6665,6666,6667,6668,6669,6697]}
+		]
+	}
+}`
+
+func TestValidateAbuseRules_HappyPath(t *testing.T) {
+	if err := ValidateAbuseRules(minimalValidLaunchCfg); err != nil {
+		t.Fatalf("expected canonical launch_cfg to pass, got: %v", err)
+	}
+}
+
+func TestValidateAbuseRules_MissingRouteBlock(t *testing.T) {
+	err := ValidateAbuseRules(`{"inbounds":[]}`)
+	if err == nil {
+		t.Fatal("expected error when route block is absent")
+	}
+	if !strings.Contains(err.Error(), "route block") {
+		t.Errorf("error should mention route block, got: %v", err)
+	}
+}
+
+func TestValidateAbuseRules_MissingRuleSetTag(t *testing.T) {
+	// Drop geosite-phishing from the rule_set list. The reject rule
+	// for it can stay; the check should still flag the missing tag
+	// because the reject is a no-op without the rule_set.
+	bad := strings.Replace(minimalValidLaunchCfg,
+		`{"type":"remote","tag":"geosite-phishing","format":"binary","url":"https://example/geosite-phishing.srs","download_detour":"direct"},`,
+		``, 1)
+	err := ValidateAbuseRules(bad)
+	if err == nil {
+		t.Fatal("expected error when an abuse tag is missing from route.rule_set")
+	}
+	if !strings.Contains(err.Error(), "geosite-phishing") {
+		t.Errorf("error should name the missing tag, got: %v", err)
+	}
+}
+
+func TestValidateAbuseRules_MissingRejectRule(t *testing.T) {
+	// Keep all rule_sets but drop one reject rule. sing-box will
+	// download the list but never enforce it.
+	bad := strings.Replace(minimalValidLaunchCfg,
+		`{"action":"reject","rule_set":["geosite-cryptominers"]},`,
+		``, 1)
+	err := ValidateAbuseRules(bad)
+	if err == nil {
+		t.Fatal("expected error when an abuse tag has no reject rule")
+	}
+	if !strings.Contains(err.Error(), "geosite-cryptominers") {
+		t.Errorf("error should name the unrejected tag, got: %v", err)
+	}
+}
+
+func TestValidateAbuseRules_MissingRFC1918Canary(t *testing.T) {
+	// Strip the RFC1918 reject rule. SMTP block stays — we want to
+	// see the RFC1918-specific error message.
+	bad := strings.Replace(minimalValidLaunchCfg,
+		`{"action":"reject","ip_cidr":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","::1/128","fc00::/7","fe80::/10"]},`,
+		``, 1)
+	err := ValidateAbuseRules(bad)
+	if err == nil {
+		t.Fatal("expected error when RFC1918 reject is missing")
+	}
+	if !strings.Contains(err.Error(), "RFC1918") {
+		t.Errorf("error should mention RFC1918, got: %v", err)
+	}
+}
+
+func TestValidateAbuseRules_MissingSMTPCanary(t *testing.T) {
+	// Drop the SMTP/IRC port-reject rule. Removes the preceding
+	// comma too so the resulting JSON is still well-formed (the
+	// port-reject is the last entry in the rules array).
+	bad := strings.Replace(minimalValidLaunchCfg,
+		`,
+			{"action":"reject","port":[25,465,587,2525,6660,6661,6662,6663,6664,6665,6666,6667,6668,6669,6697]}`,
+		``, 1)
+	err := ValidateAbuseRules(bad)
+	if err == nil {
+		t.Fatal("expected error when SMTP port reject is missing")
+	}
+	if !strings.Contains(err.Error(), "SMTP") {
+		t.Errorf("error should mention SMTP, got: %v", err)
+	}
+}
+
+func TestValidateAbuseRules_NonRejectRulesIgnored(t *testing.T) {
+	// A rule_set with action "route" (not reject) should NOT count
+	// — sing-box would forward those flows to a named outbound
+	// instead of dropping them. ValidateAbuseRules must demand the
+	// reject action specifically.
+	bad := strings.Replace(minimalValidLaunchCfg,
+		`{"action":"reject","rule_set":["geosite-malware"]},`,
+		`{"action":"route","outbound":"direct","rule_set":["geosite-malware"]},`, 1)
+	err := ValidateAbuseRules(bad)
+	if err == nil {
+		t.Fatal("expected error when abuse tag has 'route' action instead of 'reject'")
+	}
+	if !strings.Contains(err.Error(), "geosite-malware") {
+		t.Errorf("error should name the wrongly-actioned tag, got: %v", err)
+	}
+}
+
+func TestValidateAbuseRules_AllErrorsReported(t *testing.T) {
+	// errors.Join means a thoroughly-broken config should surface
+	// all the missing pieces in one report. Operators triaging
+	// "why is my peer refusing to start?" deserve a complete
+	// picture, not a fix-one-thing-find-the-next loop.
+	err := ValidateAbuseRules(`{"route":{}}`)
+	if err == nil {
+		t.Fatal("expected error for empty route block")
+	}
+	msg := err.Error()
+	for _, want := range []string{"abuse tags", "RFC1918", "SMTP"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("combined error should mention %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateAbuseRules_BadJSON(t *testing.T) {
+	err := ValidateAbuseRules(`{not valid json`)
+	if err == nil {
+		t.Fatal("expected error for malformed JSON")
+	}
+	if !strings.Contains(err.Error(), "parse launch_cfg JSON") {
+		t.Errorf("error should mention JSON parse failure, got: %v", err)
+	}
+}
+
+// sing-box accepts both `"rule_set": "tag"` (scalar) and
+// `"rule_set": ["tag"]` (array) — the validator must too, otherwise
+// a perfectly valid launch_cfg that happens to use the scalar form
+// would be flagged as missing the tag.
+func TestValidateAbuseRules_AcceptsScalarRuleSet(t *testing.T) {
+	cfg := `{
+		"route":{
+			"rule_set":[
+				{"type":"remote","tag":"geosite-malware","format":"binary","url":"https://example/geosite-malware.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geoip-malware","format":"binary","url":"https://example/geoip-malware.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geosite-phishing","format":"binary","url":"https://example/geosite-phishing.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geosite-cryptominers","format":"binary","url":"https://example/geosite-cryptominers.srs","download_detour":"direct"}
+			],
+			"rules":[
+				{"action":"reject","rule_set":"geosite-malware"},
+				{"action":"reject","rule_set":"geoip-malware"},
+				{"action":"reject","rule_set":"geosite-phishing"},
+				{"action":"reject","rule_set":"geosite-cryptominers"},
+				{"action":"reject","ip_cidr":"10.0.0.0/8"},
+				{"action":"reject","port":25}
+			]
+		}}`
+	if err := ValidateAbuseRules(cfg); err != nil {
+		t.Fatalf("scalar rule_set / ip_cidr / port should be valid, got: %v", err)
+	}
+}
+
+// A reject rule with invert=true rejects everything EXCEPT the
+// listed match — the opposite of what an abuse-block rule should do.
+// It must not satisfy the abuse-tag check.
+func TestValidateAbuseRules_RejectsInverted(t *testing.T) {
+	cfg := `{
+		"route":{
+			"rule_set":[
+				{"type":"remote","tag":"geosite-malware","format":"binary","url":"https://example/geosite-malware.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geoip-malware","format":"binary","url":"https://example/geoip-malware.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geosite-phishing","format":"binary","url":"https://example/geosite-phishing.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geosite-cryptominers","format":"binary","url":"https://example/geosite-cryptominers.srs","download_detour":"direct"}
+			],
+			"rules":[
+				{"action":"reject","rule_set":["geosite-malware"],"invert":true},
+				{"action":"reject","rule_set":["geoip-malware"]},
+				{"action":"reject","rule_set":["geosite-phishing"]},
+				{"action":"reject","rule_set":["geosite-cryptominers"]},
+				{"action":"reject","ip_cidr":["10.0.0.0/8"]},
+				{"action":"reject","port":[25]}
+			]
+		}}`
+	err := ValidateAbuseRules(cfg)
+	if err == nil {
+		t.Fatal("inverted reject must not satisfy the abuse-tag check")
+	}
+	if !strings.Contains(err.Error(), "geosite-malware") {
+		t.Errorf("error should call out the inverted tag, got: %v", err)
+	}
+}
+
+// A reject rule that ANDs the abuse rule_set with another constraint
+// (port, domain, source IP, etc.) only fires for the intersection —
+// most abuse-list traffic still passes. Must not count as covering
+// the tag.
+func TestValidateAbuseRules_RejectsExtraConstraint(t *testing.T) {
+	cfg := `{
+		"route":{
+			"rule_set":[
+				{"type":"remote","tag":"geosite-malware","format":"binary","url":"https://example/geosite-malware.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geoip-malware","format":"binary","url":"https://example/geoip-malware.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geosite-phishing","format":"binary","url":"https://example/geosite-phishing.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geosite-cryptominers","format":"binary","url":"https://example/geosite-cryptominers.srs","download_detour":"direct"}
+			],
+			"rules":[
+				{"action":"reject","rule_set":["geosite-malware"],"port":[80]},
+				{"action":"reject","rule_set":["geoip-malware"]},
+				{"action":"reject","rule_set":["geosite-phishing"]},
+				{"action":"reject","rule_set":["geosite-cryptominers"]},
+				{"action":"reject","ip_cidr":["10.0.0.0/8"]},
+				{"action":"reject","port":[25]}
+			]
+		}}`
+	err := ValidateAbuseRules(cfg)
+	if err == nil {
+		t.Fatal("reject with extra constraint must not satisfy the abuse-tag check")
+	}
+	if !strings.Contains(err.Error(), "geosite-malware") {
+		t.Errorf("error should call out the constrained tag, got: %v", err)
+	}
+}
+
+// Same predicate-narrowing concern applies to the static canary
+// reject rules. An ip_cidr reject ANDed with a port no longer
+// covers all RFC1918 traffic and must not count as the canary.
+func TestValidateAbuseRules_RejectsStaticCanaryWithExtraConstraint(t *testing.T) {
+	cfg := `{
+		"route":{
+			"rule_set":[
+				{"type":"remote","tag":"geosite-malware","format":"binary","url":"https://example/geosite-malware.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geoip-malware","format":"binary","url":"https://example/geoip-malware.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geosite-phishing","format":"binary","url":"https://example/geosite-phishing.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geosite-cryptominers","format":"binary","url":"https://example/geosite-cryptominers.srs","download_detour":"direct"}
+			],
+			"rules":[
+				{"action":"reject","rule_set":["geosite-malware"]},
+				{"action":"reject","rule_set":["geoip-malware"]},
+				{"action":"reject","rule_set":["geosite-phishing"]},
+				{"action":"reject","rule_set":["geosite-cryptominers"]},
+				{"action":"reject","ip_cidr":["10.0.0.0/8"],"port":[80]},
+				{"action":"reject","port":[25]}
+			]
+		}}`
+	err := ValidateAbuseRules(cfg)
+	if err == nil {
+		t.Fatal("RFC1918 canary ANDed with port must not satisfy the static-block check")
+	}
+	if !strings.Contains(err.Error(), "RFC1918") {
+		t.Errorf("error should call out the missing RFC1918 canary, got: %v", err)
+	}
+}
+
+// Explicit invert=false should be treated as the canonical no-op
+// (sing-box's default is false) and still credit the rule.
+func TestValidateAbuseRules_AcceptsExplicitInvertFalse(t *testing.T) {
+	cfg := `{
+		"route":{
+			"rule_set":[
+				{"type":"remote","tag":"geosite-malware","format":"binary","url":"https://example/geosite-malware.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geoip-malware","format":"binary","url":"https://example/geoip-malware.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geosite-phishing","format":"binary","url":"https://example/geosite-phishing.srs","download_detour":"direct"},
+				{"type":"remote","tag":"geosite-cryptominers","format":"binary","url":"https://example/geosite-cryptominers.srs","download_detour":"direct"}
+			],
+			"rules":[
+				{"action":"reject","rule_set":["geosite-malware"],"invert":false},
+				{"action":"reject","rule_set":["geoip-malware"]},
+				{"action":"reject","rule_set":["geosite-phishing"]},
+				{"action":"reject","rule_set":["geosite-cryptominers"]},
+				{"action":"reject","ip_cidr":["10.0.0.0/8"]},
+				{"action":"reject","port":[25]}
+			]
+		}}`
+	if err := ValidateAbuseRules(cfg); err != nil {
+		t.Fatalf("explicit invert=false should be treated as a pure reject, got: %v", err)
+	}
+}
+
+// Tolerating the discriminator must not extend to types that carry their own
+// matching fields. A logical rule scopes via mode/rules, so it is not an
+// unconditional reject even though it says action=reject.
+func TestValidateAbuseRules_RejectsNonDefaultRuleType(t *testing.T) {
+	bad := strings.Replace(minimalValidLaunchCfg,
+		`{"action":"reject","rule_set":["geosite-malware"]}`,
+		`{"type":"logical","action":"reject","rule_set":["geosite-malware"]}`, 1)
+	if bad == minimalValidLaunchCfg {
+		t.Fatal("fixture substitution did not apply — test would be vacuous")
+	}
+	if err := ValidateAbuseRules(bad); err == nil {
+		t.Fatal("a logical rule must not count as an unconditional reject")
+	}
+}
+
+func TestValidateAbuseRulesOptionsNeedsRoute(t *testing.T) {
+	err := ValidateAbuseRulesOptions(option.Options{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "route")
+}
