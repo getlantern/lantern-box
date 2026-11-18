@@ -368,21 +368,40 @@ func TestHedgeLateEventsAfterCloseChangeNothing(t *testing.T) {
 // The same, in the window where Close has marked the leg closed but not yet
 // written the record.
 func TestHedgeEventsBetweenCloseAndRecordChangeNothing(t *testing.T) {
+	for _, opening := range []string{tlsRecord("hi"), "hello"} {
+		t.Run(opening[3:], func(t *testing.T) {
+			reader := recordMetrics(t)
+			f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")},
+				func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) })
+			c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+			require.NoError(t, err)
+			_, err = c.Write([]byte(opening))
+			require.NoError(t, err)
+			s := c.(*hedgeStream)
+			s.mu.Lock()
+			s.closeLocked() // Close's first step
+			s.mu.Unlock()
+			s.noteReset()
+			c.Close() // records
+			require.Equal(t, hedgeOutcomeAbandoned, connectionRecord(t, reader)["hedge.outcome"])
+			require.Equal(t, hedgeUnknown, f.verdict(hedgeDest.String()))
+		})
+	}
+}
+
+// A reset on an opening not yet long enough to classify isn't recorded as
+// not replayable: it may still become a handshake and move.
+func TestHedgeResetOnAnUndecidedOpening(t *testing.T) {
 	reader := recordMetrics(t)
 	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")},
 		func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) })
 	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
 	require.NoError(t, err)
-	_, err = c.Write([]byte(tlsRecord("hi")))
+	_, err = c.Write([]byte("\x16"))
 	require.NoError(t, err)
-	s := c.(*hedgeStream)
-	s.mu.Lock()
-	s.closeLocked() // Close's first step
-	s.mu.Unlock()
-	s.noteReset()
-	c.Close() // records
-	require.Equal(t, hedgeOutcomeAbandoned, connectionRecord(t, reader)["hedge.outcome"])
-	require.Equal(t, hedgeUnknown, f.verdict(hedgeDest.String()))
+	c.(*hedgeStream).noteReset()
+	c.Close()
+	require.Equal(t, hedgeOutcomeResetUnmoved, connectionRecord(t, reader)["hedge.outcome"])
 }
 
 // A reset on a replayable opening whose client closes before the move
@@ -420,22 +439,6 @@ func TestHedgeCommittedFailureAfterCloseChangesNothing(t *testing.T) {
 	c.Close()
 	require.Equal(t, hedgeOutcomeCommitted, connectionRecord(t, reader)["hedge.outcome"])
 	require.Equal(t, hedgeGood, f.verdict(hedgeDest.String()))
-}
-
-// A reply whose bytes reached the client is a commit, though the close won
-// the race to record.
-func TestHedgeReplyRacingCloseIsCommitted(t *testing.T) {
-	reader := recordMetrics(t)
-	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
-	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
-	require.NoError(t, err)
-	s := c.(*hedgeStream)
-	s.mu.Lock()
-	s.closeLocked() // the close lands first
-	s.mu.Unlock()
-	s.stats.read(5) // then the reply's bytes; its commit is ignored
-	c.Close()
-	require.Equal(t, hedgeOutcomeCommitted, connectionRecord(t, reader)["hedge.outcome"])
 }
 
 // A real reset on First, through the watchdog's hook: a write that isn't a

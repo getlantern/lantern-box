@@ -275,7 +275,10 @@ func (l *hedgeLeg) noteReset() {
 	if !l.onFirst || l.moving {
 		return
 	}
-	if outcome := l.staticResetOutcomeLocked(); outcome != "" {
+	// An opening still undecided can become replayable, and move, as more
+	// of it arrives, so it isn't recorded as not replayable yet.
+	if outcome := l.staticResetOutcomeLocked(); outcome != "" &&
+		(outcome != hedgeOutcomeResetNotReplayable || l.noReplay) {
 		l.stats.set("", outcome)
 	} else {
 		// Replaced by the move's outcome if it moves. If the client closes
