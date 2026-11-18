@@ -28,6 +28,10 @@ type registerRequest struct {
 	// ReportsNetstatedAsync says the volunteer reports to netstated off its
 	// forwarding path, so the config may name netstated.
 	ReportsNetstatedAsync bool `json:"reports_netstated_async"`
+	// ServesDirectExits says this lantern-box's volunteer service understands
+	// its direct_exit option, so the config may set it: an older one decodes
+	// service options strictly and would refuse to start on the unknown field.
+	ServesDirectExits bool `json:"serves_direct_exits"`
 }
 
 type registerResponse struct {

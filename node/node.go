@@ -390,6 +390,7 @@ func (n *node) register(ctx context.Context) (*registerResponse, error) {
 		ServePool:              true,
 		RunsUnboundedVolunteer: true,
 		ReportsNetstatedAsync:  true,
+		ServesDirectExits:      true,
 	})
 }
 
