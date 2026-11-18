@@ -864,3 +864,18 @@ func TestExitMetricsFollowAProviderSwap(t *testing.T) {
 	assert.EqualValues(t, 5, counterSum(t, second, "unbounded.exit.io"))
 	assert.EqualValues(t, 1, counterSum(t, first, "unbounded.exit.sessions"))
 }
+
+// A rule set callback can still be running after its owner unregistered it and closed the exit,
+// so SetRouter after Close installs nothing, not even an expiry timer.
+func TestExitSetRouterAfterCloseIsANoOp(t *testing.T) {
+	e := newTestExit(t)
+	e.SetEnabled(true)
+	e.Close()
+	e.SetRouter(Pool, &dialRouter{}, time.Now().Add(time.Hour))
+	e.mu.Lock()
+	ks := e.kinds[Pool]
+	e.mu.Unlock()
+	assert.Nil(t, ks.router)
+	assert.Nil(t, ks.expiry)
+	assert.False(t, e.Options().Ready(false))
+}

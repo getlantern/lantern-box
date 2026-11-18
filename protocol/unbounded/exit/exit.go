@@ -103,13 +103,17 @@ func (e *Exit) SetEnabled(on bool) {
 
 // SetRouter sets kind's current exit box router and how long its registration lasts. nil clears
 // it and ends the kind's running sessions, as validUntil passing does. The other kind is left
-// as it is. A kind other than Pool and Personal is ignored.
+// as it is. A kind other than Pool and Personal is ignored, and so is any call after Close,
+// such as one from a rule set callback that was still running when its owner closed the exit.
 func (e *Exit) SetRouter(kind Kind, r adapter.ConnectionRouterEx, validUntil time.Time) {
 	if kind != Pool && kind != Personal {
 		return
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
 	ks := &e.kinds[kind]
 	ks.gen++
 	if ks.expiry != nil {
