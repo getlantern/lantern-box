@@ -79,7 +79,8 @@ type hedgeLeg struct {
 	moveCtx context.Context
 	cancel  context.CancelFunc
 	// pending is Then's leg while the copy is replayed to it, so Close can
-	// interrupt the replay and deadline changes reach it.
+	// interrupt the replay. Deadlines reach it only once the replay is done
+	// (applyDeadlinesLocked).
 	pending deadlineCloser
 	// readDeadline and writeDeadline bound waits for a move and are
 	// applied to Then's leg. deadlineChanged is closed and replaced whenever
@@ -223,10 +224,7 @@ func (l *hedgeLeg) setDeadlines(read, write *time.Time) (moving bool) {
 	}
 	close(l.deadlineChanged)
 	l.deadlineChanged = make(chan struct{})
-	if !l.moving {
-		return false
-	}
-	return true
+	return l.moving
 }
 
 // commit records First's reply and runs release under mu to free the copy.
@@ -356,9 +354,8 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 	return true
 }
 
-// startReplay records Then's leg so Close and deadline changes reach it, and
-// applies the caller's current deadlines to it. It reports false when the
-// connection closed meanwhile.
+// startReplay records Then's leg so Close can interrupt the replay. It
+// reports false when the connection closed meanwhile.
 func (l *hedgeLeg) startReplay(c deadlineCloser) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -394,11 +391,14 @@ func (e *hedgeMoveError) Unwrap() error {
 	return e.cause
 }
 
-// As reaches into the cause even when Unwrap hides it, so a caller can still
-// find, say, its *net.OpError.
-func (e *hedgeMoveError) As(target any) bool { return errors.As(e.cause, target) }
-func (e *hedgeMoveError) Timeout() bool      { return false }
-func (e *hedgeMoveError) Temporary() bool    { return false }
+func (e *hedgeMoveError) Timeout() bool   { return false }
+func (e *hedgeMoveError) Temporary() bool { return false }
+
+// closedByTimer reports whether err is what an operation returns when its
+// conn was closed under it, as replayTimer does.
+func closedByTimer(err error) bool {
+	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
+}
 
 // replayTimer closes c if the replay outlives the failover timeout, which
 // holds even for a conn that ignores deadlines. done reports whether the
@@ -422,8 +422,12 @@ func (l *hedgeLeg) dialTimer() (stop func() bool) {
 // its context; a successful one leaves it alone, since Then's connection may
 // live on it. Caller holds mu.
 func (l *hedgeLeg) finishMoveLocked(err error) {
-	// The client's own close isn't Then failing.
-	if err != nil && !l.closed {
+	// The client's own close isn't Then failing, whatever the cancelled
+	// dial or closed replay returned.
+	switch {
+	case err != nil && l.closed:
+		err = net.ErrClosed
+	case err != nil:
 		err = &hedgeMoveError{cause: err}
 	}
 	l.moveErr = err
@@ -506,18 +510,20 @@ func (s *hedgeStream) runMove() {
 	if err == nil {
 		stop := s.dialTimer()
 		conn, err = then.DialContext(ctx, s.network, s.dest)
-		// The timer firing is the cause, whatever the dial returned for
-		// its cancelled context.
+		// The timer firing is the cause when the dial failed only from
+		// the cancelled context, or succeeded too late.
 		if !stop() {
 			if err == nil {
 				conn.Close() // the timer cancelled the context it lives on
 			}
-			err = os.ErrDeadlineExceeded
+			if err == nil || errors.Is(err, context.Canceled) {
+				err = os.ErrDeadlineExceeded
+			}
 		}
 	}
 	if err == nil {
 		// Bounds the replay and the half-close after it, which run without
-		// the caller's write deadline (startReplay).
+		// the caller's deadlines (startReplay).
 		done := s.replayTimer(conn)
 		switch {
 		case !s.startReplay(conn):
@@ -539,9 +545,9 @@ func (s *hedgeStream) runMove() {
 				err = closeWrite(conn)
 			}
 		}
-		// The timer firing is the cause, whatever the write returned for
-		// the conn it closed.
-		if !done() {
+		// The timer firing is the cause when the write failed only from the
+		// conn it closed, rather than a reset of Then's own.
+		if !done() && (err == nil || closedByTimer(err)) {
 			err = os.ErrDeadlineExceeded
 		}
 		if err != nil {
@@ -973,7 +979,9 @@ func (p *hedgePacket) runMove() {
 			if err == nil {
 				raw.Close() // the timer cancelled the context it lives on
 			}
-			err = os.ErrDeadlineExceeded
+			if err == nil || errors.Is(err, context.Canceled) {
+				err = os.ErrDeadlineExceeded
+			}
 		}
 		if err == nil {
 			conn = netPacketConn(raw)
@@ -989,7 +997,7 @@ func (p *hedgePacket) runMove() {
 					break
 				}
 			}
-			if !done() {
+			if !done() && (err == nil || closedByTimer(err)) {
 				err = os.ErrDeadlineExceeded
 			}
 		}

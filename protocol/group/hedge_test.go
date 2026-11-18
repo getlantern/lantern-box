@@ -1716,6 +1716,7 @@ func TestHedgeCloseDuringTheMoveIsNotAMoveFailure(t *testing.T) {
 	require.Error(t, moveErr)
 	var me *hedgeMoveError
 	require.False(t, errors.As(moveErr, &me), "a close isn't a move failure: %v", moveErr)
+	require.ErrorIs(t, moveErr, net.ErrClosed, "it reads as the close it was")
 }
 
 // A failed move whose cause is a deadline doesn't read as a timeout to
@@ -1728,6 +1729,6 @@ func TestHedgeMoveErrorHidesADeadlineCause(t *testing.T) {
 	}
 	require.ErrorIs(t, &hedgeMoveError{cause: errors.ErrUnsupported}, errors.ErrUnsupported, "other causes stay reachable")
 	var op *net.OpError
-	require.ErrorAs(t, &hedgeMoveError{cause: &net.OpError{Op: "write", Err: os.ErrDeadlineExceeded}}, &op,
-		"errors.As still finds the cause's details")
+	require.False(t, errors.As(&hedgeMoveError{cause: &net.OpError{Op: "write", Err: os.ErrDeadlineExceeded}}, &op),
+		"nor through a cause's own timeout")
 }
