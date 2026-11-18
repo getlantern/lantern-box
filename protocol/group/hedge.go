@@ -86,6 +86,9 @@ func NewHedge(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if options.First == options.Then {
 		return nil, fmt.Errorf("hedge: first and then must differ, both are %q", options.First)
 	}
+	if options.First == tag || options.Then == tag {
+		return nil, fmt.Errorf("hedge: %q must not name itself as first or then", tag)
+	}
 	cfg := hedgeConfig{
 		commitTimeout: time.Duration(options.CommitTimeout),
 		failureTTL:    time.Duration(options.FailureTTL),
@@ -183,9 +186,37 @@ func (h *Hedge) markGood(key hedgeKey) {
 	h.cache.mark(key, hedgeGood, h.cfg.successTTL)
 }
 
+// hedgeChainKey carries the hedges a dial has passed through.
+type hedgeChainKey struct{}
+
+// hedgeChain is one link in that path.
+type hedgeChain struct {
+	tag    string
+	parent *hedgeChain
+}
+
+// enter returns ctx marked as passing through h, or an error if the dial
+// already passed through it. The outbound manager catches cycles only
+// through Dependencies, which name Then alone, so a loop through First
+// (hedge A's First is hedge B, whose First or Then is A) would otherwise
+// recurse until the stack ran out.
+func (h *Hedge) enter(ctx context.Context) (context.Context, error) {
+	parent, _ := ctx.Value(hedgeChainKey{}).(*hedgeChain)
+	for c := parent; c != nil; c = c.parent {
+		if c.tag == h.Tag() {
+			return nil, fmt.Errorf("hedge: %s loops back to itself", h.Tag())
+		}
+	}
+	return context.WithValue(ctx, hedgeChainKey{}, &hedgeChain{tag: h.Tag(), parent: parent}), nil
+}
+
 func (h *Hedge) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	ctx, err := h.enter(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if N.NetworkName(network) == N.NetworkUDP {
-		conn, err := h.ListenPacket(ctx, destination)
+		conn, err := h.listenPacket(ctx, destination)
 		if err != nil {
 			return nil, err
 		}
@@ -222,6 +253,15 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 }
 
 func (h *Hedge) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	ctx, err := h.enter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return h.listenPacket(ctx, destination)
+}
+
+// listenPacket is ListenPacket for a ctx that has entered h.
+func (h *Hedge) listenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	then, err := h.outbound(h.thenTag)
 	if err != nil {
 		return nil, err

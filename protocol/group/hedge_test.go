@@ -1276,3 +1276,67 @@ func TestHedgeConcurrentDeadlineSettersAgree(t *testing.T) {
 		require.True(t, stored.Equal(applied), "round %d: stored %v but First holds %v", round, stored, applied)
 	}
 }
+
+func TestNewHedgeRejectsItselfAsFirstOrThen(t *testing.T) {
+	ctx := service.ContextWithDefaultRegistry(context.Background())
+	for _, opts := range []option.HedgeOutboundOptions{
+		{First: "h", Then: "then"},
+		{First: "first", Then: "h"},
+	} {
+		_, err := NewHedge(ctx, nil, log.NewNOPFactory().Logger(), "h", opts)
+		require.Error(t, err, "%+v", opts)
+	}
+}
+
+// Two hedges whose First names the other would recurse forever; the loop is
+// caught, and each falls back to its Then.
+func TestHedgeLoopThroughFirstEnds(t *testing.T) {
+	thenA := &fakeOutbound{tag: "then-a", stream: answer("then-a:"), packet: func(p []byte) []byte { return append([]byte("then-a:"), p...) }}
+	thenB := &fakeOutbound{tag: "then-b", stream: answer("then-b:")}
+	mgr := &mockOutboundManager{outbounds: map[string]adapter.Outbound{"then-a": thenA, "then-b": thenB}}
+	ctx := service.ContextWithDefaultRegistry(context.Background())
+	service.MustRegister[adapter.OutboundManager](ctx, mgr)
+	newHedge := func(tag, first, then string) *Hedge {
+		out, err := NewHedge(ctx, nil, log.NewNOPFactory().Logger(), tag,
+			option.HedgeOutboundOptions{First: first, Then: then, CommitTimeout: badoption.Duration(time.Minute)})
+		require.NoError(t, err)
+		return out.(*Hedge)
+	}
+	a := newHedge("a", "b", "then-a")
+	mgr.outbounds["a"] = a
+	mgr.outbounds["b"] = newHedge("b", "a", "then-b")
+
+	type result struct {
+		reply string
+		err   error
+	}
+	got := make(chan result, 1)
+	go func() {
+		c, err := a.DialContext(ctx, "tcp", hedgeDest)
+		if err != nil {
+			got <- result{err: err}
+			return
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := c.Write([]byte(tlsRecord("hi"))); err != nil {
+			got <- result{err: err}
+			return
+		}
+		buf := make([]byte, 64)
+		n, err := c.Read(buf)
+		got <- result{reply: string(buf[:n]), err: err}
+	}()
+	select {
+	case r := <-got:
+		require.NoError(t, r.err)
+		// a's First is b; b's First (a) fails as a loop, so b uses then-b.
+		require.Equal(t, "then-b:"+tlsRecord("hi"), r.reply)
+	case <-time.After(5 * time.Second):
+		t.Fatal("dialing a hedge loop never returned")
+	}
+
+	pc, err := a.DialContext(ctx, "udp", hedgeDest)
+	require.NoError(t, err, "a UDP dial through DialContext isn't mistaken for a loop")
+	pc.Close()
+}
