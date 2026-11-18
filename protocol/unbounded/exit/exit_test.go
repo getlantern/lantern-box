@@ -834,3 +834,12 @@ func TestExitRevokingOneKindLeavesTheOther(t *testing.T) {
 		})
 	}
 }
+
+// A kind out of range is ignored rather than panicking.
+func TestExitIgnoresAnUnknownKind(t *testing.T) {
+	e := newTestExit(t)
+	e.SetEnabled(true)
+	assert.NotPanics(t, func() { e.SetRouter(Kind(7), &dialRouter{}, time.Now().Add(time.Hour)) })
+	assert.False(t, e.Options().Ready(false))
+	assert.False(t, e.Options().Ready(true))
+}

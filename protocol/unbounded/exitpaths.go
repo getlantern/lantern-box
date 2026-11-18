@@ -241,7 +241,9 @@ func sniffedDestination(ctx context.Context, destination M.Socksaddr) M.Socksadd
 // refuses: its allowlist grants UDP 443 only to hostnames, and QUIC carries none we can rely
 // on. A black hole, rather than an error, sends the browser back to TCP, which carries the
 // sniffed host, without a group counting a policy decision as the outbound's failure. With no
-// live path the flow takes today's path, which carries IPs.
+// live path the flow takes today's path, which carries IPs. It applies to a friend's personal
+// exit too, whose policy would admit QUIC to an IP: the consumer can't tell which kind of
+// session it got, and the browser's fall back to TCP costs little.
 func quicToIP(destination M.Socksaddr) bool {
 	return destination.IsIP() && destination.Port == 443
 }
