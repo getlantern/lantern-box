@@ -80,6 +80,8 @@ type hedgeLeg struct {
 	// either changes, waking waiters to re-read them.
 	readDeadline, writeDeadline time.Time
 	deadlineChanged             chan struct{}
+
+	stats *hedgeStats
 }
 
 type deadlineCloser interface {
@@ -88,8 +90,8 @@ type deadlineCloser interface {
 	SetWriteDeadline(time.Time) error
 }
 
-func (l *hedgeLeg) init(h *Hedge, ctx context.Context, key hedgeKey, network string, dest M.Socksaddr) {
-	l.h, l.ctx, l.key, l.network, l.dest = h, ctx, key, network, dest
+func (l *hedgeLeg) init(h *Hedge, ctx context.Context, key hedgeKey, network string, dest M.Socksaddr, stats *hedgeStats) {
+	l.h, l.ctx, l.key, l.network, l.dest, l.stats = h, ctx, key, network, dest, stats
 	l.onFirst = true
 	l.moved = make(chan struct{})
 	l.deadlineChanged = make(chan struct{})
@@ -245,6 +247,7 @@ func (l *hedgeLeg) commit(release func()) bool {
 	release()
 	l.mu.Unlock()
 	if first {
+		l.stats.set("", hedgeOutcomeCommitted)
 		l.h.markGood(l.key)
 	}
 	return true
@@ -258,6 +261,11 @@ func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter
 	committed := l.committed
 	l.mu.Unlock()
 	if committed {
+		outcome := hedgeOutcomeResetAfterCommit
+		if kind == lAdapter.UserFailureStall {
+			outcome = hedgeOutcomeStalledAfterCommit
+		}
+		l.stats.set("", outcome)
 		l.h.markBad(l.ctx, l.key, kind)
 		return
 	}
@@ -278,8 +286,14 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 	}
 	if notReplayable := l.noReplay || l.undecidedKept; notReplayable || l.overflow {
 		slowOnly := notReplayable && why == lAdapter.UserFailureNoResponse
+		overflowed := l.overflow
 		l.mu.Unlock()
 		if !slowOnly {
+			outcome := hedgeOutcomeOverflowFailed
+			if !overflowed {
+				outcome = hedgeOutcomeResetNotReplayable
+			}
+			l.stats.set("", outcome)
 			l.h.markBad(l.ctx, l.key, why)
 			_ = closeFirst()
 		}
@@ -288,6 +302,11 @@ func (l *hedgeLeg) beginMove(why lAdapter.UserFailureKind, closeFirst func() err
 	l.moving = true
 	l.moveCtx, l.cancel = moveContext(l.ctx)
 	l.mu.Unlock()
+	outcome := hedgeOutcomeMovedReset
+	if why == lAdapter.UserFailureNoResponse {
+		outcome = hedgeOutcomeMovedNoReply
+	}
+	l.stats.set(hedgePathThenAfterMove, outcome)
 	l.h.markBad(l.ctx, l.key, why)
 	_ = closeFirst()
 	return true
@@ -372,9 +391,9 @@ type hedgeStream struct {
 	writeClosed bool
 }
 
-func newHedgeStream(h *Hedge, ctx context.Context, key hedgeKey, network string, dest M.Socksaddr, first net.Conn) *hedgeStream {
+func newHedgeStream(h *Hedge, ctx context.Context, key hedgeKey, network string, dest M.Socksaddr, first net.Conn, stats *hedgeStats) *hedgeStream {
 	s := &hedgeStream{}
-	s.init(h, ctx, key, network, dest)
+	s.init(h, ctx, key, network, dest, stats)
 	w := newDataPlaneStream(first, defaultDataPlaneIdle, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
 		onFailure: func(kind lAdapter.UserFailureKind) { s.firstFailed(kind, s.move) },
 	})
@@ -465,6 +484,12 @@ func closeWrite(c net.Conn) error {
 }
 
 func (s *hedgeStream) Read(p []byte) (int, error) {
+	n, err := s.read(p)
+	s.stats.read(n)
+	return n, err
+}
+
+func (s *hedgeStream) read(p []byte) (int, error) {
 	for {
 		s.mu.Lock()
 		if s.moving {
@@ -511,6 +536,12 @@ func (s *hedgeStream) Read(p []byte) (int, error) {
 }
 
 func (s *hedgeStream) Write(p []byte) (int, error) {
+	n, err := s.write(p)
+	s.stats.wrote(n)
+	return n, err
+}
+
+func (s *hedgeStream) write(p []byte) (int, error) {
 	for {
 		s.mu.Lock()
 		if s.closed {
@@ -596,6 +627,7 @@ func (s *hedgeStream) NeedHandshakeForWrite() bool {
 }
 
 func (s *hedgeStream) Close() error {
+	s.stats.finish(true)
 	s.mu.Lock()
 	cancel, pending := s.closeLocked()
 	c := s.cur
@@ -676,9 +708,9 @@ type heldPacket struct {
 // client uses one or two before its handshake completes.
 const hedgeMaxCIDs = 8
 
-func newHedgePacket(h *Hedge, ctx context.Context, key hedgeKey, dest M.Socksaddr, first net.PacketConn) *hedgePacket {
+func newHedgePacket(h *Hedge, ctx context.Context, key hedgeKey, dest M.Socksaddr, first net.PacketConn, stats *hedgeStats) *hedgePacket {
 	p := &hedgePacket{}
-	p.init(h, ctx, key, N.NetworkUDP, dest)
+	p.init(h, ctx, key, N.NetworkUDP, dest, stats)
 	// The filter sits under the watchdog, so a decoy's Version Negotiation
 	// neither commits the connection nor counts as First's reply.
 	filtered := &vnFilter{PacketConn: first, ours: p.ownsCID}
@@ -867,6 +899,14 @@ func (p *hedgePacket) runMove() {
 func (p *hedgePacket) releaseLocked() { p.held, p.heldBytes = nil, 0 }
 
 func (p *hedgePacket) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := p.readFrom(b)
+	if err == nil {
+		p.stats.read(n)
+	}
+	return n, addr, err
+}
+
+func (p *hedgePacket) readFrom(b []byte) (int, net.Addr, error) {
 	for {
 		p.mu.Lock()
 		if p.moving {
@@ -913,6 +953,14 @@ func (p *hedgePacket) ReadFrom(b []byte) (int, net.Addr, error) {
 }
 
 func (p *hedgePacket) write(b []byte, dest M.Socksaddr) error {
+	err := p.writeLeg(b, dest)
+	if err == nil {
+		p.stats.wrote(len(b))
+	}
+	return err
+}
+
+func (p *hedgePacket) writeLeg(b []byte, dest M.Socksaddr) error {
 	for {
 		p.mu.Lock()
 		if p.closed {
@@ -984,6 +1032,7 @@ func (p *hedgePacket) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) e
 }
 
 func (p *hedgePacket) Close() error {
+	p.stats.finish(true)
 	p.mu.Lock()
 	cancel, pending := p.closeLocked()
 	c := p.cur

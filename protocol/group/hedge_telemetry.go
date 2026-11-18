@@ -1,0 +1,295 @@
+package group
+
+import (
+	"context"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	semconv "github.com/getlantern/semconv"
+	"github.com/sagernet/sing/common/buf"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+)
+
+// Hedge attribute keys. They are Lantern-specific, so they belong in
+// semconv's custom.go; they live here until they are added there.
+const (
+	// hedgePathKey is where a connection's bytes went: see the hedgePath
+	// constants.
+	hedgePathKey attribute.Key = "hedge.path"
+	// hedgeOutcomeKey is how a connection that tried First ended.
+	hedgeOutcomeKey attribute.Key = "hedge.outcome"
+	// hedgeSiteAttrKey is the connection's registered domain, only when it is one
+	// of the hedge's telemetry_sites, else "other". Never set otherwise.
+	hedgeSiteAttrKey attribute.Key = "hedge.site"
+	// hedgeFirstKey and hedgeThenKey are the hedge's outbound tags, with
+	// helper tags redacted.
+	hedgeFirstKey attribute.Key = "hedge.first"
+	hedgeThenKey  attribute.Key = "hedge.then"
+)
+
+// Paths a hedged connection can take. Bandit probes take none: they record
+// nothing.
+const (
+	hedgePathFirst = "first"
+	// hedgePathThen is Then because First can't carry the network.
+	hedgePathThen = "then"
+	// hedgePathThenKnownBad is Then because the cache says First fails for
+	// the site or its address block.
+	hedgePathThenKnownBad = "then_known_bad"
+	// hedgePathThenAfterMove is Then after trying First.
+	hedgePathThenAfterMove = "then_after_move"
+	// hedgePathThenExplore is Then for a site First may work for, chosen at
+	// random (explore_rate) to compare the two paths on the same sites.
+	hedgePathThenExplore = "then_explore"
+)
+
+// Outcomes of connections that tried First.
+const (
+	hedgeOutcomeCommitted          = "committed"
+	hedgeOutcomeMovedNoReply       = "moved_no_reply"
+	hedgeOutcomeMovedReset         = "moved_reset"
+	hedgeOutcomeMovedDialError     = "moved_dial_error"
+	hedgeOutcomeOverflowFailed     = "overflow_failed"
+	hedgeOutcomeStalledAfterCommit = "stalled_after_commit"
+	hedgeOutcomeResetAfterCommit   = "reset_after_commit"
+	hedgeOutcomeResetNotReplayable = "reset_not_replayable"
+	// hedgeOutcomeAbandoned is a connection the client closed before First
+	// replied or failed.
+	hedgeOutcomeAbandoned = "abandoned"
+)
+
+const hedgeSiteOther = "other"
+
+// hedgeTelemetry records one data point set per hedged connection when it
+// closes. The attributes are low-cardinality: path, outcome, transport, the
+// two outbound tags and, for sites the config names, the site.
+type hedgeTelemetry struct {
+	connections metric.Int64Counter
+	io          metric.Int64Counter
+	firstByte   metric.Float64Histogram
+}
+
+func newHedgeTelemetry() (*hedgeTelemetry, error) {
+	meter := otel.Meter(tracerName)
+	connections, err := meter.Int64Counter("hedge.connections",
+		metric.WithDescription("Hedged connections, by the path they took and how First fared"))
+	if err != nil {
+		return nil, err
+	}
+	io, err := meter.Int64Counter("hedge.io",
+		metric.WithDescription("Bytes carried by hedged connections"),
+		metric.WithUnit("By"))
+	if err != nil {
+		return nil, err
+	}
+	firstByte, err := meter.Float64Histogram("hedge.time_to_first_byte",
+		metric.WithDescription("Time from the hedge's dial to the first byte the client receives"),
+		metric.WithUnit("s"))
+	if err != nil {
+		return nil, err
+	}
+	return &hedgeTelemetry{connections: connections, io: io, firstByte: firstByte}, nil
+}
+
+// hedgeStats accumulates one connection's record. Its path and outcome can
+// change while the connection lives, as it commits or moves; finish records
+// it once.
+type hedgeStats struct {
+	h       *Hedge
+	network string
+	site    string
+	start   time.Time
+
+	mu      sync.Mutex
+	path    string
+	outcome string
+
+	firstByte atomic.Int64 // nanoseconds after start, 0 before any
+	up, down  atomic.Int64
+	once      sync.Once
+}
+
+func (h *Hedge) newStats(key hedgeKey, network, path string, start time.Time) *hedgeStats {
+	return &hedgeStats{h: h, network: network, site: h.telemetrySite(key), start: start, path: path}
+}
+
+// telemetrySite returns the site attribute value: the site when the config
+// lists it, "other" when it lists others, "" when it lists none.
+func (h *Hedge) telemetrySite(key hedgeKey) string {
+	if len(h.telemetrySites) == 0 {
+		return ""
+	}
+	if h.telemetrySites[key.site] {
+		return key.site
+	}
+	return hedgeSiteOther
+}
+
+func (s *hedgeStats) set(path, outcome string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if path != "" {
+		s.path = path
+	}
+	if outcome != "" {
+		s.outcome = outcome
+	}
+}
+
+// setOutcomeIfUnset keeps an earlier, more specific outcome.
+func (s *hedgeStats) setOutcomeIfUnset(outcome string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.outcome == "" {
+		s.outcome = outcome
+	}
+}
+
+func (s *hedgeStats) read(n int) {
+	if n <= 0 {
+		return
+	}
+	if s.firstByte.Load() == 0 {
+		s.firstByte.CompareAndSwap(0, max(int64(time.Since(s.start)), 1))
+	}
+	s.down.Add(int64(n))
+}
+
+func (s *hedgeStats) wrote(n int) {
+	if n > 0 {
+		s.up.Add(int64(n))
+	}
+}
+
+// finish records the connection. tried reports whether it tried First, so
+// an outcome is due.
+func (s *hedgeStats) finish(tried bool) {
+	s.once.Do(func() {
+		t := s.h.tel
+		if t == nil {
+			return
+		}
+		s.mu.Lock()
+		path, outcome := s.path, s.outcome
+		s.mu.Unlock()
+		if tried && outcome == "" {
+			outcome = hedgeOutcomeAbandoned
+		}
+		attrs := []attribute.KeyValue{
+			semconv.NetworkProtocolNameKey.String(s.network),
+			hedgePathKey.String(path),
+			tagAttr(string(hedgeFirstKey), s.h.firstTag),
+			tagAttr(string(hedgeThenKey), s.h.thenTag),
+		}
+		if s.site != "" {
+			attrs = append(attrs, hedgeSiteAttrKey.String(s.site))
+		}
+		pathAttrs := metric.WithAttributeSet(attribute.NewSet(attrs...))
+		if outcome != "" {
+			attrs = append(attrs, hedgeOutcomeKey.String(outcome))
+		}
+		ctx := context.Background()
+		t.connections.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(attrs...)))
+		if ns := s.firstByte.Load(); ns > 0 {
+			t.firstByte.Record(ctx, time.Duration(ns).Seconds(), pathAttrs)
+		}
+		dir := func(d string) metric.MeasurementOption {
+			return metric.WithAttributeSet(attribute.NewSet(append(attrs[:len(attrs):len(attrs)],
+				semconv.NetworkIODirectionKey.String(d))...))
+		}
+		if up := s.up.Load(); up > 0 {
+			t.io.Add(ctx, up, dir("transmit"))
+		}
+		if down := s.down.Load(); down > 0 {
+			t.io.Add(ctx, down, dir("receive"))
+		}
+	})
+}
+
+// statsStream measures a connection that went straight to Then.
+type statsStream struct {
+	net.Conn
+	stats *hedgeStats
+}
+
+func (c *statsStream) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.stats.read(n)
+	return n, err
+}
+
+func (c *statsStream) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.stats.wrote(n)
+	return n, err
+}
+
+func (c *statsStream) Close() error {
+	c.stats.finish(false)
+	return c.Conn.Close()
+}
+
+// Upstream lets common.Cast find feature interfaces on the inner conn. It
+// does not mark the reader replaceable, so reads still pass through Read.
+func (c *statsStream) Upstream() any { return c.Conn }
+
+// statsPacket measures a packet connection that went straight to Then.
+type statsPacket struct {
+	net.PacketConn
+	writer N.NetPacketConn
+	stats  *hedgeStats
+}
+
+func newStatsPacket(c net.PacketConn, stats *hedgeStats) *statsPacket {
+	return &statsPacket{PacketConn: c, writer: netPacketConn(c), stats: stats}
+}
+
+func (c *statsPacket) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(p)
+	if err == nil {
+		c.stats.read(n)
+	}
+	return n, addr, err
+}
+
+func (c *statsPacket) WriteTo(p []byte, addr net.Addr) (int, error) {
+	n, err := c.PacketConn.WriteTo(p, addr)
+	c.stats.wrote(n)
+	return n, err
+}
+
+func (c *statsPacket) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	_, addr, err := buffer.ReadPacketFrom(c)
+	if err != nil {
+		return M.Socksaddr{}, err
+	}
+	return M.SocksaddrFromNet(addr).Unwrap(), nil
+}
+
+// WritePacket keeps domain-name destinations, which WriteTo would strip.
+func (c *statsPacket) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	n := buffer.Len()
+	err := c.writer.WritePacket(buffer, destination)
+	if err == nil {
+		c.stats.wrote(n)
+	}
+	return err
+}
+
+func (c *statsPacket) Close() error {
+	c.stats.finish(false)
+	return c.PacketConn.Close()
+}
+
+func (c *statsPacket) Upstream() any { return c.PacketConn }
+
+var (
+	_ net.Conn        = (*statsStream)(nil)
+	_ N.NetPacketConn = (*statsPacket)(nil)
+)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"sync/atomic"
@@ -68,6 +69,17 @@ type Hedge struct {
 	cfg         hedgeConfig
 	cache       *hedgeCache
 	enabled     atomic.Bool
+
+	// exploreRate is the fraction of connections First could take that go
+	// to Then instead, so the two paths can be compared on the same sites.
+	exploreRate float64
+	// random draws the explore decision; tests replace it.
+	random func() float64
+	// telemetrySites are the registered domains the hedge.site attribute may
+	// name; others are reported as "other".
+	telemetrySites map[string]bool
+	// tel is nil when the instruments couldn't be created.
+	tel *hedgeTelemetry
 }
 
 var _ lAdapter.Switchable = (*Hedge)(nil)
@@ -104,18 +116,37 @@ func NewHedge(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if cfg.maxHeldBytes <= 0 {
 		cfg.maxHeldBytes = defaultHedgeMaxHeldBytes
 	}
+	if options.ExploreRate < 0 || options.ExploreRate > 1 {
+		return nil, fmt.Errorf("hedge: explore_rate must be between 0 and 1, got %v", options.ExploreRate)
+	}
+	var sites map[string]bool
+	for _, site := range options.TelemetrySites {
+		if sites == nil {
+			sites = map[string]bool{}
+		}
+		sites[registeredDomain(site)] = true
+	}
+	tel, err := newHedgeTelemetry()
+	if err != nil {
+		logger.Warn("hedge: telemetry disabled: ", err)
+		tel = nil
+	}
 	h := &Hedge{
 		// Only Then is a dependency. First may come and go at runtime, as a
 		// server-sent outbound does: the hedge looks it up on every dial and
 		// uses Then while it's missing. As a dependency, the outbound
 		// manager would refuse to remove it.
-		Adapter:     outbound.NewAdapter(constant.TypeHedge, tag, []string{N.NetworkTCP, N.NetworkUDP}, []string{options.Then}),
-		outboundMgr: service.FromContext[adapter.OutboundManager](ctx),
-		logger:      logger,
-		firstTag:    options.First,
-		thenTag:     options.Then,
-		cfg:         cfg,
-		cache:       sharedHedgeCache(ctx),
+		Adapter:        outbound.NewAdapter(constant.TypeHedge, tag, []string{N.NetworkTCP, N.NetworkUDP}, []string{options.Then}),
+		outboundMgr:    service.FromContext[adapter.OutboundManager](ctx),
+		logger:         logger,
+		firstTag:       options.First,
+		thenTag:        options.Then,
+		cfg:            cfg,
+		cache:          sharedHedgeCache(ctx),
+		exploreRate:    options.ExploreRate,
+		random:         rand.Float64,
+		telemetrySites: sites,
+		tel:            tel,
 	}
 	h.enabled.Store(!options.Disabled)
 	return h, nil
@@ -156,22 +187,27 @@ func (h *Hedge) outbound(tag string) (adapter.Outbound, error) {
 	return o, nil
 }
 
-// useFirst reports whether a dial should try First, and the key its result
-// is remembered by.
-func (h *Hedge) useFirst(ctx context.Context, network string, destination M.Socksaddr) (adapter.Outbound, hedgeKey, bool) {
+// route decides where a dial goes. It returns First when the dial should
+// try it, the key its result is remembered by, and the path for telemetry.
+// Probes, and every dial while the hedge is switched off, get an empty path:
+// they record nothing and teach the cache nothing.
+func (h *Hedge) route(ctx context.Context, network string, destination M.Socksaddr) (first adapter.Outbound, key hedgeKey, path string) {
 	if lAdapter.IsProbe(ctx) || !h.enabled.Load() {
-		return nil, hedgeKey{}, false
+		return nil, hedgeKey{}, ""
 	}
+	key = hedgeKeyFor(ctx, network, destination)
+	key.gen = h.cache.generation()
 	first, err := h.outbound(h.firstTag)
 	if err != nil || !slices.Contains(first.Network(), network) {
-		return nil, hedgeKey{}, false
+		return nil, key, hedgePathThen
 	}
-	key := hedgeKeyFor(ctx, network, destination)
-	key.gen = h.cache.generation()
 	if h.cache.verdict(key) == hedgeBad {
-		return nil, key, false
+		return nil, key, hedgePathThenKnownBad
 	}
-	return first, key, true
+	if h.exploreRate > 0 && h.random() < h.exploreRate {
+		return nil, key, hedgePathThenExplore
+	}
+	return first, key, hedgePathFirst
 }
 
 func (h *Hedge) markBad(ctx context.Context, key hedgeKey, why any) {
@@ -198,14 +234,20 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 		}
 		return bufio.NewBindPacketConn(conn, remote), nil
 	}
+	start := time.Now()
 	then, err := h.outbound(h.thenTag)
 	if err != nil {
 		return nil, err
 	}
-	first, key, ok := h.useFirst(ctx, N.NetworkTCP, destination)
-	if !ok {
-		return then.DialContext(ctx, network, destination)
+	first, key, path := h.route(ctx, N.NetworkTCP, destination)
+	if first == nil {
+		conn, err := then.DialContext(ctx, network, destination)
+		if err != nil || path == "" {
+			return conn, err
+		}
+		return &statsStream{Conn: conn, stats: h.newStats(key, N.NetworkTCP, path, start)}, nil
 	}
+	stats := h.newStats(key, N.NetworkTCP, path, start)
 	dialCtx, timedOut, stop := h.firstDialContext(ctx)
 	conn, err := first.DialContext(dialCtx, network, destination)
 	stop()
@@ -216,20 +258,31 @@ func (h *Hedge) DialContext(ctx context.Context, network string, destination M.S
 		if !timedOut() {
 			h.markBad(ctx, key, err)
 		}
-		return then.DialContext(ctx, network, destination)
+		conn, err := then.DialContext(ctx, network, destination)
+		if err != nil {
+			return nil, err
+		}
+		stats.set(hedgePathThenAfterMove, hedgeOutcomeMovedDialError)
+		return &statsStream{Conn: conn, stats: stats}, nil
 	}
-	return newHedgeStream(h, ctx, key, network, destination, conn), nil
+	return newHedgeStream(h, ctx, key, network, destination, conn, stats), nil
 }
 
 func (h *Hedge) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	start := time.Now()
 	then, err := h.outbound(h.thenTag)
 	if err != nil {
 		return nil, err
 	}
-	first, key, ok := h.useFirst(ctx, N.NetworkUDP, destination)
-	if !ok {
-		return then.ListenPacket(ctx, destination)
+	first, key, path := h.route(ctx, N.NetworkUDP, destination)
+	if first == nil {
+		conn, err := then.ListenPacket(ctx, destination)
+		if err != nil || path == "" {
+			return conn, err
+		}
+		return newStatsPacket(conn, h.newStats(key, N.NetworkUDP, path, start)), nil
 	}
+	stats := h.newStats(key, N.NetworkUDP, path, start)
 	dialCtx, timedOut, stop := h.firstDialContext(ctx)
 	conn, err := first.ListenPacket(dialCtx, destination)
 	stop()
@@ -240,9 +293,14 @@ func (h *Hedge) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		if !timedOut() {
 			h.markBad(ctx, key, err)
 		}
-		return then.ListenPacket(ctx, destination)
+		conn, err := then.ListenPacket(ctx, destination)
+		if err != nil {
+			return nil, err
+		}
+		stats.set(hedgePathThenAfterMove, hedgeOutcomeMovedDialError)
+		return newStatsPacket(conn, stats), nil
 	}
-	return newHedgePacket(h, ctx, key, destination, conn), nil
+	return newHedgePacket(h, ctx, key, destination, conn, stats), nil
 }
 
 // firstDialContext bounds First's dial by the commit timeout, so a slow

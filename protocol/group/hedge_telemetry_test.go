@@ -1,0 +1,355 @@
+package group
+
+import (
+	"context"
+	"errors"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/json/badoption"
+	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/service"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
+	lAdapter "github.com/getlantern/lantern-box/adapter"
+	"github.com/getlantern/lantern-box/option"
+)
+
+// recordMetrics installs an in-memory meter provider for the test. Hedges
+// must be created after it, since they create their instruments then.
+func recordMetrics(t *testing.T) *sdkmetric.ManualReader {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prev := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		_ = mp.Shutdown(context.Background())
+		otel.SetMeterProvider(prev)
+	})
+	return reader
+}
+
+type hedgePoint struct {
+	attrs map[string]string
+	int   int64
+	count uint64 // histogram sample count
+}
+
+func collectHedge(t *testing.T, reader *sdkmetric.ManualReader, name string) []hedgePoint {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	var points []hedgePoint
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			switch data := m.Data.(type) {
+			case metricdata.Sum[int64]:
+				for _, dp := range data.DataPoints {
+					points = append(points, hedgePoint{attrs: attrMap(dp.Attributes.ToSlice()), int: dp.Value})
+				}
+			case metricdata.Histogram[float64]:
+				for _, dp := range data.DataPoints {
+					points = append(points, hedgePoint{attrs: attrMap(dp.Attributes.ToSlice()), count: dp.Count})
+				}
+			}
+		}
+	}
+	return points
+}
+
+// connectionRecord returns the single hedge.connections point.
+func connectionRecord(t *testing.T, reader *sdkmetric.ManualReader) map[string]string {
+	t.Helper()
+	points := collectHedge(t, reader, "hedge.connections")
+	require.Len(t, points, 1, "want exactly one connection record, got %+v", points)
+	require.EqualValues(t, 1, points[0].int)
+	return points[0].attrs
+}
+
+func attrMap(kvs []attribute.KeyValue) map[string]string {
+	m := map[string]string{}
+	for _, kv := range kvs {
+		m[string(kv.Key)] = kv.Value.Emit()
+	}
+	return m
+}
+
+func TestHedgeTelemetryOutcomes(t *testing.T) {
+	commitThenStall := func(t *testing.T, f *hedgeFixture, c net.Conn) {
+		require.Equal(t, "first:hi", exchange(t, c, "hi"))
+		s := c.(*hedgeStream)
+		s.firstFailed(lAdapter.UserFailureStall, s.move)
+	}
+	for _, tc := range []struct {
+		name    string
+		first   *fakeOutbound
+		mutate  func(*option.HedgeOutboundOptions)
+		use     func(t *testing.T, f *hedgeFixture, c net.Conn)
+		path    string
+		outcome string
+	}{
+		{"committed", &fakeOutbound{stream: answer("first:")}, nil, nil, hedgePathFirst, hedgeOutcomeCommitted},
+		{"moved on no reply", &fakeOutbound{stream: blackhole}, nil, nil, hedgePathThenAfterMove, hedgeOutcomeMovedNoReply},
+		{"moved on reset", &fakeOutbound{stream: reset}, nil, nil, hedgePathThenAfterMove, hedgeOutcomeMovedReset},
+		{"moved on dial error", &fakeOutbound{dialErr: errors.New("no strategy")}, nil, nil, hedgePathThenAfterMove, hedgeOutcomeMovedDialError},
+		{"stalled after commit", &fakeOutbound{stream: answer("first:")}, nil, commitThenStall, hedgePathFirst, hedgeOutcomeStalledAfterCommit},
+		{"overflow", &fakeOutbound{stream: blackhole},
+			func(o *option.HedgeOutboundOptions) { o.MaxHeldBytes = 1 },
+			func(t *testing.T, f *hedgeFixture, c net.Conn) {
+				_, _ = c.Write([]byte(tlsRecord("too long")))
+				_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+				_, _ = c.Read(make([]byte, 16))
+			}, hedgePathFirst, hedgeOutcomeOverflowFailed},
+		{"abandoned", &fakeOutbound{stream: blackhole},
+			func(o *option.HedgeOutboundOptions) { o.CommitTimeout = badoption.Duration(time.Minute) },
+			func(t *testing.T, f *hedgeFixture, c net.Conn) { _, _ = c.Write([]byte("hi")) },
+			hedgePathFirst, hedgeOutcomeAbandoned},
+		{"reset, not replayable", &fakeOutbound{stream: reset}, nil,
+			func(t *testing.T, f *hedgeFixture, c net.Conn) {
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				_, _ = c.Write([]byte("hello"))
+				_, _ = c.Read(make([]byte, 16))
+			}, hedgePathFirst, hedgeOutcomeResetNotReplayable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := recordMetrics(t)
+			f := newHedgeFixture(t, tc.first, &fakeOutbound{stream: answer("then:")}, tc.mutate)
+			c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+			require.NoError(t, err)
+			if tc.use != nil {
+				tc.use(t, f, c)
+			} else {
+				// A handshake opening, the only kind a hedge moves.
+				exchange(t, c, tlsRecord("hi"))
+			}
+			c.Close()
+			attrs := connectionRecord(t, reader)
+			require.Equal(t, tc.path, attrs["hedge.path"])
+			require.Equal(t, tc.outcome, attrs["hedge.outcome"])
+			require.Equal(t, "tcp", attrs["network.protocol.name"])
+			require.Equal(t, "first", attrs["hedge.first"])
+			require.Equal(t, "then", attrs["hedge.then"])
+			require.NotContains(t, attrs, "hedge.site", "no site without telemetry_sites")
+		})
+	}
+}
+
+func TestHedgeTelemetryBytesAndFirstByte(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.Equal(t, "first:hello", exchange(t, c, "hello"))
+	c.Close()
+
+	io := map[string]int64{}
+	for _, p := range collectHedge(t, reader, "hedge.io") {
+		require.Equal(t, hedgeOutcomeCommitted, p.attrs["hedge.outcome"])
+		io[p.attrs["network.io.direction"]] = p.int
+	}
+	require.Equal(t, map[string]int64{"transmit": 5, "receive": 11}, io)
+
+	ttfb := collectHedge(t, reader, "hedge.time_to_first_byte")
+	require.Len(t, ttfb, 1)
+	require.EqualValues(t, 1, ttfb[0].count)
+	require.Equal(t, hedgePathFirst, ttfb[0].attrs["hedge.path"])
+	require.NotContains(t, ttfb[0].attrs, "hedge.outcome", "first byte is keyed by path alone")
+}
+
+func TestHedgeTelemetryThenPaths(t *testing.T) {
+	t.Run("known bad", func(t *testing.T) {
+		reader := recordMetrics(t)
+		f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+		f.hedge.cache.mark(hedgeKeyFor(context.Background(), "tcp", hedgeDest), hedgeBad, time.Minute)
+		c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+		require.NoError(t, err)
+		require.Equal(t, "then:x", exchange(t, c, "x"))
+		c.Close()
+		attrs := connectionRecord(t, reader)
+		require.Equal(t, hedgePathThenKnownBad, attrs["hedge.path"])
+		require.NotContains(t, attrs, "hedge.outcome", "connections that never tried First have no outcome")
+	})
+	t.Run("first lacks the network", func(t *testing.T) {
+		reader := recordMetrics(t)
+		f := newHedgeFixture(t, &fakeOutbound{networks: []string{"tcp"}}, &fakeOutbound{packet: echoPacket("then:")}, nil)
+		pc, err := f.hedge.ListenPacket(f.ctx, hedgeDest)
+		require.NoError(t, err)
+		_, err = pc.WriteTo([]byte("q"), &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443})
+		require.NoError(t, err)
+		require.NoError(t, pc.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, _, err = pc.ReadFrom(make([]byte, 16))
+		require.NoError(t, err)
+		pc.Close()
+		attrs := connectionRecord(t, reader)
+		require.Equal(t, hedgePathThen, attrs["hedge.path"])
+		require.Equal(t, "udp", attrs["network.protocol.name"])
+	})
+	t.Run("udp moved", func(t *testing.T) {
+		reader := recordMetrics(t)
+		f := newHedgeFixture(t, &fakeOutbound{}, &fakeOutbound{packet: echoPacket("then:")}, nil)
+		pc, err := f.hedge.ListenPacket(f.ctx, hedgeDest)
+		require.NoError(t, err)
+		_, err = pc.WriteTo([]byte(quicPacket("initial")), &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443})
+		require.NoError(t, err)
+		require.NoError(t, pc.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, _, err = pc.ReadFrom(make([]byte, 64))
+		require.NoError(t, err)
+		pc.Close()
+		attrs := connectionRecord(t, reader)
+		require.Equal(t, hedgePathThenAfterMove, attrs["hedge.path"])
+		require.Equal(t, hedgeOutcomeMovedNoReply, attrs["hedge.outcome"])
+	})
+}
+
+func TestHedgeTelemetryProbesRecordNothing(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	probe := lAdapter.ContextWithProbe(f.ctx)
+	c, err := f.hedge.DialContext(probe, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.Equal(t, "then:probe", exchange(t, c, "probe"))
+	c.Close()
+	pc, err := f.hedge.ListenPacket(probe, hedgeDest)
+	require.NoError(t, err)
+	pc.Close()
+	for _, name := range []string{"hedge.connections", "hedge.io", "hedge.time_to_first_byte"} {
+		require.Empty(t, collectHedge(t, reader, name), "a probe must record no %s", name)
+	}
+}
+
+// A switched-off hedge sends everything to Then, and recording it would
+// report every connection of every client while the feature is off.
+func TestHedgeTelemetrySwitchedOffRecordsNothing(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	f.hedge.SetEnabled(false)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.Equal(t, "then:off", exchange(t, c, "off"))
+	c.Close()
+	require.Empty(t, collectHedge(t, reader, "hedge.connections"))
+
+	f.hedge.SetEnabled(true)
+	c, err = f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	require.Equal(t, "first:on", exchange(t, c, "on"))
+	c.Close()
+	require.Equal(t, hedgePathFirst, connectionRecord(t, reader)["hedge.path"])
+}
+
+func TestHedgeTelemetrySites(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")},
+		func(o *option.HedgeOutboundOptions) { o.TelemetrySites = []string{"www.YouTube.com."} })
+	for _, host := range []string{"rr1---sn-x.youtube.com:443", "private-blog.example:443"} {
+		c, err := f.hedge.DialContext(f.ctx, "tcp", M.ParseSocksaddr(host))
+		require.NoError(t, err)
+		exchange(t, c, "hi")
+		c.Close()
+	}
+	sites := map[string]bool{}
+	for _, p := range collectHedge(t, reader, "hedge.connections") {
+		sites[p.attrs["hedge.site"]] = true
+	}
+	require.Equal(t, map[string]bool{"youtube.com": true, "other": true}, sites,
+		"listed sites are named, every other site is \"other\"")
+}
+
+func TestHedgeTelemetryRedactsHelperTags(t *testing.T) {
+	reader := recordMetrics(t)
+	f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")}, nil)
+	f.hedge.thenTag = helperTagA
+	f.mgr.outbounds[helperTagA] = f.then
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	exchange(t, c, "hi")
+	c.Close()
+	for _, v := range connectionRecord(t, reader) {
+		require.False(t, strings.Contains(v, "0123456789ab"), "helper tag exported: %s", v)
+	}
+}
+
+func TestHedgeExplore(t *testing.T) {
+	newExploring := func(t *testing.T, rate float64, draws []float64) (*hedgeFixture, *sdkmetric.ManualReader) {
+		reader := recordMetrics(t)
+		f := newHedgeFixture(t, &fakeOutbound{stream: answer("first:")}, &fakeOutbound{stream: answer("then:")},
+			func(o *option.HedgeOutboundOptions) { o.ExploreRate = rate })
+		f.hedge.random = func() float64 {
+			d := draws[0]
+			draws = draws[1:]
+			return d
+		}
+		return f, reader
+	}
+	dial := func(t *testing.T, f *hedgeFixture) {
+		c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+		require.NoError(t, err)
+		exchange(t, c, "hi")
+		c.Close()
+	}
+	paths := func(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
+		got := map[string]int64{}
+		for _, p := range collectHedge(t, reader, "hedge.connections") {
+			got[p.attrs["hedge.path"]] += p.int
+		}
+		return got
+	}
+
+	t.Run("zero never explores", func(t *testing.T) {
+		f, reader := newExploring(t, 0, nil) // random must not be consulted
+		for range 3 {
+			dial(t, f)
+		}
+		require.Equal(t, map[string]int64{hedgePathFirst: 3}, paths(t, reader))
+	})
+	t.Run("one always explores", func(t *testing.T) {
+		f, reader := newExploring(t, 1, []float64{0, 0.5, 0.999})
+		for range 3 {
+			dial(t, f)
+		}
+		require.Equal(t, map[string]int64{hedgePathThenExplore: 3}, paths(t, reader))
+		require.Zero(t, f.first.dials.Load())
+		require.Equal(t, hedgeUnknown, f.verdict("www.youtube.com:443"), "exploring teaches the cache nothing")
+	})
+	t.Run("fraction", func(t *testing.T) {
+		f, reader := newExploring(t, 0.25, []float64{0.1, 0.9, 0.3, 0.2})
+		for range 4 {
+			dial(t, f)
+		}
+		require.Equal(t, map[string]int64{hedgePathThenExplore: 2, hedgePathFirst: 2}, paths(t, reader))
+		require.EqualValues(t, 2, f.first.dials.Load())
+	})
+	t.Run("probes neither explore nor draw", func(t *testing.T) {
+		f, reader := newExploring(t, 1, nil)
+		c, err := f.hedge.DialContext(lAdapter.ContextWithProbe(f.ctx), "tcp", hedgeDest)
+		require.NoError(t, err)
+		c.Close()
+		require.Empty(t, paths(t, reader))
+	})
+	t.Run("known-bad sites don't explore", func(t *testing.T) {
+		f, reader := newExploring(t, 1, nil)
+		f.hedge.cache.mark(hedgeKeyFor(context.Background(), "tcp", hedgeDest), hedgeBad, time.Minute)
+		dial(t, f)
+		require.Equal(t, map[string]int64{hedgePathThenKnownBad: 1}, paths(t, reader))
+	})
+}
+
+func TestNewHedgeRejectsBadExploreRate(t *testing.T) {
+	ctx := service.ContextWithDefaultRegistry(context.Background())
+	for _, rate := range []float64{-0.1, 1.5} {
+		_, err := NewHedge(ctx, nil, log.NewNOPFactory().Logger(), "h",
+			option.HedgeOutboundOptions{First: "a", Then: "b", ExploreRate: rate})
+		require.Error(t, err, "rate %v", rate)
+	}
+}
