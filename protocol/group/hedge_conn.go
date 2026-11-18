@@ -271,11 +271,15 @@ func (l *hedgeLeg) commit(release func()) bool {
 func (l *hedgeLeg) noteReset() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if !l.onFirst || l.moving || l.closed {
+	if !l.onFirst || l.moving {
 		return
 	}
 	if outcome := l.staticResetOutcomeLocked(); outcome != "" {
 		l.stats.set("", outcome)
+	} else {
+		// A replayable opening: its move records moved_reset too. If the
+		// client closes first, or a reply commits it, the reset still shows.
+		l.stats.setOutcomeIfUnset(hedgeOutcomeMovedReset)
 	}
 	l.settleLocked(hedgeBad, lAdapter.UserFailureReset)
 }
@@ -283,10 +287,11 @@ func (l *hedgeLeg) noteReset() {
 // settleLocked records what this connection teaches the cache about its
 // site, and writes it to the cache, all under mu so every path agrees on
 // one verdict: good only while nothing is decided, bad over anything, and
-// nothing after bad. The cache's lock is never held while taking a leg's,
-// so writing it under mu can't deadlock. Caller holds mu.
+// nothing after bad, and nothing once the client closed, when an error can
+// be the teardown itself. The cache's lock is never held while taking a
+// leg's, so writing it under mu can't deadlock. Caller holds mu.
 func (l *hedgeLeg) settleLocked(v hedgeVerdict, why any) {
-	if l.verdict == hedgeBad || (v == hedgeGood && l.verdict != hedgeUnknown) {
+	if l.closed || l.verdict == hedgeBad || (v == hedgeGood && l.verdict != hedgeUnknown) {
 		return
 	}
 	l.verdict = v
@@ -321,17 +326,13 @@ func (l *hedgeLeg) staticResetOutcomeLocked() string {
 func (l *hedgeLeg) firstFailed(kind lAdapter.UserFailureKind, move func(lAdapter.UserFailureKind)) {
 	l.mu.Lock()
 	if l.committed {
-		// After the client closed, an error can be the teardown itself,
-		// as in noteReset and beginMove.
-		if !l.closed {
-			outcome := hedgeOutcomeResetAfterCommit
-			if kind == lAdapter.UserFailureStall {
-				outcome = hedgeOutcomeStalledAfterCommit
-			}
-			// A reset recorded before the commit keeps its outcome.
-			l.stats.replaceOutcome(hedgeOutcomeCommitted, outcome)
-			l.settleLocked(hedgeBad, kind)
+		outcome := hedgeOutcomeResetAfterCommit
+		if kind == lAdapter.UserFailureStall {
+			outcome = hedgeOutcomeStalledAfterCommit
 		}
+		// A reset recorded before the commit keeps its outcome.
+		l.stats.replaceOutcome(hedgeOutcomeCommitted, outcome)
+		l.settleLocked(hedgeBad, kind)
 		l.mu.Unlock()
 		return
 	}
@@ -436,6 +437,9 @@ func (l *hedgeLeg) finishMoveLocked(err error) {
 // with it. Caller holds mu.
 func (l *hedgeLeg) closeLocked() (cancel context.CancelFunc, pending io.Closer) {
 	l.closed = true
+	// Under mu with closed, so nothing noted after the close changes the
+	// record (see settleLocked for the cache).
+	l.stats.seal()
 	l.stopCommitLocked()
 	if l.pending == nil {
 		return l.cancel, nil
@@ -704,8 +708,6 @@ func (s *hedgeStream) Close() error {
 	cancel, pending := s.closeLocked()
 	c := s.cur
 	s.mu.Unlock()
-	// After closed is set, so nothing noted from here on (noteReset and
-	// firstFailed check it) can change the record.
 	s.stats.finish(true)
 	cancel()
 	if pending != nil {

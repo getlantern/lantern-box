@@ -30,8 +30,9 @@ type dataPlaneHooks struct {
 	onActivity func(time.Time)
 	// onReset runs synchronously when a reset is charged, before onFailure
 	// is dispatched on its own goroutine, so a caller can note the reset
-	// before the IO error reaches the client. It must not block or take
-	// locks the IO path holds.
+	// before the IO error reaches the client. It runs on the IO path, so it
+	// must not wait on IO or take a lock that path holds; short critical
+	// sections are fine.
 	onReset func()
 }
 

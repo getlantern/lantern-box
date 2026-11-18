@@ -150,6 +150,9 @@ type hedgeStats struct {
 	mu      sync.Mutex
 	path    string
 	outcome string
+	// sealed is set when the connection closes: what is noted afterwards
+	// can be the teardown itself, so it doesn't change the record.
+	sealed bool
 
 	firstByte atomic.Int64 // nanoseconds after start, 0 before any
 	up, down  atomic.Int64
@@ -172,9 +175,19 @@ func (h *Hedge) telemetrySite(key hedgeKey) string {
 	return hedgeSiteOther
 }
 
+// seal stops later changes to the path and outcome.
+func (s *hedgeStats) seal() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sealed = true
+}
+
 func (s *hedgeStats) set(path, outcome string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.sealed {
+		return
+	}
 	if path != "" {
 		s.path = path
 	}
@@ -187,6 +200,9 @@ func (s *hedgeStats) set(path, outcome string) {
 func (s *hedgeStats) replaceOutcome(from, outcome string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.sealed {
+		return
+	}
 	if s.outcome == "" || s.outcome == from {
 		s.outcome = outcome
 	}
@@ -196,7 +212,7 @@ func (s *hedgeStats) replaceOutcome(from, outcome string) {
 func (s *hedgeStats) setOutcomeIfUnset(outcome string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.outcome == "" {
+	if !s.sealed && s.outcome == "" {
 		s.outcome = outcome
 	}
 }
