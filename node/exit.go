@@ -42,7 +42,8 @@ type ExitConfig struct {
 	// prefers that header over the address the request came from.
 	Header  func(http.Header)
 	Version string
-	// Exit is the volunteer's exit. RunExit only sets its router; it never calls SetEnabled.
+	// Exit is the volunteer's exit. RunExit only sets its routers, one per kind of session; it
+	// never calls SetEnabled.
 	Exit *exit.Exit
 	// NewBox builds and starts the exit box from options JSON. nil: sing-box in ctx. It is
 	// exported for tests, and for embedders that build boxes their own way.
@@ -67,12 +68,21 @@ type ExitConfig struct {
 	// NetworkManager in ctx, when ctx is the VPN box's, read at each rotation, so a tun that
 	// starts after a rotation is missed until the next one. Ignored elsewhere than Linux.
 	RoutingMark uint32
-	// NetworkReset, when set, resets the current exit box's network on each receive, closing
+	// NetworkReset, when set, resets the current exit boxes' networks on each receive, closing
 	// its connections and re-seeding its interface state, as radiance does for the VPN box when
 	// the default interface keeps its name and index but changes address (macOS and iOS), which
 	// the box's interface monitor doesn't report. RunExit reads it only between registrations,
 	// so the embedder should send without blocking, on a channel with a buffer of one.
 	NetworkReset <-chan struct{}
+	// ServePool, read at each registration, is the embedder's setting for helping strangers
+	// too (radiance's "serve_pool"), sent as the registration's serve_pool. nil: true. When it
+	// changes, the embedder should send on Reregister, as radiance re-registers its peer route.
+	ServePool func() bool
+	// Reregister, when set, makes RunExit register again at once on each receive, unless
+	// lantern-cloud has asked it to hold off, after which it registers anyway. Like
+	// NetworkReset it is read only between registrations, so the embedder should send without
+	// blocking, on a channel with a buffer of one.
+	Reregister <-chan struct{}
 }
 
 // isLinux is a var so tests can mark the exit box's sockets on any OS.
@@ -100,21 +110,37 @@ type exitRunner struct {
 	maxRetry time.Duration
 
 	// Only the loop's goroutine touches these.
-	box        ExitBox
-	validUntil time.Time
-	rotation   time.Duration
-	// heldOff is whether OnHoldOff last reported a hold-off.
-	heldOff bool
+	boxes    [2]kindBox // by exit.Kind
+	rotation time.Duration
+	// heldOff is whether OnHoldOff last reported a hold-off, and holdOffUntil its end, before
+	// which Reregister waits.
+	heldOff      bool
+	holdOffUntil time.Time
 }
 
-// RunExit keeps a WebRTC-only registration and its exit box current until ctx ends. ctx must
+// kindBox is the exit box serving one kind of session, and when its registration runs out.
+type kindBox struct {
+	box        ExitBox
+	validUntil time.Time
+}
+
+// exitKinds are the kinds of session, in the order RunExit launches their boxes.
+var exitKinds = []exit.Kind{exit.Pool, exit.Personal}
+
+// RunExit keeps a WebRTC-only registration and its exit boxes current until ctx ends. ctx must
 // carry lantern-box's option registries, as box.BaseContext does. It returns an error only
 // for a config it can't run with; lantern-cloud and box failures are logged and retried.
 // Exit boxes don't share services with ctx: each gets its own clone of ctx's registry.
 //
+// Each registration can carry two configs: the pool policy, when lantern-cloud lets this
+// device serve strangers, and the personal policy, when it has helper pairings. Each gets a
+// box of its own, whose router serves only that kind of session (see exit.Kind), and a kind
+// whose config is absent is cleared. The kinds fail and expire apart: a config that fails its
+// checks leaves its kind's current box serving until its own registration runs out.
+//
 // RunExit never turns the exit on or off: the embedder drives cfg.Exit's SetEnabled, and
 // should cancel ctx while the exit is off, so RunExit stops registering every rotation. Each
-// rotation closes the previous box, which resets the streams still routed through it.
+// rotation closes the previous boxes, which resets the streams still routed through them.
 //
 // The embedder must not run RunExit where the device's country is unknown or censored, as
 // radiance's wantPairingRoute (backend/peer_pairings.go) gates its pairings-only route: the
@@ -160,6 +186,7 @@ func newExitRunner(cfg ExitConfig) (*exitRunner, error) {
 // returns once ctx ends, with the router cleared and the box closed.
 func (r *exitRunner) loop(ctx context.Context) error {
 	defer r.close()
+	r.holdOffUntil = r.cfg.NotBefore
 	if wait := time.Until(r.cfg.NotBefore); wait > 0 && !r.wait(ctx, wait) {
 		return nil
 	}
@@ -201,7 +228,7 @@ func busy(err error) (time.Duration, bool) {
 
 // holdOff reports a hold-off to the embedder, or its end with the zero time.
 func (r *exitRunner) holdOff(until time.Time) {
-	r.heldOff = !until.IsZero()
+	r.heldOff, r.holdOffUntil = !until.IsZero(), until
 	if r.cfg.OnHoldOff != nil {
 		r.cfg.OnHoldOff(until)
 	}
@@ -218,23 +245,60 @@ func (r *exitRunner) refresh(ctx context.Context) error {
 func (r *exitRunner) register(ctx context.Context) (*webrtcRegisterResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
-	return r.api.registerWebRTC(ctx)
+	servePool := r.cfg.ServePool == nil || r.cfg.ServePool()
+	return r.api.registerWebRTC(ctx, servePool)
 }
 
-// launch builds an exit box from resp's config and swaps the exit onto its router, then
-// closes the previous box, so running sessions move to the new router for their next stream.
-// On failure the current box is left as it is.
+// launch builds an exit box from each config in resp and swaps the exit onto its router for
+// that kind, then closes the kind's previous box, so its running sessions move to the new
+// router for their next stream. A kind with no config is cleared. A kind whose config fails
+// keeps its current box, and launch returns that failure, so RunExit retries soon.
 func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) error {
-	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(resp.ServerConfig))
-	if err != nil {
-		return &exitStageError{stage: "parse the exit config", err: err}
+	rotation := r.cfg.RotationInterval
+	if rotation <= 0 {
+		rotation = DefaultRotationInterval
+		if s := resp.RotationIntervalSeconds; s > 0 {
+			rotation = time.Duration(min(s, int64(maxExitRotation/time.Second))) * time.Second
+		}
 	}
+	r.rotation = rotation
+	configs := [2]string{exit.Pool: resp.ServerConfig, exit.Personal: resp.PersonalServerConfig}
+	var errs []error
+	for _, kind := range exitKinds {
+		if configs[kind] == "" {
+			r.closeKind(kind)
+			continue
+		}
+		b, err := r.build(ctx, kind, configs[kind])
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		kb := &r.boxes[kind]
+		prev := kb.box
+		kb.box, kb.validUntil = b, time.Now().Add(2*rotation)
+		r.exit.SetRouter(kind, b.Router(), kb.validUntil)
+		if prev != nil {
+			_ = prev.Close()
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// build checks and sanitizes a kind's config and starts its exit box.
+func (r *exitRunner) build(ctx context.Context, kind exit.Kind, config string) (ExitBox, error) {
+	stage := func(what string) string { return what + " the " + kind.String() + " exit config" }
+	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(config))
+	if err != nil {
+		return nil, &exitStageError{stage: stage("parse"), err: err}
+	}
+	// The personal policy has no allowlist, but the same abuse rejects as the pool's.
 	if err := peerrules.ValidateAbuseRulesOptions(opts); err != nil {
-		return &exitStageError{stage: "check the exit config", err: err, loggable: true}
+		return nil, &exitStageError{stage: stage("check"), err: err, loggable: true}
 	}
 	// Its errors are fixed text, naming no rule.
 	if err := peerrules.ValidateDirectExitRulesOptions(opts); err != nil {
-		return &exitStageError{stage: "check the exit config", err: err, loggable: true}
+		return nil, &exitStageError{stage: stage("check"), err: err, loggable: true}
 	}
 	// The exit box only routes the exit's traffic: no listeners, and nothing else lantern-cloud's
 	// config carries, such as the debug listener of its peer configs.
@@ -246,30 +310,17 @@ func (r *exitRunner) launch(ctx context.Context, resp *webrtcRegisterResponse) e
 		opts.Route.DefaultMark = option.FwMark(mark)
 	}
 	// sing-box's router logs every routed connection's destination, and this box carries
-	// strangers' traffic.
+	// strangers' and friends' traffic.
 	opts.Log = &option.LogOptions{Disabled: true}
 	options, err := json.MarshalContext(ctx, opts)
 	if err != nil {
-		return &exitStageError{stage: "marshal the exit config", err: err}
+		return nil, &exitStageError{stage: stage("marshal"), err: err}
 	}
 	b, err := r.newBox(ctx, string(options))
 	if err != nil {
-		return &exitStageError{stage: "start the exit box", err: err}
+		return nil, &exitStageError{stage: "start the " + kind.String() + " exit box", err: err}
 	}
-	rotation := r.cfg.RotationInterval
-	if rotation <= 0 {
-		rotation = DefaultRotationInterval
-		if s := resp.RotationIntervalSeconds; s > 0 {
-			rotation = time.Duration(min(s, int64(maxExitRotation/time.Second))) * time.Second
-		}
-	}
-	prev := r.box
-	r.box, r.rotation, r.validUntil = b, rotation, time.Now().Add(2*rotation)
-	r.exit.SetRouter(exit.Pool, b.Router(), r.validUntil)
-	if prev != nil {
-		_ = prev.Close()
-	}
-	return nil
+	return b, nil
 }
 
 // routingMark is the mark for the exit box's sockets on Linux (see ExitConfig.RoutingMark), or 0.
@@ -286,27 +337,33 @@ func (r *exitRunner) routingMark(ctx context.Context) uint32 {
 	return 0
 }
 
-// wait waits d, expiring the current box if its registration runs out first and resetting
-// its network on each NetworkReset, and reports false if ctx ends.
+// wait waits d, expiring each kind's box if its registration runs out first and resetting the
+// boxes' networks on each NetworkReset, and reports false if ctx ends. A Reregister ends the
+// wait early, unless lantern-cloud has asked to hold off.
 func (r *exitRunner) wait(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
-	var expiry <-chan time.Time
-	if r.box != nil {
-		e := time.NewTimer(time.Until(r.validUntil))
-		defer e.Stop()
-		expiry = e.C
-	}
 	for {
+		var expiry <-chan time.Time
+		if next, ok := r.nextExpiry(); ok {
+			e := time.NewTimer(time.Until(next))
+			defer e.Stop()
+			expiry = e.C
+		}
 		select {
 		case <-ctx.Done():
 			return false
 		case <-expiry:
-			expiry = nil
-			r.expire()
+			r.expireDue()
 		case <-r.cfg.NetworkReset:
-			if r.box != nil {
-				r.box.ResetNetwork()
+			for _, kb := range r.boxes {
+				if kb.box != nil {
+					kb.box.ResetNetwork()
+				}
+			}
+		case <-r.cfg.Reregister:
+			if !time.Now().Before(r.holdOffUntil) {
+				return true
 			}
 		case <-t.C:
 			return true
@@ -314,20 +371,43 @@ func (r *exitRunner) wait(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// expire stops serving a registration lantern-cloud no longer vouches for.
-func (r *exitRunner) expire() {
-	log.Warn("direct exit: registration expired, no longer serving until lantern-cloud registers this device again")
-	r.close()
+// nextExpiry is the earliest registration end of the boxes running, if any.
+func (r *exitRunner) nextExpiry() (time.Time, bool) {
+	var next time.Time
+	for _, kb := range r.boxes {
+		if kb.box != nil && (next.IsZero() || kb.validUntil.Before(next)) {
+			next = kb.validUntil
+		}
+	}
+	return next, !next.IsZero()
 }
 
-// close clears the exit's router before closing the box under it.
+// expireDue stops serving each kind whose registration lantern-cloud no longer vouches for.
+func (r *exitRunner) expireDue() {
+	for _, kind := range exitKinds {
+		if kb := r.boxes[kind]; kb.box != nil && !time.Now().Before(kb.validUntil) {
+			log.Warn("direct exit: ", kind, " registration expired, no longer serving it until lantern-cloud registers this device again")
+			r.closeKind(kind)
+		}
+	}
+}
+
+// close clears both kinds.
 func (r *exitRunner) close() {
-	if r.box == nil {
+	for _, kind := range exitKinds {
+		r.closeKind(kind)
+	}
+}
+
+// closeKind clears kind's router on the exit before closing the box under it.
+func (r *exitRunner) closeKind(kind exit.Kind) {
+	kb := &r.boxes[kind]
+	if kb.box == nil {
 		return
 	}
-	r.exit.SetRouter(exit.Pool, nil, time.Time{})
-	_ = r.box.Close()
-	r.box, r.validUntil = nil, time.Time{}
+	r.exit.SetRouter(kind, nil, time.Time{})
+	_ = kb.box.Close()
+	*kb = kindBox{}
 }
 
 // exitStageError is a launch step that failed. Only a loggable error is logged whole: the

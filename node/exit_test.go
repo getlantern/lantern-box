@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,11 @@ const validExitConfig = `{
 		]
 	}
 }`
+
+// personalExitConfig is validExitConfig as lantern-cloud's personal policy, which has no
+// allowlist but the same rejects; its extra outbound only tells the fake box which it got.
+var personalExitConfig = strings.Replace(validExitConfig, `"outbounds":[{"type":"direct","tag":"direct"}]`,
+	`"outbounds":[{"type":"direct","tag":"direct"},{"type":"direct","tag":"personal-marker"}]`, 1)
 
 const exitConfigWithoutAbuseRules = `{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}`
 
@@ -136,6 +142,8 @@ type fakeExitBox struct {
 	autoDetectInterface bool
 	defaultMark         uint32
 	logDisabled         bool
+	// personal is whether it was built from personalExitConfig.
+	personal bool
 	// extras counts the inbounds, endpoints, services, experimental and NTP sections it got.
 	extras int
 
@@ -184,6 +192,9 @@ func (f *fakeExitBoxes) new(ctx context.Context, options string) (ExitBox, error
 		b.defaultMark = uint32(opts.Route.DefaultMark)
 	}
 	b.logDisabled = opts.Log != nil && opts.Log.Disabled
+	for _, out := range opts.Outbounds {
+		b.personal = b.personal || out.Tag == "personal-marker"
+	}
 	b.extras = len(opts.Inbounds) + len(opts.Endpoints) + len(opts.Services)
 	if opts.Experimental != nil {
 		b.extras++
@@ -217,10 +228,14 @@ type recordingExit struct {
 }
 
 func (r *recordingExit) SetRouter(kind exit.Kind, router adapter.ConnectionRouterEx, validUntil time.Time) {
+	prefix := ""
+	if kind == exit.Personal {
+		prefix = "personal "
+	}
 	if fr, ok := router.(*fakeExitRouter); ok {
-		r.ev.add("router %d", fr.id)
+		r.ev.add("%srouter %d", prefix, fr.id)
 	} else {
-		r.ev.add("router nil")
+		r.ev.add("%srouter nil", prefix)
 	}
 	r.Exit.SetRouter(kind, router, validUntil)
 }
@@ -273,7 +288,7 @@ func TestRunExitRegistersWebRTCOnly(t *testing.T) {
 	}()
 	require.Eventually(t, func() bool { return e.Options().Ready(false) }, 5*time.Second, 10*time.Millisecond)
 	mu.Lock()
-	assert.Equal(t, map[string]any{"mode": "webrtc"}, got)
+	assert.Equal(t, map[string]any{"mode": "webrtc", "serve_pool": true}, got, "no ServePool: serve the pool")
 	assert.Equal(t, "lantern", hdr.Get("X-Lantern-App"), "the caller's headers win")
 	assert.Equal(t, "dev", hdr.Get("X-Lantern-Device-Id"))
 	assert.Equal(t, "v9", hdr.Get("X-Lantern-Version"))
@@ -513,6 +528,197 @@ func TestRunExitResetsTheExitBoxsNetwork(t *testing.T) {
 	require.Eventually(t, func() bool { return len(ev.list()) == 3 }, 5*time.Second, time.Millisecond)
 	assert.Equal(t, []string{"build 1", "router 1", "reset 1"}, ev.list())
 	assert.True(t, e.Options().Ready(false), "a reset keeps the box serving")
+	cancel()
+	waitDone(t, done)
+}
+
+// RunExit sends the embedder's serve_pool setting, read at each registration.
+func TestRunExitSendsServePool(t *testing.T) {
+	var mu sync.Mutex
+	var sent []any
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		sent = append(sent, body["serve_pool"])
+		mu.Unlock()
+		writeJSON(w, map[string]any{"personal_server_config": personalExitConfig})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	var servePool atomic.Bool
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: (&fakeExitBoxes{ev: ev}).new, RotationInterval: 50 * time.Millisecond,
+		ServePool: func() bool { return servePool.Load() }}, ev)
+	require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(sent) >= 1 }, 5*time.Second, time.Millisecond)
+	servePool.Store(true)
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Contains(sent, any(true))
+	}, 5*time.Second, time.Millisecond, "a later registration reads the setting again")
+	cancel()
+	waitDone(t, done)
+	mu.Lock()
+	assert.Equal(t, false, sent[0])
+	mu.Unlock()
+}
+
+// Each config lantern-cloud sends gets a box of its own, whose router serves that kind alone;
+// a kind whose config is absent is cleared.
+func TestRunExitBuildsABoxPerKind(t *testing.T) {
+	var mu sync.Mutex
+	resp := map[string]any{"server_config": validExitConfig, "personal_server_config": personalExitConfig}
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		writeJSON(w, resp)
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	boxes := &fakeExitBoxes{ev: ev}
+	reregister := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: boxes.new, Reregister: reregister}, ev)
+	o := e.Options()
+	require.Eventually(t, func() bool { return o.Ready(false) && o.Ready(true) }, 5*time.Second, time.Millisecond)
+	require.Len(t, boxes.all(), 2)
+	byRouter := map[string]*fakeExitBox{}
+	for _, b := range boxes.all() {
+		byRouter[fmt.Sprint(b.id)] = b
+		assert.True(t, b.autoDetectInterface)
+		assert.True(t, b.logDisabled)
+		assert.Zero(t, b.extras)
+	}
+	events := ev.list()
+	assert.Contains(t, events, "router 1")
+	assert.Contains(t, events, "personal router 2")
+	assert.False(t, byRouter["1"].personal, "the pool box is built from server_config")
+	assert.True(t, byRouter["2"].personal, "the personal box from personal_server_config")
+
+	step := func(next map[string]any, ready func() bool) {
+		t.Helper()
+		mu.Lock()
+		resp = next
+		mu.Unlock()
+		reregister <- struct{}{}
+		require.Eventually(t, ready, 5*time.Second, time.Millisecond)
+	}
+	// Only the pool's: the personal box closes and its kind is cleared.
+	step(map[string]any{"server_config": validExitConfig}, func() bool { return o.Ready(false) && !o.Ready(true) })
+	closed, _ := byRouter["2"].isClosed()
+	assert.True(t, closed)
+	assert.Contains(t, ev.list(), "personal router nil")
+	// Only the personal's: the pool's kind is cleared.
+	step(map[string]any{"personal_server_config": personalExitConfig}, func() bool { return !o.Ready(false) && o.Ready(true) })
+	assert.True(t, boxes.last().personal)
+	cancel()
+	waitDone(t, done)
+	for _, b := range boxes.all() {
+		closed, _ := b.isClosed()
+		assert.True(t, closed, "box %d", b.id)
+	}
+	assert.False(t, o.Ready(false))
+	assert.False(t, o.Ready(true))
+}
+
+// A kind whose config fails its checks keeps its current box until that box's registration
+// runs out, while the other kind's box keeps rotating.
+func TestRunExitFailsOneKindAlone(t *testing.T) {
+	var registers atomic.Int32
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		personal := personalExitConfig
+		if registers.Add(1) > 1 {
+			personal = exitConfigWithoutAbuseRules
+		}
+		writeJSON(w, map[string]any{"server_config": validExitConfig, "personal_server_config": personal})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	boxes := &fakeExitBoxes{ev: ev}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	const rotation = 100 * time.Millisecond
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: boxes.new, RotationInterval: rotation}, ev)
+	o := e.Options()
+	require.Eventually(t, func() bool { return o.Ready(true) }, 5*time.Second, time.Millisecond)
+	var personalBox *fakeExitBox
+	for _, b := range boxes.all() {
+		if b.personal {
+			personalBox = b
+		}
+	}
+	require.NotNil(t, personalBox)
+	require.Eventually(t, func() bool { closed, _ := personalBox.isClosed(); return closed }, 5*time.Second, time.Millisecond)
+	_, closedAt := personalBox.isClosed()
+	assert.GreaterOrEqual(t, closedAt.Sub(personalBox.builtAt), 2*rotation, "the personal box serves until its registration runs out")
+	assert.False(t, o.Ready(true))
+	assert.True(t, o.Ready(false), "the pool's box keeps serving")
+	for _, b := range boxes.all() {
+		if b != personalBox {
+			assert.False(t, b.personal, "no personal box is built from a config that fails its checks")
+		}
+	}
+	cancel()
+	waitDone(t, done)
+}
+
+// A response with neither config is a failure: the current boxes stay until they expire.
+func TestRunExitRefusesAResponseWithoutAConfig(t *testing.T) {
+	var registers atomic.Int32
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		if registers.Add(1) == 1 {
+			writeJSON(w, map[string]any{"server_config": validExitConfig, "personal_server_config": personalExitConfig})
+			return
+		}
+		writeJSON(w, map[string]any{"rotation_interval_seconds": 3600})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	boxes := &fakeExitBoxes{ev: ev}
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: boxes.new, RotationInterval: time.Hour}, ev)
+	o := e.Options()
+	require.Eventually(t, func() bool { return o.Ready(false) && o.Ready(true) }, 5*time.Second, time.Millisecond)
+	cancel()
+	waitDone(t, done)
+	assert.Len(t, boxes.all(), 2)
+}
+
+// Reregister registers again at once, unless lantern-cloud has asked to hold off.
+func TestRunExitReregistersOnRequest(t *testing.T) {
+	var registers atomic.Int32
+	busy := atomic.Bool{}
+	srv := exitCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		registers.Add(1)
+		if busy.Load() {
+			w.Header().Set("Retry-After", "3600")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		writeJSON(w, map[string]any{"server_config": validExitConfig, "rotation_interval_seconds": 3600})
+	})
+	e := enabledExit(t)
+	ev := &exitEvents{}
+	reregister := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(box.BaseContext())
+	defer cancel()
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e,
+		NewBox: (&fakeExitBoxes{ev: ev}).new, Reregister: reregister}, ev)
+	require.Eventually(t, func() bool { return registers.Load() == 1 }, 5*time.Second, time.Millisecond)
+	busy.Store(true)
+	reregister <- struct{}{}
+	require.Eventually(t, func() bool { return registers.Load() == 2 }, 5*time.Second, time.Millisecond)
+	reregister <- struct{}{}
+	time.Sleep(200 * time.Millisecond)
+	assert.EqualValues(t, 2, registers.Load(), "held off, a re-register waits")
 	cancel()
 	waitDone(t, done)
 }

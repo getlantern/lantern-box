@@ -36,13 +36,23 @@
 
 ## lantern-cloud contract (implemented in the lantern-cloud plan)
 
-`POST {APIURL}/peer/register` with body `{"mode":"webrtc"}` and no ports. lantern-cloud admits the request as today: the feature flag, `X-Lantern-App: lantern-box`, or a paired volunteer. It refuses with 403 for a device that isn't volunteering for Unbounded, is blocked, or is in a censored or unknown country. A 200 response:
+`POST {APIURL}/peer/register` with body `{"mode":"webrtc","serve_pool":<bool>}` and no ports. `serve_pool` is the volunteer's "help strangers too" setting (`ExitConfig.ServePool`, read at each registration; unset means true, as radiance's `servePool` treats it). lantern-cloud admits the request as today: the feature flag, `X-Lantern-App: lantern-box`, or a paired volunteer. It refuses with 403 for a device that isn't volunteering for Unbounded, is blocked, or is in a censored or unknown country. A 200 response:
 
 ```json
-{"server_config": "<sing-box options JSON>", "rotation_interval_seconds": 3600}
+{"server_config": "<pool policy JSON>", "personal_server_config": "<personal policy JSON>", "rotation_interval_seconds": 3600}
 ```
 
-`server_config` has a `direct` outbound, `route.rule_set` with the four abuse tags, `dns`, and `route.rules` with the same reject rules as a direct-mode registration (allowlist for the pool). Every `mode:"webrtc"` `server_config`, pool or paired, must have, ahead of any rule that can route `unbounded-exit` traffic to an outbound:
+The two configs are one per kind of session, as broflake reports it (getlantern/unbounded#525): a **personal** session answered a genesis sent to the volunteer's rooms alone, so it is a friend's; every other session is a **pool** session, a stranger's.
+
+- `server_config`, the pool policy, is present only when `serve_pool` is true and lantern-cloud lets this device serve the pool. It carries the residential allowlist (`applyPeerAllowlist`).
+- `personal_server_config`, the personal policy, is present only when the device has helper pairings. It has no allowlist (`applyPersonalExit`, lantern-cloud 598f6adc0).
+- At least one is present; a response with neither is a failure, and RunExit keeps its current boxes until they expire.
+
+RunExit builds a box from each config present and sets the exit's router for that kind (`exit.Pool`, `exit.Personal`). A session routes only through its own kind's router and never falls back to the other's, and a kind whose config is absent is cleared, ending its sessions. The kinds fail and expire apart: a config that fails RunExit's checks leaves that kind's current box serving until its own registration runs out. When `serve_pool` changes, the embedder sends on `ExitConfig.Reregister` (as radiance re-registers its peer route, f25ca27), and the next registration's configs replace the current ones.
+
+A Lamplighter node's box carries one policy, which lantern-cloud picks by the node registration's `serve_pool`. Nodes register with `serve_pool` true, so a node's volunteer sets the pool router alone, and its personal sessions, if any, are offered no direct exit and relay to the egress as before.
+
+Each config has a `direct` outbound, `route.rule_set` with the four abuse tags, `dns`, and `route.rules` with the same reject rules as a direct-mode registration (allowlist for the pool). Every `mode:"webrtc"` config, pool or personal, must have, ahead of any rule that can route `unbounded-exit` traffic to an outbound:
 
 1. an unconditional `resolve` action rule (sing-box's `ip_cidr` and `ip_is_private` match a domain destination only after one);
 2. an unconditional `{"ip_is_private": true, "action": "reject"}`;
@@ -52,7 +62,7 @@ The config has exactly one `resolve` rule, the unconditional one above: a later 
 
 The abuse rule-set rejects must also come before any `sniff` rule. A sniffed HTTP Host or TLS SNI replaces the domain the geosite rule sets match, so a client can name an allowed host in its request and reach a listed one. lantern-cloud's bandit-probe injection (`injectBanditProbe`) prepends a port-80 sniff ahead of them when a config has endpoints, so the `mode:"webrtc"` builder must not inject one ahead of the rejects. Today's samizdat pool configs have the same hole and should be fixed there too. lantern-box's check does not model sniffing, so it does not catch this.
 
-Every rule that routes to `direct` must set `udp_connect: true` (a Hysteria2 UDP session names a destination per packet, and the rules see only the first): the terminal route is an explicit final rule rather than `route.final`, which can't set it, and for the pool it is the allowlist's route rule ahead of its terminal reject. lantern-cloud's `applyPeerAllowlist` and `applyPersonalExit` already build this shape for samizdat peers. The config has no `experimental` (no debug listener), no inbounds, no endpoints and no services. RunExit refuses a config without the resolve and the `ip_is_private` reject after it, and drops any inbounds, endpoints, services, `experimental` and `ntp` regardless. There is no route row, verify, heartbeat or deregister.
+Every rule that routes to `direct` must set `udp_connect: true` (a Hysteria2 UDP session names a destination per packet, and the rules see only the first): the terminal route is an explicit final rule rather than `route.final`, which can't set it, and for the pool it is the allowlist's route rule ahead of its terminal reject. lantern-cloud's `applyPeerAllowlist` and `applyPersonalExit` already build this shape for samizdat peers. The config has no `experimental` (no debug listener), no inbounds, no endpoints and no services. RunExit refuses a config, of either kind, without the resolve and the `ip_is_private` reject after it, and drops any inbounds, endpoints, services, `experimental` and `ntp` regardless. There is no route row, verify, heartbeat or deregister.
 
 The client treats a registration as valid for 2 × the rotation interval (`rotation_interval_seconds`, capped at 24h; 0 means an hour), so a device lantern-cloud starts refusing keeps exiting traffic for up to that long after its last successful registration.
 

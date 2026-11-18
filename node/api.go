@@ -99,22 +99,28 @@ func (a *api) register(ctx context.Context, req registerRequest) (*registerRespo
 }
 
 // webrtcRegisterRequest registers a device that serves only WebRTC direct exits: it has no
-// inbound for lantern-cloud to verify or hand out, so no route and no heartbeats.
+// inbound for lantern-cloud to verify or hand out, so no route and no heartbeats. ServePool is
+// whether it may serve strangers as well as its helper pairings.
 type webrtcRegisterRequest struct {
-	Mode string `json:"mode"`
+	Mode      string `json:"mode"`
+	ServePool bool   `json:"serve_pool"`
 }
 
+// webrtcRegisterResponse carries a config per kind of session: ServerConfig, the pool policy,
+// only when lantern-cloud lets the device serve strangers, and PersonalServerConfig, the
+// personal policy, only when it has helper pairings.
 type webrtcRegisterResponse struct {
 	ServerConfig            string `json:"server_config"`
+	PersonalServerConfig    string `json:"personal_server_config"`
 	RotationIntervalSeconds int64  `json:"rotation_interval_seconds"`
 }
 
-func (a *api) registerWebRTC(ctx context.Context) (*webrtcRegisterResponse, error) {
+func (a *api) registerWebRTC(ctx context.Context, servePool bool) (*webrtcRegisterResponse, error) {
 	var resp webrtcRegisterResponse
-	if err := a.do(ctx, "/peer/register", webrtcRegisterRequest{Mode: "webrtc"}, &resp); err != nil {
+	if err := a.do(ctx, "/peer/register", webrtcRegisterRequest{Mode: "webrtc", ServePool: servePool}, &resp); err != nil {
 		return nil, fmt.Errorf("register: %w", err)
 	}
-	if resp.ServerConfig == "" {
+	if resp.ServerConfig == "" && resp.PersonalServerConfig == "" {
 		return nil, errNoExitConfig
 	}
 	return &resp, nil
