@@ -1724,18 +1724,79 @@ func TestHedgeCloseDuringTheMoveIsNotAMoveFailure(t *testing.T) {
 // errors.Is either.
 func TestHedgeMoveErrorHidesADeadlineCause(t *testing.T) {
 	for _, cause := range []error{os.ErrDeadlineExceeded, context.DeadlineExceeded} {
-		err := error(&hedgeMoveError{cause: cause})
+		err := error(newHedgeMoveError(cause))
 		require.NotErrorIs(t, err, os.ErrDeadlineExceeded)
 		require.NotErrorIs(t, err, context.DeadlineExceeded)
 	}
-	require.ErrorIs(t, &hedgeMoveError{cause: errors.ErrUnsupported}, errors.ErrUnsupported, "other causes stay reachable")
+	require.ErrorIs(t, newHedgeMoveError(errors.ErrUnsupported), errors.ErrUnsupported, "other causes stay reachable")
 	var opReset *net.OpError
-	require.True(t, errors.As(&hedgeMoveError{cause: &net.OpError{Op: "write", Err: syscall.ECONNRESET}}, &opReset),
+	require.True(t, errors.As(newHedgeMoveError(&net.OpError{Op: "write", Err: syscall.ECONNRESET}), &opReset),
 		"a cause that isn't a timeout keeps its details")
 	var opTimeout *net.OpError
-	require.False(t, errors.As(&hedgeMoveError{cause: &net.OpError{Op: "dial", Err: syscall.ETIMEDOUT}}, &opTimeout),
+	require.False(t, errors.As(newHedgeMoveError(&net.OpError{Op: "dial", Err: syscall.ETIMEDOUT}), &opTimeout),
 		"any cause that is a timeout is hidden, not only the deadline sentinels")
 	var op *net.OpError
-	require.False(t, errors.As(&hedgeMoveError{cause: &net.OpError{Op: "write", Err: os.ErrDeadlineExceeded}}, &op),
+	require.False(t, errors.As(newHedgeMoveError(&net.OpError{Op: "write", Err: os.ErrDeadlineExceeded}), &op),
 		"nor through a cause's own timeout")
+}
+
+// notTimeoutWrapper is an error that isn't a timeout itself but wraps one,
+// as crypto/tls's permanent errors do.
+type notTimeoutWrapper struct{ err error }
+
+func (w notTimeoutWrapper) Error() string   { return "permanent: " + w.err.Error() }
+func (w notTimeoutWrapper) Unwrap() error   { return w.err }
+func (w notTimeoutWrapper) Timeout() bool   { return false }
+func (w notTimeoutWrapper) Temporary() bool { return false }
+
+// A timeout anywhere beneath a move failure stays hidden: under a wrapper
+// that isn't a timeout itself, or in one branch of a joined error.
+func TestHedgeMoveErrorHidesANestedTimeout(t *testing.T) {
+	nested := notTimeoutWrapper{&net.OpError{Op: "write", Err: syscall.ETIMEDOUT}}
+	joined := errors.Join(&net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, &net.OpError{Op: "dial", Err: syscall.ETIMEDOUT})
+	for _, cause := range []error{nested, joined} {
+		var op *net.OpError
+		require.False(t, errors.As(newHedgeMoveError(cause), &op), "%v", cause)
+	}
+}
+
+// closeErrConn's writes block until it's closed, then fail with an error
+// of its own, as a transport whose closed-conn error isn't net.ErrClosed.
+type closeErrConn struct {
+	net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *closeErrConn) Write([]byte) (int, error) {
+	<-c.closed
+	return 0, errors.New("mux: stream closed")
+}
+
+func (c *closeErrConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+// A replay the failover timer cut short ends as a timeout, whatever error
+// Then's conn returns once closed, and keeps that error for diagnostics.
+func TestHedgeReplayCutShortByTheTimerIsATimeout(t *testing.T) {
+	old := hedgeFailoverDialTimeout
+	hedgeFailoverDialTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { hedgeFailoverDialTimeout = old })
+	then := &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn {
+		return &closeErrConn{Conn: c, closed: make(chan struct{})}
+	}}
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole}, then, nil)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte(tlsRecord("hi")))
+	require.NoError(t, err)
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = c.Read(make([]byte, 16))
+	var me *hedgeMoveError
+	require.ErrorAs(t, err, &me)
+	require.ErrorIs(t, me.cause, os.ErrDeadlineExceeded, "the timer is the cause")
+	require.Contains(t, err.Error(), "mux: stream closed", "the transport's own error is kept for diagnostics")
 }
