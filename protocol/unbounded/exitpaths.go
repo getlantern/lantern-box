@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -428,11 +429,17 @@ func (c *packetConnAsConn) Close() error {
 
 // exitPathMetrics counts the direct exit paths the outbound takes. Never an address.
 type exitPathMetrics struct {
-	// provider is the meter provider; nil means the global one, looked up on first use.
+	// provider is the meter provider; nil means the global one, looked up at each path so that
+	// it is whatever the embedder installed last.
 	provider metric.MeterProvider
 
-	once  sync.Once
-	paths metric.Int64Counter
+	// current holds the counter of the provider it was made from.
+	current atomic.Pointer[exitPathCounter]
+}
+
+type exitPathCounter struct {
+	provider metric.MeterProvider
+	paths    metric.Int64Counter
 }
 
 var (
@@ -441,20 +448,33 @@ var (
 )
 
 func (m *exitPathMetrics) path(relayed bool) {
-	m.once.Do(func() {
-		pr := m.provider
-		if pr == nil {
-			pr = otel.GetMeterProvider()
-		}
-		var err error
-		if m.paths, err = pr.Meter("lantern-box/unbounded").Int64Counter("unbounded.path",
-			metric.WithDescription("Paths the Unbounded outbound took, by kind and whether ICE chose a TURN relay")); err != nil {
-			m.paths, _ = noop.Meter{}.Int64Counter("")
-		}
-	})
+	c := m.counter()
 	if relayed {
-		m.paths.Add(context.Background(), 1, exitPathRelayed)
+		c.paths.Add(context.Background(), 1, exitPathRelayed)
 	} else {
-		m.paths.Add(context.Background(), 1, exitPathDirect)
+		c.paths.Add(context.Background(), 1, exitPathDirect)
 	}
+}
+
+// counter returns the current provider's counter, making it when the provider has changed since
+// the last path, as protocol/group's currentHedgeTelemetry does.
+func (m *exitPathMetrics) counter() *exitPathCounter {
+	pr := m.provider
+	if pr == nil {
+		pr = otel.GetMeterProvider()
+	}
+	// A provider whose type can't be compared would make == panic; it gets a fresh counter at
+	// every path instead.
+	comparable := reflect.TypeOf(pr).Comparable()
+	if cur := m.current.Load(); cur != nil && comparable && cur.provider == pr {
+		return cur
+	}
+	c := &exitPathCounter{provider: pr}
+	var err error
+	if c.paths, err = pr.Meter("lantern-box/unbounded").Int64Counter("unbounded.path",
+		metric.WithDescription("Paths the Unbounded outbound took, by kind and whether ICE chose a TURN relay")); err != nil {
+		c.paths, _ = noop.Meter{}.Int64Counter("")
+	}
+	m.current.Store(c)
+	return c
 }

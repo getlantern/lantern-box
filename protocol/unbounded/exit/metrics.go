@@ -3,7 +3,8 @@ package exit
 import (
 	"context"
 	"net"
-	"sync"
+	"reflect"
+	"sync/atomic"
 
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
@@ -17,11 +18,16 @@ import (
 // exitMetrics counts the exit's sessions, refusals and bytes. It never takes an address or a
 // host as an attribute.
 type exitMetrics struct {
-	// provider is the meter provider; nil means the global one, looked up on first use so
-	// that it is whatever the embedder installed.
+	// provider is the meter provider; nil means the global one, looked up at each measurement
+	// so that it is whatever the embedder installed last.
 	provider metric.MeterProvider
 
-	once     sync.Once
+	// current holds the instruments of the provider they were made from.
+	current atomic.Pointer[exitInstruments]
+}
+
+type exitInstruments struct {
+	provider metric.MeterProvider
 	sessions metric.Int64Counter
 	refusals metric.Int64Counter
 	io       metric.Int64Counter
@@ -36,52 +42,60 @@ var (
 
 func newExitMetrics() *exitMetrics { return &exitMetrics{} }
 
-func (m *exitMetrics) init() {
-	m.once.Do(func() {
-		p := m.provider
-		if p == nil {
-			p = otel.GetMeterProvider()
-		}
-		meter := p.Meter("lantern-box/unbounded-exit")
-		fallback := noop.Meter{}
-		var err error
-		if m.sessions, err = meter.Int64Counter("unbounded.exit.sessions",
-			metric.WithDescription("Volunteer sessions connected, by whether they exit directly (ice) or relay to the egress server (webrtc)")); err != nil {
-			m.sessions, _ = fallback.Int64Counter("")
-		}
-		if m.refusals, err = meter.Int64Counter("unbounded.exit.refused",
-			metric.WithDescription("Direct exit connections the exit box's rules refused")); err != nil {
-			m.refusals, _ = fallback.Int64Counter("")
-		}
-		if m.io, err = meter.Int64Counter("unbounded.exit.io",
-			metric.WithDescription("Bytes a volunteer's direct exit carried, up from users and down to them"),
-			metric.WithUnit("By")); err != nil {
-			m.io, _ = fallback.Int64Counter("")
-		}
-	})
+// instruments returns the current provider's instruments, making them when the provider has
+// changed since the last measurement, as protocol/group's currentHedgeTelemetry does: an
+// embedder that swaps or shuts down its provider would otherwise lose every later measurement.
+func (m *exitMetrics) instruments() *exitInstruments {
+	p := m.provider
+	if p == nil {
+		p = otel.GetMeterProvider()
+	}
+	// A provider whose type can't be compared would make == panic; it gets fresh instruments
+	// at every measurement instead.
+	comparable := reflect.TypeOf(p).Comparable()
+	if cur := m.current.Load(); cur != nil && comparable && cur.provider == p {
+		return cur
+	}
+	meter := p.Meter("lantern-box/unbounded-exit")
+	fallback := noop.Meter{}
+	in := &exitInstruments{provider: p}
+	var err error
+	if in.sessions, err = meter.Int64Counter("unbounded.exit.sessions",
+		metric.WithDescription("Volunteer sessions connected, by whether they exit directly (ice) or relay to the egress server (webrtc)")); err != nil {
+		in.sessions, _ = fallback.Int64Counter("")
+	}
+	if in.refusals, err = meter.Int64Counter("unbounded.exit.refused",
+		metric.WithDescription("Direct exit connections the exit box's rules refused")); err != nil {
+		in.refusals, _ = fallback.Int64Counter("")
+	}
+	if in.io, err = meter.Int64Counter("unbounded.exit.io",
+		metric.WithDescription("Bytes a volunteer's direct exit carried, up from users and down to them"),
+		metric.WithUnit("By")); err != nil {
+		in.io, _ = fallback.Int64Counter("")
+	}
+	m.current.Store(in)
+	return in
 }
 
 // session is clientcore's OnSession hook.
 func (m *exitMetrics) session(directExit bool) {
-	m.init()
+	in := m.instruments()
 	if directExit {
-		m.sessions.Add(context.Background(), 1, pathICE)
+		in.sessions.Add(context.Background(), 1, pathICE)
 	} else {
-		m.sessions.Add(context.Background(), 1, pathWebRTC)
+		in.sessions.Add(context.Background(), 1, pathWebRTC)
 	}
 }
 
 func (m *exitMetrics) refused() {
-	m.init()
-	m.refusals.Add(context.Background(), 1)
+	m.instruments().refusals.Add(context.Background(), 1)
 }
 
 func (m *exitMetrics) bytes(n int, direction metric.AddOption) {
 	if n <= 0 {
 		return
 	}
-	m.init()
-	m.io.Add(context.Background(), int64(n), direction)
+	m.instruments().io.Add(context.Background(), int64(n), direction)
 }
 
 // countConn counts a routed stream's bytes: what the router reads from it came up from the

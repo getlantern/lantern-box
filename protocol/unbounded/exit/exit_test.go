@@ -30,6 +30,7 @@ import (
 	"github.com/sagernet/sing/common/uot"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -842,4 +843,24 @@ func TestExitIgnoresAnUnknownKind(t *testing.T) {
 	assert.NotPanics(t, func() { e.SetRouter(Kind(7), &dialRouter{}, time.Now().Add(time.Hour)) })
 	assert.False(t, e.Options().Ready(false))
 	assert.False(t, e.Options().Ready(true))
+}
+
+// The instruments follow the global meter provider the embedder installs, including one it
+// installs after the first measurement.
+func TestExitMetricsFollowAProviderSwap(t *testing.T) {
+	prev := otel.GetMeterProvider()
+	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+	first, second := sdkmetric.NewManualReader(), sdkmetric.NewManualReader()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(first)))
+	m := newExitMetrics()
+	m.session(true)
+	assert.EqualValues(t, 1, counterSum(t, first, "unbounded.exit.sessions"))
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(second)))
+	m.session(true)
+	m.refused()
+	m.bytes(5, ioUp)
+	assert.EqualValues(t, 1, counterSum(t, second, "unbounded.exit.sessions"), "the session after the swap reaches the new provider")
+	assert.EqualValues(t, 1, counterSum(t, second, "unbounded.exit.refused"))
+	assert.EqualValues(t, 5, counterSum(t, second, "unbounded.exit.io"))
+	assert.EqualValues(t, 1, counterSum(t, first, "unbounded.exit.sessions"))
 }
