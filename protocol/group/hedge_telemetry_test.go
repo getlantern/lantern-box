@@ -399,9 +399,13 @@ func TestHedgeResetOnAnUndecidedOpening(t *testing.T) {
 	require.NoError(t, err)
 	_, err = c.Write([]byte("\x16"))
 	require.NoError(t, err)
-	c.(*hedgeStream).noteReset()
+	s := c.(*hedgeStream)
+	s.noteReset()
+	s.firstFailed(lAdapter.UserFailureReset, s.move) // and its handling, before the close
 	c.Close()
-	require.Equal(t, hedgeOutcomeResetUnmoved, connectionRecord(t, reader)["hedge.outcome"])
+	require.Equal(t, hedgeOutcomeResetUnmoved, connectionRecord(t, reader)["hedge.outcome"],
+		"the same label whether or not the handling ran before the close")
+	require.Equal(t, hedgeBad, f.verdict(hedgeDest.String()))
 }
 
 // A reset on a replayable opening whose client closes before the move

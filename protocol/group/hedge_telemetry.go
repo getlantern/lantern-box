@@ -63,8 +63,9 @@ const (
 	hedgeOutcomeResetAfterCommit   = "reset_after_commit"
 	hedgeOutcomeResetNotReplayable = "reset_not_replayable"
 	// hedgeOutcomeResetUnmoved is a connection First reset that didn't move:
-	// the client closed before the move started, or a reply already on its
-	// way committed it.
+	// the client closed before the move started, a reply already on its way
+	// committed it, or its opening was still too short to tell whether it
+	// could be replayed.
 	hedgeOutcomeResetUnmoved = "reset_unmoved"
 	// hedgeOutcomeMoveFailed is a connection whose move to Then failed: Then
 	// couldn't be dialed or didn't take the replayed opening.
@@ -72,8 +73,9 @@ const (
 	// hedgeOutcomeThenDialError is a connection Then failed to dial, on any
 	// path, so Then's failures are counted as First's are.
 	hedgeOutcomeThenDialError = "then_dial_error"
-	// hedgeOutcomeAbandoned is a connection the client closed before First
-	// replied or failed.
+	// hedgeOutcomeAbandoned is a connection the client closed before its
+	// outcome was decided: before First replied or failed, or while a reply
+	// was still on its way, so it can carry bytes and a first-byte time.
 	hedgeOutcomeAbandoned = "abandoned"
 )
 

@@ -275,10 +275,7 @@ func (l *hedgeLeg) noteReset() {
 	if !l.onFirst || l.moving {
 		return
 	}
-	// An opening still undecided can become replayable, and move, as more
-	// of it arrives, so it isn't recorded as not replayable yet.
-	if outcome := l.staticResetOutcomeLocked(); outcome != "" &&
-		(outcome != hedgeOutcomeResetNotReplayable || l.noReplay) {
+	if outcome := l.staticResetOutcomeLocked(); outcome != "" {
 		l.stats.set("", outcome)
 	} else {
 		// Replaced by the move's outcome if it moves. If the client closes
@@ -307,19 +304,21 @@ func (l *hedgeLeg) settleLocked(v hedgeVerdict, why any) {
 }
 
 // staticResetOutcomeLocked returns the outcome of a reset on First that no
-// move follows: after the commit, or on an opening whose copy overflowed or
-// that isn't a handshake, so can't be replayed. It returns "" for a
-// replayable opening. An opening still undecided can become replayable as
-// more of it arrives, and a move then records its own outcome. Caller holds
-// mu.
+// move follows: after the commit, on an opening whose copy overflowed or
+// that isn't a handshake, so can't be replayed, or on one still too short
+// to tell (reset_unmoved; it isn't known to be unreplayable). It returns ""
+// for a replayable opening, whose move records its own outcome. Caller
+// holds mu.
 func (l *hedgeLeg) staticResetOutcomeLocked() string {
 	switch {
 	case l.committed:
 		return hedgeOutcomeResetAfterCommit
 	case l.overflow:
 		return hedgeOutcomeOverflowFailed
-	case l.noReplay || l.undecidedKept:
+	case l.noReplay:
 		return hedgeOutcomeResetNotReplayable
+	case l.undecidedKept:
+		return hedgeOutcomeResetUnmoved
 	}
 	return ""
 }
