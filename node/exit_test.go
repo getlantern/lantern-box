@@ -261,7 +261,7 @@ func TestRunExitRegistersWebRTCOnly(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- RunExit(ctx, ExitConfig{
-			APIURL: srv.URL + "/v1", DeviceID: "dev", Version: "v9", Exit: e, NewBox: boxes.new,
+			APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Version: "v9", Exit: e, NewBox: boxes.new,
 			Header: func(h http.Header) { h.Set("X-Lantern-App", "lantern") },
 		})
 	}()
@@ -286,9 +286,13 @@ func TestRunExitRegistersWebRTCOnly(t *testing.T) {
 }
 
 func TestRunExitRefusesBadConfig(t *testing.T) {
-	assert.Error(t, RunExit(box.BaseContext(), ExitConfig{APIURL: "http://127.0.0.1:1", DeviceID: "dev"}), "no exit")
-	assert.Error(t, RunExit(box.BaseContext(), ExitConfig{DeviceID: "dev", Exit: enabledExit(t)}), "no API URL")
-	assert.Error(t, RunExit(box.BaseContext(), ExitConfig{APIURL: "http://127.0.0.1:1", Exit: enabledExit(t)}), "no device ID")
+	c := http.DefaultClient
+	assert.Error(t, RunExit(box.BaseContext(), ExitConfig{APIURL: "http://127.0.0.1:1", HTTPClient: c, DeviceID: "dev"}), "no exit")
+	assert.Error(t, RunExit(box.BaseContext(), ExitConfig{HTTPClient: c, DeviceID: "dev", Exit: enabledExit(t)}), "no API URL")
+	assert.Error(t, RunExit(box.BaseContext(), ExitConfig{APIURL: "http://127.0.0.1:1", HTTPClient: c, Exit: enabledExit(t)}), "no device ID")
+	// Inside the VPN's process, a default client would resolve through the tunnel.
+	assert.ErrorContains(t, RunExit(box.BaseContext(), ExitConfig{APIURL: "http://127.0.0.1:1", DeviceID: "dev", Exit: enabledExit(t)}),
+		"HTTP client", "no HTTP client")
 }
 
 func TestRunExitRefusesConfigWithoutAbuseRules(t *testing.T) {
@@ -302,7 +306,7 @@ func TestRunExitRefusesConfigWithoutAbuseRules(t *testing.T) {
 	boxes := &fakeExitBoxes{ev: ev}
 	ctx, cancel := context.WithCancel(box.BaseContext())
 	defer cancel()
-	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", DeviceID: "dev", Exit: e, NewBox: boxes.new}, ev)
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e, NewBox: boxes.new}, ev)
 	require.Eventually(t, func() bool { return registers.Load() >= 3 }, 5*time.Second, 5*time.Millisecond, "it keeps retrying")
 	assert.Empty(t, boxes.all(), "no box is built from a config without the abuse rules")
 	assert.False(t, e.Options().Ready())
@@ -328,7 +332,7 @@ func TestRunExitRefusesConfigWithoutAResolveAndPrivateReject(t *testing.T) {
 			boxes := &fakeExitBoxes{ev: ev}
 			ctx, cancel := context.WithCancel(box.BaseContext())
 			defer cancel()
-			done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", DeviceID: "dev", Exit: e, NewBox: boxes.new}, ev)
+			done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e, NewBox: boxes.new}, ev)
 			require.Eventually(t, func() bool { return registers.Load() >= 2 }, 5*time.Second, 5*time.Millisecond)
 			assert.Empty(t, boxes.all(), "no box is built from a config that skips IP rules for domains")
 			assert.False(t, e.Options().Ready())
@@ -347,7 +351,7 @@ func TestRunExitRotatesWithoutAGap(t *testing.T) {
 	boxes := &fakeExitBoxes{ev: ev}
 	ctx, cancel := context.WithCancel(box.BaseContext())
 	defer cancel()
-	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", DeviceID: "dev", Exit: e, NewBox: boxes.new,
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e, NewBox: boxes.new,
 		RotationInterval: 100 * time.Millisecond}, ev)
 	require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, time.Millisecond)
 
@@ -398,7 +402,7 @@ func TestRunExitKeepsServingUntilExpiryWhenRefused(t *testing.T) {
 	ctx, cancel := context.WithCancel(box.BaseContext())
 	defer cancel()
 	const rotation = 100 * time.Millisecond
-	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", DeviceID: "dev", Exit: e, NewBox: boxes.new,
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: "dev", Exit: e, NewBox: boxes.new,
 		RotationInterval: rotation}, ev)
 	require.Eventually(t, func() bool { return e.Options().Ready() }, 5*time.Second, time.Millisecond)
 	require.Eventually(t, func() bool { return registers.Load() >= 2 }, 5*time.Second, time.Millisecond)
@@ -461,7 +465,7 @@ func TestRunExitLogsNoSecrets(t *testing.T) {
 	ev := &exitEvents{}
 	ctx, cancel := context.WithCancel(box.BaseContext())
 	defer cancel()
-	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", DeviceID: deviceID, Exit: e,
+	done := runExitAsync(t, ctx, ExitConfig{APIURL: srv.URL + "/v1", HTTPClient: srv.Client(), DeviceID: deviceID, Exit: e,
 		NewBox: (&fakeExitBoxes{ev: ev}).new}, ev)
 	require.Eventually(t, func() bool { return registers.Load() >= 4 }, 5*time.Second, 5*time.Millisecond)
 	cancel()

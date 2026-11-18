@@ -24,13 +24,21 @@ const maxExitRotation = 24 * time.Hour
 // ExitConfig configures RunExit.
 type ExitConfig struct {
 	// APIURL is lantern-cloud's API base URL, with its version segment.
-	APIURL     string
-	DeviceID   string
-	HTTPClient *http.Client // nil: http.DefaultClient
+	APIURL   string
+	DeviceID string
+	// HTTPClient makes the requests to lantern-cloud, and is required. It must dial around the
+	// VPN's tunnel, as radiance's bypass client does: inside the VPN's own process, sockets
+	// bypass the tunnel while the system resolver points into it, so a default client can't
+	// resolve lantern-cloud, and registration fails whenever the VPN is on.
+	HTTPClient *http.Client
 	// Header, when set, is applied to every request after the defaults, so an app can send
 	// its own admission headers in place of lantern-box's. The defaults include
 	// X-Lantern-App: lantern-box, which lantern-cloud admits as a node, so an app must
 	// override it here. It must not drop X-Lantern-Device-Id or Content-Type.
+	//
+	// An app must set what its own peer API sends (radiance's common.NewRequestWithHeaders),
+	// X-Lantern-Config-Client-IP included: lantern-cloud geolocates the caller to admit it, and
+	// prefers that header over the address the request came from.
 	Header  func(http.Header)
 	Version string
 	// Exit is the volunteer's exit. RunExit only sets its router; it never calls SetEnabled.
@@ -93,9 +101,8 @@ func newExitRunner(cfg ExitConfig) (*exitRunner, error) {
 	if cfg.DeviceID == "" {
 		return nil, errors.New("direct exit: no device ID")
 	}
-	httpClient := cfg.HTTPClient
-	if httpClient == nil {
-		httpClient = http.DefaultClient
+	if cfg.HTTPClient == nil {
+		return nil, errors.New("direct exit: no HTTP client")
 	}
 	newBox := cfg.NewBox
 	if newBox == nil {
@@ -103,7 +110,7 @@ func newExitRunner(cfg ExitConfig) (*exitRunner, error) {
 	}
 	return &exitRunner{
 		cfg: cfg,
-		api: &api{httpClient: sameOrigin(httpClient), baseURL: cfg.APIURL, deviceID: cfg.DeviceID,
+		api: &api{httpClient: sameOrigin(cfg.HTTPClient), baseURL: cfg.APIURL, deviceID: cfg.DeviceID,
 			version: cfg.Version, header: cfg.Header},
 		exit:     cfg.Exit,
 		newBox:   newBox,
