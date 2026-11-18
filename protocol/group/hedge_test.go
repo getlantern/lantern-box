@@ -43,6 +43,8 @@ type fakeOutbound struct {
 	headroom int
 	// hang makes every dial wait for its context and return its error.
 	hang bool
+	// delay holds each stream dial this long before it succeeds.
+	delay time.Duration
 	// ctxBound closes each dialed conn when its dial context ends, as meek's
 	// conns do.
 	ctxBound bool
@@ -82,6 +84,7 @@ func (f *fakeOutbound) DialContext(ctx context.Context, network string, destinat
 	if f.dialErr != nil {
 		return nil, f.dialErr
 	}
+	time.Sleep(f.delay)
 	client, server := net.Pipe()
 	go f.stream(server)
 	if f.ctxBound {
@@ -1583,6 +1586,29 @@ func TestHedgeTimedOutPartialWriteReplaysOnce(t *testing.T) {
 	require.NoError(t, err)
 	buf := make([]byte, 64)
 	got, err := c.Read(buf) // First never answers, so the hedge moves
+	require.NoError(t, err)
+	require.Equal(t, "then:"+string(opening), string(buf[:got]))
+}
+
+// A write whose failure moves the connection, with Then's dial outlasting
+// the caller's write deadline: the write reports all of p taken, since the
+// move replays it, so the caller doesn't resend any and Then gets the
+// opening once.
+func TestHedgeWriteDeadlineDuringAMoveReportsTheWriteTaken(t *testing.T) {
+	f := newHedgeFixture(t, &fakeOutbound{stream: blackhole, wrap: func(c net.Conn) net.Conn {
+		return &failingConn{Conn: c, err: connResetErr(), failWrite: true}
+	}}, &fakeOutbound{stream: answer("then:"), delay: 300 * time.Millisecond}, longCommit)
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	opening := []byte(tlsRecord("client hello"))
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(50*time.Millisecond)))
+	n, err := c.Write(opening)
+	require.Error(t, err, "the caller's deadline ran out during the move")
+	require.Equal(t, len(opening), n, "the move replays all of it")
+	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 64)
+	got, err := c.Read(buf)
 	require.NoError(t, err)
 	require.Equal(t, "then:"+string(opening), string(buf[:got]))
 }

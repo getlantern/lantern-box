@@ -656,7 +656,9 @@ func (s *hedgeStream) Write(p []byte) (int, error) {
 		s.move(lAdapter.UserFailureReset)
 		onThen, moveErr := s.awaitMove(s.writeDeadlineLocked)
 		if moveErr == os.ErrDeadlineExceeded {
-			return 0, moveErr
+			// The move goes on and replays all of p, so it's reported as
+			// taken: a caller that resent any of it would duplicate it.
+			return len(p), moveErr
 		}
 		if onThen {
 			if moveErr != nil {
