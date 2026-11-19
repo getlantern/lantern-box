@@ -4,6 +4,7 @@ package quicjunk
 
 import (
 	"crypto/rand"
+	"io"
 	"math/big"
 )
 
@@ -27,4 +28,14 @@ func New() ([]byte, error) {
 	}
 	junk[0] |= 0x80
 	return junk, nil
+}
+
+// Write writes one New datagram to conn, a flow's UDP conn before QUIC takes it over.
+func Write(conn io.Writer) error {
+	junk, err := New()
+	if err != nil {
+		return err
+	}
+	_, err = conn.Write(junk)
+	return err
 }
