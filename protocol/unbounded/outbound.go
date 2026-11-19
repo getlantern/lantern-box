@@ -211,7 +211,13 @@ func NewOutbound(
 	o.watchdog = newDialWatchdog()
 	if opts.DirectExit != nil && opts.DirectExit.ServerName != "" {
 		// nil in a build without with_quic.
-		if exits := newExitPaths(ctx, lg, opts.DirectExit.ServerName); exits != nil {
+		allowlist, err := newPoolAllowlist(ctx, lg, opts.DirectExit.PoolAllowlist)
+		if err != nil {
+			// A pool exit then carries nothing, which is safe: those connections take the relay.
+			lg.WarnContext(ctx, "unbounded direct exit pool allowlist ignored: ", err)
+			allowlist = nil
+		}
+		if exits := newExitPaths(ctx, lg, opts.DirectExit.ServerName, allowlist); exits != nil {
 			o.exits = exits
 			rtcOpt.OnExitPath = exits.onExitPath
 			rtcOpt.TakeExit = exits.takeExit

@@ -14,7 +14,9 @@ import (
 // exitPaths needs sing-quic: without with_quic the outbound takes no direct exits.
 type exitPaths struct{}
 
-func newExitPaths(context.Context, logger.ContextLogger, string) *exitPaths { return nil }
+func newExitPaths(context.Context, logger.ContextLogger, string, *poolAllowlist) *exitPaths {
+	return nil
+}
 
 func (*exitPaths) onExitPath(ep UBClientcore.ExitPath) { _ = ep.Conn.Close() }
 func (*exitPaths) takeExit() bool                      { return false }

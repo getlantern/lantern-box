@@ -89,6 +89,11 @@ type UnboundedOutboundOptions struct {
 type UnboundedDirectExitOptions struct {
 	// ServerName is the SNI the Hysteria2 handshake sends. Required.
 	ServerName string `json:"server_name"`
+	// PoolAllowlist is the inline rule set a pool exit box admits: the residential allowlist
+	// lantern-cloud's pool exits enforce. A connection a pool exit wouldn't admit takes today's
+	// relay path instead of being refused there. Without it a pool exit carries nothing; a
+	// personal exit, which has no allowlist, carries everything.
+	PoolAllowlist *option.RuleSet `json:"pool_allowlist,omitempty"`
 }
 
 // UnboundedVolunteerOptions configures the volunteer side of Unbounded as a sing-box service: the

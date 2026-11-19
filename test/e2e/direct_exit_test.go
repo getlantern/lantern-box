@@ -165,6 +165,11 @@ func TestDirectExitE2E(t *testing.T) {
 		requireProxies(t, rig.proxy, origin.URL, 20*time.Second)
 		require.Zero(t, rig.egressDials.Load(), "the egress carried a direct exit's traffic")
 	})
+
+	t.Run("what the pool allowlist doesn't admit never reaches the exit", func(t *testing.T) {
+		requireNotExited(t, rig.proxy, "http://unlisted.test:"+originPort+"/", rig.router)
+		requireProxies(t, rig.proxy, origin.URL, 20*time.Second)
+	})
 }
 
 // TestDirectExitFallsBackToEgress checks that a consumer reaches the origin through today's
@@ -200,7 +205,10 @@ func TestDirectExitFallsBackToEgress(t *testing.T) {
 // TestDirectExitPersonalAndPoolSessions checks that a volunteer serving both its room and the
 // pool exits each session through its own kind's router: a stranger's pool consumer through the
 // pool one, and the inviter's helper consumer, on the room slot's rooms-only genesis, through
-// the personal one.
+// the personal one. It is the interop check of broflake's producer and consumer with
+// lantern-box's exit (exit.New, Serve) and client (exitPaths): each session's TCP round trip
+// runs over the Salamander-obfuscated, junk-led path, and each consumer learns its session's
+// kind from broflake (ExitPath.Personal).
 func TestDirectExitPersonalAndPoolSessions(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e (requires live WebRTC bootstrap)")
@@ -255,7 +263,7 @@ func TestDirectExitPersonalAndPoolSessions(t *testing.T) {
 		rtcOpt.SetServePool(true)
 	})
 	directExit := func(o *lbOption.UnboundedOutboundOptions) {
-		o.DirectExit = &lbOption.UnboundedDirectExitOptions{ServerName: "www.example.com"}
+		o.DirectExit = consumerDirectExit(t)
 	}
 
 	// The stranger first: it can answer only the pool slot's genesis, which isn't rooms-only.
@@ -274,6 +282,46 @@ func TestDirectExitPersonalAndPoolSessions(t *testing.T) {
 	require.Positive(t, personal.routed.Load(), "the room session exited through the personal router")
 	require.Equal(t, poolBefore, pool.routed.Load(), "the room session reached the pool router")
 	require.Zero(t, egressDials.Load(), "the egress carried a direct exit's traffic")
+
+	// broflake tells each consumer its session's kind (ExitPath.Personal): the friend's
+	// personal session carries what the pool allowlist doesn't admit, and the stranger's pool
+	// session never sends it to its exit.
+	_, originPort, err := net.SplitHostPort(origin.Listener.Addr().String())
+	require.NoError(t, err)
+	unlisted := "http://unlisted.test:" + originPort + "/"
+	personalBefore := personal.routed.Load()
+	requireProxies(t, friend, unlisted, 30*time.Second)
+	require.Greater(t, personal.routed.Load(), personalBefore, "the personal session didn't exit unlisted.test")
+	require.Zero(t, egressDials.Load(), "the personal session sent unlisted.test to the egress")
+	requireNotExited(t, stranger, unlisted, pool)
+}
+
+// e2ePoolAllowlist is the consumers' pool allowlist: every IP literal, so the exit box's own
+// refusals stay under test, and the fixture's hostnames but unlisted.test, which the exit box
+// resolves, and would route, like allowed.test.
+const e2ePoolAllowlist = `{"type": "inline", "tag": "allowlist", "rules": [
+	{"network": ["tcp", "udp"], "domain": ["allowed.test", "private.test", "linklocal.test",
+		"malware.test", "phishing.test", "cryptominer.test"]},
+	{"network": ["tcp", "udp"], "ip_cidr": ["0.0.0.0/0", "::/0"]}
+]}`
+
+func consumerDirectExit(t testing.TB) *lbOption.UnboundedDirectExitOptions {
+	t.Helper()
+	rs, err := json.UnmarshalExtended[option.RuleSet]([]byte(e2ePoolAllowlist))
+	require.NoError(t, err)
+	return &lbOption.UnboundedDirectExitOptions{ServerName: "www.example.com", PoolAllowlist: &rs}
+}
+
+// requireNotExited checks that a GET of target through proxy never reached router: a pool
+// session doesn't send what its allowlist doesn't admit to the exit, which would refuse it, but
+// takes today's relay path. These rigs' consumers hold direct exit sessions alone, as broflake
+// takes an exit on every slot whose producer offers one, so the relay has no peer and the GET
+// fails; the unit tests show the outbound falls through to it.
+func requireNotExited(t *testing.T, proxy, target string, router *countingRouter) {
+	t.Helper()
+	routedBefore := router.routed.Load()
+	_ = proxiedGetOK(proxy, target, 3*time.Second)
+	require.Equal(t, routedBefore, router.routed.Load(), "%s reached the pool exit", target)
 }
 
 // directExitCase is what a direct exit rig sets up: whether the volunteer's exit is enabled
@@ -344,7 +392,7 @@ func startDirectExitRig(t testing.TB, c directExitCase) *directExitRig {
 	rig.proxy = startConsumersWith(t, ctx, freddieURL, egressURL, []string{tag},
 		func(o *lbOption.UnboundedOutboundOptions) {
 			if c.consumerDirectExit {
-				o.DirectExit = &lbOption.UnboundedDirectExitOptions{ServerName: "www.example.com"}
+				o.DirectExit = consumerDirectExit(t)
 			}
 		})[tag]
 	return rig

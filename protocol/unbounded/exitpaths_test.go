@@ -17,9 +17,11 @@ import (
 	UBClientcore "github.com/getlantern/broflake/clientcore"
 	"github.com/sagernet/sing-box/adapter"
 	sblog "github.com/sagernet/sing-box/log"
+	sbOption "github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/route/rule"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
+	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -277,9 +279,31 @@ func (v *volunteerExit) badPinSession(t *testing.T) *session {
 
 func testLogger() logger.ContextLogger { return sblog.NewNOPFactory().Logger() }
 
+// testAllowlistJSON admits, over TCP and UDP to any port, example.com and its subdomains, and
+// 10.0.0.0/8.
+const testAllowlistJSON = `{"type": "inline", "tag": "allowlist", "rules": [
+	{"network": ["tcp", "udp"], "domain_suffix": ["example.com"]},
+	{"network": ["tcp", "udp"], "ip_cidr": ["10.0.0.0/8"]}
+]}`
+
+func testRuleSet(t *testing.T, raw string) *sbOption.RuleSet {
+	t.Helper()
+	rs, err := json.UnmarshalExtended[sbOption.RuleSet]([]byte(raw))
+	require.NoError(t, err)
+	return &rs
+}
+
+func testAllowlist(t *testing.T, raw string) *poolAllowlist {
+	t.Helper()
+	a, err := newPoolAllowlist(context.Background(), testLogger(), testRuleSet(t, raw))
+	require.NoError(t, err)
+	return a
+}
+
+// newTestExitPaths takes paths as pool ones, under testAllowlistJSON.
 func newTestExitPaths(t *testing.T) *exitPaths {
 	t.Helper()
-	p := newExitPaths(context.Background(), testLogger(), "www.example.com")
+	p := newExitPaths(context.Background(), testLogger(), "www.example.com", testAllowlist(t, testAllowlistJSON))
 	require.NotNil(t, p)
 	t.Cleanup(p.close)
 	return p
@@ -383,58 +407,128 @@ func TestExitPathsSendTheSniffedHostForAnIP(t *testing.T) {
 	}
 }
 
-// QUIC to an IP carries no hostname the exit's allowlist can admit, so it goes to a black hole
-// rather than failing: the browser falls back to TCP, which carries the sniffed host, and the
-// group doesn't count a policy decision as the outbound's failure. Mirrors samizdatreverse's
-// TestReverseBlackHolesQUIC.
-func TestExitPathsBlackHoleQUICToAnIP(t *testing.T) {
+// A pool path carries only what its allowlist admits. Anything else takes today's relay path
+// (errNoExitPath) without a round trip to the exit, which would refuse it: the volunteer's exit
+// box routes nothing.
+func TestExitPathsPoolPathTakesOnlyTheAllowlist(t *testing.T) {
 	v := newVolunteerExit(t)
 	p := newTestExitPaths(t)
-	dest := M.ParseSocksaddr("10.11.12.13:443")
+	p.onExitPath(v.path(t))
 
-	// With no path, today's path carries it.
-	_, err := p.dial(withDomain(dialTimeout(t), "example.com"), "udp", dest)
-	assert.ErrorIs(t, err, errNoExitPath)
-	_, err = p.listenPacket(withDomain(dialTimeout(t), "example.com"), dest)
-	assert.ErrorIs(t, err, errNoExitPath)
-
-	s := v.session(t)
-	p.onExitPath(s.ep)
-	conn, err := p.dial(withDomain(dialTimeout(t), "example.com"), "udp", dest)
+	for _, d := range []string{"example.com:80", "www.example.com:443", "10.11.12.13:443"} {
+		conn, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr(d))
+		require.NoError(t, err, d)
+		echoes(t, conn)
+	}
+	// An IP whose sniffed host is admitted goes as that host.
+	conn, err := p.dial(withDomain(dialTimeout(t), "example.com"), "tcp", M.ParseSocksaddr("192.0.2.1:443"))
 	require.NoError(t, err)
-	defer conn.Close()
-	pc, err := p.listenPacket(dialTimeout(t), dest)
+	echoes(t, conn)
+	routed := v.r.routed.Load()
+	require.EqualValues(t, 4, routed)
+
+	for _, tc := range []struct{ network, dest, sniffed string }{
+		{"tcp", "other.test:80", ""},
+		{"tcp", "notexample.com:443", ""},
+		{"tcp", "192.0.2.1:443", ""},
+		{"tcp", "192.0.2.1:443", "other.test"},
+		// A domain that would resolve into 10.0.0.0/8 is still not admitted: the exit checks
+		// before DNS.
+		{"tcp", "ten.test:443", ""},
+		{"udp", "other.test:443", ""},
+		{"udp", "192.0.2.1:443", ""},
+	} {
+		ctx := withDomain(dialTimeout(t), tc.sniffed)
+		_, err := p.dial(ctx, tc.network, M.ParseSocksaddr(tc.dest))
+		assert.ErrorIs(t, err, errNoExitPath, "%s %s", tc.network, tc.dest)
+		if tc.network == "udp" {
+			_, err = p.listenPacket(ctx, M.ParseSocksaddr(tc.dest))
+			assert.ErrorIs(t, err, errNoExitPath, "%s %s", tc.network, tc.dest)
+		}
+	}
+	assert.Equal(t, routed, v.r.routed.Load(), "nothing unadmitted reached the exit")
+	assert.Zero(t, p.failureCount(), "a relayed connection is no path failure")
+	assert.Equal(t, 1, p.live())
+
+	// QUIC to an admitted IP or host goes through the path.
+	for _, d := range []string{"10.11.12.13:443", "example.com:443"} {
+		pc, err := p.listenPacket(dialTimeout(t), M.ParseSocksaddr(d))
+		require.NoError(t, err, d)
+		_ = pc.Close()
+	}
+}
+
+// With no allowlist configured a pool path carries nothing.
+func TestExitPathsPoolPathWithoutAnAllowlistTakesNothing(t *testing.T) {
+	v := newVolunteerExit(t)
+	p := newExitPaths(context.Background(), testLogger(), "www.example.com", nil)
+	t.Cleanup(p.close)
+	p.onExitPath(v.path(t))
+	_, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr("example.com:80"))
+	assert.ErrorIs(t, err, errNoExitPath)
+	_, err = p.listenPacket(dialTimeout(t), M.ParseSocksaddr("example.com:443"))
+	assert.ErrorIs(t, err, errNoExitPath)
+	assert.Zero(t, v.r.routed.Load())
+	assert.Zero(t, p.failureCount())
+}
+
+// A personal path, under its volunteer's personal policy, carries anything, QUIC to an IP too.
+func TestExitPathsPersonalPathTakesAnything(t *testing.T) {
+	v := newVolunteerExit(t)
+	p := newExitPaths(context.Background(), testLogger(), "www.example.com", nil)
+	t.Cleanup(p.close)
+	ep := v.path(t)
+	ep.Personal = true
+	p.onExitPath(ep)
+	for _, d := range []string{"other.test:80", "192.0.2.1:443"} {
+		conn, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr(d))
+		require.NoError(t, err, d)
+		echoes(t, conn)
+	}
+	pc, err := p.listenPacket(dialTimeout(t), M.ParseSocksaddr("192.0.2.1:443"))
 	require.NoError(t, err)
 	defer pc.Close()
-	assert.Equal(t, dest.String(), conn.RemoteAddr().String())
-	n, err := conn.Write([]byte("initial"))
+	_ = pc.SetDeadline(time.Now().Add(10 * time.Second))
+	_, err = pc.WriteTo([]byte("quic"), M.ParseSocksaddr("192.0.2.1:443"))
 	require.NoError(t, err)
-	assert.Equal(t, 7, n)
-	n, err = pc.WriteTo([]byte("initial"), dest.UDPAddr())
+	b := make([]byte, 16)
+	n, _, err := pc.ReadFrom(b)
 	require.NoError(t, err)
-	assert.Equal(t, 7, n)
-	require.NoError(t, conn.SetReadDeadline(time.Now().Add(50*time.Millisecond)))
-	_, err = conn.Read(make([]byte, 16))
-	var ne net.Error
-	require.ErrorAs(t, err, &ne)
-	assert.True(t, ne.Timeout())
+	assert.Equal(t, "quic", string(b[:n]))
+	assert.Equal(t, []string{"other.test:80", "192.0.2.1:443", "192.0.2.1:443"}, v.r.destinations())
+}
 
-	// Neither touched the path: it has carried nothing, so no dial proved it.
-	p.mu.Lock()
-	proved := p.paths[0].succeeded.Load()
-	p.mu.Unlock()
-	assert.False(t, proved, "a black-holed dial used the path")
-
-	// QUIC to a hostname, and other UDP to an IP, still go through the path.
-	for _, d := range []string{"example.com:443", "10.11.12.13:53"} {
-		conn, err := p.dial(dialTimeout(t), "udp", M.ParseSocksaddr(d))
-		require.NoError(t, err)
-		_ = conn.Close()
+// A live personal path is taken over a newer pool one, even for what the pool path admits.
+func TestExitPathsPreferAPersonalPath(t *testing.T) {
+	personal, pool := newVolunteerExit(t), newVolunteerExit(t)
+	p := newTestExitPaths(t)
+	personalEP, poolEP := personal.path(t), pool.path(t)
+	personalEP.Personal = true
+	p.onExitPath(personalEP)
+	p.onExitPath(poolEP)
+	for _, d := range []string{"example.com:80", "other.test:80"} {
+		conn, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr(d))
+		require.NoError(t, err, d)
+		echoes(t, conn)
 	}
+	assert.EqualValues(t, 2, personal.r.routed.Load())
+	assert.Zero(t, pool.r.routed.Load())
+
+	// Once the personal path is gone, the pool path takes what it admits, and only that.
+	_ = personalEP.Conn.Close()
 	p.mu.Lock()
-	proved = p.paths[0].succeeded.Load()
+	for _, path := range p.paths {
+		if path.personal {
+			_ = path.conn.Close()
+		}
+	}
 	p.mu.Unlock()
-	assert.True(t, proved)
+	conn, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr("example.com:80"))
+	require.NoError(t, err)
+	echoes(t, conn)
+	assert.EqualValues(t, 1, pool.r.routed.Load())
+	_, err = p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr("other.test:80"))
+	assert.ErrorIs(t, err, errNoExitPath)
 }
 
 func TestExitPathsListenPacket(t *testing.T) {
@@ -653,7 +747,7 @@ func TestExitPathsSweepEveryDeadPath(t *testing.T) {
 
 func TestExitPathsCloseClosesEveryPath(t *testing.T) {
 	v := newVolunteerExit(t)
-	p := newExitPaths(context.Background(), testLogger(), "www.example.com")
+	p := newExitPaths(context.Background(), testLogger(), "www.example.com", testAllowlist(t, testAllowlistJSON))
 	a, b := v.session(t), v.session(t)
 	p.onExitPath(a.ep)
 	p.onExitPath(b.ep)
@@ -699,7 +793,7 @@ func TestExitPathsNeverLogSecrets(t *testing.T) {
 	t.Cleanup(func() { _ = factory.Close() })
 
 	v := newVolunteerExit(t)
-	p := newExitPaths(context.Background(), factory.Logger(), "www.example.com")
+	p := newExitPaths(context.Background(), factory.Logger(), "www.example.com", testAllowlist(t, testAllowlistJSON))
 	t.Cleanup(p.close)
 	// The bad path alone first, so its handshake fails rather than sitting under a newer path.
 	bad := v.badPinSession(t)
@@ -756,11 +850,24 @@ func TestOutboundTakesExitsOnlyWhenConfigured(t *testing.T) {
 	assert.NotNil(t, o.rtcOpt.OnExitPath)
 	assert.NotNil(t, o.rtcOpt.TakeExit)
 	require.NotNil(t, o.exits)
+	assert.Nil(t, o.exits.allowlist, "no allowlist: a pool path carries nothing")
+
+	o = newOut(option.UnboundedOutboundOptions{DirectExit: &option.UnboundedDirectExitOptions{ServerName: "x",
+		PoolAllowlist: testRuleSet(t, testAllowlistJSON)}})
+	require.NotNil(t, o.exits)
+	assert.True(t, o.exits.allowlist.admits("tcp", M.ParseSocksaddr("example.com:443")))
+
+	// An allowlist that isn't inline is dropped, which leaves pool paths carrying nothing,
+	// rather than failing the outbound.
+	o = newOut(option.UnboundedOutboundOptions{DirectExit: &option.UnboundedDirectExitOptions{ServerName: "x",
+		PoolAllowlist: &sbOption.RuleSet{Type: "local", LocalOptions: sbOption.LocalRuleSet{Path: "/nonexistent"}}}})
+	require.NotNil(t, o.exits)
+	assert.Nil(t, o.exits.allowlist)
 }
 
 func TestOutboundDialsThroughADirectExit(t *testing.T) {
 	out, err := NewOutbound(context.Background(), nil, sblog.NewNOPFactory().Logger(), "unbounded-test", option.UnboundedOutboundOptions{
-		DirectExit: &option.UnboundedDirectExitOptions{ServerName: "www.example.com"},
+		DirectExit: &option.UnboundedDirectExitOptions{ServerName: "www.example.com", PoolAllowlist: testRuleSet(t, testAllowlistJSON)},
 	})
 	require.NoError(t, err)
 	o := out.(*Outbound)
@@ -780,6 +887,15 @@ func TestOutboundDialsThroughADirectExit(t *testing.T) {
 	require.NoError(t, err)
 	_ = pc.Close()
 
+	// What the pool path's allowlist doesn't admit takes today's path instead of the exit.
+	routed := v.r.routed.Load()
+	_, err = o.DialContext(dialTimeout(t), "tcp", M.ParseSocksaddr("other.test:80"))
+	assert.ErrorContains(t, err, "not started")
+	_, err = o.ListenPacket(dialTimeout(t), M.ParseSocksaddr("other.test:443"))
+	assert.Error(t, err)
+	assert.NotErrorIs(t, err, errNoExitPath)
+	assert.Equal(t, routed, v.r.routed.Load())
+
 	require.NoError(t, o.Close())
 	assert.True(t, s.user.closed.Load(), "Close closes the paths")
 }
@@ -793,7 +909,8 @@ func TestOutboundDirectExitLogsNoDestination(t *testing.T) {
 	require.NoError(t, factory.Start())
 	t.Cleanup(func() { _ = factory.Close() })
 	out, err := NewOutbound(context.Background(), nil, factory.Logger(), "unbounded-test", option.UnboundedOutboundOptions{
-		DirectExit: &option.UnboundedDirectExitOptions{ServerName: "www.example.com"},
+		DirectExit: &option.UnboundedDirectExitOptions{ServerName: "www.example.com", PoolAllowlist: testRuleSet(t,
+			`{"type": "inline", "tag": "allowlist", "rules": [{"network": ["tcp", "udp"], "domain_suffix": ["example"]}]}`)},
 	})
 	require.NoError(t, err)
 	o := out.(*Outbound)
