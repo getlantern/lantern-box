@@ -28,8 +28,6 @@ func (fakeGeo) ISP(net.IP) string         { return "Mobile Communication Company
 // synctest bubble, which reports them as a deadlock, and later tests would
 // inherit the lookups.
 func stopLookupWorkers() {
-	close(metrics.countryLookupC)
-	metrics.countryLookupC = nil
 	close(metrics.destinationLookupC)
 	metrics.destinationLookupC = nil
 	metrics.countryLookup = geo.NoLookup{}
@@ -115,8 +113,6 @@ func TestProxyIOCarriesASNAndISP(t *testing.T) {
 		defer server.Close()
 
 		tracked := tracker.RoutedConnection(ctx, infoConn{Conn: server, info: testInfo}, adapter.InboundContext{}, nil, nil)
-		// Let the workers resolve the client before any bytes are counted.
-		synctest.Wait()
 
 		go func() {
 			buf := make([]byte, 16)
@@ -136,14 +132,30 @@ func TestProxyIOCarriesASNAndISP(t *testing.T) {
 		assert.Equal(t, "Mobile Communication Company of Iran", io["client.isp"])
 
 		// Every ASN multiplies a series, so the split stays off the other
-		// metrics. (Their first point can predate the lookup, so only the
-		// absence of the keys is checked, on every point.)
+		// metrics.
 		for _, name := range []string{"sing.connections", "sing.connection_duration"} {
 			for _, attrs := range allPointAttrs(t, rm, name) {
 				assert.Nil(t, attrs["client.asn"], "%s should not have client.asn", name)
 				assert.Nil(t, attrs["client.isp"], "%s should not have client.isp", name)
 			}
 		}
+	})
+}
+
+// TestClientResolvedWhenRouted checks that the client's country and network
+// are set when the connection's attributes are built, so its first bytes are
+// never counted as n/a.
+func TestClientResolvedWhenRouted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		SetISPLookup(fakeGeo{})
+		SetupMetricsManager(fakeGeo{}, "")
+		defer stopLookupWorkers()
+
+		attrs := metadataToAttributes(adapter.InboundContext{})
+		assert.Equal(t, "IR", attrs.country.Load())
+		network := attrs.network.Load()
+		require.NotNil(t, network)
+		assert.Equal(t, "AS197207", network.asn)
 	})
 }
 
