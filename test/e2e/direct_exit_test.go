@@ -41,9 +41,10 @@ import (
 )
 
 // TestDirectExitE2E brings up freddie, the egress, a volunteer widget whose exit is enabled
-// and routes into an exit box built from testdata/direct_exit_server.json, and a consumer
-// whose unbounded outbound takes direct exits. Traffic must leave through the volunteer's
-// exit box, never the egress, and the exit box's reject rules must refuse what they cover.
+// and routes into an exit box built from testdata/direct_exit_server.json, and its friend's
+// consumer, whose unbounded outbound takes direct exits: a personal one, through their room, as
+// a lone consumer slot takes no other kind. Traffic must leave through the volunteer's exit box,
+// never the egress, and the exit box's reject rules must refuse what they cover.
 //
 // Like the other Unbounded tests, this one must not overlap another: freddie keeps its
 // tables in package globals.
@@ -166,9 +167,11 @@ func TestDirectExitE2E(t *testing.T) {
 		require.Zero(t, rig.egressDials.Load(), "the egress carried a direct exit's traffic")
 	})
 
-	t.Run("what the pool allowlist doesn't admit never reaches the exit", func(t *testing.T) {
-		requireNotExited(t, rig.proxy, "http://unlisted.test:"+originPort+"/", rig.router)
-		requireProxies(t, rig.proxy, origin.URL, 20*time.Second)
+	t.Run("a personal exit carries what the pool allowlist doesn't admit", func(t *testing.T) {
+		routedBefore := rig.router.routed.Load()
+		requireProxies(t, rig.proxy, "http://unlisted.test:"+originPort+"/", 20*time.Second)
+		require.Greater(t, rig.router.routed.Load(), routedBefore, "the exit box didn't route unlisted.test")
+		require.Zero(t, rig.egressDials.Load(), "the egress carried a direct exit's traffic")
 	})
 }
 
@@ -221,26 +224,8 @@ func TestDirectExitPersonalAndPoolSessions(t *testing.T) {
 	origin := httptest.NewServer(countingHandler(&originHits))
 	t.Cleanup(origin.Close)
 
-	// This test's stand-in for lantern-cloud's ticket key. Tickets are credentials: never log
-	// them, even here.
-	_, priv, err := ed25519.GenerateKey(nil)
-	require.NoError(t, err)
-	keys := []helperticket.Key{helperticket.NewKey(priv.Public().(ed25519.PublicKey))}
-	ticket := func(role helperticket.Role) string {
-		tk, err := helperticket.Sign(priv, helperticket.Ticket{PairingID: "6f1c2b0e-8a7d-4c1e-9f00-0123456789ab",
-			Role: role, Expires: time.Now().Add(15 * time.Minute)})
-		require.NoError(t, err)
-		return tk
-	}
-
-	freddieAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	f, err := freddie.New(ctx, freddieAddr)
-	require.NoError(t, err, "freddie.New")
-	t.Cleanup(func() { cancel(); _ = f.Shutdown() })
-	f.RoomTicket = helperticket.RoomFunc(func() []helperticket.Key { return keys }, time.Now)
-	go func() { _ = f.ListenAndServe() }()
-	freddieURL := "http://" + freddieAddr
-	waitForHTTP(t, freddieURL+"/v1/", 5*time.Second)
+	rooms := newRoomKeys(t)
+	freddieURL := startRoomFreddie(t, ctx, cancel, rooms)
 
 	var egressDials atomic.Int64
 	egressURL := startCountingEgress(t, ctx, &egressDials)
@@ -259,41 +244,80 @@ func TestDirectExitPersonalAndPoolSessions(t *testing.T) {
 	e.SetRouter(exit.Pool, pool, time.Now().Add(time.Hour), ready)
 	startWidget(t, ctx, freddieURL, egressURL, func(_ *UBClientcore.BroflakeOptions, rtcOpt *UBClientcore.WebRTCOptions) {
 		rtcOpt.Exit = e.Options()
-		rtcOpt.SetRoomTickets([]string{ticket(helperticket.RoleVolunteer)})
+		rtcOpt.SetRoomTickets([]string{rooms.ticket(t, helperticket.RoleVolunteer)})
 		rtcOpt.SetServePool(true)
 	})
 	directExit := func(o *lbOption.UnboundedOutboundOptions) {
 		o.DirectExit = consumerDirectExit(t)
 	}
-
-	// The stranger first: it can answer only the pool slot's genesis, which isn't rooms-only.
-	// A friend could answer that one too, and would then get a pool session, as broflake
-	// counts any genesis a stranger could reach, so the friend comes second and finds only
-	// the room slot free.
-	stranger := startConsumersWith(t, ctx, freddieURL, egressURL, []string{e2ePoolTag}, directExit)[e2ePoolTag]
-	requireProxies(t, stranger, origin.URL, 60*time.Second)
-	require.Positive(t, pool.routed.Load(), "the pool session exited through the pool router")
-	require.Zero(t, personal.routed.Load(), "the pool session reached the personal router")
-
-	poolBefore := pool.routed.Load()
-	friend := startConsumersWith(t, ctx, freddieURL, egressURL, []string{e2eHelperTag}, directExit,
-		ticket(helperticket.RoleInviter))[e2eHelperTag]
-	requireProxies(t, friend, origin.URL, 60*time.Second)
-	require.Positive(t, personal.routed.Load(), "the room session exited through the personal router")
-	require.Equal(t, poolBefore, pool.routed.Load(), "the room session reached the pool router")
-	require.Zero(t, egressDials.Load(), "the egress carried a direct exit's traffic")
-
-	// broflake tells each consumer its session's kind (ExitPath.Personal): the friend's
-	// personal session carries what the pool allowlist doesn't admit, and the stranger's pool
-	// session never sends it to its exit.
 	_, originPort, err := net.SplitHostPort(origin.Listener.Addr().String())
 	require.NoError(t, err)
-	unlisted := "http://unlisted.test:" + originPort + "/"
+
+	// The stranger first: it can answer only the pool slot's genesis, which isn't rooms-only,
+	// so the friend, second, finds the room slot free. A consumer has one slot, which takes a
+	// direct exit only through a room, personal: a pool exit would leave it no relay for what
+	// the pool allowlist doesn't admit. So the stranger relays, everything, through the egress,
+	// a host the allowlist doesn't admit included.
+	stranger := startConsumersWith(t, ctx, freddieURL, egressURL, []string{e2ePoolTag}, directExit)[e2ePoolTag]
+	requireProxies(t, stranger, origin.URL, 60*time.Second)
+	requireProxies(t, stranger, "http://localhost:"+originPort+"/", 20*time.Second)
+	require.Positive(t, egressDials.Load(), "the stranger didn't relay through the egress")
+	require.Zero(t, pool.routed.Load(), "the stranger took a pool direct exit")
+	require.Zero(t, personal.routed.Load(), "the stranger reached the personal router")
+
+	// The friend's room session is personal (ExitPath.Personal, from Freddie's stamp), so it
+	// carries what the pool allowlist doesn't admit too, never through the egress.
+	dialsBefore := egressDials.Load()
+	friend := startConsumersWith(t, ctx, freddieURL, egressURL, []string{e2eHelperTag}, directExit,
+		rooms.ticket(t, helperticket.RoleInviter))[e2eHelperTag]
+	requireProxies(t, friend, origin.URL, 60*time.Second)
+	require.Positive(t, personal.routed.Load(), "the room session exited through the personal router")
 	personalBefore := personal.routed.Load()
-	requireProxies(t, friend, unlisted, 30*time.Second)
+	requireProxies(t, friend, "http://unlisted.test:"+originPort+"/", 30*time.Second)
 	require.Greater(t, personal.routed.Load(), personalBefore, "the personal session didn't exit unlisted.test")
-	require.Zero(t, egressDials.Load(), "the personal session sent unlisted.test to the egress")
-	requireNotExited(t, stranger, unlisted, pool)
+	require.Zero(t, pool.routed.Load(), "a session reached the pool router")
+	require.Equal(t, dialsBefore, egressDials.Load(), "the egress carried the friend's direct exit traffic")
+}
+
+// roomKeys is a test's stand-in for lantern-cloud's ticket key. Tickets are credentials: never
+// log them, even here.
+type roomKeys struct{ priv ed25519.PrivateKey }
+
+func newRoomKeys(t testing.TB) *roomKeys {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	return &roomKeys{priv: priv}
+}
+
+func (k *roomKeys) keys() []helperticket.Key {
+	return []helperticket.Key{helperticket.NewKey(k.priv.Public().(ed25519.PublicKey))}
+}
+
+// ticket is a ticket of role for the one pairing these tests use.
+func (k *roomKeys) ticket(t testing.TB, role helperticket.Role) string {
+	t.Helper()
+	tk, err := helperticket.Sign(k.priv, helperticket.Ticket{PairingID: "6f1c2b0e-8a7d-4c1e-9f00-0123456789ab",
+		Role: role, Expires: time.Now().Add(15 * time.Minute)})
+	require.NoError(t, err)
+	return tk
+}
+
+// startRoomFreddie runs a real Freddie that verifies k's room tickets, and so stamps a friend's
+// offer through their room with its pairing, which gets the volunteer's personal exit. cancel
+// ends ctx, which Freddie's shutdown waits on for in-flight long polls.
+func startRoomFreddie(t testing.TB, ctx context.Context, cancel context.CancelFunc, k *roomKeys) string {
+	t.Helper()
+	freddieAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	f, err := freddie.New(ctx, freddieAddr)
+	require.NoError(t, err, "freddie.New")
+	t.Cleanup(func() { cancel(); _ = f.Shutdown() })
+	f.RoomTicket = helperticket.RoomFunc(k.keys, time.Now)
+	f.KnownKeyID = helperticket.KnownKeyFunc(k.keys)
+	go func() { _ = f.ListenAndServe() }()
+	freddieURL := "http://" + freddieAddr
+	waitForHTTP(t, freddieURL+"/v1/", 5*time.Second)
+	return freddieURL
 }
 
 // e2ePoolAllowlist is the consumers' pool allowlist: every IP literal, so the exit box's own
@@ -310,18 +334,6 @@ func consumerDirectExit(t testing.TB) *lbOption.UnboundedDirectExitOptions {
 	rs, err := json.UnmarshalExtended[option.RuleSet]([]byte(e2ePoolAllowlist))
 	require.NoError(t, err)
 	return &lbOption.UnboundedDirectExitOptions{ServerName: "www.example.com", PoolAllowlist: &rs}
-}
-
-// requireNotExited checks that a GET of target through proxy never reached router: a pool
-// session doesn't send what its allowlist doesn't admit to the exit, which would refuse it, but
-// takes today's relay path. These rigs' consumers hold direct exit sessions alone, as broflake
-// takes an exit on every slot whose producer offers one, so the relay has no peer and the GET
-// fails; the unit tests show the outbound falls through to it.
-func requireNotExited(t *testing.T, proxy, target string, router *countingRouter) {
-	t.Helper()
-	routedBefore := router.routed.Load()
-	_ = proxiedGetOK(proxy, target, 3*time.Second)
-	require.Equal(t, routedBefore, router.routed.Load(), "%s reached the pool exit", target)
 }
 
 // directExitCase is what a direct exit rig sets up: whether the volunteer's exit is enabled
@@ -350,14 +362,10 @@ func startDirectExitRig(t testing.TB, c directExitCase) *directExitRig {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	freddieAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	f, err := freddie.New(ctx, freddieAddr)
-	require.NoError(t, err, "freddie.New")
-	// Shutdown waits on f's context for in-flight long polls; cancel it first.
-	t.Cleanup(func() { cancel(); _ = f.Shutdown() })
-	go func() { _ = f.ListenAndServe() }()
-	freddieURL := "http://" + freddieAddr
-	waitForHTTP(t, freddieURL+"/v1/", 5*time.Second)
+	// The consumer is the volunteer's friend, through their room: a lone consumer slot takes
+	// only a room's direct exit, which Freddie's stamp makes personal.
+	rooms := newRoomKeys(t)
+	freddieURL := startRoomFreddie(t, ctx, cancel, rooms)
 
 	rig := &directExitRig{
 		egressDials:    new(atomic.Int64),
@@ -371,7 +379,7 @@ func startDirectExitRig(t testing.TB, c directExitCase) *directExitRig {
 	t.Cleanup(e.Close)
 	e.SetEnabled(c.enabled)
 	if c.router {
-		e.SetRouter(exit.Pool, rig.router, time.Now().Add(time.Hour), abuseRuleSetsReady(rig.router.ConnectionRouterEx))
+		e.SetRouter(exit.Personal, rig.router, time.Now().Add(time.Hour), abuseRuleSetsReady(rig.router.ConnectionRouterEx))
 	}
 	exitOpts := *e.Options()
 	onSession := exitOpts.OnSession
@@ -383,18 +391,18 @@ func startDirectExitRig(t testing.TB, c directExitCase) *directExitRig {
 	}
 	startWidget(t, ctx, freddieURL, egressURL, func(_ *UBClientcore.BroflakeOptions, rtcOpt *UBClientcore.WebRTCOptions) {
 		rtcOpt.Exit = &exitOpts
+		rtcOpt.SetRoomTickets([]string{rooms.ticket(t, helperticket.RoleVolunteer)})
 		if c.widget != nil {
 			c.widget(rtcOpt)
 		}
 	})
 
-	tag := "unbounded-out"
-	rig.proxy = startConsumersWith(t, ctx, freddieURL, egressURL, []string{tag},
+	rig.proxy = startConsumersWith(t, ctx, freddieURL, egressURL, []string{e2eHelperTag},
 		func(o *lbOption.UnboundedOutboundOptions) {
 			if c.consumerDirectExit {
 				o.DirectExit = consumerDirectExit(t)
 			}
-		})[tag]
+		}, rooms.ticket(t, helperticket.RoleInviter))[e2eHelperTag]
 	return rig
 }
 
