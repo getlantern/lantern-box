@@ -33,6 +33,7 @@ import (
 
 	"github.com/getlantern/lantern-box/protocol/internal/blackhole"
 	"github.com/getlantern/lantern-box/protocol/internal/quicjunk"
+	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 )
 
 const (
@@ -54,6 +55,12 @@ var exitPathAddr = &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1}
 
 // exitPaths holds the direct exit paths broflake hands the outbound, each with its own
 // Hysteria2 client to the volunteer's exit, and dials through the newest live one.
+//
+// A path carries hysteria2x's evasions, always on: one random datagram before the QUIC
+// Initial (pathDialer), and Salamander on every packet after it, both ways, under a key both
+// ends derive from the session password (exit.SalamanderPassword). So a DPI box sees neither a
+// QUIC Initial nor its SNI. A v0.0.239 exit, which speaks stock Hysteria2, can't serve it:
+// broflake pairs only peers that both obfuscate.
 //
 // Nothing about a path is ever logged: its pin, password and conn are the session's
 // credentials, and the client's errors can carry the pin.
@@ -146,11 +153,12 @@ func (p *exitPaths) onExitPath(ep UBClientcore.ExitPath) {
 		Logger:        nop,
 		ServerAddress: M.ParseSocksaddrHostPort(p.serverName, 443),
 		// BBR: a zero send rate never negotiates Brutal.
-		SendBPS:     0,
-		ReceiveBPS:  0,
-		Password:    ep.Password,
-		TLSConfig:   tlsConfig,
-		QUICOptions: qtls.QUICOptions{IdleTimeout: p.idleTimeout},
+		SendBPS:            0,
+		ReceiveBPS:         0,
+		Password:           ep.Password,
+		SalamanderPassword: exit.SalamanderPassword(ep.Password),
+		TLSConfig:          tlsConfig,
+		QUICOptions:        qtls.QUICOptions{IdleTimeout: p.idleTimeout},
 	})
 	if err != nil {
 		path.close()
@@ -387,11 +395,7 @@ func (d *pathDialer) DialContext(_ context.Context, network string, _ M.Socksadd
 		return nil, errPathDead
 	}
 	// The junk goes first, so the QUIC Initial is never the path's first datagram.
-	junk, err := quicjunk.New()
-	if err == nil {
-		_, err = d.conn.Write(junk)
-	}
-	if err != nil {
+	if err := quicjunk.Write(d.conn); err != nil {
 		_ = d.conn.Close()
 		return nil, errPathDead
 	}

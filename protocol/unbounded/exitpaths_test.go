@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	sblog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/route/rule"
+	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -71,11 +72,26 @@ func (c *trackedConn) Close() error {
 	return c.placeholderConn.Close()
 }
 
-// recordingConn records the datagrams the volunteer reads.
+// recordingConn records the datagrams the volunteer reads and writes: the wire, both ways.
 type recordingConn struct {
 	placeholderConn
-	mu    sync.Mutex
-	reads [][]byte
+	mu     sync.Mutex
+	reads  [][]byte
+	writes [][]byte
+}
+
+func (c *recordingConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.mu.Lock()
+	c.writes = append(c.writes, append([]byte(nil), p...))
+	c.mu.Unlock()
+	return c.placeholderConn.WriteTo(p, addr)
+}
+
+// wire returns every datagram recorded, both ways.
+func (c *recordingConn) wire() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append(slices.Clone(c.reads), c.writes...)
 }
 
 func (c *recordingConn) ReadFrom(p []byte) (int, net.Addr, error) {
@@ -100,6 +116,13 @@ func (c *recordingConn) first() []byte {
 // isQUICv1Initial is copied from test/e2e/hysteria2x_test.go.
 func isQUICv1Initial(b []byte) bool {
 	return len(b) >= 1200 && b[0]&0xf0 == 0xc0 &&
+		b[1] == 0 && b[2] == 0 && b[3] == 0 && b[4] == 1
+}
+
+// isQUICv1LongHeader reports whether b reads as any QUIC v1 long-header packet: what a DPI box
+// keys on before it derives the Initial's keys, which are public, and reads the SNI.
+func isQUICv1LongHeader(b []byte) bool {
+	return len(b) >= 5 && b[0]&0xc0 == 0xc0 &&
 		b[1] == 0 && b[2] == 0 && b[3] == 0 && b[4] == 1
 }
 
@@ -152,8 +175,28 @@ func (r *echoRouter) RouteConnectionEx(ctx context.Context, conn net.Conn, md ad
 	}()
 }
 
+// RoutePacketConnectionEx echoes each packet back to the destination it was sent to.
 func (r *echoRouter) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn, md adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	_ = N.CloseOnHandshakeFailure(conn, onClose, errors.New("not used"))
+	r.routed.Add(1)
+	r.mu.Lock()
+	r.dests = append(r.dests, md.Destination.String())
+	r.mu.Unlock()
+	go func() {
+		defer conn.Close()
+		for {
+			b := buf.NewPacket()
+			dest, err := conn.ReadPacket(b)
+			if err == nil {
+				err = conn.WritePacket(b, dest)
+			} else {
+				b.Release()
+			}
+			if err != nil {
+				onClose(err)
+				return
+			}
+		}
+	}()
 }
 
 func newEchoRouter(t *testing.T) *echoRouter {
@@ -406,21 +449,51 @@ func TestExitPathsListenPacket(t *testing.T) {
 	_ = conn.Close()
 }
 
-func TestExitPathsSendJunkFirst(t *testing.T) {
+// On the wire a direct exit path is never recognizably QUIC: the consumer's first datagram is
+// junk, every QUIC packet after it, both ways, is Salamander-obfuscated, and no Initial
+// decrypts to give up the server name. TCP and UDP still round-trip through the exit.
+func TestExitPathsObfuscateTheWire(t *testing.T) {
 	v := newVolunteerExit(t)
 	p := newTestExitPaths(t)
 	vConn, uConn := pathPair(t)
 	rec := &recordingConn{placeholderConn: vConn}
 	p.onExitPath(v.serveSession(t, rec, &trackedConn{placeholderConn: uConn}))
+
 	conn, err := p.dial(dialTimeout(t), "tcp", M.ParseSocksaddr("example.com:80"))
 	require.NoError(t, err)
 	echoes(t, conn)
+
+	pc, err := p.listenPacket(dialTimeout(t), M.ParseSocksaddr("example.com:53"))
+	require.NoError(t, err)
+	defer pc.Close()
+	_ = pc.SetDeadline(time.Now().Add(10 * time.Second))
+	_, err = pc.WriteTo([]byte("pong"), M.ParseSocksaddr("example.com:53"))
+	require.NoError(t, err)
+	b := make([]byte, 64)
+	n, from, err := pc.ReadFrom(b)
+	require.NoError(t, err)
+	assert.Equal(t, "pong", string(b[:n]))
+	assert.Equal(t, "example.com:53", from.String())
+	assert.Equal(t, []string{"example.com:80", "example.com:53"}, v.r.destinations())
+
 	first := rec.first()
 	require.NotNil(t, first)
 	assert.NotZero(t, first[0]&0x80, "long-header bit")
 	assert.GreaterOrEqual(t, len(first), 8)
 	assert.LessOrEqual(t, len(first), 64)
 	assert.False(t, isQUICv1Initial(first))
+
+	wire := rec.wire()
+	require.Greater(t, len(wire), 2)
+	for i, d := range wire {
+		assert.False(t, isQUICv1Initial(d), "datagram %d is a QUIC v1 Initial", i)
+		assert.False(t, isQUICv1LongHeader(d), "datagram %d is a QUIC v1 long-header packet", i)
+	}
+	// What a DPI box does with QUIC Initials: derive their keys and read the ClientHello.
+	// TestDecryptQUICv1InitialReadsAStockClientsSNI shows it reads a stock client's.
+	hello := initialCryptoStream(wire)
+	assert.Empty(t, hello, "no datagram decrypts as a QUIC v1 Initial")
+	assert.NotContains(t, string(hello), p.serverName)
 }
 
 func TestExitPathsDropAPathWithAWrongPin(t *testing.T) {
