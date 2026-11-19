@@ -1064,6 +1064,33 @@ func TestExitRefusesAPasswordFromBeforeAWithdrawal(t *testing.T) {
 	echo(t, testClient(t, uConn, pin, password))
 }
 
+// A minted password expires after mintTTL even when nothing mints another to prune it.
+func TestExitRefusesAnExpiredPassword(t *testing.T) {
+	r := newEchoRouter(t)
+	e := newTestExit(t)
+	e.SetEnabled(true)
+	now := time.Now()
+	e.now = func() time.Time { return now }
+	e.SetRouter(Pool, r, now.Add(time.Hour), alwaysReady)
+	_, expired, ok := e.Options().Params(false)
+	require.True(t, ok)
+
+	now = now.Add(mintTTL + time.Second)
+	vConn, _ := pathPair(t)
+	done := serveKind(t, e, vConn, expired, Pool)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve took a password minted more than mintTTL ago")
+	}
+
+	// A password minted now still serves.
+	vConn, uConn := pathPair(t)
+	pin, password, _ := e.Options().Params(false)
+	serve(t, e, vConn, password)
+	echo(t, testClient(t, uConn, pin, password))
+}
+
 // The exit checks the kind's state again once the ready check returns, outside its lock, and
 // routes nothing if the kind changed meanwhile.
 func TestExitRechecksAfterTheReadyCheck(t *testing.T) {

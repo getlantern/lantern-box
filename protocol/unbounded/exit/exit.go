@@ -290,9 +290,11 @@ func (e *Exit) serve(ctx context.Context, conn net.PacketConn, password string, 
 	e.mu.Lock()
 	ks := &e.kinds[kind]
 	revoked := ks.revoked
-	// Only a password params minted for this kind since it last became servable, once.
-	_, minted := ks.minted[password]
+	// Only a password params minted for this kind since it last became servable, once, and
+	// within mintTTL.
+	at, minted := ks.minted[password]
 	delete(ks.minted, password)
+	minted = minted && e.now().Sub(at) <= mintTTL
 	e.mu.Unlock()
 	defer func() { _ = conn.Close() }()
 	if !minted {
