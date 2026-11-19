@@ -6,17 +6,12 @@
 package metrics
 
 import (
-	"net"
-	"sync/atomic"
-
 	"github.com/getlantern/geo"
 	semconv "github.com/getlantern/semconv"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 )
-
-const countryLookupWorkers = 4
 
 // goodputBucketBoundaries are the explicit bucket boundaries, in bytes/s, for
 // the proxy.session.goodput histogram: a half-decade log scale from 1 B/s to
@@ -39,12 +34,6 @@ var goodputBucketBoundaries = []float64{
 	1, 3, 10, 30, 100, 300,
 	1_000, 3_000, 10_000, 30_000, 100_000, 300_000,
 	1_000_000, 3_000_000, 10_000_000,
-}
-
-type countryLookupRequest struct {
-	ip      net.IP
-	country *atomic.Value
-	network *atomic.Pointer[clientNetwork]
 }
 
 // clientNetwork is the client's ASN and ISP, published together so a reader
@@ -78,8 +67,7 @@ type metricsManager struct {
 	// the bandit evaluator filters/groups by.
 	track string
 
-	countryLookup  geo.CountryLookup
-	countryLookupC chan countryLookupRequest
+	countryLookup geo.CountryLookup
 
 	// ispLookup resolves the client's ASN and ISP for proxy.io only. It is a
 	// NoLookup unless SetISPLookup installs one before SetupMetricsManager.
@@ -102,8 +90,8 @@ var metrics = &metricsManager{
 }
 
 // SetISPLookup makes proxy.io carry client.asn and client.isp, resolved by
-// lookup alongside the country. It must be called before SetupMetricsManager,
-// which starts the workers that use it.
+// lookup alongside the country. It must be called before the proxy routes
+// any connections.
 //
 // Only proxy.io gets them: every distinct ASN multiplies a series, and the
 // connection, duration and goodput metrics (the goodput histogram has a
@@ -176,10 +164,6 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 		metrics.countryLookup = countryLookup
 	}
 	if _, ok := countryLookup.(geo.NoLookup); !ok {
-		metrics.countryLookupC = make(chan countryLookupRequest, 256)
-		for range countryLookupWorkers {
-			go countryLookupWorker(metrics.countryLookupC, metrics.countryLookup, metrics.ispLookup)
-		}
 		metrics.destinationLookupC = make(chan destinationLookupRequest, 256)
 		for range destinationLookupWorkers {
 			go destinationLookupWorker(metrics.destinationLookupC, metrics.countryLookup)
@@ -187,14 +171,4 @@ func SetupMetricsManager(countryLookup geo.CountryLookup, track string) {
 	}
 
 	metrics.meter = meter
-}
-
-func countryLookupWorker(ch <-chan countryLookupRequest, lookup geo.CountryLookup, ispLookup geo.ISPLookup) {
-	_, noISP := ispLookup.(geo.NoLookup)
-	for req := range ch {
-		req.country.Store(lookup.CountryCode(req.ip))
-		if !noISP {
-			req.network.Store(&clientNetwork{asn: ispLookup.ASN(req.ip), isp: ispLookup.ISP(req.ip)})
-		}
-	}
 }

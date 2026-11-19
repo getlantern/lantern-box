@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/getlantern/geo"
 	semconv "github.com/getlantern/semconv"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/sagernet/sing-box/adapter"
@@ -343,18 +344,25 @@ func metadataToAttributes(metadata adapter.InboundContext) *attributes {
 		},
 	}
 	attrs.country.Store(ccNa)
-	if metrics.countryLookupC != nil {
-		select {
-		case metrics.countryLookupC <- countryLookupRequest{
-			ip:      metadata.Source.IPAddr().IP,
-			country: &attrs.country,
-			network: &attrs.network,
-		}:
-		default:
-		}
+	if _, ok := metrics.countryLookup.(geo.NoLookup); !ok {
+		lookupClient(attrs, metadata.Source.IPAddr().IP)
 	}
 	requestDestinationCountry(attrs, metadata)
 	return attrs
+}
+
+// lookupClient resolves the client's country, ASN and ISP into attrs before
+// the connection carries any bytes. proxy.io labels each report with the
+// country stored when it is counted, so a lookup that lands later counts the
+// connection's first bytes as n/a.
+func lookupClient(attrs *attributes, ip net.IP) {
+	attrs.country.Store(metrics.countryLookup.CountryCode(ip))
+	if _, ok := metrics.ispLookup.(geo.NoLookup); !ok {
+		attrs.network.Store(&clientNetwork{
+			asn: metrics.ispLookup.ASN(ip),
+			isp: metrics.ispLookup.ISP(ip),
+		})
+	}
 }
 
 // RoutedFlow returns nil: L3-forwarded TUN flows carry no stream to wrap
