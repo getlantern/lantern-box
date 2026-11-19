@@ -30,10 +30,11 @@ var ErrUnavailable = errors.New("unbounded exit: built without with_quic")
 // InboundTag is the inbound every direct exit stream and flow is routed as.
 const InboundTag = "unbounded-exit"
 
-// Exit serves a volunteer's direct exits: Hysteria2 over each ICE path broflake hands it, with
-// each stream and flow routed into the current exit box of the session's kind as inbound
-// unbounded-exit. A kind is servable only while the exit is enabled and that kind has a router
-// whose registration hasn't run out, and a session never routes through the other kind's.
+// Exit serves a volunteer's direct exits: Salamander-obfuscated Hysteria2 over each ICE path
+// broflake hands it (see serve), with each stream and flow routed into the current exit box of
+// the session's kind as inbound unbounded-exit. A kind is servable only while the exit is
+// enabled and that kind has a router whose registration hasn't run out, and a session never
+// routes through the other kind's.
 type Exit struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -284,8 +285,12 @@ func isClosed(c chan struct{}) bool {
 
 // serve is clientcore's Serve hook: one Hysteria2 service for one session's path, routing
 // through kind's router alone, for a password params minted for kind in its current stretch of
-// serving. It returns once ctx ends, the path's reads fail, or the kind is
-// revoked, having closed the service and conn.
+// serving. Every packet on the path, both ways, is Salamander-obfuscated under a key derived
+// from the password (SalamanderPassword), so the path never reads as QUIC and its Initial's
+// SNI can't be read. That makes the exit incompatible with a v0.0.239 consumer's stock
+// Hysteria2 client, and the other way round: broflake pairs only peers that both obfuscate.
+// It returns once ctx ends, the path's reads fail, or the kind is revoked, having closed the
+// service and conn.
 func (e *Exit) serve(ctx context.Context, conn net.PacketConn, password string, kind Kind) {
 	e.mu.Lock()
 	ks := &e.kinds[kind]
@@ -330,7 +335,7 @@ func (e *Exit) serve(ctx context.Context, conn net.PacketConn, password string, 
 		return
 	}
 	defer func() { _ = tlsConfig.Close() }()
-	svc, err := hysteria2.NewService[int](serviceOptions(ctx, tlsConfig, &handler{exit: e, kind: kind}))
+	svc, err := hysteria2.NewService[int](serviceOptions(ctx, tlsConfig, &handler{exit: e, kind: kind}, SalamanderPassword(password)))
 	if err != nil {
 		e.logger.WarnContext(ctx, "unbounded exit: service: ", err)
 		return
@@ -348,14 +353,15 @@ func (e *Exit) serve(ctx context.Context, conn net.PacketConn, password string, 
 	_ = svc.Close()
 }
 
-// serviceOptions forces BBR: with IgnoreClientBandwidth and no receive rate the service
-// answers every client RxAuto, so Brutal is never negotiated. No masquerade: a client that
-// fails authentication gets a bare 404. The service gets no logger: it logs the errors its
-// sessions end with, which quote a client's close reason, text the client chose. The handler
-// logs a failure's class instead.
-func serviceOptions(ctx context.Context, tlsConfig tls.ServerConfig, h hysteria2.ServerHandler) hysteria2.ServiceOptions {
+// serviceOptions obfuscates with Salamander under the key salamander, and forces BBR: with
+// IgnoreClientBandwidth and no receive rate the service answers every client RxAuto, so Brutal
+// is never negotiated. No masquerade: a client that fails authentication gets a bare 404. The
+// service gets no logger: it logs the errors its sessions end with, which quote a client's
+// close reason, text the client chose. The handler logs a failure's class instead.
+func serviceOptions(ctx context.Context, tlsConfig tls.ServerConfig, h hysteria2.ServerHandler, salamander string) hysteria2.ServiceOptions {
 	return hysteria2.ServiceOptions{
 		Context:               ctx,
+		SalamanderPassword:    salamander,
 		Logger:                sblog.NewNOPFactory().Logger(),
 		TLSConfig:             tlsConfig,
 		IgnoreClientBandwidth: true,

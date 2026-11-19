@@ -31,8 +31,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 
-	"github.com/getlantern/lantern-box/protocol/internal/blackhole"
 	"github.com/getlantern/lantern-box/protocol/internal/quicjunk"
+	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 )
 
 const (
@@ -55,6 +55,17 @@ var exitPathAddr = &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1}
 // exitPaths holds the direct exit paths broflake hands the outbound, each with its own
 // Hysteria2 client to the volunteer's exit, and dials through the newest live one.
 //
+// A path carries hysteria2x's evasions, always on: one random datagram before the QUIC
+// Initial (pathDialer), and Salamander on every packet after it, both ways, under a key both
+// ends derive from the session password (exit.SalamanderPassword). So a DPI box sees neither a
+// QUIC Initial nor its SNI. A v0.0.239 exit, which speaks stock Hysteria2, can't serve it:
+// broflake pairs only peers that both obfuscate.
+//
+// A path is personal, served under its volunteer's personal policy with no allowlist, or pool,
+// served under the residential allowlist. A dial takes the newest personal path, else the
+// newest pool path, and only for what that pool path's allowlist admits: anything else takes
+// today's relay path rather than a pool exit's refusal.
+//
 // Nothing about a path is ever logged: its pin, password and conn are the session's
 // credentials, and the client's errors can carry the pin.
 type exitPaths struct {
@@ -62,6 +73,8 @@ type exitPaths struct {
 	cancel     context.CancelFunc
 	logger     logger.ContextLogger
 	serverName string
+	// allowlist is what a pool path admits; nil admits nothing.
+	allowlist *poolAllowlist
 	// idleTimeout is the clients' QUIC idle timeout; zero means sing-quic's default.
 	idleTimeout time.Duration
 	now         func() time.Time
@@ -78,6 +91,8 @@ type exitPaths struct {
 type exitPath struct {
 	client *hysteria2.Client
 	conn   *packetConnAsConn
+	// personal is set for a path served under its volunteer's personal policy.
+	personal bool
 	// succeeded is set once the path has carried a dial, which proves its QUIC handshake, pin
 	// and password. After that, an error is the destination's, not the path's.
 	succeeded atomic.Bool
@@ -99,13 +114,14 @@ func (p *exitPath) close() {
 	})
 }
 
-func newExitPaths(ctx context.Context, lg logger.ContextLogger, serverName string) *exitPaths {
+func newExitPaths(ctx context.Context, lg logger.ContextLogger, serverName string, allowlist *poolAllowlist) *exitPaths {
 	ctx, cancel := context.WithCancel(ctx)
 	return &exitPaths{
 		ctx:        ctx,
 		cancel:     cancel,
 		logger:     lg,
 		serverName: serverName,
+		allowlist:  allowlist,
 		now:        time.Now,
 		metrics:    &exitPathMetrics{},
 	}
@@ -115,7 +131,7 @@ func newExitPaths(ctx context.Context, lg logger.ContextLogger, serverName strin
 // builds the path's client; nothing connects until a dial.
 func (p *exitPaths) onExitPath(ep UBClientcore.ExitPath) {
 	conn := &packetConnAsConn{PacketConn: ep.Conn}
-	path := &exitPath{conn: conn}
+	path := &exitPath{conn: conn, personal: ep.Personal}
 	pin, err := base64.StdEncoding.DecodeString(ep.CertPin)
 	if err != nil || len(pin) != sha256.Size {
 		path.close()
@@ -146,11 +162,12 @@ func (p *exitPaths) onExitPath(ep UBClientcore.ExitPath) {
 		Logger:        nop,
 		ServerAddress: M.ParseSocksaddrHostPort(p.serverName, 443),
 		// BBR: a zero send rate never negotiates Brutal.
-		SendBPS:     0,
-		ReceiveBPS:  0,
-		Password:    ep.Password,
-		TLSConfig:   tlsConfig,
-		QUICOptions: qtls.QUICOptions{IdleTimeout: p.idleTimeout},
+		SendBPS:            0,
+		ReceiveBPS:         0,
+		Password:           ep.Password,
+		SalamanderPassword: exit.SalamanderPassword(ep.Password),
+		TLSConfig:          tlsConfig,
+		QUICOptions:        qtls.QUICOptions{IdleTimeout: p.idleTimeout},
 	})
 	if err != nil {
 		path.close()
@@ -180,44 +197,31 @@ func (p *exitPaths) takeExit() bool {
 	return !p.closed && !p.now().Before(p.backoffUntil)
 }
 
-// dial dials destination through the newest live path. It returns errNoExitPath when there is
-// none. TCP to an IP names the host sniffed from the connection instead (sniffedDestination),
-// and QUIC to an IP goes to a black hole (quicToIP).
+// dial dials destination through the newest live path that admits it (see exitPaths), or
+// returns errNoExitPath. TCP to an IP names the host sniffed from the connection instead
+// (sniffedDestination).
 func (p *exitPaths) dial(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		sent := sniffedDestination(ctx, destination)
-		return usePath(p, ctx, func(c *hysteria2.Client) (net.Conn, error) {
+		return usePath(p, ctx, N.NetworkTCP, sent, func(c *hysteria2.Client) (net.Conn, error) {
 			return c.DialConn(ctx, sent)
 		})
 	case N.NetworkUDP:
-		if quicToIP(destination) {
-			if p.newest() == nil {
-				return nil, errNoExitPath
-			}
-			return blackhole.New(destination), nil
+		pc, err := p.listenPacket(ctx, destination)
+		if err != nil {
+			return nil, err
 		}
-		return usePath(p, ctx, func(c *hysteria2.Client) (net.Conn, error) {
-			pc, err := c.ListenPacket(ctx)
-			if err != nil {
-				return nil, err
-			}
-			return bufio.NewBindPacketConn(pc, destination), nil
-		})
+		return bufio.NewBindPacketConn(pc, destination), nil
 	}
 	return nil, errors.New("unbounded: unsupported network for a direct exit")
 }
 
-// listenPacket opens a UDP session through the newest live path, or returns errNoExitPath.
-// QUIC to an IP goes to a black hole, as in dial.
+// listenPacket opens a UDP session to destination, its first, through the newest live path
+// that admits it, or returns errNoExitPath. The exit box checks only a session's first
+// destination and connects the session to it, so that is the one checked here.
 func (p *exitPaths) listenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	if quicToIP(destination) {
-		if p.newest() == nil {
-			return nil, errNoExitPath
-		}
-		return blackhole.New(destination), nil
-	}
-	return usePath(p, ctx, func(c *hysteria2.Client) (net.PacketConn, error) {
+	return usePath(p, ctx, N.NetworkUDP, destination, func(c *hysteria2.Client) (net.PacketConn, error) {
 		return c.ListenPacket(ctx)
 	})
 }
@@ -238,28 +242,22 @@ func sniffedDestination(ctx context.Context, destination M.Socksaddr) M.Socksadd
 	return M.Socksaddr{Fqdn: metadata.Domain, Port: destination.Port}
 }
 
-// quicToIP reports whether UDP to destination is QUIC to an IP, which the volunteer's exit
-// refuses: its allowlist grants UDP 443 only to hostnames, and QUIC carries none we can rely
-// on. A black hole, rather than an error, sends the browser back to TCP, which carries the
-// sniffed host, without a group counting a policy decision as the outbound's failure. With no
-// live path the flow takes today's path, which carries IPs. It applies to a friend's personal
-// exit too, whose policy would admit QUIC to an IP: the consumer can't tell which kind of
-// session it got, and the browser's fall back to TCP costs little.
-func quicToIP(destination M.Socksaddr) bool {
-	return destination.IsIP() && destination.Port == 443
-}
-
-// usePath runs f on the newest live path's client. sing-quic's DialConn and ListenPacket finish
+// usePath runs f on the newest live path's client, the newest personal one if any. A pool
+// path that doesn't admit network to destination ends it with errNoExitPath, so the outbound
+// takes today's path rather than the exit's refusal. sing-quic's DialConn and ListenPacket finish
 // the QUIC handshake and Hysteria2 authentication before they return (only a stream's request
 // waits for its first write), so f succeeding proves the path. An error on a path that never
 // succeeded is the path's: it counts as a failure, and the next path is tried. An error on a
 // path that has succeeded is the destination's, and is returned, unless the path has since
 // died.
-func usePath[T any](p *exitPaths, ctx context.Context, f func(*hysteria2.Client) (T, error)) (T, error) {
+func usePath[T any](p *exitPaths, ctx context.Context, network string, destination M.Socksaddr, f func(*hysteria2.Client) (T, error)) (T, error) {
 	var zero T
 	for {
 		path := p.newest()
 		if path == nil {
+			return zero, errNoExitPath
+		}
+		if !path.personal && !p.allowlist.admits(network, destination) {
 			return zero, errNoExitPath
 		}
 		v, err := f(path.client)
@@ -290,13 +288,19 @@ func usePath[T any](p *exitPaths, ctx context.Context, f func(*hysteria2.Client)
 	}
 }
 
-// newest returns the newest live path, or nil, dropping every dead one.
+// newest returns the newest live personal path, else the newest live path, or nil, dropping
+// every dead one.
 func (p *exitPaths) newest() *exitPath {
 	p.mu.Lock()
 	dead := p.sweepLocked()
 	var path *exitPath
-	if len(p.paths) > 0 {
-		path = p.paths[len(p.paths)-1]
+	for i := len(p.paths) - 1; i >= 0; i-- {
+		if path == nil || p.paths[i].personal {
+			path = p.paths[i]
+		}
+		if path.personal {
+			break
+		}
 	}
 	p.mu.Unlock()
 	closePaths(dead)
@@ -387,11 +391,7 @@ func (d *pathDialer) DialContext(_ context.Context, network string, _ M.Socksadd
 		return nil, errPathDead
 	}
 	// The junk goes first, so the QUIC Initial is never the path's first datagram.
-	junk, err := quicjunk.New()
-	if err == nil {
-		_, err = d.conn.Write(junk)
-	}
-	if err != nil {
+	if err := quicjunk.Write(d.conn); err != nil {
 		_ = d.conn.Close()
 		return nil, errPathDead
 	}

@@ -144,11 +144,7 @@ func (d *junkDialer) DialContext(ctx context.Context, network string, destinatio
 	if err != nil || N.NetworkName(network) != N.NetworkUDP {
 		return conn, err
 	}
-	junk, err := quicjunk.New()
-	if err == nil {
-		_, err = conn.Write(junk)
-	}
-	if err != nil {
+	if err := quicjunk.Write(conn); err != nil {
 		conn.Close()
 		return nil, E.Cause(err, "write pre-initial junk")
 	}

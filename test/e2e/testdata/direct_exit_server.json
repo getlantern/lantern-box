@@ -9,6 +9,7 @@
         "tag": "hosts",
         "predefined": {
           "allowed.test": ["127.0.0.1"],
+          "unlisted.test": ["127.0.0.1"],
           "private.test": ["10.255.255.1"],
           "linklocal.test": ["169.254.255.1"],
           "malware.test": ["127.0.0.1"],

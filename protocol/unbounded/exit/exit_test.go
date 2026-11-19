@@ -36,6 +36,8 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
+	"github.com/getlantern/lantern-box/protocol/internal/quicjunk"
 )
 
 // placeholderConn is a connected UDP socket as clientcore's ICE packet conn: one peer, and a
@@ -207,7 +209,11 @@ func (d oneConnDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketCon
 	return nil, errors.New("not used")
 }
 
-type clientOpts struct{ sendBPS, receiveBPS uint64 }
+type clientOpts struct {
+	sendBPS, receiveBPS uint64
+	// stock leaves Salamander off, as a v0.0.239 consumer's client does.
+	stock bool
+}
 
 func testClient(t *testing.T, conn placeholderConn, pin, password string, opts ...clientOpts) *hysteria2.Client {
 	t.Helper()
@@ -225,15 +231,20 @@ func testClient(t *testing.T, conn placeholderConn, pin, password string, opts .
 	if len(opts) > 0 {
 		o = opts[0]
 	}
+	salamander := SalamanderPassword(password)
+	if o.stock {
+		salamander = ""
+	}
 	c, err := hysteria2.NewClient(hysteria2.ClientOptions{
-		Context:       context.Background(),
-		Dialer:        oneConnDialer{conn},
-		Logger:        lg,
-		ServerAddress: M.SocksaddrFromNet(placeholderAddr),
-		SendBPS:       o.sendBPS,
-		ReceiveBPS:    o.receiveBPS,
-		Password:      password,
-		TLSConfig:     tlsConfig,
+		Context:            context.Background(),
+		Dialer:             oneConnDialer{conn},
+		Logger:             lg,
+		ServerAddress:      M.SocksaddrFromNet(placeholderAddr),
+		SendBPS:            o.sendBPS,
+		ReceiveBPS:         o.receiveBPS,
+		Password:           password,
+		SalamanderPassword: salamander,
+		TLSConfig:          tlsConfig,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.CloseWithError(errors.New("test over")) })
@@ -665,14 +676,15 @@ func TestExitCountsSessionsAndBytes(t *testing.T) {
 }
 
 func TestExitForcesBBR(t *testing.T) {
-	o := serviceOptions(context.Background(), nil, nil)
+	o := serviceOptions(context.Background(), nil, nil, "obfs")
 	assert.True(t, o.IgnoreClientBandwidth)
 	assert.Zero(t, o.ReceiveBPS)
 	assert.Zero(t, o.SendBPS)
 	assert.Equal(t, 2*time.Minute, o.UDPTimeout)
 	assert.Nil(t, o.MasqueradeHandler)
 	assert.Nil(t, o.RealmOptions)
-	assert.Empty(t, o.SalamanderPassword)
+	assert.Equal(t, "obfs", o.SalamanderPassword)
+	assert.Empty(t, o.GeckoPassword)
 
 	// A client that asks for Brutal still connects, on BBR.
 	e := readyExit(t, newEchoRouter(t))
@@ -720,7 +732,8 @@ func TestExitNeverLogsAClientsCloseReason(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// Only the PacketConn methods: quic-go would write to a *net.UDPConn's address.
-	qc, err := quic.Dial(ctx, struct{ net.PacketConn }{uConn}, placeholderAddr, &stdtls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}},
+	obfs := hysteria2.NewSalamanderConn(struct{ net.PacketConn }{uConn}, []byte(SalamanderPassword(password)))
+	qc, err := quic.Dial(ctx, obfs, placeholderAddr, &stdtls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}},
 		&quic.Config{EnableDatagrams: true})
 	require.NoError(t, err)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://hysteria/auth", nil)
@@ -1109,4 +1122,88 @@ func TestExitRechecksAfterTheReadyCheck(t *testing.T) {
 	e.SetEnabled(true)
 	during = func() { e.SetRouter(Pool, nil, time.Time{}, nil) }
 	assert.Nil(t, e.currentRouter(Pool), "the router was cleared during the check")
+}
+
+// Every session is Salamander-obfuscated, so a stock Hysteria2 client, as a v0.0.239
+// consumer's, can't reach it: its Initial de-obfuscates to garbage, which quic-go drops.
+func TestExitRefusesAStockHysteria2Client(t *testing.T) {
+	r := newEchoRouter(t)
+	e := readyExit(t, r)
+	vConn, uConn := pathPair(t)
+	pin, password, _ := e.Options().Params(false)
+	serve(t, e, vConn, password)
+	c := testClient(t, uConn, pin, password, clientOpts{stock: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := c.DialConn(ctx, M.ParseSocksaddr("example.com:80"))
+	assert.Error(t, err)
+	assert.Zero(t, r.count(), "nothing reaches the router")
+}
+
+// serveStock serves a session as a v0.0.239 exit did: Hysteria2 without Salamander.
+func serveStock(t *testing.T, e *Exit, conn net.PacketConn, password string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	tlsConfig, err := tls.NewServer(ctx, sblog.NewNOPFactory().Logger(), option.InboundTLSOptions{
+		Enabled:     true,
+		ALPN:        badoption.Listable[string]{"h3"},
+		Certificate: badoption.Listable[string]{e.cert.certPEM},
+		Key:         badoption.Listable[string]{e.cert.keyPEM},
+	})
+	require.NoError(t, err)
+	require.NoError(t, tlsConfig.Start())
+	t.Cleanup(func() { _ = tlsConfig.Close() })
+	svc, err := hysteria2.NewService[int](serviceOptions(ctx, tlsConfig, &handler{exit: e, kind: Pool}, ""))
+	require.NoError(t, err)
+	svc.UpdateUsers([]int{0}, []string{password})
+	// Only the PacketConn methods, as serve's watchedConn: quic-go would write to a
+	// *net.UDPConn's address.
+	require.NoError(t, svc.Start(struct{ net.PacketConn }{conn}))
+	t.Cleanup(func() { _ = svc.Close() })
+}
+
+// And the other way: an obfuscating client, as the consumer's now is, can't reach a stock
+// service, as a v0.0.239 volunteer's exit is, which a stock client still reaches.
+func TestExitClientCannotReachAStockService(t *testing.T) {
+	r := newEchoRouter(t)
+	e := readyExit(t, r)
+	pin, password, _ := e.Options().Params(false)
+
+	vConn, uConn := pathPair(t)
+	serveStock(t, e, vConn, password)
+	echo(t, testClient(t, uConn, pin, password, clientOpts{stock: true}))
+	require.Equal(t, 1, r.count(), "the stock service works for a stock client")
+
+	vConn, uConn = pathPair(t)
+	serveStock(t, e, vConn, password)
+	c := testClient(t, uConn, pin, password)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := c.DialConn(ctx, M.ParseSocksaddr("example.com:80"))
+	assert.Error(t, err)
+	assert.Equal(t, 1, r.count(), "nothing more reaches the router")
+}
+
+// The consumer writes a random datagram before its Initial (quicjunk). Under Salamander the
+// exit de-obfuscates it to garbage, or passes one of 8 bytes, Salamander's salt length, through
+// as is, and quic-go drops either: the session still comes up.
+func TestExitDropsPreInitialJunk(t *testing.T) {
+	r := newEchoRouter(t)
+	e := readyExit(t, r)
+	vConn, uConn := pathPair(t)
+	pin, password, _ := e.Options().Params(false)
+	serve(t, e, vConn, password)
+	junk := [][]byte{{0xc0, 0, 0, 0, 1, 0, 0, 0}}
+	for range 32 {
+		j, err := quicjunk.New()
+		require.NoError(t, err)
+		junk = append(junk, j)
+	}
+	for _, j := range junk {
+		_, err := uConn.Write(j)
+		require.NoError(t, err)
+	}
+	echo(t, testClient(t, uConn, pin, password))
+	assert.Equal(t, 1, r.count())
 }
