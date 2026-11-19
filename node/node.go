@@ -29,7 +29,9 @@ import (
 	"github.com/sagernet/sing/common/json"
 
 	C "github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/internal/directexit"
 	LO "github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/peerrules"
 	"github.com/getlantern/lantern-box/portforward"
 	"github.com/getlantern/lantern-box/protocol/unbounded"
 	"github.com/getlantern/lantern-box/tracker/peerconn"
@@ -388,6 +390,7 @@ func (n *node) register(ctx context.Context) (*registerResponse, error) {
 		ServePool:              true,
 		RunsUnboundedVolunteer: true,
 		ReportsNetstatedAsync:  true,
+		ServesDirectExits:      true,
 	})
 }
 
@@ -397,10 +400,13 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 	if resp.ServerConfig == "" {
 		return nil, errors.New("register: response has no config")
 	}
-	options, volunteer, err := applyOperatorLimits(ctx, resp.ServerConfig, n.cfg.MaxPeers, n.cfg.BandwidthLimit)
+	boxCtx, options, volunteer, err := applyOperatorLimits(ctx, resp.ServerConfig, n.cfg.MaxPeers, n.cfg.BandwidthLimit)
 	if err != nil {
 		return nil, err
 	}
+	// The volunteer's direct exit stops two rotations after this registration, as RunExit's
+	// does: a rotation lantern-cloud refuses keeps this box, but not its exit, running.
+	boxCtx = directexit.WithValidUntil(boxCtx, time.Now().Add(2*n.rotation))
 	if !volunteer {
 		log.Warn("node: lantern-cloud sent no Unbounded volunteer service, so this node serves only its inbound")
 	}
@@ -409,7 +415,7 @@ func (n *node) launch(ctx context.Context, resp *registerResponse) (*session, er
 	if err := n.checkPort(); err != nil {
 		return nil, err
 	}
-	b, err := n.newBox(ctx, options)
+	b, err := n.newBox(boxCtx, options)
 	if err != nil {
 		if addrInUse(err) && bindsPort(err, n.port) {
 			err = fmt.Errorf("%w: %w", errPortInUse, err)
@@ -527,12 +533,15 @@ func (n *node) deregister(routeID string) {
 }
 
 // applyOperatorLimits sets the operator's limits on the Unbounded volunteer
-// service in options, and reports whether there is one. ctx carries the
-// option registries.
-func applyOperatorLimits(ctx context.Context, options string, maxPeers int, bandwidthLimit string) (string, bool, error) {
+// service in options, and reports whether there is one. It also turns off the
+// volunteer's direct exit unless options carry the rules peerrules checks for
+// one, which are global in the box and so apply to its exit streams too, and
+// returns the context to build the box with, which the volunteer needs to run
+// the exit. ctx carries the option registries.
+func applyOperatorLimits(ctx context.Context, options string, maxPeers int, bandwidthLimit string) (context.Context, string, bool, error) {
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(options))
 	if err != nil {
-		return "", false, fmt.Errorf("parse server config: %w", err)
+		return nil, "", false, fmt.Errorf("parse server config: %w", err)
 	}
 	found := false
 	for _, svc := range opts.Services {
@@ -549,16 +558,26 @@ func applyOperatorLimits(ctx context.Context, options string, maxPeers int, band
 		}
 	}
 	if !found {
-		return options, false, nil
+		return ctx, options, false, nil
+	}
+	boxCtx, stripped := peerrules.CheckDirectExit(ctx, &opts)
+	// The rules aren't logged: they name hosts.
+	if stripped {
+		log.Warn("node: lantern-cloud's rules failed the direct exit check, so this node won't exit Unbounded traffic directly")
 	}
 	b, err := json.MarshalContext(ctx, opts)
 	if err != nil {
-		return "", false, fmt.Errorf("marshal server config: %w", err)
+		return nil, "", false, fmt.Errorf("marshal server config: %w", err)
 	}
-	return string(b), true, nil
+	return boxCtx, string(b), true, nil
 }
 
 func newSingBox(ctx context.Context, options string) (boxService, error) {
+	return startSingBox(ctx, options)
+}
+
+// startSingBox builds and starts a sing-box from options JSON.
+func startSingBox(ctx context.Context, options string) (*sbox.Box, error) {
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(options))
 	if err != nil {
 		return nil, fmt.Errorf("parse server config: %w", err)

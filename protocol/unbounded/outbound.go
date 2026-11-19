@@ -56,6 +56,7 @@ import (
 	lbAdapter "github.com/getlantern/lantern-box/adapter"
 	C "github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/protocol/internal/failureclass"
 )
 
 // RegisterOutbound registers the Unbounded outbound with the given sing-box
@@ -100,6 +101,9 @@ type Outbound struct {
 	// gated on a follow-up that adds a re-pairing API in broflake. See
 	// watchdog.go for the trip heuristic.
 	watchdog *dialWatchdog
+
+	// exits holds the volunteers' direct exits; nil when the outbound takes none.
+	exits *exitPaths
 }
 
 // tlsProvider carries the inputs needed to generate a TLS config lazily at
@@ -205,6 +209,14 @@ func NewOutbound(
 		Version: uot.Version,
 	}
 	o.watchdog = newDialWatchdog()
+	if opts.DirectExit != nil && opts.DirectExit.ServerName != "" {
+		// nil in a build without with_quic.
+		if exits := newExitPaths(ctx, lg, opts.DirectExit.ServerName); exits != nil {
+			o.exits = exits
+			rtcOpt.OnExitPath = exits.onExitPath
+			rtcOpt.TakeExit = exits.takeExit
+		}
+	}
 	return o, nil
 }
 
@@ -264,6 +276,9 @@ func (o *Outbound) Close() error {
 	if o.ui != nil {
 		o.ui.Stop()
 	}
+	if o.exits != nil {
+		o.exits.close()
+	}
 	if o.ql != nil {
 		o.ql.Close()
 	}
@@ -279,6 +294,9 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	md.Outbound = o.Tag()
 	md.Destination = destination
 
+	if conn, ok, err := o.dialExit(ctx, network, destination); ok {
+		return conn, err
+	}
 	if o.dial == nil {
 		return nil, fmt.Errorf("unbounded: not started (DialContext called before Start)")
 	}
@@ -337,6 +355,9 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	md.Outbound = o.Tag()
 	md.Destination = destination
 
+	if pc, ok, err := o.listenExit(ctx, destination); ok {
+		return pc, err
+	}
 	if o.dial == nil {
 		return nil, fmt.Errorf("unbounded: not started (ListenPacket called before Start)")
 	}
@@ -364,6 +385,57 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 		"elapsed", elapsed)
 	o.recordWatchdog(ctx, elapsed)
 	return pc, nil
+}
+
+// errNoExitPath is what exitPaths returns when it has no live direct exit path; the outbound
+// then takes today's path.
+var errNoExitPath = errors.New("unbounded: no direct exit")
+
+// dialExit dials through a direct exit when the outbound has a live one. ok is false when it
+// has none, and the caller takes today's path. Its error is logged by class only: a direct
+// exit client's errors can carry the volunteer's certificate pin.
+func (o *Outbound) dialExit(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, bool, error) {
+	if o.exits == nil {
+		return nil, false, nil
+	}
+	started := time.Now()
+	conn, err := o.exits.dial(ctx, network, destination)
+	if errors.Is(err, errNoExitPath) {
+		return nil, false, nil
+	}
+	o.logExit(ctx, "unbounded dial", network, started, err)
+	return conn, true, err
+}
+
+// listenExit is ListenPacket's dialExit.
+func (o *Outbound) listenExit(ctx context.Context, destination M.Socksaddr) (net.PacketConn, bool, error) {
+	if o.exits == nil {
+		return nil, false, nil
+	}
+	started := time.Now()
+	pc, err := o.exits.listenPacket(ctx, destination)
+	if errors.Is(err, errNoExitPath) {
+		return nil, false, nil
+	}
+	o.logExit(ctx, "unbounded ListenPacket", N.NetworkUDP, started, err)
+	return pc, true, err
+}
+
+// logExit logs a direct exit dial without its destination: the traffic is a stranger's, carried
+// by a volunteer.
+func (o *Outbound) logExit(ctx context.Context, what, network string, started time.Time, err error) {
+	if err != nil {
+		o.logger.ErrorContext(ctx, what+" failed",
+			"network", network,
+			"path", "direct_exit",
+			"elapsed", time.Since(started),
+			"err", failureclass.Of(err))
+		return
+	}
+	o.logger.DebugContext(ctx, what+" ok",
+		"network", network,
+		"path", "direct_exit",
+		"elapsed", time.Since(started))
 }
 
 // ErrNoHelperConnected is returned by a rooms-only (helper) outbound's dials
@@ -425,12 +497,16 @@ func (o *Outbound) HelperPath() (lbAdapter.HelperPathStatus, bool) {
 // and route dials have no deadline: a url-test group that picked this
 // outbound would hang instead of trying its other members. A pool consumer
 // keeps waiting, since the pool eventually provides a peer.
+//
+// A direct exit slot doesn't count: it carries no QUIC, so broflake's
+// no-path guard ignores it too, and a dial gets here only once dialExit
+// found no live exit path. HelperPath still counts it as connected.
 func (o *Outbound) checkHelperConnected() error {
 	if !o.rtcOpt.ConsumerRoomsOnly || o.consumerSlots == nil {
 		return nil
 	}
 	for _, slot := range o.consumerSlots() {
-		if slot.Connected {
+		if slot.Connected && !slot.DirectExit {
 			return nil
 		}
 	}

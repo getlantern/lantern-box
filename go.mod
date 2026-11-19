@@ -33,7 +33,7 @@ replace github.com/sagernet/gvisor => github.com/sagernet/gvisor v0.0.0-20260727
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/getlantern/algeneva v0.0.0-20260731172949-952f13725b7b
-	github.com/getlantern/broflake v0.0.0-20261117033427-62a624d1b849
+	github.com/getlantern/broflake v0.0.0-20261118210841-4875108851cd
 	github.com/getlantern/geo v0.0.0-20241129152027-2fc88c10f91e
 	github.com/getlantern/lantern-water v0.0.0-20260520145825-958775d51395
 	github.com/getlantern/samizdat v0.0.3-0.20261117205503-f66a0285afd9
@@ -50,6 +50,7 @@ require (
 	github.com/pion/transport/v5 v5.1.1
 	github.com/quic-go/quic-go v0.62.0
 	github.com/refraction-networking/water v0.7.1-alpha
+	github.com/sagernet/quic-go v0.61.0-sing-box-mod.7
 	github.com/sagernet/sing v0.9.6-0.20260922013354-87c33f17688f
 	github.com/sagernet/sing-box v1.14.2
 	github.com/sagernet/sing-quic v0.7.1-0.20260924092235-6a3a24d65b99
@@ -304,7 +305,6 @@ require (
 	github.com/sagernet/gvisor v0.0.0-20250325023245-7a9c0f5725fb // indirect
 	github.com/sagernet/netlink v0.0.0-20260814022025-64455d367bbf // indirect
 	github.com/sagernet/nftables v0.3.0-mod.4 // indirect
-	github.com/sagernet/quic-go v0.61.0-sing-box-mod.7 // indirect
 	github.com/sagernet/sing-cloudflared v0.1.3-0.20260706062323-d9787e794aa3 // indirect
 	github.com/sagernet/sing-mux v0.3.8 // indirect
 	github.com/sagernet/sing-openconnect v0.0.0-20260810065514-53aa8058f8df // indirect

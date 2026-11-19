@@ -1,4 +1,6 @@
-package samizdatreverse
+// Package failureclass names why a routed connection failed without naming
+// where it was going.
+package failureclass
 
 import (
 	"context"
@@ -12,9 +14,9 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-// failureClass names why a routed connection failed, from a closed set of
-// values that never include the destination, an address or error text.
-func failureClass(err error) string {
+// Of names why a routed connection failed, from a closed set of values that
+// never include the destination, an address or error text.
+func Of(err error) string {
 	if rule.IsRejected(err) {
 		return "rejected"
 	}

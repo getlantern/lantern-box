@@ -19,9 +19,12 @@ import (
 	"github.com/sagernet/sing-box/common/dialer"
 	sblog "github.com/sagernet/sing-box/log"
 	sbOption "github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/service"
 
 	C "github.com/getlantern/lantern-box/constant"
+	"github.com/getlantern/lantern-box/internal/directexit"
 	"github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 )
 
 // RegisterService registers the Unbounded volunteer with the given sing-box ServiceRegistry. It
@@ -32,6 +35,10 @@ func RegisterService(registry *boxService.Registry) {
 
 const (
 	defaultStatsInterval = time.Minute
+
+	// directExitLifetime is how long a direct exit stays servable in a box whose context
+	// carries no deadline, such as `lantern-box run`'s: as long as the box.
+	directExitLifetime = 100 * 365 * 24 * time.Hour
 
 	// natFailTimeoutKey is the tuning key lantern-cloud's unbounded_volunteer_tuning uses for the
 	// volunteer's NAT fail timeout, as radiance's widget reads it.
@@ -52,6 +59,7 @@ type Volunteer struct {
 	ctx                   context.Context
 	dialerOptions         sbOption.DialerOptions
 	insecureDiscoveryCert bool
+	directExit            bool
 
 	bfOpt         *UBClientcore.BroflakeOptions
 	rtcOpt        *UBClientcore.WebRTCOptions
@@ -63,8 +71,11 @@ type Volunteer struct {
 
 	mu     sync.Mutex
 	ui     *UBClientcore.UIImpl
+	exit   *exit.Exit
 	cancel context.CancelFunc
 	done   chan struct{}
+	// serveExit sets the exit's router, at PostStart; nil once it has, or with no exit.
+	serveExit func()
 }
 
 func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts option.UnboundedVolunteerOptions) (adapter.Service, error) {
@@ -100,6 +111,7 @@ func NewVolunteer(ctx context.Context, lg sblog.ContextLogger, tag string, opts 
 		ctx:                   ctx,
 		dialerOptions:         opts.DialerOptions,
 		insecureDiscoveryCert: opts.InsecureDoNotVerifyDiscoveryCert,
+		directExit:            opts.DirectExit,
 	}
 
 	bfOpt := UBClientcore.NewDefaultBroflakeOptions()
@@ -173,6 +185,16 @@ func (v *Volunteer) Tag() string  { return v.tag }
 // Start runs broflake once the box is up. A volunteer only dials out, so it needs nothing from
 // the box's inbounds or outbounds.
 func (v *Volunteer) Start(stage adapter.StartStage) error {
+	if stage == adapter.StartStatePostStart {
+		v.mu.Lock()
+		serve := v.serveExit
+		v.serveExit = nil
+		v.mu.Unlock()
+		if serve != nil {
+			serve()
+		}
+		return nil
+	}
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -187,11 +209,19 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 		return fmt.Errorf("unbounded volunteer: build signaling dialer: %w", err)
 	}
 	v.rtcOpt.HTTPClient = signalingClient(v.ctx, signalingDialer, v.insecureDiscoveryCert)
+	e := v.startExit()
+	if e != nil {
+		v.rtcOpt.Exit = e.Options()
+	}
 	_, ui, err := UBClientcore.NewBroflake(v.bfOpt, v.rtcOpt, v.egOpt)
 	if err != nil {
+		if e != nil {
+			e.Close()
+			v.rtcOpt.Exit, v.serveExit = nil, nil
+		}
 		return fmt.Errorf("unbounded volunteer: start broflake: %w", err)
 	}
-	v.ui = ui
+	v.ui, v.exit = ui, e
 	v.logger.InfoContext(context.Background(), "unbounded volunteer started",
 		"discovery_srv", v.rtcOpt.DiscoverySrv,
 		"egress_addr", v.egOpt.Addr,
@@ -200,6 +230,7 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 		"target_countries", strings.Join(v.rtcOpt.TargetCountries, ","),
 		"nat_fail_timeout", v.rtcOpt.NATFailTimeout,
 		"bandwidth_limit", v.bandwidth.String(),
+		"direct_exit", e != nil,
 	)
 	if v.statsInterval > 0 {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -211,8 +242,8 @@ func (v *Volunteer) Start(stage adapter.StartStage) error {
 
 func (v *Volunteer) Close() error {
 	v.mu.Lock()
-	ui, cancel, done := v.ui, v.cancel, v.done
-	v.ui, v.cancel, v.done = nil, nil, nil
+	ui, e, cancel, done := v.ui, v.exit, v.cancel, v.done
+	v.ui, v.exit, v.cancel, v.done, v.serveExit = nil, nil, nil, nil, nil
 	v.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -221,7 +252,59 @@ func (v *Volunteer) Close() error {
 	if ui != nil {
 		ui.Stop()
 	}
+	if e != nil {
+		e.Close()
+	}
 	return nil
+}
+
+// startExit makes the volunteer's direct exit, served through its box's router, so the box's
+// route rules apply to every stream and flow. It returns nil when the volunteer has no direct
+// exit, or can't make one, in which case it serves as a relay only. The box must have been
+// built with the context peerrules.CheckDirectExit returned for its options: those rules are
+// all that checks strangers' traffic.
+func (v *Volunteer) startExit() *exit.Exit {
+	if !v.directExit {
+		return nil
+	}
+	if !directexit.Checked(v.ctx) {
+		v.logger.WarnContext(v.ctx, "unbounded volunteer: the box's rules weren't checked for a direct exit, so no direct exit")
+		return nil
+	}
+	router := service.FromContext[adapter.Router](v.ctx)
+	if router == nil {
+		v.logger.WarnContext(v.ctx, "unbounded volunteer: no router in the box, so no direct exit")
+		return nil
+	}
+	e, err := exit.New(v.ctx, v.logger)
+	if err != nil {
+		v.logger.WarnContext(v.ctx, "unbounded volunteer: no direct exit: ", err)
+		return nil
+	}
+	// A node's box carries the end of the registration it was built from, and the exit stops
+	// there. Without one, as for `lantern-box run`, the exit lasts as long as the box.
+	validUntil, ok := directexit.ValidUntil(v.ctx)
+	if !ok {
+		validUntil = time.Now().Add(directExitLifetime)
+	}
+	e.SetEnabled(true)
+	// A node's box carries one policy, and nodes register to serve the pool, so it serves pool
+	// sessions alone: its friends' room sessions, if any, relay to the egress as before rather
+	// than exit through a policy that isn't theirs.
+	// sing-box starts a box with a remote set it couldn't download empty, and a later download
+	// or reload can empty a set too, so the abuse rejects would match nothing. The exit checks
+	// the sets at every stream and session, and relays only while any is empty.
+	ready := func() error { return directexit.AbuseRuleSetsLoaded(router) }
+	if err := ready(); err != nil {
+		v.logger.WarnContext(v.ctx, "unbounded volunteer: no direct exit until its abuse rule sets hold rules: ", err)
+	}
+	// sing-box starts services before its router's PostStart, which is when the route rules
+	// take up their rule sets: until then the abuse rejects match nothing, whatever the sets
+	// hold. The router comes before the services in each stage, so by the volunteer's PostStart
+	// the rules are in place. Until then the exit has no router, so it is unready, and broflake
+	// offers no direct exit.
+	v.serveExit = func() { e.SetRouter(exit.Pool, router, validUntil, ready) }
+	return e
 }
 
 // stunPreflight logs STUN checks that fail. A node that can't reach any STUN server stops taking

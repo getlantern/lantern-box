@@ -44,17 +44,17 @@ type UnboundedOutboundOptions struct {
 	Netstated   string `json:"netstated,omitempty"`
 
 	// WebRTC / signaling parameters.
-	DiscoverySrv      string   `json:"discovery_srv,omitempty"`
-	DiscoveryEndpoint string   `json:"discovery_endpoint,omitempty"`
+	DiscoverySrv      string `json:"discovery_srv,omitempty"`
+	DiscoveryEndpoint string `json:"discovery_endpoint,omitempty"`
 	// InsecureDoNotVerifyDiscoveryCert skips TLS verification of the
 	// signaling server's (freddie's) cert. Only for test/dev against
 	// self-signed rigs; production freddie deployments present a real cert
 	// and this flag must be false. Ignored when a direct transport is
 	// injected on the context (radiance's production path), which carries
 	// its own verification policy.
-	InsecureDoNotVerifyDiscoveryCert bool `json:"insecure_do_not_verify_discovery_cert,omitempty"`
-	GenesisAddr       string   `json:"genesis_addr,omitempty"`
-	NATFailTimeout    int      `json:"nat_fail_timeout,omitempty"` // seconds
+	InsecureDoNotVerifyDiscoveryCert bool   `json:"insecure_do_not_verify_discovery_cert,omitempty"`
+	GenesisAddr                      string `json:"genesis_addr,omitempty"`
+	NATFailTimeout                   int    `json:"nat_fail_timeout,omitempty"` // seconds
 	// Tuning overrides pion's ICE, DTLS and SCTP defaults (broflake's
 	// clientcore.WebRTCTuning), as decimal strings keyed by name: see
 	// protocol/unbounded/tuning.go for the keys. It is a map rather than
@@ -62,13 +62,13 @@ type UnboundedOutboundOptions struct {
 	// ignore keys they don't know. Clients that predate the option reject it
 	// outright, though, so servers must send it only to clients advertising
 	// common.CapabilityUnboundedTuning.
-	Tuning map[string]string `json:"tuning,omitempty"`
-	STUNBatchSize     int      `json:"stun_batch_size,omitempty"`
+	Tuning        map[string]string `json:"tuning,omitempty"`
+	STUNBatchSize int               `json:"stun_batch_size,omitempty"`
 	// STUNServers is the full pool. At batch time the outbound samples
 	// STUNBatchSize entries at random to avoid a static fingerprint.
 	STUNServers       []string `json:"stun_servers,omitempty"`
 	Tag               string   `json:"tag,omitempty"`
-	Patience          int      `json:"patience,omitempty"`     // seconds
+	Patience          int      `json:"patience,omitempty"`      // seconds
 	ErrorBackoff      int      `json:"error_backoff,omitempty"` // seconds
 	ConsumerSessionID string   `json:"consumer_session_id,omitempty"`
 
@@ -78,6 +78,17 @@ type UnboundedOutboundOptions struct {
 	EgressEndpoint       string `json:"egress_endpoint,omitempty"`
 	EgressConnectTimeout int    `json:"egress_connect_timeout,omitempty"` // seconds
 	EgressErrorBackoff   int    `json:"egress_error_backoff,omitempty"`   // seconds
+
+	// DirectExit, when set, lets this outbound take direct exits from volunteers that offer
+	// them. lantern-cloud sets it.
+	DirectExit *UnboundedDirectExitOptions `json:"direct_exit,omitempty"`
+}
+
+// UnboundedDirectExitOptions configures the Hysteria2 client an Unbounded outbound runs over each
+// volunteer's direct exit.
+type UnboundedDirectExitOptions struct {
+	// ServerName is the SNI the Hysteria2 handshake sends. Required.
+	ServerName string `json:"server_name"`
 }
 
 // UnboundedVolunteerOptions configures the volunteer side of Unbounded as a sing-box service: the
@@ -137,4 +148,9 @@ type UnboundedVolunteerOptions struct {
 	// StatsInterval is how often the node logs what it served, in seconds. Zero means 60; a
 	// negative value turns the line off.
 	StatsInterval int `json:"stats_interval,omitempty"`
+
+	// DirectExit lets the volunteer exit censored users' traffic itself, over Hysteria2 on their
+	// WebRTC path, through its box's router and so under its box's route rules. A node drops it
+	// when lantern-cloud's rules fail the abuse check. The volunteer still relays to the egress.
+	DirectExit bool `json:"direct_exit,omitempty"`
 }

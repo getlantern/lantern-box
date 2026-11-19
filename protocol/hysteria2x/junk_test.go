@@ -14,18 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	box "github.com/getlantern/lantern-box"
-	"github.com/getlantern/lantern-box/protocol/hysteria2x"
+	"github.com/getlantern/lantern-box/protocol/internal/quicjunk"
 )
-
-func TestNewJunkShape(t *testing.T) {
-	for range 1000 {
-		junk, err := hysteria2x.NewJunk()
-		require.NoError(t, err)
-		require.GreaterOrEqual(t, len(junk), 8)
-		require.LessOrEqual(t, len(junk), 64)
-		require.NotZero(t, junk[0]&0x80, "long-header bit")
-	}
-}
 
 // TestStockServerNeverAnswersJunk first confirms a stock hysteria2 inbound
 // answers a full-size unknown-version packet, then sends it a few hundred junk
@@ -75,7 +65,7 @@ func TestStockServerNeverAnswersJunk(t *testing.T) {
 		conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
 		require.NoError(t, err)
 		for range 25 {
-			junk, err := hysteria2x.NewJunk()
+			junk, err := quicjunk.New()
 			require.NoError(t, err)
 			_, err = conn.Write(junk)
 			require.NoError(t, err)

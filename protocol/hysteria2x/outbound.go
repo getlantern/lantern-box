@@ -8,8 +8,6 @@ package hysteria2x
 
 import (
 	"context"
-	"crypto/rand"
-	"math/big"
 	"net"
 	"os"
 	"time"
@@ -31,6 +29,7 @@ import (
 
 	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/option"
+	"github.com/getlantern/lantern-box/protocol/internal/quicjunk"
 )
 
 func RegisterOutbound(registry *outbound.Registry) {
@@ -145,7 +144,7 @@ func (d *junkDialer) DialContext(ctx context.Context, network string, destinatio
 	if err != nil || N.NetworkName(network) != N.NetworkUDP {
 		return conn, err
 	}
-	junk, err := newJunk()
+	junk, err := quicjunk.New()
 	if err == nil {
 		_, err = conn.Write(junk)
 	}
@@ -154,26 +153,4 @@ func (d *junkDialer) DialContext(ctx context.Context, network string, destinatio
 		return nil, E.Cause(err, "write pre-initial junk")
 	}
 	return conn, nil
-}
-
-const (
-	minJunkLen = 8
-	maxJunkLen = 64
-)
-
-// newJunk returns 8–64 random bytes with the QUIC long-header bit set. quic-go
-// drops long-header packets under 1200 bytes with an unsupported version before
-// it considers version negotiation, and drops the ~1-in-2^32 all-zero-version
-// case as a Version Negotiation packet, so the server never answers the junk.
-func newJunk() ([]byte, error) {
-	n, err := rand.Int(rand.Reader, big.NewInt(maxJunkLen-minJunkLen+1))
-	if err != nil {
-		return nil, err
-	}
-	junk := make([]byte, minJunkLen+int(n.Int64()))
-	if _, err := rand.Read(junk); err != nil {
-		return nil, err
-	}
-	junk[0] |= 0x80
-	return junk, nil
 }

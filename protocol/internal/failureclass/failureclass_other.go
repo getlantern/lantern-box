@@ -1,6 +1,6 @@
 //go:build !windows
 
-package samizdatreverse
+package failureclass
 
 import "syscall"
 

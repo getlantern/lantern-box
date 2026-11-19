@@ -21,6 +21,8 @@ import (
 
 	"github.com/getlantern/lantern-box/internal/memtune"
 	lbotel "github.com/getlantern/lantern-box/otel"
+	"github.com/getlantern/lantern-box/peerrules"
+	"github.com/getlantern/lantern-box/protocol/unbounded/exit"
 	"github.com/getlantern/lantern-box/tracker/clientcontext"
 	"github.com/getlantern/lantern-box/tracker/datacap"
 	"github.com/getlantern/lantern-box/tracker/metrics"
@@ -65,22 +67,40 @@ var runCmd = &cobra.Command{
 	},
 }
 
-func readConfig(path string) (option.Options, error) {
+// readConfig reads and parses a config, turning off an Unbounded volunteer's direct exit unless
+// the config carries the rules that check strangers' traffic, as node does for lantern-cloud's.
+// The box must be built with the context it returns, which the volunteer needs to run the exit.
+func readConfig(path string) (context.Context, option.Options, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return option.Options{}, fmt.Errorf("reading config file: %w", err)
+		return nil, option.Options{}, fmt.Errorf("reading config file: %w", err)
 	}
 	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, content)
 	if err != nil {
-		return option.Options{}, fmt.Errorf("parsing config file: %w", err)
+		return nil, option.Options{}, fmt.Errorf("parsing config file: %w", err)
 	}
-	return options, nil
+	ctx, stripped := peerrules.CheckDirectExit(globalCtx, &options)
+	if stripped {
+		log.Warn("the config's rules failed the direct exit check, so its Unbounded volunteer won't exit traffic directly")
+	}
+	return ctx, options, nil
+}
+
+// clientContextBounds reads a client-info frame from every routed connection
+// but a volunteer's direct exit streams, which carry a user's own traffic and
+// would stall waiting for one.
+func clientContextBounds() clientcontext.MatchBounds {
+	return clientcontext.MatchBounds{
+		Inbound:        []string{""},
+		Outbound:       []string{""},
+		ExcludeInbound: []string{exit.InboundTag},
+	}
 }
 
 // create builds and starts a box. closeTrackers must be called after the box
 // is closed.
 func create(configPath string, datacapURL string) (instance *box.Box, cancel context.CancelFunc, closeTrackers func(), debugOptions *option.DebugOptions, err error) {
-	options, err := readConfig(configPath)
+	boxCtx, options, err := readConfig(configPath)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("read config: %w", err)
 	}
@@ -88,7 +108,7 @@ func create(configPath string, datacapURL string) (instance *box.Box, cancel con
 		debugOptions = options.Experimental.Debug
 	}
 
-	ctx, cancel := context.WithCancel(globalCtx)
+	ctx, cancel := context.WithCancel(boxCtx)
 	instance, err = box.New(box.Options{
 		Context: ctx,
 		Options: options,
@@ -98,10 +118,7 @@ func create(configPath string, datacapURL string) (instance *box.Box, cancel con
 		return nil, nil, nil, debugOptions, fmt.Errorf("create service: %w", err)
 	}
 
-	clientCtxMgr := clientcontext.NewManager(clientcontext.MatchBounds{
-		Inbound:  []string{""},
-		Outbound: []string{""},
-	}, log.StdLogger())
+	clientCtxMgr := clientcontext.NewManager(clientContextBounds(), log.StdLogger())
 	// Register Manager before trackers that call clientcontext.InfoFromConn,
 	// because it wraps the connection they inspect.
 	instance.Router().AppendTracker(clientCtxMgr)

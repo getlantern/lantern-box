@@ -1,0 +1,381 @@
+//go:build with_quic
+
+package exit
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"net"
+	"sync"
+	"time"
+
+	UBClientcore "github.com/getlantern/broflake/clientcore"
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/tls"
+	sblog "github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-quic/hysteria2"
+	"github.com/sagernet/sing/common/json/badoption"
+	"github.com/sagernet/sing/common/logger"
+
+	"github.com/getlantern/lantern-box/protocol/internal/failureclass"
+	"github.com/getlantern/lantern-box/protocol/internal/uotrouter"
+)
+
+// ErrUnavailable is what New returns in a build without with_quic.
+var ErrUnavailable = errors.New("unbounded exit: built without with_quic")
+
+// InboundTag is the inbound every direct exit stream and flow is routed as.
+const InboundTag = "unbounded-exit"
+
+// Exit serves a volunteer's direct exits: Hysteria2 over each ICE path broflake hands it, with
+// each stream and flow routed into the current exit box of the session's kind as inbound
+// unbounded-exit. A kind is servable only while the exit is enabled and that kind has a router
+// whose registration hasn't run out, and a session never routes through the other kind's.
+type Exit struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	logger logger.ContextLogger
+	cert   *certificate
+	opts   *UBClientcore.ExitOptions
+
+	mu      sync.Mutex
+	closed  bool
+	enabled bool
+	kinds   [2]kindState
+	// routers route each kind's streams and flows: UoT decoding over a router that takes the
+	// kind's current router, and checks its readiness, at the moment it forwards.
+	routers [2]adapter.ConnectionRouterEx
+
+	now     func() time.Time
+	metrics *exitMetrics
+}
+
+// kindState is one kind's exit box router.
+type kindState struct {
+	router adapter.ConnectionRouterEx
+	// ready checks the router can route now: that the box's abuse rule sets hold rules.
+	ready      func() error
+	validUntil time.Time
+	// expiry clears the router at validUntil. gen counts SetRouter calls for the kind, so an
+	// expiry that fires after a later one leaves its router alone.
+	expiry *time.Timer
+	gen    uint64
+	// revoked is closed when the kind stops being servable, ending its sessions. A new
+	// channel replaces it once it is servable again.
+	revoked chan struct{}
+	// minted holds the passwords params minted for the kind since it last became servable, and
+	// when, until serve takes them. Revocation drops them all, so a password minted before a
+	// withdrawal can't be served after the kind is restored.
+	minted map[string]time.Time
+}
+
+// mintTTL bounds how long a minted password waits for its session to be served: broflake serves
+// it once the session's ICE connects, within its NAT fail timeout, seconds after minting.
+const mintTTL = 5 * time.Minute
+
+// New makes an exit, off and with no routers, and its certificate, which it keeps for its life.
+func New(ctx context.Context, lg logger.ContextLogger) (*Exit, error) {
+	cert, err := newCertificate()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	e := &Exit{
+		ctx:     ctx,
+		cancel:  cancel,
+		logger:  lg,
+		cert:    cert,
+		now:     time.Now,
+		metrics: newExitMetrics(),
+	}
+	for k := range e.kinds {
+		e.kinds[k].revoked = make(chan struct{})
+		close(e.kinds[k].revoked)
+		// The UoT router logs each flow's destination at info, so it gets no logger.
+		e.routers[k] = uotrouter.New(kindRouter{e: e, kind: Kind(k)}, sblog.NewNOPFactory().Logger())
+	}
+	e.opts = &UBClientcore.ExitOptions{
+		Ready:  func(personal bool) bool { return e.ready(KindOf(personal)) },
+		Params: func(personal bool) (string, string, bool) { return e.params(KindOf(personal)) },
+		Serve: func(ctx context.Context, conn net.PacketConn, password string, personal bool) {
+			e.serve(ctx, conn, password, KindOf(personal))
+		},
+		OnSession: func(directExit bool) { e.metrics.session(directExit) },
+	}
+	return e, nil
+}
+
+// SetEnabled sets the direct_exit flag. Turning it off also ends running sessions of both kinds.
+func (e *Exit) SetEnabled(on bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.enabled = on
+	e.updateRevokedLocked()
+}
+
+// SetRouter sets kind's current exit box router, how long its registration lasts, and ready,
+// which reports whether the router may route now: whether the box's abuse rule sets hold rules
+// (see directexit.AbuseRuleSetsLoaded). The exit calls ready before routing each stream or flow
+// and before offering or minting each session, and treats the kind as unready while it fails,
+// so a list a download or reload emptied refuses new streams until it holds rules again. A nil
+// ready is never ready. nil r clears the kind and ends its running sessions, as validUntil
+// passing does. The other kind is left as it is. A kind other than Pool and Personal is
+// ignored, and so is any call after Close.
+func (e *Exit) SetRouter(kind Kind, r adapter.ConnectionRouterEx, validUntil time.Time, ready func() error) {
+	if kind != Pool && kind != Personal {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	ks := &e.kinds[kind]
+	ks.gen++
+	if ks.expiry != nil {
+		ks.expiry.Stop()
+		ks.expiry = nil
+	}
+	if r != nil {
+		gen := ks.gen
+		ks.expiry = time.AfterFunc(validUntil.Sub(e.now()), func() { e.expire(kind, gen) })
+	}
+	if r == nil {
+		ready = nil
+	}
+	ks.router, ks.validUntil, ks.ready = r, validUntil, ready
+	e.updateRevokedLocked()
+}
+
+// expire clears kind's router set by its SetRouter call gen, unless a later one replaced it.
+func (e *Exit) expire(kind Kind, gen uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ks := &e.kinds[kind]
+	if ks.gen != gen {
+		return
+	}
+	ks.router, ks.validUntil, ks.expiry, ks.ready = nil, time.Time{}, nil, nil
+	e.updateRevokedLocked()
+}
+
+// Options returns the hooks for broflake's WebRTCOptions.Exit, the same for the exit's life.
+func (e *Exit) Options() *UBClientcore.ExitOptions { return e.opts }
+
+// Close ends running sessions, and the exit serves none after.
+func (e *Exit) Close() {
+	e.mu.Lock()
+	e.closed = true
+	for k := range e.kinds {
+		if ks := &e.kinds[k]; ks.expiry != nil {
+			ks.expiry.Stop()
+			ks.expiry = nil
+		}
+	}
+	e.updateRevokedLocked()
+	e.mu.Unlock()
+	e.cancel()
+}
+
+// updateRevokedLocked closes each kind's revoked when the kind can't serve, and opens a new one
+// when it can again. Expiry revokes through the router it clears.
+func (e *Exit) updateRevokedLocked() {
+	for k := range e.kinds {
+		ks := &e.kinds[k]
+		servable := !e.closed && e.enabled && ks.router != nil
+		select {
+		case <-ks.revoked:
+			if servable {
+				ks.revoked = make(chan struct{})
+			}
+		default:
+			if !servable {
+				close(ks.revoked)
+				ks.minted = nil
+			}
+		}
+	}
+}
+
+func (e *Exit) ready(kind Kind) bool {
+	return e.currentRouter(kind) != nil
+}
+
+// currentRouter is the router to route a stream or flow of a kind's session through, or nil
+// once the exit is off or closed, the kind's registration has run out or been cleared, or its
+// ready check fails. Revocation ends sessions asynchronously, and expiry by timer, so a session
+// can still open streams and flows in the meantime.
+//
+// The ready check runs here, at each stream or flow, rather than on rule set updates: sing-box
+// publishes a set's new rules before it calls its callbacks, so a callback would always act
+// after the fact. A set emptied between this check and the routing still passes the one stream
+// being routed; that window is the residue of checking at the point of use.
+func (e *Exit) currentRouter(kind Kind) adapter.ConnectionRouterEx {
+	// A router set while the check ran is checked in turn, a few times at most.
+	for range 3 {
+		e.mu.Lock()
+		ks := e.kinds[kind]
+		usable := !e.closed && e.enabled && ks.router != nil && e.now().Before(ks.validUntil)
+		e.mu.Unlock()
+		// Outside mu: it takes the rule sets' locks.
+		if !usable || ks.ready == nil || ks.ready() != nil {
+			return nil
+		}
+		// The kind may have changed while the check ran.
+		e.mu.Lock()
+		cur := e.kinds[kind]
+		still := !e.closed && e.enabled && e.now().Before(cur.validUntil)
+		e.mu.Unlock()
+		switch {
+		case cur.gen != ks.gen:
+			continue
+		case !still:
+			return nil
+		}
+		return ks.router
+	}
+	return nil
+}
+
+// params mints a session's credentials for kind, recording the password for serve.
+func (e *Exit) params(kind Kind) (pin, password string, ok bool) {
+	e.mu.Lock()
+	revoked := e.kinds[kind].revoked
+	e.mu.Unlock()
+	if !e.ready(kind) {
+		return "", "", false
+	}
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", "", false
+	}
+	password = base64.RawURLEncoding.EncodeToString(b)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ks := &e.kinds[kind]
+	// Withdrawn, and perhaps restored, since the check: the password would outlive it.
+	if ks.revoked != revoked || isClosed(revoked) {
+		return "", "", false
+	}
+	now := e.now()
+	for pw, at := range ks.minted {
+		if now.Sub(at) > mintTTL {
+			delete(ks.minted, pw)
+		}
+	}
+	if ks.minted == nil {
+		ks.minted = make(map[string]time.Time)
+	}
+	ks.minted[password] = now
+	return e.cert.pin, password, true
+}
+
+func isClosed(c chan struct{}) bool {
+	select {
+	case <-c:
+		return true
+	default:
+		return false
+	}
+}
+
+// serve is clientcore's Serve hook: one Hysteria2 service for one session's path, routing
+// through kind's router alone, for a password params minted for kind in its current stretch of
+// serving. It returns once ctx ends, the path's reads fail, or the kind is
+// revoked, having closed the service and conn.
+func (e *Exit) serve(ctx context.Context, conn net.PacketConn, password string, kind Kind) {
+	e.mu.Lock()
+	ks := &e.kinds[kind]
+	revoked := ks.revoked
+	// Only a password params minted for this kind since it last became servable, once, and
+	// within mintTTL.
+	at, minted := ks.minted[password]
+	delete(ks.minted, password)
+	minted = minted && e.now().Sub(at) <= mintTTL
+	e.mu.Unlock()
+	defer func() { _ = conn.Close() }()
+	if !minted {
+		return
+	}
+	select {
+	case <-revoked:
+		return
+	default:
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(e.ctx, cancel)
+	defer stop()
+	// The path's reads fail once its session ends; watching them ends serve with it.
+	conn = &watchedConn{PacketConn: conn, dead: cancel}
+
+	// The TLS and service errors come from the certificate and constants alone, so they can
+	// be logged whole. Start's could name the path, so it logs only a class.
+	tlsConfig, err := tls.NewServer(ctx, e.logger, option.InboundTLSOptions{
+		Enabled:     true,
+		ALPN:        badoption.Listable[string]{"h3"},
+		Certificate: badoption.Listable[string]{e.cert.certPEM},
+		Key:         badoption.Listable[string]{e.cert.keyPEM},
+	})
+	if err != nil {
+		e.logger.WarnContext(ctx, "unbounded exit: TLS config: ", err)
+		return
+	}
+	if err := tlsConfig.Start(); err != nil {
+		e.logger.WarnContext(ctx, "unbounded exit: TLS start: ", err)
+		return
+	}
+	defer func() { _ = tlsConfig.Close() }()
+	svc, err := hysteria2.NewService[int](serviceOptions(ctx, tlsConfig, &handler{exit: e, kind: kind}))
+	if err != nil {
+		e.logger.WarnContext(ctx, "unbounded exit: service: ", err)
+		return
+	}
+	svc.UpdateUsers([]int{0}, []string{password})
+	if err := svc.Start(conn); err != nil {
+		e.logger.WarnContext(ctx, "unbounded exit: start: ", failureclass.Of(err))
+		_ = svc.Close()
+		return
+	}
+	select {
+	case <-ctx.Done():
+	case <-revoked:
+	}
+	_ = svc.Close()
+}
+
+// serviceOptions forces BBR: with IgnoreClientBandwidth and no receive rate the service
+// answers every client RxAuto, so Brutal is never negotiated. No masquerade: a client that
+// fails authentication gets a bare 404. The service gets no logger: it logs the errors its
+// sessions end with, which quote a client's close reason, text the client chose. The handler
+// logs a failure's class instead.
+func serviceOptions(ctx context.Context, tlsConfig tls.ServerConfig, h hysteria2.ServerHandler) hysteria2.ServiceOptions {
+	return hysteria2.ServiceOptions{
+		Context:               ctx,
+		Logger:                sblog.NewNOPFactory().Logger(),
+		TLSConfig:             tlsConfig,
+		IgnoreClientBandwidth: true,
+		SendBPS:               0,
+		ReceiveBPS:            0,
+		UDPTimeout:            2 * time.Minute,
+		Handler:               h,
+	}
+}
+
+// watchedConn calls dead once a read fails: the ICE session under it has ended.
+type watchedConn struct {
+	net.PacketConn
+	dead func()
+}
+
+func (c *watchedConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(p)
+	if err != nil {
+		c.dead()
+	}
+	return n, addr, err
+}

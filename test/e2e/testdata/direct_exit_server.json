@@ -1,0 +1,85 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "hosts",
+        "tag": "hosts",
+        "predefined": {
+          "allowed.test": ["127.0.0.1"],
+          "private.test": ["10.255.255.1"],
+          "linklocal.test": ["169.254.255.1"],
+          "malware.test": ["127.0.0.1"],
+          "phishing.test": ["127.0.0.1"],
+          "cryptominer.test": ["127.0.0.1"]
+        }
+      }
+    ]
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "default_domain_resolver": "hosts",
+    "rule_set": [
+      {
+        "type": "inline",
+        "tag": "geosite-malware",
+        "rules": [{ "domain": ["malware.test"] }]
+      },
+      {
+        "type": "inline",
+        "tag": "geoip-malware",
+        "rules": [{ "ip_cidr": ["192.0.2.66/32"] }]
+      },
+      {
+        "type": "inline",
+        "tag": "geosite-phishing",
+        "rules": [{ "domain": ["phishing.test"] }]
+      },
+      {
+        "type": "inline",
+        "tag": "geosite-cryptominers",
+        "rules": [{ "domain": ["cryptominer.test"] }]
+      }
+    ],
+    "rules": [
+      {
+        "action": "resolve",
+        "server": "hosts"
+      },
+      {
+        "rule_set": ["geosite-malware", "geoip-malware", "geosite-phishing", "geosite-cryptominers"],
+        "action": "reject"
+      },
+      {
+        "ip_cidr": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+        "action": "reject"
+      },
+      {
+        "port": [25, 465, 587],
+        "action": "reject"
+      },
+      {
+        "ip_cidr": ["127.0.0.1/32"],
+        "action": "route",
+        "outbound": "direct",
+        "udp_connect": true
+      },
+      {
+        "ip_is_private": true,
+        "action": "reject"
+      },
+      {
+        "action": "route",
+        "outbound": "direct",
+        "udp_connect": true
+      }
+    ]
+  }
+}

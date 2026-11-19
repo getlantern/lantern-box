@@ -95,3 +95,18 @@ func TestCheckHelperConnected_AnyConnectedSlot(t *testing.T) {
 	o.consumerSlots = func() []UBClientcore.ConsumerSlot { return nil }
 	assert.ErrorIs(t, o.checkHelperConnected(), ErrNoHelperConnected)
 }
+
+// A direct exit slot carries no QUIC, so broflake's no-path guard ignores it. A dial that found
+// no live exit path and falls to the QUIC path must fail at once when a direct exit is the only
+// connected slot, rather than wait for a peer.
+func TestCheckHelperConnected_IgnoresDirectExitSlots(t *testing.T) {
+	o := newTestOutbound(t, context.Background(), "helper-0123456789ab")
+	o.consumerSlots = func() []UBClientcore.ConsumerSlot {
+		return []UBClientcore.ConsumerSlot{{WorkerIdx: 0, Connected: true, DirectExit: true}, {WorkerIdx: 1}}
+	}
+	assert.ErrorIs(t, o.checkHelperConnected(), ErrNoHelperConnected)
+	o.consumerSlots = func() []UBClientcore.ConsumerSlot {
+		return []UBClientcore.ConsumerSlot{{WorkerIdx: 0, Connected: true, DirectExit: true}, {WorkerIdx: 1, Connected: true}}
+	}
+	assert.NoError(t, o.checkHelperConnected())
+}
