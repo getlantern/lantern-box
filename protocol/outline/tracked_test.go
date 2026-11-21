@@ -105,3 +105,27 @@ func TestPacketDialerOverTrackedConnections(t *testing.T) {
 	require.NoError(t, conn.Close())
 	require.Zero(t, manager.Count())
 }
+
+// closeCountingConn is a connection with no TCP socket under it, as an
+// outbound detour could return. It counts Close calls.
+type closeCountingConn struct {
+	net.Conn
+	closed int
+}
+
+func (c *closeCountingConn) Close() error {
+	c.closed++
+	return c.Conn.Close()
+}
+
+// TestStreamConnClosesNonTCP checks that a connection the stream dialer can't
+// use is closed, since the caller gets only the error.
+func TestStreamConnClosesNonTCP(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	conn := &closeCountingConn{Conn: a}
+	got, err := newStreamConn(conn)
+	require.Error(t, err)
+	require.Nil(t, got)
+	require.Equal(t, 1, conn.closed)
+}
