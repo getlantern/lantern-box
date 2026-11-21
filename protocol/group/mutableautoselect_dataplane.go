@@ -24,13 +24,14 @@ const defaultDataPlaneResetQuiet = 5 * time.Second
 const defaultFirstResponseTimeout = 10 * time.Second
 
 // dataPlaneStallMinUnanswered is how many bytes a connection must have
-// written since its last read for going quiet to count as a stall. An idle keep-alive connection's last write is a single
-// small frame, such as an HTTP/2 WINDOW_UPDATE or PING ack, about 35-60 bytes
-// in a TLS record. A browser's new connection blocked after its handshake
-// leaves more unanswered: the HTTP/2 preface, settings and first request run
-// past this. Under it, and so not charged: a single small request on an
-// established connection that has since died, or a client whose TLS Finished
-// and first request are both small.
+// written since its last read for going quiet to count as a stall. An idle
+// keep-alive connection's last write is a single small frame, such as an
+// HTTP/2 WINDOW_UPDATE or PING ack, about 35-60 bytes in a TLS record. A
+// browser's new connection blocked after its handshake leaves more
+// unanswered: the HTTP/2 preface, settings and first request run past this.
+// Under it, and so not charged: a single small request on an established
+// connection that has since died, or a client whose TLS Finished and first
+// request are both small.
 const dataPlaneStallMinUnanswered = 256
 
 type dataPlaneHooks struct {
