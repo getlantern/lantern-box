@@ -125,6 +125,53 @@ func TestOutlineQUICPreludeHandshake(t *testing.T) {
 	}
 }
 
+// TestHedgeOutlineQUIC completes a QUIC handshake through a hedge whose First
+// is the outline outbound with quicprelude, as radiance builds it, inside a
+// running box whose dialers track connections. Then blocks, so the handshake
+// can only complete over First. Like TestOutlineQUICPreludeHandshake, it
+// drives the outbound's ListenPacket directly: sing's SOCKS5 UDP server races
+// between its read and write paths under -race.
+func TestHedgeOutlineQUIC(t *testing.T) {
+	serverCtx := box.BaseContext()
+	serverPort := freeUDPPort(t)
+	startBox(t, serverCtx, mustOptions(serverCtx, t, fmt.Sprintf(`{
+		"log": {"level": "error"},
+		"inbounds": [{"type": "hysteria2", "listen": "127.0.0.1", "listen_port": %d,
+			"users": [{"password": "pw"}], "tls": {"enabled": true, "insecure": true}}],
+		"outbounds": [{"type": "direct"}]
+	}`, serverPort)))
+	clientCtx := box.BaseContext()
+	client, err := sbox.New(sbox.Options{Context: clientCtx, Options: mustOptions(clientCtx, t, `{
+		"log": {"level": "error"},
+		"outbounds": [
+			{"type": "hedge", "tag": "smart", "first": "proxyless", "then": "blocked", "commit_timeout": "2s"},
+			{"type": "outline", "tag": "proxyless", "domains": ["example.com"], "udp": "quicprelude:count=1"},
+			{"type": "block", "tag": "blocked"}
+		]
+	}`)})
+	require.NoError(t, err)
+	require.NoError(t, client.Start())
+	t.Cleanup(func() { client.Close() })
+	out, ok := client.Outbound().Outbound("smart")
+	require.True(t, ok)
+
+	server := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(serverPort)}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pc, err := out.ListenPacket(ctx, M.SocksaddrFromNet(server))
+	require.NoError(t, err)
+	defer pc.Close()
+	conn, err := quic.DialEarly(ctx, pc, server,
+		&tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}, &quic.Config{})
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
+	select {
+	case <-conn.HandshakeComplete():
+	case <-ctx.Done():
+		t.Fatal("QUIC handshake did not complete through the hedge's outline First")
+	}
+}
+
 // TestOutlineUDPToDomain sends UDP to a domain-name destination through the
 // outline outbound, as a SOCKS5 or HTTP inbound does: the outbound must
 // resolve it rather than write to an empty address.
