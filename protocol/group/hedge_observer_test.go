@@ -71,14 +71,15 @@ func TestHedgeObserverSeesCommitToFirstOnce(t *testing.T) {
 			c.Close()
 		}
 	}()
+	// The deadline ends any other hang with an error, so only a deadlock,
+	// which no deadline can end, reaches the timeout below.
+	deadline := time.Now().Add(3 * time.Second)
+	require.NoError(t, c.SetDeadline(deadline))
 	// The observer is the host's code, so it may call back into the
 	// connection: SetDeadline takes the leg's mutex, and would deadlock if
 	// the report were made while holding it.
-	obs.onCommit = func() { _ = c.SetDeadline(time.Now().Add(5 * time.Second)) }
+	obs.onCommit = func() { _ = c.SetDeadline(deadline) }
 	require.Empty(t, obs.committed(), "nothing is reported before First replies")
-	// The deadline ends any other hang with an error, so only a deadlock,
-	// which no deadline can end, reaches the timeout below.
-	require.NoError(t, c.SetDeadline(time.Now().Add(3*time.Second)))
 	type result struct {
 		got []string
 		err error
