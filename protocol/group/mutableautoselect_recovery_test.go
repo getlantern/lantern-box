@@ -305,6 +305,11 @@ func TestDialContext_UnreachableReplacementKeepsSelection(t *testing.T) {
 		out, _, err := s.selectOutbound("tcp", "")
 		require.NoError(t, err)
 		require.Equal(t, "a", out.Tag(), "nothing is released to a replacement whose probe fails")
+		// The first selection probes a before deciding; the next decides.
+		synctest.Wait()
+		out, _, err = s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		require.Equal(t, "a", out.Tag())
 		h, _ := s.peekHistoryLocked("a")
 		require.Zero(t, h.streakCount(streakTCP, time.Now(), s.hist.userFailureWindow), "with nothing reachable, the streak is not a's")
 	})
@@ -1717,4 +1722,114 @@ func TestDialContext_DialContextLivesUntilClose(t *testing.T) {
 	require.NoError(t, dialCtx.Err(), "a conn tied to its dial context stays usable while open")
 	conn.Close()
 	assert.ErrorIs(t, dialCtx.Err(), context.Canceled, "and the context is released once it closes")
+}
+
+func TestStreak_StaleSelectionProbeIsNoOutage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, members := newStreakTestMUR(t)
+		ob, _ := s.members.Load("b")
+		ob.(*mockOutbound).dial = func(context.Context) (net.Conn, error) { return nil, errors.New("probe failed") }
+		requestTestProbes(s, []string{"a"}, probeForced)
+		synctest.Wait()
+		s.access.Lock()
+		stale := s.probeMembers["a"].outcome.sequence
+		s.access.Unlock()
+		unansweredExchange(t, s, members, false, 3*time.Second)
+		unansweredExchange(t, s, members, false, 3*time.Second)
+		_, _, err := s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		// The first selection probes a, whose earlier pass is stale; the
+		// next decides on that fresh pass.
+		synctest.Wait()
+		out, _, err := s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		require.Equal(t, "a", out.Tag(), "with no replacement reachable, the selection stays")
+		s.access.Lock()
+		defer s.access.Unlock()
+		require.Greater(t, s.probeMembers["a"].outcome.sequence, stale, "a was probed afresh")
+		require.True(t, s.probeMembers["a"].outcome.success)
+		assert.False(t, s.outageSuspectedLocked(), "its fresh pass shows the device's network works")
+	})
+}
+
+func TestDataPlanePacket_CreditsNewSourcePastTheLimit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var got []string
+		c := newScriptedPacketConn()
+		d := newDataPlanePacket(c, time.Hour, 1<<20, dataPlaneHooks{
+			onResponse: func(_ time.Time, dest string) { got = append(got, dest) },
+		})
+		d.unansweredAfter = defaultUDPUnansweredAfter
+		d.unansweredWhileOpen = true
+		defer d.Close()
+		reply := func(i int) {
+			c.replies <- scriptedDatagram{b: []byte("r"), from: &net.UDPAddr{IP: net.IPv4(192, 0, 2, byte(i)), Port: 53}}
+			d.ReadFrom(make([]byte, 64))
+		}
+		for i := range maxUDPAnsweredDestinations {
+			reply(i + 1)
+		}
+		require.Len(t, got, maxUDPAnsweredDestinations, "each of the first sources is passed on at once")
+		reply(65)
+		require.Len(t, got, maxUDPAnsweredDestinations, "past the limit, a new source waits for the once-a-second pass")
+		time.Sleep(time.Second)
+		reply(65)
+		reply(66)
+		assert.Equal(t, []string{"192.0.2.65:53"}, got[maxUDPAnsweredDestinations:], "then it is passed on, one source a second")
+	})
+}
+
+// expiredUnseenCtx reports its deadline through Err from at on, before its
+// Done channel would close, as a context whose deadline passed at the same
+// instant as another timer may.
+type expiredUnseenCtx struct {
+	context.Context
+	at time.Time
+}
+
+func (c expiredUnseenCtx) Done() <-chan struct{} { return nil }
+
+func (c expiredUnseenCtx) Err() error {
+	if !time.Now().Before(c.at) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+func TestDialContext_DeadlineAsWaitEndsDialsNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, members := newStreakTestMUR(t)
+		ob, _ := s.members.Load("b")
+		ob.(*mockOutbound).dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(5 * time.Second), nil }
+		unansweredExchange(t, s, members, false, 3*time.Second)
+		unansweredExchange(t, s, members, false, 3*time.Second)
+		last := members["a"]
+		ctx := expiredUnseenCtx{Context: context.Background(), at: time.Now().Add(time.Second)}
+		_, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Same(t, last, members["a"], "no member is dialed with a context that ended during the wait")
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+	})
+}
+
+func TestStreak_UDPOutageIsSuspected(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s.stickyTag.udp.Store("a")
+		for _, tag := range []string{"a", "b"} {
+			obs[tag].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("network down") }
+		}
+		generation := s.networkGeneration.Load()
+		s.noteUserResponse("a", generation, "udp", "dns:53", time.Now(), time.Now())
+		time.Sleep(time.Second)
+		for range 2 {
+			s.noteUnanswered("a", generation, "udp", "dns:53", time.Now(), time.Now())
+			time.Sleep(2 * time.Second)
+		}
+		synctest.Wait()
+		s.access.Lock()
+		defer s.access.Unlock()
+		assert.True(t, s.outageSuspectedLocked(), "with the selection's own probe failing too, nothing is reachable")
+	})
 }

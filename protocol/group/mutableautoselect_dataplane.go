@@ -456,8 +456,9 @@ func (w *dataPlaneWatchdog) cancelDatagramWait(started datagramWait) {
 // source, falling back to the destination waited on when source is unknown.
 // A reply credits its destination only if it comes back addressed as it was
 // sent, as sing-box's NAT-wrapped conns are; otherwise detection for that
-// destination stays quiet rather than misfiring. The first reply from each
-// source is passed on; later ones at most once a second.
+// destination stays quiet rather than misfiring. The first reply from each of
+// up to maxUDPAnsweredDestinations sources is passed on; others at most once
+// a second.
 func (w *dataPlaneWatchdog) noteDatagramReceived(at time.Time, source M.Socksaddr) (dest string, notify bool) {
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
@@ -469,6 +470,8 @@ func (w *dataPlaneWatchdog) noteDatagramReceived(at time.Time, source M.Socksadd
 	// unansweredAfter exceeds this limit, so a reply after an unanswered
 	// report is always passed on, ending the streak it fed.
 	notify = w.lastAnswerNotify.IsZero() || at.Sub(w.lastAnswerNotify) >= time.Second
+	// Past the limit, as on a peer-to-peer socket, new sources share the
+	// once-a-second pass, which bounds the group lock taken per handle.
 	if _, seen := w.notifiedSources[dest]; !seen && dest != "" && len(w.notifiedSources) < maxUDPAnsweredDestinations {
 		if w.notifiedSources == nil {
 			w.notifiedSources = make(map[string]struct{})

@@ -996,10 +996,10 @@ func (s *MutableAutoSelect) streakReleaseAllowedLocked(network, sticky string) b
 // in pool whose probe, completed no earlier than since, passed. It requests
 // probes of the others, so a later call may find one. A member that can't be
 // probed counts as reachable, so a group without probing still releases.
-// When every member's fresh probe failed, sticky's streak is cleared instead
-// of walking the pool, and unless sticky's own probe passed since, nothing is
-// reachable, as in an outage of the device's own network. Caller must hold
-// s.access.
+// When every member's fresh probe failed, sticky is probed too unless its
+// result is fresh; then sticky's streak is cleared instead of walking the
+// pool, and if sticky's probe failed as well, nothing is reachable, as in an
+// outage of the device's own network. Caller must hold s.access.
 func (s *MutableAutoSelect) streakReplacementLocked(pool []rankedCandidate, network, sticky string, since time.Time) (replacement rankedCandidate, ok, pending bool) {
 	var requested []string
 	failed := 0
@@ -1024,11 +1024,18 @@ func (s *MutableAutoSelect) streakReplacementLocked(pool []rankedCandidate, netw
 		s.requestProbesLocked(requested, probeForced, false)
 		s.dispatchProbesLocked()
 	} else if failed > 0 {
+		own := s.probeMembers[sticky]
+		fresh := own != nil && own.outcome != nil && !own.outcome.completed.Before(since) && s.outcomeCurrentLocked(sticky, own.outcome)
+		if !fresh && own != nil && probe.ValidateURL(s.probeURLForLocked(sticky)) == nil {
+			s.requestProbesLocked([]string{sticky}, probeForced, false)
+			s.dispatchProbesLocked()
+			return rankedCandidate{}, false, true
+		}
 		if h, ok := s.peekHistoryLocked(sticky); ok {
 			h.clearStreak(streakNetFor(network))
 		}
 		s.logger.Info(network, " consecutive failures on ", sticky, " kept: no other member reachable")
-		if !s.passedSinceLocked(sticky, since) {
+		if fresh && !own.outcome.success {
 			s.suspectOutageLocked(since)
 		}
 	}
@@ -1091,8 +1098,8 @@ const streakProbeWait = 2 * time.Second
 // awaitStreakReplacement delays a dial while network's selection is at the
 // consecutive-failure limit and the probes deciding its replacement are still
 // running, for at most streakProbeWait. A dial sent to the failing selection
-// meanwhile would most likely fail too. It returns ctx's error if ctx ended
-// while waiting.
+// meanwhile would most likely fail too. It returns ctx's error if ctx has
+// ended by the time a wait is over.
 func (s *MutableAutoSelect) awaitStreakReplacement(ctx context.Context, network string) error {
 	var timeout <-chan time.Time
 	for {
@@ -1100,6 +1107,9 @@ func (s *MutableAutoSelect) awaitStreakReplacement(ctx context.Context, network 
 		pending, changed := s.startStreakReplacementLocked(network), s.probeChanged
 		s.access.Unlock()
 		if !pending {
+			if timeout != nil {
+				return ctx.Err()
+			}
 			return nil
 		}
 		if timeout == nil {
@@ -1110,7 +1120,7 @@ func (s *MutableAutoSelect) awaitStreakReplacement(ctx context.Context, network 
 		select {
 		case <-changed:
 		case <-timeout:
-			return nil
+			return ctx.Err()
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-s.ctx.Done():
