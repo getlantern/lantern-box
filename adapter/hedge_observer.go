@@ -18,14 +18,15 @@ import "context"
 //
 // The report is made before the read that commits the connection returns.
 // When several goroutines read the connection, another reader can return
-// First's bytes before the report arrives. A reply read after the connection
-// closed isn't reported, but one that commits just before the close can be
-// reported after Close returns.
+// First's bytes before the report arrives. A reply that commits after the
+// connection closed isn't reported, but one that commits just before the
+// close can be reported after Close returns.
 //
-// Connections that go to Then are never reported, and neither is one that
-// stays on First but closes before it reads a reply from First, such as a
-// plaintext request that is never answered, so a host counting First's
-// traffic undercounts it slightly.
+// Only connections that commit to First are reported. Not reported: those
+// that go to Then; those that close before a reply from First commits them,
+// such as a plaintext request that is never answered; and those whose move
+// to Then failed. Some of their bytes may have gone through First, so a host
+// counting First's traffic undercounts it slightly.
 //
 // It is called on the connection's data path, so it must be fast and must
 // not block.

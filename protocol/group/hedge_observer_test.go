@@ -76,25 +76,33 @@ func TestHedgeObserverSeesCommitToFirstOnce(t *testing.T) {
 	// the report were made while holding it.
 	obs.onCommit = func() { _ = c.SetDeadline(time.Now().Add(5 * time.Second)) }
 	require.Empty(t, obs.committed(), "nothing is reported before First replies")
-	replies := make(chan []string, 1)
+	// The deadline ends any other hang with an error, so only a deadlock,
+	// which no deadline can end, reaches the timeout below.
+	require.NoError(t, c.SetDeadline(time.Now().Add(3*time.Second)))
+	type result struct {
+		got []string
+		err error
+	}
+	results := make(chan result, 1)
 	go func() {
-		var got []string
+		var r result
 		buf := make([]byte, 64)
 		for _, req := range []string{"hello", "again"} {
-			if _, err := c.Write([]byte(req)); err != nil {
+			if _, r.err = c.Write([]byte(req)); r.err != nil {
 				break
 			}
-			n, err := c.Read(buf)
-			if err != nil {
+			var n int
+			if n, r.err = c.Read(buf); r.err != nil {
 				break
 			}
-			got = append(got, string(buf[:n]))
+			r.got = append(r.got, string(buf[:n]))
 		}
-		replies <- got
+		results <- r
 	}()
 	select {
-	case got := <-replies:
-		require.Equal(t, []string{"first:hello", "first:again"}, got)
+	case r := <-results:
+		require.NoError(t, r.err)
+		require.Equal(t, []string{"first:hello", "first:again"}, r.got)
 	case <-time.After(5 * time.Second):
 		deadlocked = true
 		t.Fatal("the read that commits hung: the observer must be called without the leg's mutex")
@@ -102,6 +110,20 @@ func TestHedgeObserverSeesCommitToFirstOnce(t *testing.T) {
 	// A second reader that started before the first reply also commits.
 	require.True(t, c.(*hedgeStream).commit(c.(*hedgeStream).releaseLocked))
 	require.Equal(t, []string{"conn-1 hedge first"}, obs.committed(), "one report, with the dial's context and the tags")
+}
+
+// A reply that races a move is discarded, so it must not be reported either.
+func TestHedgeObserverIgnoresAReplyRacingAMove(t *testing.T) {
+	f, obs := newObservedHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")})
+	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
+	require.NoError(t, err)
+	defer c.Close()
+	s := c.(*hedgeStream)
+	s.mu.Lock()
+	s.moving = true
+	s.mu.Unlock()
+	require.False(t, s.commit(s.releaseLocked))
+	require.Empty(t, obs.committed())
 }
 
 func TestHedgeObserverIgnoresAReplyRacingClose(t *testing.T) {
