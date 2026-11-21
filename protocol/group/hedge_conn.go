@@ -252,6 +252,10 @@ func (l *hedgeLeg) commit(release func()) bool {
 	l.stopCommitLocked()
 	release()
 	l.mu.Unlock()
+	// Outside mu: the observer is the host's code.
+	if first && l.h.observer != nil {
+		l.h.observer.FirstCommitted(l.ctx)
+	}
 	return true
 }
 
