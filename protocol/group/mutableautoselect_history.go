@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	N "github.com/sagernet/sing/common/network"
+
 	"github.com/getlantern/lantern-box/adapter"
 )
 
@@ -25,6 +27,24 @@ const (
 	// the user from a fast member onto a much slower one should need
 	// more evidence than switching between two similar-latency members.
 	switchPenaltyAltFactor = 3
+	// consecutiveUserFailureLimit soft-demotes a member, and releases it as
+	// the selection, once its user traffic fails this many times in a row:
+	// each failure on a conn opened after the previous one, with no conn
+	// opened since then answering.
+	consecutiveUserFailureLimit = 2
+	// streakSwitchCooldown spaces releases for consecutive failures on one
+	// network. Two failures in a row also happen by chance on a member that
+	// mostly works, and releasing on each such pair walks the selection
+	// across working members; a member that hasn't answered since the last
+	// release is released at once, as a broken pick.
+	streakSwitchCooldown = 5 * time.Minute
+	// udpRetryWindow bounds the gap between the starts of consecutive failed
+	// UDP exchanges: an app recovering from a dead relay retries within
+	// seconds (a resolver's 5s timeout, WireGuard's 5s handshake retry),
+	// while a one-way periodic sender, like a WireGuard client's keepalive
+	// that its peer never answers, typically sends every 10s or more on a
+	// working relay.
+	udpRetryWindow = 7 * time.Second
 )
 
 type historyParams struct {
@@ -61,9 +81,20 @@ type localHistory struct {
 	lastSuccessDelayMs  uint32
 	lastOutcomeAt       time.Time
 	consecutiveFailures uint32
-	userFailures        []adapter.UserFailure
+	// failureTimes holds when the latest of consecutiveFailures happened,
+	// up to maxFailureTimes; failures restored from storage have none.
+	// In-memory only.
+	failureTimes []time.Time
+	userFailures []adapter.UserFailure
 	// In-memory only; zero means no recovery gate.
 	recoveryGateStartedAt time.Time
+	// streaks holds each network's consecutive user-traffic failures.
+	// In-memory only.
+	streaks [2]failureStreak
+	// udpAnswered maps a UDP destination to when a handle to it last
+	// answered through this member, keeping the most recent
+	// maxUDPAnsweredDestinations. In-memory only.
+	udpAnswered map[string]time.Time
 }
 
 func newLocalHistory() *localHistory { return &localHistory{} }
@@ -84,7 +115,7 @@ func (h *localHistory) recordProbeSuccess(delayMs uint32, now time.Time) {
 	defer h.mu.Unlock()
 	h.lastSuccessDelayMs = delayMs
 	h.lastOutcomeAt = now
-	h.consecutiveFailures = 0
+	h.consecutiveFailures, h.failureTimes = 0, h.failureTimes[:0]
 	if !h.recoveryGateStartedAt.IsZero() && now.Sub(h.recoveryGateStartedAt) >= recoveryGateMinDuration {
 		h.recoveryGateStartedAt = time.Time{}
 	}
@@ -96,8 +127,43 @@ func (h *localHistory) recordProbeSuccess(delayMs uint32, now time.Time) {
 func (h *localHistory) recordProbeFailure(now time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.failureTimes = append(h.failureTimes, now)
+	if len(h.failureTimes) > maxFailureTimes {
+		h.failureTimes = h.failureTimes[1:]
+	}
 	h.consecutiveFailures++
 	h.lastOutcomeAt = now
+}
+
+// recordForgivenProbeFailure records a failed probe's time without counting
+// it, for a failure blamed on the device's own network.
+func (h *localHistory) recordForgivenProbeFailure(now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lastOutcomeAt = now
+}
+
+// maxFailureTimes bounds the failure times kept for forgiveness.
+const maxFailureTimes = 8
+
+// forgiveProbeFailures uncounts the consecutive probe failures blamed on the
+// device's own network: those no earlier than since. Earlier ones stay,
+// since its member was failing, or unlucky, before. It reports whether any
+// were uncounted.
+func (h *localHistory) forgiveProbeFailures(since time.Time) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	before := h.consecutiveFailures
+	kept := h.failureTimes[:0]
+	for _, t := range h.failureTimes {
+		if t.Before(since) {
+			kept = append(kept, t)
+		} else if h.consecutiveFailures > 0 {
+			h.consecutiveFailures--
+		}
+	}
+	h.failureTimes = kept
+	return h.consecutiveFailures != before
 }
 
 func (h *localHistory) startRecoveryGate(now time.Time) {
@@ -106,9 +172,11 @@ func (h *localHistory) startRecoveryGate(now time.Time) {
 	h.recoveryGateStartedAt = now
 }
 
-// addUserFailure appends the failure and prunes entries older than window
-// in place. A data-plane stall and a dial error each count as one failure;
-// hard demotion requires three in the window.
+// addUserFailure records the failure of a conn on network opened at opened
+// in that network's failure streak, then appends it to the window and prunes
+// entries older than window in place. A data-plane stall and a dial error each
+// count as one failure; hard demotion requires three in the window. A zero
+// opened means the conn's age is unknown.
 //
 // dedupe collapses bursts to a single failure: if the most recent
 // entry is newer than dedupe, the append is dropped. A single broken
@@ -116,8 +184,16 @@ func (h *localHistory) startRecoveryGate(now time.Time) {
 // would otherwise inflate the count out of proportion to the event.
 // The dedupe window spans kinds so a dial error immediately followed by
 // a stall on the retry counts once, matching the one-event intent.
-// Returns true if the failure was recorded.
-func (h *localHistory) addUserFailure(failure adapter.UserFailure, window, dedupe time.Duration) bool {
+// Returns true if the failure was appended.
+func (h *localHistory) addUserFailure(failure adapter.UserFailure, network streakNet, opened time.Time, window, dedupe time.Duration) bool {
+	h.mu.Lock()
+	h.streaks[network].extend(failure.At, opened, window, network.retryWindow())
+	h.mu.Unlock()
+	return h.addWindowFailure(failure, window, dedupe)
+}
+
+// addWindowFailure is addUserFailure without the failure streak.
+func (h *localHistory) addWindowFailure(failure adapter.UserFailure, window, dedupe time.Duration) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if dedupe > 0 && len(h.userFailures) > 0 {
@@ -128,6 +204,172 @@ func (h *localHistory) addUserFailure(failure adapter.UserFailure, window, dedup
 	}
 	h.userFailures = pruneUserFailures(append(h.userFailures, failure), failure.At, window)
 	return true
+}
+
+// addUnanswered records, in network's failure streak only, a conn opened at
+// opened that went unanswered. Alone it is as likely a caller abandoning a
+// request as a failing path, so it never enters the failure window.
+func (h *localHistory) addUnanswered(network streakNet, at, opened time.Time, window time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.streaks[network].extend(at, opened, window, network.retryWindow())
+}
+
+// noteUserResponse records that a conn on network to dest, opened at opened,
+// answered at at. A TCP answer ends the TCP streak only if the conn was
+// opened after the streak's latest failure: a path can keep established flows
+// alive while failing every new one. Any UDP answer ends the UDP streak, so a
+// slow destination's late reply cancels its own unanswered report.
+func (h *localHistory) noteUserResponse(network streakNet, dest string, opened, at time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	st := &h.streaks[network]
+	st.lastAnswerAt = at
+	if network == streakUDP || opened.After(st.at) {
+		st.count = 0
+	}
+	if network == streakUDP && dest != "" {
+		if h.udpAnswered == nil {
+			h.udpAnswered = make(map[string]time.Time)
+		}
+		if _, ok := h.udpAnswered[dest]; !ok && len(h.udpAnswered) >= maxUDPAnsweredDestinations {
+			h.evictOldestUDPAnsweredLocked()
+		}
+		h.udpAnswered[dest] = at
+	}
+}
+
+// maxUDPAnsweredDestinations bounds the UDP destinations a member remembers.
+const maxUDPAnsweredDestinations = 64
+
+func (h *localHistory) evictOldestUDPAnsweredLocked() {
+	var oldest string
+	var oldestAt time.Time
+	for dest, at := range h.udpAnswered {
+		if oldest == "" || at.Before(oldestAt) {
+			oldest, oldestAt = dest, at
+		}
+	}
+	delete(h.udpAnswered, oldest)
+}
+
+// udpDestAnswered reports whether a UDP handle to dest has answered through
+// this member. It has no age limit: a relay that dies after UDP has been
+// quiet for a while must still be detectable.
+func (h *localHistory) udpDestAnswered(dest string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, ok := h.udpAnswered[dest]
+	return ok
+}
+
+func (h *localHistory) streakCount(network streakNet, now time.Time, window time.Duration) uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.streaks[network].live(now, window)
+}
+
+func (h *localHistory) clearStreak(network streakNet) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.streaks[network].count = 0
+}
+
+// limitReachedAt returns when network's streak live at now reached
+// consecutiveUserFailureLimit, or zero if it hasn't.
+func (h *localHistory) limitReachedAt(network streakNet, now time.Time, window time.Duration) time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	st := h.streaks[network]
+	if st.live(now, window) < consecutiveUserFailureLimit {
+		return time.Time{}
+	}
+	return st.limitAt
+}
+
+// streakStarted returns when network's live streak's first failed conn or
+// exchange started, or zero without a live streak.
+func (h *localHistory) streakStarted(network streakNet, now time.Time, window time.Duration) time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.streaks[network].live(now, window) == 0 {
+		return time.Time{}
+	}
+	return h.streaks[network].started
+}
+
+func (h *localHistory) answeredSince(network streakNet, t time.Time) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.streaks[network].lastAnswerAt.After(t)
+}
+
+// streakNet indexes a member's per-network failure streaks. A member's UDP
+// relay can fail while its TCP path works, and the reverse, so evidence on
+// one network never moves the other's selection.
+type streakNet uint8
+
+const (
+	streakTCP streakNet = iota
+	streakUDP
+)
+
+// retryWindow is how soon after the start of the previous failed exchange
+// on network a failed exchange must start to extend the streak, or zero for
+// no bound.
+func (n streakNet) retryWindow() time.Duration {
+	if n == streakUDP {
+		return udpRetryWindow
+	}
+	return 0
+}
+
+func streakNetFor(network string) streakNet {
+	if network == N.NetworkUDP {
+		return streakUDP
+	}
+	return streakTCP
+}
+
+// failureStreak counts one network's consecutive user-traffic failures on a
+// member.
+type failureStreak struct {
+	count uint32
+	// at is the latest failure's time and opened its conn's or exchange's
+	// start; started is the first failure's conn's or exchange's start, and
+	// limitAt when count reached consecutiveUserFailureLimit.
+	at, opened, started, limitAt time.Time
+	lastAnswerAt                 time.Time
+}
+
+// extend counts a failure at at, on a conn opened at opened. A failure
+// extends a live streak only if its conn was opened after the streak's latest
+// failure, and, with a non-zero retryWindow, within retryWindow of that
+// failure's conn opening; one on an older conn is part of the same event, and
+// one opened later starts a new streak. A streak ends once window passes
+// without a failure.
+func (st *failureStreak) extend(at, opened time.Time, window, retryWindow time.Duration) {
+	switch {
+	case st.live(at, window) == 0:
+		st.count, st.started = 1, opened
+	case opened.IsZero() || !opened.After(st.at):
+		return
+	case retryWindow > 0 && opened.Sub(st.opened) > retryWindow:
+		st.count, st.started = 1, opened
+	default:
+		st.count++
+	}
+	st.at, st.opened = at, opened
+	if st.count == consecutiveUserFailureLimit {
+		st.limitAt = at
+	}
+}
+
+func (st *failureStreak) live(now time.Time, window time.Duration) uint32 {
+	if st.count == 0 || !ageWithin(now, st.at, window) {
+		return 0
+	}
+	return st.count
 }
 
 // userFailureCount returns the number of user-traffic failures inside

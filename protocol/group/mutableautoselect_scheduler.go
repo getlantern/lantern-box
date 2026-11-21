@@ -5,6 +5,7 @@ import (
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 
@@ -47,6 +48,7 @@ type probeOutcome struct {
 	sequence   uint64
 	success    bool
 	delayMs    uint32
+	started    time.Time
 	completed  time.Time
 	generation uint64
 	url        string
@@ -59,10 +61,15 @@ type memberProbeState struct {
 	membershipID uint64
 	need         probeNeed
 	// confirmationPending waits for an attempt sequenced after confirmSequence;
-	// a failed one may switch TCP selection to replacement.
+	// two failed ones in a row may switch TCP selection to replacement.
 	confirmationPending bool
 	confirmSequence     uint64
 	replacement         string
+	// firstConfirmFailedAt is when a confirmation first failed, awaiting the
+	// next one; zero otherwise. confirmedAt is when a confirmation last
+	// concluded.
+	firstConfirmFailedAt time.Time
+	confirmedAt          time.Time
 	// outcome is the latest recorded outcome.
 	outcome *probeOutcome
 }
@@ -74,6 +81,7 @@ type probeAttempt struct {
 	membershipID uint64
 	generation   uint64
 	url          string
+	started      time.Time
 	deadline     time.Time
 	lastResort   bool
 	// finalized is set once the attempt records an outcome or is canceled; it
@@ -235,6 +243,7 @@ func (s *MutableAutoSelect) startProbeLocked(
 		membershipID: state.membershipID,
 		generation:   s.networkGeneration.Load(),
 		url:          s.probeURLForLocked(tag),
+		started:      time.Now(),
 		deadline:     time.Now().Add(probeBound(beh)),
 		lastResort:   beh.lastResort,
 		holdsSlot:    holdsSlot,
@@ -312,10 +321,14 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 	outcome := s.recordProbeOutcomeLocked(attempt.tag, &probeOutcome{
 		success:    success,
 		delayMs:    delayMs,
+		started:    attempt.started,
 		generation: attempt.generation,
 		url:        attempt.url,
 		lastResort: attempt.lastResort,
 	})
+	if success {
+		s.endOutageLocked()
+	}
 	if success && !attempt.lastResort {
 		for waiter := range s.urlWaiters {
 			member, ok := waiter.members[attempt.tag]
@@ -332,10 +345,34 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 		replacement := state.replacement
 		state.confirmationPending = false
 		state.replacement = ""
-		if !success {
-			s.trySwitchAfterConfirmedFailureLocked(attempt.tag, replacement)
+		state.confirmedAt = outcome.completed
+		first := state.firstConfirmFailedAt
+		switch {
+		case success:
+			state.firstConfirmFailedAt = time.Time{}
+		// The gap runs to the second confirmation's start, so a probe timeout
+		// longer than the window still lets it conclude.
+		case first.IsZero() || attempt.started.Sub(first) > confirmStrikeWindow:
+			// One failed probe can be chance on a working member: confirm
+			// again, and meanwhile probe where the selection would move.
+			state.firstConfirmFailedAt = outcome.completed
+			s.rearmConfirmationLocked(attempt.tag, replacement)
+			s.probeTCPReplacementsLocked(attempt.tag, outcome.completed)
+		default:
+			state.firstConfirmFailedAt = time.Time{}
+			// A fast-failover replacement just carried user traffic, so it
+			// needs no recheck; otherwise the switch goes through the
+			// pending path, which rechecks a mixed picture.
+			named := replacement != "" && s.eligibleReplacementLocked(time.Now(), replacement)
+			if !named || !s.trySwitchAfterConfirmedFailureLocked(attempt.tag, replacement, first) {
+				p := &s.pendingConfirmedFailure
+				p.tag, p.since, p.at = attempt.tag, first, outcome.completed
+				p.replacementFailed = s.replacementFailedSinceLocked(attempt.tag, first)
+			}
 		}
 	}
+	s.tryPendingConfirmedSwitchLocked()
+	s.reselectUDPLocked()
 	s.notifyProbesLocked()
 }
 
@@ -346,10 +383,20 @@ func (s *MutableAutoSelect) recordProbeOutcomeLocked(tag string, outcome *probeO
 	outcome.sequence = s.probeSequence
 	outcome.completed = time.Now()
 	s.probeMembers[tag].outcome = outcome
+	forgiven := !outcome.success && s.outageSuspectedLocked()
 	s.mutateHistoryLocked(tag, func(h *localHistory, now time.Time) bool {
-		h.recordProbe(outcome.success, outcome.delayMs, now)
+		if forgiven {
+			h.recordForgivenProbeFailure(now)
+		} else {
+			h.recordProbe(outcome.success, outcome.delayMs, now)
+		}
 		return true
 	})
+	if !outcome.success && !outcome.lastResort {
+		if p := &s.pendingConfirmedFailure; p.tag != "" && p.tag != tag {
+			p.replacementFailed = true
+		}
+	}
 	return outcome
 }
 
@@ -641,10 +688,79 @@ func (s *MutableAutoSelect) URLTest(ctx context.Context) (map[string]uint16, err
 	return results, nil
 }
 
+// earlyConfirmCooldown spaces early confirmations of one member: a member
+// that failed is moved off within one, and repeating them on a member that
+// passed, or through an outage, only adds probes and probe failures.
+const earlyConfirmCooldown = 30 * time.Second
+
+// requestEarlyConfirmation confirms tag, the TCP selection, when its traffic
+// is slow to be answered: unless a confirmation of tag is running or
+// concluded within earlyConfirmCooldown.
+func (s *MutableAutoSelect) requestEarlyConfirmation(tag string, generation uint64) {
+	s.access.Lock()
+	state := s.probeMembers[tag]
+	skip := state == nil || state.confirmationPending ||
+		(!state.firstConfirmFailedAt.IsZero() && time.Since(state.firstConfirmFailedAt) <= confirmStrikeWindow) ||
+		(!state.confirmedAt.IsZero() && time.Since(state.confirmedAt) < earlyConfirmCooldown)
+	s.access.Unlock()
+	if !skip {
+		s.requestFailureConfirmation(tag, "", generation)
+	}
+}
+
+// confirmStrikeWindow bounds the gap between the two consecutive failed
+// confirmations that switch TCP selection.
+const confirmStrikeWindow = 30 * time.Second
+
+// rearmConfirmationLocked confirms tag again after a failed confirmation,
+// while tag is still the TCP selection. Caller must hold s.access.
+func (s *MutableAutoSelect) rearmConfirmationLocked(tag, replacement string) {
+	state := s.probeMembers[tag]
+	if loadString(&s.stickyTag.tcp) != tag || s.outageSuspectedLocked() {
+		// No second confirmation will conclude to clear the strike.
+		state.firstConfirmFailedAt = time.Time{}
+		return
+	}
+	s.requestProbesLocked([]string{tag}, probeForced, false)
+	state.confirmationPending = true
+	s.probeSequence++
+	state.confirmSequence = s.probeSequence
+	state.replacement = replacement
+	s.dispatchProbesLocked()
+}
+
+// maxReplacementProbes bounds the members probed as replacements at a time
+// after a failed confirmation.
+const maxReplacementProbes = 3
+
+// probeTCPReplacementsLocked probes the highest-ranked members TCP selection
+// would move to from tag that have no probe outcome since since, and reports
+// how many. Caller must hold s.access.
+func (s *MutableAutoSelect) probeTCPReplacementsLocked(tag string, since time.Time) int {
+	var tags []string
+	for _, c := range s.replacementPoolLocked(time.Now(), N.NetworkTCP, tag) {
+		if len(tags) == maxReplacementProbes {
+			break
+		}
+		if state := s.probeMembers[c.tag]; state != nil && state.outcome != nil && !state.outcome.completed.Before(since) {
+			continue
+		}
+		tags = append(tags, c.tag)
+	}
+	// requestProbesLocked reads nil as every member.
+	if len(tags) == 0 {
+		return 0
+	}
+	s.requestProbesLocked(tags, probeForced, false)
+	s.dispatchProbesLocked()
+	return len(tags)
+}
+
 func (s *MutableAutoSelect) requestFailureConfirmation(tag, replacement string, generation uint64) {
 	s.access.Lock()
 	defer s.access.Unlock()
-	if s.isClosed() || s.paused() || !s.matchesGenerationLocked(generation) || loadString(&s.stickyTag.tcp) != tag {
+	if s.isClosed() || s.paused() || !s.matchesGenerationLocked(generation) || loadString(&s.stickyTag.tcp) != tag ||
+		s.outageSuspectedLocked() {
 		return
 	}
 	out, ok := s.members.Load(tag)
@@ -701,6 +817,9 @@ func (s *MutableAutoSelect) onProbePause(event int) {
 	case pause.EventDevicePaused, pause.EventNetworkPause:
 		s.pauseEpoch++
 		s.cancelProbesLocked(false)
+		// Probes are canceled unrecorded, and probes after the pause say
+		// nothing about failures before it.
+		s.resetConfirmationsLocked()
 		if s.periodicTimer != nil {
 			s.periodicTimer.Stop()
 			s.periodicTimer = nil
@@ -711,6 +830,16 @@ func (s *MutableAutoSelect) onProbePause(event int) {
 			s.dispatchProbesLocked()
 		}
 	}
+}
+
+// resetConfirmationsLocked drops every confirmation under way, its strikes
+// and cooldowns, and a pending switch. Caller must hold s.access.
+func (s *MutableAutoSelect) resetConfirmationsLocked() {
+	for _, state := range s.probeMembers {
+		state.confirmationPending, state.replacement = false, ""
+		state.firstConfirmFailedAt, state.confirmedAt = time.Time{}, time.Time{}
+	}
+	s.pendingConfirmedFailure.tag = ""
 }
 
 func (s *MutableAutoSelect) armPeriodicLocked() {
@@ -809,9 +938,16 @@ func (s *MutableAutoSelect) advanceNetworkLocked() {
 	}
 	s.lastNetworkAdvanceAt = now
 	s.cancelProbesLocked(true)
-	for _, state := range s.probeMembers {
-		state.confirmationPending = false
+	// Confirmations and failure streaks on the old network say nothing about
+	// the new one.
+	s.resetConfirmationsLocked()
+	// Probes on the new network decide whether it is down too.
+	s.outageSince = time.Time{}
+	for _, h := range s.histories {
+		h.clearStreak(streakTCP)
+		h.clearStreak(streakUDP)
 	}
+	s.lastStreakSwitch.tcp, s.lastStreakSwitch.udp = time.Time{}, time.Time{}
 	if s.probing {
 		s.requestProbesLocked(nil, probeForced, true)
 	}

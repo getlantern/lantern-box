@@ -67,15 +67,15 @@ func TestDialContext_FailedConfirmationSwitchesToFallback(t *testing.T) {
 		conn.Close()
 		synctest.Wait()
 
-		assert.Equal(t, "b", loadString(&s.stickyTag.tcp), "a failed confirmation, so b serves subsequent dials")
-		assert.EqualValues(t, 2, aDials.Load(), "the failed dial plus one confirmation probe")
+		assert.Equal(t, "b", loadString(&s.stickyTag.tcp), "a failed confirmation twice, so b serves subsequent dials")
+		assert.EqualValues(t, 3, aDials.Load(), "the failed dial plus two confirmation probes")
 
 		conn, err = s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
 		require.NoError(t, err)
 		conn.Close()
 		synctest.Wait()
 		assert.Equal(t, "b", loadString(&s.stickyTag.tcp), "gated a must not win back on delay")
-		assert.EqualValues(t, 2, aDials.Load(), "the next dial goes straight to b")
+		assert.EqualValues(t, 3, aDials.Load(), "the next dial goes straight to b")
 	})
 }
 
@@ -223,14 +223,14 @@ func TestRecoveryGate_SelectionAndClearing(t *testing.T) {
 func TestRecoveryGate_FallbackDemotionDoesNotRestoreFailedMember(t *testing.T) {
 	s, _ := newConfirmationTestMUR(t, "a", "b")
 	recordSuccess(s, "b", 200)
-	s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load())
+	s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp")
 	seedProbe(s, "a", false, 0)
 	switchAfterConfirmedFailure(s, "a", "b")
 	require.Equal(t, "b", loadString(&s.stickyTag.tcp))
 
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.softFailLimit {
-		s.recordUserFailure("b", adapter.UserFailureStall, s.networkGeneration.Load())
+		s.recordUserFailure("b", adapter.UserFailureStall, s.networkGeneration.Load(), time.Time{}, "tcp")
 	}
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -272,14 +272,14 @@ func TestSplitHealthyFor_RecoveryGate(t *testing.T) {
 func TestRecoveryGate_HardDemotedFallbackRestoresFailedMember(t *testing.T) {
 	s, _ := newConfirmationTestMUR(t, "a", "b")
 	recordSuccess(s, "b", 200)
-	s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load())
+	s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp")
 	seedProbe(s, "a", false, 0)
 	switchAfterConfirmedFailure(s, "a", "b")
 	require.Equal(t, "b", loadString(&s.stickyTag.tcp))
 
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.consecutiveFailLimit {
-		s.recordUserFailure("b", adapter.UserFailureStall, s.networkGeneration.Load())
+		s.recordUserFailure("b", adapter.UserFailureStall, s.networkGeneration.Load(), time.Time{}, "tcp")
 	}
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -302,14 +302,17 @@ func TestRecoveryGate_FastFailover(t *testing.T) {
 
 func TestDataPlaneFailure_ConfirmsSelection(t *testing.T) {
 	tests := []struct {
-		name     string
-		firstA   func() net.Conn
-		probeOK  bool
-		drive    func(conn net.Conn)
+		name    string
+		firstA  func() net.Conn
+		probeOK bool
+		drive   func(conn net.Conn)
+		// wantKind is the charged failure, or "" for none.
 		wantKind adapter.UserFailureKind
 		switched bool
 	}{
 		{
+			// The early confirmation moves the selection off a before its
+			// no-response timer fires, so that is not charged to it.
 			name:   "no response, probe fails",
 			firstA: blackholeConn,
 			drive: func(conn net.Conn) {
@@ -317,7 +320,6 @@ func TestDataPlaneFailure_ConfirmsSelection(t *testing.T) {
 				go io.ReadFull(conn, make([]byte, 1))
 				time.Sleep(defaultFirstResponseTimeout)
 			},
-			wantKind: adapter.UserFailureNoResponse,
 			switched: true,
 		},
 		{
@@ -341,6 +343,7 @@ func TestDataPlaneFailure_ConfirmsSelection(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				s, obs := newConfirmationTestMUR(t, "a", "b")
 				s.cfg.dataPlaneFirstResponseTimeout = defaultFirstResponseTimeout
+				obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 				var aDials atomic.Int32
 				obs["a"].dial = func(context.Context) (net.Conn, error) {
 					if aDials.Add(1) == 1 {
@@ -359,9 +362,17 @@ func TestDataPlaneFailure_ConfirmsSelection(t *testing.T) {
 				synctest.Wait()
 
 				uf, _ := userFailures(s, "a")
-				require.Len(t, uf, 1)
-				assert.Equal(t, tt.wantKind, uf[0].Kind)
-				assert.EqualValues(t, 2, aDials.Load(), "one user dial plus one confirmation probe")
+				if tt.wantKind == "" {
+					require.Empty(t, uf)
+				} else {
+					require.Len(t, uf, 1)
+					assert.Equal(t, tt.wantKind, uf[0].Kind)
+				}
+				wantDials := 2
+				if tt.switched {
+					wantDials = 3
+				}
+				assert.EqualValues(t, wantDials, aDials.Load(), "one user dial plus a confirmation probe, and another after a failure")
 				h, _ := s.peekHistoryLocked("a")
 				if tt.switched {
 					assert.Equal(t, "b", loadString(&s.stickyTag.tcp))
@@ -399,6 +410,7 @@ func TestMakeHooks_ConfirmsOnlyPrimaryTCPResetOrNoResponse(t *testing.T) {
 					aDials.Add(1)
 					return nil, errors.New("dial timeout")
 				}
+				obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 
 				s.makeHooks("a", tt.network, tt.route, s.networkGeneration.Load()).onFailure(tt.kind)
 				synctest.Wait()
@@ -406,7 +418,7 @@ func TestMakeHooks_ConfirmsOnlyPrimaryTCPResetOrNoResponse(t *testing.T) {
 				uf, _ := userFailures(s, "a")
 				require.Len(t, uf, 1, "every case is a recorded failure")
 				if tt.confirms {
-					assert.EqualValues(t, 1, aDials.Load(), "one confirmation probe")
+					assert.EqualValues(t, 2, aDials.Load(), "two failed confirmation probes")
 					assert.Equal(t, "b", loadString(&s.stickyTag.tcp))
 				} else {
 					assert.Zero(t, aDials.Load(), "no confirmation probe")
