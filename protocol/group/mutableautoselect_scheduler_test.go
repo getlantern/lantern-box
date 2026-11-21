@@ -854,9 +854,14 @@ func TestSchedulerRepeatedConfirmationReplacement(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				s, obs := newSchedulerTest(t, "a", "b", "c", "d")
-				release := make(chan struct{})
+				release, second := make(chan struct{}), make(chan struct{})
+				var aDials atomic.Int32
 				obs["a"].dial = func(context.Context) (net.Conn, error) {
-					<-release
+					if aDials.Add(1) == 1 {
+						<-release
+					} else {
+						<-second
+					}
 					return nil, errors.New("confirmation failed")
 				}
 				recordSuccess(s, "b", 100)
@@ -868,6 +873,12 @@ func TestSchedulerRepeatedConfirmationReplacement(t *testing.T) {
 				synctest.Wait()
 				s.requestFailureConfirmation("a", tc.repeat, generation)
 				close(release)
+				synctest.Wait()
+				// The named replacement carries the fallback's traffic between
+				// the strikes.
+				time.Sleep(time.Second)
+				s.noteUserResponse(tc.want, generation, "tcp", "", time.Now(), time.Now())
+				close(second)
 				synctest.Wait()
 				require.Equal(t, tc.want, s.Now())
 			})

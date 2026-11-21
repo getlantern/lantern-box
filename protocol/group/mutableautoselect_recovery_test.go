@@ -2378,3 +2378,153 @@ func TestDataPlanePacket_SendStillUnderWayIsNotUnanswered(t *testing.T) {
 		assert.Zero(t, unanswered.Load(), "a datagram that was never sent went unanswered by no one")
 	})
 }
+
+func TestListenPacket_SessionLeftOnConfirmedFailedMemberMovesOnceStuck(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		recordSuccess(s, "b", 200)
+		s.stickyTag.udp.Store("a")
+		handles := map[string][]*scriptedPacketConn{}
+		listenScripted(obs, handles, "a", "b")
+		dest := metadata.ParseSocksaddrHostPort("dns.test", 53)
+		pc, err := s.ListenPacket(context.Background(), dest)
+		require.NoError(t, err)
+		go func() {
+			for {
+				if _, _, err := pc.ReadFrom(make([]byte, 64)); err != nil {
+					return
+				}
+			}
+		}()
+		pc.WriteTo([]byte("q"), &net.UDPAddr{})
+		handles["a"][0].in <- []byte("a")
+		time.Sleep(time.Second)
+		synctest.Wait()
+
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("dial timeout") }
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		conn.Close()
+		synctest.Wait()
+		require.Equal(t, "b", loadString(&s.stickyTag.tcp), "a failed confirmation twice")
+		pc2, err := s.ListenPacket(context.Background(), dest)
+		require.NoError(t, err)
+		require.Equal(t, "b", loadString(&s.stickyTag.udp), "a new flow moves UDP off gated a")
+		require.False(t, isClosed(handles["a"][0]), "a session idle at the release is left")
+
+		pc.WriteTo([]byte("q"), &net.UDPAddr{})
+		time.Sleep(2250 * time.Millisecond)
+		synctest.Wait()
+		assert.True(t, isClosed(handles["a"][0]), "once its exchange goes unanswered it is moved off a, though a has no UDP failure streak")
+		pc.Close()
+		pc2.Close()
+	})
+}
+
+func TestListenPacket_SessionLeftOnReleasedMemberByCause(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		release func(h *localHistory)
+		closed  bool
+	}{
+		{"slower", func(*localHistory) {}, false},
+		{"probe failed", func(h *localHistory) { h.recordProbeFailure(time.Now()) }, true},
+		{"gated", func(h *localHistory) { h.startRecoveryGate(time.Now()) }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, obs := newConfirmationTestMUR(t, "a", "b")
+				s.stickyTag.udp.Store("a")
+				s.stickyTag.tcp.Store("b")
+				handles := map[string][]*scriptedPacketConn{}
+				listenScripted(obs, handles, "a")
+				dest := metadata.ParseSocksaddrHostPort("dns.test", 53)
+				pc, err := s.ListenPacket(context.Background(), dest)
+				require.NoError(t, err)
+				go func() {
+					for {
+						if _, _, err := pc.ReadFrom(make([]byte, 64)); err != nil {
+							return
+						}
+					}
+				}()
+				pc.WriteTo([]byte("q"), &net.UDPAddr{})
+				handles["a"][0].in <- []byte("a")
+				time.Sleep(time.Second)
+				synctest.Wait()
+				s.access.Lock()
+				tc.release(s.historyForLocked("a"))
+				s.stickyTag.udp.Store("b")
+				s.access.Unlock()
+
+				pc.WriteTo([]byte("q"), &net.UDPAddr{})
+				time.Sleep(2250 * time.Millisecond)
+				synctest.Wait()
+				assert.Equal(t, tc.closed, isClosed(handles["a"][0]),
+					"an unanswered session moves off a member released for failing, not one released for being slower")
+				pc.Close()
+			})
+		})
+	}
+}
+
+func TestConfirmation_FallbackDialAloneDoesNotSwitch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("dial timeout") }
+		// b accepts connections but blackholes them, so its probe hangs.
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return blackholeConn(), nil }
+
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		synctest.Wait()
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "b's dial succeeding and an old passing probe don't show b delivers")
+
+		time.Sleep(15 * time.Second)
+		synctest.Wait()
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "nor does the switch follow once b's own probe fails")
+		conn.Close()
+	})
+}
+
+func TestConfirmation_FallbackThatAnsweredSwitches(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		release, second := make(chan struct{}), make(chan struct{})
+		var aDials atomic.Int32
+		obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+			switch aDials.Add(1) {
+			case 1:
+				return nil, errors.New("dial timeout")
+			case 2:
+				<-release
+			default:
+				<-second
+			}
+			return nil, errors.New("dial timeout")
+		}
+		// b's probes hang, so only its traffic can show it delivers.
+		var bDials atomic.Int32
+		obs["b"].dial = func(context.Context) (net.Conn, error) {
+			if bDials.Add(1) == 1 {
+				return probeResponderConn(), nil
+			}
+			return blackholeConn(), nil
+		}
+
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		close(release)
+		synctest.Wait()
+		time.Sleep(time.Second)
+		_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: probe.test\r\n\r\n"))
+		require.NoError(t, err)
+		_, err = conn.Read(make([]byte, 64))
+		require.NoError(t, err)
+		close(second)
+		synctest.Wait()
+		assert.Equal(t, "b", loadString(&s.stickyTag.tcp), "b answered the fallback conn between the strikes")
+		conn.Close()
+	})
+}

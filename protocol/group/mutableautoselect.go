@@ -841,19 +841,19 @@ func (s *MutableAutoSelect) closeStuckUDPLocked(tag string) {
 }
 
 // afterUDPFailureLocked acts on a UDP failure of tag. If tag is no longer the
-// UDP selection and its failure streak is at the limit, its sessions whose
-// exchange went unanswered are closed: those left on it at its release were
-// idle or hadn't waited long enough then. Otherwise a release it allows is
-// applied. Caller must hold s.access.
+// UDP selection and is failing, its sessions whose exchange went unanswered
+// are closed: those left on it at its release were idle or hadn't waited long
+// enough then. Otherwise a release it allows is applied. Caller must hold
+// s.access.
 func (s *MutableAutoSelect) afterUDPFailureLocked(tag string) {
 	s.closeStuckOffSelectionUDPLocked(tag)
 	s.reselectUDPLocked()
 }
 
 // closeStuckOffSelectionUDP closes tag's UDP sessions whose exchange went
-// unanswered if tag was released as the UDP selection and its failure streak
-// is still at the limit, without recording a failure: a member selected for
-// neither network isn't charged. Generation is the reporting handle's.
+// unanswered if tag is no longer the UDP selection and is failing, without
+// recording a failure: a member selected for neither network isn't charged.
+// Generation is the reporting handle's.
 func (s *MutableAutoSelect) closeStuckOffSelectionUDP(tag string, generation uint64) {
 	s.access.Lock()
 	defer s.access.Unlock()
@@ -865,9 +865,25 @@ func (s *MutableAutoSelect) closeStuckOffSelectionUDP(tag string, generation uin
 // closeStuckOffSelectionUDPLocked is closeStuckOffSelectionUDP for the
 // current generation. Caller must hold s.access.
 func (s *MutableAutoSelect) closeStuckOffSelectionUDPLocked(tag string) {
-	if loadString(&s.stickyTag.udp) != tag && !s.streakSinceLocked(tag, N.NetworkUDP).IsZero() {
+	if loadString(&s.stickyTag.udp) != tag && s.failingLocked(tag) {
 		s.closeStuckUDPLocked(tag)
 	}
+}
+
+// failingLocked reports whether tag's UDP failure streak is at the limit, its
+// latest probe failed, or a confirmed failure gated it. A member released
+// only for being slower keeps its sessions through a quiet spell. Caller must
+// hold s.access.
+func (s *MutableAutoSelect) failingLocked(tag string) bool {
+	if !s.streakSinceLocked(tag, N.NetworkUDP).IsZero() {
+		return true
+	}
+	h, ok := s.peekHistoryLocked(tag)
+	if !ok {
+		return false
+	}
+	_, consec, _, gated := h.snapshot(time.Now(), s.hist.userFailureWindow)
+	return consec > 0 || gated
 }
 
 // reselectUDPLocked applies a pending release of the UDP selection for
@@ -1677,9 +1693,10 @@ func (s *MutableAutoSelect) noteUnanswered(tag string, generation uint64, networ
 }
 
 // trySwitchAfterConfirmedFailureLocked moves TCP selection off failedTag,
-// whose confirmations failed twice in a row from since, to replacementTag or
-// a member whose probe passed after since. With none, as in an outage of the
-// device's own network, the selection stays.
+// whose confirmations failed twice in a row from since, to replacementTag if
+// it delivered after since, or else a member whose probe passed after since.
+// With none, as in an outage of the device's own network, the selection
+// stays.
 func (s *MutableAutoSelect) trySwitchAfterConfirmedFailureLocked(failedTag, replacementTag string, since time.Time) (switched bool) {
 	slot := &s.stickyTag.tcp
 	if loadString(slot) != failedTag {
@@ -1696,9 +1713,7 @@ func (s *MutableAutoSelect) trySwitchAfterConfirmedFailureLocked(failedTag, repl
 	if _, consec, _, _ := h.snapshot(now, s.hist.userFailureWindow); consec == 0 {
 		return false
 	}
-	// A named replacement just carried the user's traffic in fast failover,
-	// which is fresher evidence than a probe.
-	if replacementTag == "" || !s.eligibleReplacementLocked(now, replacementTag) {
+	if replacementTag == "" || !s.eligibleReplacementLocked(now, replacementTag) || !s.deliveredSinceLocked(replacementTag, since) {
 		replacementTag = s.findProbedReplacementLocked(now, N.NetworkTCP, failedTag, since)
 	}
 	if replacementTag == "" {
@@ -1916,6 +1931,18 @@ func (s *MutableAutoSelect) passedSinceLocked(tag string, since time.Time) bool 
 	state := s.probeMembers[tag]
 	return state != nil && state.outcome != nil && state.outcome.success &&
 		!state.outcome.completed.Before(since) && s.outcomeCurrentLocked(tag, state.outcome)
+}
+
+// deliveredSinceLocked reports whether tag answered a TCP conn or passed a
+// probe after since. A fast-failover dial succeeding doesn't count: a member
+// that blackholes traffic still accepts connections. Caller must hold
+// s.access.
+func (s *MutableAutoSelect) deliveredSinceLocked(tag string, since time.Time) bool {
+	if s.passedSinceLocked(tag, since) {
+		return true
+	}
+	h, ok := s.peekHistoryLocked(tag)
+	return ok && h.answeredSince(streakTCP, since)
 }
 
 // findProbedReplacementLocked returns the highest-ranked member whose latest

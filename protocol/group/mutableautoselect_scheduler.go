@@ -360,10 +360,11 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 			s.probeTCPReplacementsLocked(attempt.tag, outcome.completed)
 		default:
 			state.firstConfirmFailedAt = time.Time{}
-			// A fast-failover replacement just carried user traffic, so it
-			// needs no recheck; otherwise the switch goes through the
+			// A fast-failover replacement that has delivered since the first
+			// strike needs no recheck; otherwise the switch goes through the
 			// pending path, which rechecks a mixed picture.
-			named := replacement != "" && s.eligibleReplacementLocked(time.Now(), replacement)
+			named := replacement != "" && s.eligibleReplacementLocked(time.Now(), replacement) &&
+				s.deliveredSinceLocked(replacement, first)
 			if !named || !s.trySwitchAfterConfirmedFailureLocked(attempt.tag, replacement, first) {
 				p := &s.pendingConfirmedFailure
 				p.tag, p.since, p.at = attempt.tag, first, outcome.completed
