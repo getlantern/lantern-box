@@ -2103,41 +2103,72 @@ func TestConfirmation_GatedPassAmongFailedReplacementsIsNoOutage(t *testing.T) {
 func TestConfirmation_RecheckStartsAfterReplacementPass(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
-		// a's first two probes time out; later ones pass.
-		var (
-			mu      sync.Mutex
-			aStarts []time.Time
-			cPassed time.Time
-		)
+		// a's first two probes time out; later ones pass. Each later one
+		// notes, as it starts, whether c's passing outcome was recorded.
+		var aProbes atomic.Int32
+		var cPassedFirst []bool
 		obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
-			mu.Lock()
-			aStarts = append(aStarts, time.Now())
-			n := len(aStarts)
-			mu.Unlock()
-			if n <= 2 {
+			if aProbes.Add(1) <= 2 {
 				return hangUntilDone(ctx)
 			}
+			s.access.Lock()
+			state := s.probeMembers["c"]
+			cPassedFirst = append(cPassedFirst, state.outcome != nil && state.outcome.success)
+			s.access.Unlock()
 			return probeResponderConn(), nil
 		}
 		var bProbes atomic.Int32
 		failingProbes(obs["b"], &bProbes, hangUntilDone)
-		obs["c"].dial = func(context.Context) (net.Conn, error) {
-			mu.Lock()
-			if cPassed.IsZero() {
-				cPassed = time.Now().Add(time.Second)
-			}
-			mu.Unlock()
-			return slowProbeResponderConn(time.Second), nil
-		}
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(time.Second), nil }
 		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
 		time.Sleep(time.Minute)
 		synctest.Wait()
-		mu.Lock()
-		defer mu.Unlock()
-		require.GreaterOrEqual(t, len(aStarts), 3, "a is rechecked")
-		assert.False(t, aStarts[2].Before(cPassed), "the recheck starts once c has passed")
+		require.GreaterOrEqual(t, aProbes.Load(), int32(3), "a is rechecked")
+		s.access.Lock()
+		defer s.access.Unlock()
+		require.NotEmpty(t, cPassedFirst)
+		assert.True(t, cPassedFirst[0], "the recheck starts once c's pass is recorded")
 		assert.Equal(t, "a", loadString(&s.stickyTag.tcp),
 			"a probe of a started before c passed is no recheck after it; the recheck that follows passes")
+	})
+}
+
+func TestConfirmation_NoRecheckBeforeReplacementPasses(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		// a's first probe times out and its second fails at once, so the
+		// switch is pending while c's probe still runs; later ones pass.
+		var aProbes atomic.Int32
+		var cPassedFirst []bool
+		var cPendingAtSecondStrike bool
+		obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+			switch aProbes.Add(1) {
+			case 1:
+				return hangUntilDone(ctx)
+			case 2:
+				s.access.Lock()
+				cPendingAtSecondStrike = s.probeMembers["c"].outcome == nil
+				s.access.Unlock()
+				return nil, errors.New("probe failed")
+			}
+			s.access.Lock()
+			state := s.probeMembers["c"]
+			cPassedFirst = append(cPassedFirst, state.outcome != nil && state.outcome.success)
+			s.access.Unlock()
+			return probeResponderConn(), nil
+		}
+		var bProbes atomic.Int32
+		failingProbes(obs["b"], &bProbes, hangUntilDone)
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(time.Second), nil }
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		s.access.Lock()
+		defer s.access.Unlock()
+		require.True(t, cPendingAtSecondStrike, "the switch is pending while c's probe still runs")
+		require.NotEmpty(t, cPassedFirst, "a is rechecked")
+		assert.True(t, cPassedFirst[0], "b failing alone doesn't start the recheck; c passing does")
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "and a, passing it, keeps the selection")
 	})
 }
 
@@ -2634,5 +2665,83 @@ func TestConfirmation_SelectionPassingDuringPendingSwitchIsNoOutage(t *testing.T
 		require.True(t, s.probeMembers["a"].outcome.success, "a passed")
 		assert.False(t, s.outageSuspectedLocked(), "b failing while a answers is no outage")
 		assert.Equal(t, "a", loadString(&s.stickyTag.tcp))
+	})
+}
+
+func TestListenPacket_SessionMissingTheReleaseIsReplaced(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// before is how many of a's exchanges went unanswered before the
+		// listen began, the rest during it.
+		before int
+	}{
+		{"streak reaches the limit during setup", 0},
+		{"streak already at the limit", consecutiveUserFailureLimit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, obs := newConfirmationTestMUR(t, "a", "b")
+				s.stickyTag.udp.Store("a")
+				// b's probe hangs, so a release waiting on it gives up and
+				// keeps a until the listen moves the selection.
+				obs["b"].dial = hangUntilDone
+				unanswered := func() {
+					s.access.Lock()
+					s.historyForLocked("a").addUnanswered(streakUDP, time.Now(), time.Now(), s.hist.userFailureWindow)
+					s.access.Unlock()
+					time.Sleep(time.Second)
+				}
+				for range tc.before {
+					unanswered()
+				}
+				primary := newScriptedPacketConn()
+				obs["a"].listen = func(context.Context) (net.PacketConn, error) {
+					// Another session's unanswered exchanges, or the end
+					// of a cooldown, release a while this one is set up.
+					for range consecutiveUserFailureLimit - tc.before {
+						unanswered()
+					}
+					s.access.Lock()
+					s.stickyTag.udp.Store("b")
+					s.access.Unlock()
+					return primary, nil
+				}
+				var bListens atomic.Int32
+				obs["b"].listen = func(context.Context) (net.PacketConn, error) {
+					bListens.Add(1)
+					return newScriptedPacketConn(), nil
+				}
+				pc, err := s.ListenPacket(context.Background(), metadata.ParseSocksaddrHostPort("dns.test", 53))
+				require.NoError(t, err)
+				defer pc.Close()
+				assert.EqualValues(t, 1, bListens.Load(), "the caller gets a session through the new selection")
+				assert.True(t, isClosed(primary), "the session on the released member is closed")
+			})
+		})
+	}
+}
+
+func TestListenPacket_SessionSetUpAcrossASwitchOnDelayIsKept(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s.stickyTag.udp.Store("a")
+		primary := newScriptedPacketConn()
+		obs["a"].listen = func(context.Context) (net.PacketConn, error) {
+			time.Sleep(time.Second)
+			s.access.Lock()
+			s.stickyTag.udp.Store("b")
+			s.access.Unlock()
+			return primary, nil
+		}
+		var bListens atomic.Int32
+		obs["b"].listen = func(context.Context) (net.PacketConn, error) {
+			bListens.Add(1)
+			return newScriptedPacketConn(), nil
+		}
+		pc, err := s.ListenPacket(context.Background(), metadata.ParseSocksaddrHostPort("dns.test", 53))
+		require.NoError(t, err)
+		defer pc.Close()
+		assert.Zero(t, bListens.Load(), "a member that moved off the selection without failing keeps the session")
+		assert.False(t, isClosed(primary))
 	})
 }

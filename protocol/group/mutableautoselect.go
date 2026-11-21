@@ -583,7 +583,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		stream := s.wrapStream(conn, network, o, primaryRoute, generation, release)
 		// Registered by now, so a switch from here on closes it with the
 		// rest; one that came before it was registered is caught here.
-		if N.NetworkName(network) != N.NetworkTCP || !s.failedSince(outerTag, dialed) {
+		if N.NetworkName(network) != N.NetworkTCP || !s.failedSince(outerTag, N.NetworkTCP, dialed) {
 			return stream, nil
 		}
 		stream.Close()
@@ -654,7 +654,14 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	dialed := time.Now()
 	conn, err := o.ListenPacket(ctx, destination)
 	if err == nil {
-		return s.wrapPacket(conn, o, primaryRoute, generation, destination), nil
+		pc := s.wrapPacket(conn, o, primaryRoute, generation, destination)
+		// The release sweep closes only sessions already waiting on a reply,
+		// so one set up across it is caught here.
+		if !s.failedSince(outerTag, N.NetworkUDP, dialed) {
+			return pc, nil
+		}
+		pc.Close()
+		err = errAbandonedDial
 	}
 	s.logger.ErrorContext(ctx, err)
 	if errors.Is(ctx.Err(), context.Canceled) {
@@ -1533,7 +1540,7 @@ func (s *MutableAutoSelect) mutateHistoryLocked(tag string, fn func(*localHistor
 	return true
 }
 
-var errAbandonedDial = errors.New("dial abandoned: member failed confirmation")
+var errAbandonedDial = errors.New("dial abandoned: member failed while it was set up")
 
 // dialPrimary dials o, the TCP selection, and probes o once the dial has been
 // pending earlyConfirmAfter. If that probe fails and the selection moves off
@@ -1563,7 +1570,7 @@ func (s *MutableAutoSelect) dialPrimary(ctx context.Context, o A.Outbound, netwo
 	tag := o.Tag()
 	for {
 		s.access.Lock()
-		changed, failed := s.probeChanged, s.failedSinceLocked(tag, dialed)
+		changed, failed := s.probeChanged, s.failedSinceLocked(tag, N.NetworkTCP, dialed)
 		s.access.Unlock()
 		if failed {
 			cancel()
@@ -1589,17 +1596,21 @@ func (s *MutableAutoSelect) dialPrimary(ctx context.Context, o A.Outbound, netwo
 }
 
 // failedSince is failedSinceLocked for a caller not holding s.access.
-func (s *MutableAutoSelect) failedSince(tag string, since time.Time) bool {
+func (s *MutableAutoSelect) failedSince(tag, network string, since time.Time) bool {
 	s.access.Lock()
 	defer s.access.Unlock()
-	return s.failedSinceLocked(tag, since)
+	return s.failedSinceLocked(tag, network, since)
 }
 
-// failedSinceLocked reports whether tag is no longer the TCP selection and
-// its latest probe, completed after since, failed. Caller must hold s.access.
-func (s *MutableAutoSelect) failedSinceLocked(tag string, since time.Time) bool {
-	if loadString(&s.stickyTag.tcp) == tag {
+// failedSinceLocked reports whether tag is no longer network's selection and
+// is failing: its latest probe, completed after since, failed or, for UDP,
+// its failure streak is at the limit. Caller must hold s.access.
+func (s *MutableAutoSelect) failedSinceLocked(tag, network string, since time.Time) bool {
+	if loadString(s.stickySlot(network)) == tag {
 		return false
+	}
+	if network == N.NetworkUDP && !s.streakSinceLocked(tag, network).IsZero() {
+		return true
 	}
 	state := s.probeMembers[tag]
 	return state != nil && state.outcome != nil && !state.outcome.success &&
