@@ -74,6 +74,9 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 	hooks := dataPlaneHooks{
 		onUnanswered: func(waitingSince time.Time, dest string) {
 			if !s.chargeable(outerTag, route) {
+				if network == N.NetworkUDP {
+					s.closeStuckOffSelectionUDP(outerTag, generation)
+				}
 				return
 			}
 			// A UDP handle carries many exchanges; each counts as a conn
@@ -174,17 +177,24 @@ type dataPlaneWatchdog struct {
 	reportedSinceAnswer bool
 	lastAnswerNotify    time.Time
 	notifiedSources     map[string]struct{}
-	waitJoined          bool // a send joined the current wait
-	readBytes           atomic.Uint64
-	responded           atomic.Bool
-	answered            atomic.Bool // set by the first read of data
-	peerClosed          atomic.Bool // set by a read of EOF
-	closed              atomic.Bool
-	proven              atomic.Bool
-	stalled             atomic.Bool
-	fired               atomic.Bool
-	timer               *time.Timer
-	closeOnce           sync.Once
+	// The current wait's id; its sends still under way and how many joined
+	// it; the join order of the earliest send that sent, or -1; and the
+	// latest destination waited on before it began.
+	waitID       uint64
+	waitSends    int
+	waitJoins    int
+	waitSentSeq  int
+	waitPrevDest string
+	readBytes    atomic.Uint64
+	responded    atomic.Bool
+	answered     atomic.Bool // set by the first read of data
+	peerClosed   atomic.Bool // set by a read of EOF
+	closed       atomic.Bool
+	proven       atomic.Bool
+	stalled      atomic.Bool
+	fired        atomic.Bool
+	timer        *time.Timer
+	closeOnce    sync.Once
 }
 
 func (w *dataPlaneWatchdog) init(idle time.Duration, provedReadBytes uint64, hooks dataPlaneHooks) {
@@ -406,11 +416,14 @@ func (w *dataPlaneWatchdog) noteFirstWrite() {
 	}
 }
 
-// datagramWait identifies the wait a send started, so a failed send can
-// undo it.
+// datagramWait identifies the wait a send began or joined, the send's place
+// in it, when it began and where to, so its outcome can be recorded against
+// the wait.
 type datagramWait struct {
-	since    time.Time
-	lastDest string
+	id    uint64
+	seq   int
+	since time.Time
+	dest  string
 }
 
 // beginDatagramWait starts a wait for a reply to a datagram about to be sent
@@ -423,18 +436,21 @@ func (w *dataPlaneWatchdog) beginDatagramWait(dest M.Socksaddr) datagramWait {
 	}
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
-	if !w.awaitingSince.IsZero() {
-		w.waitJoined = true
-		return datagramWait{}
-	}
-	started := datagramWait{since: time.Now(), lastDest: w.lastDest}
-	w.awaitingSince, w.waitJoined = started.since, false
 	// Unwrapped so an IPv4 destination has one spelling however the
 	// datagram was addressed.
+	to := w.lastDest
 	if dest = dest.Unwrap(); dest.IsValid() {
-		w.lastDest = dest.String()
+		to = dest.String()
 	}
-	w.awaitingDest = w.lastDest
+	if !w.awaitingSince.IsZero() {
+		w.waitSends++
+		w.waitJoins++
+		return datagramWait{id: w.waitID, seq: w.waitJoins, since: time.Now(), dest: to}
+	}
+	w.waitID++
+	started := datagramWait{id: w.waitID, since: time.Now(), dest: to}
+	w.awaitingSince, w.waitSends, w.waitJoins, w.waitSentSeq, w.waitPrevDest = started.since, 1, 0, -1, w.lastDest
+	w.lastDest, w.awaitingDest = to, to
 	if w.unansweredTimer == nil {
 		w.unansweredTimer = time.AfterFunc(w.unansweredAfter, w.fireUnansweredWhileOpen)
 	} else {
@@ -443,21 +459,31 @@ func (w *dataPlaneWatchdog) beginDatagramWait(dest M.Socksaddr) datagramWait {
 	return started
 }
 
-// cancelDatagramWait undoes the wait a send that failed started, unless it
-// has already ended or another send joined it.
-func (w *dataPlaneWatchdog) cancelDatagramWait(started datagramWait) {
-	if started.since.IsZero() {
+// endDatagramSend records whether a send that began or joined wait sent its
+// datagram. A wait still running is for the earliest send that sent: its
+// destination, from when it began. Once every send has ended and none sent,
+// the wait is undone.
+func (w *dataPlaneWatchdog) endDatagramSend(wait datagramWait, sent bool) {
+	if wait.id == 0 {
 		return
 	}
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
-	if !w.awaitingSince.Equal(started.since) || w.waitJoined {
+	if w.awaitingSince.IsZero() || wait.id != w.waitID {
 		return
 	}
-	w.awaitingSince, w.lastDest = time.Time{}, started.lastDest
-	if w.unansweredTimer != nil {
-		w.unansweredTimer.Stop()
+	w.waitSends--
+	if sent && (w.waitSentSeq < 0 || wait.seq < w.waitSentSeq) {
+		w.waitSentSeq = wait.seq
+		w.awaitingSince, w.awaitingDest, w.lastDest = wait.since, wait.dest, wait.dest
+		w.unansweredTimer.Reset(w.unansweredAfter - time.Since(wait.since))
+		return
 	}
+	if w.waitSends > 0 || w.waitSentSeq >= 0 {
+		return
+	}
+	w.awaitingSince, w.lastDest = time.Time{}, w.waitPrevDest
+	w.unansweredTimer.Stop()
 }
 
 // noteDatagramReceived ends the current wait, since the handle delivered,
@@ -734,9 +760,7 @@ func (d *dataPlanePacket) WriteTo(p []byte, addr net.Addr) (int, error) {
 		started = d.beginDatagramWait(M.SocksaddrFromNet(addr))
 	}
 	n, err := d.PacketConn.WriteTo(p, addr)
-	if err != nil || n == 0 {
-		d.cancelDatagramWait(started)
-	}
+	d.endDatagramSend(started, err == nil && n > 0)
 	d.noteIO(n, err, false)
 	return n, err
 }
@@ -759,9 +783,7 @@ func (d *dataPlanePacket) WritePacket(buffer *buf.Buffer, destination M.Socksadd
 		started = d.beginDatagramWait(destination)
 	}
 	err := d.writer.WritePacket(buffer, destination)
-	if err != nil {
-		d.cancelDatagramWait(started)
-	}
+	d.endDatagramSend(started, err == nil)
 	d.noteIO(n, err, false)
 	return err
 }

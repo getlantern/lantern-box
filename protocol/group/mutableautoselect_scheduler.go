@@ -48,6 +48,7 @@ type probeOutcome struct {
 	sequence   uint64
 	success    bool
 	delayMs    uint32
+	started    time.Time
 	completed  time.Time
 	generation uint64
 	url        string
@@ -320,6 +321,7 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 	outcome := s.recordProbeOutcomeLocked(attempt.tag, &probeOutcome{
 		success:    success,
 		delayMs:    delayMs,
+		started:    attempt.started,
 		generation: attempt.generation,
 		url:        attempt.url,
 		lastResort: attempt.lastResort,
@@ -815,9 +817,9 @@ func (s *MutableAutoSelect) onProbePause(event int) {
 	case pause.EventDevicePaused, pause.EventNetworkPause:
 		s.pauseEpoch++
 		s.cancelProbesLocked(false)
-		// Its probes are canceled unrecorded, and probes after the pause say
+		// Probes are canceled unrecorded, and probes after the pause say
 		// nothing about failures before it.
-		s.pendingConfirmedFailure.tag = ""
+		s.resetConfirmationsLocked()
 		if s.periodicTimer != nil {
 			s.periodicTimer.Stop()
 			s.periodicTimer = nil
@@ -828,6 +830,16 @@ func (s *MutableAutoSelect) onProbePause(event int) {
 			s.dispatchProbesLocked()
 		}
 	}
+}
+
+// resetConfirmationsLocked drops every confirmation under way, its strikes
+// and cooldowns, and a pending switch. Caller must hold s.access.
+func (s *MutableAutoSelect) resetConfirmationsLocked() {
+	for _, state := range s.probeMembers {
+		state.confirmationPending, state.replacement = false, ""
+		state.firstConfirmFailedAt, state.confirmedAt = time.Time{}, time.Time{}
+	}
+	s.pendingConfirmedFailure.tag = ""
 }
 
 func (s *MutableAutoSelect) armPeriodicLocked() {
@@ -928,11 +940,9 @@ func (s *MutableAutoSelect) advanceNetworkLocked() {
 	s.cancelProbesLocked(true)
 	// Confirmations and failure streaks on the old network say nothing about
 	// the new one.
-	for _, state := range s.probeMembers {
-		state.confirmationPending = false
-		state.firstConfirmFailedAt, state.confirmedAt = time.Time{}, time.Time{}
-	}
-	s.pendingConfirmedFailure.tag = ""
+	s.resetConfirmationsLocked()
+	// Probes on the new network decide whether it is down too.
+	s.outageSince = time.Time{}
 	for _, h := range s.histories {
 		h.clearStreak(streakTCP)
 		h.clearStreak(streakUDP)

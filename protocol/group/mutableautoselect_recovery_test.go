@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1853,6 +1854,8 @@ func TestListenPacket_SessionLeftOnReleasedMemberMovesOnceStuck(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, obs := newConfirmationTestMUR(t, "a", "b")
 		s.stickyTag.udp.Store("a")
+		// Once released, a is selected for neither network.
+		s.stickyTag.tcp.Store("b")
 		handles := map[string][]*scriptedPacketConn{}
 		listenScripted(obs, handles, "a")
 		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
@@ -2095,4 +2098,244 @@ func TestConfirmation_GatedPassAmongFailedReplacementsIsNoOutage(t *testing.T) {
 		defer s.access.Unlock()
 		assert.False(t, s.outageSuspectedLocked(), "a member in its recovery gate passing shows the network is up")
 	})
+}
+
+func TestConfirmation_RecheckStartsAfterReplacementPass(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		// a's first two probes time out; later ones pass.
+		var aProbes atomic.Int32
+		obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+			if aProbes.Add(1) <= 2 {
+				return hangUntilDone(ctx)
+			}
+			return probeResponderConn(), nil
+		}
+		var bProbes atomic.Int32
+		failingProbes(obs["b"], &bProbes, hangUntilDone)
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(time.Second), nil }
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		require.GreaterOrEqual(t, aProbes.Load(), int32(3), "a is rechecked")
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp),
+			"a probe of a started before c passed is no recheck after it; the recheck that follows passes")
+	})
+}
+
+func TestDialContext_CallerCancelIsNotCharged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s.lastLadderAt.Store(0)
+		obs["a"].dial = hangUntilDone
+		var bProbes atomic.Int32
+		obs["b"].dial = func(ctx context.Context) (net.Conn, error) {
+			bProbes.Add(1)
+			return probeResponderConn(), nil
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			cancel()
+		}()
+		_, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
+		require.Error(t, err)
+		synctest.Wait()
+		failures, _ := userFailures(s, "a")
+		assert.Empty(t, failures, "a caller giving up says nothing about the member")
+		assert.Zero(t, bProbes.Load(), "so it starts no ladder")
+	})
+}
+
+type failingSendsPacketConn struct {
+	*scriptedPacketConn
+	d     *dataPlanePacket
+	sends int
+}
+
+func (c *failingSendsPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.sends++
+	if c.sends == 1 {
+		c.d.WriteTo(p, addr)
+	}
+	return 0, os.ErrDeadlineExceeded
+}
+
+func TestDataPlanePacket_AllSendsFailingEndsTheWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var unanswered atomic.Int32
+		c := &failingSendsPacketConn{scriptedPacketConn: newScriptedPacketConn()}
+		d := newDataPlanePacket(c, time.Hour, 1<<20, dataPlaneHooks{
+			onUnanswered: func(time.Time, string) { unanswered.Add(1) },
+		})
+		c.d = d
+		d.unansweredAfter = defaultUDPUnansweredAfter
+		d.unansweredWhileOpen = true
+		defer d.Close()
+		d.WriteTo([]byte("query"), &net.UDPAddr{})
+		time.Sleep(2 * defaultUDPUnansweredAfter)
+		synctest.Wait()
+		assert.Zero(t, unanswered.Load(), "no datagram was sent, so none went unanswered")
+	})
+}
+
+func TestConfirmation_PauseDropsFirstStrike(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		var aProbes atomic.Int32
+		obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+			aProbes.Add(1)
+			return hangUntilDone(ctx)
+		}
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		time.Sleep(defaultProbeTimeout + time.Second)
+		s.onProbePause(pause.EventNetworkPause)
+		time.Sleep(time.Second)
+		s.onProbePause(pause.EventNetworkWake)
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		require.GreaterOrEqual(t, aProbes.Load(), int32(3), "a is probed again after the wake")
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp),
+			"a failure before a pause doesn't pair with one after it")
+	})
+}
+
+func TestSplitHealthy_StreakBumpKeepsTierOrder(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b", "c")
+	recordSuccess(s, "a", 30)
+	recordSuccess(s, "b", 500)
+	recordSuccess(s, "c", 20)
+	s.stickyTag.tcp.Store("a")
+	addUserFailureN(s, "b", int(s.hist.softFailLimit))
+	addUserFailureN(s, "c", int(s.hist.softFailLimit))
+	generation := s.networkGeneration.Load()
+	s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+	s.noteUnanswered("a", generation, "tcp", "", time.Now().Add(time.Second), time.Now().Add(time.Second))
+	s.access.Lock()
+	defer s.access.Unlock()
+	pool, _ := s.splitHealthyForLocked(s.rankLocked(time.Now().Add(time.Second)), "tcp")
+	require.Len(t, pool, 3)
+	assert.Equal(t, []string{"c", "a", "b"}, []string{pool[0].tag, pool[1].tag, pool[2].tag},
+		"a member bumped by its streak ranks within its new tier as any other")
+}
+
+func TestAdvanceNetwork_ClearsOutageSuspicion(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.suspectOutageLocked(time.Now())
+	s.advanceNetworkLocked()
+	assert.False(t, s.outageSuspectedLocked(), "an outage of the old network says nothing about the new one")
+}
+
+func TestStreak_TCPOnlyPassIsNoUDPOutage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		s.stickyTag.udp.Store("a")
+		// a's and b's probes time out, so c's pass comes before they fail.
+		for _, tag := range []string{"a", "b"} {
+			obs[tag].dial = hangUntilDone
+		}
+		obs["c"].networks = []string{"tcp"}
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		generation := s.networkGeneration.Load()
+		s.noteUserResponse("a", generation, "udp", "dns:53", time.Now(), time.Now())
+		time.Sleep(time.Second)
+		s.noteUnanswered("a", generation, "udp", "dns:53", time.Now(), time.Now())
+		time.Sleep(2 * time.Second)
+		s.noteUnanswered("a", generation, "udp", "dns:53", time.Now(), time.Now())
+		s.access.Lock()
+		s.requestProbesLocked([]string{"c"}, probeForced, false)
+		s.dispatchProbesLocked()
+		s.access.Unlock()
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		s.access.Lock()
+		defer s.access.Unlock()
+		require.True(t, s.probeMembers["c"].outcome.success, "c passed")
+		assert.False(t, s.outageSuspectedLocked(), "a TCP-only member passing shows the network is up")
+	})
+}
+
+func TestDialContext_ClosedGroupDialsNothing(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	var dials atomic.Int32
+	for _, tag := range []string{"a", "b"} {
+		obs[tag].dial = func(context.Context) (net.Conn, error) {
+			dials.Add(1)
+			return newScriptedConn(), nil
+		}
+	}
+	s.Close()
+	_, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+	require.ErrorIs(t, err, net.ErrClosed)
+	assert.Zero(t, dials.Load(), "a closed group dials no member")
+}
+
+// reroutedSendPacketConn fails its first send after another send, a second
+// later and to another destination, has joined the wait and succeeded.
+type reroutedSendPacketConn struct {
+	*scriptedPacketConn
+	d        *dataPlanePacket
+	to       net.Addr
+	sends    int
+	joinedAt time.Time
+}
+
+func (c *reroutedSendPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.sends++
+	if c.sends == 1 {
+		time.Sleep(time.Second)
+		c.joinedAt = time.Now()
+		c.d.WriteTo(p, c.to)
+		return 0, errors.New("send failed")
+	}
+	return len(p), nil
+}
+
+func TestDataPlanePacket_WaitFollowsTheSendThatSucceeded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var reportedSince time.Time
+		var reportedDest string
+		c := &reroutedSendPacketConn{
+			scriptedPacketConn: newScriptedPacketConn(),
+			to:                 &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 53},
+		}
+		d := newDataPlanePacket(c, time.Hour, 1<<20, dataPlaneHooks{
+			onUnanswered: func(since time.Time, dest string) { reportedSince, reportedDest = since, dest },
+		})
+		c.d = d
+		d.unansweredAfter = defaultUDPUnansweredAfter
+		d.unansweredWhileOpen = true
+		defer d.Close()
+		d.WriteTo([]byte("query"), &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 53})
+		time.Sleep(2 * defaultUDPUnansweredAfter)
+		synctest.Wait()
+		assert.Equal(t, "10.0.0.2:53", reportedDest, "the wait is for the datagram that was sent")
+		assert.Equal(t, c.joinedAt, reportedSince, "from when it was sent")
+	})
+}
+
+func TestDialContext_ConnMissingTheSwitchSweepIsReplaced(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	s.cfg.dataPlaneFirstResponseTimeout = defaultFirstResponseTimeout
+	obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+		// The selection moves off a after its dial result is taken but
+		// before the conn is registered, so the switch's sweep misses it.
+		s.access.Lock()
+		s.recordProbeOutcomeLocked("a", &probeOutcome{generation: s.networkGeneration.Load(), url: s.probeURLForLocked("a")})
+		s.stickyTag.tcp.Store("b")
+		s.access.Unlock()
+		return newScriptedConn(), nil
+	}
+	var bDials atomic.Int32
+	obs["b"].dial = func(context.Context) (net.Conn, error) {
+		bDials.Add(1)
+		return newScriptedConn(), nil
+	}
+	conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+	require.NoError(t, err)
+	defer conn.Close()
+	assert.EqualValues(t, 1, bDials.Load(), "the caller gets a conn through the new selection")
 }
