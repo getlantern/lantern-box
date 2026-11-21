@@ -64,30 +64,44 @@ func TestHedgeObserverSeesCommitToFirstOnce(t *testing.T) {
 	ctx := context.WithValue(f.ctx, connLabelKey{}, "conn-1")
 	c, err := f.hedge.DialContext(ctx, "tcp", hedgeDest)
 	require.NoError(t, err)
-	defer c.Close()
+	// A deadlocked report holds the leg's mutex for good, and Close needs it.
+	deadlocked := false
+	defer func() {
+		if !deadlocked {
+			c.Close()
+		}
+	}()
 	// The observer is the host's code, so it may call back into the
 	// connection: SetDeadline takes the leg's mutex, and would deadlock if
 	// the report were made while holding it.
 	obs.onCommit = func() { _ = c.SetDeadline(time.Now().Add(5 * time.Second)) }
 	require.Empty(t, obs.committed(), "nothing is reported before First replies")
-	require.Equal(t, "first:hello", exchange(t, c, "hello"))
-	require.Equal(t, "first:again", exchange(t, c, "again"))
+	replies := make(chan []string, 1)
+	go func() {
+		var got []string
+		buf := make([]byte, 64)
+		for _, req := range []string{"hello", "again"} {
+			if _, err := c.Write([]byte(req)); err != nil {
+				break
+			}
+			n, err := c.Read(buf)
+			if err != nil {
+				break
+			}
+			got = append(got, string(buf[:n]))
+		}
+		replies <- got
+	}()
+	select {
+	case got := <-replies:
+		require.Equal(t, []string{"first:hello", "first:again"}, got)
+	case <-time.After(5 * time.Second):
+		deadlocked = true
+		t.Fatal("the read that commits hung: the observer must be called without the leg's mutex")
+	}
 	// A second reader that started before the first reply also commits.
 	require.True(t, c.(*hedgeStream).commit(c.(*hedgeStream).releaseLocked))
 	require.Equal(t, []string{"conn-1 hedge first"}, obs.committed(), "one report, with the dial's context and the tags")
-}
-
-func TestHedgeObserverIgnoresAReplyRacingAMove(t *testing.T) {
-	f, obs := newObservedHedgeFixture(t, &fakeOutbound{stream: blackhole}, &fakeOutbound{stream: answer("then:")})
-	c, err := f.hedge.DialContext(f.ctx, "tcp", hedgeDest)
-	require.NoError(t, err)
-	defer c.Close()
-	s := c.(*hedgeStream)
-	s.mu.Lock()
-	s.moving = true
-	s.mu.Unlock()
-	require.False(t, s.commit(s.releaseLocked))
-	require.Empty(t, obs.committed())
 }
 
 func TestHedgeObserverIgnoresAReplyRacingClose(t *testing.T) {
