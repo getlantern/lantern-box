@@ -1124,7 +1124,7 @@ func (s *MutableAutoSelect) awaitStreakReplacement(ctx context.Context, network 
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-s.ctx.Done():
-			return nil
+			return ctx.Err()
 		}
 	}
 }

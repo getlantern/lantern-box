@@ -1797,6 +1797,14 @@ func (c expiredUnseenCtx) Err() error {
 }
 
 func TestDialContext_DeadlineAsWaitEndsDialsNothing(t *testing.T) {
+	for _, closeGroup := range []bool{false, true} {
+		t.Run(map[bool]string{false: "wait times out", true: "group closes"}[closeGroup], func(t *testing.T) {
+			deadlineAsWaitEnds(t, closeGroup)
+		})
+	}
+}
+
+func deadlineAsWaitEnds(t *testing.T, closeGroup bool) {
 	synctest.Test(t, func(t *testing.T) {
 		s, members := newStreakTestMUR(t)
 		ob, _ := s.members.Load("b")
@@ -1805,6 +1813,12 @@ func TestDialContext_DeadlineAsWaitEndsDialsNothing(t *testing.T) {
 		unansweredExchange(t, s, members, false, 3*time.Second)
 		last := members["a"]
 		ctx := expiredUnseenCtx{Context: context.Background(), at: time.Now().Add(time.Second)}
+		if closeGroup {
+			go func() {
+				time.Sleep(1500 * time.Millisecond)
+				s.Close()
+			}()
+		}
 		_, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
 		require.ErrorIs(t, err, context.DeadlineExceeded)
 		assert.Same(t, last, members["a"], "no member is dialed with a context that ended during the wait")
