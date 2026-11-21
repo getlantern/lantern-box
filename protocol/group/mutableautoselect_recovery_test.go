@@ -2104,20 +2104,38 @@ func TestConfirmation_RecheckStartsAfterReplacementPass(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
 		// a's first two probes time out; later ones pass.
-		var aProbes atomic.Int32
+		var (
+			mu      sync.Mutex
+			aStarts []time.Time
+			cPassed time.Time
+		)
 		obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
-			if aProbes.Add(1) <= 2 {
+			mu.Lock()
+			aStarts = append(aStarts, time.Now())
+			n := len(aStarts)
+			mu.Unlock()
+			if n <= 2 {
 				return hangUntilDone(ctx)
 			}
 			return probeResponderConn(), nil
 		}
 		var bProbes atomic.Int32
 		failingProbes(obs["b"], &bProbes, hangUntilDone)
-		obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(time.Second), nil }
+		obs["c"].dial = func(context.Context) (net.Conn, error) {
+			mu.Lock()
+			if cPassed.IsZero() {
+				cPassed = time.Now().Add(time.Second)
+			}
+			mu.Unlock()
+			return slowProbeResponderConn(time.Second), nil
+		}
 		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
 		time.Sleep(time.Minute)
 		synctest.Wait()
-		require.GreaterOrEqual(t, aProbes.Load(), int32(3), "a is rechecked")
+		mu.Lock()
+		defer mu.Unlock()
+		require.GreaterOrEqual(t, len(aStarts), 3, "a is rechecked")
+		assert.False(t, aStarts[2].Before(cPassed), "the recheck starts once c has passed")
 		assert.Equal(t, "a", loadString(&s.stickyTag.tcp),
 			"a probe of a started before c passed is no recheck after it; the recheck that follows passes")
 	})
@@ -2173,6 +2191,10 @@ func TestDataPlanePacket_AllSendsFailingEndsTheWait(t *testing.T) {
 		d.unansweredWhileOpen = true
 		defer d.Close()
 		d.WriteTo([]byte("query"), &net.UDPAddr{})
+		d.ioMu.Lock()
+		waiting := !d.awaitingSince.IsZero()
+		d.ioMu.Unlock()
+		assert.False(t, waiting, "both sends failed, so the wait ended")
 		time.Sleep(2 * defaultUDPUnansweredAfter)
 		synctest.Wait()
 		assert.Zero(t, unanswered.Load(), "no datagram was sent, so none went unanswered")
@@ -2416,21 +2438,30 @@ func TestListenPacket_SessionLeftOnConfirmedFailedMemberMovesOnceStuck(t *testin
 		pc.WriteTo([]byte("q"), &net.UDPAddr{})
 		time.Sleep(2250 * time.Millisecond)
 		synctest.Wait()
-		assert.True(t, isClosed(handles["a"][0]), "once its exchange goes unanswered it is moved off a, though a has no UDP failure streak")
+		require.False(t, isClosed(handles["a"][0]), "one unanswered exchange isn't enough")
+		pc.WriteTo([]byte("q"), &net.UDPAddr{})
+		time.Sleep(2250 * time.Millisecond)
+		synctest.Wait()
+		assert.True(t, isClosed(handles["a"][0]),
+			"once a retry goes unanswered too it is moved off a, though a was released for its TCP failures")
 		pc.Close()
 		pc2.Close()
 	})
 }
 
 func TestListenPacket_SessionLeftOnReleasedMemberByCause(t *testing.T) {
+	failedProbe := func(h *localHistory) { h.recordProbeFailure(time.Now()) }
 	for _, tc := range []struct {
 		name    string
 		release func(h *localHistory)
-		closed  bool
+		// gap separates the session's two unanswered exchanges.
+		gap    time.Duration
+		closed bool
 	}{
-		{"slower", func(*localHistory) {}, false},
-		{"probe failed", func(h *localHistory) { h.recordProbeFailure(time.Now()) }, true},
-		{"gated", func(h *localHistory) { h.startRecoveryGate(time.Now()) }, true},
+		{"slower", func(*localHistory) {}, 2250 * time.Millisecond, false},
+		{"probe failed", failedProbe, 2250 * time.Millisecond, true},
+		{"gated", func(h *localHistory) { h.startRecoveryGate(time.Now()) }, 2250 * time.Millisecond, true},
+		{"probe failed, one-way keepalives", failedProbe, 25 * time.Second, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -2458,11 +2489,13 @@ func TestListenPacket_SessionLeftOnReleasedMemberByCause(t *testing.T) {
 				s.stickyTag.udp.Store("b")
 				s.access.Unlock()
 
-				pc.WriteTo([]byte("q"), &net.UDPAddr{})
-				time.Sleep(2250 * time.Millisecond)
-				synctest.Wait()
+				for range 2 {
+					pc.WriteTo([]byte("q"), &net.UDPAddr{})
+					time.Sleep(tc.gap)
+					synctest.Wait()
+				}
 				assert.Equal(t, tc.closed, isClosed(handles["a"][0]),
-					"an unanswered session moves off a member released for failing, not one released for being slower")
+					"a retried exchange going unanswered moves a session off a member released for failing")
 				pc.Close()
 			})
 		})
@@ -2526,5 +2559,80 @@ func TestConfirmation_FallbackThatAnsweredSwitches(t *testing.T) {
 		synctest.Wait()
 		assert.Equal(t, "b", loadString(&s.stickyTag.tcp), "b answered the fallback conn between the strikes")
 		conn.Close()
+	})
+}
+
+func TestConfirmation_AnsweredFallbackStillRechecksMixedResults(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		release, second := make(chan struct{}), make(chan struct{})
+		var aDials atomic.Int32
+		obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+			switch aDials.Add(1) {
+			case 1:
+				return nil, errors.New("dial timeout")
+			case 2:
+				<-release
+				return nil, errors.New("dial timeout")
+			case 3:
+				<-second
+				return nil, errors.New("dial timeout")
+			}
+			return probeResponderConn(), nil
+		}
+		obs["b"].dial = func(ctx context.Context) (net.Conn, error) {
+			if adapter.IsProbe(ctx) {
+				return slowProbeResponderConn(2 * time.Second), nil
+			}
+			return probeResponderConn(), nil
+		}
+		var cProbes atomic.Int32
+		failingProbes(obs["c"], &cProbes, hangUntilDone)
+
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		close(release)
+		synctest.Wait()
+		time.Sleep(time.Second)
+		_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: probe.test\r\n\r\n"))
+		require.NoError(t, err)
+		_, err = conn.Read(make([]byte, 64))
+		require.NoError(t, err)
+		close(second)
+		synctest.Wait()
+		require.Positive(t, cProbes.Load(), "c's replacement probe failed since the first strike")
+		require.Equal(t, "a", loadString(&s.stickyTag.tcp), "with c failing too, b answering is no reason to skip the recheck")
+
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		assert.GreaterOrEqual(t, aDials.Load(), int32(4), "a is rechecked once b passes")
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "and passing it, keeps the selection")
+		conn.Close()
+	})
+}
+
+func TestConfirmation_SelectionPassingDuringPendingSwitchIsNoOutage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("dial timeout") }
+		// b's replacement probe hangs until it times out.
+		obs["b"].dial = func(ctx context.Context) (net.Conn, error) { return hangUntilDone(ctx) }
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		synctest.Wait()
+		s.access.Lock()
+		require.Equal(t, "a", s.pendingConfirmedFailure.tag, "a failed twice; the switch waits on b")
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		s.requestProbesLocked([]string{"a"}, probeForced, false)
+		s.dispatchProbesLocked()
+		s.access.Unlock()
+		synctest.Wait()
+
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		s.access.Lock()
+		defer s.access.Unlock()
+		require.True(t, s.probeMembers["a"].outcome.success, "a passed")
+		assert.False(t, s.outageSuspectedLocked(), "b failing while a answers is no outage")
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp))
 	})
 }

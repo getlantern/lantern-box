@@ -73,19 +73,17 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 	opened := time.Now()
 	hooks := dataPlaneHooks{
 		onUnanswered: func(waitingSince time.Time, dest string) {
-			if !s.chargeable(outerTag, route) {
-				if network == N.NetworkUDP {
-					s.closeStuckOffSelectionUDP(outerTag, generation)
-				}
-				return
-			}
 			// A UDP handle carries many exchanges; each counts as a conn
 			// opened when its wait began.
 			exchangeOpened := opened
 			if network == N.NetworkUDP {
 				exchangeOpened = waitingSince
 			}
-			s.noteUnanswered(outerTag, generation, network, dest, exchangeOpened, waitingSince)
+			if s.chargeable(outerTag, route) {
+				s.noteUnanswered(outerTag, generation, network, dest, exchangeOpened, waitingSince)
+			} else if network == N.NetworkUDP {
+				s.noteUnansweredOffSelection(outerTag, generation, dest, exchangeOpened, waitingSince)
+			}
 		},
 		onFailure: func(kind adapter.UserFailureKind) {
 			if !s.chargeable(outerTag, route) {
