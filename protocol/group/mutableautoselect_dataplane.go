@@ -23,6 +23,15 @@ const defaultDataPlaneResetQuiet = 5 * time.Second
 
 const defaultFirstResponseTimeout = 10 * time.Second
 
+// dataPlaneStallMinUnanswered is how many bytes a connection must have
+// written since its last read for going quiet to count as a stall. An idle
+// keep-alive connection's last write is a single small frame, such as an
+// HTTP/2 WINDOW_UPDATE or PING ack, about 35-60 bytes in a TLS record. A new
+// connection blocked after its handshake leaves more unanswered: its first
+// request alone runs past this. A single small request on an established
+// connection that has since died is not charged.
+const dataPlaneStallMinUnanswered = 256
+
 type dataPlaneHooks struct {
 	onFailure func(adapter.UserFailureKind)
 	// onError runs on the IO goroutine, outside the watchdog's lock.
@@ -65,7 +74,8 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 				}
 			}
 			s.logger.Debug("data-plane error: tag=", outerTag, " decision=", decision,
-				" err=", err, " quiet=", state.quiet, " last=", last, " proven=", state.proven)
+				" err=", err, " quiet=", state.quiet, " last=", last, " proven=", state.proven,
+				" unanswered=", state.unanswered)
 		},
 		onActivity: s.noteDataActivity,
 	}
@@ -74,13 +84,16 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 type dataPlaneIO struct {
 	hasIO        bool
 	lastWasWrite bool
+	unanswered   uint64
 	quiet        time.Duration
 	proven       bool
 }
 
 // dataPlaneWatchdog detects unanswered writes and mid-stream stalls.
-// Idle expiry counts only after provedReadBytes have arrived and the last
-// non-empty IO was a write, so unused keep-alive connections are not charged.
+// Idle expiry counts only after provedReadBytes have arrived and at least
+// dataPlaneStallMinUnanswered bytes were written since the last read, so
+// keep-alive connections are not charged, whether unused or idle after a
+// small final write.
 //
 // A non-zero firstResponseTimeout starts after the first non-empty write,
 // independently of provedReadBytes. Read bytes or a non-timeout read error
@@ -94,6 +107,7 @@ type dataPlaneWatchdog struct {
 	ioMu                 sync.Mutex
 	lastIO               time.Time   // guarded by ioMu
 	lastWasWrite         bool        // guarded by ioMu
+	unanswered           uint64      // bytes written since the last read; guarded by ioMu
 	firstResponseTimer   *time.Timer // guarded by ioMu
 	readBytes            atomic.Uint64
 	responded            atomic.Bool
@@ -173,6 +187,11 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 	w.ioMu.Lock()
 	w.lastIO = now
 	w.lastWasWrite = !isRead
+	if isRead {
+		w.unanswered = 0
+	} else {
+		w.unanswered += uint64(n)
+	}
 	w.ioMu.Unlock()
 	w.timer.Reset(w.idle)
 	if !isRead {
@@ -202,6 +221,7 @@ func (w *dataPlaneWatchdog) snapshotIO() dataPlaneIO {
 	return dataPlaneIO{
 		hasIO:        hasIO,
 		lastWasWrite: w.lastWasWrite,
+		unanswered:   w.unanswered,
 		quiet:        time.Since(last),
 		proven:       w.proven.Load(),
 	}
@@ -268,13 +288,14 @@ func (w *dataPlaneWatchdog) fireNoResponse() {
 }
 
 // fireStall is the idle-timer callback: it demotes a conn that went quiet
-// mid-stream. It fires only on a proven conn whose last non-empty IO was a
-// Write.
+// mid-stream. It fires only on a proven conn that has written at least
+// dataPlaneStallMinUnanswered bytes since its last read, which also means its
+// last IO was a write.
 func (w *dataPlaneWatchdog) fireStall() {
 	if !w.proven.Load() {
 		return
 	}
-	if !w.snapshotIO().lastWasWrite {
+	if st := w.snapshotIO(); st.unanswered < dataPlaneStallMinUnanswered {
 		return
 	}
 	if !w.stalled.CompareAndSwap(false, true) {

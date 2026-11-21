@@ -172,7 +172,7 @@ func TestDataPlane_ConcurrentFailureClose(t *testing.T) {
 				})
 				defer w.closeWatchdog()
 				w.noteIO(1, nil, true)
-				w.noteIO(1, nil, false)
+				w.noteIO(dataPlaneStallMinUnanswered, nil, false)
 				var wg sync.WaitGroup
 				for range 20 {
 					wg.Go(func() { w.noteIO(0, connResetErr(), true) })
@@ -377,6 +377,55 @@ func TestDialContext_NoResponseChargedOnTCPOnly(t *testing.T) {
 					assert.Empty(t, uf)
 				}
 			})
+		})
+	}
+}
+
+// TestDataPlane_StallNeedsUnansweredBytes checks that going quiet counts as a
+// stall only after enough unanswered writes: an idle keep-alive connection
+// whose last write was one small frame, such as an HTTP/2 WINDOW_UPDATE once a
+// page has loaded, must not be charged.
+func TestDataPlane_StallNeedsUnansweredBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		io     func(w *dataPlaneWatchdog)
+		stalls bool
+	}{
+		{"small write after a read", func(w *dataPlaneWatchdog) {
+			w.noteIO(4096, nil, true)
+			w.noteIO(38, nil, false)
+		}, false},
+		{"writes add up past the threshold", func(w *dataPlaneWatchdog) {
+			w.noteIO(4096, nil, true)
+			for range 4 {
+				w.noteIO(dataPlaneStallMinUnanswered/4, nil, false)
+			}
+		}, true},
+		{"a read answers earlier writes", func(w *dataPlaneWatchdog) {
+			w.noteIO(4096, nil, true)
+			w.noteIO(dataPlaneStallMinUnanswered, nil, false)
+			w.noteIO(100, nil, true)
+			w.noteIO(38, nil, false)
+		}, false},
+		{"last IO a read", func(w *dataPlaneWatchdog) {
+			w.noteIO(dataPlaneStallMinUnanswered, nil, false)
+			w.noteIO(4096, nil, true)
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var failures []adapter.UserFailureKind
+			var w dataPlaneWatchdog
+			w.init(time.Hour, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
+				onFailure: func(k adapter.UserFailureKind) { failures = append(failures, k) },
+			})
+			defer w.closeWatchdog()
+			tc.io(&w)
+			w.fireStall()
+			if tc.stalls {
+				assert.Equal(t, []adapter.UserFailureKind{adapter.UserFailureStall}, failures)
+			} else {
+				assert.Empty(t, failures)
+			}
 		})
 	}
 }
