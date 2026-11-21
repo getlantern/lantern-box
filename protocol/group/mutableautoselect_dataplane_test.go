@@ -411,6 +411,13 @@ func TestDataPlane_StallNeedsUnansweredBytes(t *testing.T) {
 			w.noteIO(dataPlaneStallMinUnanswered, nil, false)
 			w.noteIO(4096, nil, true)
 		}, false},
+		{"small writes in separate quiet windows don't add up", func(w *dataPlaneWatchdog) {
+			w.noteIO(4096, nil, true)
+			for range 8 {
+				w.noteIO(38, nil, false)
+				w.fireStall() // the idle window passes, and declines
+			}
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var failures []adapter.UserFailureKind

@@ -158,9 +158,10 @@ type MutableAutoSelectOutboundOptions struct {
 	ConfirmedFailureSwitchCooldownSeconds uint32 `json:"confirmed_failure_switch_cooldown_seconds,omitempty"`
 
 	// DataPlaneIdleSeconds is the no-traffic threshold after which an
-	// established and proven tunnel that wrote at least 256 bytes since its
-	// last read is treated as a data-plane stall. A keep-alive idle after a
-	// small final write is not. Default 60.
+	// established and proven tunnel whose writes since its last read went
+	// unanswered is treated as a data-plane stall, if they add up to enough
+	// bytes (protocol/group's dataPlaneStallMinUnanswered). A keep-alive idle
+	// after a small final write is not. Default 60.
 	DataPlaneIdleSeconds uint32 `json:"data_plane_idle_seconds,omitempty"`
 
 	// DataPlaneProvedReadBytes is the cumulative Read-bytes threshold a
