@@ -20,8 +20,10 @@ replace github.com/quic-go/quic-go => github.com/getlantern/quic-go-unbounded-fo
 
 // x/v0.3.0 plus a one-line fix so x/httpconnect builds against quic-go >= v0.53
 // (quic.EarlyConnection became *quic.Conn), which the quic-go replace above
-// resolves to. Drop once an upstream x release includes OutlineFoundation/outline-sdk#657.
-replace golang.getoutline.org/sdk/x => github.com/getlantern/outline-sdk/x v0.3.0-lantern.1
+// resolves to, and getlantern/outline-sdk#2, so disorder finds the TCP socket
+// under the outline outbound's tracked connections. Drop once an upstream x
+// release includes both OutlineFoundation/outline-sdk#657 and that fix.
+replace golang.getoutline.org/sdk/x => github.com/getlantern/outline-sdk/x v0.3.0-lantern.2
 
 // sing-box/sing-tun/tailscale need gvisor's v0.0.0-20260727.0-sing-box-mod.1
 // API (WritePacketDirect, the new udp.NewForwarder signature). That tag's first

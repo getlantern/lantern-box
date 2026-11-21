@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/metadata"
@@ -287,24 +288,40 @@ func (s *outboundDialer) DialStream(ctx context.Context, addr string) (transport
 	if err != nil {
 		return nil, err
 	}
-	tcpConn, ok := conn.(*net.TCPConn)
-	if !ok {
-		return nil, fmt.Errorf("expected *net.TCPConn, got %T", conn)
-	}
-	return tcpConn, nil
+	return newStreamConn(conn)
 }
 
-func (s *outboundDialer) DialPacket(ctx context.Context, addr string) (net.Conn, error) {
-	destination := metadata.ParseSocksaddr(addr)
-	conn, err := s.dialer.ListenPacket(ctx, destination)
-	if err != nil {
-		return nil, err
+// newStreamConn makes a StreamConn of a TCP connection from sing-box's dialer.
+// Inside a box the dialer wraps each connection to track it, so the socket is
+// found through the wrapper. The wrapper is kept, so closing the stream still
+// stops tracking it.
+func newStreamConn(conn net.Conn) (transport.StreamConn, error) {
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		return tcp, nil
 	}
-	udpConn, ok := conn.(*net.UDPConn)
+	tcp, ok := common.Cast[*net.TCPConn](conn)
 	if !ok {
-		return nil, fmt.Errorf("failed to assert connection as *net.UDPConn")
+		conn.Close()
+		return nil, fmt.Errorf("expected a TCP connection, got %T", conn)
 	}
-	return udpConn, nil
+	return &streamConn{Conn: conn, tcp: tcp}, nil
+}
+
+// streamConn is a tracked TCP connection. NetConn gives strategies that set
+// socket options, such as disorder, the socket itself.
+type streamConn struct {
+	net.Conn
+	tcp *net.TCPConn
+}
+
+func (c *streamConn) CloseRead() error  { return c.tcp.CloseRead() }
+func (c *streamConn) CloseWrite() error { return c.tcp.CloseWrite() }
+func (c *streamConn) NetConn() net.Conn { return c.tcp }
+
+// DialPacket returns a UDP connection to addr. Any net.Conn will do, so a
+// tracked one from inside a box is returned as is.
+func (s *outboundDialer) DialPacket(ctx context.Context, addr string) (net.Conn, error) {
+	return s.dialer.DialContext(ctx, N.NetworkUDP, metadata.ParseSocksaddr(addr))
 }
 
 type logWriter struct {
