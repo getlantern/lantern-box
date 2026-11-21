@@ -227,14 +227,14 @@ func TestToTagHistory_HardDemoted(t *testing.T) {
 	// are not hard demoted.
 	soft := newLocalHistory()
 	for i := uint32(0); i < p.softFailLimit; i++ {
-		soft.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, p.userFailureWindow, 0)
+		soft.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, p.userFailureWindow, 0)
 	}
 	assert.False(t, soft.toTagHistory(now, p).HardDemoted,
 		"user failures below the hard limit are not hard demoted")
 
 	userHard := newLocalHistory()
 	for i := uint32(0); i < p.consecutiveFailLimit; i++ {
-		userHard.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, p.userFailureWindow, 0)
+		userHard.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, p.userFailureWindow, 0)
 	}
 	assert.True(t, userHard.toTagHistory(now, p).HardDemoted,
 		"user failures at the hard limit are hard demoted")
@@ -247,8 +247,8 @@ func TestLocalHistory_UserFailuresIndependentOfProbeOutcomes(t *testing.T) {
 	// laundered to clean by a passing probe.
 	h := newLocalHistory()
 	now := time.Now()
-	h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
-	h.addUserFailure(adapter.UserFailure{At: now.Add(time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now.Add(time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, 0)
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(2*time.Second), 5*time.Minute))
 	h.recordProbeSuccess(100, now.Add(3*time.Second))
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(4*time.Second), 5*time.Minute),
@@ -261,8 +261,8 @@ func TestLocalHistory_UserFailuresAgeOut(t *testing.T) {
 	// regardless of whether traffic gets routed through it.
 	h := newLocalHistory()
 	now := time.Now()
-	h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
-	h.addUserFailure(adapter.UserFailure{At: now.Add(time.Minute), Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now.Add(time.Minute), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, 0)
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(time.Minute), 5*time.Minute))
 	// Six minutes later, both are stale.
 	assert.Equal(t, uint32(0), h.userFailureCount(now.Add(6*time.Minute), 5*time.Minute),
@@ -278,12 +278,12 @@ func TestLocalHistory_AddUserFailureDedupesBurst(t *testing.T) {
 	now := time.Now()
 	dedupe := 30 * time.Second
 
-	require.True(t, h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "first failure must record")
-	require.False(t, h.addUserFailure(adapter.UserFailure{At: now.Add(time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "burst within dedupe must drop")
-	require.False(t, h.addUserFailure(adapter.UserFailure{At: now.Add(29 * time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "still within dedupe must drop")
+	require.True(t, h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, dedupe), "first failure must record")
+	require.False(t, h.addUserFailure(adapter.UserFailure{At: now.Add(time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, dedupe), "burst within dedupe must drop")
+	require.False(t, h.addUserFailure(adapter.UserFailure{At: now.Add(29 * time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, dedupe), "still within dedupe must drop")
 	assert.Equal(t, uint32(1), h.userFailureCount(now.Add(30*time.Second), 5*time.Minute), "burst collapsed to one")
 
-	require.True(t, h.addUserFailure(adapter.UserFailure{At: now.Add(30 * time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "at-or-past dedupe must record")
+	require.True(t, h.addUserFailure(adapter.UserFailure{At: now.Add(30 * time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, dedupe), "at-or-past dedupe must record")
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(30*time.Second), 5*time.Minute))
 }
 
@@ -389,7 +389,7 @@ func addUserFailureN(s *MutableAutoSelect, tag string, n int) {
 	h := s.historyForLocked(tag)
 	now := time.Now()
 	for i := 0; i < n; i++ {
-		h.addUserFailure(adapter.UserFailure{At: now.Add(time.Duration(i) * time.Millisecond), Kind: adapter.UserFailureStall}, s.hist.userFailureWindow, 0)
+		h.addUserFailure(adapter.UserFailure{At: now.Add(time.Duration(i) * time.Millisecond), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, s.hist.userFailureWindow, 0)
 	}
 }
 
@@ -560,7 +560,7 @@ func TestSetURLOverrides_KeepsSelectionOffFailedMember(t *testing.T) {
 	recordSuccess(s, "b", 200)
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.consecutiveFailLimit {
-		s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load())
+		s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load(), time.Time{}, "tcp")
 	}
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -762,8 +762,8 @@ func TestLateProbeAfterRemoveRecordsNothing(t *testing.T) {
 
 func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	assert.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load()), "first call must persist")
-	assert.False(t, s.recordUserFailure("a", adapter.UserFailureStall, s.networkGeneration.Load()), "immediate burst must return false (deduped)")
+	assert.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp"), "first call must persist")
+	assert.False(t, s.recordUserFailure("a", adapter.UserFailureStall, s.networkGeneration.Load(), time.Time{}, "tcp"), "immediate burst must return false (deduped)")
 	s.access.Lock()
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
@@ -771,7 +771,7 @@ func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	assert.Equal(t, uint32(1), h.userFailureCount(time.Now(), s.hist.userFailureWindow),
 		"successive calls within dedupe window must collapse")
 
-	assert.False(t, s.recordUserFailure("nonexistent", adapter.UserFailureDial, s.networkGeneration.Load()), "non-member must return false")
+	assert.False(t, s.recordUserFailure("nonexistent", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp"), "non-member must return false")
 	s.access.Lock()
 	_, exists := s.peekHistoryLocked("nonexistent")
 	s.access.Unlock()
@@ -806,7 +806,7 @@ func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 
 func TestRecordUserFailure_AttributesDialKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	require.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load()))
+	require.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp"))
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -2059,7 +2059,7 @@ func seedProbe(s *MutableAutoSelect, tag string, success bool, delayMs uint32) {
 func switchAfterConfirmedFailure(s *MutableAutoSelect, failedTag, replacementTag string) {
 	s.access.Lock()
 	defer s.access.Unlock()
-	s.trySwitchAfterConfirmedFailureLocked(failedTag, replacementTag)
+	s.trySwitchAfterConfirmedFailureLocked(failedTag, replacementTag, time.Time{})
 }
 
 func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
@@ -2079,7 +2079,7 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 			recordSuccess(s, "b", 200)
 			s.hist.userFailureDedupeWindow = 0
 			for range s.hist.consecutiveFailLimit {
-				s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load())
+				s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load(), time.Time{}, "tcp")
 			}
 			s.access.Lock()
 			s.historyForLocked("a").startRecoveryGate(time.Now())
