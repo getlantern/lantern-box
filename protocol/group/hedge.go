@@ -78,6 +78,9 @@ type Hedge struct {
 	// telemetrySites are the registered domains the hedge.site attribute may
 	// name; others are reported as "other".
 	telemetrySites map[string]bool
+	// observer, when the host registered one, is told about each
+	// connection that commits to First.
+	observer lAdapter.HedgeObserver
 }
 
 var _ lAdapter.Switchable = (*Hedge)(nil)
@@ -148,6 +151,7 @@ func NewHedge(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		exploreRate:    options.ExploreRate,
 		random:         rand.Float64,
 		telemetrySites: sites,
+		observer:       service.FromContext[lAdapter.HedgeObserver](ctx),
 	}
 	h.enabled.Store(!options.Disabled)
 	return h, nil
