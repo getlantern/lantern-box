@@ -527,7 +527,9 @@ func (w *dataPlaneWatchdog) noteDatagramReceived(at time.Time, source M.Socksadd
 func (w *dataPlaneWatchdog) fireUnansweredWhileOpen() {
 	w.ioMu.Lock()
 	since, dest := w.awaitingSince, w.awaitingDest
-	report := !since.IsZero() && !w.closed.Load() && time.Since(since) >= w.unansweredAfter
+	// Until one of its sends has sent, the wait may be for nothing; a send
+	// that does re-arms the timer.
+	report := !since.IsZero() && w.waitSentSeq >= 0 && !w.closed.Load() && time.Since(since) >= w.unansweredAfter
 	if report {
 		w.awaitingSince, w.reportedSinceAnswer = time.Time{}, true
 	}
@@ -588,7 +590,9 @@ func (w *dataPlaneWatchdog) closeUnanswered() {
 	dest := w.awaitingDest
 	switch {
 	case w.unansweredWhileOpen:
-		since = w.awaitingSince
+		if w.waitSentSeq >= 0 {
+			since = w.awaitingSince
+		}
 	case !w.answered.Load():
 		since = w.firstWriteAt
 	case w.reportQuiet:

@@ -2318,24 +2318,63 @@ func TestDataPlanePacket_WaitFollowsTheSendThatSucceeded(t *testing.T) {
 }
 
 func TestDialContext_ConnMissingTheSwitchSweepIsReplaced(t *testing.T) {
-	s, obs := newConfirmationTestMUR(t, "a", "b")
-	s.cfg.dataPlaneFirstResponseTimeout = defaultFirstResponseTimeout
-	obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
-		// The selection moves off a after its dial result is taken but
-		// before the conn is registered, so the switch's sweep misses it.
-		s.access.Lock()
-		s.recordProbeOutcomeLocked("a", &probeOutcome{generation: s.networkGeneration.Load(), url: s.probeURLForLocked("a")})
-		s.stickyTag.tcp.Store("b")
-		s.access.Unlock()
-		return newScriptedConn(), nil
-	}
-	var bDials atomic.Int32
-	obs["b"].dial = func(context.Context) (net.Conn, error) {
-		bDials.Add(1)
-		return newScriptedConn(), nil
-	}
-	conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
-	require.NoError(t, err)
-	defer conn.Close()
-	assert.EqualValues(t, 1, bDials.Load(), "the caller gets a conn through the new selection")
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s.cfg.dataPlaneFirstResponseTimeout = defaultFirstResponseTimeout
+		primary := newScriptedConn()
+		obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+			// By now dialPrimary waits in its select, having checked for a
+			// switch. The selection moves off a without waking it, as when
+			// the switch lands after the dial result is taken but before
+			// the conn is registered, so the switch's sweep misses it.
+			time.Sleep(100 * time.Millisecond)
+			s.access.Lock()
+			s.recordProbeOutcomeLocked("a", &probeOutcome{generation: s.networkGeneration.Load(), url: s.probeURLForLocked("a")})
+			s.stickyTag.tcp.Store("b")
+			s.access.Unlock()
+			return primary, nil
+		}
+		var bDials atomic.Int32
+		obs["b"].dial = func(context.Context) (net.Conn, error) {
+			bDials.Add(1)
+			return newScriptedConn(), nil
+		}
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		defer conn.Close()
+		assert.EqualValues(t, 1, bDials.Load(), "the caller gets a conn through the new selection")
+		select {
+		case <-primary.closed:
+		default:
+			t.Fatal("the conn on the failed member is closed")
+		}
+	})
+}
+
+// slowFailingSendPacketConn's sends block past the unanswered timeout, then
+// fail.
+type slowFailingSendPacketConn struct {
+	*scriptedPacketConn
+}
+
+func (c *slowFailingSendPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	time.Sleep(2 * defaultUDPUnansweredAfter)
+	return 0, os.ErrDeadlineExceeded
+}
+
+func TestDataPlanePacket_SendStillUnderWayIsNotUnanswered(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var unanswered atomic.Int32
+		c := &slowFailingSendPacketConn{scriptedPacketConn: newScriptedPacketConn()}
+		d := newDataPlanePacket(c, time.Hour, 1<<20, dataPlaneHooks{
+			onUnanswered: func(time.Time, string) { unanswered.Add(1) },
+		})
+		d.unansweredAfter = defaultUDPUnansweredAfter
+		d.unansweredWhileOpen = true
+		defer d.Close()
+		d.WriteTo([]byte("query"), &net.UDPAddr{})
+		time.Sleep(2 * defaultUDPUnansweredAfter)
+		synctest.Wait()
+		assert.Zero(t, unanswered.Load(), "a datagram that was never sent went unanswered by no one")
+	})
 }
