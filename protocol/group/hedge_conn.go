@@ -241,6 +241,7 @@ func (l *hedgeLeg) commit(release func()) bool {
 		return false
 	}
 	first := !l.committed
+	report := first && !l.closed
 	l.committed = true
 	if first {
 		// Under mu, so a failure seen after the commit (stalled or reset
@@ -253,8 +254,8 @@ func (l *hedgeLeg) commit(release func()) bool {
 	release()
 	l.mu.Unlock()
 	// Outside mu: the observer is the host's code.
-	if first && l.h.observer != nil {
-		l.h.observer.FirstCommitted(l.ctx)
+	if report && l.h.observer != nil {
+		l.h.observer.FirstCommitted(l.ctx, l.h.Tag(), l.h.firstTag)
 	}
 	return true
 }
