@@ -24,8 +24,7 @@ const defaultDataPlaneResetQuiet = 5 * time.Second
 const defaultFirstResponseTimeout = 10 * time.Second
 
 // dataPlaneStallMinUnanswered is how many bytes a connection must have
-// written since its last read, within one idle window, for going quiet to
-// count as a stall. An idle keep-alive connection's last write is a single
+// written since its last read for going quiet to count as a stall. An idle keep-alive connection's last write is a single
 // small frame, such as an HTTP/2 WINDOW_UPDATE or PING ack, about 35-60 bytes
 // in a TLS record. A browser's new connection blocked after its handshake
 // leaves more unanswered: the HTTP/2 preface, settings and first request run
@@ -297,7 +296,7 @@ func (w *dataPlaneWatchdog) fireStall() {
 	if !w.proven.Load() {
 		return
 	}
-	if !w.unansweredReachedLocked() {
+	if st := w.snapshotIO(); st.unanswered < dataPlaneStallMinUnanswered {
 		return
 	}
 	if !w.stalled.CompareAndSwap(false, true) {
@@ -309,20 +308,6 @@ func (w *dataPlaneWatchdog) fireStall() {
 	if w.hooks.onFailure != nil {
 		w.hooks.onFailure(adapter.UserFailureStall)
 	}
-}
-
-// unansweredReachedLocked reports whether the writes since the last read
-// reach dataPlaneStallMinUnanswered. When they don't, it clears the count: a
-// quiet window has passed, so lone small writes spread over several windows,
-// such as occasional keep-alive frames, can't add up to a stall.
-func (w *dataPlaneWatchdog) unansweredReachedLocked() bool {
-	w.ioMu.Lock()
-	defer w.ioMu.Unlock()
-	if w.unanswered >= dataPlaneStallMinUnanswered {
-		return true
-	}
-	w.unanswered = 0
-	return false
 }
 
 // fireResetFailure attributes a non-excused error once, even on an unproven conn.
