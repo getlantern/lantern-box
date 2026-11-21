@@ -131,6 +131,10 @@ type MutableAutoSelect struct {
 		// replacementFailed is set once a member tag could move to failed a
 		// probe while the switch was pending.
 		replacementFailed bool
+		// awaitingProbes is set while probes that can decide the switch are
+		// requested or running; they may conclude it past
+		// confirmStrikeWindow.
+		awaitingProbes bool
 	}
 	// Guarded by access: outageSince is set while an outage of the
 	// device's own network is suspected, since the selection and every
@@ -819,6 +823,18 @@ func (s *MutableAutoSelect) closeStuckUDPLocked(tag string) {
 	}()
 }
 
+// afterUDPFailureLocked acts on a UDP failure of tag. If tag is no longer the
+// UDP selection and its failure streak is at the limit, its sessions whose
+// exchange went unanswered are closed: those left on it at its release were
+// idle or hadn't waited long enough then. Otherwise a release it allows is
+// applied. Caller must hold s.access.
+func (s *MutableAutoSelect) afterUDPFailureLocked(tag string) {
+	if loadString(&s.stickyTag.udp) != tag && !s.streakSinceLocked(tag, N.NetworkUDP).IsZero() {
+		s.closeStuckUDPLocked(tag)
+	}
+	s.reselectUDPLocked()
+}
+
 // reselectUDPLocked applies a pending release of the UDP selection for
 // consecutive failures without waiting for the next ListenPacket, which an
 // app holding one socket never makes. Caller must hold s.access.
@@ -1099,7 +1115,7 @@ const streakProbeWait = 2 * time.Second
 // consecutive-failure limit and the probes deciding its replacement are still
 // running, for at most streakProbeWait. A dial sent to the failing selection
 // meanwhile would most likely fail too. It returns ctx's error if ctx has
-// ended by the time a wait is over.
+// ended, or net.ErrClosed if the group closed while it waited.
 func (s *MutableAutoSelect) awaitStreakReplacement(ctx context.Context, network string) error {
 	var timeout <-chan time.Time
 	for {
@@ -1107,10 +1123,7 @@ func (s *MutableAutoSelect) awaitStreakReplacement(ctx context.Context, network 
 		pending, changed := s.startStreakReplacementLocked(network), s.probeChanged
 		s.access.Unlock()
 		if !pending {
-			if timeout != nil {
-				return ctx.Err()
-			}
-			return nil
+			return ctx.Err()
 		}
 		if timeout == nil {
 			timer := time.NewTimer(streakProbeWait)
@@ -1124,7 +1137,10 @@ func (s *MutableAutoSelect) awaitStreakReplacement(ctx context.Context, network 
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-s.ctx.Done():
-			return ctx.Err()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return net.ErrClosed
 		}
 	}
 }
@@ -1545,12 +1561,11 @@ func (s *MutableAutoSelect) failedSinceLocked(tag string, since time.Time) bool 
 // conn opened at opened, was added to its window. A zero opened means
 // unknown.
 func (s *MutableAutoSelect) recordUserFailure(tag string, kind adapter.UserFailureKind, generation uint64, opened time.Time, network string) bool {
-	s.access.Lock()
-	outage := s.outageEvidenceLocked(opened)
-	s.access.Unlock()
 	recorded := s.mutateHistory(tag, generation, func(h *localHistory, now time.Time) bool {
 		failure := adapter.UserFailure{At: now, Kind: kind}
-		if outage {
+		// mutateHistory holds s.access, so a suspicion can't start and clear
+		// the streaks between this check and the add.
+		if s.outageEvidenceLocked(opened) {
 			return h.addWindowFailure(failure, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
 		}
 		return h.addUserFailure(failure, streakNetFor(network), opened, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
@@ -1561,7 +1576,7 @@ func (s *MutableAutoSelect) recordUserFailure(tag string, kind adapter.UserFailu
 	s.access.Lock()
 	s.probeStreakReplacementLocked(tag, network)
 	if network == N.NetworkUDP {
-		s.reselectUDPLocked()
+		s.afterUDPFailureLocked(tag)
 	}
 	s.access.Unlock()
 	return recorded
@@ -1605,7 +1620,7 @@ func (s *MutableAutoSelect) noteUnanswered(tag string, generation uint64, networ
 	s.logger.Debug(network, " unanswered: tag=", tag)
 	s.probeStreakReplacementLocked(tag, network)
 	if sn == streakUDP {
-		s.reselectUDPLocked()
+		s.afterUDPFailureLocked(tag)
 	}
 }
 
@@ -1657,35 +1672,45 @@ func (s *MutableAutoSelect) trySwitchAfterConfirmedFailureLocked(failedTag, repl
 // tryPendingConfirmedSwitchLocked retries the switch off a TCP selection
 // whose confirmations failed twice, as replacement probes complete, probing
 // further members while those probed fail. It gives up once the selection
-// has moved, confirmStrikeWindow has passed, or every member it could move
-// to failed. Caller must hold s.access.
+// has moved, confirmStrikeWindow has passed with no probe left that could
+// decide it, or every member it could move to failed. Caller must hold
+// s.access.
 func (s *MutableAutoSelect) tryPendingConfirmedSwitchLocked() {
-	p := s.pendingConfirmedFailure
+	p := &s.pendingConfirmedFailure
 	if p.tag == "" {
 		return
 	}
-	if loadString(&s.stickyTag.tcp) != p.tag || time.Since(p.at) > confirmStrikeWindow {
-		s.pendingConfirmedFailure.tag = ""
+	if loadString(&s.stickyTag.tcp) != p.tag || (time.Since(p.at) > confirmStrikeWindow && !p.awaitingProbes) {
+		p.tag = ""
 		return
 	}
+	defer func() {
+		if p.tag != "" {
+			p.awaitingProbes = s.probePendingLocked(p.tag) || s.replacementProbesPendingLocked(p.tag)
+		}
+	}()
 	if recheck, abort := s.recheckFailedSelectionLocked(p.tag, p.since, p.replacementFailed); abort {
-		s.pendingConfirmedFailure.tag = ""
+		p.tag = ""
 		return
 	} else if recheck {
 		return
 	}
 	switch {
 	case s.trySwitchAfterConfirmedFailureLocked(p.tag, "", p.since):
-		s.pendingConfirmedFailure.tag = ""
+		p.tag = ""
 	case s.replacementProbesPendingLocked(p.tag):
 	case s.probeTCPReplacementsLocked(p.tag, p.since) > 0:
 	case s.findProbedReplacementLocked(time.Now(), N.NetworkTCP, p.tag, p.since) != "":
 		// The switch cooldown held it back; a probe completing within
 		// confirmStrikeWindow retries it.
 	default:
-		// Every member it could move to failed its probe since.
-		s.pendingConfirmedFailure.tag = ""
-		s.suspectOutageLocked(p.since)
+		tag, since := p.tag, p.since
+		p.tag = ""
+		// A member that passed but may not take the selection yet, as in its
+		// recovery gate, shows the network is up.
+		if !s.otherMemberPassedSinceLocked(tag, since) {
+			s.suspectOutageLocked(since)
+		}
 	}
 }
 
@@ -1728,6 +1753,18 @@ func (s *MutableAutoSelect) replacementFailedSinceLocked(tag string, since time.
 	for _, c := range s.replacementPoolLocked(time.Now(), N.NetworkTCP, tag) {
 		state := s.probeMembers[c.tag]
 		if state != nil && state.outcome != nil && !state.outcome.success && !state.outcome.completed.Before(since) {
+			return true
+		}
+	}
+	return false
+}
+
+// otherMemberPassedSinceLocked reports whether a member other than tag has a
+// latest probe that passed no earlier than since, whether or not the
+// selection could move to it. Caller must hold s.access.
+func (s *MutableAutoSelect) otherMemberPassedSinceLocked(tag string, since time.Time) bool {
+	for _, other := range s.tags {
+		if _, member := s.members.Load(other); member && other != tag && s.passedSinceLocked(other, since) {
 			return true
 		}
 	}
@@ -1782,15 +1819,23 @@ func (s *MutableAutoSelect) outageEvidenceLocked(opened time.Time) bool {
 // s.access.
 func (s *MutableAutoSelect) replacementProbesPendingLocked(tag string) bool {
 	for _, c := range s.replacementPoolLocked(time.Now(), N.NetworkTCP, tag) {
-		if state := s.probeMembers[c.tag]; state != nil && state.need != probeNotNeeded {
-			return true
-		}
-		// The attempt being accepted is still in flight but finalized.
-		if attempt := s.inFlightProbes[c.outbound]; attempt != nil && !attempt.finalized {
+		if s.probePendingLocked(c.tag) {
 			return true
 		}
 	}
 	return false
+}
+
+// probePendingLocked reports whether tag has a probe requested or running.
+// Caller must hold s.access.
+func (s *MutableAutoSelect) probePendingLocked(tag string) bool {
+	if state := s.probeMembers[tag]; state != nil && state.need != probeNotNeeded {
+		return true
+	}
+	out, member := s.members.Load(tag)
+	// The attempt being accepted is still in flight but finalized.
+	attempt := s.inFlightProbes[out]
+	return member && attempt != nil && !attempt.finalized
 }
 
 // eligibleReplacementLocked requires membership, no recovery gate, and a

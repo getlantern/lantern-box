@@ -243,6 +243,11 @@ func (w *dataPlaneWatchdog) noteIOFrom(n int, err error, isRead bool, source M.S
 				w.hooks.onResponse(at, dest)
 			}
 		case first && w.hooks.onResponse != nil:
+			// The hook can block on the group's lock, so the response
+			// timers stop first.
+			if w.needsResponseTracking() {
+				w.markResponded()
+			}
 			w.hooks.onResponse(at, "")
 		}
 	}
@@ -366,13 +371,17 @@ func (w *dataPlaneWatchdog) fireSlowResponse() {
 	}
 }
 
-// awaitingFirstResponse reports whether the conn wrote at least minWait ago
-// and has had no response since. Data counts as soon as a read returns it,
-// before the read's hooks run.
+// awaitingFirstResponse reports whether the conn has had no response and
+// wrote at least minWait ago; a zero minWait includes a conn that hasn't
+// written yet. Data counts as soon as a read returns it, before the read's
+// hooks run.
 func (w *dataPlaneWatchdog) awaitingFirstResponse(now time.Time, minWait time.Duration) bool {
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
-	return !w.responded.Load() && !w.answered.Load() && !w.firstWriteAt.IsZero() && now.Sub(w.firstWriteAt) >= minWait
+	if w.responded.Load() || w.answered.Load() {
+		return false
+	}
+	return minWait == 0 || (!w.firstWriteAt.IsZero() && now.Sub(w.firstWriteAt) >= minWait)
 }
 
 // noteWriteStarting starts waiting for a response as a write begins, since a

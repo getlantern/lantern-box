@@ -15,6 +15,7 @@ import (
 
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/service/pause"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -1845,5 +1846,253 @@ func TestStreak_UDPOutageIsSuspected(t *testing.T) {
 		s.access.Lock()
 		defer s.access.Unlock()
 		assert.True(t, s.outageSuspectedLocked(), "with the selection's own probe failing too, nothing is reachable")
+	})
+}
+
+func TestListenPacket_SessionLeftOnReleasedMemberMovesOnceStuck(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s.stickyTag.udp.Store("a")
+		handles := map[string][]*scriptedPacketConn{}
+		listenScripted(obs, handles, "a")
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		dest := metadata.ParseSocksaddrHostPort("dns.test", 53)
+		var pcs []net.PacketConn
+		for i := range 2 {
+			pc, err := s.ListenPacket(context.Background(), dest)
+			require.NoError(t, err)
+			go func() {
+				for {
+					if _, _, err := pc.ReadFrom(make([]byte, 64)); err != nil {
+						return
+					}
+				}
+			}()
+			pc.WriteTo([]byte("q"), &net.UDPAddr{})
+			handles["a"][i].in <- []byte("a")
+			pcs = append(pcs, pc)
+		}
+		time.Sleep(time.Second)
+		for range 2 {
+			pcs[0].WriteTo([]byte("q"), &net.UDPAddr{})
+			time.Sleep(2250 * time.Millisecond)
+		}
+		synctest.Wait()
+		require.Equal(t, "b", loadString(&s.stickyTag.udp))
+		require.True(t, isClosed(handles["a"][0]))
+		require.False(t, isClosed(handles["a"][1]), "a session idle at the release is left")
+
+		pcs[1].WriteTo([]byte("q"), &net.UDPAddr{})
+		time.Sleep(2250 * time.Millisecond)
+		synctest.Wait()
+		assert.True(t, isClosed(handles["a"][1]), "once its exchange goes unanswered it is moved off the released member too")
+		for _, pc := range pcs {
+			pc.Close()
+		}
+	})
+}
+
+func TestDialContext_CanceledContextDialsNothing(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	var dials atomic.Int32
+	for _, tag := range []string{"a", "b"} {
+		obs[tag].dial = func(ctx context.Context) (net.Conn, error) {
+			dials.Add(1)
+			return nil, ctx.Err()
+		}
+		obs[tag].listen = func(ctx context.Context) (net.PacketConn, error) {
+			dials.Add(1)
+			return nil, ctx.Err()
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
+	require.ErrorIs(t, err, context.Canceled)
+	_, err = s.ListenPacket(ctx, metadata.Socksaddr{})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, dials.Load(), "a caller already gone dials no member")
+	failures, _ := userFailures(s, "a")
+	assert.Empty(t, failures, "and charges none")
+}
+
+func TestDialContext_GroupClosingDuringWaitDialsNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, members := newStreakTestMUR(t)
+		ob, _ := s.members.Load("b")
+		ob.(*mockOutbound).dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(5 * time.Second), nil }
+		unansweredExchange(t, s, members, false, 3*time.Second)
+		unansweredExchange(t, s, members, false, 3*time.Second)
+		last := members["a"]
+		go func() {
+			time.Sleep(time.Second)
+			s.Close()
+		}()
+		_, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.ErrorIs(t, err, net.ErrClosed)
+		assert.Same(t, last, members["a"], "no member is dialed once the group has closed")
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+	})
+}
+
+func TestConfirmation_SlowReplacementProbeStillSwitches(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s.probeTimeouts.Store(&map[string]time.Duration{"slow": time.Minute})
+		obs["b"].typeName = "slow"
+		var aProbes atomic.Int32
+		failingProbes(obs["a"], &aProbes, hangUntilDone)
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(40 * time.Second), nil }
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		require.EqualValues(t, 2, aProbes.Load(), "both confirmations failed")
+		assert.Equal(t, "b", loadString(&s.stickyTag.tcp),
+			"a replacement probe still running when the strike window ends can conclude the switch")
+	})
+}
+
+func TestConfirmation_GatedPassingReplacementIsNoOutage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		var aProbes atomic.Int32
+		failingProbes(obs["a"], &aProbes, hangUntilDone)
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		s.access.Lock()
+		s.historyForLocked("b").startRecoveryGate(time.Now())
+		s.access.Unlock()
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		synctest.Wait()
+		require.EqualValues(t, 2, aProbes.Load(), "both confirmations failed")
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "a replacement in its recovery gate can't take the selection")
+		s.access.Lock()
+		defer s.access.Unlock()
+		assert.False(t, s.outageSuspectedLocked(), "but its passing probe shows the network is up")
+	})
+}
+
+func TestDataPlaneStream_ReplyDisarmsTimersBeforeHooks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		var failures, slow atomic.Int32
+		c := newScriptedConn()
+		d := newDataPlaneStream(c, time.Hour, 1<<20, dataPlaneHooks{
+			onResponse:     func(time.Time, string) { <-release },
+			onFailure:      func(adapter.UserFailureKind) { failures.Add(1) },
+			onSlowResponse: func() { slow.Add(1) },
+		})
+		d.firstResponseTimeout = defaultFirstResponseTimeout
+		d.slowResponseAfter = earlyConfirmAfter
+		defer d.Close()
+		d.Write([]byte("request"))
+		c.reads <- scriptedRead{data: []byte("reply")}
+		go d.Read(make([]byte, 8))
+		time.Sleep(defaultFirstResponseTimeout + time.Second)
+		synctest.Wait()
+		assert.Zero(t, slow.Load(), "a reply whose hooks are still running is no slow response")
+		assert.Zero(t, failures.Load(), "nor a missing one")
+		close(release)
+	})
+}
+
+func TestConfirmation_ClosesUnwrittenConns(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s.cfg.dataPlaneFirstResponseTimeout = defaultFirstResponseTimeout
+		user := newScriptedConn()
+		var aProbes atomic.Int32
+		failingProbes(obs["a"], &aProbes, func(context.Context) (net.Conn, error) { return user, nil })
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		closed := make(chan struct{})
+		go func() {
+			conn.Read(make([]byte, 8))
+			close(closed)
+		}()
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		synctest.Wait()
+		require.Equal(t, "b", loadString(&s.stickyTag.tcp))
+		select {
+		case <-closed:
+		default:
+			t.Fatal("a conn that hasn't written yet to a failed member is closed")
+		}
+	})
+}
+
+func TestAdvanceNetwork_ClearsFailureStreaks(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	recordSuccess(s, "a", 100)
+	s.stickyTag.tcp.Store("a")
+	generation := s.networkGeneration.Load()
+	s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+	s.noteUnanswered("a", generation, "tcp", "", time.Now().Add(time.Second), time.Now().Add(time.Second))
+	s.access.Lock()
+	defer s.access.Unlock()
+	h := s.historyForLocked("a")
+	require.EqualValues(t, 2, h.streakCount(streakTCP, time.Now().Add(time.Second), s.hist.userFailureWindow))
+	s.lastStreakSwitch.tcp = time.Now()
+	s.advanceNetworkLocked()
+	assert.Zero(t, h.streakCount(streakTCP, time.Now().Add(time.Second), s.hist.userFailureWindow),
+		"an old network's failure streak says nothing about the new one")
+	assert.True(t, s.lastStreakSwitch.tcp.IsZero(), "nor does its release cooldown")
+}
+
+func TestConfirmation_PauseDropsPendingSwitch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s.probeTimeouts.Store(&map[string]time.Duration{"slow": time.Minute})
+		obs["b"].typeName = "slow"
+		var aProbes atomic.Int32
+		failingProbes(obs["a"], &aProbes, hangUntilDone)
+		var woke atomic.Bool
+		obs["b"].dial = func(context.Context) (net.Conn, error) {
+			if woke.Load() {
+				return probeResponderConn(), nil
+			}
+			return slowProbeResponderConn(40 * time.Second), nil
+		}
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		time.Sleep(10 * time.Second)
+		require.EqualValues(t, 2, aProbes.Load(), "both confirmations failed")
+		s.onProbePause(pause.EventNetworkPause)
+		time.Sleep(time.Hour)
+		woke.Store(true)
+		s.onProbePause(pause.EventNetworkWake)
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "a switch decided before a pause doesn't act on probes after it")
+	})
+}
+
+func TestConfirmation_GatedPassAmongFailedReplacementsIsNoOutage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		var aProbes, cProbes atomic.Int32
+		// a's probes time out, leaving time for b's to pass between them.
+		obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+			aProbes.Add(1)
+			return hangUntilDone(ctx)
+		}
+		failingProbes(obs["c"], &cProbes, hangUntilDone)
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		s.access.Lock()
+		s.historyForLocked("b").startRecoveryGate(time.Now())
+		s.access.Unlock()
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		time.Sleep(defaultProbeTimeout + time.Second)
+		s.access.Lock()
+		s.requestProbesLocked([]string{"b"}, probeForced, false)
+		s.dispatchProbesLocked()
+		s.access.Unlock()
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		require.EqualValues(t, 2, aProbes.Load(), "both confirmations failed")
+		require.NotZero(t, cProbes.Load(), "the usable replacement failed its probe")
+		s.access.Lock()
+		defer s.access.Unlock()
+		assert.False(t, s.outageSuspectedLocked(), "a member in its recovery gate passing shows the network is up")
 	})
 }

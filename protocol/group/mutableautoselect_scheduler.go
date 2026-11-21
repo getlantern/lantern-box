@@ -815,6 +815,9 @@ func (s *MutableAutoSelect) onProbePause(event int) {
 	case pause.EventDevicePaused, pause.EventNetworkPause:
 		s.pauseEpoch++
 		s.cancelProbesLocked(false)
+		// Its probes are canceled unrecorded, and probes after the pause say
+		// nothing about failures before it.
+		s.pendingConfirmedFailure.tag = ""
 		if s.periodicTimer != nil {
 			s.periodicTimer.Stop()
 			s.periodicTimer = nil
@@ -923,12 +926,18 @@ func (s *MutableAutoSelect) advanceNetworkLocked() {
 	}
 	s.lastNetworkAdvanceAt = now
 	s.cancelProbesLocked(true)
-	// Confirmations on the old network say nothing about the new one.
+	// Confirmations and failure streaks on the old network say nothing about
+	// the new one.
 	for _, state := range s.probeMembers {
 		state.confirmationPending = false
 		state.firstConfirmFailedAt, state.confirmedAt = time.Time{}, time.Time{}
 	}
 	s.pendingConfirmedFailure.tag = ""
+	for _, h := range s.histories {
+		h.clearStreak(streakTCP)
+		h.clearStreak(streakUDP)
+	}
+	s.lastStreakSwitch.tcp, s.lastStreakSwitch.udp = time.Time{}, time.Time{}
 	if s.probing {
 		s.requestProbesLocked(nil, probeForced, true)
 	}
