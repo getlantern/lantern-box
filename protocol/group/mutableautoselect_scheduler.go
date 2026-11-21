@@ -80,6 +80,7 @@ type probeAttempt struct {
 	membershipID uint64
 	generation   uint64
 	url          string
+	started      time.Time
 	deadline     time.Time
 	lastResort   bool
 	// finalized is set once the attempt records an outcome or is canceled; it
@@ -241,6 +242,7 @@ func (s *MutableAutoSelect) startProbeLocked(
 		membershipID: state.membershipID,
 		generation:   s.networkGeneration.Load(),
 		url:          s.probeURLForLocked(tag),
+		started:      time.Now(),
 		deadline:     time.Now().Add(probeBound(beh)),
 		lastResort:   beh.lastResort,
 		holdsSlot:    holdsSlot,
@@ -346,7 +348,9 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 		switch {
 		case success:
 			state.firstConfirmFailedAt = time.Time{}
-		case first.IsZero() || outcome.completed.Sub(first) > confirmStrikeWindow:
+		// The gap runs to the second confirmation's start, so a probe timeout
+		// longer than the window still lets it conclude.
+		case first.IsZero() || attempt.started.Sub(first) > confirmStrikeWindow:
 			// One failed probe can be chance on a working member: confirm
 			// again, and meanwhile probe where the selection would move.
 			state.firstConfirmFailedAt = outcome.completed
@@ -359,8 +363,9 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 			// pending path, which rechecks a mixed picture.
 			named := replacement != "" && s.eligibleReplacementLocked(time.Now(), replacement)
 			if !named || !s.trySwitchAfterConfirmedFailureLocked(attempt.tag, replacement, first) {
-				s.pendingConfirmedFailure.tag, s.pendingConfirmedFailure.since = attempt.tag, first
-				s.pendingConfirmedFailure.replacementFailed = s.replacementFailedSinceLocked(attempt.tag, first)
+				p := &s.pendingConfirmedFailure
+				p.tag, p.since, p.at = attempt.tag, first, outcome.completed
+				p.replacementFailed = s.replacementFailedSinceLocked(attempt.tag, first)
 			}
 		}
 	}
@@ -730,11 +735,10 @@ const maxReplacementProbes = 3
 // would move to from tag that have no probe outcome since since, and reports
 // how many. Caller must hold s.access.
 func (s *MutableAutoSelect) probeTCPReplacementsLocked(tag string, since time.Time) int {
-	pool, _ := s.splitHealthyForLocked(s.rankLocked(time.Now()), N.NetworkTCP)
 	var tags []string
-	for _, c := range pool {
-		if c.tag == tag || len(tags) == maxReplacementProbes {
-			continue
+	for _, c := range s.replacementPoolLocked(time.Now(), N.NetworkTCP, tag) {
+		if len(tags) == maxReplacementProbes {
+			break
 		}
 		if state := s.probeMembers[c.tag]; state != nil && state.outcome != nil && !state.outcome.completed.Before(since) {
 			continue
@@ -919,9 +923,12 @@ func (s *MutableAutoSelect) advanceNetworkLocked() {
 	}
 	s.lastNetworkAdvanceAt = now
 	s.cancelProbesLocked(true)
+	// Confirmations on the old network say nothing about the new one.
 	for _, state := range s.probeMembers {
 		state.confirmationPending = false
+		state.firstConfirmFailedAt, state.confirmedAt = time.Time{}, time.Time{}
 	}
+	s.pendingConfirmedFailure.tag = ""
 	if s.probing {
 		s.requestProbesLocked(nil, probeForced, true)
 	}

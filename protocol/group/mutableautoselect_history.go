@@ -148,10 +148,12 @@ const maxFailureTimes = 8
 
 // forgiveProbeFailures uncounts the consecutive probe failures blamed on the
 // device's own network: those no earlier than since. Earlier ones stay,
-// since its member was failing, or unlucky, before.
-func (h *localHistory) forgiveProbeFailures(since time.Time) {
+// since its member was failing, or unlucky, before. It reports whether any
+// were uncounted.
+func (h *localHistory) forgiveProbeFailures(since time.Time) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	before := h.consecutiveFailures
 	kept := h.failureTimes[:0]
 	for _, t := range h.failureTimes {
 		if t.Before(since) {
@@ -161,6 +163,7 @@ func (h *localHistory) forgiveProbeFailures(since time.Time) {
 		}
 	}
 	h.failureTimes = kept
+	return h.consecutiveFailures != before
 }
 
 func (h *localHistory) startRecoveryGate(now time.Time) {

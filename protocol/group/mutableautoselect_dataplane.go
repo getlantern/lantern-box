@@ -132,14 +132,14 @@ type dataPlaneIO struct {
 // Idle expiry counts only after provedReadBytes have arrived and the last
 // non-empty IO was a write, so unused keep-alive connections are not charged.
 //
-// A non-zero firstResponseTimeout starts after the first non-empty write,
+// A non-zero firstResponseTimeout starts when the first non-empty write begins,
 // independently of provedReadBytes. Read bytes or a non-timeout read error
 // (including EOF) disarm it. Set firstResponseTimeout before the first IO.
 //
 // With a non-zero unansweredAfter as well, a conn is reported unanswered when
 // it reads EOF after writing but before its first response, or when it is
 // closed locally, before reading EOF, after waiting at least unansweredAfter
-// since its first write for a first response. With reportQuiet, a local close
+// since its first write began for a first response. With reportQuiet, a local close
 // at least unansweredAfter after the last IO, once data has arrived, is
 // reported too. With unansweredWhileOpen, for UDP, each exchange is
 // watched: a datagram sent with no reply since the previous one starts a
@@ -165,19 +165,21 @@ type dataPlaneWatchdog struct {
 	unansweredTimer      *time.Timer // guarded by ioMu
 	// The current UDP exchange wait, guarded by ioMu: when it began and its
 	// destination, the latest destination waited on, whether an unanswered
-	// report awaits a reply, and when a reply was last passed to onResponse.
-	// A report leaves the handle's other detection armed, since the group
-	// may not count it.
+	// report awaits a reply, when a reply was last passed to onResponse, and
+	// the sources a reply has been passed on from. A report leaves the
+	// handle's other detection armed, since the group may not count it.
 	awaitingSince       time.Time
 	awaitingDest        string
 	lastDest            string
-	readSource          M.Socksaddr
 	reportedSinceAnswer bool
 	lastAnswerNotify    time.Time
+	notifiedSources     map[string]struct{}
+	waitJoined          bool // a send joined the current wait
 	readBytes           atomic.Uint64
 	responded           atomic.Bool
 	answered            atomic.Bool // set by the first read of data
 	peerClosed          atomic.Bool // set by a read of EOF
+	closed              atomic.Bool
 	proven              atomic.Bool
 	stalled             atomic.Bool
 	fired               atomic.Bool
@@ -213,6 +215,11 @@ func endsQuietRead(isRead bool, n int, state dataPlaneIO) bool {
 }
 
 func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
+	w.noteIOFrom(n, err, isRead, M.Socksaddr{})
+}
+
+// noteIOFrom is noteIO for a read that reports where its datagram came from.
+func (w *dataPlaneWatchdog) noteIOFrom(n int, err error, isRead bool, source M.Socksaddr) {
 	var now time.Time
 	if n > 0 && err == nil {
 		now = time.Now()
@@ -232,7 +239,7 @@ func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
 		first := w.answered.CompareAndSwap(false, true)
 		switch {
 		case w.unansweredWhileOpen:
-			if dest, notify := w.noteDatagramReceived(at); notify && w.hooks.onResponse != nil {
+			if dest, notify := w.noteDatagramReceived(at, source); notify && w.hooks.onResponse != nil {
 				w.hooks.onResponse(at, dest)
 			}
 		case first && w.hooks.onResponse != nil:
@@ -322,6 +329,7 @@ func (w *dataPlaneWatchdog) snapshotIO() dataPlaneIO {
 func (w *dataPlaneWatchdog) closeWatchdog() (firstClose bool) {
 	w.closeOnce.Do(func() {
 		w.stalled.Store(true)
+		w.closed.Store(true)
 		w.timer.Stop()
 		w.stopFirstResponseTimer()
 		w.stopUnansweredTimer()
@@ -359,11 +367,26 @@ func (w *dataPlaneWatchdog) fireSlowResponse() {
 }
 
 // awaitingFirstResponse reports whether the conn wrote at least minWait ago
-// and has had no response since.
+// and has had no response since. Data counts as soon as a read returns it,
+// before the read's hooks run.
 func (w *dataPlaneWatchdog) awaitingFirstResponse(now time.Time, minWait time.Duration) bool {
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
-	return !w.responded.Load() && !w.firstWriteAt.IsZero() && now.Sub(w.firstWriteAt) >= minWait
+	return !w.responded.Load() && !w.answered.Load() && !w.firstWriteAt.IsZero() && now.Sub(w.firstWriteAt) >= minWait
+}
+
+// noteWriteStarting starts waiting for a response as a write begins, since a
+// first write can block on a deferred handshake while its caller waits.
+func (w *dataPlaneWatchdog) noteWriteStarting() {
+	if w.stalled.Load() {
+		return
+	}
+	if w.unansweredAfter > 0 {
+		w.noteFirstWrite()
+	}
+	if w.needsResponseTracking() {
+		w.startFirstResponseTimer()
+	}
 }
 
 func (w *dataPlaneWatchdog) noteFirstWrite() {
@@ -374,18 +397,29 @@ func (w *dataPlaneWatchdog) noteFirstWrite() {
 	}
 }
 
-// noteDatagramSent starts a wait for a reply to a datagram sent to dest,
-// unless one is already running.
-func (w *dataPlaneWatchdog) noteDatagramSent(dest M.Socksaddr) {
-	if !w.unansweredWhileOpen || w.stalled.Load() {
-		return
+// datagramWait identifies the wait a send started, so a failed send can
+// undo it.
+type datagramWait struct {
+	since    time.Time
+	lastDest string
+}
+
+// beginDatagramWait starts a wait for a reply to a datagram about to be sent
+// to dest, unless one is already running. It runs before the send, so a reply
+// read before the send returns still ends the wait.
+func (w *dataPlaneWatchdog) beginDatagramWait(dest M.Socksaddr) datagramWait {
+	// An idle stall leaves the handle open, so exchanges are still watched.
+	if !w.unansweredWhileOpen || w.closed.Load() {
+		return datagramWait{}
 	}
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
 	if !w.awaitingSince.IsZero() {
-		return
+		w.waitJoined = true
+		return datagramWait{}
 	}
-	w.awaitingSince = time.Now()
+	started := datagramWait{since: time.Now(), lastDest: w.lastDest}
+	w.awaitingSince, w.waitJoined = started.since, false
 	// Unwrapped so an IPv4 destination has one spelling however the
 	// datagram was addressed.
 	if dest = dest.Unwrap(); dest.IsValid() {
@@ -397,24 +431,37 @@ func (w *dataPlaneWatchdog) noteDatagramSent(dest M.Socksaddr) {
 	} else {
 		w.unansweredTimer.Reset(w.unansweredAfter)
 	}
+	return started
 }
 
-func (w *dataPlaneWatchdog) noteDatagramFrom(source M.Socksaddr) {
+// cancelDatagramWait undoes the wait a send that failed started, unless it
+// has already ended or another send joined it.
+func (w *dataPlaneWatchdog) cancelDatagramWait(started datagramWait) {
+	if started.since.IsZero() {
+		return
+	}
 	w.ioMu.Lock()
-	w.readSource = source
-	w.ioMu.Unlock()
+	defer w.ioMu.Unlock()
+	if !w.awaitingSince.Equal(started.since) || w.waitJoined {
+		return
+	}
+	w.awaitingSince, w.lastDest = time.Time{}, started.lastDest
+	if w.unansweredTimer != nil {
+		w.unansweredTimer.Stop()
+	}
 }
 
 // noteDatagramReceived ends the current wait, since the handle delivered,
 // and reports whether to pass the reply on and the address it came from,
-// falling back to the destination waited on when the source is unknown. A
-// reply credits its destination only if it comes back addressed as it was
+// source, falling back to the destination waited on when source is unknown.
+// A reply credits its destination only if it comes back addressed as it was
 // sent, as sing-box's NAT-wrapped conns are; otherwise detection for that
-// destination stays quiet rather than misfiring.
-func (w *dataPlaneWatchdog) noteDatagramReceived(at time.Time) (dest string, notify bool) {
+// destination stays quiet rather than misfiring. The first reply from each
+// source is passed on; later ones at most once a second.
+func (w *dataPlaneWatchdog) noteDatagramReceived(at time.Time, source M.Socksaddr) (dest string, notify bool) {
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
-	if source := w.readSource.Unwrap(); source.IsValid() {
+	if source = source.Unwrap(); source.IsValid() {
 		dest = source.String()
 	} else if dest = w.lastDest; !w.awaitingSince.IsZero() {
 		dest = w.awaitingDest
@@ -422,6 +469,13 @@ func (w *dataPlaneWatchdog) noteDatagramReceived(at time.Time) (dest string, not
 	// unansweredAfter exceeds this limit, so a reply after an unanswered
 	// report is always passed on, ending the streak it fed.
 	notify = w.lastAnswerNotify.IsZero() || at.Sub(w.lastAnswerNotify) >= time.Second
+	if _, seen := w.notifiedSources[dest]; !seen && dest != "" && len(w.notifiedSources) < maxUDPAnsweredDestinations {
+		if w.notifiedSources == nil {
+			w.notifiedSources = make(map[string]struct{})
+		}
+		w.notifiedSources[dest] = struct{}{}
+		notify = true
+	}
 	w.awaitingSince, w.reportedSinceAnswer = time.Time{}, false
 	if w.unansweredTimer != nil {
 		w.unansweredTimer.Stop()
@@ -435,7 +489,7 @@ func (w *dataPlaneWatchdog) noteDatagramReceived(at time.Time) (dest string, not
 func (w *dataPlaneWatchdog) fireUnansweredWhileOpen() {
 	w.ioMu.Lock()
 	since, dest := w.awaitingSince, w.awaitingDest
-	report := !since.IsZero() && !w.stalled.Load() && time.Since(since) >= w.unansweredAfter
+	report := !since.IsZero() && !w.closed.Load() && time.Since(since) >= w.unansweredAfter
 	if report {
 		w.awaitingSince, w.reportedSinceAnswer = time.Time{}, true
 	}
@@ -503,6 +557,10 @@ func (w *dataPlaneWatchdog) closeUnanswered() {
 		since = w.lastIO
 	}
 	report := !since.IsZero() && time.Since(since) >= w.unansweredAfter && w.stalled.CompareAndSwap(false, true)
+	if report && w.unansweredWhileOpen {
+		// The open-handle timer must not report this wait as well.
+		w.awaitingSince = time.Time{}
+	}
 	w.ioMu.Unlock()
 	if report {
 		w.reportUnanswered(since, dest)
@@ -607,6 +665,9 @@ func (d *dataPlaneStream) Read(p []byte) (int, error) {
 }
 
 func (d *dataPlaneStream) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		d.noteWriteStarting()
+	}
 	n, err := d.Conn.Write(p)
 	d.noteIO(n, err, false)
 	return n, err
@@ -647,17 +708,22 @@ func newDataPlanePacket(
 
 func (d *dataPlanePacket) ReadFrom(p []byte) (int, net.Addr, error) {
 	n, addr, err := d.PacketConn.ReadFrom(p)
+	var source M.Socksaddr
 	if n > 0 && err == nil && d.unansweredWhileOpen {
-		d.noteDatagramFrom(M.SocksaddrFromNet(addr))
+		source = M.SocksaddrFromNet(addr)
 	}
-	d.noteIO(n, err, true)
+	d.noteIOFrom(n, err, true, source)
 	return n, addr, err
 }
 
 func (d *dataPlanePacket) WriteTo(p []byte, addr net.Addr) (int, error) {
+	var started datagramWait
+	if len(p) > 0 {
+		started = d.beginDatagramWait(M.SocksaddrFromNet(addr))
+	}
 	n, err := d.PacketConn.WriteTo(p, addr)
-	if err == nil && n > 0 {
-		d.noteDatagramSent(M.SocksaddrFromNet(addr))
+	if err != nil || n == 0 {
+		d.cancelDatagramWait(started)
 	}
 	d.noteIO(n, err, false)
 	return n, err
@@ -676,9 +742,13 @@ func (d *dataPlanePacket) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 // net.PacketConn adapter would strip them to IP-only.
 func (d *dataPlanePacket) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	n := buffer.Len()
+	var started datagramWait
+	if n > 0 {
+		started = d.beginDatagramWait(destination)
+	}
 	err := d.writer.WritePacket(buffer, destination)
-	if err == nil && n > 0 {
-		d.noteDatagramSent(destination)
+	if err != nil {
+		d.cancelDatagramWait(started)
 	}
 	d.noteIO(n, err, false)
 	return err

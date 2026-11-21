@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/getlantern/lantern-box/adapter"
+	lConst "github.com/getlantern/lantern-box/constant"
 )
 
 func TestDialContext_ExpiredContextSkipsAlternate(t *testing.T) {
@@ -1205,6 +1206,14 @@ func TestConfirmation_RecheckAfterMixedPicture(t *testing.T) {
 		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
 		time.Sleep(time.Minute)
 		synctest.Wait()
+		s.access.Lock()
+		e, a := s.probeMembers["e"].outcome, s.probeMembers["a"].outcome
+		s.access.Unlock()
+		require.NotNil(t, e)
+		require.NotNil(t, a)
+		require.True(t, e.success, "e, probed after b-d failed, passes")
+		require.True(t, a.success, "a is rechecked once e passes")
+		require.False(t, a.completed.Before(e.completed), "a's recheck follows e's pass")
 		assert.Equal(t, "a", loadString(&s.stickyTag.tcp),
 			"when replacements failed too and a's recheck passes, the failures were the network's")
 	})
@@ -1252,6 +1261,7 @@ func TestStreak_TCPSelectionFailingProbesLeftToConfirmation(t *testing.T) {
 		time.Sleep(time.Second)
 		s.access.Lock()
 		s.recordProbeOutcomeLocked("a", &probeOutcome{success: false, generation: generation, url: s.probeURLForLocked("a")})
+		s.probeMembers["a"].firstConfirmFailedAt = time.Now()
 		s.access.Unlock()
 		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
 		out, _, err := s.selectOutbound("tcp", "")
@@ -1297,4 +1307,414 @@ func TestOutage_ForgivesOnlyFailuresSinceEvidence(t *testing.T) {
 	h.forgiveProbeFailures(evidence)
 	_, consec, _, _ := h.snapshot(evidence.Add(time.Minute), time.Hour)
 	assert.EqualValues(t, 1, consec, "an earlier chance failure stays counted, the outage's don't")
+}
+
+func TestDataPlanePacket_CreditsEachNewSource(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var got []string
+		c := newScriptedPacketConn()
+		d := newDataPlanePacket(c, time.Hour, 1<<20, dataPlaneHooks{
+			onResponse: func(_ time.Time, dest string) { got = append(got, dest) },
+		})
+		d.unansweredAfter = defaultUDPUnansweredAfter
+		d.unansweredWhileOpen = true
+		defer d.Close()
+		a := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 53}
+		b := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 53}
+		d.WriteTo([]byte("q"), a)
+		d.WriteTo([]byte("q"), b)
+		for _, from := range []net.Addr{a, b, a} {
+			c.replies <- scriptedDatagram{b: []byte("r"), from: from}
+			d.ReadFrom(make([]byte, 64))
+		}
+		assert.Equal(t, []string{"192.0.2.1:53", "192.0.2.2:53"}, got,
+			"each source's first reply is passed on, a repeat within a second isn't")
+	})
+}
+
+// sendHookPacketConn runs onSend inside WriteTo, before it returns err or
+// success.
+type sendHookPacketConn struct {
+	*scriptedPacketConn
+	onSend func()
+	err    error
+}
+
+func (c *sendHookPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	if c.onSend != nil {
+		c.onSend()
+	}
+	if c.err != nil {
+		return 0, c.err
+	}
+	return len(p), nil
+}
+
+func TestDataPlanePacket_WaitStartsBeforeTheSend(t *testing.T) {
+	tests := []struct {
+		name  string
+		reply bool
+		err   error
+	}{
+		{"a reply read before the send returns ends the wait", true, nil},
+		{"a failed send leaves no wait", false, errors.New("send failed")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var unanswered atomic.Int32
+				c := &sendHookPacketConn{scriptedPacketConn: newScriptedPacketConn(), err: tt.err}
+				d := newDataPlanePacket(c, time.Hour, 1<<20, dataPlaneHooks{
+					onUnanswered: func(time.Time, string) { unanswered.Add(1) },
+				})
+				d.unansweredAfter = defaultUDPUnansweredAfter
+				d.unansweredWhileOpen = true
+				defer d.Close()
+				if tt.reply {
+					c.onSend = func() {
+						c.in <- []byte("reply")
+						d.ReadFrom(make([]byte, 64))
+					}
+				}
+				d.WriteTo([]byte("query"), &net.UDPAddr{})
+				time.Sleep(2 * defaultUDPUnansweredAfter)
+				synctest.Wait()
+				assert.Zero(t, unanswered.Load(), "no unanswered report")
+				assert.False(t, d.awaitingReply(time.Now()), "nothing awaits a reply")
+			})
+		})
+	}
+}
+
+func TestDataPlanePacket_StallKeepsExchangesWatched(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var unanswered, stalls atomic.Int32
+		c := newScriptedPacketConn()
+		d := newDataPlanePacket(c, time.Second, 1, dataPlaneHooks{
+			onUnanswered: func(time.Time, string) { unanswered.Add(1) },
+			onFailure:    func(adapter.UserFailureKind) { stalls.Add(1) },
+		})
+		d.unansweredAfter = defaultUDPUnansweredAfter
+		d.unansweredWhileOpen = true
+		defer d.Close()
+		d.WriteTo([]byte("q"), &net.UDPAddr{})
+		c.in <- []byte("r")
+		d.ReadFrom(make([]byte, 64))
+		d.WriteTo([]byte("q"), &net.UDPAddr{})
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		require.EqualValues(t, 1, stalls.Load(), "the handle stalled")
+		assert.EqualValues(t, 1, unanswered.Load(), "its unanswered exchange is still reported")
+	})
+}
+
+func TestDataPlaneStream_AnsweredBeforeHooksFinishIsNotDoomed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		c := newScriptedConn()
+		d := newDataPlaneStream(c, time.Hour, 1<<20, dataPlaneHooks{
+			onResponse: func(time.Time, string) { <-release },
+		})
+		d.firstResponseTimeout = defaultFirstResponseTimeout
+		d.unansweredAfter = defaultUnansweredAfter
+		defer d.Close()
+		d.Write([]byte("request"))
+		time.Sleep(time.Second)
+		c.reads <- scriptedRead{data: []byte("reply")}
+		go d.Read(make([]byte, 8))
+		synctest.Wait()
+		assert.False(t, d.awaitingFirstResponse(time.Now(), 0), "data that arrived counts while its read's hooks run")
+		close(release)
+	})
+}
+
+// blockingWriteConn's Write blocks until release is closed, as a write
+// carrying a deferred handshake to an unresponsive server does.
+type blockingWriteConn struct {
+	*scriptedConn
+	release chan struct{}
+}
+
+func (c *blockingWriteConn) Write(p []byte) (int, error) {
+	<-c.release
+	return len(p), nil
+}
+
+func TestDataPlaneStream_BlockedFirstWriteAwaitsResponse(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var slow atomic.Int32
+		c := &blockingWriteConn{scriptedConn: newScriptedConn(), release: make(chan struct{})}
+		d := newDataPlaneStream(c, time.Hour, 1<<20, dataPlaneHooks{
+			onSlowResponse: func() { slow.Add(1) },
+		})
+		d.firstResponseTimeout = defaultFirstResponseTimeout
+		d.unansweredAfter = defaultUnansweredAfter
+		d.slowResponseAfter = earlyConfirmAfter
+		go d.Write([]byte("request"))
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		assert.True(t, d.awaitingFirstResponse(time.Now(), earlyConfirmAfter), "a conn blocked in its first write is waiting")
+		assert.EqualValues(t, 1, slow.Load(), "and asks for an early confirmation")
+		close(c.release)
+		d.Close()
+	})
+}
+
+func TestDialContext_DeadlineDuringReplacementWaitDialsNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, members := newStreakTestMUR(t)
+		ob, _ := s.members.Load("b")
+		ob.(*mockOutbound).dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(5 * time.Second), nil }
+		unansweredExchange(t, s, members, false, 3*time.Second)
+		unansweredExchange(t, s, members, false, 3*time.Second)
+		last := members["a"]
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Same(t, last, members["a"], "no member is dialed with the caller's spent context")
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+	})
+}
+
+func TestDialContext_AlternateCutOffByDeadlineIsNotCharged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("refused") }
+		obs["b"].dial = hangUntilDone
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
+		require.Error(t, err)
+		synctest.Wait()
+		failures, _ := userFailures(s, "b")
+		assert.Empty(t, failures, "the alternate is not charged for the caller's deadline")
+	})
+}
+
+func TestConfirmation_ProbesSoftDemotedReplacement(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		var aProbes atomic.Int32
+		failingProbes(obs["a"], &aProbes, hangUntilDone)
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		s.access.Lock()
+		h := s.historyForLocked("b")
+		for i := range s.hist.softFailLimit {
+			h.addWindowFailure(adapter.UserFailure{At: time.Now().Add(time.Duration(i) * time.Second), Kind: adapter.UserFailureDial}, s.hist.userFailureWindow, 0)
+		}
+		s.access.Unlock()
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		synctest.Wait()
+		assert.Equal(t, "b", loadString(&s.stickyTag.tcp), "a soft-demoted member is probed and taken when the selection fails")
+		s.access.Lock()
+		defer s.access.Unlock()
+		assert.False(t, s.outageSuspectedLocked(), "with a replacement passing, there's no outage")
+	})
+}
+
+func TestConfirmation_CooldownVetoIsNoOutage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		var aProbes atomic.Int32
+		failingProbes(obs["a"], &aProbes, hangUntilDone)
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		s.access.Lock()
+		s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = time.Now(), "x"
+		s.access.Unlock()
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		synctest.Wait()
+		require.EqualValues(t, 2, aProbes.Load(), "both confirmations failed")
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "the switch cooldown holds the selection")
+		s.access.Lock()
+		defer s.access.Unlock()
+		assert.False(t, s.outageSuspectedLocked(), "a cooldown veto with a replacement passing is no outage")
+	})
+}
+
+func TestConfirmation_LongProbeTimeoutStillConcludes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		obs["a"].typeName = lConst.TypeUnbounded
+		var aProbes atomic.Int32
+		failingProbes(obs["a"], &aProbes, hangUntilDone)
+		obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+			aProbes.Add(1)
+			return hangUntilDone(ctx)
+		}
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		time.Sleep(3 * time.Minute)
+		synctest.Wait()
+		assert.Equal(t, "b", loadString(&s.stickyTag.tcp),
+			"confirmations that each take longer than the strike window still switch")
+	})
+}
+
+func TestAdvanceNetwork_ClearsConfirmationStrikes(t *testing.T) {
+	s, _ := newConfirmationTestMUR(t, "a", "b")
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.probeMembers["a"].firstConfirmFailedAt = time.Now()
+	s.probeMembers["a"].confirmedAt = time.Now()
+	s.pendingConfirmedFailure.tag, s.pendingConfirmedFailure.at = "a", time.Now()
+	s.advanceNetworkLocked()
+	assert.True(t, s.probeMembers["a"].firstConfirmFailedAt.IsZero(), "an old network's strike is dropped")
+	assert.True(t, s.probeMembers["a"].confirmedAt.IsZero(), "as is its early-confirmation cooldown")
+	assert.Empty(t, s.pendingConfirmedFailure.tag, "and its pending switch")
+}
+
+func TestStreak_FailedProbeWithoutConfirmationReleases(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		generation := s.networkGeneration.Load()
+		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		time.Sleep(time.Second)
+		s.access.Lock()
+		s.recordProbeOutcomeLocked("a", &probeOutcome{success: false, generation: generation, url: s.probeURLForLocked("a")})
+		s.access.Unlock()
+		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		synctest.Wait()
+		out, _, err := s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		assert.Equal(t, "b", out.Tag(), "with no confirmation under way, a failed probe doesn't hold off the streak's release")
+	})
+}
+
+func TestStreak_PassingSelectionIsNoOutage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, members := newStreakTestMUR(t)
+		ob, _ := s.members.Load("b")
+		ob.(*mockOutbound).dial = func(context.Context) (net.Conn, error) { return nil, errors.New("probe failed") }
+		unansweredExchange(t, s, members, false, 3*time.Second)
+		unansweredExchange(t, s, members, false, 3*time.Second)
+		requestTestProbes(s, []string{"a"}, probeForced)
+		synctest.Wait()
+		out, _, err := s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		require.Equal(t, "a", out.Tag(), "with no replacement reachable, the selection stays")
+		s.access.Lock()
+		defer s.access.Unlock()
+		assert.False(t, s.outageSuspectedLocked(), "its own passing probe shows the device's network works")
+	})
+}
+
+func TestSelectOutbound_StreakReleaseToUnmeasuredWaitsForProbe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newTestMUR(t, "a", "c")
+		s.defaultURL = "http://probe.test/"
+		recordSuccess(s, "a", 100)
+		obs["c"].dial = hangUntilDone
+		s.stickyTag.tcp.Store("a")
+		generation := s.networkGeneration.Load()
+		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		time.Sleep(time.Second)
+		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		out, _, err := s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		assert.Equal(t, "a", out.Tag(), "a streak-demoted selection waits for an unmeasured member's probe to pass")
+	})
+}
+
+func TestOutage_ForgivenessIsPersisted(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	t0 := time.Now()
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.mutateHistoryLocked("b", func(h *localHistory, now time.Time) bool {
+		h.recordProbeFailure(now)
+		h.recordProbeFailure(now)
+		return true
+	})
+	require.EqualValues(t, 2, s.history.Load("b").ConsecutiveFailures)
+	s.suspectOutageLocked(t0)
+	assert.Zero(t, s.history.Load("b").ConsecutiveFailures, "the stored history drops the forgiven failures")
+}
+
+func TestOutage_SuspicionDropsFailureStreaks(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	recordSuccess(s, "a", 100)
+	s.stickyTag.tcp.Store("a")
+	generation := s.networkGeneration.Load()
+	s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+	s.noteUnanswered("a", generation, "tcp", "", time.Now().Add(time.Second), time.Now().Add(time.Second))
+	s.access.Lock()
+	defer s.access.Unlock()
+	h := s.historyForLocked("a")
+	require.EqualValues(t, 2, h.streakCount(streakTCP, time.Now().Add(time.Second), s.hist.userFailureWindow))
+	s.suspectOutageLocked(time.Now())
+	assert.Zero(t, h.streakCount(streakTCP, time.Now().Add(time.Second), s.hist.userFailureWindow),
+		"failures that led to a suspected outage don't release the selection once it ends")
+}
+
+func TestDialContext_AbandonedDialIsCanceled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		var aProbes atomic.Int32
+		var abandoned atomic.Bool
+		failingProbes(obs["a"], &aProbes, func(ctx context.Context) (net.Conn, error) {
+			<-ctx.Done()
+			abandoned.Store(true)
+			return nil, ctx.Err()
+		})
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+		defer cancel()
+		conn, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		defer conn.Close()
+		synctest.Wait()
+		assert.True(t, abandoned.Load(), "the abandoned dial ends with the failover, not at the caller's deadline")
+	})
+}
+
+// joinedSendPacketConn fails its first send after running a second, nested
+// one that succeeds, as a concurrent writer's would.
+type joinedSendPacketConn struct {
+	*scriptedPacketConn
+	d     *dataPlanePacket
+	sends int
+}
+
+func (c *joinedSendPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.sends++
+	if c.sends == 1 {
+		c.d.WriteTo(p, addr)
+		return 0, errors.New("send failed")
+	}
+	return len(p), nil
+}
+
+func TestDataPlanePacket_FailedSendKeepsJoinedWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var unanswered atomic.Int32
+		c := &joinedSendPacketConn{scriptedPacketConn: newScriptedPacketConn()}
+		d := newDataPlanePacket(c, time.Hour, 1<<20, dataPlaneHooks{
+			onUnanswered: func(time.Time, string) { unanswered.Add(1) },
+		})
+		c.d = d
+		d.unansweredAfter = defaultUDPUnansweredAfter
+		d.unansweredWhileOpen = true
+		defer d.Close()
+		d.WriteTo([]byte("query"), &net.UDPAddr{})
+		time.Sleep(2 * defaultUDPUnansweredAfter)
+		synctest.Wait()
+		assert.EqualValues(t, 1, unanswered.Load(), "the send that succeeded is still watched")
+	})
+}
+
+func TestDialContext_DialContextLivesUntilClose(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	var dialCtx context.Context
+	obs["a"].dial = func(ctx context.Context) (net.Conn, error) {
+		dialCtx = ctx
+		return newScriptedConn(), nil
+	}
+	conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+	require.NoError(t, err)
+	require.NoError(t, dialCtx.Err(), "a conn tied to its dial context stays usable while open")
+	conn.Close()
+	assert.ErrorIs(t, dialCtx.Err(), context.Canceled, "and the context is released once it closes")
 }
