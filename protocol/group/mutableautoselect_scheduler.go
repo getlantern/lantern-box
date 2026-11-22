@@ -326,8 +326,9 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 		url:        attempt.url,
 		lastResort: attempt.lastResort,
 	})
-	if success {
+	if success && s.outageSuspectedLocked() {
 		s.endOutageLocked()
+		s.probeSelectionAfterOutageLocked(attempt.tag, outcome.completed)
 	}
 	if success && !attempt.lastResort {
 		for waiter := range s.urlWaiters {
@@ -373,6 +374,8 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 			}
 		}
 	}
+	// After the need above is settled, so a probe it requests stands.
+	s.settleAfterOutageLocked(attempt.tag, outcome)
 	s.tryPendingConfirmedSwitchLocked()
 	s.reselectUDPLocked()
 	s.notifyProbesLocked()
@@ -385,7 +388,7 @@ func (s *MutableAutoSelect) recordProbeOutcomeLocked(tag string, outcome *probeO
 	outcome.sequence = s.probeSequence
 	outcome.completed = time.Now()
 	s.probeMembers[tag].outcome = outcome
-	forgiven := !outcome.success && s.outageSuspectedLocked()
+	forgiven := !outcome.success && s.startedInOutageLocked(outcome.started)
 	s.mutateHistoryLocked(tag, func(h *localHistory, now time.Time) bool {
 		if forgiven {
 			h.recordForgivenProbeFailure(now)
@@ -829,6 +832,9 @@ func (s *MutableAutoSelect) onProbePause(event int) {
 	case pause.EventDeviceWake, pause.EventNetworkWake:
 		if !s.paused() {
 			s.armPeriodicLocked()
+			if s.outageSuspectedLocked() {
+				s.armOutageRecheckLocked()
+			}
 			s.dispatchProbesLocked()
 		}
 	}
@@ -876,6 +882,9 @@ func (s *MutableAutoSelect) keepAliveLocked() {
 	s.requestProbesLocked(nil, probeIfStale, false)
 	s.dispatchProbesLocked()
 	s.armPeriodicLocked()
+	if s.outageSuspectedLocked() {
+		s.armOutageRecheckLocked()
+	}
 	s.armIdleLocked(s.cfg.idleThreshold)
 }
 
@@ -910,6 +919,9 @@ func (s *MutableAutoSelect) closeProbesLocked() {
 	}
 	if s.periodicTimer != nil {
 		s.periodicTimer.Stop()
+	}
+	if s.outageRecheck != nil {
+		s.outageRecheck.Stop()
 	}
 	if s.idleTimer != nil {
 		s.idleTimer.Stop()
@@ -950,6 +962,10 @@ func (s *MutableAutoSelect) advanceNetworkLocked() {
 		h.clearStreak(streakUDP)
 	}
 	s.lastStreakSwitch.tcp, s.lastStreakSwitch.udp = time.Time{}, time.Time{}
+	s.trials = [2]trialState{}
+	s.releasedSince = [2]time.Time{}
+	// A decision armed on the old network says nothing about the new one.
+	s.afterOutage.tag = ""
 	if s.probing {
 		s.requestProbesLocked(nil, probeForced, true)
 	}

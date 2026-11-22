@@ -132,6 +132,12 @@ func TestTrySwitchAfterConfirmedFailure(t *testing.T) {
 		want  string
 	}{
 		{"validated fallback", func(*MutableAutoSelect) {}, "b"},
+		// c outranks b, so only the named fallback's answer picks b.
+		{"named fallback answered", func(s *MutableAutoSelect) {
+			recordSuccess(s, "c", 5)
+			s.noteUserResponse("b", s.networkGeneration.Load(), "tcp", "", time.Now(), time.Now())
+		}, "b"},
+		{"named fallback never answered", func(s *MutableAutoSelect) { recordSuccess(s, "c", 5) }, "c"},
 		{"current selection changed", func(s *MutableAutoSelect) { s.stickyTag.tcp.Store("c") }, ""},
 		{"newer probe passed", func(s *MutableAutoSelect) { seedProbe(s, "a", true, 10) }, ""},
 		{"fallback failed its last probe", func(s *MutableAutoSelect) {
@@ -412,7 +418,7 @@ func TestMakeHooks_ConfirmsOnlyPrimaryTCPResetOrNoResponse(t *testing.T) {
 				}
 				obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 
-				s.makeHooks("a", tt.network, tt.route, s.networkGeneration.Load()).onFailure(tt.kind, nil)
+				s.makeHooks("a", tt.network, tt.route, s.networkGeneration.Load(), "").onFailure(tt.kind, nil)
 				synctest.Wait()
 
 				uf, _ := userFailures(s, "a")

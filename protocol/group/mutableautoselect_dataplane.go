@@ -60,6 +60,9 @@ type dataPlaneHooks struct {
 	// onSlowResponse runs once, on its own goroutine, if the conn still has
 	// no first response slowResponseAfter after its first write.
 	onSlowResponse func()
+	// detached, once set, means the conn's member was removed: the hooks the
+	// group installed no longer report on it. Nil for a conn without them.
+	detached *atomic.Bool
 	// onReset runs synchronously when a reset is charged, before onFailure
 	// is dispatched on its own goroutine, so a caller can note the reset
 	// before the IO error reaches the client. It runs on the IO path, so it
@@ -70,11 +73,27 @@ type dataPlaneHooks struct {
 
 // makeHooks records chargeable failures and starts recovery. Only primary TCP
 // resets and unanswered writes trigger selection confirmation.
-func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind, generation uint64) dataPlaneHooks {
+func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind, generation uint64, trialFor string) dataPlaneHooks {
 	confirms := network == N.NetworkTCP && route == primaryRoute
 	opened := time.Now()
+	detached := new(atomic.Bool)
+	// A trial's conn reports a failure once, however many ways it fails,
+	// and again only after it has answered since.
+	var trialFailed atomic.Bool
+	noteTrialFailed := func() {
+		if trialFailed.CompareAndSwap(false, true) {
+			s.noteTrialFailed(outerTag, network, trialFor, generation)
+		}
+	}
 	hooks := dataPlaneHooks{
+		detached: detached,
 		onUnanswered: func(waitingSince time.Time, dest string) {
+			if detached.Load() {
+				return
+			}
+			if route == trialRoute {
+				noteTrialFailed()
+			}
 			// A UDP handle carries many exchanges; each counts as a conn
 			// opened when its wait began.
 			exchangeOpened := opened
@@ -88,7 +107,10 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 			}
 		},
 		onFailure: func(kind adapter.UserFailureKind, cause error) {
-			if !s.chargeable(outerTag, route) {
+			if !detached.Load() && route == trialRoute {
+				noteTrialFailed()
+			}
+			if detached.Load() || !s.chargeable(outerTag, route) {
 				return
 			}
 			if !s.recordUserFailure(outerTag, kind, generation, opened, network, cause) {
@@ -99,6 +121,13 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 			}
 		},
 		onError: func(err error, state dataPlaneIO, excused bool) {
+			if !detached.Load() && failedLocally(err) {
+				if route == trialRoute {
+					noteTrialFailed()
+				} else {
+					s.noteSelectionFailedLocally(outerTag, network, generation)
+				}
+			}
 			decision := "candidate"
 			if excused {
 				decision = "excused"
@@ -116,9 +145,20 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 		onActivity: s.noteDataActivity,
 	}
 	if confirms {
-		hooks.onSlowResponse = func() { s.requestEarlyConfirmation(outerTag, generation) }
+		hooks.onSlowResponse = func() {
+			if !detached.Load() {
+				s.requestEarlyConfirmation(outerTag, generation)
+			}
+		}
 	}
 	hooks.onResponse = func(at time.Time, dest string) {
+		if detached.Load() {
+			return
+		}
+		if route == trialRoute {
+			trialFailed.Store(false)
+			s.noteTrialAnswered(outerTag, network, generation, trialFor)
+		}
 		s.noteUserResponse(outerTag, generation, network, dest, opened, at)
 	}
 	return hooks
@@ -175,8 +215,10 @@ type dataPlaneWatchdog struct {
 	awaitingDest        string
 	lastDest            string
 	reportedSinceAnswer bool
-	lastAnswerNotify    time.Time
-	notifiedSources     map[string]struct{}
+	// reportedDest is the destination of the latest unanswered report.
+	reportedDest     string
+	lastAnswerNotify time.Time
+	notifiedSources  map[string]struct{}
 	// The current wait's id; its sends still under way and how many joined
 	// it; the join order of the earliest send that sent, or -1; and the
 	// latest destination waited on before it began.
@@ -531,7 +573,7 @@ func (w *dataPlaneWatchdog) fireUnansweredWhileOpen() {
 	// that does re-arms the timer.
 	report := !since.IsZero() && w.waitSentSeq >= 0 && !w.closed.Load() && time.Since(since) >= w.unansweredAfter
 	if report {
-		w.awaitingSince, w.reportedSinceAnswer = time.Time{}, true
+		w.awaitingSince, w.reportedSinceAnswer, w.reportedDest = time.Time{}, true, dest
 	}
 	w.ioMu.Unlock()
 	if report && w.hooks.onUnanswered != nil {
@@ -541,11 +583,22 @@ func (w *dataPlaneWatchdog) fireUnansweredWhileOpen() {
 
 // awaitingReply reports whether the handle's latest exchange went
 // unanswered: reported with no reply since, or waiting at least
-// unansweredAfter.
+// unansweredAfter since a send that went out.
 func (w *dataPlaneWatchdog) awaitingReply(now time.Time) bool {
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
-	return w.reportedSinceAnswer || (!w.awaitingSince.IsZero() && now.Sub(w.awaitingSince) >= w.unansweredAfter)
+	return w.reportedSinceAnswer ||
+		(!w.awaitingSince.IsZero() && w.waitSentSeq >= 0 && now.Sub(w.awaitingSince) >= w.unansweredAfter)
+}
+
+// awaitingReplyFrom is awaitingReply for an exchange with dest: one
+// reported unanswered, or waiting at least unansweredAfter since a send
+// that went out.
+func (w *dataPlaneWatchdog) awaitingReplyFrom(now time.Time, dest string) bool {
+	w.ioMu.Lock()
+	defer w.ioMu.Unlock()
+	return (w.reportedSinceAnswer && w.reportedDest == dest) ||
+		(!w.awaitingSince.IsZero() && w.waitSentSeq >= 0 && w.awaitingDest == dest && now.Sub(w.awaitingSince) >= w.unansweredAfter)
 }
 
 func (w *dataPlaneWatchdog) stopUnansweredTimer() {

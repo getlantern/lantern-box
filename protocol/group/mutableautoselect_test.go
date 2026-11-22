@@ -784,7 +784,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// one. (Spec change from earlier "one-shot hard demote.")
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureStall, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1,
@@ -796,7 +796,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset, nil)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureReset, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -1887,7 +1887,7 @@ func TestMakeHooks_IgnoresFailureFromUnselectedTag(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("b")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureStall, nil)
 
 	s.access.Lock()
 	_, ok := s.peekHistoryLocked("a")
@@ -1903,7 +1903,7 @@ func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("a")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureStall, nil)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the udp selection must still be chargeable")
@@ -1915,7 +1915,7 @@ func TestMakeHooks_UnselectedGateDisabledByConfig(t *testing.T) {
 	s.cfg.demoteOnlySelected = false
 	s.stickyTag.tcp.Store("b")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureStall, nil)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the gate must be defeatable for rollback")
@@ -1928,7 +1928,7 @@ func TestMakeHooks_ChargesFallbackRouteEvenWhenUnselected(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	s.stickyTag.tcp.Store("a")
 
-	s.makeHooks("b", "tcp", fallbackRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset, nil)
+	s.makeHooks("b", "tcp", fallbackRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureReset, nil)
 
 	uf, ok := userFailures(s, "b")
 	require.True(t, ok, "a fallback-route conn must stay chargeable")
@@ -2032,7 +2032,7 @@ func TestMakeHooks_FailureDoesNotRunLadder(t *testing.T) {
 		obs["a"].dial = denyDial
 		obs["b"].dial = denyDial
 		s.stickyTag.tcp.Store("a")
-		s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset, nil)
+		s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureReset, nil)
 		synctest.Wait()
 		assert.Zero(t, s.lastLadderAt.Load(), "a data-plane failure must not re-probe every member")
 	})
@@ -2050,6 +2050,7 @@ func seedProbe(s *MutableAutoSelect, tag string, success bool, delayMs uint32) {
 	s.recordProbeOutcomeLocked(tag, &probeOutcome{
 		success:    success,
 		delayMs:    delayMs,
+		started:    time.Now(),
 		generation: s.networkGeneration.Load(),
 		url:        s.probeURLForLocked(tag),
 		lastResort: behaviorFor(out.Type()).lastResort,

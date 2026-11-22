@@ -13,3 +13,11 @@ import (
 func peerAnswered(err error) bool {
 	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED)
 }
+
+// failedLocally reports whether err shows the device failed the conn itself:
+// it has no route or no network, as a device that lost its network reports
+// for new conns, or it aborted an established one, as Android does then.
+// EHOSTUNREACH isn't included, since a router on the way can report it.
+func failedLocally(err error) bool {
+	return errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.ENETDOWN) || errors.Is(err, syscall.ECONNABORTED)
+}

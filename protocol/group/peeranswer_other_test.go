@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/getlantern/lantern-box/adapter"
+	"github.com/sagernet/sing/common/metadata"
 )
 
 func opErr(op string, errno syscall.Errno) error {
@@ -41,6 +42,26 @@ func TestPeerAnswered(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, peerAnswered(tc.err))
+		})
+	}
+}
+
+func TestFailedLocally(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"network unreachable", opErr("write", syscall.ENETUNREACH), true},
+		{"network down", opErr("connect", syscall.ENETDOWN), true},
+		{"aborted by the device", opErr("read", syscall.ECONNABORTED), true},
+		{"host unreachable", opErr("connect", syscall.EHOSTUNREACH), false},
+		{"reset", opErr("read", syscall.ECONNRESET), false},
+		{"timeout", timeoutErr{}, false},
+		{"none", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, failedLocally(tc.err))
 		})
 	}
 }
@@ -143,11 +164,15 @@ func TestStreak_ReleasedWhenOnlyTheProbesFail(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		causes []error
-		want   string
+		// bSoft soft-demotes b first, so the selection and b share a tier.
+		bSoft bool
+		want  string
 	}{
-		{"the far end reset the selection's traffic", []error{reset, reset}, "b"},
-		{"the selection's traffic failed locally", []error{aborted, aborted}, "a"},
-		{"the far end answered only before the streak", []error{reset, aborted}, "a"},
+		{"the far end reset the selection's traffic", []error{reset, reset}, false, "b"},
+		{"the selection's traffic failed locally", []error{aborted, aborted}, false, "a"},
+		{"the far end answered only before the streak", []error{reset, aborted}, false, "a"},
+		// As when every server refuses: b failing too, nothing sets it apart.
+		{"the only other member is in the selection's tier", []error{reset, reset}, true, "a"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -156,17 +181,85 @@ func TestStreak_ReleasedWhenOnlyTheProbesFail(t *testing.T) {
 					ob.dial = func(context.Context) (net.Conn, error) { return nil, errors.New("probe endpoint down") }
 				}
 				generation := s.networkGeneration.Load()
+				if tc.bSoft {
+					for range s.hist.softFailLimit {
+						require.True(t, s.recordUserFailure("b", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+						time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+					}
+				}
 				for _, cause := range tc.causes {
 					s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", cause)
 					time.Sleep(time.Second)
 				}
-				for range 3 {
+				for range 4 {
 					_, _, err := s.selectOutbound("tcp", "")
 					require.NoError(t, err)
+					if tc.want == "a" {
+						require.Equal(t, "a", loadString(&s.stickyTag.tcp), "the selection is never released")
+					}
 					time.Sleep(time.Second)
 					synctest.Wait()
 				}
 				assert.Equal(t, tc.want, loadString(&s.stickyTag.tcp))
+			})
+		})
+	}
+}
+
+// localWriteFailConn's writes fail as a deferred setup's first write does
+// once the device has lost its network.
+type localWriteFailConn struct{ *scriptedConn }
+
+func (c localWriteFailConn) Write([]byte) (int, error) { return 0, opErr("write", syscall.ENETUNREACH) }
+
+func TestOutage_NoTrialOnceTheSelectionFailsLocallyOrAnswers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// conn is a's conn; answer has it answer after it went unanswered.
+		conn   func() net.Conn
+		answer bool
+	}{
+		{"a deferred setup's write fails locally", func() net.Conn { return localWriteFailConn{newScriptedConn()} }, false},
+		{"the selection answers again", func() net.Conn { return newScriptedConn() }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, obs := newConfirmationTestMUR(t, "a", "b")
+				probeDown := errors.New("probe endpoint down")
+				obs["a"].dialTo = func(_ context.Context, dest metadata.Socksaddr) (net.Conn, error) {
+					if dest.Fqdn == "probe.test" {
+						return nil, probeDown
+					}
+					return tc.conn(), nil
+				}
+				obs["b"].dialTo = func(_ context.Context, dest metadata.Socksaddr) (net.Conn, error) {
+					if dest.Fqdn == "probe.test" {
+						return nil, probeDown
+					}
+					return probeResponderConn(), nil
+				}
+				generation := s.networkGeneration.Load()
+				s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+				conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+				require.NoError(t, err)
+				conn.Write([]byte("request"))
+				conn.Close()
+				if tc.answer {
+					s.noteUserResponse("a", generation, "tcp", "", time.Now(), time.Now())
+				}
+				s.access.Lock()
+				s.suspectOutageLocked(time.Now())
+				s.access.Unlock()
+				time.Sleep(3 * time.Second)
+				conn, err = s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+				if err == nil {
+					defer time.AfterFunc(5*time.Second, func() { conn.Close() }).Stop()
+					conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+					conn.Read(make([]byte, 64))
+					conn.Close()
+				}
+				synctest.Wait()
+				assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "nothing showed a failing while the network was up")
 			})
 		})
 	}

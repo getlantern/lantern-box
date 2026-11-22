@@ -1,6 +1,7 @@
 package group
 
 import (
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -95,6 +96,12 @@ type localHistory struct {
 	// answered through this member, keeping the most recent
 	// maxUDPAnsweredDestinations. In-memory only.
 	udpAnswered map[string]time.Time
+	// udpInherited holds the destinations that answered through the UDP
+	// selection this member last replaced, so one failing through this
+	// member as well is its failure too. They aren't passed on again, which
+	// bounds how far a destination that died moves the selection.
+	// In-memory only.
+	udpInherited map[string]time.Time
 }
 
 func newLocalHistory() *localHistory { return &localHistory{} }
@@ -260,7 +267,19 @@ func (h *localHistory) udpDestAnswered(dest string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	_, ok := h.udpAnswered[dest]
-	return ok
+	_, inherited := h.udpInherited[dest]
+	return ok || inherited
+}
+
+// inheritUDPDestinations replaces h's inherited destinations with those that
+// answered through from itself.
+func (h *localHistory) inheritUDPDestinations(from *localHistory) {
+	from.mu.Lock()
+	dests := maps.Clone(from.udpAnswered)
+	from.mu.Unlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.udpInherited = dests
 }
 
 func (h *localHistory) streakCount(network streakNet, now time.Time, window time.Duration) uint32 {
