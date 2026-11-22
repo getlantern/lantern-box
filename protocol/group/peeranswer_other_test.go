@@ -69,7 +69,7 @@ func TestOutage_LocalFailuresAreNotCounted(t *testing.T) {
 	s.access.Unlock()
 	generation := s.networkGeneration.Load()
 	for _, cause := range []error{opErr("connect", syscall.ENETUNREACH), opErr("write", syscall.ECONNABORTED), nil} {
-		assert.False(t, s.recordUserFailure("a", adapter.UserFailureDial, generation, time.Now(), "tcp", cause))
+		assert.False(t, s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureDial, time.Now(), "tcp", cause))
 	}
 	failures, _ := userFailures(s, "a")
 	assert.Empty(t, failures, "failures of the device's own network don't demote the member")
@@ -84,7 +84,7 @@ func TestOutage_PeerResetEndsSuspicionAndCounts(t *testing.T) {
 	s.suspectOutageLocked(time.Now())
 	s.access.Unlock()
 	opened := time.Now()
-	require.True(t, s.recordUserFailure("a", adapter.UserFailureReset, s.networkGeneration.Load(), opened, "tcp", opErr("read", syscall.ECONNRESET)))
+	require.True(t, s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureReset, opened, "tcp", opErr("read", syscall.ECONNRESET)))
 	failures, _ := userFailures(s, "a")
 	assert.Len(t, failures, 1, "a reset from the far end is the member's failure")
 	s.access.Lock()
@@ -112,7 +112,7 @@ func TestOutage_PeerResetOnAConnTheOutageOutlastedIsNotCounted(t *testing.T) {
 				}
 				s.access.Unlock()
 				time.Sleep(time.Second)
-				assert.False(t, s.recordUserFailure("a", adapter.UserFailureReset, s.networkGeneration.Load(), opened, "tcp", opErr("write", syscall.ECONNRESET)),
+				assert.False(t, s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureReset, opened, "tcp", opErr("write", syscall.ECONNRESET)),
 					"the far end may have dropped the conn during the outage")
 				failures, _ := userFailures(s, "a")
 				assert.Empty(t, failures)
@@ -134,7 +134,7 @@ func TestOutage_LocalFailureOnAConnTheOutageOutlastedIsNotCounted(t *testing.T) 
 		s.endOutageLocked()
 		s.access.Unlock()
 		time.Sleep(time.Second)
-		assert.False(t, s.recordUserFailure("a", adapter.UserFailureStall, s.networkGeneration.Load(), opened, "tcp", nil))
+		assert.False(t, s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureStall, opened, "tcp", nil))
 		failures, _ := userFailures(s, "a")
 		assert.Empty(t, failures, "a stall on a conn opened before the outage ended is the outage's")
 	})
@@ -178,12 +178,12 @@ func TestStreak_ReleasedWhenOnlyTheProbesFail(t *testing.T) {
 				generation := s.networkGeneration.Load()
 				if tc.bSoft {
 					for range s.hist.softFailLimit {
-						require.True(t, s.recordUserFailure("b", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+						require.True(t, s.recordUserFailure(s.originAt("b", generation), adapter.UserFailureDial, time.Now(), "tcp", nil))
 						time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
 					}
 				}
 				for _, cause := range tc.causes {
-					s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", cause)
+					s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "tcp", cause)
 					time.Sleep(time.Second)
 				}
 				for range 4 {
@@ -234,13 +234,13 @@ func TestOutage_NoTrialOnceTheSelectionFailsLocallyOrAnswers(t *testing.T) {
 					return probeResponderConn(), nil
 				}
 				generation := s.networkGeneration.Load()
-				s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+				s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 				conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
 				require.NoError(t, err)
 				conn.Write([]byte("request"))
 				conn.Close()
 				if tc.answer {
-					s.noteUserResponse("a", generation, "tcp", "", time.Now(), time.Now())
+					s.noteUserResponse(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 				}
 				s.access.Lock()
 				s.suspectOutageLocked(time.Now())
