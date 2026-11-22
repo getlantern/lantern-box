@@ -2032,9 +2032,11 @@ func (s *MutableAutoSelect) findProbedReplacementLocked(now time.Time, network, 
 // replacementPoolLocked returns the members network's selection could move
 // to from tag, in rank order: network's healthiest tier after excluding tag,
 // followed by its soft tier when that tier is clean, since a failed probe
-// leaves a member clean. A soft member past softFailLimit is left out, as
-// applyStickiness would release it again at once. The result aliases scratch
-// space reused by the next split. Caller must hold s.access.
+// leaves a member clean. A member past softFailLimit is left out of that
+// appended tier, since applyStickiness releases one to a cleaner tier at
+// once; a pool that is itself the soft tier keeps it, as nothing cleaner
+// exists to release it to. The result aliases scratch space reused by the
+// next split. Caller must hold s.access.
 func (s *MutableAutoSelect) replacementPoolLocked(now time.Time, network, tag string) []rankedCandidate {
 	ranked := slices.DeleteFunc(s.rankLocked(now), func(c rankedCandidate) bool {
 		return c.tag == tag
