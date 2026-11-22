@@ -69,6 +69,10 @@ type MutableAutoSelect struct {
 	connMgr     A.ConnectionManager
 	logger      log.ContextLogger
 
+	// reportMu orders a conn's reports against Remove detaching its member's
+	// conns: a report checks and reaches the group under the read lock, so it
+	// can't land on a member re-added under the same tag. Taken before access.
+	reportMu     sync.RWMutex
 	access       sync.Mutex
 	tags         []string
 	members      isync.TypedMap[string, A.Outbound]
@@ -510,6 +514,8 @@ func (s *MutableAutoSelect) Add(tags ...string) (n int, err error) {
 }
 
 func (s *MutableAutoSelect) Remove(tags ...string) (n int, err error) {
+	s.reportMu.Lock()
+	defer s.reportMu.Unlock()
 	s.access.Lock()
 	defer s.access.Unlock()
 	if s.isClosed() {
@@ -618,6 +624,15 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 			if !errors.Is(ctx.Err(), context.Canceled) {
 				s.noteTrialFailed(trial.out.Tag(), network, trial.trialFor, trial.generation)
 			}
+		}
+		if ctx.Err() != nil {
+			// The trial used up the caller's deadline, so the selection isn't
+			// dialed and charged for a setup that had no time to run.
+			if err == nil {
+				err = ctx.Err()
+			}
+			recordError(span, err)
+			return nil, err
 		}
 	}
 	origin, err := s.selectOrigin(network, "", primaryRoute)
@@ -730,6 +745,13 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 			if !errors.Is(ctx.Err(), context.Canceled) {
 				s.noteTrialFailed(trial.out.Tag(), N.NetworkUDP, trial.trialFor, trial.generation)
 			}
+		}
+		if ctx.Err() != nil {
+			if err == nil {
+				err = ctx.Err()
+			}
+			recordError(span, err)
+			return nil, err
 		}
 	}
 	origin, err := s.selectOrigin("udp", "", primaryRoute)

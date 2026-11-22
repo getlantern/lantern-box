@@ -85,48 +85,56 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 			s.noteTrialFailed(outerTag, network, trialFor, generation)
 		}
 	}
+	// report runs f, a report on the conn, unless its member was removed.
+	report := func(f func()) {
+		s.reportMu.RLock()
+		defer s.reportMu.RUnlock()
+		if !detached.Load() {
+			f()
+		}
+	}
 	hooks := dataPlaneHooks{
 		detached: detached,
 		onUnanswered: func(waitingSince time.Time, dest string) {
-			if detached.Load() {
-				return
-			}
-			if route == trialRoute {
-				noteTrialFailed()
-			}
-			// A UDP handle carries many exchanges; each counts as a conn
-			// opened when its wait began.
-			exchangeOpened := opened
-			if network == N.NetworkUDP {
-				exchangeOpened = waitingSince
-			}
-			if s.chargeable(outerTag, route) {
-				s.noteUnanswered(outerTag, generation, network, dest, exchangeOpened, waitingSince)
-			} else if network == N.NetworkUDP {
-				s.noteUnansweredOffSelection(outerTag, generation, dest, exchangeOpened, waitingSince)
-			}
-		},
-		onFailure: func(kind adapter.UserFailureKind, cause error) {
-			if !detached.Load() && route == trialRoute {
-				noteTrialFailed()
-			}
-			if detached.Load() || !s.chargeable(outerTag, route) {
-				return
-			}
-			if !s.recordUserFailure(outerTag, kind, generation, opened, network, cause) {
-				return
-			}
-			if confirms && (kind == adapter.UserFailureReset || kind == adapter.UserFailureNoResponse) {
-				s.requestFailureConfirmation(outerTag, "", generation)
-			}
-		},
-		onError: func(err error, state dataPlaneIO, excused bool) {
-			if !detached.Load() && failedLocally(err) {
+			report(func() {
 				if route == trialRoute {
 					noteTrialFailed()
-				} else {
-					s.noteSelectionFailedLocally(outerTag, network, generation)
 				}
+				// A UDP handle carries many exchanges; each counts as a conn
+				// opened when its wait began.
+				exchangeOpened := opened
+				if network == N.NetworkUDP {
+					exchangeOpened = waitingSince
+				}
+				if s.chargeable(outerTag, route) {
+					s.noteUnanswered(outerTag, generation, network, dest, exchangeOpened, waitingSince)
+				} else if network == N.NetworkUDP {
+					s.noteUnansweredOffSelection(outerTag, generation, dest, exchangeOpened, waitingSince)
+				}
+			})
+		},
+		onFailure: func(kind adapter.UserFailureKind, cause error) {
+			report(func() {
+				if route == trialRoute {
+					noteTrialFailed()
+				}
+				if !s.chargeable(outerTag, route) || !s.recordUserFailure(outerTag, kind, generation, opened, network, cause) {
+					return
+				}
+				if confirms && (kind == adapter.UserFailureReset || kind == adapter.UserFailureNoResponse) {
+					s.requestFailureConfirmation(outerTag, "", generation)
+				}
+			})
+		},
+		onError: func(err error, state dataPlaneIO, excused bool) {
+			if failedLocally(err) {
+				report(func() {
+					if route == trialRoute {
+						noteTrialFailed()
+					} else {
+						s.noteSelectionFailedLocally(outerTag, network, generation)
+					}
+				})
 			}
 			decision := "candidate"
 			if excused {
@@ -146,20 +154,17 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 	}
 	if confirms {
 		hooks.onSlowResponse = func() {
-			if !detached.Load() {
-				s.requestEarlyConfirmation(outerTag, generation)
-			}
+			report(func() { s.requestEarlyConfirmation(outerTag, generation) })
 		}
 	}
 	hooks.onResponse = func(at time.Time, dest string) {
-		if detached.Load() {
-			return
-		}
-		if route == trialRoute {
-			trialFailed.Store(false)
-			s.noteTrialAnswered(outerTag, network, generation, trialFor)
-		}
-		s.noteUserResponse(outerTag, generation, network, dest, opened, at)
+		report(func() {
+			if route == trialRoute {
+				trialFailed.Store(false)
+				s.noteTrialAnswered(outerTag, network, generation, trialFor)
+			}
+			s.noteUserResponse(outerTag, generation, network, dest, opened, at)
+		})
 	}
 	return hooks
 }

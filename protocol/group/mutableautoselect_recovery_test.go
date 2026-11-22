@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -4262,5 +4263,125 @@ func TestRemove_DropsAPendingMoveToTheMember(t *testing.T) {
 		time.Sleep(time.Second)
 		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
 		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "the answer was the removed b's")
+	})
+}
+
+func TestTrial_DeadlineSpentOnTheTrialLeavesTheSelectionUndialed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var selectionDials, trialDials atomic.Int32
+		s := newTrialTestMUR(t, map[string]func() (net.Conn, error){
+			"a": func() (net.Conn, error) {
+				selectionDials.Add(1)
+				return newScriptedConn(), nil
+			},
+			"b": func() (net.Conn, error) {
+				trialDials.Add(1)
+				time.Sleep(2 * time.Second)
+				return nil, errors.New("dial timeout")
+			},
+		}, "a", "b")
+		generation := s.networkGeneration.Load()
+		dialAndRead(s)
+		seedProbe(s, "a", false, 0)
+		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		time.Sleep(3 * time.Second)
+		selectionDials.Store(0)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, err := s.DialContext(ctx, "tcp", metadata.Socksaddr{})
+		require.Error(t, err)
+		require.Equal(t, int32(1), trialDials.Load(), "b is trialled")
+		assert.Zero(t, selectionDials.Load(), "the trial used up the caller's deadline, so a had no time to be tried")
+	})
+}
+
+// pausingLogger blocks the first Info call whose message starts with prefix,
+// closing reached, until release is closed.
+type pausingLogger struct {
+	log.ContextLogger
+	prefix           string
+	reached, release chan struct{}
+	once             sync.Once
+}
+
+func (l *pausingLogger) Info(args ...any) {
+	if msg, ok := args[0].(string); ok && strings.HasPrefix(msg, l.prefix) {
+		l.once.Do(func() {
+			close(l.reached)
+			<-l.release
+		})
+	}
+}
+
+func TestRemove_ReportUnderWayStaysWithTheRemovedMembership(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	for _, ob := range obs {
+		ob.dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+	}
+	logger := &pausingLogger{ContextLogger: s.logger, prefix: "user failure", reached: make(chan struct{}), release: make(chan struct{})}
+	s.logger = logger
+	conn := s.wrapStream(newScriptedConn(), "tcp", s.originOf(obs["a"], primaryRoute, s.networkGeneration.Load()), nil)
+	defer conn.Close()
+	var stream *dataPlaneStream
+	s.access.Lock()
+	for c := range s.tcpStreams["a"] {
+		stream = c
+	}
+	s.access.Unlock()
+	reported := make(chan struct{})
+	go func() {
+		defer close(reported)
+		stream.hooks.onFailure(adapter.UserFailureReset, nil)
+	}()
+	// The reset is recorded; its confirmation request is still to come.
+	<-logger.reached
+	readded := make(chan struct{})
+	go func() {
+		defer close(readded)
+		s.Remove("a")
+		s.access.Lock()
+		s.members.Store("a", sbAdapter.Outbound(obs["a"]))
+		s.addProbeMemberLocked("a")
+		s.tags = append(s.tags, "a")
+		s.stickyTag.tcp.Store("a")
+		s.access.Unlock()
+	}()
+	select {
+	case <-readded:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(logger.release)
+	<-reported
+	<-readded
+	s.access.Lock()
+	defer s.access.Unlock()
+	assert.False(t, s.probeMembers["a"].confirmationPending, "the reset was the removed a's conn's")
+}
+
+func TestTrial_DeadlineSpentOnAUDPTrialLeavesTheSelectionUnset(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		var selectionSetups, trialSetups atomic.Int32
+		obs["a"].listen = func(context.Context) (net.PacketConn, error) {
+			selectionSetups.Add(1)
+			return newScriptedPacketConn(), nil
+		}
+		obs["b"].listen = func(context.Context) (net.PacketConn, error) {
+			trialSetups.Add(1)
+			time.Sleep(2 * time.Second)
+			return nil, errors.New("setup timeout")
+		}
+		s.stickyTag.udp.Store("a")
+		s.access.Lock()
+		s.suspectOutageLocked(time.Now())
+		trials := s.trialsLocked("udp")
+		trials.setupOK, trials.unansweredAt = true, time.Now()
+		s.access.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, err := s.ListenPacket(ctx, metadata.Socksaddr{})
+		require.Error(t, err)
+		require.Equal(t, int32(1), trialSetups.Load(), "b is trialled")
+		assert.Zero(t, selectionSetups.Load(), "the trial used up the caller's deadline, so a had no time to be tried")
 	})
 }
