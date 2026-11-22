@@ -1005,7 +1005,7 @@ func (s *MutableAutoSelect) applyStickiness(
 		s.closeStuckOnReleaseLocked(network, sticky)
 	case c.lastResort && !best.lastResort && best.demote <= c.demote:
 		s.logSwitch(network, sticky, best, "last resort no longer needed")
-	case c.demote > best.demote && c.userFails > s.hist.softFailLimit:
+	case c.demote > best.demote && s.pastRetention(c):
 		s.logSwitch(network, sticky, best, "failures past retention")
 		s.closeStuckOnReleaseLocked(network, sticky)
 	case c.demote > best.demote && c.streak >= consecutiveUserFailureLimit && s.streakReleaseAllowedLocked(network, sticky) &&
@@ -1086,7 +1086,7 @@ func (s *MutableAutoSelect) streakReplacementLocked(pool, forNetwork []rankedCan
 		// returned only once none of pool's is still being probed.
 		usable := i == 0 || len(requested) == 0
 		for _, c := range tier {
-			if c.tag == sticky || (i == 1 && c.demote != demoteSoft) {
+			if c.tag == sticky || (i == 1 && (c.demote != demoteSoft || s.pastRetention(c))) {
 				continue
 			}
 			if probe.ValidateURL(s.probeURLForLocked(c.tag)) != nil {
@@ -2008,12 +2008,20 @@ func (s *MutableAutoSelect) answeredSinceLocked(tag string, since time.Time) boo
 	return ok && h.answeredSince(streakTCP, since)
 }
 
-// findProbedReplacementLocked returns the highest-ranked member whose latest
-// probe passed no earlier than since and that has no recovery gate, in
-// network's healthiest tier after excluding excludeTag, or "" if there is
-// none. Caller must hold s.access.
+// findProbedReplacementLocked returns the highest-ranked member of
+// replacementPoolLocked whose latest probe passed no earlier than since and
+// that has no recovery gate, or "" if there is none. A soft-demoted member is
+// returned only once every clean one has a probe outcome since since. Caller
+// must hold s.access.
 func (s *MutableAutoSelect) findProbedReplacementLocked(now time.Time, network, excludeTag string, since time.Time) string {
+	cleanUndecided := false
 	for _, c := range s.replacementPoolLocked(now, network, excludeTag) {
+		if c.demote == demoteClean {
+			state := s.probeMembers[c.tag]
+			cleanUndecided = cleanUndecided || state == nil || state.outcome == nil || state.outcome.completed.Before(since)
+		} else if cleanUndecided {
+			break
+		}
 		if s.eligibleReplacementLocked(now, c.tag) && s.passedSinceLocked(c.tag, since) {
 			return c.tag
 		}
@@ -2022,14 +2030,31 @@ func (s *MutableAutoSelect) findProbedReplacementLocked(now time.Time, network, 
 }
 
 // replacementPoolLocked returns the members network's selection could move
-// to from tag: network's healthiest tier after excluding tag. The result
-// aliases scratch space reused by the next split. Caller must hold s.access.
+// to from tag, in rank order: network's healthiest tier after excluding tag,
+// followed by its soft tier when that tier is clean, since a failed probe
+// leaves a member clean. A soft member past softFailLimit is left out, as
+// applyStickiness would release it again at once. The result aliases scratch
+// space reused by the next split. Caller must hold s.access.
 func (s *MutableAutoSelect) replacementPoolLocked(now time.Time, network, tag string) []rankedCandidate {
 	ranked := slices.DeleteFunc(s.rankLocked(now), func(c rankedCandidate) bool {
 		return c.tag == tag
 	})
-	pool, _ := s.splitHealthyForLocked(ranked, network)
-	return pool
+	pool, forNetwork := s.splitHealthyForLocked(ranked, network)
+	if len(pool) == 0 || pool[0].demote != demoteClean {
+		return pool
+	}
+	n := len(pool)
+	for n < len(forNetwork) && forNetwork[n].demote == demoteSoft {
+		n++
+	}
+	soft := slices.DeleteFunc(forNetwork[len(pool):n], s.pastRetention)
+	return forNetwork[:len(pool)+len(soft)]
+}
+
+// pastRetention reports whether c has more failures than applyStickiness
+// retains a selection through.
+func (s *MutableAutoSelect) pastRetention(c rankedCandidate) bool {
+	return c.userFails > s.hist.softFailLimit
 }
 
 // emitExhaustionLocked requires s.access, which Close holds while closing the

@@ -472,3 +472,82 @@ func blackholeConn() net.Conn {
 	go io.Copy(io.Discard, server)
 	return client
 }
+
+func TestConfirmation_SwitchesToASoftDemotedMemberWhenEveryCleanOneFails(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		down := func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["a"].dial, obs["b"].dial = down, down
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		generation := s.networkGeneration.Load()
+		for range s.hist.softFailLimit {
+			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+		}
+		s.requestFailureConfirmation("a", "", generation)
+		time.Sleep(confirmStrikeWindow)
+		synctest.Wait()
+		assert.Equal(t, "c", loadString(&s.stickyTag.tcp), "c is the only member that passes")
+		s.access.Lock()
+		defer s.access.Unlock()
+		assert.False(t, s.outageSuspectedLocked(), "c passing shows the device's network is up")
+	})
+}
+
+func TestFindProbedReplacement_SoftMemberWaitsForEveryCleanOne(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		generation := s.networkGeneration.Load()
+		for range s.hist.softFailLimit {
+			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+		}
+		since := time.Now()
+		probe := func(tag string) {
+			s.access.Lock()
+			s.requestProbesLocked([]string{tag}, probeForced, false)
+			s.dispatchProbesLocked()
+			s.access.Unlock()
+			time.Sleep(time.Second)
+			synctest.Wait()
+		}
+		probe("c")
+		s.access.Lock()
+		assert.Empty(t, s.findProbedReplacementLocked(time.Now(), "tcp", "a", since), "b hasn't been probed since")
+		s.access.Unlock()
+		probe("b")
+		s.access.Lock()
+		defer s.access.Unlock()
+		assert.Equal(t, "c", s.findProbedReplacementLocked(time.Now(), "tcp", "a", since), "every clean member failed")
+	})
+}
+
+func TestConfirmation_NoSwitchToASoftMemberPastRetention(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		// More than switchPenaltyAltFactor times faster than the others, so c
+		// stays soft past softFailLimit.
+		recordSuccess(s, "c", 2)
+		down := func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["a"].dial, obs["b"].dial = down, down
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		generation := s.networkGeneration.Load()
+		for range s.hist.softFailLimit + 1 {
+			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+		}
+		s.access.Lock()
+		for _, c := range s.rankLocked(time.Now()) {
+			if c.tag == "c" {
+				require.Equal(t, demoteSoft, c.demote)
+			}
+		}
+		s.access.Unlock()
+		s.requestFailureConfirmation("a", "", generation)
+		time.Sleep(confirmStrikeWindow)
+		synctest.Wait()
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "applyStickiness would release c past retention at once")
+	})
+}

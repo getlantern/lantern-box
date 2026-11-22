@@ -2857,6 +2857,23 @@ func TestStreak_NeverReleasedBelowTheSoftTier(t *testing.T) {
 			}
 		}},
 		{"last resort", func(_ *MutableAutoSelect, d *mockOutbound) { d.typeName = lConst.TypeUnbounded }},
+		{"soft past retention", func(s *MutableAutoSelect, _ *mockOutbound) {
+			// More than switchPenaltyAltFactor times faster than the others, so
+			// d stays soft past softFailLimit.
+			recordSuccess(s, "d", 2)
+			generation := s.networkGeneration.Load()
+			for range s.hist.softFailLimit + 1 {
+				require.True(t, s.recordUserFailure("d", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+				time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+			}
+			s.access.Lock()
+			defer s.access.Unlock()
+			for _, c := range s.rankLocked(time.Now()) {
+				if c.tag == "d" {
+					require.Equal(t, demoteSoft, c.demote)
+				}
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -2889,9 +2906,11 @@ func TestStreak_ReplacementKeepsFailuresAfterItsProbe(t *testing.T) {
 		obs["a"].dial, obs["b"].dial = down, down
 		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 		generation := s.networkGeneration.Load()
-		for range s.hist.softFailLimit {
-			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
-			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+		// A streak makes c soft; the dedupe keeps its window at one failure,
+		// within retention.
+		for range consecutiveUserFailureLimit {
+			s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil)
+			time.Sleep(time.Second)
 		}
 		for range consecutiveUserFailureLimit {
 			s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
