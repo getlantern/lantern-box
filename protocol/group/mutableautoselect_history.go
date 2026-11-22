@@ -193,9 +193,7 @@ func (h *localHistory) startRecoveryGate(now time.Time) {
 // a stall on the retry counts once, matching the one-event intent.
 // Returns true if the failure was appended.
 func (h *localHistory) addUserFailure(failure adapter.UserFailure, network streakNet, opened time.Time, window, dedupe time.Duration) bool {
-	h.mu.Lock()
-	h.streaks[network].extend(failure.At, opened, window, network.retryWindow())
-	h.mu.Unlock()
+	h.addUnanswered(network, failure.At, opened, window)
 	return h.addWindowFailure(failure, window, dedupe)
 }
 
@@ -288,10 +286,27 @@ func (h *localHistory) streakCount(network streakNet, now time.Time, window time
 	return h.streaks[network].live(now, window)
 }
 
+func (h *localHistory) streakCounts(now time.Time, window time.Duration) (counts [2]uint32) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.streaks {
+		counts[i] = h.streaks[i].live(now, window)
+	}
+	return counts
+}
+
 func (h *localHistory) clearStreak(network streakNet) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.streaks[network].count = 0
+}
+
+func (h *localHistory) clearStreaks() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.streaks {
+		h.streaks[i].count = 0
+	}
 }
 
 // clearStreakBefore clears network's streak if its latest failure came

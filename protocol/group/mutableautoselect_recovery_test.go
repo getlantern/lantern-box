@@ -150,7 +150,6 @@ func TestDataPlaneStream_Unanswered(t *testing.T) {
 				})
 				d.firstResponseTimeout = 10 * time.Second
 				d.unansweredAfter = 2 * time.Second
-				d.reportQuiet = true
 				for _, s := range tt.steps {
 					s(d, c)
 				}
@@ -455,7 +454,6 @@ func TestDataPlaneStream_OwnAnswerStartsTheWait(t *testing.T) {
 	})
 	d.firstResponseTimeout = 10 * time.Second
 	d.unansweredAfter = 20 * time.Millisecond
-	d.reportQuiet = true
 	d.Write([]byte("request"))
 	c.reads <- scriptedRead{data: []byte("reply")}
 	d.Read(make([]byte, 8))
@@ -846,7 +844,7 @@ func TestCloseStuckUDP_ClosesOnlyUnansweredHandles(t *testing.T) {
 		time.Sleep(2 * time.Second)
 
 		s.access.Lock()
-		s.closeStuckUDPLocked("a")
+		s.closeStuckUDPLocked("a", "")
 		s.access.Unlock()
 		synctest.Wait()
 		assert.False(t, isClosed(handles["a"][0]), "a handle still getting replies keeps its session")
@@ -1149,7 +1147,7 @@ func TestProbeTCPReplacements_NoneToProbeRequestsNothing(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	s.access.Lock()
 	defer s.access.Unlock()
-	require.Zero(t, s.probeTCPReplacementsLocked("a", time.Now()))
+	require.False(t, s.probeTCPReplacementsLocked("a", time.Now()))
 	assert.Equal(t, probeNotNeeded, s.probeMembers["a"].need, "with no replacement to probe, the selection isn't probed either")
 }
 
@@ -1391,7 +1389,7 @@ func TestDataPlanePacket_WaitStartsBeforeTheSend(t *testing.T) {
 				time.Sleep(2 * defaultUDPUnansweredAfter)
 				synctest.Wait()
 				assert.Zero(t, unanswered.Load(), "no unanswered report")
-				assert.False(t, d.awaitingReply(time.Now()), "nothing awaits a reply")
+				assert.False(t, d.awaitingReply(time.Now(), ""), "nothing awaits a reply")
 			})
 		})
 	}
@@ -2040,11 +2038,11 @@ func TestAdvanceNetwork_ClearsFailureStreaks(t *testing.T) {
 	defer s.access.Unlock()
 	h := s.historyForLocked("a")
 	require.EqualValues(t, 2, h.streakCount(streakTCP, time.Now().Add(time.Second), s.hist.userFailureWindow))
-	s.lastStreakSwitch.tcp = time.Now()
+	s.lastStreakSwitch[streakTCP] = time.Now()
 	s.advanceNetworkLocked()
 	assert.Zero(t, h.streakCount(streakTCP, time.Now().Add(time.Second), s.hist.userFailureWindow),
 		"an old network's failure streak says nothing about the new one")
-	assert.True(t, s.lastStreakSwitch.tcp.IsZero(), "nor does its release cooldown")
+	assert.True(t, s.lastStreakSwitch[streakTCP].IsZero(), "nor does its release cooldown")
 }
 
 func TestConfirmation_PauseDropsPendingSwitch(t *testing.T) {
@@ -2449,7 +2447,7 @@ func TestDataPlanePacket_SendStillUnderWayIsNotAwaitingReply(t *testing.T) {
 			d.WriteTo([]byte("query"), &net.UDPAddr{})
 		}()
 		time.Sleep(defaultUDPUnansweredAfter + time.Second)
-		assert.False(t, d.awaitingReply(time.Now()), "a release sweep leaves a handle whose send hasn't gone out")
+		assert.False(t, d.awaitingReply(time.Now(), ""), "a release sweep leaves a handle whose send hasn't gone out")
 		<-sent
 	})
 }
@@ -3686,11 +3684,7 @@ func TestTrial_StuckUDPSessionIsClosedForATrial(t *testing.T) {
 		pc.WriteTo([]byte("query"), dest)
 		time.Sleep(2 * defaultUDPUnansweredAfter)
 		synctest.Wait()
-		select {
-		case <-c.closed:
-		default:
-			t.Fatal("the stuck session is closed, so the app's next datagram sets up one a trial can take")
-		}
+		require.True(t, isClosed(c), "the stuck session is closed, so the app's next datagram sets up one a trial can take")
 	})
 }
 
@@ -3870,11 +3864,7 @@ func TestTrial_FailedUDPTrialSessionCloses(t *testing.T) {
 		udpExchange(c, pc, dest, false)
 		time.Sleep(2 * defaultUDPUnansweredAfter)
 		synctest.Wait()
-		select {
-		case <-c.closed:
-		default:
-			t.Fatal("an app holding a failed trial's socket sets up again")
-		}
+		require.True(t, isClosed(c), "an app holding a failed trial's socket sets up again")
 	})
 }
 
@@ -3922,17 +3912,9 @@ func TestTrial_UDPSweepNeedsAnAlternateAndClosesOnlyTheDestination(t *testing.T)
 				udpExchange(c, pc, dest, false)
 				time.Sleep(2 * defaultUDPUnansweredAfter)
 				synctest.Wait()
-				select {
-				case <-oc.closed:
-					t.Fatal("the session waiting on another destination stays")
-				default:
-				}
+				require.False(t, isClosed(oc), "the session waiting on another destination stays")
 				if len(tc.members) == 1 {
-					select {
-					case <-c.closed:
-						t.Fatal("with nothing to try, the session stays")
-					default:
-					}
+					require.False(t, isClosed(c), "with nothing to try, the session stays")
 				}
 			})
 		})
@@ -4000,7 +3982,6 @@ func TestTrial_OldNetworksLocalFailureLeavesTheNewSetup(t *testing.T) {
 		s.access.Unlock()
 		current := s.networkGeneration.Load()
 		s.noteSelectionSetup("tcp", "a", current, true)
-		s.noteSelectionFailedLocally("a", "tcp", old)
 		s.noteSelectionSetup("tcp", "a", old, false)
 		s.access.Lock()
 		defer s.access.Unlock()
@@ -4024,11 +4005,7 @@ func TestTrial_AnsweredUDPTrialSessionStaysOpen(t *testing.T) {
 		udpExchange(c, pc, dest, false)
 		time.Sleep(2 * defaultUDPUnansweredAfter)
 		synctest.Wait()
-		select {
-		case <-c.closed:
-			t.Fatal("a trial that answered serves its app")
-		default:
-		}
+		require.False(t, isClosed(c), "a trial that answered serves its app")
 	})
 }
 
@@ -4172,14 +4149,10 @@ func TestUDPSweep_SkipsAHandleNowWaitingOnTheDestination(t *testing.T) {
 		// x timed out; y has only just been sent to.
 		pc.WriteTo([]byte("query"), y)
 		s.access.Lock()
-		s.closeStuckUDPToLocked("a", y.String())
+		s.closeStuckUDPLocked("a", y.String())
 		s.access.Unlock()
 		synctest.Wait()
-		select {
-		case <-c.closed:
-			t.Fatal("the handle's wait on y hasn't timed out")
-		default:
-		}
+		require.False(t, isClosed(c), "the handle's wait on y hasn't timed out")
 	})
 }
 

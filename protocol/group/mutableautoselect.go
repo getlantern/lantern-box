@@ -142,13 +142,12 @@ type MutableAutoSelect struct {
 	}
 	// Guarded by access: outageSince is set while an outage of the
 	// device's own network is suspected, since the selection and every
-	// replacement failed their probes, and outageEndedAt when the suspicion
-	// was last cleared by an answer or a passing probe. outageEvidence is
-	// when the failures behind the latest suspicion began, and pastOutages
-	// the latest maxPastOutages suspicions, each from its evidence to its
-	// end.
-	outageSince, outageEndedAt, outageEvidence time.Time
-	pastOutages                                []timeSpan
+	// replacement failed their probes. outageEvidence is when the failures
+	// behind the latest suspicion began, and pastOutages the latest
+	// maxPastOutages suspicions, each from its evidence to when an answer or
+	// a passing probe cleared it.
+	outageSince, outageEvidence time.Time
+	pastOutages                 []timeSpan
 	// Guarded by access: outageRecheck probes for the end of a suspected
 	// outage; afterOutage is the TCP selection probed again once another
 	// member's pass, completed at at, ended one.
@@ -163,9 +162,9 @@ type MutableAutoSelect struct {
 	// Guarded by access: when a failure's cause last showed the far end
 	// answered, which shows the device's own network was up.
 	peerAnsweredAt time.Time
-	// Guarded by access: when each network's selection was last released
-	// for consecutive failures.
-	lastStreakSwitch struct{ tcp, udp time.Time }
+	// Guarded by access: per streakNet, when the selection was last
+	// released for consecutive failures.
+	lastStreakSwitch [2]time.Time
 	// Guarded by access: each network's trials of user traffic on another
 	// member, indexed by streakNet.
 	trials [2]trialState
@@ -858,27 +857,17 @@ func (s *MutableAutoSelect) wrapStream(conn net.Conn, network string, origin con
 		wrapped.firstResponseTimeout = s.cfg.dataPlaneFirstResponseTimeout
 		wrapped.unansweredAfter = defaultUnansweredAfter
 		wrapped.slowResponseAfter = earlyConfirmAfter
-		wrapped.reportQuiet = true
 		tag := o.Tag()
 		wrapped.hooks.onClose = func() {
-			s.untrackTCPStream(tag, wrapped)
+			untrackConn(s, &s.tcpStreams, tag, wrapped)
 			if release != nil {
 				release()
 			}
 		}
 	}
 	s.access.Lock()
-	switch {
-	case !s.attachLocked(origin, wrapped.hooks.detached):
-	case N.NetworkName(network) == N.NetworkTCP:
-		tag := o.Tag()
-		if s.tcpStreams == nil {
-			s.tcpStreams = make(map[string]map[*dataPlaneStream]struct{})
-		}
-		if s.tcpStreams[tag] == nil {
-			s.tcpStreams[tag] = make(map[*dataPlaneStream]struct{})
-		}
-		s.tcpStreams[tag][wrapped] = struct{}{}
+	if s.attachLocked(origin, wrapped.hooks.detached) && N.NetworkName(network) == N.NetworkTCP {
+		trackConnLocked(&s.tcpStreams, o.Tag(), wrapped)
 	}
 	s.access.Unlock()
 	return adapter.NewTaggedConn(wrapped, realTag(o))
@@ -893,13 +882,6 @@ type connOrigin struct {
 	membership uint64
 	// trialFor is, for a trial, the selection it was made for.
 	trialFor string
-}
-
-// originOf returns the origin of a conn about to be set up through o.
-func (s *MutableAutoSelect) originOf(o A.Outbound, route routeKind, generation uint64) connOrigin {
-	s.access.Lock()
-	defer s.access.Unlock()
-	return s.originOfLocked(o, route, generation)
 }
 
 func (s *MutableAutoSelect) originOfLocked(o A.Outbound, route routeKind, generation uint64) connOrigin {
@@ -961,7 +943,7 @@ func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, origin connOrigin, d
 	if destination = destination.Unwrap(); destination.IsValid() {
 		wrapped.lastDest = destination.String()
 	}
-	wrapped.hooks.onClose = func() { s.untrackUDPHandle(tag, wrapped) }
+	wrapped.hooks.onClose = func() { untrackConn(s, &s.udpHandles, tag, wrapped) }
 	if origin.route == trialRoute {
 		var answered atomic.Bool
 		response, unanswered := wrapped.hooks.onResponse, wrapped.hooks.onUnanswered
@@ -981,13 +963,7 @@ func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, origin connOrigin, d
 	}
 	s.access.Lock()
 	if s.attachLocked(origin, wrapped.hooks.detached) {
-		if s.udpHandles == nil {
-			s.udpHandles = make(map[string]map[*dataPlanePacket]struct{})
-		}
-		if s.udpHandles[tag] == nil {
-			s.udpHandles[tag] = make(map[*dataPlanePacket]struct{})
-		}
-		s.udpHandles[tag][wrapped] = struct{}{}
+		trackConnLocked(&s.udpHandles, tag, wrapped)
 	}
 	s.access.Unlock()
 	return adapter.NewTaggedPacketConn(wrapped, realTag(o))
@@ -1007,13 +983,57 @@ func (s *MutableAutoSelect) detachConnsLocked(tag string) {
 	delete(s.udpHandles, tag)
 }
 
-func (s *MutableAutoSelect) untrackTCPStream(tag string, conn *dataPlaneStream) {
+// trackConnLocked adds c to tag's conns. Caller must hold s.access.
+func trackConnLocked[C comparable](conns *map[string]map[C]struct{}, tag string, c C) {
+	if *conns == nil {
+		*conns = make(map[string]map[C]struct{})
+	}
+	if (*conns)[tag] == nil {
+		(*conns)[tag] = make(map[C]struct{})
+	}
+	(*conns)[tag][c] = struct{}{}
+}
+
+// untrackConn removes c from tag's conns, one of s's conn sets.
+func untrackConn[C comparable](s *MutableAutoSelect, conns *map[string]map[C]struct{}, tag string, c C) {
 	s.access.Lock()
 	defer s.access.Unlock()
-	delete(s.tcpStreams[tag], conn)
-	if len(s.tcpStreams[tag]) == 0 {
-		delete(s.tcpStreams, tag)
+	delete((*conns)[tag], c)
+	if len((*conns)[tag]) == 0 {
+		delete(*conns, tag)
 	}
+}
+
+// closeWaitingLocked closes, on another goroutine, tag's conns in conns
+// for which waiting holds both now and when closed, and logs how many as
+// what. Caller must hold s.access.
+func closeWaitingLocked[C interface {
+	comparable
+	Close() error
+}](s *MutableAutoSelect, conns map[string]map[C]struct{}, tag, what string, waiting func(C, time.Time) bool) {
+	now := time.Now()
+	var picked []C
+	for c := range conns[tag] {
+		if waiting(c, now) {
+			picked = append(picked, c)
+		}
+	}
+	if len(picked) == 0 {
+		return
+	}
+	go func() {
+		closed := 0
+		for _, c := range picked {
+			// A conn answered since it was picked has recovered.
+			if waiting(c, time.Now()) {
+				c.Close()
+				closed++
+			}
+		}
+		if closed > 0 {
+			s.logger.Info(what, " closed: tag=", tag, " count=", closed)
+		}
+	}()
 }
 
 // closeDoomedTCPLocked closes tag's TCP conns that have waited at least
@@ -1023,82 +1043,21 @@ func (s *MutableAutoSelect) untrackTCPStream(tag string, conn *dataPlaneStream) 
 // left alone. Caller must hold s.access; the conns are closed on another
 // goroutine.
 func (s *MutableAutoSelect) closeDoomedTCPLocked(tag string, minWait time.Duration) {
-	now := time.Now()
-	var doomed []*dataPlaneStream
-	for conn := range s.tcpStreams[tag] {
-		if conn.awaitingFirstResponse(now, minWait) {
-			doomed = append(doomed, conn)
-		}
-	}
-	if len(doomed) == 0 {
-		return
-	}
-	go func() {
-		closed := 0
-		for _, conn := range doomed {
-			// A conn answered since it was picked has recovered.
-			if conn.awaitingFirstResponse(time.Now(), minWait) {
-				conn.Close()
-				closed++
-			}
-		}
-		if closed > 0 {
-			s.logger.Info("tcp conns closed: tag=", tag, " count=", closed)
-		}
-	}()
+	closeWaitingLocked(s, s.tcpStreams, tag, "tcp conns", func(conn *dataPlaneStream, now time.Time) bool {
+		return conn.awaitingFirstResponse(now, minWait)
+	})
 }
 
-func (s *MutableAutoSelect) untrackUDPHandle(tag string, handle *dataPlanePacket) {
-	s.access.Lock()
-	defer s.access.Unlock()
-	delete(s.udpHandles[tag], handle)
-	if len(s.udpHandles[tag]) == 0 {
-		delete(s.udpHandles, tag)
-	}
-}
-
-// closeStuckUDPLocked closes tag's UDP handles whose latest exchange went
-// unanswered, once tag has been released as the UDP selection for failing.
-// sing-box then rebuilds each session through the group's new selection on
-// the app's next datagram. Handles still getting replies are left alone, so
-// working flows keep their egress. Caller must hold s.access; the handles
-// are closed on another goroutine.
-func (s *MutableAutoSelect) closeStuckUDPLocked(tag string) {
-	s.closeStuckUDPToLocked(tag, "")
-}
-
-// closeStuckUDPToLocked is closeStuckUDPLocked for the handles whose latest
-// exchange went to dest, or any if dest is "". Caller must hold s.access.
-func (s *MutableAutoSelect) closeStuckUDPToLocked(tag, dest string) {
-	now := time.Now()
-	waiting := func(handle *dataPlanePacket, now time.Time) bool {
-		if dest == "" {
-			return handle.awaitingReply(now)
-		}
-		return handle.awaitingReplyFrom(now, dest)
-	}
-	var stuck []*dataPlanePacket
-	for handle := range s.udpHandles[tag] {
-		if waiting(handle, now) {
-			stuck = append(stuck, handle)
-		}
-	}
-	if len(stuck) == 0 {
-		return
-	}
-	go func() {
-		closed := 0
-		for _, handle := range stuck {
-			// A handle answered since it was picked has recovered.
-			if waiting(handle, time.Now()) {
-				handle.Close()
-				closed++
-			}
-		}
-		if closed > 0 {
-			s.logger.Info("udp sessions closed: tag=", tag, " count=", closed)
-		}
-	}()
+// closeStuckUDPLocked closes tag's UDP handles whose latest exchange (with
+// dest, unless dest is "") went unanswered, once tag has been released
+// as the UDP selection for failing. sing-box then rebuilds each session
+// through the group's new selection on the app's next datagram. Handles
+// still getting replies are left alone, so working flows keep their egress.
+// Caller must hold s.access; the handles are closed on another goroutine.
+func (s *MutableAutoSelect) closeStuckUDPLocked(tag, dest string) {
+	closeWaitingLocked(s, s.udpHandles, tag, "udp sessions", func(handle *dataPlanePacket, now time.Time) bool {
+		return handle.awaitingReply(now, dest)
+	})
 }
 
 // afterUDPFailureLocked acts on a UDP failure of tag. If tag is no longer the
@@ -1108,7 +1067,7 @@ func (s *MutableAutoSelect) closeStuckUDPToLocked(tag, dest string) {
 // applied. Caller must hold s.access.
 func (s *MutableAutoSelect) afterUDPFailureLocked(tag string) {
 	if loadString(&s.stickyTag.udp) != tag && !s.streakSinceLocked(tag, N.NetworkUDP).IsZero() {
-		s.closeStuckUDPLocked(tag)
+		s.closeStuckUDPLocked(tag, "")
 	}
 	s.reselectUDPLocked()
 }
@@ -1167,13 +1126,9 @@ func (s *MutableAutoSelect) NewPacketConnection(ctx context.Context, conn N.Pack
 	s.connMgr.NewPacketConnection(ctx, s, conn, metadata, onClose)
 }
 
-func (s *MutableAutoSelect) selectOutbound(network, excludeTag string) (A.Outbound, uint64, error) {
-	origin, err := s.selectOrigin(network, excludeTag, primaryRoute)
-	return origin.out, origin.generation, err
-}
-
-// selectOrigin is selectOutbound returning the origin of a conn set up
-// through the member it picks, by route, captured as it picks it.
+// selectOrigin picks the member to set up a conn on network through, other
+// than excludeTag, and returns the conn's origin by route, captured as it
+// picks it.
 func (s *MutableAutoSelect) selectOrigin(network, excludeTag string, route routeKind) (connOrigin, error) {
 	var slot *atomic.Value
 	switch network {
@@ -1353,10 +1308,7 @@ func (s *MutableAutoSelect) hardDemotionReleaseLocked(sticky string, pool []rank
 	if !found && len(requested) > maxReplacementProbes {
 		requested = requested[:maxReplacementProbes]
 	}
-	if len(requested) > 0 {
-		s.requestProbesLocked(requested, probeForced, false)
-		s.dispatchProbesLocked()
-	}
+	s.forceProbesLocked(requested...)
 	return passed, !found
 }
 
@@ -1385,7 +1337,7 @@ func (s *MutableAutoSelect) releaseForStreakLocked(network string, pool, forNetw
 			h.clearStreakBefore(streakNetFor(network), state.outcome.completed)
 		}
 	}
-	*s.lastStreakSwitchLocked(network) = time.Now()
+	s.lastStreakSwitch[streakNetFor(network)] = time.Now()
 	s.closeStuckOnReleaseLocked(network, sticky)
 	return replacement, true
 }
@@ -1395,7 +1347,7 @@ func (s *MutableAutoSelect) releaseForStreakLocked(network string, pool, forNetw
 // Caller must hold s.access.
 func (s *MutableAutoSelect) closeStuckOnReleaseLocked(network, released string) {
 	if network == N.NetworkUDP {
-		s.closeStuckUDPLocked(released)
+		s.closeStuckUDPLocked(released, "")
 	} else {
 		s.closeDoomedTCPLocked(released, earlyConfirmAfter)
 	}
@@ -1406,7 +1358,7 @@ func (s *MutableAutoSelect) closeStuckOnReleaseLocked(network, released string) 
 // passed since the last such release, or at once if sticky hasn't answered
 // since. Caller must hold s.access.
 func (s *MutableAutoSelect) streakReleaseAllowedLocked(network, sticky string) bool {
-	last := *s.lastStreakSwitchLocked(network)
+	last := s.lastStreakSwitch[streakNetFor(network)]
 	if last.IsZero() || time.Since(last) >= streakSwitchCooldown {
 		return true
 	}
@@ -1464,14 +1416,12 @@ func (s *MutableAutoSelect) streakReplacementLocked(pool, forNetwork []rankedCan
 		}
 	}
 	if len(requested) > 0 {
-		s.requestProbesLocked(requested, probeForced, false)
-		s.dispatchProbesLocked()
+		s.forceProbesLocked(requested...)
 	} else if failed > 0 {
 		own := s.probeMembers[sticky]
 		fresh := own != nil && own.outcome != nil && !own.outcome.completed.Before(since) && s.outcomeCurrentLocked(sticky, own.outcome)
 		if !fresh && own != nil && probe.ValidateURL(s.probeURLForLocked(sticky)) == nil {
-			s.requestProbesLocked([]string{sticky}, probeForced, false)
-			s.dispatchProbesLocked()
+			s.forceProbesLocked(sticky)
 			return rankedCandidate{}, false, true
 		}
 		if fresh && !own.outcome.success && !s.peerAnsweredAt.Before(since) && !sameTier {
@@ -1616,13 +1566,6 @@ func (s *MutableAutoSelect) stickySlot(network string) *atomic.Value {
 		return &s.stickyTag.udp
 	}
 	return &s.stickyTag.tcp
-}
-
-func (s *MutableAutoSelect) lastStreakSwitchLocked(network string) *time.Time {
-	if network == N.NetworkUDP {
-		return &s.lastStreakSwitch.udp
-	}
-	return &s.lastStreakSwitch.tcp
 }
 
 // beatsOnDelay reports whether candidateMs improves on stickyMs by at least
@@ -1819,9 +1762,7 @@ func (s *MutableAutoSelect) rankLocked(now time.Time) []rankedCandidate {
 			rawDelay = lastDelay
 			consec = c
 			userFails = uint32(len(uf))
-			for n := range streaks {
-				streaks[n] = h.streakCount(streakNet(n), now, s.hist.userFailureWindow)
-			}
+			streaks = h.streakCounts(now, s.hist.userFailureWindow)
 			hasRecoveryGate = gated
 		} else if s.history != nil {
 			if seed := s.history.Load(tag); seed != nil {
@@ -1888,7 +1829,6 @@ func (s *MutableAutoSelect) rankLocked(now time.Time) []rankedCandidate {
 	return out
 }
 
-// rankedBefore orders candidates by tier, then within a tier.
 func rankedBefore(a, b rankedCandidate) bool {
 	if a.demote != b.demote {
 		return a.demote < b.demote
@@ -2036,7 +1976,7 @@ func (s *MutableAutoSelect) recordUserFailure(tag string, kind adapter.UserFailu
 			s.peerAnsweredAt = now
 			// A conn the outage outlasted may have been dropped by the far
 			// end meanwhile, so its reset says nothing about the member.
-			stale := !opened.IsZero() && (opened.Before(s.outageSince) || opened.Before(s.outageEndedAt))
+			stale := !opened.IsZero() && (opened.Before(s.outageSince) || opened.Before(s.lastOutageEndLocked()))
 			s.endOutageLocked()
 			if stale {
 				return false
@@ -2198,7 +2138,7 @@ func (s *MutableAutoSelect) tryPendingConfirmedSwitchLocked() {
 	case s.trySwitchAfterConfirmedFailureLocked(p.tag, "", p.since):
 		p.tag = ""
 	case s.replacementProbesPendingLocked(p.tag):
-	case s.probeTCPReplacementsLocked(p.tag, p.since) > 0:
+	case s.probeTCPReplacementsLocked(p.tag, p.since):
 	case s.findProbedReplacementLocked(time.Now(), N.NetworkTCP, p.tag, p.since) != "":
 		// The switch cooldown held it back; a probe completing within
 		// confirmStrikeWindow retries it.
@@ -2242,8 +2182,7 @@ func (s *MutableAutoSelect) recheckFailedSelectionLocked(tag string, since time.
 	if own != nil && own.outcome != nil && !own.outcome.started.Before(passed) {
 		return false, own.outcome.success
 	}
-	s.requestProbesLocked([]string{tag}, probeForced, false)
-	s.dispatchProbesLocked()
+	s.forceProbesLocked(tag)
 	return true, false
 }
 
@@ -2286,8 +2225,7 @@ func (s *MutableAutoSelect) suspectOutageLocked(evidence time.Time) {
 		// once the outage ends.
 		now := time.Now()
 		for tag, h := range s.histories {
-			h.clearStreak(streakTCP)
-			h.clearStreak(streakUDP)
+			h.clearStreaks()
 			if h.forgiveProbeFailures(evidence) && s.history != nil {
 				s.history.Store(tag, h.toTagHistory(now, s.hist))
 			}
@@ -2382,8 +2320,8 @@ func (s *MutableAutoSelect) trialDueLocked(network, sticky string, t *trialState
 	if t.failures > 0 {
 		spacing = min(trialRetryAfter<<min(t.failures-1, 8), trialRetryMax)
 	}
-	return (s.outageSuspectedLocked() || s.probesCantDecideLocked(network, sticky)) && t.setupOK &&
-		now.Sub(t.unansweredAt) <= probeFreshnessWindow && now.Sub(t.lastAt) >= spacing
+	return t.setupOK && now.Sub(t.unansweredAt) <= probeFreshnessWindow && now.Sub(t.lastAt) >= spacing &&
+		(s.outageSuspectedLocked() || s.probesCantDecideLocked(network, sticky))
 }
 
 // probesCantDecideLocked reports whether the latest probe of sticky,
@@ -2408,23 +2346,13 @@ func (s *MutableAutoSelect) trialForLocked(network, trialFor string, generation 
 	return nil
 }
 
-// noteSelectionFailedLocally records that the device failed a conn on
-// network through tag, set up on network generation generation, itself: if
-// tag is the selection, that stops trials until its next setup succeeds.
-func (s *MutableAutoSelect) noteSelectionFailedLocally(tag, network string, generation uint64) {
-	s.access.Lock()
-	defer s.access.Unlock()
-	if t := s.trialsLocked(network); t.tag == tag && s.matchesGenerationLocked(generation) {
-		t.setupOK = false
-	}
-}
-
 // noteSelectionSetup records whether a setup on tag, network's selection,
-// on network generation generation, succeeded.
+// on network generation generation, succeeded. A conn the device itself
+// failed counts as a failed setup: trials stop until the next one succeeds.
 func (s *MutableAutoSelect) noteSelectionSetup(network, tag string, generation uint64, ok bool) {
 	s.access.Lock()
 	defer s.access.Unlock()
-	if t := s.trialsLocked(network); t.tag == tag && s.matchesGenerationLocked(generation) {
+	if t := s.trialForLocked(network, tag, generation); t != nil {
 		t.setupOK = ok
 	}
 }
@@ -2492,7 +2420,7 @@ func (s *MutableAutoSelect) noteSelectionUnansweredLocked(network, tag, dest str
 		}
 	}
 	if network == N.NetworkUDP && s.trialDueLocked(network, tag, t, now) && len(s.replacementPoolLocked(now, network, tag)) > 0 {
-		s.closeStuckUDPToLocked(tag, dest)
+		s.closeStuckUDPLocked(tag, dest)
 	}
 }
 
@@ -2551,10 +2479,7 @@ func (s *MutableAutoSelect) armOutageRecheckLocked() {
 			tags = append(tags, pool[(s.recheckNext+i)%len(pool)].tag)
 		}
 		s.recheckNext += maxReplacementProbes
-		if len(tags) > 0 {
-			s.requestProbesLocked(tags, probeForced, false)
-			s.dispatchProbesLocked()
-		}
+		s.forceProbesLocked(tags...)
 		s.armOutageRecheckLocked()
 	})
 }
@@ -2569,8 +2494,7 @@ func (s *MutableAutoSelect) probeSelectionAfterOutageLocked(passed string, at ti
 		return
 	}
 	s.afterOutage.tag, s.afterOutage.passed, s.afterOutage.at = sticky, passed, at
-	s.requestProbesLocked([]string{sticky}, probeForced, false)
-	s.dispatchProbesLocked()
+	s.forceProbesLocked(sticky)
 }
 
 // settleAfterOutageLocked moves the TCP selection, tag, to the member whose
@@ -2603,7 +2527,6 @@ func (s *MutableAutoSelect) settleAfterOutageLocked(tag string, outcome *probeOu
 	}
 }
 
-// timeSpan is the times from from up to to.
 type timeSpan struct{ from, to time.Time }
 
 // maxPastOutages bounds the past outages kept: a probe outlives few.
@@ -2621,8 +2544,8 @@ func (s *MutableAutoSelect) startedInOutageLocked(started time.Time) bool {
 // endOutageLocked clears an outage suspicion once something answered.
 func (s *MutableAutoSelect) endOutageLocked() {
 	if !s.outageSince.IsZero() {
-		s.outageSince, s.outageEndedAt = time.Time{}, time.Now()
-		s.pastOutages = append(s.pastOutages, timeSpan{s.outageEvidence, s.outageEndedAt})
+		s.pastOutages = append(s.pastOutages, timeSpan{s.outageEvidence, time.Now()})
+		s.outageSince = time.Time{}
 		if len(s.pastOutages) > maxPastOutages {
 			s.pastOutages = s.pastOutages[1:]
 		}
@@ -2633,12 +2556,21 @@ func (s *MutableAutoSelect) endOutageLocked() {
 	}
 }
 
+// lastOutageEndLocked returns when the latest outage suspicion was cleared,
+// or zero if none was. Caller must hold s.access.
+func (s *MutableAutoSelect) lastOutageEndLocked() time.Time {
+	if len(s.pastOutages) == 0 {
+		return time.Time{}
+	}
+	return s.pastOutages[len(s.pastOutages)-1].to
+}
+
 // outageEvidenceLocked reports whether a failure on a conn opened at opened
 // says more about an outage of the device's own network than about its
 // member: an outage is suspected, or the conn was opened before the latest
 // one ended. Such failures aren't counted. Caller must hold s.access.
 func (s *MutableAutoSelect) outageEvidenceLocked(opened time.Time) bool {
-	return s.outageSuspectedLocked() || (!opened.IsZero() && opened.Before(s.outageEndedAt))
+	return s.outageSuspectedLocked() || (!opened.IsZero() && opened.Before(s.lastOutageEndLocked()))
 }
 
 // replacementProbesPendingLocked reports whether a member TCP selection could

@@ -1,12 +1,10 @@
 package group
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"io"
 	"net"
-	"net/http"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -20,17 +18,7 @@ import (
 )
 
 func probeResponderConn() net.Conn {
-	client, server := net.Pipe()
-	go func() {
-		defer server.Close()
-		req, err := http.ReadRequest(bufio.NewReader(server))
-		if err != nil {
-			return
-		}
-		io.Copy(io.Discard, req.Body)
-		io.WriteString(server, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-	}()
-	return client
+	return slowProbeResponderConn(0)
 }
 
 // newConfirmationTestMUR selects a and suppresses ladder probes.

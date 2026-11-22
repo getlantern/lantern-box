@@ -81,7 +81,7 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 	// and again only after it has answered since.
 	var trialFailed atomic.Bool
 	noteTrialFailed := func() {
-		if trialFailed.CompareAndSwap(false, true) {
+		if route == trialRoute && trialFailed.CompareAndSwap(false, true) {
 			s.noteTrialFailed(outerTag, network, trialFor, generation)
 		}
 	}
@@ -97,9 +97,7 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 		detached: detached,
 		onUnanswered: func(waitingSince time.Time, dest string) {
 			report(func() {
-				if route == trialRoute {
-					noteTrialFailed()
-				}
+				noteTrialFailed()
 				// A UDP handle carries many exchanges; each counts as a conn
 				// opened when its wait began.
 				exchangeOpened := opened
@@ -115,9 +113,7 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 		},
 		onFailure: func(kind adapter.UserFailureKind, cause error) {
 			report(func() {
-				if route == trialRoute {
-					noteTrialFailed()
-				}
+				noteTrialFailed()
 				if !s.chargeable(outerTag, route) || !s.recordUserFailure(outerTag, kind, generation, opened, network, cause) {
 					return
 				}
@@ -132,7 +128,7 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 					if route == trialRoute {
 						noteTrialFailed()
 					} else {
-						s.noteSelectionFailedLocally(outerTag, network, generation)
+						s.noteSelectionSetup(network, outerTag, generation, false)
 					}
 				})
 			}
@@ -187,9 +183,9 @@ type dataPlaneIO struct {
 // With a non-zero unansweredAfter as well, a conn is reported unanswered when
 // it reads EOF after writing but before its first response, or when it is
 // closed locally, before reading EOF, after waiting at least unansweredAfter
-// since its first write began for a first response. With reportQuiet, a local close
-// at least unansweredAfter after the last IO, once data has arrived, is
-// reported too. With unansweredWhileOpen, for UDP, each exchange is
+// since its first write began for a first response, or at least
+// unansweredAfter after the last IO once data has arrived. With
+// unansweredWhileOpen, for UDP, each exchange is
 // watched: a datagram sent with no reply since the previous one starts a
 // wait, reported if nothing is read within unansweredAfter, and the next
 // datagram sent after a report starts another. Set these before the first
@@ -199,7 +195,6 @@ type dataPlaneWatchdog struct {
 	firstResponseTimeout time.Duration
 	unansweredAfter      time.Duration
 	slowResponseAfter    time.Duration
-	reportQuiet          bool
 	unansweredWhileOpen  bool
 	hooks                dataPlaneHooks
 	provedReadBytes      uint64
@@ -232,16 +227,18 @@ type dataPlaneWatchdog struct {
 	waitJoins    int
 	waitSentSeq  int
 	waitPrevDest string
-	readBytes    atomic.Uint64
-	responded    atomic.Bool
-	answered     atomic.Bool // set by the first read of data
-	peerClosed   atomic.Bool // set by a read of EOF
-	closed       atomic.Bool
-	proven       atomic.Bool
-	stalled      atomic.Bool
-	fired        atomic.Bool
-	timer        *time.Timer
-	closeOnce    sync.Once
+	// Guarded by ioMu.
+	sentTo, readFrom addrName
+	readBytes        atomic.Uint64
+	responded        atomic.Bool
+	answered         atomic.Bool // set by the first read of data
+	peerClosed       atomic.Bool // set by a read of EOF
+	closed           atomic.Bool
+	proven           atomic.Bool
+	stalled          atomic.Bool
+	fired            atomic.Bool
+	timer            *time.Timer
+	closeOnce        sync.Once
 }
 
 func (w *dataPlaneWatchdog) init(idle time.Duration, provedReadBytes uint64, hooks dataPlaneHooks) {
@@ -293,7 +290,7 @@ func (w *dataPlaneWatchdog) noteIOFrom(n int, err error, isRead bool, source M.S
 		if at.IsZero() {
 			at = time.Now()
 		}
-		first := w.answered.CompareAndSwap(false, true)
+		first := !w.answered.Load() && w.answered.CompareAndSwap(false, true)
 		switch {
 		case w.unansweredWhileOpen:
 			if dest, notify := w.noteDatagramReceived(at, source); notify && w.hooks.onResponse != nil {
@@ -313,17 +310,19 @@ func (w *dataPlaneWatchdog) noteIOFrom(n int, err error, isRead bool, source M.S
 	if w.stalled.Load() {
 		return
 	}
-	if !isRead && n > 0 && w.unansweredAfter > 0 {
-		w.noteFirstWrite()
-	}
-	if isRead && n == 0 && errors.Is(err, io.EOF) {
+	eof := isRead && n == 0 && errors.Is(err, io.EOF)
+	if eof {
 		w.peerClosed.Store(true)
 	}
 	if w.needsResponseTracking() {
+		var wroteAt time.Time
+		if eof && w.unansweredAfter > 0 {
+			wroteAt = w.firstWrite()
+		}
 		switch {
-		case isRead && n == 0 && errors.Is(err, io.EOF) && w.unansweredAfter > 0 && w.wrote():
+		case !wroteAt.IsZero():
 			if w.stalled.CompareAndSwap(false, true) {
-				w.reportUnanswered(w.firstWrite(), "")
+				w.reportUnanswered(wroteAt, "")
 			}
 			return
 		case isRead && (n > 0 || (err != nil && !isTimeout(err))):
@@ -487,7 +486,7 @@ func (w *dataPlaneWatchdog) beginDatagramWait(dest M.Socksaddr) datagramWait {
 	// datagram was addressed.
 	to := w.lastDest
 	if dest = dest.Unwrap(); dest.IsValid() {
-		to = dest.String()
+		to = w.sentTo.of(dest)
 	}
 	if !w.awaitingSince.IsZero() {
 		w.waitSends++
@@ -545,7 +544,7 @@ func (w *dataPlaneWatchdog) noteDatagramReceived(at time.Time, source M.Socksadd
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
 	if source = source.Unwrap(); source.IsValid() {
-		dest = source.String()
+		dest = w.readFrom.of(source)
 	} else if dest = w.lastDest; !w.awaitingSince.IsZero() {
 		dest = w.awaitingDest
 	}
@@ -561,14 +560,29 @@ func (w *dataPlaneWatchdog) noteDatagramReceived(at time.Time, source M.Socksadd
 		w.notifiedSources[dest] = struct{}{}
 		notify = true
 	}
-	w.awaitingSince, w.reportedSinceAnswer = time.Time{}, false
-	if w.unansweredTimer != nil {
+	if !w.awaitingSince.IsZero() {
+		w.awaitingSince = time.Time{}
 		w.unansweredTimer.Stop()
 	}
+	w.reportedSinceAnswer = false
 	if notify {
 		w.lastAnswerNotify = at
 	}
 	return dest, notify
+}
+
+// addrName caches the string form of the address last named, since a
+// handle's datagrams mostly go to and come from the same one.
+type addrName struct {
+	addr M.Socksaddr
+	name string
+}
+
+func (a *addrName) of(addr M.Socksaddr) string {
+	if a.name == "" || a.addr != addr {
+		a.addr, a.name = addr, addr.String()
+	}
+	return a.name
 }
 
 func (w *dataPlaneWatchdog) fireUnansweredWhileOpen() {
@@ -586,24 +600,15 @@ func (w *dataPlaneWatchdog) fireUnansweredWhileOpen() {
 	}
 }
 
-// awaitingReply reports whether the handle's latest exchange went
-// unanswered: reported with no reply since, or waiting at least
-// unansweredAfter since a send that went out.
-func (w *dataPlaneWatchdog) awaitingReply(now time.Time) bool {
+// awaitingReply reports whether the handle's latest exchange (with dest,
+// unless dest is "") went unanswered: reported with no reply since, or
+// waiting at least unansweredAfter since a send that went out.
+func (w *dataPlaneWatchdog) awaitingReply(now time.Time, dest string) bool {
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
-	return w.reportedSinceAnswer ||
-		(!w.awaitingSince.IsZero() && w.waitSentSeq >= 0 && now.Sub(w.awaitingSince) >= w.unansweredAfter)
-}
-
-// awaitingReplyFrom is awaitingReply for an exchange with dest: one
-// reported unanswered, or waiting at least unansweredAfter since a send
-// that went out.
-func (w *dataPlaneWatchdog) awaitingReplyFrom(now time.Time, dest string) bool {
-	w.ioMu.Lock()
-	defer w.ioMu.Unlock()
-	return (w.reportedSinceAnswer && w.reportedDest == dest) ||
-		(!w.awaitingSince.IsZero() && w.waitSentSeq >= 0 && w.awaitingDest == dest && now.Sub(w.awaitingSince) >= w.unansweredAfter)
+	return (w.reportedSinceAnswer && (dest == "" || w.reportedDest == dest)) ||
+		(!w.awaitingSince.IsZero() && w.waitSentSeq >= 0 && (dest == "" || w.awaitingDest == dest) &&
+			now.Sub(w.awaitingSince) >= w.unansweredAfter)
 }
 
 func (w *dataPlaneWatchdog) stopUnansweredTimer() {
@@ -612,10 +617,6 @@ func (w *dataPlaneWatchdog) stopUnansweredTimer() {
 	if w.unansweredTimer != nil {
 		w.unansweredTimer.Stop()
 	}
-}
-
-func (w *dataPlaneWatchdog) wrote() bool {
-	return !w.firstWrite().IsZero()
 }
 
 func (w *dataPlaneWatchdog) firstWrite() time.Time {
@@ -653,7 +654,7 @@ func (w *dataPlaneWatchdog) closeUnanswered() {
 		}
 	case !w.answered.Load():
 		since = w.firstWriteAt
-	case w.reportQuiet:
+	default:
 		since = w.lastIO
 	}
 	report := !since.IsZero() && time.Since(since) >= w.unansweredAfter && w.stalled.CompareAndSwap(false, true)
@@ -673,17 +674,16 @@ func (w *dataPlaneWatchdog) markResponded() {
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
 	w.responded.Store(true)
-	if w.firstResponseTimer != nil {
-		w.firstResponseTimer.Stop()
-	}
-	if w.slowResponseTimer != nil {
-		w.slowResponseTimer.Stop()
-	}
+	w.stopResponseTimersLocked()
 }
 
 func (w *dataPlaneWatchdog) stopFirstResponseTimer() {
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
+	w.stopResponseTimersLocked()
+}
+
+func (w *dataPlaneWatchdog) stopResponseTimersLocked() {
 	if w.firstResponseTimer != nil {
 		w.firstResponseTimer.Stop()
 	}

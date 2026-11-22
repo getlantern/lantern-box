@@ -2300,3 +2300,15 @@ func TestProbeTimeoutOverrides(t *testing.T) {
 	tor := s.behavior(C.TypeTor)
 	assert.True(t, tor.excludeFromPool, "an override never brings an excluded type into the pool")
 }
+
+func (s *MutableAutoSelect) selectOutbound(network, excludeTag string) (sbAdapter.Outbound, uint64, error) {
+	origin, err := s.selectOrigin(network, excludeTag, primaryRoute)
+	return origin.out, origin.generation, err
+}
+
+// originOf returns the origin of a conn about to be set up through o.
+func (s *MutableAutoSelect) originOf(o sbAdapter.Outbound, route routeKind, generation uint64) connOrigin {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.originOfLocked(o, route, generation)
+}

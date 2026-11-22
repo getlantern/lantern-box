@@ -365,12 +365,13 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 			// the first strike, while no other replacement failed, needs no
 			// recheck; otherwise the switch goes through the pending path,
 			// which rechecks a mixed picture.
+			replacementFailed := s.replacementFailedSinceLocked(attempt.tag, first)
 			named := replacement != "" && s.eligibleReplacementLocked(time.Now(), replacement) &&
-				s.answeredSinceLocked(replacement, first) && !s.replacementFailedSinceLocked(attempt.tag, first)
+				s.answeredSinceLocked(replacement, first) && !replacementFailed
 			if !named || !s.trySwitchAfterConfirmedFailureLocked(attempt.tag, replacement, first) {
 				p := &s.pendingConfirmedFailure
 				p.tag, p.since, p.at = attempt.tag, first, outcome.completed
-				p.replacementFailed = s.replacementFailedSinceLocked(attempt.tag, first)
+				p.replacementFailed = replacementFailed
 			}
 		}
 	}
@@ -734,14 +735,13 @@ func (s *MutableAutoSelect) rearmConfirmationLocked(tag, replacement string) {
 	s.dispatchProbesLocked()
 }
 
-// maxReplacementProbes bounds the members probed as replacements at a time
-// after a failed confirmation.
+// maxReplacementProbes bounds the members probed as replacements at a time.
 const maxReplacementProbes = 3
 
 // probeTCPReplacementsLocked probes the highest-ranked members TCP selection
 // would move to from tag that have no probe outcome since since, and reports
-// how many. Caller must hold s.access.
-func (s *MutableAutoSelect) probeTCPReplacementsLocked(tag string, since time.Time) int {
+// whether there were any. Caller must hold s.access.
+func (s *MutableAutoSelect) probeTCPReplacementsLocked(tag string, since time.Time) bool {
 	var tags []string
 	for _, c := range s.replacementPoolLocked(time.Now(), N.NetworkTCP, tag) {
 		if len(tags) == maxReplacementProbes {
@@ -752,13 +752,19 @@ func (s *MutableAutoSelect) probeTCPReplacementsLocked(tag string, since time.Ti
 		}
 		tags = append(tags, c.tag)
 	}
+	s.forceProbesLocked(tags...)
+	return len(tags) > 0
+}
+
+// forceProbesLocked probes tags now, if there are any. Caller must hold
+// s.access.
+func (s *MutableAutoSelect) forceProbesLocked(tags ...string) {
 	// requestProbesLocked reads nil as every member.
 	if len(tags) == 0 {
-		return 0
+		return
 	}
 	s.requestProbesLocked(tags, probeForced, false)
 	s.dispatchProbesLocked()
-	return len(tags)
 }
 
 func (s *MutableAutoSelect) requestFailureConfirmation(tag, replacement string, generation uint64) {
@@ -958,10 +964,9 @@ func (s *MutableAutoSelect) advanceNetworkLocked() {
 	// Probes on the new network decide whether it is down too.
 	s.outageSince = time.Time{}
 	for _, h := range s.histories {
-		h.clearStreak(streakTCP)
-		h.clearStreak(streakUDP)
+		h.clearStreaks()
 	}
-	s.lastStreakSwitch.tcp, s.lastStreakSwitch.udp = time.Time{}, time.Time{}
+	s.lastStreakSwitch = [2]time.Time{}
 	s.trials = [2]trialState{}
 	s.releasedSince = [2]time.Time{}
 	// A decision armed on the old network says nothing about the new one.

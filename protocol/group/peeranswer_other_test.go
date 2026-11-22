@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -20,10 +19,6 @@ import (
 	"github.com/getlantern/lantern-box/adapter"
 	"github.com/sagernet/sing/common/metadata"
 )
-
-func opErr(op string, errno syscall.Errno) error {
-	return &net.OpError{Op: op, Net: "tcp", Err: os.NewSyscallError(op, errno)}
-}
 
 func TestPeerAnswered(t *testing.T) {
 	for _, tc := range []struct {
