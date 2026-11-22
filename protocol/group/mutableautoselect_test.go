@@ -560,7 +560,7 @@ func TestSetURLOverrides_KeepsSelectionOffFailedMember(t *testing.T) {
 	recordSuccess(s, "b", 200)
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.consecutiveFailLimit {
-		s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load(), time.Time{}, "tcp")
+		s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load(), time.Time{}, "tcp", nil)
 	}
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -594,7 +594,7 @@ func TestDataPlaneStream_StallSuppressedUntilProven(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 100
 	d := newDataPlaneStream(stallConn{}, 10*time.Millisecond, provedReadBytes,
-		dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+		dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, uint32(0), calls.Load(),
@@ -608,7 +608,7 @@ func TestDataPlaneStream_StallFiresAfterProven(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 50
 	d := newDataPlaneStream(echoConn{}, 30*time.Millisecond, provedReadBytes,
-		dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+		dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	// Drive enough Read bytes to prove the conn.
@@ -638,7 +638,7 @@ func TestDataPlaneStream_StallSuppressedOnReadOnlyIdle(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 50
 	d := newDataPlaneStream(echoConn{}, 30*time.Millisecond, provedReadBytes,
-		dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+		dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	_, err := d.Read(make([]byte, provedReadBytes))
@@ -659,7 +659,7 @@ func TestDataPlaneStream_CloseIsIdempotent(t *testing.T) {
 
 func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
-	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	d.proven.Store(true)    // simulate a proven conn so fireStall isn't gated on the proven check
 	d.noteIO(1, nil, false) // ...nor on the write-without-read gate
 	d.Close()
@@ -669,7 +669,7 @@ func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 
 func TestDataPlanePacket_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
-	d := newDataPlanePacket(stallPacketConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlanePacket(stallPacketConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	d.proven.Store(true)
 	d.noteIO(1, nil, false)
 	d.Close()
@@ -762,8 +762,8 @@ func TestLateProbeAfterRemoveRecordsNothing(t *testing.T) {
 
 func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	assert.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp"), "first call must persist")
-	assert.False(t, s.recordUserFailure("a", adapter.UserFailureStall, s.networkGeneration.Load(), time.Time{}, "tcp"), "immediate burst must return false (deduped)")
+	assert.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp", nil), "first call must persist")
+	assert.False(t, s.recordUserFailure("a", adapter.UserFailureStall, s.networkGeneration.Load(), time.Time{}, "tcp", nil), "immediate burst must return false (deduped)")
 	s.access.Lock()
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
@@ -771,7 +771,7 @@ func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	assert.Equal(t, uint32(1), h.userFailureCount(time.Now(), s.hist.userFailureWindow),
 		"successive calls within dedupe window must collapse")
 
-	assert.False(t, s.recordUserFailure("nonexistent", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp"), "non-member must return false")
+	assert.False(t, s.recordUserFailure("nonexistent", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp", nil), "non-member must return false")
 	s.access.Lock()
 	_, exists := s.peekHistoryLocked("nonexistent")
 	s.access.Unlock()
@@ -784,7 +784,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// one. (Spec change from earlier "one-shot hard demote.")
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1,
@@ -796,7 +796,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -806,7 +806,7 @@ func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 
 func TestRecordUserFailure_AttributesDialKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	require.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp"))
+	require.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp", nil))
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -1140,7 +1140,7 @@ func TestDataPlanePacket_WritePacketReset_AttributesFailure(t *testing.T) {
 	// WritePacket shares noteIO with WriteTo, so a reset on it is charged.
 	var calls atomic.Uint32
 	inner := &addressedPacketConn{writeErr: connResetErr()}
-	d := newDataPlanePacket(inner, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlanePacket(inner, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	b := buf.NewSize(128)
@@ -1176,7 +1176,7 @@ func TestDataPlaneStream_MidStreamReset_ConnReset_AttributesFailure(t *testing.T
 	var calls atomic.Uint32
 	const provedReadBytes = 1 << 20 // never reached by the 16-byte read below
 	c := &failingConn{err: connResetErr(), firstN: 16}
-	d := newDataPlaneStream(c, time.Hour, provedReadBytes, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, provedReadBytes, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1214,7 +1214,7 @@ func TestDataPlaneStream_MidStreamReset_AttributesResetKind(t *testing.T) {
 	// mid-stream failure modes stay separable downstream.
 	var got atomic.Value // adapter.UserFailureKind
 	c := &failingConn{err: connResetErr(), firstN: 16}
-	d := newDataPlaneStream(c, time.Hour, 1<<20, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind) { got.Store(kind) }})
+	d := newDataPlaneStream(c, time.Hour, 1<<20, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind, _ error) { got.Store(kind) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1232,7 +1232,7 @@ func TestDataPlaneStream_MidStreamReset_AttributesResetKind(t *testing.T) {
 func TestDataPlaneStream_Stall_AttributesStallKind(t *testing.T) {
 	// The idle-timeout path must report a stall, complementing the reset path.
 	var got atomic.Value // adapter.UserFailureKind
-	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind) { got.Store(kind) }})
+	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind, _ error) { got.Store(kind) }})
 	defer d.Close()
 	d.proven.Store(true)
 	d.noteIO(1, nil, false)
@@ -1248,7 +1248,7 @@ func TestDataPlaneStream_MidStreamReset_ErrClosed_AttributesFailure(t *testing.T
 	// inner outbound tore its own fd down — a broken tunnel, so demote.
 	var calls atomic.Uint32
 	c := &failingConn{err: net.ErrClosed, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1266,7 +1266,7 @@ func TestDataPlaneStream_MidStreamReset_WritePath_AttributesFailure(t *testing.T
 	// The failure path must fire on a reset Write too, not just Read.
 	var calls atomic.Uint32
 	c := &failingConn{err: connResetErr(), failWrite: true}
-	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	_, err := d.Write([]byte("req"))
@@ -1281,7 +1281,7 @@ func TestDataPlanePacket_MidStreamReset_AttributesFailure(t *testing.T) {
 	// the same way as the stream path.
 	var calls atomic.Uint32
 	c := &failingPacketConn{err: connResetErr()}
-	d := newDataPlanePacket(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlanePacket(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	_, _, err := d.ReadFrom(make([]byte, 32))
@@ -1295,7 +1295,7 @@ func TestDataPlaneStream_EOFDoesNotAttribute(t *testing.T) {
 	// io.EOF is an ordinary stream end, not a tunnel failure.
 	var calls atomic.Uint32
 	c := &failingConn{err: io.EOF, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1314,7 +1314,7 @@ func TestDataPlaneStream_TimeoutDoesNotAttribute(t *testing.T) {
 	// double-count and usurp that role.
 	var calls atomic.Uint32
 	c := &failingConn{err: timeoutErr{}, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1334,7 +1334,7 @@ func TestDataPlaneStream_NoAttributeAfterClose(t *testing.T) {
 	// failure.
 	var calls atomic.Uint32
 	c := &failingConn{err: net.ErrClosed}
-	d := newDataPlaneStream(c, time.Hour, 1, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 1, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	require.True(t, d.closeWatchdog(), "first close")
 
 	_, err := d.Read(make([]byte, 8))
@@ -1348,7 +1348,7 @@ func TestDataPlaneStream_FailureFiresOnce(t *testing.T) {
 	// Repeated errored reads attribute at most once per conn (the fired CAS).
 	var calls atomic.Uint32
 	c := &failingConn{err: connResetErr()}
-	d := newDataPlaneStream(c, time.Hour, 1, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 1, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	for i := range 3 {
@@ -1887,7 +1887,7 @@ func TestMakeHooks_IgnoresFailureFromUnselectedTag(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("b")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall, nil)
 
 	s.access.Lock()
 	_, ok := s.peekHistoryLocked("a")
@@ -1903,7 +1903,7 @@ func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("a")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall, nil)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the udp selection must still be chargeable")
@@ -1915,7 +1915,7 @@ func TestMakeHooks_UnselectedGateDisabledByConfig(t *testing.T) {
 	s.cfg.demoteOnlySelected = false
 	s.stickyTag.tcp.Store("b")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
+	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall, nil)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the gate must be defeatable for rollback")
@@ -1928,7 +1928,7 @@ func TestMakeHooks_ChargesFallbackRouteEvenWhenUnselected(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	s.stickyTag.tcp.Store("a")
 
-	s.makeHooks("b", "tcp", fallbackRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset)
+	s.makeHooks("b", "tcp", fallbackRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset, nil)
 
 	uf, ok := userFailures(s, "b")
 	require.True(t, ok, "a fallback-route conn must stay chargeable")
@@ -2032,7 +2032,7 @@ func TestMakeHooks_FailureDoesNotRunLadder(t *testing.T) {
 		obs["a"].dial = denyDial
 		obs["b"].dial = denyDial
 		s.stickyTag.tcp.Store("a")
-		s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset)
+		s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset, nil)
 		synctest.Wait()
 		assert.Zero(t, s.lastLadderAt.Load(), "a data-plane failure must not re-probe every member")
 	})
@@ -2079,7 +2079,7 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 			recordSuccess(s, "b", 200)
 			s.hist.userFailureDedupeWindow = 0
 			for range s.hist.consecutiveFailLimit {
-				s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load(), time.Time{}, "tcp")
+				s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load(), time.Time{}, "tcp", nil)
 			}
 			s.access.Lock()
 			s.historyForLocked("a").startRecoveryGate(time.Now())

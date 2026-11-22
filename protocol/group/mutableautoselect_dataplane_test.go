@@ -58,7 +58,7 @@ func TestDataPlane_QuietReadPolicy(t *testing.T) {
 					var observed dataPlaneIO
 					var activity, observations int
 					w.init(time.Hour, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
-						onFailure:  func(kind adapter.UserFailureKind) { failures = append(failures, kind) },
+						onFailure:  func(kind adapter.UserFailureKind, _ error) { failures = append(failures, kind) },
 						onActivity: func(time.Time) { activity++ },
 						onError: func(err error, state dataPlaneIO, excused bool) {
 							assert.Same(t, readErr, err)
@@ -108,7 +108,7 @@ func TestDataPlane_ExcusedFailureThenLiveResetChargedOnce(t *testing.T) {
 				var decisions []bool
 				var w dataPlaneWatchdog
 				w.init(time.Hour, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
-					onFailure: func(kind adapter.UserFailureKind) { failures = append(failures, kind) },
+					onFailure: func(kind adapter.UserFailureKind, _ error) { failures = append(failures, kind) },
 					onError:   func(_ error, _ dataPlaneIO, excused bool) { decisions = append(decisions, excused) },
 				})
 				defer w.closeWatchdog()
@@ -132,7 +132,7 @@ func TestDataPlane_NoDiagnosticsAfterClose(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var w dataPlaneWatchdog
 		w.init(time.Hour, 0, dataPlaneHooks{
-			onFailure: func(adapter.UserFailureKind) { t.Error("failure after close") },
+			onFailure: func(adapter.UserFailureKind, error) { t.Error("failure after close") },
 			onError:   func(error, dataPlaneIO, bool) { t.Error("diagnostic after close") },
 		})
 		w.closeWatchdog()
@@ -168,7 +168,7 @@ func TestDataPlane_ConcurrentFailureClose(t *testing.T) {
 				var calls atomic.Uint32
 				var w dataPlaneWatchdog
 				w.init(time.Hour, 1, dataPlaneHooks{
-					onFailure: func(adapter.UserFailureKind) { calls.Add(1) },
+					onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) },
 				})
 				defer w.closeWatchdog()
 				w.noteIO(1, nil, true)
@@ -329,7 +329,7 @@ func TestDataPlane_NoResponse(t *testing.T) {
 				var failures []adapter.UserFailureKind
 				var w dataPlaneWatchdog
 				w.init(time.Hour, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
-					onFailure: func(kind adapter.UserFailureKind) { failures = append(failures, kind) },
+					onFailure: func(kind adapter.UserFailureKind, _ error) { failures = append(failures, kind) },
 				})
 				if !tt.disabled {
 					w.firstResponseTimeout = timeout

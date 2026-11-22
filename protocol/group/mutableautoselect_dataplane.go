@@ -41,7 +41,9 @@ const defaultUDPUnansweredAfter = 1500 * time.Millisecond
 const defaultUnansweredAfter = 2 * time.Second
 
 type dataPlaneHooks struct {
-	onFailure func(adapter.UserFailureKind)
+	// onFailure gets the error that caused a reset; a stall or a missing
+	// response has none.
+	onFailure func(kind adapter.UserFailureKind, cause error)
 	// onError runs on the IO goroutine, outside the watchdog's lock.
 	onError    func(err error, state dataPlaneIO, excused bool)
 	onActivity func(time.Time)
@@ -85,11 +87,11 @@ func (s *MutableAutoSelect) makeHooks(outerTag, network string, route routeKind,
 				s.noteUnansweredOffSelection(outerTag, generation, dest, exchangeOpened, waitingSince)
 			}
 		},
-		onFailure: func(kind adapter.UserFailureKind) {
+		onFailure: func(kind adapter.UserFailureKind, cause error) {
 			if !s.chargeable(outerTag, route) {
 				return
 			}
-			if !s.recordUserFailure(outerTag, kind, generation, opened, network) {
+			if !s.recordUserFailure(outerTag, kind, generation, opened, network, cause) {
 				return
 			}
 			if confirms && (kind == adapter.UserFailureReset || kind == adapter.UserFailureNoResponse) {
@@ -287,7 +289,7 @@ func (w *dataPlaneWatchdog) noteIOFrom(n int, err error, isRead bool, source M.S
 		state := w.snapshotIO()
 		excused := endsQuietRead(isRead, n, state)
 		if !excused {
-			w.fireResetFailure()
+			w.fireResetFailure(err)
 		}
 		if w.hooks.onError != nil {
 			w.hooks.onError(err, state, excused)
@@ -643,7 +645,7 @@ func (w *dataPlaneWatchdog) fireNoResponse() {
 		return
 	}
 	if w.hooks.onFailure != nil {
-		w.hooks.onFailure(adapter.UserFailureNoResponse)
+		w.hooks.onFailure(adapter.UserFailureNoResponse, nil)
 	}
 }
 
@@ -664,12 +666,12 @@ func (w *dataPlaneWatchdog) fireStall() {
 		return
 	}
 	if w.hooks.onFailure != nil {
-		w.hooks.onFailure(adapter.UserFailureStall)
+		w.hooks.onFailure(adapter.UserFailureStall, nil)
 	}
 }
 
 // fireResetFailure attributes a non-excused error once, even on an unproven conn.
-func (w *dataPlaneWatchdog) fireResetFailure() {
+func (w *dataPlaneWatchdog) fireResetFailure(cause error) {
 	if !w.stalled.CompareAndSwap(false, true) {
 		return
 	}
@@ -682,7 +684,7 @@ func (w *dataPlaneWatchdog) fireResetFailure() {
 	if w.hooks.onFailure != nil {
 		// run onFailure in a goroutine to avoid deadlocks: the callback may call back
 		// into the selector, which may hold locks that the data-plane IO path also needs.
-		go w.hooks.onFailure(adapter.UserFailureReset)
+		go w.hooks.onFailure(adapter.UserFailureReset, cause)
 	}
 }
 

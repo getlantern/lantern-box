@@ -141,6 +141,9 @@ type MutableAutoSelect struct {
 	// replacement failed their probes, and outageEndedAt when the suspicion
 	// was last cleared by an answer or a passing probe.
 	outageSince, outageEndedAt time.Time
+	// Guarded by access: when a failure's cause last showed the far end
+	// answered, which shows the device's own network was up.
+	peerAnsweredAt time.Time
 	// Guarded by access: when each network's selection was last released
 	// for consecutive failures.
 	lastStreakSwitch struct{ tcp, udp time.Time }
@@ -599,7 +602,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	// Attribute the failure to the outer (member) tag so rankLocked sees
 	// it. For nested groups, the inner tag isn't a member of this group,
 	// so recordUserFailure would drop on the member gate.
-	s.recordUserFailure(outerTag, adapter.UserFailureDial, generation, dialed, network)
+	s.recordUserFailure(outerTag, adapter.UserFailureDial, generation, dialed, network, err)
 
 	// Fast failover: try one alternate from the current rank. The active
 	// 3-min cadence keeps the probe history fresh enough to pick a working
@@ -623,7 +626,7 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		// The primary dial used up most of the caller's deadline, so an
 		// alternate cut off by it isn't charged.
 		if ctx.Err() == nil {
-			s.recordUserFailure(replacementTag, adapter.UserFailureDial, altGeneration, dialed, network)
+			s.recordUserFailure(replacementTag, adapter.UserFailureDial, altGeneration, dialed, network, err)
 		}
 		outerTag, ladderGeneration = replacementTag, altGeneration
 	}
@@ -668,7 +671,7 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		recordError(span, err)
 		return nil, err
 	}
-	s.recordUserFailure(outerTag, adapter.UserFailureDial, generation, dialed, N.NetworkUDP)
+	s.recordUserFailure(outerTag, adapter.UserFailureDial, generation, dialed, N.NetworkUDP, err)
 
 	ladderGeneration := generation
 	alt, altGeneration, altErr := s.selectOutbound("udp", outerTag)
@@ -683,7 +686,7 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		// The primary dial used up most of the caller's deadline, so an
 		// alternate cut off by it isn't charged.
 		if ctx.Err() == nil {
-			s.recordUserFailure(replacementTag, adapter.UserFailureDial, altGeneration, dialed, N.NetworkUDP)
+			s.recordUserFailure(replacementTag, adapter.UserFailureDial, altGeneration, dialed, N.NetworkUDP, err)
 		}
 		outerTag, ladderGeneration = replacementTag, altGeneration
 	}
@@ -1054,7 +1057,10 @@ func (s *MutableAutoSelect) streakReleaseAllowedLocked(network, sticky string) b
 // When every member's fresh probe failed, sticky is probed too unless its
 // result is fresh; then sticky's streak is cleared instead of walking the
 // pool, and if sticky's probe failed as well, nothing is reachable, as in an
-// outage of the device's own network. Caller must hold s.access.
+// outage of the device's own network. But when sticky's probe failed and a
+// failure since since showed the far end answered, the device is online and
+// the probes are what fail, so the highest-ranked other member in pool is
+// returned. Caller must hold s.access.
 func (s *MutableAutoSelect) streakReplacementLocked(pool []rankedCandidate, network, sticky string, since time.Time) (replacement rankedCandidate, ok, pending bool) {
 	var requested []string
 	failed := 0
@@ -1085,6 +1091,13 @@ func (s *MutableAutoSelect) streakReplacementLocked(pool []rankedCandidate, netw
 			s.requestProbesLocked([]string{sticky}, probeForced, false)
 			s.dispatchProbesLocked()
 			return rankedCandidate{}, false, true
+		}
+		if fresh && !own.outcome.success && !s.peerAnsweredAt.Before(since) {
+			for _, c := range pool {
+				if c.tag != sticky {
+					return c, true, false
+				}
+			}
 		}
 		if h, ok := s.peekHistoryLocked(sticky); ok {
 			h.clearStreak(streakNetFor(network))
@@ -1195,7 +1208,8 @@ func (s *MutableAutoSelect) awaitStreakReplacement(ctx context.Context, network 
 // startStreakReplacementLocked does what streakReplacementLocked does for
 // network's selection when applyStickiness would release it for consecutive
 // failures: it requests the probes that decide the replacement, or clears the
-// selection's streak if every fresh probe failed. It reports whether the
+// selection's streak if every fresh probe failed and no failure since the
+// streak began showed the far end answered. It reports whether the
 // release is still waiting on probes. Caller must hold s.access.
 func (s *MutableAutoSelect) startStreakReplacementLocked(network string) bool {
 	sticky := loadString(s.stickySlot(network))
@@ -1619,14 +1633,25 @@ func (s *MutableAutoSelect) failedSinceLocked(tag, network string, since time.Ti
 
 // recordUserFailure reports whether a current member's failure, on a network
 // conn opened at opened, was added to its window. A zero opened means
-// unknown.
-func (s *MutableAutoSelect) recordUserFailure(tag string, kind adapter.UserFailureKind, generation uint64, opened time.Time, network string) bool {
+// unknown. A failure whose cause shows the far end answered ends an outage
+// suspicion, and counts unless its conn predates the outage; any other is
+// dropped while outage evidence holds.
+func (s *MutableAutoSelect) recordUserFailure(tag string, kind adapter.UserFailureKind, generation uint64, opened time.Time, network string, cause error) bool {
 	recorded := s.mutateHistory(tag, generation, func(h *localHistory, now time.Time) bool {
 		failure := adapter.UserFailure{At: now, Kind: kind}
 		// mutateHistory holds s.access, so a suspicion can't start and clear
 		// the streaks between this check and the add.
-		if s.outageEvidenceLocked(opened) {
-			return h.addWindowFailure(failure, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
+		if peerAnswered(cause) {
+			s.peerAnsweredAt = now
+			// A conn the outage outlasted may have been dropped by the far
+			// end meanwhile, so its reset says nothing about the member.
+			stale := !opened.IsZero() && (opened.Before(s.outageSince) || opened.Before(s.outageEndedAt))
+			s.endOutageLocked()
+			if stale {
+				return false
+			}
+		} else if s.outageEvidenceLocked(opened) {
+			return false
 		}
 		return h.addUserFailure(failure, streakNetFor(network), opened, s.hist.userFailureWindow, s.hist.userFailureDedupeWindow)
 	})
@@ -1886,8 +1911,7 @@ func (s *MutableAutoSelect) endOutageLocked() {
 // outageEvidenceLocked reports whether a failure on a conn opened at opened
 // says more about an outage of the device's own network than about its
 // member: an outage is suspected, or the conn was opened before the latest
-// one ended. Such failures don't build a failure streak. Caller must hold
-// s.access.
+// one ended. Such failures aren't counted. Caller must hold s.access.
 func (s *MutableAutoSelect) outageEvidenceLocked(opened time.Time) bool {
 	return s.outageSuspectedLocked() || (!opened.IsZero() && opened.Before(s.outageEndedAt))
 }

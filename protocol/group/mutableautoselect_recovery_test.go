@@ -142,7 +142,7 @@ func TestDataPlaneStream_Unanswered(t *testing.T) {
 				d := newDataPlaneStream(c, time.Hour, 1, dataPlaneHooks{
 					onUnanswered: func(time.Time, string) { unanswered.Add(1) },
 					onResponse:   func(time.Time, string) { answered.Add(1) },
-					onFailure:    func(adapter.UserFailureKind) { failures.Add(1) },
+					onFailure:    func(adapter.UserFailureKind, error) { failures.Add(1) },
 				})
 				d.firstResponseTimeout = 10 * time.Second
 				d.unansweredAfter = 2 * time.Second
@@ -214,7 +214,7 @@ func TestRecordUserFailure_StockLogger(t *testing.T) {
 	defer factory.Close()
 	s.logger = factory.Logger()
 	require.NotPanics(t, func() {
-		s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp")
+		s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp", nil)
 	})
 }
 
@@ -727,7 +727,7 @@ func TestDataPlanePacket_OpenReportKeepsResetDetection(t *testing.T) {
 		c := newScriptedPacketConn()
 		d := newDataPlanePacket(c, time.Hour, 1<<20, dataPlaneHooks{
 			onUnanswered: func(time.Time, string) { unanswered.Add(1) },
-			onFailure:    func(adapter.UserFailureKind) { failures.Add(1) },
+			onFailure:    func(adapter.UserFailureKind, error) { failures.Add(1) },
 		})
 		d.unansweredAfter = defaultUDPUnansweredAfter
 		d.unansweredWhileOpen = true
@@ -1399,7 +1399,7 @@ func TestDataPlanePacket_StallKeepsExchangesWatched(t *testing.T) {
 		c := newScriptedPacketConn()
 		d := newDataPlanePacket(c, time.Second, 1, dataPlaneHooks{
 			onUnanswered: func(time.Time, string) { unanswered.Add(1) },
-			onFailure:    func(adapter.UserFailureKind) { stalls.Add(1) },
+			onFailure:    func(adapter.UserFailureKind, error) { stalls.Add(1) },
 		})
 		d.unansweredAfter = defaultUDPUnansweredAfter
 		d.unansweredWhileOpen = true
@@ -1982,7 +1982,7 @@ func TestDataPlaneStream_ReplyDisarmsTimersBeforeHooks(t *testing.T) {
 		c := newScriptedConn()
 		d := newDataPlaneStream(c, time.Hour, 1<<20, dataPlaneHooks{
 			onResponse:     func(time.Time, string) { <-release },
-			onFailure:      func(adapter.UserFailureKind) { failures.Add(1) },
+			onFailure:      func(adapter.UserFailureKind, error) { failures.Add(1) },
 			onSlowResponse: func() { slow.Add(1) },
 		})
 		d.firstResponseTimeout = defaultFirstResponseTimeout
