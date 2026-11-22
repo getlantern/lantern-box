@@ -275,6 +275,16 @@ func (h *localHistory) clearStreak(network streakNet) {
 	h.streaks[network].count = 0
 }
 
+// clearStreakBefore clears network's streak if its latest failure came
+// before t.
+func (h *localHistory) clearStreakBefore(network streakNet, t time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.streaks[network].at.Before(t) {
+		h.streaks[network].count = 0
+	}
+}
+
 // limitReachedAt returns when network's streak live at now reached
 // consecutiveUserFailureLimit, or zero if it hasn't.
 func (h *localHistory) limitReachedAt(network streakNet, now time.Time, window time.Duration) time.Time {

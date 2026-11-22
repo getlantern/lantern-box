@@ -2745,3 +2745,167 @@ func TestListenPacket_SessionSetUpAcrossASwitchOnDelayIsKept(t *testing.T) {
 		assert.False(t, isClosed(primary))
 	})
 }
+
+func TestStreak_ReleasedToASoftDemotedMemberWhenEveryCleanOneFails(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		down := func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["a"].dial, obs["b"].dial = down, down
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		generation := s.networkGeneration.Load()
+		for range s.hist.softFailLimit {
+			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+		}
+		for range consecutiveUserFailureLimit {
+			s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+			time.Sleep(time.Second)
+		}
+		for range 5 {
+			_, _, err := s.selectOutbound("tcp", "")
+			require.NoError(t, err)
+			time.Sleep(time.Second)
+			synctest.Wait()
+		}
+		assert.Equal(t, "c", loadString(&s.stickyTag.tcp), "c is the only member that passes")
+		s.access.Lock()
+		defer s.access.Unlock()
+		assert.False(t, s.outageSuspectedLocked(), "c passing shows the device's network is up")
+	})
+}
+
+func TestStreak_CleanMemberStillProbingIsPreferredToASoftOne(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(time.Second), nil }
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		generation := s.networkGeneration.Load()
+		for range s.hist.softFailLimit {
+			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+		}
+		s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+		time.Sleep(time.Second)
+		s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+		time.Sleep(10 * time.Millisecond)
+		_, _, err := s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "b's probe is still running")
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		_, _, err = s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		assert.Equal(t, "b", loadString(&s.stickyTag.tcp), "a passing clean member is preferred to a soft one")
+	})
+}
+
+func TestStreak_SoftReplacementLasts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// aPasses makes a, released for its streak, a soft member that passes
+		// probes too.
+		aPasses bool
+		// cDelay is how long c's probe takes, so b's older delay can beat it.
+		cDelay time.Duration
+	}{
+		{"despite its own earlier streak", true, 0},
+		{"over a faster member whose probe failed", false, 400 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+				down := func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+				obs["a"].dial, obs["b"].dial = down, down
+				if tc.aPasses {
+					obs["a"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+				}
+				obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(tc.cDelay), nil }
+				generation := s.networkGeneration.Load()
+				for range s.hist.softFailLimit {
+					require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+					time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+				}
+				for range consecutiveUserFailureLimit {
+					s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+					time.Sleep(time.Second)
+				}
+				var picks []string
+				for range 8 {
+					_, _, err := s.selectOutbound("tcp", "")
+					require.NoError(t, err)
+					picks = append(picks, loadString(&s.stickyTag.tcp))
+					time.Sleep(time.Second)
+					synctest.Wait()
+				}
+				assert.Equal(t, []string{"c", "c", "c", "c", "c", "c", "c", "c"}, picks)
+			})
+		})
+	}
+}
+
+func TestStreak_NeverReleasedBelowTheSoftTier(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(s *MutableAutoSelect, d *mockOutbound)
+	}{
+		{"hard-demoted", func(s *MutableAutoSelect, _ *mockOutbound) {
+			generation := s.networkGeneration.Load()
+			for range s.hist.consecutiveFailLimit {
+				require.True(t, s.recordUserFailure("d", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+				time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+			}
+		}},
+		{"last resort", func(_ *MutableAutoSelect, d *mockOutbound) { d.typeName = lConst.TypeUnbounded }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, obs := newConfirmationTestMUR(t, "a", "b", "d")
+				down := func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+				obs["a"].dial, obs["b"].dial = down, down
+				obs["d"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+				tc.setup(s, obs["d"])
+				generation := s.networkGeneration.Load()
+				for range consecutiveUserFailureLimit {
+					s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+					time.Sleep(time.Second)
+				}
+				for range 5 {
+					_, _, err := s.selectOutbound("tcp", "")
+					require.NoError(t, err)
+					assert.NotEqual(t, "d", loadString(&s.stickyTag.tcp))
+					time.Sleep(time.Second)
+					synctest.Wait()
+				}
+			})
+		})
+	}
+}
+
+func TestStreak_ReplacementKeepsFailuresAfterItsProbe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		down := func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["a"].dial, obs["b"].dial = down, down
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		generation := s.networkGeneration.Load()
+		for range s.hist.softFailLimit {
+			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+		}
+		for range consecutiveUserFailureLimit {
+			s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+			time.Sleep(time.Second)
+		}
+		synctest.Wait()
+		// c's probe passed; this failure comes after it.
+		s.recordUserFailure("c", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+		_, _, err := s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		require.Equal(t, "c", loadString(&s.stickyTag.tcp))
+		h, ok := s.peekHistoryLocked("c")
+		require.True(t, ok)
+		assert.False(t, h.limitReachedAt(streakTCP, time.Now(), s.hist.userFailureWindow).IsZero(),
+			"a failure after the probe that chose c still counts")
+	})
+}

@@ -990,8 +990,11 @@ func (s *MutableAutoSelect) applyStickiness(
 	// at once.
 	streakOnly := c.delayMs > 0 && best.delayMs == 0 && c.demote == demoteSoft && best.demote < c.demote &&
 		c.streak >= consecutiveUserFailureLimit && c.userFails < s.hist.softFailLimit
+	// A selection whose latest probe passed isn't given up on delay or
+	// measurement for a cleaner member whose latest probe failed.
+	probedBetter := c.delayMs > 0 && !c.probeFailed && best.probeFailed
 	switch {
-	case (c.delayMs == 0) != (best.delayMs == 0) && !streakOnly:
+	case (c.delayMs == 0) != (best.delayMs == 0) && !streakOnly && !probedBetter:
 		// The tolerance comparison only means something between two real
 		// measurements: delayMs 0 means never measured, and comparing it with
 		// a real delay would let a never-probed sticky's 0ms retain it.
@@ -1007,17 +1010,25 @@ func (s *MutableAutoSelect) applyStickiness(
 		s.closeStuckOnReleaseLocked(network, sticky)
 	case c.demote > best.demote && c.streak >= consecutiveUserFailureLimit && s.streakReleaseAllowedLocked(network, sticky) &&
 		!s.streakSinceLocked(sticky, network).IsZero():
-		replacement, ok, _ := s.streakReplacementLocked(pool, network, sticky, s.streakSinceLocked(sticky, network))
+		replacement, ok, _ := s.streakReplacementLocked(pool, forNetwork, network, sticky, s.streakSinceLocked(sticky, network))
 		if !ok {
 			return c
 		}
 		s.logSwitch(network, sticky, replacement, "consecutive failures")
+		// replacement's streak from before the probe that chose it would
+		// release it again at once.
+		if state := s.probeMembers[replacement.tag]; replacement.streak >= consecutiveUserFailureLimit &&
+			state != nil && state.outcome != nil && state.outcome.success {
+			if h, ok := s.peekHistoryLocked(replacement.tag); ok {
+				h.clearStreakBefore(streakNetFor(network), state.outcome.completed)
+			}
+		}
 		*s.lastStreakSwitchLocked(network) = time.Now()
 		s.closeStuckOnReleaseLocked(network, sticky)
 		return replacement
 	case streakOnly:
 		return c
-	case s.beatsOnDelay(best.delayMs, c.delayMs):
+	case s.beatsOnDelay(best.delayMs, c.delayMs) && !probedBetter:
 		s.logSwitch(network, sticky, best, "beaten on delay")
 	default:
 		return c
@@ -1051,35 +1062,48 @@ func (s *MutableAutoSelect) streakReleaseAllowedLocked(network, sticky string) b
 
 // streakReplacementLocked returns the member to release network's selection,
 // sticky, to for consecutive failures since since: the highest-ranked member
-// in pool whose probe, completed no earlier than since, passed. It requests
-// probes of the others, so a later call may find one. A member that can't be
-// probed counts as reachable, so a group without probing still releases.
-// When every member's fresh probe failed, sticky is probed too unless its
-// result is fresh; then sticky's streak is cleared instead of walking the
-// pool, and if sticky's probe failed as well, nothing is reachable, as in an
-// outage of the device's own network. But when sticky's probe failed and a
-// failure since since showed the far end answered, the device is online and
-// the probes are what fail, so the highest-ranked other member in pool is
-// returned. Caller must hold s.access.
-func (s *MutableAutoSelect) streakReplacementLocked(pool []rankedCandidate, network, sticky string, since time.Time) (replacement rankedCandidate, ok, pending bool) {
+// in pool whose probe, completed no earlier than since, passed, or when pool
+// is the clean tier and each of its members failed, such a member of
+// forNetwork's soft tier. It requests probes of the others, so a later call
+// may find one. A member that can't be probed counts as reachable, so a group
+// without probing still releases. When every member's fresh probe failed,
+// sticky is probed too unless its result is fresh; then sticky's streak is
+// cleared instead of walking the pool, and if sticky's probe failed as well,
+// nothing is reachable, as in an outage of the device's own network. But when
+// sticky's probe failed and a failure since since showed the far end
+// answered, the device is online and the probes are what fail, so the
+// highest-ranked other member in pool is returned. Caller must hold s.access.
+func (s *MutableAutoSelect) streakReplacementLocked(pool, forNetwork []rankedCandidate, network, sticky string, since time.Time) (replacement rankedCandidate, ok, pending bool) {
 	var requested []string
 	failed := 0
-	for _, c := range pool {
-		if c.tag == sticky {
-			continue
+	for i, tier := range [2][]rankedCandidate{pool, forNetwork} {
+		if i == 1 && (len(pool) == 0 || pool[0].demote != demoteClean) {
+			break
 		}
-		if probe.ValidateURL(s.probeURLForLocked(c.tag)) != nil {
-			return c, true, false
-		}
-		if state := s.probeMembers[c.tag]; state != nil && state.outcome != nil &&
-			!state.outcome.completed.Before(since) && s.outcomeCurrentLocked(c.tag, state.outcome) {
-			if state.outcome.success {
-				return c, true, false
+		// The soft tier's members are probed alongside pool's, but one is
+		// returned only once none of pool's is still being probed.
+		usable := i == 0 || len(requested) == 0
+		for _, c := range tier {
+			if c.tag == sticky || (i == 1 && c.demote != demoteSoft) {
+				continue
 			}
-			failed++
-			continue
+			if probe.ValidateURL(s.probeURLForLocked(c.tag)) != nil {
+				if usable {
+					return c, true, false
+				}
+				continue
+			}
+			if state := s.probeMembers[c.tag]; state != nil && state.outcome != nil &&
+				!state.outcome.completed.Before(since) && s.outcomeCurrentLocked(c.tag, state.outcome) {
+				if !state.outcome.success {
+					failed++
+				} else if usable {
+					return c, true, false
+				}
+				continue
+			}
+			requested = append(requested, c.tag)
 		}
-		requested = append(requested, c.tag)
 	}
 	if len(requested) > 0 {
 		s.requestProbesLocked(requested, probeForced, false)
@@ -1121,8 +1145,8 @@ func (s *MutableAutoSelect) probeStreakReplacementLocked(tag, network string) {
 	if since.IsZero() || loadString(s.stickySlot(network)) != tag || !s.streakReleaseAllowedLocked(network, tag) {
 		return
 	}
-	pool, _ := s.splitHealthyForLocked(s.rankLocked(time.Now()), network)
-	s.streakReplacementLocked(pool, network, tag, since)
+	pool, forNetwork := s.splitHealthyForLocked(s.rankLocked(time.Now()), network)
+	s.streakReplacementLocked(pool, forNetwork, network, tag, since)
 }
 
 // streakSinceLocked returns when tag's live failure streak on network reached
@@ -1225,7 +1249,7 @@ func (s *MutableAutoSelect) startStreakReplacementLocked(network string) bool {
 	if idx < 0 || len(pool) == 0 || forNetwork[idx].demote <= pool[0].demote {
 		return false
 	}
-	_, _, pending := s.streakReplacementLocked(pool, network, sticky, since)
+	_, _, pending := s.streakReplacementLocked(pool, forNetwork, network, sticky, since)
 	return pending
 }
 
