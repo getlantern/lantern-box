@@ -2909,3 +2909,94 @@ func TestStreak_ReplacementKeepsFailuresAfterItsProbe(t *testing.T) {
 			"a failure after the probe that chose c still counts")
 	})
 }
+
+func TestRank_ForgivenProbeFailureStillRanksAfterAPass(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(200 * time.Millisecond), nil }
+		evidence := time.Now()
+		s.access.Lock()
+		s.requestProbesLocked([]string{"a", "b"}, probeForced, false)
+		s.dispatchProbesLocked()
+		s.access.Unlock()
+		time.Sleep(time.Second)
+		synctest.Wait()
+		s.access.Lock()
+		defer s.access.Unlock()
+		s.suspectOutageLocked(evidence)
+		s.endOutageLocked()
+		_, consec, _, _ := s.histories["a"].snapshot(time.Now(), s.hist.userFailureWindow)
+		require.Zero(t, consec, "a's probe failure is forgiven")
+		ranked := s.rankLocked(time.Now())
+		require.Len(t, ranked, 2)
+		assert.Equal(t, "b", ranked[0].tag, "a's latest probe failed, forgiven or not")
+	})
+}
+
+func TestApplyStickiness_NotBeatenOnDelayByAMemberWhoseProbeFailed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "x")
+		recordSuccess(s, "a", 150)
+		recordSuccess(s, "x", 20)
+		evidence := time.Now()
+		for _, ob := range obs {
+			ob.dial = func(context.Context) (net.Conn, error) { return nil, errors.New("network down") }
+		}
+		s.access.Lock()
+		s.requestProbesLocked([]string{"a", "x"}, probeForced, false)
+		s.dispatchProbesLocked()
+		s.access.Unlock()
+		time.Sleep(time.Second)
+		synctest.Wait()
+		s.access.Lock()
+		s.suspectOutageLocked(evidence)
+		s.endOutageLocked()
+		_, consec, _, _ := s.histories["x"].snapshot(time.Now(), s.hist.userFailureWindow)
+		s.access.Unlock()
+		require.Zero(t, consec, "x's probe failure is forgiven")
+		_, _, err := s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "x's delay predates its failed probe")
+	})
+}
+
+func TestApplyStickiness_NotReleasedAsUnmeasuredToAMemberWhoseProbeFailed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newTestMUR(t, "a", "x")
+		s.defaultURL = "http://probe.test/"
+		s.cfg.ladderCooldown = time.Hour
+		s.lastLadderAt.Store(time.Now().UnixNano())
+		recordSuccess(s, "a", 150)
+		s.stickyTag.tcp.Store("a")
+		for _, ob := range obs {
+			ob.dial = func(context.Context) (net.Conn, error) { return nil, errors.New("network down") }
+		}
+		generation := s.networkGeneration.Load()
+		for range s.hist.softFailLimit {
+			require.True(t, s.recordUserFailure("a", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
+		}
+		probe := func(tags ...string) {
+			s.access.Lock()
+			s.requestProbesLocked(tags, probeForced, false)
+			s.dispatchProbesLocked()
+			s.access.Unlock()
+			time.Sleep(time.Second)
+			synctest.Wait()
+		}
+		// x has never passed a probe, and this failure of it is counted.
+		probe("x")
+		evidence := time.Now()
+		probe("a", "x")
+		s.access.Lock()
+		s.suspectOutageLocked(evidence)
+		s.endOutageLocked()
+		_, consec, _, _ := s.histories["a"].snapshot(time.Now(), s.hist.userFailureWindow)
+		s.access.Unlock()
+		require.Zero(t, consec, "a's probe failure in the outage is forgiven")
+		_, _, err := s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "x's latest probe failed too")
+	})
+}

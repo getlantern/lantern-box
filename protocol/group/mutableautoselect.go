@@ -990,11 +990,11 @@ func (s *MutableAutoSelect) applyStickiness(
 	// at once.
 	streakOnly := c.delayMs > 0 && best.delayMs == 0 && c.demote == demoteSoft && best.demote < c.demote &&
 		c.streak >= consecutiveUserFailureLimit && c.userFails < s.hist.softFailLimit
-	// A selection whose latest probe passed isn't given up on delay or
-	// measurement for a cleaner member whose latest probe failed.
-	probedBetter := c.delayMs > 0 && !c.probeFailed && best.probeFailed
+	// A measured selection isn't given up as unmeasured for a cleaner member
+	// whose latest probe failed.
+	measuredOverFailed := c.delayMs > 0 && best.probeFailed
 	switch {
-	case (c.delayMs == 0) != (best.delayMs == 0) && !streakOnly && !probedBetter:
+	case (c.delayMs == 0) != (best.delayMs == 0) && !streakOnly && !measuredOverFailed:
 		// The tolerance comparison only means something between two real
 		// measurements: delayMs 0 means never measured, and comparing it with
 		// a real delay would let a never-probed sticky's 0ms retain it.
@@ -1028,7 +1028,9 @@ func (s *MutableAutoSelect) applyStickiness(
 		return replacement
 	case streakOnly:
 		return c
-	case s.beatsOnDelay(best.delayMs, c.delayMs) && !probedBetter:
+	case s.beatsOnDelay(best.delayMs, c.delayMs) && !best.probeFailed:
+		// A delay from before best's latest, failed probe says nothing about
+		// how it would serve now.
 		s.logSwitch(network, sticky, best, "beaten on delay")
 	default:
 		return c
@@ -1324,6 +1326,14 @@ func (s *MutableAutoSelect) peekHistoryLocked(tag string) (*localHistory, bool) 
 	return h, ok
 }
 
+// latestProbeFailedLocked reports whether tag's latest current probe failed,
+// even when an outage suspicion forgave the failure so it doesn't demote tag.
+// Caller must hold s.access.
+func (s *MutableAutoSelect) latestProbeFailedLocked(tag string) bool {
+	state := s.probeMembers[tag]
+	return state != nil && state.outcome != nil && !state.outcome.success && s.outcomeCurrentLocked(tag, state.outcome)
+}
+
 // demoteLevel ranks how cautious selection should be about a candidate.
 // Ordering is load-bearing: rankLocked sorts on the integer value, so
 // demoteClean must compare < demoteSoft < demoteLastResort < demoteHard for
@@ -1515,7 +1525,7 @@ func (s *MutableAutoSelect) rankLocked(now time.Time) []rankedCandidate {
 		case soft:
 			level = demoteSoft
 		}
-		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, demote: level, userFails: p.userFails, streaks: p.streaks, probeFailed: p.consec > 0, lastResort: p.lastResort, hasRecoveryGate: p.hasRecoveryGate})
+		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, demote: level, userFails: p.userFails, streaks: p.streaks, probeFailed: p.consec > 0 || s.latestProbeFailedLocked(p.tag), lastResort: p.lastResort, hasRecoveryGate: p.hasRecoveryGate})
 	}
 	s.scratchRanked = out
 	sort.SliceStable(out, func(i, j int) bool { return rankedBefore(out[i], out[j]) })
