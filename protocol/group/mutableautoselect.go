@@ -612,17 +612,17 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	if trial, ok := s.takeTrial(network); ok {
 		conn, err := trial.out.DialContext(ctx, network, destination)
 		switch {
-		case !s.originCurrent(trial):
-			// Removed during the setup: no one's trial.
-			if err == nil {
-				conn.Close()
-			}
-		case err == nil:
+		case err == nil && s.originCurrent(trial):
 			return s.wrapStream(conn, network, trial, nil), nil
+		case err == nil:
+			// Removed during the setup: no one's trial.
+			conn.Close()
 		default:
 			s.logger.ErrorContext(ctx, err)
 			if !errors.Is(ctx.Err(), context.Canceled) {
-				s.noteTrialFailed(trial.out.Tag(), network, trial.trialFor, trial.generation)
+				s.reportSetup(trial, func() {
+					s.noteTrialFailed(trial.out.Tag(), network, trial.trialFor, trial.generation)
+				})
 			}
 		}
 		if ctx.Err() != nil {
@@ -643,8 +643,8 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	o, generation := origin.out, origin.generation
 	outerTag := o.Tag()
 	dialed := time.Now()
-	conn, release, err := s.dialPrimary(ctx, o, network, destination, generation, dialed)
-	if !s.originCurrent(origin) {
+	conn, release, err := s.dialPrimary(ctx, origin, network, destination, dialed)
+	if !s.reportSetup(origin, func() { s.noteSelectionSetup(network, outerTag, generation, err == nil) }) {
 		// The member was removed during the setup: its result is no one's.
 		if err == nil {
 			conn.Close()
@@ -656,7 +656,6 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		recordError(span, err)
 		return nil, err
 	}
-	s.noteSelectionSetup(network, outerTag, generation, err == nil)
 	if err == nil {
 		stream := s.wrapStream(conn, network, origin, release)
 		// Registered by now, so a switch from here on closes it with the
@@ -677,7 +676,9 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	// Attribute the failure to the outer (member) tag so rankLocked sees
 	// it. For nested groups, the inner tag isn't a member of this group,
 	// so recordUserFailure would drop on the member gate.
-	s.recordUserFailure(outerTag, adapter.UserFailureDial, generation, dialed, network, err)
+	s.reportSetup(origin, func() {
+		s.recordUserFailure(outerTag, adapter.UserFailureDial, generation, dialed, network, err)
+	})
 
 	// Fast failover: try one alternate from the current rank. The active
 	// 3-min cadence keeps the probe history fresh enough to pick a working
@@ -692,14 +693,16 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		replacementTag := alt.Tag()
 		dialed = time.Now()
 		conn, err = alt.DialContext(ctx, network, destination)
-		current := s.originCurrent(altOrigin)
-		if err == nil && current {
-			if network == N.NetworkTCP {
-				s.requestFailureConfirmation(outerTag, replacementTag, generation)
-			}
-			return s.wrapStream(conn, network, altOrigin, nil), nil
-		}
 		if err == nil {
+			if s.reportSetup(altOrigin, func() {
+				// The confirmation is the primary's, so its membership must
+				// hold too.
+				if network == N.NetworkTCP && s.originCurrent(origin) {
+					s.requestFailureConfirmation(outerTag, replacementTag, generation)
+				}
+			}) {
+				return s.wrapStream(conn, network, altOrigin, nil), nil
+			}
 			// Removed during the setup: its conn is no one's.
 			conn.Close()
 			err = errAbandonedDial
@@ -707,8 +710,10 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		s.logger.ErrorContext(ctx, err)
 		// The primary dial used up most of the caller's deadline, so an
 		// alternate cut off by it isn't charged.
-		if ctx.Err() == nil && current {
-			s.recordUserFailure(replacementTag, adapter.UserFailureDial, altGeneration, dialed, network, err)
+		if ctx.Err() == nil {
+			s.reportSetup(altOrigin, func() {
+				s.recordUserFailure(replacementTag, adapter.UserFailureDial, altGeneration, dialed, network, err)
+			})
 		}
 		outerTag, ladderGeneration = replacementTag, altGeneration
 	}
@@ -733,17 +738,17 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	if trial, ok := s.takeTrial(N.NetworkUDP); ok {
 		conn, err := trial.out.ListenPacket(ctx, destination)
 		switch {
-		case !s.originCurrent(trial):
-			// Removed during the setup: no one's trial.
-			if err == nil {
-				conn.Close()
-			}
-		case err == nil:
+		case err == nil && s.originCurrent(trial):
 			return s.wrapPacket(conn, trial, destination), nil
+		case err == nil:
+			// Removed during the setup: no one's trial.
+			conn.Close()
 		default:
 			s.logger.ErrorContext(ctx, err)
 			if !errors.Is(ctx.Err(), context.Canceled) {
-				s.noteTrialFailed(trial.out.Tag(), N.NetworkUDP, trial.trialFor, trial.generation)
+				s.reportSetup(trial, func() {
+					s.noteTrialFailed(trial.out.Tag(), N.NetworkUDP, trial.trialFor, trial.generation)
+				})
 			}
 		}
 		if ctx.Err() != nil {
@@ -763,7 +768,7 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	outerTag := o.Tag()
 	dialed := time.Now()
 	conn, err := o.ListenPacket(ctx, destination)
-	if !s.originCurrent(origin) {
+	if !s.reportSetup(origin, func() { s.noteSelectionSetup(N.NetworkUDP, outerTag, generation, err == nil) }) {
 		// The member was removed during the setup: its result is no one's.
 		if err == nil {
 			conn.Close()
@@ -772,7 +777,6 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		recordError(span, err)
 		return nil, err
 	}
-	s.noteSelectionSetup(N.NetworkUDP, outerTag, generation, err == nil)
 	if err == nil {
 		pc := s.wrapPacket(conn, origin, destination)
 		// The release sweep closes only sessions already waiting on a reply,
@@ -788,7 +792,9 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		recordError(span, err)
 		return nil, err
 	}
-	s.recordUserFailure(outerTag, adapter.UserFailureDial, generation, dialed, N.NetworkUDP, err)
+	s.reportSetup(origin, func() {
+		s.recordUserFailure(outerTag, adapter.UserFailureDial, generation, dialed, N.NetworkUDP, err)
+	})
 
 	ladderGeneration := generation
 	altOrigin, altErr := s.selectOrigin("udp", outerTag, fallbackRoute)
@@ -797,11 +803,10 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		replacementTag := alt.Tag()
 		dialed = time.Now()
 		conn, err = alt.ListenPacket(ctx, destination)
-		current := s.originCurrent(altOrigin)
-		if err == nil && current {
-			return s.wrapPacket(conn, altOrigin, destination), nil
-		}
 		if err == nil {
+			if s.originCurrent(altOrigin) {
+				return s.wrapPacket(conn, altOrigin, destination), nil
+			}
 			// Removed during the setup: its session is no one's.
 			conn.Close()
 			err = errAbandonedDial
@@ -809,8 +814,10 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 		s.logger.ErrorContext(ctx, err)
 		// The primary dial used up most of the caller's deadline, so an
 		// alternate cut off by it isn't charged.
-		if ctx.Err() == nil && current {
-			s.recordUserFailure(replacementTag, adapter.UserFailureDial, altGeneration, dialed, N.NetworkUDP, err)
+		if ctx.Err() == nil {
+			s.reportSetup(altOrigin, func() {
+				s.recordUserFailure(replacementTag, adapter.UserFailureDial, altGeneration, dialed, N.NetworkUDP, err)
+			})
 		}
 		outerTag, ladderGeneration = replacementTag, altGeneration
 	}
@@ -901,6 +908,20 @@ func (s *MutableAutoSelect) originOfLocked(o A.Outbound, route routeKind, genera
 		origin.membership = state.membershipID
 	}
 	return origin
+}
+
+// reportSetup runs report, on a setup through origin, if origin's
+// membership still holds, and reports whether it did. The check and report
+// are made under reportMu's read lock, so report can't reach a member
+// re-added under the same tag.
+func (s *MutableAutoSelect) reportSetup(origin connOrigin, report func()) bool {
+	s.reportMu.RLock()
+	defer s.reportMu.RUnlock()
+	if !s.originCurrent(origin) {
+		return false
+	}
+	report()
+	return true
 }
 
 // originCurrent reports whether origin's membership still holds.
@@ -1925,15 +1946,16 @@ func (s *MutableAutoSelect) mutateHistoryLocked(tag string, fn func(*localHistor
 
 var errAbandonedDial = errors.New("dial abandoned: member failed while it was set up")
 
-// dialPrimary dials o, the TCP selection, and probes o once the dial has been
-// pending earlyConfirmAfter. If that probe fails and the selection moves off
-// o while the dial is still pending, it gives up on the dial with
-// errAbandonedDial so the caller fails over now rather than at its deadline,
-// and cancels the abandoned dial; a conn it returns late is closed. The dial
-// runs under a context derived from ctx, which some outbounds tie their conns
-// to, so a TCP conn comes with a release that cancels it, to run once the conn
-// closes.
-func (s *MutableAutoSelect) dialPrimary(ctx context.Context, o A.Outbound, network string, destination M.Socksaddr, generation uint64, dialed time.Time) (net.Conn, func(), error) {
+// dialPrimary dials through origin, the TCP selection, and probes it, if its
+// membership still holds, once the dial has been pending earlyConfirmAfter.
+// If that probe fails and the selection moves off it while the dial is still
+// pending, it gives up on the dial with errAbandonedDial so the caller fails
+// over now rather than at its deadline, and cancels the abandoned dial; a
+// conn it returns late is closed. The dial runs under a context derived from
+// ctx, which some outbounds tie their conns to, so a TCP conn comes with a
+// release that cancels it, to run once the conn closes.
+func (s *MutableAutoSelect) dialPrimary(ctx context.Context, origin connOrigin, network string, destination M.Socksaddr, dialed time.Time) (net.Conn, func(), error) {
+	o := origin.out
 	if network != N.NetworkTCP {
 		conn, err := o.DialContext(ctx, network, destination)
 		return conn, nil, err
@@ -1972,7 +1994,7 @@ func (s *MutableAutoSelect) dialPrimary(ctx context.Context, o A.Outbound, netwo
 			}
 			return r.conn, cancel, nil
 		case <-slow.C:
-			s.requestEarlyConfirmation(tag, generation)
+			s.reportSetup(origin, func() { s.requestEarlyConfirmation(tag, origin.generation) })
 		case <-changed:
 		}
 	}

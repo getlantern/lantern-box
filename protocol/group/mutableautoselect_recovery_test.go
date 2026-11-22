@@ -4295,21 +4295,33 @@ func TestTrial_DeadlineSpentOnTheTrialLeavesTheSelectionUndialed(t *testing.T) {
 	})
 }
 
-// pausingLogger blocks the first Info call whose message starts with prefix,
-// closing reached, until release is closed.
+// pausingLogger blocks its first matching call, closing reached, until
+// release is closed: an Info call whose message starts with prefix, or with
+// errors set, an ErrorContext call.
 type pausingLogger struct {
 	log.ContextLogger
 	prefix           string
+	errors           bool
 	reached, release chan struct{}
 	once             sync.Once
 }
 
+func (l *pausingLogger) pause() {
+	l.once.Do(func() {
+		close(l.reached)
+		<-l.release
+	})
+}
+
 func (l *pausingLogger) Info(args ...any) {
-	if msg, ok := args[0].(string); ok && strings.HasPrefix(msg, l.prefix) {
-		l.once.Do(func() {
-			close(l.reached)
-			<-l.release
-		})
+	if msg, ok := args[0].(string); ok && l.prefix != "" && strings.HasPrefix(msg, l.prefix) {
+		l.pause()
+	}
+}
+
+func (l *pausingLogger) ErrorContext(context.Context, ...any) {
+	if l.errors {
+		l.pause()
 	}
 }
 
@@ -4384,4 +4396,157 @@ func TestTrial_DeadlineSpentOnAUDPTrialLeavesTheSelectionUnset(t *testing.T) {
 		require.Equal(t, int32(1), trialSetups.Load(), "b is trialled")
 		assert.Zero(t, selectionSetups.Load(), "the trial used up the caller's deadline, so a had no time to be tried")
 	})
+}
+
+func TestRemove_SetupFailureStaysWithTheRemovedMembership(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("dial timeout") }
+	obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+	logger := &pausingLogger{ContextLogger: s.logger, errors: true, reached: make(chan struct{}), release: make(chan struct{})}
+	s.logger = logger
+	dialed := make(chan struct{})
+	go func() {
+		defer close(dialed)
+		if conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{}); err == nil {
+			conn.Close()
+		}
+	}()
+	// a's setup failed; its failure is still to be charged.
+	<-logger.reached
+	readded := make(chan struct{})
+	go func() {
+		defer close(readded)
+		s.Remove("a")
+		s.access.Lock()
+		s.members.Store("a", sbAdapter.Outbound(obs["a"]))
+		s.addProbeMemberLocked("a")
+		s.tags = append(s.tags, "a")
+		s.access.Unlock()
+	}()
+	select {
+	case <-readded:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(logger.release)
+	<-dialed
+	<-readded
+	uf, _ := userFailures(s, "a")
+	assert.Empty(t, uf, "the failed setup was the removed a's")
+}
+
+// readdAsSelection removes ob's tag and adds ob back under it as the TCP
+// selection.
+func readdAsSelection(t *testing.T, s *MutableAutoSelect, ob *mockOutbound) {
+	t.Helper()
+	_, err := s.Remove(ob.tag)
+	require.NoError(t, err)
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.members.Store(ob.tag, sbAdapter.Outbound(ob))
+	s.addProbeMemberLocked(ob.tag)
+	s.tags = append(s.tags, ob.tag)
+	s.stickyTag.tcp.Store(ob.tag)
+}
+
+func TestRemove_AlternateDoesNotConfirmAReaddedPrimary(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		probesHeld := make(chan struct{})
+		defer close(probesHeld)
+		obs["a"].dialTo = func(_ context.Context, dest metadata.Socksaddr) (net.Conn, error) {
+			if dest.Fqdn == "probe.test" {
+				<-probesHeld
+			}
+			return nil, errors.New("dial timeout")
+		}
+		reached, release := make(chan struct{}), make(chan struct{})
+		obs["b"].dialTo = func(_ context.Context, dest metadata.Socksaddr) (net.Conn, error) {
+			if dest.Fqdn != "probe.test" {
+				close(reached)
+				<-release
+			}
+			return probeResponderConn(), nil
+		}
+		dialed := make(chan struct{})
+		go func() {
+			defer close(dialed)
+			if conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{}); err == nil {
+				conn.Close()
+			}
+		}()
+		// a's setup failed and b, the alternate, is being dialed.
+		<-reached
+		readdAsSelection(t, s, obs["a"])
+		close(release)
+		<-dialed
+		s.access.Lock()
+		defer s.access.Unlock()
+		assert.False(t, s.probeMembers["a"].confirmationPending, "the failed setup was the removed a's")
+	})
+}
+
+func TestRemove_PendingDialDoesNotConfirmAReaddedSelection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		release := make(chan struct{})
+		obs["a"].dialTo = func(context.Context, metadata.Socksaddr) (net.Conn, error) {
+			<-release
+			return nil, errors.New("dial timeout")
+		}
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		dialed := make(chan struct{})
+		go func() {
+			defer close(dialed)
+			if conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{}); err == nil {
+				conn.Close()
+			}
+		}()
+		synctest.Wait()
+		readdAsSelection(t, s, obs["a"])
+		time.Sleep(earlyConfirmAfter + time.Second)
+		synctest.Wait()
+		s.access.Lock()
+		pending := s.probeMembers["a"].confirmationPending
+		s.access.Unlock()
+		close(release)
+		<-dialed
+		assert.False(t, pending, "the slow dial was through the removed a")
+	})
+}
+
+func TestRemove_UDPSetupFailureStaysWithTheRemovedMembership(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	s.stickyTag.udp.Store("a")
+	obs["a"].listen = func(context.Context) (net.PacketConn, error) { return nil, errors.New("setup timeout") }
+	obs["b"].listen = func(context.Context) (net.PacketConn, error) { return newScriptedPacketConn(), nil }
+	logger := &pausingLogger{ContextLogger: s.logger, errors: true, reached: make(chan struct{}), release: make(chan struct{})}
+	s.logger = logger
+	set := make(chan struct{})
+	go func() {
+		defer close(set)
+		if pc, err := s.ListenPacket(context.Background(), metadata.Socksaddr{}); err == nil {
+			pc.Close()
+		}
+	}()
+	// a's setup failed; its failure is still to be charged.
+	<-logger.reached
+	readded := make(chan struct{})
+	go func() {
+		defer close(readded)
+		s.Remove("a")
+		s.access.Lock()
+		s.members.Store("a", sbAdapter.Outbound(obs["a"]))
+		s.addProbeMemberLocked("a")
+		s.tags = append(s.tags, "a")
+		s.access.Unlock()
+	}()
+	select {
+	case <-readded:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(logger.release)
+	<-set
+	<-readded
+	uf, _ := userFailures(s, "a")
+	assert.Empty(t, uf, "the failed setup was the removed a's")
 }
