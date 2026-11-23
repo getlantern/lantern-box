@@ -856,8 +856,10 @@ type connOrigin struct {
 	generation uint64
 	// membership is out's tag's membership then, or 0 if out wasn't a member.
 	membership uint64
-	// trialFor is, for a trial, the selection it was made for.
-	trialFor string
+	// trialFor is, for a trial, the selection it was made for, and
+	// trialForMembership that selection's membership then.
+	trialFor           string
+	trialForMembership uint64
 }
 
 func (s *MutableAutoSelect) originOfLocked(o A.Outbound, route routeKind, generation uint64) connOrigin {
@@ -2188,7 +2190,8 @@ const (
 // one network's selection, tag, while the probes can't tell whether the
 // selection alone is failing, as when the probe endpoint is down too.
 type trialState struct {
-	tag string
+	tag        string
+	membership uint64
 	// unansweredAt is when the selection last went unanswered, and setupOK
 	// whether its latest setup succeeded and its traffic since hasn't
 	// failed locally: a device that lost its own network fails its conns
@@ -2210,12 +2213,17 @@ type trialState struct {
 }
 
 // trialsLocked returns the trial state of network's selection, starting it
-// afresh when the selection is another member than it was kept for. Caller
-// must hold s.access.
+// afresh when the selection is another member, or another membership of its
+// tag, than it was kept for. Caller must hold s.access.
 func (s *MutableAutoSelect) trialsLocked(network string) *trialState {
 	t := &s.trials[streakNetFor(network)]
-	if sticky := loadString(s.stickySlot(network)); t.tag != sticky {
-		*t = trialState{tag: sticky}
+	sticky := loadString(s.stickySlot(network))
+	var membership uint64
+	if state := s.probeMembers[sticky]; state != nil {
+		membership = state.membershipID
+	}
+	if t.tag != sticky || t.membership != membership {
+		*t = trialState{tag: sticky, membership: membership}
 	}
 	return t
 }
@@ -2243,7 +2251,7 @@ func (s *MutableAutoSelect) takeTrial(network string) (trial connOrigin, ok bool
 	t.lastAt = now
 	s.logger.Debug(network, " trial: ", c.tag, " (selection ", sticky, " unanswered)")
 	trial = s.originOfLocked(c.outbound, trialRoute, s.networkGeneration.Load())
-	trial.trialFor = sticky
+	trial.trialFor, trial.trialForMembership = sticky, t.membership
 	return trial, true
 }
 
@@ -2273,9 +2281,10 @@ func (s *MutableAutoSelect) probesCantDecideLocked(network, sticky string) bool 
 }
 
 // trialForLocked returns network's trial state if it is still that of
-// trialFor and generation is current, or nil. Caller must hold s.access.
-func (s *MutableAutoSelect) trialForLocked(network, trialFor string, generation uint64) *trialState {
-	if t := s.trialsLocked(network); t.tag == trialFor && s.matchesGenerationLocked(generation) {
+// trialFor under membership ID membership and generation is current, or nil.
+// Caller must hold s.access.
+func (s *MutableAutoSelect) trialForLocked(network, trialFor string, membership, generation uint64) *trialState {
+	if t := s.trialsLocked(network); t.tag == trialFor && t.membership == membership && s.matchesGenerationLocked(generation) {
 		return t
 	}
 	return nil
@@ -2291,7 +2300,7 @@ func (s *MutableAutoSelect) noteSelectionSetup(origin connOrigin, network string
 	if !s.originCurrentLocked(origin) {
 		return false
 	}
-	if t := s.trialForLocked(network, origin.out.Tag(), origin.generation); t != nil {
+	if t := s.trialForLocked(network, origin.out.Tag(), origin.membership, origin.generation); t != nil {
 		t.setupOK = ok
 	}
 	return true
@@ -2323,7 +2332,7 @@ func (s *MutableAutoSelect) noteTrialAnswered(origin connOrigin, network string)
 	s.access.Lock()
 	defer s.access.Unlock()
 	tag := origin.out.Tag()
-	t := s.trialForLocked(network, origin.trialFor, origin.generation)
+	t := s.trialForLocked(network, origin.trialFor, origin.trialForMembership, origin.generation)
 	if t == nil || t.tag == "" || t.tag == tag || t.unansweredAt.IsZero() || time.Since(t.unansweredAt) > probeFreshnessWindow {
 		return
 	}
@@ -2350,7 +2359,7 @@ func (s *MutableAutoSelect) noteTrialFailed(origin connOrigin, network string) {
 	if !s.originCurrentLocked(origin) {
 		return
 	}
-	if t := s.trialForLocked(network, origin.trialFor, origin.generation); t != nil {
+	if t := s.trialForLocked(network, origin.trialFor, origin.trialForMembership, origin.generation); t != nil {
 		t.failures++
 		if t.pending == origin.out.Tag() {
 			t.pending = ""

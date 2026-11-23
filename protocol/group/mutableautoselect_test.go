@@ -1928,7 +1928,7 @@ func TestMakeHooks_ChargesFallbackRouteEvenWhenUnselected(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	s.stickyTag.tcp.Store("a")
 
-	s.makeHooks(s.originAt("b", s.networkGeneration.Load()).via(fallbackRoute, ""), "tcp").onFailure(adapter.UserFailureReset, nil)
+	s.makeHooks(s.originAt("b", s.networkGeneration.Load()).on(fallbackRoute), "tcp").onFailure(adapter.UserFailureReset, nil)
 
 	uf, ok := userFailures(s, "b")
 	require.True(t, ok, "a fallback-route conn must stay chargeable")
@@ -2323,9 +2323,21 @@ func (s *MutableAutoSelect) originAt(tag string, generation uint64) connOrigin {
 	return connOrigin{out: &mockOutbound{tag: tag}, generation: generation}
 }
 
-// via returns o for a conn on route, a trial's made for the selection
-// trialFor.
-func (o connOrigin) via(route routeKind, trialFor string) connOrigin {
-	o.route, o.trialFor = route, trialFor
+// on returns o for a conn on route.
+func (o connOrigin) on(route routeKind) connOrigin {
+	o.route = route
+	return o
+}
+
+// trialOriginAt returns the origin, on network generation generation, of a
+// trial conn through tag's member made for trialFor, the selection now.
+func (s *MutableAutoSelect) trialOriginAt(tag string, generation uint64, trialFor string) connOrigin {
+	o := s.originAt(tag, generation).on(trialRoute)
+	o.trialFor = trialFor
+	s.access.Lock()
+	defer s.access.Unlock()
+	if state := s.probeMembers[trialFor]; state != nil {
+		o.trialForMembership = state.membershipID
+	}
 	return o
 }

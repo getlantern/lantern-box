@@ -3731,7 +3731,7 @@ func TestTrial_PendingMoveNeedsAConnOpenedAfterTheAnswer(t *testing.T) {
 		// b's trial for a answers after a's conn below opened.
 		opened := time.Now()
 		time.Sleep(time.Second)
-		s.noteTrialAnswered(s.originAt("b", generation).via(trialRoute, "a"), "tcp")
+		s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 		time.Sleep(time.Second)
 		s.noteUnanswered(s.originAt("a", generation), "tcp", "", opened, time.Now())
 		require.Equal(t, "a", loadString(&s.stickyTag.tcp), "a's conn opened before b answered may have failed for the outage")
@@ -3961,11 +3961,11 @@ func TestTrial_PendingMoveKeepsTheFirstAnswer(t *testing.T) {
 		s.access.Lock()
 		s.trialsLocked("tcp").failures = 1
 		s.access.Unlock()
-		s.noteTrialAnswered(s.originAt("b", generation).via(trialRoute, "a"), "tcp")
+		s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 		time.Sleep(time.Second)
 		opened := time.Now()
 		time.Sleep(time.Second)
-		s.noteTrialAnswered(s.originAt("b", generation).via(trialRoute, "a"), "tcp")
+		s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 		time.Sleep(time.Second)
 		s.noteUnanswered(s.originAt("a", generation), "tcp", "", opened, time.Now())
 		assert.Equal(t, "b", loadString(&s.stickyTag.tcp), "a's conn opened after b first answered")
@@ -4117,11 +4117,11 @@ func TestTrial_PendingMoveFreshnessAndFailure(t *testing.T) {
 				s.access.Lock()
 				s.trialsLocked("tcp").failures = 1
 				s.access.Unlock()
-				s.noteTrialAnswered(s.originAt("b", generation).via(trialRoute, "a"), "tcp")
+				s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 				time.Sleep(probeFreshnessWindow - time.Second)
-				s.noteTrialAnswered(s.originAt("b", generation).via(trialRoute, "a"), "tcp")
+				s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 				if tc.failBefore {
-					s.noteTrialFailed(s.originAt("b", generation).via(trialRoute, "a"), "tcp")
+					s.noteTrialFailed(s.trialOriginAt("b", generation, "a"), "tcp")
 				}
 				time.Sleep(2 * time.Second)
 				opened := time.Now()
@@ -4223,7 +4223,7 @@ func TestRemove_DropsAPendingMoveToTheMember(t *testing.T) {
 		s.access.Lock()
 		s.trialsLocked("tcp").failures = 1
 		s.access.Unlock()
-		s.noteTrialAnswered(s.originAt("b", generation).via(trialRoute, "a"), "tcp")
+		s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 		ob, _ := s.members.Load("b")
 		_, err := s.Remove("b")
 		require.NoError(t, err)
@@ -4402,7 +4402,7 @@ func TestRemove_FailoverToAReaddedAlternateIsAbandoned(t *testing.T) {
 func TestRemove_TrialAnswerStaysWithTheRemovedMembership(t *testing.T) {
 	s, obs := newConfirmationTestMUR(t, "a", "b")
 	s.stickyTag.tcp.Store("a")
-	trial := s.originOf(obs["b"], trialRoute, s.networkGeneration.Load()).via(trialRoute, "a")
+	trial := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
 	s.access.Lock()
 	s.trialsLocked("tcp").unansweredAt = time.Now()
 	s.access.Unlock()
@@ -4411,10 +4411,49 @@ func TestRemove_TrialAnswerStaysWithTheRemovedMembership(t *testing.T) {
 	assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "the answer was the removed b's trial's")
 }
 
+func TestRemove_TrialForARemovedSelectionDoesNotMoveItsSuccessor(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("a")
+	trial := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
+	readdAsSelection(t, s, obs["a"])
+	s.access.Lock()
+	s.trialsLocked("tcp").unansweredAt = time.Now()
+	s.access.Unlock()
+	s.noteTrialAnswered(trial, "tcp")
+	assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "the trial was made for the removed a")
+}
+
+func TestRemove_ReaddedSelectionStartsItsTrialsAfresh(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("a")
+	s.access.Lock()
+	old := s.trialsLocked("tcp")
+	old.failures, old.unansweredAt = 1, time.Now()
+	s.access.Unlock()
+	readdAsSelection(t, s, obs["a"])
+	s.access.Lock()
+	defer s.access.Unlock()
+	trials := s.trialsLocked("tcp")
+	assert.Zero(t, trials.failures, "the failed trial was the removed a's")
+	assert.Zero(t, trials.unansweredAt, "the unanswered traffic was the removed a's")
+	assert.Equal(t, s.probeMembers["a"].membershipID, trials.membership)
+}
+
+func TestRemove_TrialForARemovedSelectionDoesNotHoldBackItsSuccessor(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("a")
+	trial := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
+	readdAsSelection(t, s, obs["a"])
+	s.noteTrialFailed(trial, "tcp")
+	s.access.Lock()
+	defer s.access.Unlock()
+	assert.Zero(t, s.trialsLocked("tcp").failures, "the trial was made for the removed a")
+}
+
 func TestRemove_TrialFailureStaysWithTheRemovedMembership(t *testing.T) {
 	s, obs := newConfirmationTestMUR(t, "a", "b")
 	s.stickyTag.tcp.Store("a")
-	trial := s.originOf(obs["b"], trialRoute, s.networkGeneration.Load()).via(trialRoute, "a")
+	trial := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
 	readd(t, s, obs["b"])
 	s.noteTrialFailed(trial, "tcp")
 	s.access.Lock()
