@@ -4734,3 +4734,21 @@ func TestHardDemotion_ReleaseOfAnUnmeasuredSelectionClosesItsStuckConns(t *testi
 	require.Equal(t, "b", winner.tag)
 	assert.True(t, why.released, "a's release for its hard demotion closes its stuck conns")
 }
+
+func TestClose_ConnsTheShutdownKillsAreNotCharged(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	s.selections[streakTCP].tag.Store("a")
+	report := s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp")
+	// The host cancels the group's context before it tears down the conns,
+	// whose errors then say nothing about their member.
+	s.cancel()
+	report.failure(adapter.UserFailureReset, errors.New("use of closed network connection"))
+	report.unanswered(time.Now().Add(-5*time.Second), "")
+
+	uf, _ := userFailures(s, "a")
+	assert.Empty(t, uf, "a reset from the shutdown isn't a failure of a")
+	s.access.Lock()
+	h := s.historyForLocked("a")
+	s.access.Unlock()
+	assert.Zero(t, h.streakCounts(time.Now(), s.hist.userFailureWindow)[streakTCP], "nor is a conn the shutdown left unanswered")
+}

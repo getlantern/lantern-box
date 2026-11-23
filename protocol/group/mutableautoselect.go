@@ -9,6 +9,8 @@ import (
 	"maps"
 	"net"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -407,7 +409,23 @@ func (s *MutableAutoSelect) hydrateHistoryLocked(tag string) {
 		s.history.Delete(tag)
 		return
 	}
-	s.histories[tag] = hydrateLocalHistory(snap, now, s.hist.userFailureWindow)
+	h := hydrateLocalHistory(snap, now, s.hist.userFailureWindow)
+	s.histories[tag] = h
+	age := "unknown"
+	if !snap.UpdatedAt.IsZero() {
+		age = now.Sub(snap.UpdatedAt).Round(time.Second).String()
+	}
+	s.logger.Debug("history seed: tag=", tag, " delay=", delayText(snap.LastSuccessDelayMs), " consecutive_failures=",
+		snap.ConsecutiveFailures, " user_failures=", len(h.userFailures), " age=", age)
+}
+
+// delayText is a delay in milliseconds for a log line, where 0 means never
+// measured.
+func delayText(ms uint32) string {
+	if ms == 0 {
+		return "unmeasured"
+	}
+	return strconv.FormatUint(uint64(ms), 10) + "ms"
 }
 
 // PostStart is idempotent. Background probing starts on the first dial or
@@ -1025,6 +1043,7 @@ func (s *MutableAutoSelect) reselectUDPLocked() {
 		return
 	}
 	if winner, why := s.applyStickiness(N.NetworkUDP, pool, forNetwork); winner.tag != sticky {
+		s.logger.Debug("udp candidates: ", describeCandidates(forNetwork))
 		s.switchSelectionLocked(N.NetworkUDP, sticky, winner.tag, why)
 	}
 }
@@ -1088,6 +1107,7 @@ func (s *MutableAutoSelect) selectOrigin(network, excludeTag string, route route
 		var why switchReason
 		winner, why = s.applyStickiness(network, pool, forNetwork)
 		if prev := s.selected(network); prev != winner.tag {
+			s.logger.Debug(network, " candidates: ", describeCandidates(forNetwork))
 			s.switchSelectionLocked(network, prev, winner.tag, why)
 		}
 	} else {
@@ -1116,7 +1136,7 @@ func (s *MutableAutoSelect) applyStickiness(
 	best := pool[0]
 	sticky := s.selected(network)
 	if sticky == "" {
-		return best, switchReason{}
+		return best, switchReason{text: fmt.Sprint(delayText(best.delayMs), ", ", best.demote)}
 	}
 	if sticky == best.tag {
 		// Ranking first among its tier says nothing about a selection whose
@@ -1181,7 +1201,7 @@ func (s *MutableAutoSelect) applyStickiness(
 		// how it would serve now, nor does one of a member whose traffic
 		// keeps failing, one being probed again, or one measured before the
 		// failure that last released a hard-demoted selection.
-		return best, switchReason{text: "beaten on delay"}
+		return best, switchReason{text: fmt.Sprint("beaten on delay: ", delayText(best.delayMs), " vs ", delayText(c.delayMs))}
 	default:
 		return c, switchReason{}
 	}
@@ -1489,6 +1509,30 @@ func (s *MutableAutoSelect) beatsOnDelay(candidateMs, stickyMs uint32) bool {
 		gain*100 >= uint64(stickyMs)*uint64(s.cfg.switchTolerancePercent)
 }
 
+// describeCandidates names the first few of ranked, in rank order, with what
+// ranked them, for a log line.
+func describeCandidates(ranked []rankedCandidate) string {
+	const shown = 6
+	var b strings.Builder
+	for i, c := range ranked {
+		if i == shown {
+			fmt.Fprintf(&b, ", and %d more", len(ranked)-shown)
+			break
+		}
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s %s %s", c.tag, delayText(c.delayMs), c.demote)
+		if c.streak > 0 {
+			fmt.Fprintf(&b, " streak=%d", c.streak)
+		}
+		if c.probeFailed {
+			b.WriteString(" probe-failed")
+		}
+	}
+	return b.String()
+}
+
 // switchReason is why a network's selection moved off its previous member.
 type switchReason struct {
 	text string
@@ -1504,7 +1548,11 @@ type switchReason struct {
 func (s *MutableAutoSelect) switchSelectionLocked(network, prev, next string, why switchReason) {
 	s.selectionFor(network).tag.Store(next)
 	if prev == "" {
-		s.logger.Info(network, " select: ", next)
+		if why.text == "" {
+			s.logger.Info(network, " select: ", next)
+		} else {
+			s.logger.Info(network, " select: ", next, " (", why.text, ")")
+		}
 		return
 	}
 	s.logger.Info(network, " switch: ", prev, " -> ", next, " (", why.text, ")")
@@ -1570,6 +1618,19 @@ func (s *MutableAutoSelect) latestProbeFailedLocked(tag string) bool {
 // demoteClean must compare < demoteSoft < demoteLastResort < demoteHard for
 // the tiers to land in the right order.
 type demoteLevel uint8
+
+func (l demoteLevel) String() string {
+	switch l {
+	case demoteClean:
+		return "clean"
+	case demoteSoft:
+		return "soft"
+	case demoteLastResort:
+		return "last resort"
+	default:
+		return "hard"
+	}
+}
 
 const (
 	demoteClean      demoteLevel = iota
@@ -1906,6 +1967,9 @@ func (s *MutableAutoSelect) failedSinceLocked(tag, network string, since time.Ti
 // dropped while outage evidence holds, as is one from another network
 // generation.
 func (s *MutableAutoSelect) recordUserFailure(origin connOrigin, kind adapter.UserFailureKind, opened time.Time, network string, cause error) bool {
+	if s.isClosed() {
+		return false
+	}
 	s.access.Lock()
 	defer s.access.Unlock()
 	if !s.originCurrentLocked(origin) {
@@ -1981,7 +2045,7 @@ func (s *MutableAutoSelect) noteUnansweredOffSelection(origin connOrigin, dest s
 
 // noteUnansweredLocked is noteUnanswered with s.access held.
 func (s *MutableAutoSelect) noteUnansweredLocked(origin connOrigin, network, dest string, opened, waitingSince time.Time) {
-	if !s.originCurrentLocked(origin) || !s.matchesGenerationLocked(origin.generation) {
+	if s.isClosed() || !s.originCurrentLocked(origin) || !s.matchesGenerationLocked(origin.generation) {
 		return
 	}
 	tag := origin.out.Tag()

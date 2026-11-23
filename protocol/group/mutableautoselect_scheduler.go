@@ -318,6 +318,7 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 		return
 	}
 	state := s.probeMembers[attempt.tag]
+	s.logger.Debug("probe: tag=", attempt.tag, " ok=", success, " delay=", delayMs, "ms")
 	outcome := s.recordProbeOutcomeLocked(attempt.tag, &probeOutcome{
 		success:    success,
 		delayMs:    delayMs,
