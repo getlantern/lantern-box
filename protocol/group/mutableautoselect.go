@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net"
@@ -89,14 +90,8 @@ type MutableAutoSelect struct {
 	scratchRanked []rankedCandidate
 	scratchSplit  []rankedCandidate
 
-	// Last dial-time tag per network, for switch-tolerance hysteresis.
-	// atomic.Value (not access-guarded) so Now() can read without taking
-	// the access lock. A stale tag is harmless: the in-pool check in
-	// applyStickiness drops it.
-	stickyTag struct {
-		tcp atomic.Value // string; "" when unset
-		udp atomic.Value // string; "" when unset
-	}
+	// selections holds each network's selection, indexed by streakNet.
+	selections [2]networkSelection
 
 	probeMembers     map[string]*memberProbeState
 	inFlightProbes   map[A.Outbound]*probeAttempt
@@ -158,16 +153,6 @@ type MutableAutoSelect struct {
 	// Guarded by access: when a failure's cause last showed the far end
 	// answered, which shows the device's own network was up.
 	peerAnsweredAt time.Time
-	// Guarded by access: per streakNet, when the selection was last
-	// released for consecutive failures.
-	lastStreakSwitch [2]time.Time
-	// Guarded by access: each network's trials of user traffic on another
-	// member, indexed by streakNet.
-	trials [2]trialState
-	// Guarded by access: per streakNet, when the failing probe began that
-	// last hard-demoted the selection, which was then released. A delay
-	// measured by a probe started earlier says nothing of the network since.
-	releasedSince [2]time.Time
 	// udpHandles holds each member's open UDP handles, so a member released
 	// as the UDP selection for failing can have its stuck sessions closed.
 	// Guarded by access.
@@ -187,6 +172,24 @@ type MutableAutoSelect struct {
 
 	started   bool
 	closeOnce sync.Once
+}
+
+// networkSelection is one network's selected member and the state kept
+// about it.
+type networkSelection struct {
+	// tag is the selected member's tag, "" when unset. It changes only under
+	// access but is read without it, as by Now(); a stale tag is harmless:
+	// the in-pool check in applyStickiness drops it.
+	tag atomic.Value // string
+	// Guarded by access: when the selection was last released for
+	// consecutive failures.
+	lastStreakSwitch time.Time
+	// Guarded by access: when the failing probe began that last hard-demoted
+	// the selection, which was then released. A delay measured by a probe
+	// started earlier says nothing of the network since.
+	releasedSince time.Time
+	// Guarded by access: the trials of user traffic on another member.
+	trials trialState
 }
 
 type mutableAutoSelectConfig struct {
@@ -457,10 +460,10 @@ func (s *MutableAutoSelect) paused() bool {
 // fallback. Single representative tag for telemetry; not a per-network
 // route — TCP and UDP select independently at dial time.
 func (s *MutableAutoSelect) Now() string {
-	if t := loadString(&s.stickyTag.tcp); t != "" {
+	if t := s.selected(N.NetworkTCP); t != "" {
 		return t
 	}
-	return loadString(&s.stickyTag.udp)
+	return s.selected(N.NetworkUDP)
 }
 
 func (s *MutableAutoSelect) All() []string {
@@ -526,9 +529,9 @@ func (s *MutableAutoSelect) Remove(tags ...string) (n int, err error) {
 		s.members.Delete(tag)
 		s.untrackConnsLocked(tag)
 		// A pending move is evidence about this membership only.
-		for i := range s.trials {
-			if s.trials[i].pending == tag {
-				s.trials[i].pending = ""
+		for i := range s.selections {
+			if t := &s.selections[i].trials; t.pending == tag {
+				t.pending = ""
 			}
 		}
 		delete(s.probeMembers, tag)
@@ -537,7 +540,7 @@ func (s *MutableAutoSelect) Remove(tags ...string) (n int, err error) {
 		if s.history != nil {
 			s.history.Delete(tag)
 		}
-		s.clearStickyTagLocked(tag)
+		s.clearSelectionLocked(tag)
 		removed[tag] = struct{}{}
 		n++
 	}
@@ -598,15 +601,107 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		attribute.String("type", s.Type()),
 	))
 	defer span.End()
-	if err := s.awaitStreakReplacement(ctx, network); err != nil {
+	conn, err := setUp(ctx, s, streamKind{s, network, destination})
+	if err != nil {
 		recordError(span, err)
-		return nil, err
+	}
+	return conn, err
+}
+
+func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableAutoSelect.ListenPacket", trace.WithAttributes(
+		attribute.StringSlice("supported_network_options", s.Network()),
+		tagAttr("outbound", s.Now()),
+		tagAttr("tag", s.Tag()),
+		attribute.String("type", s.Type()),
+	))
+	defer span.End()
+	conn, err := setUp(ctx, s, packetKind{s, destination})
+	if err != nil {
+		recordError(span, err)
+	}
+	return conn, err
+}
+
+// connKind is how setUp sets up and hands out one kind of conn, C.
+type connKind[C io.Closer] interface {
+	network() string
+	// dial sets up a conn through o, for a trial or a failover.
+	dial(ctx context.Context, o A.Outbound) (C, error)
+	// dialSelection sets up a conn through origin, the selection's, at
+	// dialed; a non-nil release goes to wrap.
+	dialSelection(ctx context.Context, origin connOrigin, dialed time.Time) (C, func(), error)
+	// wrap watches c, set up through origin, and returns what the caller gets.
+	wrap(c C, origin connOrigin, release func()) C
+	// recheck reports whether a conn through the selection is abandoned,
+	// once registered, if its member failed since it was dialed.
+	recheck() bool
+}
+
+// streamKind is DialContext's conn to destination on network.
+type streamKind struct {
+	s           *MutableAutoSelect
+	net         string
+	destination M.Socksaddr
+}
+
+func (k streamKind) network() string { return k.net }
+
+func (k streamKind) dial(ctx context.Context, o A.Outbound) (net.Conn, error) {
+	return o.DialContext(ctx, k.net, k.destination)
+}
+
+func (k streamKind) dialSelection(ctx context.Context, origin connOrigin, dialed time.Time) (net.Conn, func(), error) {
+	return k.s.dialPrimary(ctx, origin, k.net, k.destination, dialed)
+}
+
+func (k streamKind) wrap(c net.Conn, origin connOrigin, release func()) net.Conn {
+	return k.s.wrapStream(c, k.net, origin, release)
+}
+
+// recheck holds for TCP only: a UDP conn from DialContext isn't tracked, so
+// no release sweep passes it by.
+func (k streamKind) recheck() bool { return N.NetworkName(k.net) == N.NetworkTCP }
+
+// packetKind is ListenPacket's handle first addressed to destination.
+type packetKind struct {
+	s           *MutableAutoSelect
+	destination M.Socksaddr
+}
+
+func (packetKind) network() string { return N.NetworkUDP }
+
+func (k packetKind) dial(ctx context.Context, o A.Outbound) (net.PacketConn, error) {
+	return o.ListenPacket(ctx, k.destination)
+}
+
+func (k packetKind) dialSelection(ctx context.Context, origin connOrigin, _ time.Time) (net.PacketConn, func(), error) {
+	conn, err := k.dial(ctx, origin.out)
+	return conn, nil, err
+}
+
+func (k packetKind) wrap(c net.PacketConn, origin connOrigin, _ func()) net.PacketConn {
+	return k.s.wrapPacket(c, origin, k.destination)
+}
+
+// recheck holds because the release sweep closes only sessions already
+// waiting on a reply.
+func (packetKind) recheck() bool { return true }
+
+// setUp sets up a conn of kind k: through a member on trial if one is due,
+// else through the selection, failing over once to another member, and
+// starting the ladder if that fails too.
+func setUp[C io.Closer, K connKind[C]](ctx context.Context, s *MutableAutoSelect, k K) (C, error) {
+	var none C
+	network := k.network()
+	if err := s.awaitStreakReplacement(ctx, network); err != nil {
+		return none, err
 	}
 	if trial, ok := s.takeTrial(network); ok {
-		conn, err := trial.out.DialContext(ctx, network, destination)
+		conn, err := k.dial(ctx, trial.out)
 		switch {
 		case err == nil && s.originCurrent(trial):
-			return s.wrapStream(conn, network, trial, nil), nil
+			return k.wrap(conn, trial, nil), nil
 		case err == nil:
 			// Removed during the setup: no one's trial.
 			conn.Close()
@@ -622,19 +717,16 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 			if err == nil {
 				err = ctx.Err()
 			}
-			recordError(span, err)
-			return nil, err
+			return none, err
 		}
 	}
 	origin, err := s.selectOrigin(network, "", primaryRoute)
 	if err != nil {
-		recordError(span, err)
-		return nil, err
+		return none, err
 	}
-	o, generation := origin.out, origin.generation
-	outerTag := o.Tag()
+	outerTag, ladderGeneration := origin.out.Tag(), origin.generation
 	dialed := time.Now()
-	conn, release, err := s.dialPrimary(ctx, origin, network, destination, dialed)
+	conn, release, err := k.dialSelection(ctx, origin, dialed)
 	if !s.noteSelectionSetup(origin, network, err == nil) {
 		// The member was removed during the setup: its result is no one's.
 		if err == nil {
@@ -644,25 +736,23 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 			}
 			err = errAbandonedDial
 		}
-		recordError(span, err)
-		return nil, err
+		return none, err
 	}
 	if err == nil {
-		stream := s.wrapStream(conn, network, origin, release)
-		// Registered by now, so a switch from here on closes it with the
+		wrapped := k.wrap(conn, origin, release)
+		// Registered by now, so a release from here on closes it with the
 		// rest; one that came before it was registered is caught here.
-		if N.NetworkName(network) != N.NetworkTCP || !s.failedSince(outerTag, N.NetworkTCP, dialed) {
-			return stream, nil
+		if !k.recheck() || !s.failedSince(outerTag, N.NetworkName(network), dialed) {
+			return wrapped, nil
 		}
-		stream.Close()
+		wrapped.Close()
 		err = errAbandonedDial
 	}
 	s.logger.ErrorContext(ctx, err)
 	// A caller giving up says nothing about the member, so nothing is
 	// charged or probed; its deadline expiring does.
 	if errors.Is(ctx.Err(), context.Canceled) {
-		recordError(span, err)
-		return nil, err
+		return none, err
 	}
 	s.recordUserFailure(origin, adapter.UserFailureDial, dialed, network, err)
 
@@ -672,16 +762,13 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 	// primary dial, so the alternate carries its own generation. An
 	// alternate dialed after the caller's context ended fails at once
 	// without saying anything about the alternate, so none is tried.
-	ladderGeneration := generation
 	altOrigin, altErr := s.selectOrigin(network, outerTag, fallbackRoute)
-	alt, altGeneration := altOrigin.out, altOrigin.generation
 	if altErr == nil && ctx.Err() == nil {
-		replacementTag := alt.Tag()
 		dialed = time.Now()
-		conn, err = alt.DialContext(ctx, network, destination)
+		conn, err = k.dial(ctx, altOrigin.out)
 		if err == nil {
 			if s.noteFailover(origin, altOrigin, network) {
-				return s.wrapStream(conn, network, altOrigin, nil), nil
+				return k.wrap(conn, altOrigin, nil), nil
 			}
 			// Removed during the setup: its conn is no one's.
 			conn.Close()
@@ -693,110 +780,11 @@ func (s *MutableAutoSelect) DialContext(ctx context.Context, network string, des
 		if ctx.Err() == nil {
 			s.recordUserFailure(altOrigin, adapter.UserFailureDial, dialed, network, err)
 		}
-		outerTag, ladderGeneration = replacementTag, altGeneration
+		outerTag, ladderGeneration = altOrigin.out.Tag(), altOrigin.generation
 	}
 
 	go s.runLadder(outerTag, ladderGeneration)
-	recordError(span, err)
-	return nil, err
-}
-
-func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	ctx, span := otel.Tracer(tracerName).Start(ctx, "MutableAutoSelect.ListenPacket", trace.WithAttributes(
-		attribute.StringSlice("supported_network_options", s.Network()),
-		tagAttr("outbound", s.Now()),
-		tagAttr("tag", s.Tag()),
-		attribute.String("type", s.Type()),
-	))
-	defer span.End()
-	if err := s.awaitStreakReplacement(ctx, N.NetworkUDP); err != nil {
-		recordError(span, err)
-		return nil, err
-	}
-	if trial, ok := s.takeTrial(N.NetworkUDP); ok {
-		conn, err := trial.out.ListenPacket(ctx, destination)
-		switch {
-		case err == nil && s.originCurrent(trial):
-			return s.wrapPacket(conn, trial, destination), nil
-		case err == nil:
-			// Removed during the setup: no one's trial.
-			conn.Close()
-		default:
-			s.logger.ErrorContext(ctx, err)
-			if !errors.Is(ctx.Err(), context.Canceled) {
-				s.noteTrialFailed(trial, N.NetworkUDP)
-			}
-		}
-		if ctx.Err() != nil {
-			if err == nil {
-				err = ctx.Err()
-			}
-			recordError(span, err)
-			return nil, err
-		}
-	}
-	origin, err := s.selectOrigin("udp", "", primaryRoute)
-	if err != nil {
-		recordError(span, err)
-		return nil, err
-	}
-	o, generation := origin.out, origin.generation
-	outerTag := o.Tag()
-	dialed := time.Now()
-	conn, err := o.ListenPacket(ctx, destination)
-	if !s.noteSelectionSetup(origin, N.NetworkUDP, err == nil) {
-		// The member was removed during the setup: its result is no one's.
-		if err == nil {
-			conn.Close()
-			err = errAbandonedDial
-		}
-		recordError(span, err)
-		return nil, err
-	}
-	if err == nil {
-		pc := s.wrapPacket(conn, origin, destination)
-		// The release sweep closes only sessions already waiting on a reply,
-		// so one set up across it is caught here.
-		if !s.failedSince(outerTag, N.NetworkUDP, dialed) {
-			return pc, nil
-		}
-		pc.Close()
-		err = errAbandonedDial
-	}
-	s.logger.ErrorContext(ctx, err)
-	if errors.Is(ctx.Err(), context.Canceled) {
-		recordError(span, err)
-		return nil, err
-	}
-	s.recordUserFailure(origin, adapter.UserFailureDial, dialed, N.NetworkUDP, err)
-
-	ladderGeneration := generation
-	altOrigin, altErr := s.selectOrigin("udp", outerTag, fallbackRoute)
-	alt, altGeneration := altOrigin.out, altOrigin.generation
-	if altErr == nil && ctx.Err() == nil {
-		replacementTag := alt.Tag()
-		dialed = time.Now()
-		conn, err = alt.ListenPacket(ctx, destination)
-		if err == nil {
-			if s.noteFailover(origin, altOrigin, N.NetworkUDP) {
-				return s.wrapPacket(conn, altOrigin, destination), nil
-			}
-			// Removed during the setup: its session is no one's.
-			conn.Close()
-			err = errAbandonedDial
-		}
-		s.logger.ErrorContext(ctx, err)
-		// The primary dial used up most of the caller's deadline, so an
-		// alternate cut off by it isn't charged.
-		if ctx.Err() == nil {
-			s.recordUserFailure(altOrigin, adapter.UserFailureDial, dialed, N.NetworkUDP, err)
-		}
-		outerTag, ladderGeneration = replacementTag, altGeneration
-	}
-
-	go s.runLadder(outerTag, ladderGeneration)
-	recordError(span, err)
-	return nil, err
+	return none, err
 }
 
 // routeKind records whether a conn used the selected member or a
@@ -816,7 +804,7 @@ const (
 // UDP; fallback-route failures are always counted as fresh failover traffic.
 func (s *MutableAutoSelect) chargeable(tag string, route routeKind) bool {
 	return !s.cfg.demoteOnlySelected || route == fallbackRoute || route == trialRoute ||
-		loadString(&s.stickyTag.tcp) == tag || loadString(&s.stickyTag.udp) == tag
+		s.selected(N.NetworkTCP) == tag || s.selected(N.NetworkUDP) == tag
 }
 
 // wrapStream enables response tracking for TCP only; a conn from
@@ -1011,7 +999,7 @@ func (s *MutableAutoSelect) closeStuckUDPLocked(tag, dest string) {
 // idle or hadn't waited long enough then. Otherwise a release it allows is
 // applied. Caller must hold s.access.
 func (s *MutableAutoSelect) afterUDPFailureLocked(tag string) {
-	if loadString(&s.stickyTag.udp) != tag && !s.streakSinceLocked(tag, N.NetworkUDP).IsZero() {
+	if s.selected(N.NetworkUDP) != tag && !s.streakSinceLocked(tag, N.NetworkUDP).IsZero() {
 		s.closeStuckUDPLocked(tag, "")
 	}
 	s.reselectUDPLocked()
@@ -1036,8 +1024,7 @@ func (s *MutableAutoSelect) failingLocked(tag string) bool {
 // consecutive failures without waiting for the next ListenPacket, which an
 // app holding one socket never makes. Caller must hold s.access.
 func (s *MutableAutoSelect) reselectUDPLocked() {
-	slot := &s.stickyTag.udp
-	sticky := loadString(slot)
+	sticky := s.selected(N.NetworkUDP)
 	if sticky == "" || s.streakSinceLocked(sticky, N.NetworkUDP).IsZero() {
 		return
 	}
@@ -1045,9 +1032,8 @@ func (s *MutableAutoSelect) reselectUDPLocked() {
 	if len(pool) == 0 {
 		return
 	}
-	if winner := s.applyStickiness(N.NetworkUDP, slot, pool, forNetwork); winner.tag != sticky {
-		slot.Store(winner.tag)
-		s.inheritUDPDestinationsLocked(sticky, winner.tag)
+	if winner, why := s.applyStickiness(N.NetworkUDP, pool, forNetwork); winner.tag != sticky {
+		s.switchSelectionLocked(N.NetworkUDP, sticky, winner.tag, why)
 	}
 }
 
@@ -1075,13 +1061,7 @@ func (s *MutableAutoSelect) NewPacketConnection(ctx context.Context, conn N.Pack
 // than excludeTag, and returns the conn's origin by route, captured as it
 // picks it.
 func (s *MutableAutoSelect) selectOrigin(network, excludeTag string, route routeKind) (connOrigin, error) {
-	var slot *atomic.Value
-	switch network {
-	case "tcp":
-		slot = &s.stickyTag.tcp
-	case "udp":
-		slot = &s.stickyTag.udp
-	default:
+	if network != N.NetworkTCP && network != N.NetworkUDP {
 		return connOrigin{}, fmt.Errorf("network %s not supported", network)
 	}
 	s.access.Lock()
@@ -1113,15 +1093,10 @@ func (s *MutableAutoSelect) selectOrigin(network, excludeTag string, route route
 	}
 	var winner rankedCandidate
 	if excludeTag == "" {
-		winner = s.applyStickiness(network, slot, pool, forNetwork)
-		prev := loadString(slot)
-		if prev != winner.tag {
-			slot.Store(winner.tag)
-			if prev == "" {
-				s.logger.Info(network, " select: ", winner.tag)
-			} else if network == N.NetworkUDP {
-				s.inheritUDPDestinationsLocked(prev, winner.tag)
-			}
+		var why switchReason
+		winner, why = s.applyStickiness(network, pool, forNetwork)
+		if prev := s.selected(network); prev != winner.tag {
+			s.switchSelectionLocked(network, prev, winner.tag, why)
 		}
 	} else {
 		winner = pool[0]
@@ -1139,34 +1114,33 @@ func (s *MutableAutoSelect) selectOrigin(network, excludeTag string, route route
 // Retention is capped at softFailLimit failures; beyond that, continuing
 // failures release the sticky even if it remains much faster.
 //
+// A winner other than a set sticky tag comes with why it replaces it.
 // Caller must hold s.access.
 func (s *MutableAutoSelect) applyStickiness(
 	network string,
-	slot *atomic.Value,
 	pool []rankedCandidate,
 	forNetwork []rankedCandidate,
-) rankedCandidate {
+) (winner rankedCandidate, why switchReason) {
 	best := pool[0]
-	sticky := loadString(slot)
+	sticky := s.selected(network)
 	if sticky == "" {
-		return best
+		return best, switchReason{}
 	}
 	if sticky == best.tag {
 		// Ranking first among its tier says nothing about a selection whose
 		// traffic keeps failing.
 		if s.streakReleaseDueLocked(network, best) {
 			if replacement, ok := s.releaseForStreakLocked(network, pool, forNetwork, sticky); ok {
-				return replacement
+				return replacement, switchReason{text: "consecutive failures", released: true}
 			}
 		}
-		return best
+		return best, switchReason{}
 	}
 	idx := slices.IndexFunc(forNetwork, func(c rankedCandidate) bool {
 		return c.tag == sticky
 	})
 	if idx < 0 {
-		s.logSwitch(network, sticky, best, "not a candidate")
-		return best
+		return best, switchReason{text: "not a candidate"}
 	}
 	c := forNetwork[idx]
 	// A measured selection soft-demoted only by its failure streak is
@@ -1180,11 +1154,11 @@ func (s *MutableAutoSelect) applyStickiness(
 	if c.demote == demoteHard && best.demote < demoteHard {
 		passed, hold := s.hardDemotionReleaseLocked(sticky, pool)
 		if hold {
-			return c
+			return c, switchReason{}
 		}
 		if passed.tag != "" {
 			best = passed
-			s.releasedSince[streakNetFor(network)] = s.probeMembers[sticky].outcome.started
+			s.selectionFor(network).releasedSince = s.probeMembers[sticky].outcome.started
 		}
 	}
 	switch {
@@ -1193,33 +1167,30 @@ func (s *MutableAutoSelect) applyStickiness(
 		// measurements: delayMs 0 means never measured, and comparing it with
 		// a real delay would let a never-probed sticky's 0ms retain it.
 		// rankLocked already sorts measured members first, so defer to it.
-		s.logSwitch(network, sticky, best, "unmeasured")
+		return best, switchReason{text: "unmeasured"}
 	case c.demote == demoteHard && best.demote < demoteHard:
-		s.logSwitch(network, sticky, best, "hard-demoted")
-		s.closeStuckOnReleaseLocked(network, sticky)
+		return best, switchReason{text: "hard-demoted", released: true}
 	case c.lastResort && !best.lastResort && best.demote <= c.demote:
-		s.logSwitch(network, sticky, best, "last resort no longer needed")
+		return best, switchReason{text: "last resort no longer needed"}
 	case c.demote > best.demote && s.pastRetention(c):
-		s.logSwitch(network, sticky, best, "failures past retention")
-		s.closeStuckOnReleaseLocked(network, sticky)
+		return best, switchReason{text: "failures past retention", released: true}
 	case c.demote >= best.demote && s.streakReleaseDueLocked(network, c):
 		if replacement, ok := s.releaseForStreakLocked(network, pool, forNetwork, sticky); ok {
-			return replacement
+			return replacement, switchReason{text: "consecutive failures", released: true}
 		}
-		return c
+		return c, switchReason{}
 	case streakOnly:
-		return c
+		return c, switchReason{}
 	case s.beatsOnDelay(best.delayMs, c.delayMs) && !best.probeFailed && best.streak < consecutiveUserFailureLimit &&
-		!s.probePendingLocked(best.tag) && !s.probedBeforeLocked(best.tag, s.releasedSince[streakNetFor(network)]):
+		!s.probePendingLocked(best.tag) && !s.probedBeforeLocked(best.tag, s.selectionFor(network).releasedSince):
 		// A delay from before best's latest, failed probe says nothing about
 		// how it would serve now, nor does one of a member whose traffic
 		// keeps failing, one being probed again, or one measured before the
 		// failure that last released a hard-demoted selection.
-		s.logSwitch(network, sticky, best, "beaten on delay")
+		return best, switchReason{text: "beaten on delay"}
 	default:
-		return c
+		return c, switchReason{}
 	}
-	return best
 }
 
 // hardDemotionReleaseLocked decides the release of sticky, the selection,
@@ -1266,14 +1237,13 @@ func (s *MutableAutoSelect) streakReleaseDueLocked(network string, c rankedCandi
 }
 
 // releaseForStreakLocked releases network's selection, sticky, for
-// consecutive failures to the member streakReplacementLocked finds, if any.
-// Caller must hold s.access.
+// consecutive failures to the member streakReplacementLocked finds, if any,
+// for the caller to switch to. Caller must hold s.access.
 func (s *MutableAutoSelect) releaseForStreakLocked(network string, pool, forNetwork []rankedCandidate, sticky string) (rankedCandidate, bool) {
 	replacement, ok, _ := s.streakReplacementLocked(pool, forNetwork, network, sticky, s.streakSinceLocked(sticky, network))
 	if !ok {
 		return rankedCandidate{}, false
 	}
-	s.logSwitch(network, sticky, replacement, "consecutive failures")
 	// replacement's streak from before the probe that chose it would
 	// release it again at once.
 	if state := s.probeMembers[replacement.tag]; replacement.streak >= consecutiveUserFailureLimit &&
@@ -1282,8 +1252,7 @@ func (s *MutableAutoSelect) releaseForStreakLocked(network string, pool, forNetw
 			h.clearStreakBefore(streakNetFor(network), state.outcome.completed)
 		}
 	}
-	s.lastStreakSwitch[streakNetFor(network)] = time.Now()
-	s.closeStuckOnReleaseLocked(network, sticky)
+	s.selectionFor(network).lastStreakSwitch = time.Now()
 	return replacement, true
 }
 
@@ -1303,7 +1272,7 @@ func (s *MutableAutoSelect) closeStuckOnReleaseLocked(network, released string) 
 // passed since the last such release, or at once if sticky hasn't answered
 // since. Caller must hold s.access.
 func (s *MutableAutoSelect) streakReleaseAllowedLocked(network, sticky string) bool {
-	last := s.lastStreakSwitch[streakNetFor(network)]
+	last := s.selectionFor(network).lastStreakSwitch
 	if last.IsZero() || time.Since(last) >= streakSwitchCooldown {
 		return true
 	}
@@ -1395,7 +1364,7 @@ func (s *MutableAutoSelect) streakReplacementLocked(pool, forNetwork []rankedCan
 // Caller must hold s.access.
 func (s *MutableAutoSelect) probeStreakReplacementLocked(tag, network string) {
 	since := s.streakSinceLocked(tag, network)
-	if since.IsZero() || loadString(s.stickySlot(network)) != tag || !s.streakReleaseAllowedLocked(network, tag) {
+	if since.IsZero() || s.selected(network) != tag || !s.streakReleaseAllowedLocked(network, tag) {
 		return
 	}
 	pool, forNetwork := s.splitHealthyForLocked(s.rankLocked(time.Now()), network)
@@ -1489,7 +1458,7 @@ func (s *MutableAutoSelect) awaitStreakReplacement(ctx context.Context, network 
 // streak began showed the far end answered. It reports whether the
 // release is still waiting on probes. Caller must hold s.access.
 func (s *MutableAutoSelect) startStreakReplacementLocked(network string) bool {
-	sticky := loadString(s.stickySlot(network))
+	sticky := s.selected(network)
 	if sticky == "" {
 		return false
 	}
@@ -1506,11 +1475,13 @@ func (s *MutableAutoSelect) startStreakReplacementLocked(network string) bool {
 	return pending
 }
 
-func (s *MutableAutoSelect) stickySlot(network string) *atomic.Value {
-	if network == N.NetworkUDP {
-		return &s.stickyTag.udp
-	}
-	return &s.stickyTag.tcp
+func (s *MutableAutoSelect) selectionFor(network string) *networkSelection {
+	return &s.selections[streakNetFor(network)]
+}
+
+// selected returns network's selected tag, or "" if none.
+func (s *MutableAutoSelect) selected(network string) string {
+	return loadString(&s.selectionFor(network).tag)
 }
 
 // beatsOnDelay reports whether candidateMs improves on stickyMs by at least
@@ -1524,17 +1495,38 @@ func (s *MutableAutoSelect) beatsOnDelay(candidateMs, stickyMs uint32) bool {
 		gain*100 >= uint64(stickyMs)*uint64(s.cfg.switchTolerancePercent)
 }
 
-// logSwitch records which rule moved the group off sticky; a churn report is
-// only actionable if the logs say that.
-func (s *MutableAutoSelect) logSwitch(network, sticky string, best rankedCandidate, reason string) {
-	s.logger.Info(network, " switch: ", sticky, " -> ", best.tag, " (", reason, ")")
+// switchReason is why a network's selection moved off its previous member.
+type switchReason struct {
+	text string
+	// released means the previous member was released for failing, so its
+	// stuck conns are closed.
+	released bool
 }
 
-// clearStickyTagLocked drops the sticky tag for any network where it
-// equals tag. Caller must hold s.access.
-func (s *MutableAutoSelect) clearStickyTagLocked(tag string) {
-	for _, slot := range [...]*atomic.Value{&s.stickyTag.tcp, &s.stickyTag.udp} {
-		if loadString(slot) == tag {
+// switchSelectionLocked makes next network's selection in place of prev and
+// logs why; a churn report is only actionable if the logs say which rule
+// moved the group. The destinations that answered through a UDP selection
+// pass to its successor. Caller must hold s.access.
+func (s *MutableAutoSelect) switchSelectionLocked(network, prev, next string, why switchReason) {
+	s.selectionFor(network).tag.Store(next)
+	if prev == "" {
+		s.logger.Info(network, " select: ", next)
+		return
+	}
+	s.logger.Info(network, " switch: ", prev, " -> ", next, " (", why.text, ")")
+	if why.released {
+		s.closeStuckOnReleaseLocked(network, prev)
+	}
+	if network == N.NetworkUDP {
+		s.inheritUDPDestinationsLocked(prev, next)
+	}
+}
+
+// clearSelectionLocked drops the selection of any network where it is tag.
+// Caller must hold s.access.
+func (s *MutableAutoSelect) clearSelectionLocked(tag string) {
+	for i := range s.selections {
+		if slot := &s.selections[i].tag; loadString(slot) == tag {
 			slot.Store("")
 		}
 	}
@@ -1883,7 +1875,7 @@ func (s *MutableAutoSelect) failedSince(tag, network string, since time.Time) bo
 // is failing: its latest probe, completed after since, failed or, for UDP,
 // its failure streak is at the limit. Caller must hold s.access.
 func (s *MutableAutoSelect) failedSinceLocked(tag, network string, since time.Time) bool {
-	if loadString(s.stickySlot(network)) == tag {
+	if s.selected(network) == tag {
 		return false
 	}
 	if network == N.NetworkUDP && !s.streakSinceLocked(tag, network).IsZero() {
@@ -1969,7 +1961,7 @@ func (s *MutableAutoSelect) noteUnanswered(origin connOrigin, network, dest stri
 func (s *MutableAutoSelect) noteUnansweredOffSelection(origin connOrigin, dest string, opened, waitingSince time.Time) {
 	s.access.Lock()
 	defer s.access.Unlock()
-	if tag := origin.out.Tag(); loadString(&s.stickyTag.udp) != tag && s.failingLocked(tag) {
+	if tag := origin.out.Tag(); s.selected(N.NetworkUDP) != tag && s.failingLocked(tag) {
 		s.noteUnansweredLocked(origin, N.NetworkUDP, dest, opened, waitingSince)
 	}
 }
@@ -2007,8 +1999,7 @@ func (s *MutableAutoSelect) noteUnansweredLocked(origin connOrigin, network, des
 // since. With none, as in an outage of the device's own network, the
 // selection stays.
 func (s *MutableAutoSelect) trySwitchAfterConfirmedFailureLocked(failedTag, replacementTag string, since time.Time) (switched bool) {
-	slot := &s.stickyTag.tcp
-	if loadString(slot) != failedTag {
+	if s.selected(N.NetworkTCP) != failedTag {
 		return false
 	}
 	if _, member := s.members.Load(failedTag); !member {
@@ -2036,10 +2027,9 @@ func (s *MutableAutoSelect) trySwitchAfterConfirmedFailureLocked(failedTag, repl
 		}
 		return false
 	}
-	slot.Store(replacementTag)
+	s.switchSelectionLocked(N.NetworkTCP, failedTag, replacementTag, switchReason{text: "failed confirmation"})
 	h.startRecoveryGate(now)
 	s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = now, replacementTag
-	s.logger.Info("tcp switch: ", failedTag, " -> ", replacementTag, " (failed confirmation)")
 	// Its probes failed, so every conn it hasn't answered yet is doomed.
 	s.closeDoomedTCPLocked(failedTag, 0)
 	return true
@@ -2056,7 +2046,7 @@ func (s *MutableAutoSelect) tryPendingConfirmedSwitchLocked() {
 	if p.tag == "" {
 		return
 	}
-	if loadString(&s.stickyTag.tcp) != p.tag || (time.Since(p.at) > confirmStrikeWindow && !p.awaitingProbes) {
+	if s.selected(N.NetworkTCP) != p.tag || (time.Since(p.at) > confirmStrikeWindow && !p.awaitingProbes) {
 		p.tag = ""
 		return
 	}
@@ -2216,8 +2206,8 @@ type trialState struct {
 // afresh when the selection is another member, or another membership of its
 // tag, than it was kept for. Caller must hold s.access.
 func (s *MutableAutoSelect) trialsLocked(network string) *trialState {
-	t := &s.trials[streakNetFor(network)]
-	sticky := loadString(s.stickySlot(network))
+	t := &s.selectionFor(network).trials
+	sticky := s.selected(network)
 	var membership uint64
 	if state := s.probeMembers[sticky]; state != nil {
 		membership = state.membershipID
@@ -2236,7 +2226,7 @@ func (s *MutableAutoSelect) trialsLocked(network string) *trialState {
 func (s *MutableAutoSelect) takeTrial(network string) (trial connOrigin, ok bool) {
 	s.access.Lock()
 	defer s.access.Unlock()
-	sticky := loadString(s.stickySlot(network))
+	sticky := s.selected(network)
 	t := s.trialsLocked(network)
 	now := time.Now()
 	if sticky == "" || !s.trialDueLocked(network, sticky, t, now) {
@@ -2408,14 +2398,9 @@ func (s *MutableAutoSelect) moveToTrialLocked(network, prev, tag string) {
 	if _, member := s.members.Load(tag); !member {
 		return
 	}
-	s.stickySlot(network).Store(tag)
+	s.switchSelectionLocked(network, prev, tag, switchReason{text: "trial answered", released: true})
 	// Its trial's setup succeeded, and an app may keep using that handle.
 	s.trialsLocked(network).setupOK = true
-	s.logger.Info(network, " switch: ", prev, " -> ", tag, " (trial answered)")
-	s.closeStuckOnReleaseLocked(network, prev)
-	if network == N.NetworkUDP {
-		s.inheritUDPDestinationsLocked(prev, tag)
-	}
 }
 
 // outageRecheckInterval spaces the probes that look for the end of a
@@ -2438,7 +2423,7 @@ func (s *MutableAutoSelect) armOutageRecheckLocked() {
 		if s.isClosed() || s.paused() || !s.probing || !s.outageSuspectedLocked() {
 			return
 		}
-		sticky := loadString(&s.stickyTag.tcp)
+		sticky := s.selected(N.NetworkTCP)
 		var tags []string
 		if sticky != "" {
 			tags = append(tags, sticky)
@@ -2458,7 +2443,7 @@ func (s *MutableAutoSelect) armOutageRecheckLocked() {
 // own failures until then may have been the outage's, or its own. Caller
 // must hold s.access.
 func (s *MutableAutoSelect) probeSelectionAfterOutageLocked(passed string, at time.Time) {
-	sticky := loadString(&s.stickyTag.tcp)
+	sticky := s.selected(N.NetworkTCP)
 	if sticky == "" || sticky == passed {
 		return
 	}

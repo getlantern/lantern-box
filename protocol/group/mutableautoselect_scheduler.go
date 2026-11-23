@@ -726,7 +726,7 @@ const confirmStrikeWindow = 30 * time.Second
 // while tag is still the TCP selection. Caller must hold s.access.
 func (s *MutableAutoSelect) rearmConfirmationLocked(tag, replacement string) {
 	state := s.probeMembers[tag]
-	if loadString(&s.stickyTag.tcp) != tag || s.outageSuspectedLocked() {
+	if s.selected(N.NetworkTCP) != tag || s.outageSuspectedLocked() {
 		// No second confirmation will conclude to clear the strike.
 		state.firstConfirmFailedAt = time.Time{}
 		return
@@ -784,7 +784,7 @@ func (s *MutableAutoSelect) requestFailureConfirmation(origin connOrigin, replac
 // requestFailureConfirmationLocked is requestFailureConfirmation for tag,
 // with s.access held.
 func (s *MutableAutoSelect) requestFailureConfirmationLocked(tag, replacement string, generation uint64) {
-	if s.isClosed() || s.paused() || !s.matchesGenerationLocked(generation) || loadString(&s.stickyTag.tcp) != tag ||
+	if s.isClosed() || s.paused() || !s.matchesGenerationLocked(generation) || s.selected(N.NetworkTCP) != tag ||
 		s.outageSuspectedLocked() {
 		return
 	}
@@ -980,9 +980,10 @@ func (s *MutableAutoSelect) advanceNetworkLocked() {
 	for _, h := range s.histories {
 		h.clearStreaks()
 	}
-	s.lastStreakSwitch = [2]time.Time{}
-	s.trials = [2]trialState{}
-	s.releasedSince = [2]time.Time{}
+	for i := range s.selections {
+		sel := &s.selections[i]
+		sel.lastStreakSwitch, sel.releasedSince, sel.trials = time.Time{}, time.Time{}, trialState{}
+	}
 	// A decision armed on the old network says nothing about the new one.
 	s.afterOutage.tag = ""
 	if s.probing {

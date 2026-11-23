@@ -190,12 +190,12 @@ func TestStreak_ReleasedWhenOnlyTheProbesFail(t *testing.T) {
 					_, _, err := s.selectOutbound("tcp", "")
 					require.NoError(t, err)
 					if tc.want == "a" {
-						require.Equal(t, "a", loadString(&s.stickyTag.tcp), "the selection is never released")
+						require.Equal(t, "a", loadString(&s.selections[streakTCP].tag), "the selection is never released")
 					}
 					time.Sleep(time.Second)
 					synctest.Wait()
 				}
-				assert.Equal(t, tc.want, loadString(&s.stickyTag.tcp))
+				assert.Equal(t, tc.want, loadString(&s.selections[streakTCP].tag))
 			})
 		})
 	}
@@ -254,7 +254,7 @@ func TestOutage_NoTrialOnceTheSelectionFailsLocallyOrAnswers(t *testing.T) {
 					conn.Close()
 				}
 				synctest.Wait()
-				assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "nothing showed a failing while the network was up")
+				assert.Equal(t, "a", loadString(&s.selections[streakTCP].tag), "nothing showed a failing while the network was up")
 			})
 		})
 	}
