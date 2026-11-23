@@ -52,7 +52,7 @@ func TestSchedulerSharedOwnershipAndConfirmation(t *testing.T) {
 			return nil, errors.New("failed confirmation")
 		}
 		recordSuccess(s, "b", 100)
-		s.stickyTag.tcp.Store("a")
+		s.selections[streakTCP].tag.Store("a")
 		requestTestProbes(s, []string{"a"}, probeForced)
 		synctest.Wait()
 		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "b")
@@ -87,7 +87,7 @@ func TestSchedulerConfirmationBypassesConcurrencyLimit(t *testing.T) {
 		synctest.Wait()
 		require.Equal(t, "a", <-started)
 		requestTestProbes(s, []string{"b"}, probeIfStale)
-		s.stickyTag.tcp.Store("c")
+		s.selections[streakTCP].tag.Store("c")
 		s.requestFailureConfirmation(s.originAt("c", s.networkGeneration.Load()), "")
 		synctest.Wait()
 		require.Equal(t, "c", <-started)
@@ -117,7 +117,7 @@ func TestSchedulerCanceledObjectRemainsBusyAcrossFlaps(t *testing.T) {
 		synctest.Wait()
 		for range 4 {
 			s.InterfaceUpdated(context.Background())
-			s.stickyTag.tcp.Store("a")
+			s.selections[streakTCP].tag.Store("a")
 			s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 			s.CheckOutbounds()
 			synctest.Wait()
@@ -762,7 +762,7 @@ func TestSchedulerWatchdogPreservesNewerConfirmation(t *testing.T) {
 			return nil, errors.New("confirmation failed")
 		}
 		recordSuccess(s, "b", 100)
-		s.stickyTag.tcp.Store("a")
+		s.selections[streakTCP].tag.Store("a")
 		requestTestProbes(s, []string{"a"}, probeForced)
 		synctest.Wait()
 		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "b")
@@ -827,7 +827,7 @@ func TestSchedulerRepeatedConfirmationKeepsBoundary(t *testing.T) {
 			return nil, errors.New("confirmation failed")
 		}
 		recordSuccess(s, "b", 100)
-		s.stickyTag.tcp.Store("a")
+		s.selections[streakTCP].tag.Store("a")
 		generation := s.networkGeneration.Load()
 		s.requestFailureConfirmation(s.originAt("a", generation), "b")
 		synctest.Wait()
@@ -867,7 +867,7 @@ func TestSchedulerRepeatedConfirmationReplacement(t *testing.T) {
 				recordSuccess(s, "b", 100)
 				recordSuccess(s, "c", 200)
 				recordSuccess(s, "d", 300)
-				s.stickyTag.tcp.Store("a")
+				s.selections[streakTCP].tag.Store("a")
 				generation := s.networkGeneration.Load()
 				s.requestFailureConfirmation(s.originAt("a", generation), tc.first)
 				synctest.Wait()
@@ -934,8 +934,8 @@ func TestSchedulerInterfaceUpdatedRejectsStaleUserFailure(t *testing.T) {
 func TestSchedulerInterfaceUpdatedPreservesSelection(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	generation := s.networkGeneration.Load()
-	s.stickyTag.tcp.Store("a")
-	s.stickyTag.udp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
+	s.selections[streakUDP].tag.Store("a")
 	at := time.Now()
 	s.lastConfirmedFailureSwitch.at = at
 	s.lastConfirmedFailureSwitch.selectedTag = "a"
@@ -943,8 +943,8 @@ func TestSchedulerInterfaceUpdatedPreservesSelection(t *testing.T) {
 	s.exhaustionCh <- struct{}{}
 	s.InterfaceUpdated(context.Background())
 	require.NotEqual(t, generation, s.networkGeneration.Load())
-	require.Equal(t, "a", loadString(&s.stickyTag.tcp))
-	require.Equal(t, "a", loadString(&s.stickyTag.udp))
+	require.Equal(t, "a", loadString(&s.selections[streakTCP].tag))
+	require.Equal(t, "a", loadString(&s.selections[streakUDP].tag))
 	require.Equal(t, at, s.lastConfirmedFailureSwitch.at)
 	require.Equal(t, "a", s.lastConfirmedFailureSwitch.selectedTag)
 	require.Zero(t, s.lastLadderAt.Load())

@@ -460,7 +460,7 @@ func TestSelectOutbound_SwitchTolerance(t *testing.T) {
 			s.cfg.switchTolerancePercent = tt.percent
 			recordSuccess(s, "alpha", tt.alphaDelay)
 			recordSuccess(s, "beta", tt.betaDelay)
-			s.stickyTag.tcp.Store("alpha")
+			s.selections[streakTCP].tag.Store("alpha")
 			got, _, err := s.selectOutbound("tcp", "")
 			require.NoError(t, err)
 			require.NotNil(t, got)
@@ -473,7 +473,7 @@ func TestSelectOutbound_ForcedSwitchWhenStickyNotInPool(t *testing.T) {
 	s, _ := newTestMUR(t, "alpha", "beta")
 	recordSuccess(s, "beta", 120)
 	addUserFailureN(s, "alpha", int(s.hist.consecutiveFailLimit))
-	s.stickyTag.tcp.Store("alpha")
+	s.selections[streakTCP].tag.Store("alpha")
 
 	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -487,20 +487,20 @@ func TestSelectOutbound_RecordsStickyAfterPick(t *testing.T) {
 	recordSuccess(s, "a", 50)
 	_, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
-	assert.Equal(t, "a", loadString(&s.stickyTag.tcp))
+	assert.Equal(t, "a", loadString(&s.selections[streakTCP].tag))
 }
 
 func TestSelectOutboundExcluding_SkipsTargetAndDoesNotMutateSticky(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	recordSuccess(s, "a", 30)
 	recordSuccess(s, "b", 50)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	got, _, err := s.selectOutbound("tcp", "a")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Tag(), "fast-failover must skip the excluded tag")
-	assert.Equal(t, "a", loadString(&s.stickyTag.tcp),
+	assert.Equal(t, "a", loadString(&s.selections[streakTCP].tag),
 		"a fast-failover pick must not poison the sticky tag")
 }
 
@@ -783,7 +783,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// error. The demote rule hits hard at three failures in window, not
 	// one. (Spec change from earlier "one-shot hard demote.")
 	s, _ := newTestMUR(t, "a")
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
@@ -795,7 +795,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 
 func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureReset, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
@@ -820,7 +820,7 @@ func TestRecordUserFailure_SoftDemotedStickyStillLosesOnDelay(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	recordSuccess(s, "a", 200)
 	recordSuccess(s, "b", 100)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	// addUserFailureN bypasses the dedupe window, so the soft-limit
 	// failures land deterministically without depending on wall time.
@@ -839,7 +839,7 @@ func TestRecordUserFailure_SoftDemotedStickyKeptOverSlowerPeer(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	recordSuccess(s, "a", 50)
 	recordSuccess(s, "b", 100)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	addUserFailureN(s, "a", int(s.hist.softFailLimit))
 
@@ -858,7 +858,7 @@ func TestRecordUserFailure_HardDemotedStickyDropsRegardlessOfDelay(t *testing.T)
 	// hard-demote limit is not doubled; see the boost case below.
 	recordSuccess(s, "a", 100)
 	recordSuccess(s, "b", 200)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	addUserFailureN(s, "a", int(s.hist.consecutiveFailLimit))
 
@@ -875,7 +875,7 @@ func TestRecordUserFailure_RetentionBoundedBySoftLimit(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	recordSuccess(s, "a", 10)
 	recordSuccess(s, "b", 900)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	addUserFailureN(s, "a", int(s.hist.softFailLimit))
 	got, _, err := s.selectOutbound("tcp", "")
@@ -893,7 +893,7 @@ func TestRecordUserFailure_RetentionBoundedBySoftLimit(t *testing.T) {
 func TestApplyStickiness_DepartedStickyFallsToBest(t *testing.T) {
 	s, _ := newTestMUR(t, "b")
 	recordSuccess(s, "b", 100)
-	s.stickyTag.tcp.Store("gone")
+	s.selections[streakTCP].tag.Store("gone")
 
 	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -966,7 +966,7 @@ func TestSelectOutbound_PreservesStickyAfterUnrelatedRemove(t *testing.T) {
 	recordSuccess(s, "a", 200)
 	recordSuccess(s, "b", 150)
 	recordSuccess(s, "c", 50)
-	s.stickyTag.tcp.Store("c")
+	s.selections[streakTCP].tag.Store("c")
 	_, err := s.Remove("b")
 	require.NoError(t, err)
 
@@ -981,7 +981,7 @@ func TestSelectOutbound_RepicksWhenStickyGone(t *testing.T) {
 	recordSuccess(s, "a", 100)
 	recordSuccess(s, "b", 50)
 	recordSuccess(s, "c", 200)
-	s.stickyTag.tcp.Store("b")
+	s.selections[streakTCP].tag.Store("b")
 	_, err := s.Remove("b")
 	require.NoError(t, err)
 
@@ -989,7 +989,7 @@ func TestSelectOutbound_RepicksWhenStickyGone(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Contains(t, []string{"a", "c"}, got.Tag())
-	assert.NotEqual(t, "b", loadString(&s.stickyTag.tcp))
+	assert.NotEqual(t, "b", loadString(&s.selections[streakTCP].tag))
 }
 
 func TestSelectOutbound_PrefersLowestSeededDelay(t *testing.T) {
@@ -1884,8 +1884,8 @@ func TestMakeHooks_IgnoresFailureFromUnselectedTag(t *testing.T) {
 	// Stale conns from a tag that is no longer selected should not keep that
 	// tag demoted after traffic has moved elsewhere.
 	s, _ := newTestMUR(t, "a", "b")
-	s.stickyTag.tcp.Store("b")
-	s.stickyTag.udp.Store("b")
+	s.selections[streakTCP].tag.Store("b")
+	s.selections[streakUDP].tag.Store("b")
 
 	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
 
@@ -1900,8 +1900,8 @@ func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
 	// The gate spans both networks: a member carrying UDP is still
 	// selected even when TCP has moved elsewhere.
 	s, _ := newTestMUR(t, "a", "b")
-	s.stickyTag.tcp.Store("b")
-	s.stickyTag.udp.Store("a")
+	s.selections[streakTCP].tag.Store("b")
+	s.selections[streakUDP].tag.Store("a")
 
 	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
 
@@ -1913,7 +1913,7 @@ func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
 func TestMakeHooks_UnselectedGateDisabledByConfig(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	s.cfg.demoteOnlySelected = false
-	s.stickyTag.tcp.Store("b")
+	s.selections[streakTCP].tag.Store("b")
 
 	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
 
@@ -1926,7 +1926,7 @@ func TestMakeHooks_ChargesFallbackRouteEvenWhenUnselected(t *testing.T) {
 	// Fast-failover conns are fresh traffic and remain chargeable even though
 	// selecting an alternate does not make it sticky.
 	s, _ := newTestMUR(t, "a", "b")
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	s.makeHooks(s.originAt("b", s.networkGeneration.Load()).on(fallbackRoute), "tcp").onFailure(adapter.UserFailureReset, nil)
 
@@ -1951,7 +1951,7 @@ func TestDialContext_FastFailoverConnStaysChargeable(t *testing.T) {
 
 	conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
 	require.NoError(t, err, "fast failover should have produced b's conn")
-	require.Equal(t, "a", loadString(&s.stickyTag.tcp),
+	require.Equal(t, "a", loadString(&s.selections[streakTCP].tag),
 		"fast failover must not move the sticky tag")
 
 	_, err = conn.Write([]byte("x"))
@@ -1969,7 +1969,7 @@ func TestApplyStickiness_UnmeasuredStickyLosesToMeasuredPeer(t *testing.T) {
 	// peer should outrank an unmeasured soft-demoted sticky.
 	s, _ := newTestMUR(t, "a", "b")
 	recordSuccess(s, "b", 300)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 	addUserFailureN(s, "a", int(s.hist.softFailLimit))
 
 	got, _, err := s.selectOutbound("tcp", "")
@@ -1981,7 +1981,7 @@ func TestApplyStickiness_UnmeasuredStickyLosesToMeasuredPeer(t *testing.T) {
 
 func TestChargeable_Policy(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	assert.True(t, s.chargeable("a", primaryRoute), "the selection is chargeable")
 	assert.False(t, s.chargeable("b", primaryRoute), "an unselected primary conn is not")
@@ -2031,7 +2031,7 @@ func TestMakeHooks_FailureDoesNotRunLadder(t *testing.T) {
 		s.defaultURL = "http://probe.test/"
 		obs["a"].dial = denyDial
 		obs["b"].dial = denyDial
-		s.stickyTag.tcp.Store("a")
+		s.selections[streakTCP].tag.Store("a")
 		s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureReset, nil)
 		synctest.Wait()
 		assert.Zero(t, s.lastLadderAt.Load(), "a data-plane failure must not re-probe every member")
