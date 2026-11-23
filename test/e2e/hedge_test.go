@@ -20,6 +20,7 @@ import (
 	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/sniff"
+	"github.com/sagernet/sing-box/option"
 	"github.com/stretchr/testify/require"
 
 	box "github.com/getlantern/lantern-box"
@@ -47,17 +48,20 @@ func TestHedgeMultiDomainPage(t *testing.T) {
 	proxy := startTestSOCKS(t, originAddr, nil)
 
 	boxCtx := box.BaseContext()
-	clientPort := freePort(t)
-	startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
-		"log": {"level": "error"},
-		"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
-		"outbounds": [
-			{"type": "hedge", "tag": "smart", "first": "censored", "then": "proxy", "commit_timeout": "%s"},
-			{"type": "socks", "tag": "censored", "server": "127.0.0.1", "server_port": %d},
-			{"type": "socks", "tag": "proxy", "server": "127.0.0.1", "server_port": %d}
-		],
-		"route": {"final": "smart"}
-	}`, clientPort, commitTimeout, censor.port, proxy.port)))
+	var clientPort uint16
+	startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+		clientPort = port("tcp")
+		return mustOptions(boxCtx, t, fmt.Sprintf(`{
+			"log": {"level": "error"},
+			"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+			"outbounds": [
+				{"type": "hedge", "tag": "smart", "first": "censored", "then": "proxy", "commit_timeout": "%s"},
+				{"type": "socks", "tag": "censored", "server": "127.0.0.1", "server_port": %d},
+				{"type": "socks", "tag": "proxy", "server": "127.0.0.1", "server_port": %d}
+			],
+			"route": {"final": "smart"}
+		}`, clientPort, commitTimeout, censor.port, proxy.port))
+	})
 
 	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", clientPort))
 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
@@ -133,20 +137,20 @@ func TestHedgeSurvivesRemovingFirst(t *testing.T) {
 	proxy := startTestSOCKS(t, origin.Listener.Addr().String(), nil)
 
 	boxCtx := box.BaseContext()
-	clientPort := freePort(t)
-	client, err := sbox.New(sbox.Options{Context: boxCtx, Options: mustOptions(boxCtx, t, fmt.Sprintf(`{
-		"log": {"level": "error"},
-		"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
-		"outbounds": [
-			{"type": "hedge", "tag": "smart", "first": "proxyless", "then": "proxy"},
-			{"type": "direct", "tag": "proxyless"},
-			{"type": "socks", "tag": "proxy", "server": "127.0.0.1", "server_port": %d}
-		],
-		"route": {"final": "smart"}
-	}`, clientPort, proxy.port))})
-	require.NoError(t, err)
-	require.NoError(t, client.Start())
-	t.Cleanup(func() { client.Close() })
+	var clientPort uint16
+	client := startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+		clientPort = port("tcp")
+		return mustOptions(boxCtx, t, fmt.Sprintf(`{
+			"log": {"level": "error"},
+			"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+			"outbounds": [
+				{"type": "hedge", "tag": "smart", "first": "proxyless", "then": "proxy"},
+				{"type": "direct", "tag": "proxyless"},
+				{"type": "socks", "tag": "proxy", "server": "127.0.0.1", "server_port": %d}
+			],
+			"route": {"final": "smart"}
+		}`, clientPort, proxy.port))
+	})
 
 	require.NoError(t, client.Outbound().Remove("proxyless"), "First is not a dependency the manager may refuse to remove")
 

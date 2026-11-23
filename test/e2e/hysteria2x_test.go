@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
@@ -33,26 +32,27 @@ func TestHysteria2XPreInitialJunk(t *testing.T) {
 	for _, junk := range []bool{true, false} {
 		t.Run(fmt.Sprintf("pre_initial_junk=%t", junk), func(t *testing.T) {
 			boxCtx := box.BaseContext()
-			serverPort := freeUDPPort(t)
+			var serverPort, clientPort uint16
+			startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+				serverPort = port("udp")
+				return mustOptions(boxCtx, t, fmt.Sprintf(`{
+					"log": {"level": "error"},
+					"inbounds": [{"type": "hysteria2", "listen": "127.0.0.1", "listen_port": %d,
+						"users": [{"password": "pw"}], "tls": {"enabled": true, "insecure": true}}],
+					"outbounds": [{"type": "direct"}]
+				}`, serverPort))
+			})
 			relay := startRecordingUDPRelay(t, serverPort)
-			clientPort := freePort(t)
-
-			serverOpts := mustOptions(boxCtx, t, fmt.Sprintf(`{
-				"log": {"level": "error"},
-				"inbounds": [{"type": "hysteria2", "listen": "127.0.0.1", "listen_port": %d,
-					"users": [{"password": "pw"}], "tls": {"enabled": true, "insecure": true}}],
-				"outbounds": [{"type": "direct"}]
-			}`, serverPort))
-			clientOpts := mustOptions(boxCtx, t, fmt.Sprintf(`{
-				"log": {"level": "error"},
-				"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
-				"outbounds": [{"type": "hysteria2x", "server": "127.0.0.1", "server_port": %d,
-					"password": "pw", "pre_initial_junk": %t,
-					"tls": {"enabled": true, "server_name": "example.com", "insecure": true}}]
-			}`, clientPort, relay.port, junk))
-
-			startBox(t, boxCtx, serverOpts)
-			startBox(t, boxCtx, clientOpts)
+			startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+				clientPort = port("tcp")
+				return mustOptions(boxCtx, t, fmt.Sprintf(`{
+					"log": {"level": "error"},
+					"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+					"outbounds": [{"type": "hysteria2x", "server": "127.0.0.1", "server_port": %d,
+						"password": "pw", "pre_initial_junk": %t,
+						"tls": {"enabled": true, "server_name": "example.com", "insecure": true}}]
+				}`, clientPort, relay.port, junk))
+			})
 
 			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				fmt.Fprint(w, "through hysteria2x")
@@ -99,22 +99,6 @@ func mustOptions(ctx context.Context, t *testing.T, raw string) option.Options {
 	opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(raw))
 	require.NoError(t, err)
 	return opts
-}
-
-func startBox(t *testing.T, ctx context.Context, opts option.Options) {
-	t.Helper()
-	b, err := sbox.New(sbox.Options{Context: ctx, Options: opts})
-	require.NoError(t, err)
-	require.NoError(t, b.Start())
-	t.Cleanup(func() { b.Close() })
-}
-
-func freeUDPPort(t *testing.T) uint16 {
-	t.Helper()
-	c, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer c.Close()
-	return uint16(c.LocalAddr().(*net.UDPAddr).Port)
 }
 
 // recordingUDPRelay forwards one client flow to the server and keeps a copy of

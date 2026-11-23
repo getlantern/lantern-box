@@ -14,6 +14,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	sbox "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/option"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/protocol/socks"
@@ -38,13 +39,16 @@ func TestOutlineQUICPrelude(t *testing.T) {
 		t.Run(fmt.Sprintf("udp=%q", tc.udp), func(t *testing.T) {
 			boxCtx := box.BaseContext()
 			sink := startUDPSink(t)
-			clientPort := freePort(t)
-			startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
-				"log": {"level": "error"},
-				"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
-				"outbounds": [{"type": "outline", "tag": "proxyless",
-					"domains": ["example.com"], "udp": %q}]
-			}`, clientPort, tc.udp)))
+			var clientPort uint16
+			startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+				clientPort = port("tcp")
+				return mustOptions(boxCtx, t, fmt.Sprintf(`{
+					"log": {"level": "error"},
+					"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+					"outbounds": [{"type": "outline", "tag": "proxyless",
+						"domains": ["example.com"], "udp": %q}]
+				}`, clientPort, tc.udp))
+			})
 
 			sc := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -89,13 +93,16 @@ func TestOutlineQUICPreludeHandshake(t *testing.T) {
 	for _, udp := range []string{"quicprelude:count=1", "quicprelude:count=3&version=draft", ""} {
 		t.Run(fmt.Sprintf("udp=%q", udp), func(t *testing.T) {
 			boxCtx := box.BaseContext()
-			serverPort := freeUDPPort(t)
-			startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
-				"log": {"level": "error"},
-				"inbounds": [{"type": "hysteria2", "listen": "127.0.0.1", "listen_port": %d,
-					"users": [{"password": "pw"}], "tls": {"enabled": true, "insecure": true}}],
-				"outbounds": [{"type": "direct"}]
-			}`, serverPort)))
+			var serverPort uint16
+			startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+				serverPort = port("udp")
+				return mustOptions(boxCtx, t, fmt.Sprintf(`{
+					"log": {"level": "error"},
+					"inbounds": [{"type": "hysteria2", "listen": "127.0.0.1", "listen_port": %d,
+						"users": [{"password": "pw"}], "tls": {"enabled": true, "insecure": true}}],
+					"outbounds": [{"type": "direct"}]
+				}`, serverPort))
+			})
 			client, err := sbox.New(sbox.Options{Context: boxCtx, Options: mustOptions(boxCtx, t, fmt.Sprintf(`{
 				"log": {"level": "error"},
 				"outbounds": [{"type": "outline", "tag": "proxyless", "domains": ["example.com"], "udp": %q}]
@@ -133,13 +140,16 @@ func TestOutlineQUICPreludeHandshake(t *testing.T) {
 // between its read and write paths under -race.
 func TestHedgeOutlineQUIC(t *testing.T) {
 	serverCtx := box.BaseContext()
-	serverPort := freeUDPPort(t)
-	startBox(t, serverCtx, mustOptions(serverCtx, t, fmt.Sprintf(`{
-		"log": {"level": "error"},
-		"inbounds": [{"type": "hysteria2", "listen": "127.0.0.1", "listen_port": %d,
-			"users": [{"password": "pw"}], "tls": {"enabled": true, "insecure": true}}],
-		"outbounds": [{"type": "direct"}]
-	}`, serverPort)))
+	var serverPort uint16
+	startBoxOnFreePorts(t, serverCtx, func(port func(string) uint16) option.Options {
+		serverPort = port("udp")
+		return mustOptions(serverCtx, t, fmt.Sprintf(`{
+			"log": {"level": "error"},
+			"inbounds": [{"type": "hysteria2", "listen": "127.0.0.1", "listen_port": %d,
+				"users": [{"password": "pw"}], "tls": {"enabled": true, "insecure": true}}],
+			"outbounds": [{"type": "direct"}]
+		}`, serverPort))
+	})
 	clientCtx := box.BaseContext()
 	client, err := sbox.New(sbox.Options{Context: clientCtx, Options: mustOptions(clientCtx, t, `{
 		"log": {"level": "error"},

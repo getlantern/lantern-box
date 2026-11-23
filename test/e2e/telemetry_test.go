@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -87,26 +89,22 @@ func TestTelemetryE2E(t *testing.T) {
 	boxCtx := box.BaseContext()
 	logger := log.NewNOPFactory().NewLogger("")
 
-	serverPort := freePort(t)
-	clientPort := freePort(t)
-	serverOpts := getOptions(boxCtx, t, "testdata/http_server.json")
-	clientOpts := getOptions(boxCtx, t, "testdata/http_client.json")
-	patchPorts(&serverOpts, &clientOpts, serverPort, clientPort)
-
-	serverBox, err := sbox.New(sbox.Options{Context: boxCtx, Options: serverOpts})
-	require.NoError(t, err)
-
 	mgr := clientcontext.NewManager(
 		clientcontext.MatchBounds{Inbound: []string{"any"}, Outbound: []string{"any"}},
 		logger,
 	)
-	serverBox.Router().AppendTracker(mgr)
-
 	metricsTracker := metrics.NewTracker(boxCtx)
-	serverBox.Router().AppendTracker(metricsTracker)
 
-	require.NoError(t, serverBox.Start())
-	defer serverBox.Close()
+	var serverPort uint16
+	startBoxOnFreePortsWith(t, boxCtx, func(port func(string) uint16) option.Options {
+		serverPort = port("tcp")
+		opts := getOptions(boxCtx, t, "testdata/http_server.json")
+		opts.Inbounds[0].Options.(*option.HTTPMixedInboundOptions).ListenPort = serverPort
+		return opts
+	}, func(b *sbox.Box) {
+		b.Router().AppendTracker(mgr)
+		b.Router().AppendTracker(metricsTracker)
+	})
 
 	// --- Start sing-box client with injector ---
 	cInfo := clientcontext.ClientInfo{
@@ -123,10 +121,20 @@ func TestTelemetryE2E(t *testing.T) {
 	)
 	require.NoError(t, injector.Install(clientCtx))
 
-	clientBox, err := sbox.New(sbox.Options{Context: clientCtx, Options: clientOpts})
-	require.NoError(t, err)
-	require.NoError(t, clientBox.Start())
-	defer clientBox.Close()
+	var clientOpts option.Options
+	startBoxOnFreePorts(t, clientCtx, func(port func(string) uint16) option.Options {
+		clientOpts = getOptions(clientCtx, t, "testdata/http_client.json")
+		clientOpts.Inbounds[0].Options.(*option.HTTPMixedInboundOptions).ListenPort = port("tcp")
+		for _, ob := range clientOpts.Outbounds {
+			switch opts := ob.Options.(type) {
+			case *option.HTTPOutboundOptions:
+				opts.ServerPort = serverPort
+			case *option.SOCKSOutboundOptions:
+				opts.ServerPort = serverPort
+			}
+		}
+		return clientOpts
+	})
 
 	// --- Send traffic through the proxy ---
 	proxyAddr := getProxyAddress(clientOpts.Inbounds)
@@ -188,19 +196,76 @@ func freePort(t testing.TB) uint16 {
 	return uint16(port)
 }
 
-func patchPorts(
-	serverOpts *option.Options,
-	clientOpts *option.Options,
-	serverPort, clientPort uint16,
-) {
-	serverOpts.Inbounds[0].Options.(*option.HTTPMixedInboundOptions).ListenPort = serverPort
-	clientOpts.Inbounds[0].Options.(*option.HTTPMixedInboundOptions).ListenPort = clientPort
-	for _, ob := range clientOpts.Outbounds {
-		switch opts := ob.Options.(type) {
-		case *option.HTTPOutboundOptions:
-			opts.ServerPort = serverPort
-		case *option.SOCKSOutboundOptions:
-			opts.ServerPort = serverPort
+func TestStartBoxOnFreePortsRetriesTakenPort(t *testing.T) {
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer taken.Close()
+	takenPort := uint16(taken.Addr().(*net.TCPAddr).Port)
+
+	ctx := box.BaseContext()
+	var builds int
+	var bound uint16
+	startBoxOnFreePorts(t, ctx, func(port func(string) uint16) option.Options {
+		builds++
+		bound = port("tcp")
+		if builds == 1 {
+			bound = takenPort
+		}
+		opts, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(fmt.Sprintf(
+			`{"log":{"disabled":true},"inbounds":[{"type":"mixed","listen":"127.0.0.1","listen_port":%d}]}`, bound)))
+		require.NoError(t, err)
+		return opts
+	})
+	require.GreaterOrEqual(t, builds, 2, "a start that lost its port must build again")
+	require.NotEqual(t, takenPort, bound)
+}
+
+func freeUDPPort(t testing.TB) uint16 {
+	t.Helper()
+	c, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer c.Close()
+	return uint16(c.LocalAddr().(*net.UDPAddr).Port)
+}
+
+// startBoxOnFreePorts starts the box build returns and closes it at cleanup.
+// build takes its listen ports from port, which returns a free port on network
+// ("tcp" or "udp") per call. Another socket can bind a port after port returns
+// it, so a start that fails with EADDRINUSE runs build again for new ports.
+func startBoxOnFreePorts(t testing.TB, ctx context.Context, build func(port func(network string) uint16) option.Options) *sbox.Box {
+	t.Helper()
+	return startBoxOnFreePortsWith(t, ctx, build, nil)
+}
+
+// startBoxOnFreePortsWith is startBoxOnFreePorts with prepare, if not nil,
+// called on each box before it starts.
+func startBoxOnFreePortsWith(t testing.TB, ctx context.Context,
+	build func(port func(network string) uint16) option.Options, prepare func(*sbox.Box)) *sbox.Box {
+	t.Helper()
+	port := func(network string) uint16 {
+		switch network {
+		case "tcp":
+			return freePort(t)
+		case "udp":
+			return freeUDPPort(t)
+		}
+		t.Fatalf("no free port for network %q", network)
+		return 0
+	}
+	const attempts = 5
+	for i := 1; ; i++ {
+		b, err := sbox.New(sbox.Options{Context: ctx, Options: build(port)})
+		require.NoError(t, err)
+		if prepare != nil {
+			prepare(b)
+		}
+		err = b.Start()
+		if err == nil {
+			t.Cleanup(func() { b.Close() })
+			return b
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) || i == attempts {
+			require.NoError(t, err)
 		}
 	}
 }

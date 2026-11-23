@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
@@ -54,9 +53,6 @@ func TestTwiddleCarriesTCPAndUDPOverOneTunnel(t *testing.T) {
 	// which hellos are on the wire.
 	pool := tw.FormatPool(tw.DefaultPool()[:1])
 
-	serverPort := freePort(t)
-	clientPort := freePort(t)
-
 	serverOpts := twiddleOptions(boxCtx, t, "testdata/twiddle_server.json", map[string]string{
 		"TICKET_KEY": hex.EncodeToString(key[:]),
 	})
@@ -65,20 +61,20 @@ func TestTwiddleCarriesTCPAndUDPOverOneTunnel(t *testing.T) {
 		"PSK":        hex.EncodeToString(cred.PSK[:]),
 		"HELLO_POOL": strings.TrimSpace(pool),
 	})
-	serverOpts.Inbounds[0].Options.(*lboption.TwiddleInboundOptions).ListenPort = serverPort
-	clientOpts.Inbounds[0].Options.(*option.HTTPMixedInboundOptions).ListenPort = clientPort
+
+	var serverPort, clientPort uint16
+	startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+		serverPort = port("tcp")
+		serverOpts.Inbounds[0].Options.(*lboption.TwiddleInboundOptions).ListenPort = serverPort
+		return serverOpts
+	})
 	relay := startCountingRelay(t, serverPort)
 	clientOpts.Outbounds[0].Options.(*lboption.TwiddleOutboundOptions).ServerPort = relay.port
-
-	serverBox, err := sbox.New(sbox.Options{Context: boxCtx, Options: serverOpts})
-	require.NoError(t, err)
-	require.NoError(t, serverBox.Start())
-	t.Cleanup(func() { serverBox.Close() })
-
-	clientBox, err := sbox.New(sbox.Options{Context: boxCtx, Options: clientOpts})
-	require.NoError(t, err)
-	require.NoError(t, clientBox.Start())
-	t.Cleanup(func() { clientBox.Close() })
+	startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+		clientPort = port("tcp")
+		clientOpts.Inbounds[0].Options.(*option.HTTPMixedInboundOptions).ListenPort = clientPort
+		return clientOpts
+	})
 
 	client := socks.NewClient(
 		N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
