@@ -3851,10 +3851,9 @@ func drain(pc net.PacketConn) {
 
 func TestTrial_FailedUDPTrialSessionCloses(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s, _ := newConfirmationTestMUR(t, "a", "b")
 		s.stickyTag.udp.Store("a")
-		origin := s.originOf(obs["b"], trialRoute, s.networkGeneration.Load())
-		origin.trialFor = "a"
+		origin := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
 		c := newScriptedPacketConn()
 		dest := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 443}
 		pc := s.wrapPacket(c, origin, metadata.SocksaddrFromNet(dest))
@@ -3990,10 +3989,9 @@ func TestTrial_OldNetworksLocalFailureLeavesTheNewSetup(t *testing.T) {
 
 func TestTrial_AnsweredUDPTrialSessionStaysOpen(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s, _ := newConfirmationTestMUR(t, "a", "b")
 		s.stickyTag.udp.Store("a")
-		origin := s.originOf(obs["b"], trialRoute, s.networkGeneration.Load())
-		origin.trialFor = "a"
+		origin := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
 		c := newScriptedPacketConn()
 		dest := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 443}
 		pc := s.wrapPacket(c, origin, metadata.SocksaddrFromNet(dest))
@@ -4157,7 +4155,7 @@ func TestUDPSweep_SkipsAHandleNowWaitingOnTheDestination(t *testing.T) {
 
 func TestTrial_RepeatedFailureOnAKeptTrialHandleCounts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s, _ := newConfirmationTestMUR(t, "a", "b")
 		s.stickyTag.udp.Store("a")
 		generation := s.networkGeneration.Load()
 		dest := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 443}
@@ -4168,22 +4166,26 @@ func TestTrial_RepeatedFailureOnAKeptTrialHandleCounts(t *testing.T) {
 		s.access.Lock()
 		s.trialsLocked("udp").failures = 1
 		s.access.Unlock()
-		origin := s.originOf(obs["b"], trialRoute, generation)
-		origin.trialFor = "a"
+		origin := s.trialOriginAt("b", generation, "a")
 		c := newScriptedPacketConn()
 		pc := s.wrapPacket(c, origin, metadata.SocksaddrFromNet(dest))
 		defer pc.Close()
 		drain(pc)
-		for range 2 {
+		pending := func() string {
+			s.access.Lock()
+			defer s.access.Unlock()
+			return s.trialsLocked("udp").pending
+		}
+		for i := range 2 {
 			udpExchange(c, pc, dest, true)
+			synctest.Wait()
+			require.Equal(t, "b", pending(), "b's answer %d makes it the pending move", i+1)
 			time.Sleep(time.Second)
 			udpExchange(c, pc, dest, false)
 			time.Sleep(2 * defaultUDPUnansweredAfter)
 			synctest.Wait()
+			require.Empty(t, pending(), "b's failure %d after it answered drops the move", i+1)
 		}
-		s.access.Lock()
-		defer s.access.Unlock()
-		assert.Empty(t, s.trialsLocked("udp").pending, "b failed again after it last answered")
 	})
 }
 
