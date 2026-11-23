@@ -5,7 +5,6 @@ package e2e
 import (
 	"context"
 	"crypto/ed25519"
-	"fmt"
 	"io"
 	stdlog "log"
 	"net"
@@ -225,7 +224,7 @@ func TestDirectExitPersonalAndPoolSessions(t *testing.T) {
 	t.Cleanup(origin.Close)
 
 	rooms := newRoomKeys(t)
-	freddieURL := startRoomFreddie(t, ctx, cancel, rooms)
+	freddieURL := startRoomFreddie(t, ctx, rooms)
 
 	var egressDials atomic.Int64
 	egressURL := startCountingEgress(t, ctx, &egressDials)
@@ -304,20 +303,13 @@ func (k *roomKeys) ticket(t testing.TB, role helperticket.Role) string {
 }
 
 // startRoomFreddie runs a real Freddie that verifies k's room tickets, and so stamps a friend's
-// offer through their room with its pairing, which gets the volunteer's personal exit. cancel
-// ends ctx, which Freddie's shutdown waits on for in-flight long polls.
-func startRoomFreddie(t testing.TB, ctx context.Context, cancel context.CancelFunc, k *roomKeys) string {
+// offer through their room with its pairing, which gets the volunteer's personal exit.
+func startRoomFreddie(t testing.TB, ctx context.Context, k *roomKeys) string {
 	t.Helper()
-	freddieAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	f, err := freddie.New(ctx, freddieAddr)
-	require.NoError(t, err, "freddie.New")
-	t.Cleanup(func() { cancel(); _ = f.Shutdown() })
-	f.RoomTicket = helperticket.RoomFunc(k.keys, time.Now)
-	f.KnownKeyID = helperticket.KnownKeyFunc(k.keys)
-	go func() { _ = f.ListenAndServe() }()
-	freddieURL := "http://" + freddieAddr
-	waitForHTTP(t, freddieURL+"/v1/", 5*time.Second)
-	return freddieURL
+	return startFreddie(t, ctx, func(f *freddie.Freddie) {
+		f.RoomTicket = helperticket.RoomFunc(k.keys, time.Now)
+		f.KnownKeyID = helperticket.KnownKeyFunc(k.keys)
+	})
 }
 
 // e2ePoolAllowlist is the consumers' pool allowlist: every IP literal, so the exit box's own
@@ -365,7 +357,7 @@ func startDirectExitRig(t testing.TB, c directExitCase) *directExitRig {
 	// The consumer is the volunteer's friend, through their room: a lone consumer slot takes
 	// only a room's direct exit, which Freddie's stamp makes personal.
 	rooms := newRoomKeys(t)
-	freddieURL := startRoomFreddie(t, ctx, cancel, rooms)
+	freddieURL := startRoomFreddie(t, ctx, rooms)
 
 	rig := &directExitRig{
 		egressDials:    new(atomic.Int64),

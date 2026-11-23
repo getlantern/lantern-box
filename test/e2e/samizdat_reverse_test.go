@@ -22,6 +22,7 @@ import (
 
 	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/control"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -48,17 +49,14 @@ func TestSamizdatReverseThroughHelper(t *testing.T) {
 	require.NoError(t, err)
 	certPEM, keyPEM, pin := selfSignedCert(t)
 
-	socksPort := freePort(t)
-	portalPort := freePort(t)
-
 	inviterCtx := box.BaseContext()
-	inviterOpts := twiddleOptions(inviterCtx, t, "testdata/samizdat_reverse_inviter.json", map[string]string{
-		"SOCKS_PORT": strconv.Itoa(int(socksPort)),
+	var socksPort uint16
+	inviter := startBoxOnFreePorts(t, inviterCtx, func(port func(string) uint16) option.Options {
+		socksPort = port("tcp")
+		return twiddleOptions(inviterCtx, t, "testdata/samizdat_reverse_inviter.json", map[string]string{
+			"SOCKS_PORT": strconv.Itoa(int(socksPort)),
+		})
 	})
-	inviter, err := sbox.New(sbox.Options{Context: inviterCtx, Options: inviterOpts})
-	require.NoError(t, err)
-	require.NoError(t, inviter.Start())
-	t.Cleanup(func() { inviter.Close() })
 
 	// A desktop box binds the portal's listener to the default physical
 	// interface, as it must to keep the portal off a TUN, and loopback
@@ -71,18 +69,19 @@ func TestSamizdatReverseThroughHelper(t *testing.T) {
 	require.True(t, ok, "the inviter box has no portal inbound")
 	portal, ok := in.(interface {
 		Configure(samizdatreverse.PortalConfig) error
+		Addr() net.Addr
 	})
 	require.True(t, ok, "the portal inbound cannot be configured")
 	require.NoError(t, portal.Configure(samizdatreverse.PortalConfig{
-		ListenPort: portalPort,
 		PrivateKey: priv,
 		CertPEM:    certPEM,
 		KeyPEM:     keyPEM,
 		Pairings:   map[[8]byte]string{shortID: reverseTag},
 	}))
+	portalPort := portal.Addr().(*net.TCPAddr).Port
 
 	helperSubs := map[string]string{
-		"PORTAL_PORT": strconv.Itoa(int(portalPort)),
+		"PORTAL_PORT": strconv.Itoa(portalPort),
 		"PUBLIC_KEY":  hex.EncodeToString(pub),
 		"SHORT_ID":    hex.EncodeToString(shortID[:]),
 		"CERT_PIN":    hex.EncodeToString(pin[:]),

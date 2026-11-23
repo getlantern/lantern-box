@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	stdlog "log"
@@ -13,8 +14,10 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -24,7 +27,6 @@ import (
 	"github.com/getlantern/broflake/common/helperticket"
 	"github.com/getlantern/broflake/egress"
 	"github.com/getlantern/broflake/freddie"
-	sbox "github.com/sagernet/sing-box"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -82,15 +84,7 @@ func TestUnboundedE2E(t *testing.T) {
 	t.Cleanup(upstream.Close)
 
 	// 2. Freddie.
-	freddieAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	f, err := freddie.New(ctx, freddieAddr)
-	require.NoError(t, err, "freddie.New")
-	// Shutdown waits on f's context for in-flight long polls; cancel it
-	// first so the listener closes without that wait.
-	t.Cleanup(func() { cancel(); _ = f.Shutdown() })
-	go func() { _ = f.ListenAndServe() }()
-	freddieURL := "http://" + freddieAddr
-	waitForHTTP(t, freddieURL+"/v1/", 5*time.Second)
+	freddieURL := startFreddie(t, ctx, nil)
 
 	// 3. Egress: a plain SOCKS5 server behind the broflake egress layer.
 	egressURL := startEgress(t, ctx)
@@ -212,6 +206,19 @@ func startConsumersWith(t testing.TB, ctx context.Context, freddieURL, egressURL
 		boxCtx = lbAdapter.ContextWithRoomTicketSource(boxCtx, func() []string { return tickets })
 	}
 
+	var addrs map[string]string
+	startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+		opts, a := consumerOptions(freddieURL, egressURL, tags, configure, port)
+		addrs = a
+		return opts
+	})
+	return addrs
+}
+
+// consumerOptions is the consumer box's options, with a mixed inbound on a port
+// from port routed to each tag's outbound, and each inbound's address by tag.
+func consumerOptions(freddieURL, egressURL string, tags []string,
+	configure func(*lbOption.UnboundedOutboundOptions), port func(string) uint16) (option.Options, map[string]string) {
 	listenAddr := badoption.Addr(netip.MustParseAddr("127.0.0.1"))
 	opts := option.Options{
 		Log:   &option.LogOptions{Disabled: true},
@@ -219,7 +226,7 @@ func startConsumersWith(t testing.TB, ctx context.Context, freddieURL, egressURL
 	}
 	addrs := make(map[string]string, len(tags))
 	for _, tag := range tags {
-		inboundPort := freePort(t)
+		inboundPort := port("tcp")
 		inTag := "in-" + tag
 		opts.Inbounds = append(opts.Inbounds, option.Inbound{
 			Type: "mixed",
@@ -259,33 +266,83 @@ func startConsumersWith(t testing.TB, ctx context.Context, freddieURL, egressURL
 		})
 		addrs[tag] = fmt.Sprintf("127.0.0.1:%d", inboundPort)
 	}
-
-	b, err := sbox.New(sbox.Options{
-		Context: boxCtx,
-		Options: opts,
-	})
-	require.NoError(t, err, "sbox.New")
-	require.NoError(t, b.Start(), "sbox Start")
-	t.Cleanup(func() { _ = b.Close() })
-
-	return addrs
+	return opts, addrs
 }
 
-// waitForHTTP polls the given URL until it returns any response (even an
-// error status) or the deadline passes. Used as a readiness gate for freddie.
-func waitForHTTP(t testing.TB, target string, timeout time.Duration) {
+// startFreddie runs a Freddie on a free port, set up by configure, if not nil,
+// before it serves, and returns its URL. Another socket can bind the port
+// after freePort returns it, so a serve that fails with EADDRINUSE is retried
+// on a new port.
+func startFreddie(t testing.TB, ctx context.Context, configure func(*freddie.Freddie)) string {
 	t.Helper()
+	const attempts = 5
+	for i := 1; ; i++ {
+		addr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+		fctx, cancel := context.WithCancel(ctx)
+		f, err := freddie.New(fctx, addr)
+		require.NoError(t, err, "freddie.New")
+		// Shutdown waits on fctx for in-flight long polls; cancel it first so
+		// the listener closes without that wait.
+		t.Cleanup(func() { cancel(); _ = f.Shutdown() })
+		if configure != nil {
+			configure(f)
+		}
+		served := make(chan error, 1)
+		go func() { served <- f.ListenAndServe() }()
+		freddieURL := "http://" + addr
+		err = waitForFreddie(freddieURL, served, 5*time.Second)
+		if err == nil {
+			return freddieURL
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) || i == attempts {
+			require.NoError(t, err, "freddie")
+		}
+	}
+}
+
+// waitForFreddie polls the Freddie at freddieURL until its health check
+// answers. It returns the error received on served if the server stops first.
+// Only a body naming Freddie counts, since another server may hold the port.
+func waitForFreddie(freddieURL string, served <-chan error, timeout time.Duration) error {
 	client := &http.Client{Timeout: 1 * time.Second}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(target)
-		if err == nil {
-			resp.Body.Close()
-			return
+		select {
+		case err := <-served:
+			return err
+		default:
+		}
+		if isFreddie(client, freddieURL) {
+			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("%s never became ready within %s", target, timeout)
+	return fmt.Errorf("%s never became ready within %s", freddieURL, timeout)
+}
+
+func TestWaitForFreddieRejectsAnotherServer(t *testing.T) {
+	other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer other.Close()
+	addr := other.Listener.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f, err := freddie.New(ctx, addr)
+	require.NoError(t, err)
+	served := make(chan error, 1)
+	go func() { served <- f.ListenAndServe() }()
+	require.ErrorIs(t, waitForFreddie("http://"+addr, served, 5*time.Second), syscall.EADDRINUSE,
+		"another server answering on Freddie's port must not pass for Freddie")
+}
+
+func isFreddie(client *http.Client, freddieURL string) bool {
+	resp, err := client.Get(freddieURL + "/healthz")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	return err == nil && strings.HasPrefix(string(body), "freddie (")
 }
 
 // consumerSeq numbers consumers so that each has its own session ID.
@@ -340,16 +397,9 @@ func TestUnboundedRoomE2E(t *testing.T) {
 	}))
 	t.Cleanup(upstream.Close)
 
-	freddieAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	f, err := freddie.New(ctx, freddieAddr)
-	require.NoError(t, err, "freddie.New")
-	// Shutdown waits on f's context for in-flight long polls; cancel it
-	// first so the listener closes without that wait.
-	t.Cleanup(func() { cancel(); _ = f.Shutdown() })
-	f.RoomTicket = helperticket.RoomFunc(func() []helperticket.Key { return keys }, time.Now)
-	go func() { _ = f.ListenAndServe() }()
-	freddieURL := "http://" + freddieAddr
-	waitForHTTP(t, freddieURL+"/v1/", 5*time.Second)
+	freddieURL := startFreddie(t, ctx, func(f *freddie.Freddie) {
+		f.RoomTicket = helperticket.RoomFunc(func() []helperticket.Key { return keys }, time.Now)
+	})
 
 	egressURL := startEgress(t, ctx)
 

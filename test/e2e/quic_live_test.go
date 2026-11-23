@@ -18,6 +18,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/sagernet/sing-box/option"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/protocol/socks"
@@ -51,21 +52,26 @@ func TestHysteria2XLiveQUICSites(t *testing.T) {
 	for _, junk := range []bool{false, true} {
 		t.Run(fmt.Sprintf("pre_initial_junk=%t", junk), func(t *testing.T) {
 			boxCtx := box.BaseContext()
-			serverPort := freeUDPPort(t)
-			clientPort := freePort(t)
-			startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
-				"log": {"level": "error"},
-				"inbounds": [{"type": "hysteria2", "listen": "127.0.0.1", "listen_port": %d,
-					"users": [{"password": "pw"}], "tls": {"enabled": true, "insecure": true}}],
-				"outbounds": [{"type": "direct"}]
-			}`, serverPort)))
-			startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
-				"log": {"level": "error"},
-				"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
-				"outbounds": [{"type": "hysteria2x", "server": "127.0.0.1", "server_port": %d,
-					"password": "pw", "pre_initial_junk": %t,
-					"tls": {"enabled": true, "server_name": "example.com", "insecure": true}}]
-			}`, clientPort, serverPort, junk)))
+			var serverPort, clientPort uint16
+			startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+				serverPort = port("udp")
+				return mustOptions(boxCtx, t, fmt.Sprintf(`{
+					"log": {"level": "error"},
+					"inbounds": [{"type": "hysteria2", "listen": "127.0.0.1", "listen_port": %d,
+						"users": [{"password": "pw"}], "tls": {"enabled": true, "insecure": true}}],
+					"outbounds": [{"type": "direct"}]
+				}`, serverPort))
+			})
+			startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+				clientPort = port("tcp")
+				return mustOptions(boxCtx, t, fmt.Sprintf(`{
+					"log": {"level": "error"},
+					"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+					"outbounds": [{"type": "hysteria2x", "server": "127.0.0.1", "server_port": %d,
+						"password": "pw", "pre_initial_junk": %t,
+						"tls": {"enabled": true, "server_name": "example.com", "insecure": true}}]
+				}`, clientPort, serverPort, junk))
+			})
 
 			sc := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
 			for _, u := range sites {
@@ -144,12 +150,15 @@ func TestOutlineLiveQUICSites(t *testing.T) {
 		t.Skip("set QUIC_LIVE=1 to run against live QUIC sites")
 	}
 	boxCtx := box.BaseContext()
-	clientPort := freePort(t)
-	startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
-		"log": {"level": "error"},
-		"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
-		"outbounds": [{"type": "outline", "domains": ["example.com"], "udp": %q}]
-	}`, clientPort, cmp.Or(os.Getenv("OUTLINE_UDP"), "quicprelude:count=1"))))
+	var clientPort uint16
+	startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+		clientPort = port("tcp")
+		return mustOptions(boxCtx, t, fmt.Sprintf(`{
+			"log": {"level": "error"},
+			"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+			"outbounds": [{"type": "outline", "domains": ["example.com"], "udp": %q}]
+		}`, clientPort, cmp.Or(os.Getenv("OUTLINE_UDP"), "quicprelude:count=1")))
+	})
 	sc := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
 	for _, u := range []string{"https://www.youtube.com/", "https://i.ytimg.com/generate_204", "https://www.google.com/generate_204", "https://cloudflare-quic.com/"} {
 		proto, n, err := h3Get(t, u, sc)
@@ -168,17 +177,20 @@ func TestHedgeLiveQUICSites(t *testing.T) {
 		t.Skip("set QUIC_LIVE=1 to run against live QUIC sites")
 	}
 	boxCtx := box.BaseContext()
-	clientPort := freePort(t)
-	startBox(t, boxCtx, mustOptions(boxCtx, t, fmt.Sprintf(`{
-		"log": {"level": "error"},
-		"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
-		"outbounds": [
-			{"type": "hedge", "tag": "smart", "first": "proxyless", "then": "direct"},
-			{"type": "outline", "tag": "proxyless", "domains": ["example.com"], "udp": "quicprelude:count=1"},
-			{"type": "direct", "tag": "direct"}
-		],
-		"route": {"final": "smart"}
-	}`, clientPort)))
+	var clientPort uint16
+	startBoxOnFreePorts(t, boxCtx, func(port func(string) uint16) option.Options {
+		clientPort = port("tcp")
+		return mustOptions(boxCtx, t, fmt.Sprintf(`{
+			"log": {"level": "error"},
+			"inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": %d}],
+			"outbounds": [
+				{"type": "hedge", "tag": "smart", "first": "proxyless", "then": "direct"},
+				{"type": "outline", "tag": "proxyless", "domains": ["example.com"], "udp": "quicprelude:count=1"},
+				{"type": "direct", "tag": "direct"}
+			],
+			"route": {"final": "smart"}
+		}`, clientPort))
+	})
 	sc := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
 	for _, u := range []string{"https://www.youtube.com/", "https://i.ytimg.com/generate_204", "https://www.google.com/generate_204", "https://cloudflare-quic.com/"} {
 		proto, n, err := h3Get(t, u, sc)

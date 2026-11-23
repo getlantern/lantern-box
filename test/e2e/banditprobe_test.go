@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
@@ -46,23 +45,22 @@ func probeThrough(t *testing.T, serverInbound, clientOutbound string) {
 // getting the probe's answer, for tests that expect the route to fail.
 func probeThroughErr(t *testing.T, serverInbound, clientOutbound string) error {
 	ctx := box.BaseContext()
-	serverPort, clientPort := freePort(t), freePort(t)
 	callbackURL := fmt.Sprintf("https://127.0.0.1:%d/v1/bandit/callback", freePort(t))
-	srv := fmt.Sprintf(probeServer(serverInbound, callbackURL), serverPort)
-	cli := fmt.Sprintf(`{"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],"outbounds":[`+clientOutbound+`]}`, clientPort, serverPort)
-
-	so, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(srv))
-	require.NoError(t, err)
-	co, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(cli))
-	require.NoError(t, err)
-	sb, err := sbox.New(sbox.Options{Context: ctx, Options: so})
-	require.NoError(t, err)
-	require.NoError(t, sb.Start())
-	t.Cleanup(func() { sb.Close() })
-	cb, err := sbox.New(sbox.Options{Context: ctx, Options: co})
-	require.NoError(t, err)
-	require.NoError(t, cb.Start())
-	t.Cleanup(func() { cb.Close() })
+	var serverPort, clientPort uint16
+	startBoxOnFreePorts(t, ctx, func(port func(string) uint16) option.Options {
+		serverPort = port("tcp")
+		srv := fmt.Sprintf(probeServer(serverInbound, callbackURL), serverPort)
+		so, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(srv))
+		require.NoError(t, err)
+		return so
+	})
+	startBoxOnFreePorts(t, ctx, func(port func(string) uint16) option.Options {
+		clientPort = port("tcp")
+		cli := fmt.Sprintf(`{"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],"outbounds":[`+clientOutbound+`]}`, clientPort, serverPort)
+		co, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(cli))
+		require.NoError(t, err)
+		return co
+	})
 
 	client := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
 	hc := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{

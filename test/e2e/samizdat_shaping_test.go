@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/option"
 	sjson "github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
@@ -118,16 +117,17 @@ func sentSessionID(t *testing.T, outboundExtra string) ([]byte, [8]byte) {
 	}()
 
 	ctx := box.BaseContext()
-	clientPort := freePort(t)
-	cli := fmt.Sprintf(`{"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],`+
-		`"outbounds":[{"type":"samizdat","tag":"samizdat-out","server":"127.0.0.1","server_port":%d,`+
-		`"public_key":"%s","short_id":"%s","server_name":"localhost","disable_tcp_fragmentation":true%s}]}`,
-		clientPort, ln.Addr().(*net.TCPAddr).Port, hex.EncodeToString(pub), hex.EncodeToString(sid[:]), outboundExtra)
-	co, err := sjson.UnmarshalExtendedContext[option.Options](ctx, []byte(cli))
-	require.NoError(t, err)
-	cb, err := sbox.New(sbox.Options{Context: ctx, Options: co})
-	require.NoError(t, err)
-	require.NoError(t, cb.Start())
+	var clientPort uint16
+	cb := startBoxOnFreePorts(t, ctx, func(port func(string) uint16) option.Options {
+		clientPort = port("tcp")
+		cli := fmt.Sprintf(`{"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],`+
+			`"outbounds":[{"type":"samizdat","tag":"samizdat-out","server":"127.0.0.1","server_port":%d,`+
+			`"public_key":"%s","short_id":"%s","server_name":"localhost","disable_tcp_fragmentation":true%s}]}`,
+			clientPort, ln.Addr().(*net.TCPAddr).Port, hex.EncodeToString(pub), hex.EncodeToString(sid[:]), outboundExtra)
+		co, err := sjson.UnmarshalExtendedContext[option.Options](ctx, []byte(cli))
+		require.NoError(t, err)
+		return co
+	})
 	defer cb.Close()
 
 	client := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
