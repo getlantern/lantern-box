@@ -699,19 +699,23 @@ func (s *MutableAutoSelect) URLTest(ctx context.Context) (map[string]uint16, err
 // passed, or through an outage, only adds probes and probe failures.
 const earlyConfirmCooldown = 30 * time.Second
 
-// requestEarlyConfirmation confirms tag, the TCP selection, when its traffic
-// is slow to be answered: unless a confirmation of tag is running or
-// concluded within earlyConfirmCooldown.
-func (s *MutableAutoSelect) requestEarlyConfirmation(tag string, generation uint64) {
+// requestEarlyConfirmation confirms origin's member, the TCP selection, when
+// its traffic is slow to be answered: unless a confirmation of it is running
+// or concluded within earlyConfirmCooldown.
+func (s *MutableAutoSelect) requestEarlyConfirmation(origin connOrigin) {
 	s.access.Lock()
-	state := s.probeMembers[tag]
-	skip := state == nil || state.confirmationPending ||
-		(!state.firstConfirmFailedAt.IsZero() && time.Since(state.firstConfirmFailedAt) <= confirmStrikeWindow) ||
-		(!state.confirmedAt.IsZero() && time.Since(state.confirmedAt) < earlyConfirmCooldown)
-	s.access.Unlock()
-	if !skip {
-		s.requestFailureConfirmation(tag, "", generation)
+	defer s.access.Unlock()
+	if !s.originCurrentLocked(origin) {
+		return
 	}
+	tag := origin.out.Tag()
+	state := s.probeMembers[tag]
+	if state.confirmationPending ||
+		(!state.firstConfirmFailedAt.IsZero() && time.Since(state.firstConfirmFailedAt) <= confirmStrikeWindow) ||
+		(!state.confirmedAt.IsZero() && time.Since(state.confirmedAt) < earlyConfirmCooldown) {
+		return
+	}
+	s.requestFailureConfirmationLocked(tag, "", origin.generation)
 }
 
 // confirmStrikeWindow bounds the gap between the two consecutive failed
@@ -767,9 +771,19 @@ func (s *MutableAutoSelect) forceProbesLocked(tags ...string) {
 	s.dispatchProbesLocked()
 }
 
-func (s *MutableAutoSelect) requestFailureConfirmation(tag, replacement string, generation uint64) {
+// requestFailureConfirmation confirms origin's member, the TCP selection, with
+// replacement, if not empty, as the member to move to should it fail.
+func (s *MutableAutoSelect) requestFailureConfirmation(origin connOrigin, replacement string) {
 	s.access.Lock()
 	defer s.access.Unlock()
+	if s.originCurrentLocked(origin) {
+		s.requestFailureConfirmationLocked(origin.out.Tag(), replacement, origin.generation)
+	}
+}
+
+// requestFailureConfirmationLocked is requestFailureConfirmation for tag,
+// with s.access held.
+func (s *MutableAutoSelect) requestFailureConfirmationLocked(tag, replacement string, generation uint64) {
 	if s.isClosed() || s.paused() || !s.matchesGenerationLocked(generation) || loadString(&s.stickyTag.tcp) != tag ||
 		s.outageSuspectedLocked() {
 		return

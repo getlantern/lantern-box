@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -197,13 +196,13 @@ func TestSelectOutbound_ReleasesStickyAfterConsecutiveFailures(t *testing.T) {
 		s.stickyTag.tcp.Store("a")
 		generation := s.networkGeneration.Load()
 
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		time.Sleep(time.Second)
 		out, _, err := s.selectOutbound("tcp", "")
 		require.NoError(t, err)
 		require.Equal(t, "a", out.Tag(), "one unanswered conn keeps the selection")
 
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		out, _, err = s.selectOutbound("tcp", "")
 		require.NoError(t, err)
 		require.Equal(t, "b", out.Tag(), "a second consecutive one releases it")
@@ -217,7 +216,7 @@ func TestRecordUserFailure_StockLogger(t *testing.T) {
 	defer factory.Close()
 	s.logger = factory.Logger()
 	require.NotPanics(t, func() {
-		s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp", nil)
+		s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureDial, time.Time{}, "tcp", nil)
 	})
 }
 
@@ -365,8 +364,8 @@ func TestNoteUnanswered_IgnoresStaleGeneration(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	generation := s.networkGeneration.Load()
 	s.InterfaceUpdated(context.Background())
-	s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
-	s.noteUnanswered("missing", s.networkGeneration.Load(), "tcp", "", time.Now(), time.Now())
+	s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
+	s.noteUnanswered(s.originAt("missing", s.networkGeneration.Load()), "tcp", "", time.Now(), time.Now())
 	_, ok := s.peekHistoryLocked("missing")
 	assert.False(t, ok, "a non-member gets no history")
 	if h, ok := s.peekHistoryLocked("a"); ok {
@@ -383,9 +382,9 @@ func TestSelectOutbound_StreakReleaseCooldown(t *testing.T) {
 		s.stickyTag.tcp.Store("a")
 		generation := s.networkGeneration.Load()
 		release := func(tag string) string {
-			s.noteUnanswered(tag, generation, "tcp", "", time.Now(), time.Now())
+			s.noteUnanswered(s.originAt(tag, generation), "tcp", "", time.Now(), time.Now())
 			time.Sleep(time.Second)
-			s.noteUnanswered(tag, generation, "tcp", "", time.Now(), time.Now())
+			s.noteUnanswered(s.originAt(tag, generation), "tcp", "", time.Now(), time.Now())
 			out, _, err := s.selectOutbound("tcp", "")
 			require.NoError(t, err)
 			return out.Tag()
@@ -393,7 +392,7 @@ func TestSelectOutbound_StreakReleaseCooldown(t *testing.T) {
 		require.Equal(t, "b", release("a"))
 
 		time.Sleep(time.Second)
-		s.noteUserResponse("b", generation, "tcp", "", time.Now().Add(-time.Hour), time.Now())
+		s.noteUserResponse(s.originAt("b", generation), "tcp", "", time.Now().Add(-time.Hour), time.Now())
 		time.Sleep(time.Minute)
 		require.Equal(t, "b", release("b"), "a member that answered since the last release keeps the selection within the cooldown")
 
@@ -411,9 +410,9 @@ func TestSelectOutbound_StreakReleaseSkipsCooldownForSilentPick(t *testing.T) {
 		s.stickyTag.tcp.Store("a")
 		generation := s.networkGeneration.Load()
 		for _, tag := range []string{"a", "b"} {
-			s.noteUnanswered(tag, generation, "tcp", "", time.Now(), time.Now())
+			s.noteUnanswered(s.originAt(tag, generation), "tcp", "", time.Now(), time.Now())
 			time.Sleep(time.Second)
-			s.noteUnanswered(tag, generation, "tcp", "", time.Now(), time.Now())
+			s.noteUnanswered(s.originAt(tag, generation), "tcp", "", time.Now(), time.Now())
 			_, _, err := s.selectOutbound("tcp", "")
 			require.NoError(t, err)
 		}
@@ -432,9 +431,9 @@ func TestNoteUnanswered_IgnoredWhenMemberAnsweredMeanwhile(t *testing.T) {
 			waiting := time.Now()
 			time.Sleep(time.Second)
 			// An answer on a conn opened long ago leaves the streak alone.
-			s.noteUserResponse("a", generation, "tcp", "", waiting.Add(-time.Hour), time.Now())
+			s.noteUserResponse(s.originAt("a", generation), "tcp", "", waiting.Add(-time.Hour), time.Now())
 			time.Sleep(time.Second)
-			s.noteUnanswered("a", generation, "tcp", "", time.Now(), waiting)
+			s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), waiting)
 		}
 		out, _, err := s.selectOutbound("tcp", "")
 		require.NoError(t, err)
@@ -473,7 +472,7 @@ func TestSelectOutbound_SlowProbesStillRelease(t *testing.T) {
 		obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(time.Second), nil }
 		generation := s.networkGeneration.Load()
 		for range 4 {
-			s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+			s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 			time.Sleep(250 * time.Millisecond)
 			if out, _, err := s.selectOutbound("tcp", ""); err == nil && out.Tag() == "b" {
 				return
@@ -597,15 +596,15 @@ func TestNoteUnanswered_UDPNeedsAnAnsweredDestination(t *testing.T) {
 		s, _ := newTestMUR(t, "a", "b")
 		generation := s.networkGeneration.Load()
 		twice := func(dest string) uint32 {
-			s.noteUnanswered("a", generation, "udp", dest, time.Now(), time.Now())
+			s.noteUnanswered(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
 			time.Sleep(time.Second)
-			s.noteUnanswered("a", generation, "udp", dest, time.Now(), time.Now())
+			s.noteUnanswered(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
 			h, _ := s.peekHistoryLocked("a")
 			return h.streakCount(streakUDP, time.Now(), s.hist.userFailureWindow)
 		}
 		require.Zero(t, twice("silent.test:123"), "a destination that never answered is no evidence")
 
-		s.noteUserResponse("a", generation, "udp", "service.test:443", time.Now(), time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "udp", "service.test:443", time.Now(), time.Now())
 		time.Sleep(time.Second)
 		require.EqualValues(t, 2, twice("service.test:443"), "a destination that answered before is")
 	})
@@ -619,13 +618,13 @@ func TestFailureStreak_PerNetwork(t *testing.T) {
 		s.stickyTag.tcp.Store("a")
 		s.stickyTag.udp.Store("a")
 		generation := s.networkGeneration.Load()
-		s.noteUserResponse("a", generation, "udp", "dns:53", time.Now(), time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "udp", "dns:53", time.Now(), time.Now())
 		time.Sleep(time.Second)
 		for range 2 {
-			s.noteUnanswered("a", generation, "udp", "dns:53", time.Now(), time.Now())
+			s.noteUnanswered(s.originAt("a", generation), "udp", "dns:53", time.Now(), time.Now())
 			time.Sleep(time.Second)
 			// A TCP answer on a newer conn doesn't end the UDP streak.
-			s.noteUserResponse("a", generation, "tcp", "", time.Now(), time.Now())
+			s.noteUserResponse(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 			time.Sleep(time.Second)
 		}
 		udp, _, err := s.selectOutbound("udp", "")
@@ -642,11 +641,11 @@ func TestNoteUserResponse_AnyUDPAnswerEndsStreak(t *testing.T) {
 		s, _ := newTestMUR(t, "a")
 		generation := s.networkGeneration.Load()
 		old := time.Now()
-		s.noteUserResponse("a", generation, "udp", "dns:53", old, old)
+		s.noteUserResponse(s.originAt("a", generation), "udp", "dns:53", old, old)
 		time.Sleep(time.Second)
-		s.noteUnanswered("a", generation, "udp", "dns:53", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "udp", "dns:53", time.Now(), time.Now())
 		time.Sleep(time.Second)
-		s.noteUserResponse("a", generation, "udp", "dns:53", old, time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "udp", "dns:53", old, time.Now())
 		h, _ := s.peekHistoryLocked("a")
 		assert.Zero(t, h.streakCount(streakUDP, time.Now(), s.hist.userFailureWindow),
 			"a late reply on a handle opened before the failure still shows UDP working")
@@ -696,9 +695,9 @@ func TestNoteUserResponse_KeepsStoredHistory(t *testing.T) {
 			require.Equal(t, "a", out.Tag())
 			generation := s.networkGeneration.Load()
 			if note == "response" {
-				s.noteUserResponse("a", generation, "tcp", "", time.Now(), time.Now())
+				s.noteUserResponse(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 			} else {
-				s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+				s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 			}
 			out, _, err = s.selectOutbound("tcp", "")
 			require.NoError(t, err)
@@ -711,10 +710,10 @@ func TestNoteUnanswered_UDPDestinationOutlivesFailureWindow(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, _ := newTestMUR(t, "a")
 		generation := s.networkGeneration.Load()
-		s.noteUserResponse("a", generation, "udp", "dns:53", time.Now(), time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "udp", "dns:53", time.Now(), time.Now())
 		time.Sleep(s.hist.userFailureWindow + time.Minute)
 		for range 2 {
-			s.noteUnanswered("a", generation, "udp", "dns:53", time.Now(), time.Now())
+			s.noteUnanswered(s.originAt("a", generation), "udp", "dns:53", time.Now(), time.Now())
 			time.Sleep(time.Second)
 		}
 		h, _ := s.peekHistoryLocked("a")
@@ -1019,7 +1018,7 @@ func TestConfirmation_OneFailureDoesNotSwitch(t *testing.T) {
 			return probeResponderConn(), nil
 		}
 		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		synctest.Wait()
 		assert.EqualValues(t, 2, probes.Load(), "a failed confirmation is confirmed once more")
 		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "one failed probe doesn't move the selection")
@@ -1035,14 +1034,14 @@ func TestEarlyConfirmation_Cooldown(t *testing.T) {
 			return probeResponderConn(), nil
 		}
 		generation := s.networkGeneration.Load()
-		s.requestEarlyConfirmation("a", generation)
+		s.requestEarlyConfirmation(s.originAt("a", generation))
 		synctest.Wait()
 		time.Sleep(10 * time.Second)
-		s.requestEarlyConfirmation("a", generation)
+		s.requestEarlyConfirmation(s.originAt("a", generation))
 		synctest.Wait()
 		require.EqualValues(t, 1, probes.Load(), "no second early confirmation within the cooldown")
 		time.Sleep(earlyConfirmCooldown)
-		s.requestEarlyConfirmation("a", generation)
+		s.requestEarlyConfirmation(s.originAt("a", generation))
 		synctest.Wait()
 		require.EqualValues(t, 2, probes.Load(), "another once it passes")
 	})
@@ -1055,18 +1054,18 @@ func TestConfirmation_OutageHoldsOffConfirmations(t *testing.T) {
 		failingProbes(obs["a"], &aProbes, hangUntilDone)
 		failingProbes(obs["b"], &bProbes, hangUntilDone)
 		generation := s.networkGeneration.Load()
-		s.requestFailureConfirmation("a", "", generation)
+		s.requestFailureConfirmation(s.originAt("a", generation), "")
 		synctest.Wait()
 		require.Equal(t, "a", loadString(&s.stickyTag.tcp), "nothing to move to")
 		probed := aProbes.Load()
-		s.requestFailureConfirmation("a", "", generation)
+		s.requestFailureConfirmation(s.originAt("a", generation), "")
 		synctest.Wait()
 		assert.Equal(t, probed, aProbes.Load(), "with nothing reachable, confirmations are held off")
 
 		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 		requestTestProbes(s, []string{"b"}, probeForced)
 		synctest.Wait()
-		s.requestFailureConfirmation("a", "", generation)
+		s.requestFailureConfirmation(s.originAt("a", generation), "")
 		synctest.Wait()
 		assert.Greater(t, aProbes.Load(), probed, "a passing probe ends the hold-off")
 	})
@@ -1081,7 +1080,7 @@ func TestConfirmation_SwitchWaitsForReplacementProbe(t *testing.T) {
 			time.Sleep(time.Second)
 			return probeResponderConn(), nil
 		}
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		time.Sleep(2 * time.Second)
 		synctest.Wait()
 		assert.Equal(t, "b", loadString(&s.stickyTag.tcp),
@@ -1130,14 +1129,14 @@ func TestEarlyConfirmation_SkippedRearmLeavesNoStrike(t *testing.T) {
 		}
 		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 		generation := s.networkGeneration.Load()
-		s.requestEarlyConfirmation("a", generation)
+		s.requestEarlyConfirmation(s.originAt("a", generation))
 		synctest.Wait()
 		s.stickyTag.tcp.Store("b")
 		close(release)
 		synctest.Wait()
 		s.stickyTag.tcp.Store("a")
 		time.Sleep(2 * time.Minute)
-		s.requestEarlyConfirmation("a", generation)
+		s.requestEarlyConfirmation(s.originAt("a", generation))
 		synctest.Wait()
 		assert.EqualValues(t, 2, probes.Load(), "a first strike whose second confirmation never ran doesn't hold off early confirmation")
 	})
@@ -1170,7 +1169,7 @@ func TestConfirmation_ProbesPastFailedReplacements(t *testing.T) {
 			failingProbes(obs[tag], &probes, hangUntilDone)
 		}
 		obs["e"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		synctest.Wait()
 		assert.Equal(t, "e", loadString(&s.stickyTag.tcp),
 			"when the first replacements probed fail too, the next are probed before giving up")
@@ -1212,7 +1211,7 @@ func TestConfirmation_RecheckAfterMixedPicture(t *testing.T) {
 		for _, tag := range tags {
 			obs[tag].dial = networkDownUntil(up)
 		}
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		time.Sleep(time.Minute)
 		synctest.Wait()
 		s.access.Lock()
@@ -1251,7 +1250,7 @@ func TestOutage_SuspicionLastsUntilAnAnswer(t *testing.T) {
 	s.access.Unlock()
 
 	opened := time.Now().Add(-time.Second)
-	s.noteUserResponse("b", s.networkGeneration.Load(), "tcp", "", time.Now(), time.Now())
+	s.noteUserResponse(s.originAt("b", s.networkGeneration.Load()), "tcp", "", time.Now(), time.Now())
 	s.access.Lock()
 	defer s.access.Unlock()
 	assert.False(t, s.outageSuspectedLocked(), "an answer ends it")
@@ -1266,13 +1265,13 @@ func TestStreak_TCPSelectionFailingProbesLeftToConfirmation(t *testing.T) {
 		recordSuccess(s, "b", 110)
 		s.stickyTag.tcp.Store("a")
 		generation := s.networkGeneration.Load()
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		time.Sleep(time.Second)
 		s.access.Lock()
 		s.recordProbeOutcomeLocked("a", &probeOutcome{success: false, generation: generation, url: s.probeURLForLocked("a")})
 		s.probeMembers["a"].firstConfirmFailedAt = time.Now()
 		s.access.Unlock()
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		out, _, err := s.selectOutbound("tcp", "")
 		require.NoError(t, err)
 		assert.Equal(t, "a", out.Tag(), "a selection whose own probe failed during the streak is the confirmations' to judge")
@@ -1294,7 +1293,7 @@ func TestConfirmation_ClosesFreshUnansweredConns(t *testing.T) {
 			conn.Read(make([]byte, 8))
 			close(closed)
 		}()
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		synctest.Wait()
 		require.Equal(t, "b", loadString(&s.stickyTag.tcp))
 		select {
@@ -1514,7 +1513,7 @@ func TestConfirmation_ProbesSoftDemotedReplacement(t *testing.T) {
 			h.addWindowFailure(adapter.UserFailure{At: time.Now().Add(time.Duration(i) * time.Second), Kind: adapter.UserFailureDial}, s.hist.userFailureWindow, 0)
 		}
 		s.access.Unlock()
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		synctest.Wait()
 		assert.Equal(t, "b", loadString(&s.stickyTag.tcp), "a soft-demoted member is probed and taken when the selection fails")
 		s.access.Lock()
@@ -1532,7 +1531,7 @@ func TestConfirmation_CooldownVetoIsNoOutage(t *testing.T) {
 		s.access.Lock()
 		s.lastConfirmedFailureSwitch.at, s.lastConfirmedFailureSwitch.selectedTag = time.Now(), "x"
 		s.access.Unlock()
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		synctest.Wait()
 		require.EqualValues(t, 2, aProbes.Load(), "both confirmations failed")
 		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "the switch cooldown holds the selection")
@@ -1553,7 +1552,7 @@ func TestConfirmation_LongProbeTimeoutStillConcludes(t *testing.T) {
 			return hangUntilDone(ctx)
 		}
 		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		time.Sleep(3 * time.Minute)
 		synctest.Wait()
 		assert.Equal(t, "b", loadString(&s.stickyTag.tcp),
@@ -1579,12 +1578,12 @@ func TestStreak_FailedProbeWithoutConfirmationReleases(t *testing.T) {
 		s, obs := newConfirmationTestMUR(t, "a", "b")
 		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 		generation := s.networkGeneration.Load()
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		time.Sleep(time.Second)
 		s.access.Lock()
 		s.recordProbeOutcomeLocked("a", &probeOutcome{success: false, generation: generation, url: s.probeURLForLocked("a")})
 		s.access.Unlock()
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		synctest.Wait()
 		out, _, err := s.selectOutbound("tcp", "")
 		require.NoError(t, err)
@@ -1618,9 +1617,9 @@ func TestSelectOutbound_StreakReleaseToUnmeasuredWaitsForProbe(t *testing.T) {
 		obs["c"].dial = hangUntilDone
 		s.stickyTag.tcp.Store("a")
 		generation := s.networkGeneration.Load()
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		time.Sleep(time.Second)
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		out, _, err := s.selectOutbound("tcp", "")
 		require.NoError(t, err)
 		assert.Equal(t, "a", out.Tag(), "a streak-demoted selection waits for an unmeasured member's probe to pass")
@@ -1647,8 +1646,8 @@ func TestOutage_SuspicionDropsFailureStreaks(t *testing.T) {
 	recordSuccess(s, "a", 100)
 	s.stickyTag.tcp.Store("a")
 	generation := s.networkGeneration.Load()
-	s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
-	s.noteUnanswered("a", generation, "tcp", "", time.Now().Add(time.Second), time.Now().Add(time.Second))
+	s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
+	s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now().Add(time.Second), time.Now().Add(time.Second))
 	s.access.Lock()
 	defer s.access.Unlock()
 	h := s.historyForLocked("a")
@@ -1839,10 +1838,10 @@ func TestStreak_UDPOutageIsSuspected(t *testing.T) {
 			obs[tag].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("network down") }
 		}
 		generation := s.networkGeneration.Load()
-		s.noteUserResponse("a", generation, "udp", "dns:53", time.Now(), time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "udp", "dns:53", time.Now(), time.Now())
 		time.Sleep(time.Second)
 		for range 2 {
-			s.noteUnanswered("a", generation, "udp", "dns:53", time.Now(), time.Now())
+			s.noteUnanswered(s.originAt("a", generation), "udp", "dns:53", time.Now(), time.Now())
 			time.Sleep(2 * time.Second)
 		}
 		synctest.Wait()
@@ -1949,7 +1948,7 @@ func TestConfirmation_SlowReplacementProbeStillSwitches(t *testing.T) {
 		var aProbes atomic.Int32
 		failingProbes(obs["a"], &aProbes, hangUntilDone)
 		obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(40 * time.Second), nil }
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		time.Sleep(time.Minute)
 		synctest.Wait()
 		require.EqualValues(t, 2, aProbes.Load(), "both confirmations failed")
@@ -1967,7 +1966,7 @@ func TestConfirmation_GatedPassingReplacementIsNoOutage(t *testing.T) {
 		s.access.Lock()
 		s.historyForLocked("b").startRecoveryGate(time.Now())
 		s.access.Unlock()
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		synctest.Wait()
 		require.EqualValues(t, 2, aProbes.Load(), "both confirmations failed")
 		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "a replacement in its recovery gate can't take the selection")
@@ -2016,7 +2015,7 @@ func TestConfirmation_ClosesUnwrittenConns(t *testing.T) {
 			conn.Read(make([]byte, 8))
 			close(closed)
 		}()
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		synctest.Wait()
 		require.Equal(t, "b", loadString(&s.stickyTag.tcp))
 		select {
@@ -2032,8 +2031,8 @@ func TestAdvanceNetwork_ClearsFailureStreaks(t *testing.T) {
 	recordSuccess(s, "a", 100)
 	s.stickyTag.tcp.Store("a")
 	generation := s.networkGeneration.Load()
-	s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
-	s.noteUnanswered("a", generation, "tcp", "", time.Now().Add(time.Second), time.Now().Add(time.Second))
+	s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
+	s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now().Add(time.Second), time.Now().Add(time.Second))
 	s.access.Lock()
 	defer s.access.Unlock()
 	h := s.historyForLocked("a")
@@ -2059,7 +2058,7 @@ func TestConfirmation_PauseDropsPendingSwitch(t *testing.T) {
 			}
 			return slowProbeResponderConn(40 * time.Second), nil
 		}
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		time.Sleep(10 * time.Second)
 		require.EqualValues(t, 2, aProbes.Load(), "both confirmations failed")
 		s.onProbePause(pause.EventNetworkPause)
@@ -2086,7 +2085,7 @@ func TestConfirmation_GatedPassAmongFailedReplacementsIsNoOutage(t *testing.T) {
 		s.access.Lock()
 		s.historyForLocked("b").startRecoveryGate(time.Now())
 		s.access.Unlock()
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		time.Sleep(defaultProbeTimeout + time.Second)
 		s.access.Lock()
 		s.requestProbesLocked([]string{"b"}, probeForced, false)
@@ -2122,7 +2121,7 @@ func TestConfirmation_RecheckStartsAfterReplacementPass(t *testing.T) {
 		var bProbes atomic.Int32
 		failingProbes(obs["b"], &bProbes, hangUntilDone)
 		obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(time.Second), nil }
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		time.Sleep(time.Minute)
 		synctest.Wait()
 		require.GreaterOrEqual(t, aProbes.Load(), int32(3), "a is rechecked")
@@ -2162,7 +2161,7 @@ func TestConfirmation_NoRecheckBeforeReplacementPasses(t *testing.T) {
 		var bProbes atomic.Int32
 		failingProbes(obs["b"], &bProbes, hangUntilDone)
 		obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(time.Second), nil }
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		time.Sleep(time.Minute)
 		synctest.Wait()
 		s.access.Lock()
@@ -2243,7 +2242,7 @@ func TestConfirmation_PauseDropsFirstStrike(t *testing.T) {
 			return hangUntilDone(ctx)
 		}
 		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		time.Sleep(defaultProbeTimeout + time.Second)
 		s.onProbePause(pause.EventNetworkPause)
 		time.Sleep(time.Second)
@@ -2265,8 +2264,8 @@ func TestSplitHealthy_StreakBumpKeepsTierOrder(t *testing.T) {
 	addUserFailureN(s, "b", int(s.hist.softFailLimit))
 	addUserFailureN(s, "c", int(s.hist.softFailLimit))
 	generation := s.networkGeneration.Load()
-	s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
-	s.noteUnanswered("a", generation, "tcp", "", time.Now().Add(time.Second), time.Now().Add(time.Second))
+	s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
+	s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now().Add(time.Second), time.Now().Add(time.Second))
 	s.access.Lock()
 	defer s.access.Unlock()
 	pool, _ := s.splitHealthyForLocked(s.rankLocked(time.Now().Add(time.Second)), "tcp")
@@ -2295,11 +2294,11 @@ func TestStreak_TCPOnlyPassIsNoUDPOutage(t *testing.T) {
 		obs["c"].networks = []string{"tcp"}
 		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 		generation := s.networkGeneration.Load()
-		s.noteUserResponse("a", generation, "udp", "dns:53", time.Now(), time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "udp", "dns:53", time.Now(), time.Now())
 		time.Sleep(time.Second)
-		s.noteUnanswered("a", generation, "udp", "dns:53", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "udp", "dns:53", time.Now(), time.Now())
 		time.Sleep(2 * time.Second)
-		s.noteUnanswered("a", generation, "udp", "dns:53", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "udp", "dns:53", time.Now(), time.Now())
 		s.access.Lock()
 		s.requestProbesLocked([]string{"c"}, probeForced, false)
 		s.dispatchProbesLocked()
@@ -2668,7 +2667,7 @@ func TestConfirmation_SelectionPassingDuringPendingSwitchIsNoOutage(t *testing.T
 		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("dial timeout") }
 		// b's replacement probe hangs until it times out.
 		obs["b"].dial = func(ctx context.Context) (net.Conn, error) { return hangUntilDone(ctx) }
-		s.requestFailureConfirmation("a", "", s.networkGeneration.Load())
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
 		synctest.Wait()
 		s.access.Lock()
 		require.Equal(t, "a", s.pendingConfirmedFailure.tag, "a failed twice; the switch waits on b")
@@ -2774,11 +2773,11 @@ func TestStreak_ReleasedToASoftDemotedMemberWhenEveryCleanOneFails(t *testing.T)
 		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 		generation := s.networkGeneration.Load()
 		for range s.hist.softFailLimit {
-			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			require.True(t, s.recordUserFailure(s.originAt("c", generation), adapter.UserFailureDial, time.Now(), "tcp", nil))
 			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
 		}
 		for range consecutiveUserFailureLimit {
-			s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+			s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "tcp", nil)
 			time.Sleep(time.Second)
 		}
 		for range 5 {
@@ -2802,13 +2801,13 @@ func TestStreak_CleanMemberStillProbingIsPreferredToASoftOne(t *testing.T) {
 		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 		generation := s.networkGeneration.Load()
 		for range s.hist.softFailLimit {
-			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			require.True(t, s.recordUserFailure(s.originAt("c", generation), adapter.UserFailureDial, time.Now(), "tcp", nil))
 			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
 		}
-		s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+		s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "tcp", nil)
 		time.Sleep(time.Second)
 		since := time.Now()
-		s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+		s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "tcp", nil)
 		time.Sleep(10 * time.Millisecond)
 		synctest.Wait()
 		s.access.Lock()
@@ -2849,11 +2848,11 @@ func TestStreak_SoftReplacementLasts(t *testing.T) {
 				obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(tc.cDelay), nil }
 				generation := s.networkGeneration.Load()
 				for range s.hist.softFailLimit {
-					require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+					require.True(t, s.recordUserFailure(s.originAt("c", generation), adapter.UserFailureDial, time.Now(), "tcp", nil))
 					time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
 				}
 				for range consecutiveUserFailureLimit {
-					s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+					s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "tcp", nil)
 					time.Sleep(time.Second)
 				}
 				var picks []string
@@ -2878,7 +2877,7 @@ func TestStreak_NeverReleasedBelowTheSoftTier(t *testing.T) {
 		{"hard-demoted", func(s *MutableAutoSelect, _ *mockOutbound) {
 			generation := s.networkGeneration.Load()
 			for range s.hist.consecutiveFailLimit {
-				require.True(t, s.recordUserFailure("d", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+				require.True(t, s.recordUserFailure(s.originAt("d", generation), adapter.UserFailureDial, time.Now(), "tcp", nil))
 				time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
 			}
 		}},
@@ -2889,7 +2888,7 @@ func TestStreak_NeverReleasedBelowTheSoftTier(t *testing.T) {
 			recordSuccess(s, "d", 2)
 			generation := s.networkGeneration.Load()
 			for range s.hist.softFailLimit + 1 {
-				require.True(t, s.recordUserFailure("d", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+				require.True(t, s.recordUserFailure(s.originAt("d", generation), adapter.UserFailureDial, time.Now(), "tcp", nil))
 				time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
 			}
 			s.access.Lock()
@@ -2910,7 +2909,7 @@ func TestStreak_NeverReleasedBelowTheSoftTier(t *testing.T) {
 				tc.setup(s, obs["d"])
 				generation := s.networkGeneration.Load()
 				for range consecutiveUserFailureLimit {
-					s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+					s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "tcp", nil)
 					time.Sleep(time.Second)
 				}
 				for range 5 {
@@ -2935,16 +2934,16 @@ func TestStreak_ReplacementKeepsFailuresAfterItsProbe(t *testing.T) {
 		// A streak makes c soft; the dedupe keeps its window at one failure,
 		// within retention.
 		for range consecutiveUserFailureLimit {
-			s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil)
+			s.recordUserFailure(s.originAt("c", generation), adapter.UserFailureDial, time.Now(), "tcp", nil)
 			time.Sleep(time.Second)
 		}
 		for range consecutiveUserFailureLimit {
-			s.recordUserFailure("a", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+			s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "tcp", nil)
 			time.Sleep(time.Second)
 		}
 		synctest.Wait()
 		// c's probe passed; this failure comes after it.
-		s.recordUserFailure("c", adapter.UserFailureReset, generation, time.Now(), "tcp", nil)
+		s.recordUserFailure(s.originAt("c", generation), adapter.UserFailureReset, time.Now(), "tcp", nil)
 		_, _, err := s.selectOutbound("tcp", "")
 		require.NoError(t, err)
 		require.Equal(t, "c", loadString(&s.stickyTag.tcp))
@@ -3019,7 +3018,7 @@ func TestApplyStickiness_NotReleasedAsUnmeasuredToAMemberWhoseProbeFailed(t *tes
 		}
 		generation := s.networkGeneration.Load()
 		for range s.hist.softFailLimit {
-			require.True(t, s.recordUserFailure("a", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			require.True(t, s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureDial, time.Now(), "tcp", nil))
 			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
 		}
 		probe := func(tags ...string) {
@@ -3046,12 +3045,12 @@ func TestApplyStickiness_NotReleasedAsUnmeasuredToAMemberWhoseProbeFailed(t *tes
 	})
 }
 
-func TestRemove_DetachesTheRemovedMembersConns(t *testing.T) {
+func TestRemove_RemovedMembersConnsStopReporting(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, obs := newTestMUR(t, "a", "b")
 		generation := s.networkGeneration.Load()
 		c := newScriptedConn()
-		conn := s.wrapStream(c, "tcp", connOrigin{out: obs["a"], route: primaryRoute, generation: generation}, nil)
+		conn := s.wrapStream(c, "tcp", s.originOf(obs["a"], primaryRoute, generation), nil)
 		defer conn.Close()
 		conn.Write([]byte("request"))
 		_, err := s.Remove("a")
@@ -3083,7 +3082,7 @@ func TestProbe_FailureStartedDuringAnOutageIsForgivenAfterItEnds(t *testing.T) {
 		time.Sleep(time.Second)
 		started := time.Now()
 		time.Sleep(time.Second)
-		s.noteUserResponse("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		time.Sleep(5 * time.Second)
 		s.access.Lock()
 		defer s.access.Unlock()
@@ -3119,11 +3118,11 @@ func TestStreak_ReleasedWithinTheSoftTier(t *testing.T) {
 				}
 				generation := s.networkGeneration.Load()
 				for range s.hist.softFailLimit {
-					require.True(t, s.recordUserFailure("b", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+					require.True(t, s.recordUserFailure(s.originAt("b", generation), adapter.UserFailureDial, time.Now(), "tcp", nil))
 					time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
 				}
 				for range consecutiveUserFailureLimit {
-					s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+					s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 					time.Sleep(time.Second)
 				}
 				released := false
@@ -3153,11 +3152,11 @@ func TestUDPStreak_ReplacementInheritsTheFailedSelectionsDestinations(t *testing
 		s.stickyTag.udp.Store("a")
 		generation := s.networkGeneration.Load()
 		const dest = "198.51.100.1:443"
-		s.noteUserResponse("a", generation, "udp", dest, time.Now(), time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
 		fail := func(tag string) string {
 			for range consecutiveUserFailureLimit {
 				time.Sleep(time.Second)
-				s.noteUnanswered(tag, generation, "udp", dest, time.Now(), time.Now())
+				s.noteUnanswered(s.originAt(tag, generation), "udp", dest, time.Now(), time.Now())
 			}
 			for range 3 {
 				_, _, err := s.selectOutbound("udp", "")
@@ -3260,7 +3259,7 @@ func TestOutage_SelectionAnsweringAfterTheOutageKeepsIt(t *testing.T) {
 		synctest.Wait()
 		up.Store(true)
 		time.Sleep(5 * time.Second)
-		s.noteUserResponse("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		time.Sleep(2*defaultProbeTimeout + time.Second)
 		synctest.Wait()
 		s.access.Lock()
@@ -3306,7 +3305,7 @@ func TestOutage_UserTrafficTriesAnotherMemberWhenProbesCantDecide(t *testing.T) 
 				if err == nil {
 					conn.Close()
 				}
-				s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+				s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 				s.access.Lock()
 				s.suspectOutageLocked(time.Now())
 				s.access.Unlock()
@@ -3404,7 +3403,7 @@ func TestTrial_MadeWhenProbesCantDecide(t *testing.T) {
 		generation := s.networkGeneration.Load()
 		dialAndRead(s)
 		seedProbe(s, "a", false, 0)
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		time.Sleep(3 * time.Second)
 		dialAndRead(s)
 		synctest.Wait()
@@ -3425,7 +3424,7 @@ func TestTrial_BacksOffAfterOneFailsAndStillFindsAWorkingMember(t *testing.T) {
 				generation := s.networkGeneration.Load()
 				dialAndRead(s)
 				seedProbe(s, "a", false, 0)
-				s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+				s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 				if suspected {
 					s.access.Lock()
 					s.suspectOutageLocked(time.Now())
@@ -3444,7 +3443,7 @@ func TestTrial_BacksOffAfterOneFailsAndStillFindsAWorkingMember(t *testing.T) {
 				synctest.Wait()
 				require.Equal(t, "a", loadString(&s.stickyTag.tcp), "after a failed trial an answer may only mean the network is back")
 				time.Sleep(time.Second)
-				s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+				s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 				assert.Equal(t, "c", loadString(&s.stickyTag.tcp), "a failing a conn opened after c answered settles it")
 			})
 		})
@@ -3459,7 +3458,7 @@ func TestTrial_ResultForAnEarlierSelectionIsIgnored(t *testing.T) {
 		}, "a", "b", "c")
 		generation := s.networkGeneration.Load()
 		dialAndRead(s)
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		s.access.Lock()
 		s.suspectOutageLocked(time.Now())
 		s.access.Unlock()
@@ -3472,7 +3471,7 @@ func TestTrial_ResultForAnEarlierSelectionIsIgnored(t *testing.T) {
 		time.Sleep(time.Second)
 		// The selection moves to c meanwhile, and c goes unanswered.
 		s.stickyTag.tcp.Store("c")
-		s.noteUnanswered("c", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("c", generation), "tcp", "", time.Now(), time.Now())
 		<-done
 		synctest.Wait()
 		assert.Equal(t, "c", loadString(&s.stickyTag.tcp), "b's trial was made for a, not c")
@@ -3486,10 +3485,10 @@ func TestTrial_NotArmedByADiscardedReport(t *testing.T) {
 		dialAndRead(s)
 		waiting := time.Now()
 		time.Sleep(time.Second)
-		s.noteUserResponse("a", generation, "tcp", "", waiting.Add(-time.Hour), time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "tcp", "", waiting.Add(-time.Hour), time.Now())
 		time.Sleep(time.Second)
 		// a answered another conn meanwhile, so this wait was the conn's own.
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), waiting)
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), waiting)
 		s.access.Lock()
 		s.suspectOutageLocked(time.Now())
 		s.access.Unlock()
@@ -3513,7 +3512,7 @@ func TestTrial_StateIsTheSelections(t *testing.T) {
 		}}, "a", "b", "c")
 		generation := s.networkGeneration.Load()
 		dialAndRead(s)
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		s.stickyTag.tcp.Store("c")
 		s.access.Lock()
 		s.suspectOutageLocked(time.Now())
@@ -3610,7 +3609,7 @@ func TestProbe_ForgivenAcrossALaterOutage(t *testing.T) {
 			s.suspectOutageLocked(time.Now())
 			s.access.Unlock()
 			time.Sleep(2 * time.Second)
-			s.noteUserResponse("a", generation, "tcp", "", time.Now(), time.Now())
+			s.noteUserResponse(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 			time.Sleep(time.Second)
 		}
 		s.access.Lock()
@@ -3619,7 +3618,7 @@ func TestProbe_ForgivenAcrossALaterOutage(t *testing.T) {
 		time.Sleep(time.Second)
 		started := time.Now()
 		time.Sleep(time.Second)
-		s.noteUserResponse("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		time.Sleep(time.Second)
 		outage()
 		s.access.Lock()
@@ -3630,11 +3629,11 @@ func TestProbe_ForgivenAcrossALaterOutage(t *testing.T) {
 	})
 }
 
-func TestRemove_ConnSetUpAcrossARemovalIsDetached(t *testing.T) {
+func TestRemove_ConnSetUpAcrossARemovalDoesNotReport(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, obs := newTestMUR(t, "a", "b")
 		generation := s.networkGeneration.Load()
-		old := obs["a"]
+		origin := s.originOf(obs["a"], primaryRoute, generation)
 		_, err := s.Remove("a")
 		require.NoError(t, err)
 		s.access.Lock()
@@ -3645,7 +3644,7 @@ func TestRemove_ConnSetUpAcrossARemovalIsDetached(t *testing.T) {
 		s.access.Unlock()
 		// A dial through the removed a returns only now.
 		c := newScriptedConn()
-		conn := s.wrapStream(c, "tcp", connOrigin{out: old, route: primaryRoute, generation: generation}, nil)
+		conn := s.wrapStream(c, "tcp", origin, nil)
 		defer conn.Close()
 		conn.Write([]byte("request"))
 		c.reads <- scriptedRead{data: []byte("reply")}
@@ -3666,7 +3665,7 @@ func TestTrial_StuckUDPSessionIsClosedForATrial(t *testing.T) {
 		c := newScriptedPacketConn()
 		pc := s.wrapPacket(c, s.originOf(obs["a"], primaryRoute, generation), metadata.SocksaddrFromNet(dest))
 		defer pc.Close()
-		s.noteSelectionSetup("udp", "a", s.networkGeneration.Load(), true)
+		s.noteSelectionSetup(s.originAt("a", s.networkGeneration.Load()), "udp", true)
 		go func() {
 			for {
 				if _, _, err := pc.ReadFrom(make([]byte, 64)); err != nil {
@@ -3700,7 +3699,7 @@ func TestTrial_SelectionChangingDuringSetupKeepsItsOwner(t *testing.T) {
 		}, "a", "b", "c")
 		generation := s.networkGeneration.Load()
 		dialAndRead(s)
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		s.access.Lock()
 		s.suspectOutageLocked(time.Now())
 		s.access.Unlock()
@@ -3712,7 +3711,7 @@ func TestTrial_SelectionChangingDuringSetupKeepsItsOwner(t *testing.T) {
 		}()
 		synctest.Wait()
 		s.stickyTag.tcp.Store("c")
-		s.noteUnanswered("c", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("c", generation), "tcp", "", time.Now(), time.Now())
 		close(release)
 		<-done
 		synctest.Wait()
@@ -3725,18 +3724,18 @@ func TestTrial_PendingMoveNeedsAConnOpenedAfterTheAnswer(t *testing.T) {
 		s := newTrialTestMUR(t, map[string]func() (net.Conn, error){"a": silent}, "a", "b")
 		generation := s.networkGeneration.Load()
 		dialAndRead(s)
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		s.access.Lock()
 		s.trialsLocked("tcp").failures = 1
 		s.access.Unlock()
 		// b's trial for a answers after a's conn below opened.
 		opened := time.Now()
 		time.Sleep(time.Second)
-		s.noteTrialAnswered("b", "tcp", generation, "a")
+		s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 		time.Sleep(time.Second)
-		s.noteUnanswered("a", generation, "tcp", "", opened, time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", opened, time.Now())
 		require.Equal(t, "a", loadString(&s.stickyTag.tcp), "a's conn opened before b answered may have failed for the outage")
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		assert.Equal(t, "b", loadString(&s.stickyTag.tcp))
 	})
 }
@@ -3781,7 +3780,7 @@ func TestHardDemotion_ReleasedToTheMemberThatPassed(t *testing.T) {
 	})
 }
 
-func TestRemove_SameOutboundReaddedDuringSetupIsDetached(t *testing.T) {
+func TestRemove_SameOutboundReaddedDuringSetupDoesNotReport(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, obs := newTestMUR(t, "a", "b")
 		generation := s.networkGeneration.Load()
@@ -3852,10 +3851,9 @@ func drain(pc net.PacketConn) {
 
 func TestTrial_FailedUDPTrialSessionCloses(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s, _ := newConfirmationTestMUR(t, "a", "b")
 		s.stickyTag.udp.Store("a")
-		origin := s.originOf(obs["b"], trialRoute, s.networkGeneration.Load())
-		origin.trialFor = "a"
+		origin := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
 		c := newScriptedPacketConn()
 		dest := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 443}
 		pc := s.wrapPacket(c, origin, metadata.SocksaddrFromNet(dest))
@@ -3891,7 +3889,7 @@ func TestTrial_UDPSweepNeedsAnAlternateAndClosesOnlyTheDestination(t *testing.T)
 				s, obs := newConfirmationTestMUR(t, tc.members...)
 				s.stickyTag.udp.Store("a")
 				generation := s.networkGeneration.Load()
-				s.noteSelectionSetup("udp", "a", s.networkGeneration.Load(), true)
+				s.noteSelectionSetup(s.originAt("a", s.networkGeneration.Load()), "udp", true)
 				dest := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 443}
 				other := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 3), Port: 51820}
 				c := newScriptedPacketConn()
@@ -3958,17 +3956,17 @@ func TestTrial_PendingMoveKeepsTheFirstAnswer(t *testing.T) {
 		s := newTrialTestMUR(t, map[string]func() (net.Conn, error){"a": silent}, "a", "b")
 		generation := s.networkGeneration.Load()
 		dialAndRead(s)
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		s.access.Lock()
 		s.trialsLocked("tcp").failures = 1
 		s.access.Unlock()
-		s.noteTrialAnswered("b", "tcp", generation, "a")
+		s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 		time.Sleep(time.Second)
 		opened := time.Now()
 		time.Sleep(time.Second)
-		s.noteTrialAnswered("b", "tcp", generation, "a")
+		s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 		time.Sleep(time.Second)
-		s.noteUnanswered("a", generation, "tcp", "", opened, time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", opened, time.Now())
 		assert.Equal(t, "b", loadString(&s.stickyTag.tcp), "a's conn opened after b first answered")
 	})
 }
@@ -3981,8 +3979,8 @@ func TestTrial_OldNetworksLocalFailureLeavesTheNewSetup(t *testing.T) {
 		s.advanceNetworkLocked()
 		s.access.Unlock()
 		current := s.networkGeneration.Load()
-		s.noteSelectionSetup("tcp", "a", current, true)
-		s.noteSelectionSetup("tcp", "a", old, false)
+		s.noteSelectionSetup(s.originAt("a", current), "tcp", true)
+		s.noteSelectionSetup(s.originAt("a", old), "tcp", false)
 		s.access.Lock()
 		defer s.access.Unlock()
 		assert.True(t, s.trialsLocked("tcp").setupOK, "a conn from the old network says nothing of this one")
@@ -3991,10 +3989,9 @@ func TestTrial_OldNetworksLocalFailureLeavesTheNewSetup(t *testing.T) {
 
 func TestTrial_AnsweredUDPTrialSessionStaysOpen(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s, _ := newConfirmationTestMUR(t, "a", "b")
 		s.stickyTag.udp.Store("a")
-		origin := s.originOf(obs["b"], trialRoute, s.networkGeneration.Load())
-		origin.trialFor = "a"
+		origin := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
 		c := newScriptedPacketConn()
 		dest := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 443}
 		pc := s.wrapPacket(c, origin, metadata.SocksaddrFromNet(dest))
@@ -4114,20 +4111,20 @@ func TestTrial_PendingMoveFreshnessAndFailure(t *testing.T) {
 				s := newTrialTestMUR(t, map[string]func() (net.Conn, error){"a": silent}, "a", "b")
 				generation := s.networkGeneration.Load()
 				dialAndRead(s)
-				s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+				s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 				s.access.Lock()
 				s.trialsLocked("tcp").failures = 1
 				s.access.Unlock()
-				s.noteTrialAnswered("b", "tcp", generation, "a")
+				s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 				time.Sleep(probeFreshnessWindow - time.Second)
-				s.noteTrialAnswered("b", "tcp", generation, "a")
+				s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 				if tc.failBefore {
-					s.noteTrialFailed("b", "tcp", "a", generation)
+					s.noteTrialFailed(s.trialOriginAt("b", generation, "a"), "tcp")
 				}
 				time.Sleep(2 * time.Second)
 				opened := time.Now()
 				time.Sleep(time.Second)
-				s.noteUnanswered("a", generation, "tcp", "", opened, time.Now())
+				s.noteUnanswered(s.originAt("a", generation), "tcp", "", opened, time.Now())
 				assert.Equal(t, tc.want, loadString(&s.stickyTag.tcp))
 			})
 		})
@@ -4158,33 +4155,37 @@ func TestUDPSweep_SkipsAHandleNowWaitingOnTheDestination(t *testing.T) {
 
 func TestTrial_RepeatedFailureOnAKeptTrialHandleCounts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s, obs := newConfirmationTestMUR(t, "a", "b")
+		s, _ := newConfirmationTestMUR(t, "a", "b")
 		s.stickyTag.udp.Store("a")
 		generation := s.networkGeneration.Load()
 		dest := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 443}
 		// dest answered through a, which now leaves it unanswered.
-		s.noteUserResponse("a", generation, "udp", dest.String(), time.Now(), time.Now())
+		s.noteUserResponse(s.originAt("a", generation), "udp", dest.String(), time.Now(), time.Now())
 		time.Sleep(time.Second)
-		s.noteUnanswered("a", generation, "udp", dest.String(), time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "udp", dest.String(), time.Now(), time.Now())
 		s.access.Lock()
 		s.trialsLocked("udp").failures = 1
 		s.access.Unlock()
-		origin := s.originOf(obs["b"], trialRoute, generation)
-		origin.trialFor = "a"
+		origin := s.trialOriginAt("b", generation, "a")
 		c := newScriptedPacketConn()
 		pc := s.wrapPacket(c, origin, metadata.SocksaddrFromNet(dest))
 		defer pc.Close()
 		drain(pc)
-		for range 2 {
+		pending := func() string {
+			s.access.Lock()
+			defer s.access.Unlock()
+			return s.trialsLocked("udp").pending
+		}
+		for i := range 2 {
 			udpExchange(c, pc, dest, true)
+			synctest.Wait()
+			require.Equal(t, "b", pending(), "b's answer %d makes it the pending move", i+1)
 			time.Sleep(time.Second)
 			udpExchange(c, pc, dest, false)
 			time.Sleep(2 * defaultUDPUnansweredAfter)
 			synctest.Wait()
+			require.Empty(t, pending(), "b's failure %d after it answered drops the move", i+1)
 		}
-		s.access.Lock()
-		defer s.access.Unlock()
-		assert.Empty(t, s.trialsLocked("udp").pending, "b failed again after it last answered")
 	})
 }
 
@@ -4220,11 +4221,11 @@ func TestRemove_DropsAPendingMoveToTheMember(t *testing.T) {
 		s := newTrialTestMUR(t, map[string]func() (net.Conn, error){"a": silent}, "a", "b")
 		generation := s.networkGeneration.Load()
 		dialAndRead(s)
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		s.access.Lock()
 		s.trialsLocked("tcp").failures = 1
 		s.access.Unlock()
-		s.noteTrialAnswered("b", "tcp", generation, "a")
+		s.noteTrialAnswered(s.trialOriginAt("b", generation, "a"), "tcp")
 		ob, _ := s.members.Load("b")
 		_, err := s.Remove("b")
 		require.NoError(t, err)
@@ -4234,7 +4235,7 @@ func TestRemove_DropsAPendingMoveToTheMember(t *testing.T) {
 		s.tags = append(s.tags, "b")
 		s.access.Unlock()
 		time.Sleep(time.Second)
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "the answer was the removed b's")
 	})
 }
@@ -4256,7 +4257,7 @@ func TestTrial_DeadlineSpentOnTheTrialLeavesTheSelectionUndialed(t *testing.T) {
 		generation := s.networkGeneration.Load()
 		dialAndRead(s)
 		seedProbe(s, "a", false, 0)
-		s.noteUnanswered("a", generation, "tcp", "", time.Now(), time.Now())
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
 		time.Sleep(3 * time.Second)
 		selectionDials.Store(0)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -4268,13 +4269,10 @@ func TestTrial_DeadlineSpentOnTheTrialLeavesTheSelectionUndialed(t *testing.T) {
 	})
 }
 
-// pausingLogger blocks its first matching call, closing reached, until
-// release is closed: an Info call whose message starts with prefix, or with
-// errors set, an ErrorContext call.
+// pausingLogger blocks its first ErrorContext call, closing reached, until
+// release is closed.
 type pausingLogger struct {
 	log.ContextLogger
-	prefix           string
-	errors           bool
 	reached, release chan struct{}
 	once             sync.Once
 }
@@ -4286,58 +4284,21 @@ func (l *pausingLogger) pause() {
 	})
 }
 
-func (l *pausingLogger) Info(args ...any) {
-	if msg, ok := args[0].(string); ok && l.prefix != "" && strings.HasPrefix(msg, l.prefix) {
-		l.pause()
-	}
-}
-
 func (l *pausingLogger) ErrorContext(context.Context, ...any) {
-	if l.errors {
-		l.pause()
-	}
+	l.pause()
 }
 
-func TestRemove_ReportUnderWayStaysWithTheRemovedMembership(t *testing.T) {
+func TestRemove_ConfirmationAfterItsFailureStaysWithTheRemovedMembership(t *testing.T) {
 	s, obs := newConfirmationTestMUR(t, "a", "b")
 	for _, ob := range obs {
 		ob.dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 	}
-	logger := &pausingLogger{ContextLogger: s.logger, prefix: "user failure", reached: make(chan struct{}), release: make(chan struct{})}
-	s.logger = logger
-	conn := s.wrapStream(newScriptedConn(), "tcp", s.originOf(obs["a"], primaryRoute, s.networkGeneration.Load()), nil)
-	defer conn.Close()
-	var stream *dataPlaneStream
-	s.access.Lock()
-	for c := range s.tcpStreams["a"] {
-		stream = c
-	}
-	s.access.Unlock()
-	reported := make(chan struct{})
-	go func() {
-		defer close(reported)
-		stream.hooks.onFailure(adapter.UserFailureReset, nil)
-	}()
-	// The reset is recorded; its confirmation request is still to come.
-	<-logger.reached
-	readded := make(chan struct{})
-	go func() {
-		defer close(readded)
-		s.Remove("a")
-		s.access.Lock()
-		s.members.Store("a", sbAdapter.Outbound(obs["a"]))
-		s.addProbeMemberLocked("a")
-		s.tags = append(s.tags, "a")
-		s.stickyTag.tcp.Store("a")
-		s.access.Unlock()
-	}()
-	select {
-	case <-readded:
-	case <-time.After(100 * time.Millisecond):
-	}
-	close(logger.release)
-	<-reported
-	<-readded
+	s.stickyTag.tcp.Store("a")
+	origin := s.originOf(obs["a"], primaryRoute, s.networkGeneration.Load())
+	require.True(t, s.recordUserFailure(origin, adapter.UserFailureReset, time.Now(), "tcp", nil))
+	// a is removed and re-added between the reset's two reports.
+	readdAsSelection(t, s, obs["a"])
+	s.requestFailureConfirmation(origin, "")
 	s.access.Lock()
 	defer s.access.Unlock()
 	assert.False(t, s.probeMembers["a"].confirmationPending, "the reset was the removed a's conn's")
@@ -4375,7 +4336,7 @@ func TestRemove_SetupFailureStaysWithTheRemovedMembership(t *testing.T) {
 	s, obs := newConfirmationTestMUR(t, "a", "b")
 	obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("dial timeout") }
 	obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
-	logger := &pausingLogger{ContextLogger: s.logger, errors: true, reached: make(chan struct{}), release: make(chan struct{})}
+	logger := &pausingLogger{ContextLogger: s.logger, reached: make(chan struct{}), release: make(chan struct{})}
 	s.logger = logger
 	dialed := make(chan struct{})
 	go func() {
@@ -4411,6 +4372,13 @@ func TestRemove_SetupFailureStaysWithTheRemovedMembership(t *testing.T) {
 // selection.
 func readdAsSelection(t *testing.T, s *MutableAutoSelect, ob *mockOutbound) {
 	t.Helper()
+	readd(t, s, ob)
+	s.stickyTag.tcp.Store(ob.tag)
+}
+
+// readd removes ob's tag and adds ob back under it.
+func readd(t *testing.T, s *MutableAutoSelect, ob *mockOutbound) {
+	t.Helper()
 	_, err := s.Remove(ob.tag)
 	require.NoError(t, err)
 	s.access.Lock()
@@ -4418,7 +4386,81 @@ func readdAsSelection(t *testing.T, s *MutableAutoSelect, ob *mockOutbound) {
 	s.members.Store(ob.tag, sbAdapter.Outbound(ob))
 	s.addProbeMemberLocked(ob.tag)
 	s.tags = append(s.tags, ob.tag)
-	s.stickyTag.tcp.Store(ob.tag)
+}
+
+func TestRemove_FailoverToAReaddedAlternateIsAbandoned(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("a")
+	generation := s.networkGeneration.Load()
+	origin := s.originOf(obs["a"], primaryRoute, generation)
+	alt := s.originOf(obs["b"], fallbackRoute, generation)
+	readd(t, s, obs["b"])
+	assert.False(t, s.noteFailover(origin, alt, "tcp"), "the alternate's setup was the removed b's")
+	s.access.Lock()
+	defer s.access.Unlock()
+	assert.False(t, s.probeMembers["a"].confirmationPending, "no failover was served")
+}
+
+func TestRemove_TrialAnswerStaysWithTheRemovedMembership(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("a")
+	trial := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
+	s.access.Lock()
+	s.trialsLocked("tcp").unansweredAt = time.Now()
+	s.access.Unlock()
+	readd(t, s, obs["b"])
+	s.noteTrialAnswered(trial, "tcp")
+	assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "the answer was the removed b's trial's")
+}
+
+func TestRemove_TrialForARemovedSelectionDoesNotMoveItsSuccessor(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("a")
+	trial := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
+	readdAsSelection(t, s, obs["a"])
+	s.access.Lock()
+	s.trialsLocked("tcp").unansweredAt = time.Now()
+	s.access.Unlock()
+	s.noteTrialAnswered(trial, "tcp")
+	assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "the trial was made for the removed a")
+}
+
+func TestRemove_ReaddedSelectionStartsItsTrialsAfresh(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("a")
+	s.access.Lock()
+	old := s.trialsLocked("tcp")
+	old.failures, old.unansweredAt = 1, time.Now()
+	s.access.Unlock()
+	readdAsSelection(t, s, obs["a"])
+	s.access.Lock()
+	defer s.access.Unlock()
+	trials := s.trialsLocked("tcp")
+	assert.Zero(t, trials.failures, "the failed trial was the removed a's")
+	assert.Zero(t, trials.unansweredAt, "the unanswered traffic was the removed a's")
+	assert.Equal(t, s.probeMembers["a"].membershipID, trials.membership)
+}
+
+func TestRemove_TrialForARemovedSelectionDoesNotHoldBackItsSuccessor(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("a")
+	trial := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
+	readdAsSelection(t, s, obs["a"])
+	s.noteTrialFailed(trial, "tcp")
+	s.access.Lock()
+	defer s.access.Unlock()
+	assert.Zero(t, s.trialsLocked("tcp").failures, "the trial was made for the removed a")
+}
+
+func TestRemove_TrialFailureStaysWithTheRemovedMembership(t *testing.T) {
+	s, obs := newConfirmationTestMUR(t, "a", "b")
+	s.stickyTag.tcp.Store("a")
+	trial := s.trialOriginAt("b", s.networkGeneration.Load(), "a")
+	readd(t, s, obs["b"])
+	s.noteTrialFailed(trial, "tcp")
+	s.access.Lock()
+	defer s.access.Unlock()
+	assert.Zero(t, s.trialsLocked("tcp").failures, "the failure was the removed b's trial's")
 }
 
 func TestRemove_AlternateDoesNotConfirmAReaddedPrimary(t *testing.T) {
@@ -4492,7 +4534,7 @@ func TestRemove_UDPSetupFailureStaysWithTheRemovedMembership(t *testing.T) {
 	s.stickyTag.udp.Store("a")
 	obs["a"].listen = func(context.Context) (net.PacketConn, error) { return nil, errors.New("setup timeout") }
 	obs["b"].listen = func(context.Context) (net.PacketConn, error) { return newScriptedPacketConn(), nil }
-	logger := &pausingLogger{ContextLogger: s.logger, errors: true, reached: make(chan struct{}), release: make(chan struct{})}
+	logger := &pausingLogger{ContextLogger: s.logger, reached: make(chan struct{}), release: make(chan struct{})}
 	s.logger = logger
 	set := make(chan struct{})
 	go func() {

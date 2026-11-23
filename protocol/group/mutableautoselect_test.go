@@ -560,7 +560,7 @@ func TestSetURLOverrides_KeepsSelectionOffFailedMember(t *testing.T) {
 	recordSuccess(s, "b", 200)
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.consecutiveFailLimit {
-		s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load(), time.Time{}, "tcp", nil)
+		s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureNoResponse, time.Time{}, "tcp", nil)
 	}
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -762,8 +762,8 @@ func TestLateProbeAfterRemoveRecordsNothing(t *testing.T) {
 
 func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	assert.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp", nil), "first call must persist")
-	assert.False(t, s.recordUserFailure("a", adapter.UserFailureStall, s.networkGeneration.Load(), time.Time{}, "tcp", nil), "immediate burst must return false (deduped)")
+	assert.True(t, s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureDial, time.Time{}, "tcp", nil), "first call must persist")
+	assert.False(t, s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureStall, time.Time{}, "tcp", nil), "immediate burst must return false (deduped)")
 	s.access.Lock()
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
@@ -771,7 +771,7 @@ func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	assert.Equal(t, uint32(1), h.userFailureCount(time.Now(), s.hist.userFailureWindow),
 		"successive calls within dedupe window must collapse")
 
-	assert.False(t, s.recordUserFailure("nonexistent", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp", nil), "non-member must return false")
+	assert.False(t, s.recordUserFailure(s.originAt("nonexistent", s.networkGeneration.Load()), adapter.UserFailureDial, time.Time{}, "tcp", nil), "non-member must return false")
 	s.access.Lock()
 	_, exists := s.peekHistoryLocked("nonexistent")
 	s.access.Unlock()
@@ -784,7 +784,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// one. (Spec change from earlier "one-shot hard demote.")
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1,
@@ -796,7 +796,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureReset, nil)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureReset, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -806,7 +806,7 @@ func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 
 func TestRecordUserFailure_AttributesDialKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	require.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp", nil))
+	require.True(t, s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureDial, time.Time{}, "tcp", nil))
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -1887,7 +1887,7 @@ func TestMakeHooks_IgnoresFailureFromUnselectedTag(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("b")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
 
 	s.access.Lock()
 	_, ok := s.peekHistoryLocked("a")
@@ -1903,7 +1903,7 @@ func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
 	s.stickyTag.tcp.Store("b")
 	s.stickyTag.udp.Store("a")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the udp selection must still be chargeable")
@@ -1915,7 +1915,7 @@ func TestMakeHooks_UnselectedGateDisabledByConfig(t *testing.T) {
 	s.cfg.demoteOnlySelected = false
 	s.stickyTag.tcp.Store("b")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the gate must be defeatable for rollback")
@@ -1928,7 +1928,7 @@ func TestMakeHooks_ChargesFallbackRouteEvenWhenUnselected(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	s.stickyTag.tcp.Store("a")
 
-	s.makeHooks("b", "tcp", fallbackRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureReset, nil)
+	s.makeHooks(s.originAt("b", s.networkGeneration.Load()).on(fallbackRoute), "tcp").onFailure(adapter.UserFailureReset, nil)
 
 	uf, ok := userFailures(s, "b")
 	require.True(t, ok, "a fallback-route conn must stay chargeable")
@@ -2032,7 +2032,7 @@ func TestMakeHooks_FailureDoesNotRunLadder(t *testing.T) {
 		obs["a"].dial = denyDial
 		obs["b"].dial = denyDial
 		s.stickyTag.tcp.Store("a")
-		s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load(), "").onFailure(adapter.UserFailureReset, nil)
+		s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureReset, nil)
 		synctest.Wait()
 		assert.Zero(t, s.lastLadderAt.Load(), "a data-plane failure must not re-probe every member")
 	})
@@ -2080,7 +2080,7 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 			recordSuccess(s, "b", 200)
 			s.hist.userFailureDedupeWindow = 0
 			for range s.hist.consecutiveFailLimit {
-				s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load(), time.Time{}, "tcp", nil)
+				s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureNoResponse, time.Time{}, "tcp", nil)
 			}
 			s.access.Lock()
 			s.historyForLocked("a").startRecoveryGate(time.Now())
@@ -2311,4 +2311,33 @@ func (s *MutableAutoSelect) originOf(o sbAdapter.Outbound, route routeKind, gene
 	s.access.Lock()
 	defer s.access.Unlock()
 	return s.originOfLocked(o, route, generation)
+}
+
+// originAt returns the origin, on network generation generation, of a conn
+// set up through tag's member, or through an outbound that never was one if
+// tag isn't a member.
+func (s *MutableAutoSelect) originAt(tag string, generation uint64) connOrigin {
+	if out, ok := s.members.Load(tag); ok {
+		return s.originOf(out, primaryRoute, generation)
+	}
+	return connOrigin{out: &mockOutbound{tag: tag}, generation: generation}
+}
+
+// on returns o for a conn on route.
+func (o connOrigin) on(route routeKind) connOrigin {
+	o.route = route
+	return o
+}
+
+// trialOriginAt returns the origin, on network generation generation, of a
+// trial conn through tag's member made for trialFor, the selection now.
+func (s *MutableAutoSelect) trialOriginAt(tag string, generation uint64, trialFor string) connOrigin {
+	o := s.originAt(tag, generation).on(trialRoute)
+	o.trialFor = trialFor
+	s.access.Lock()
+	defer s.access.Unlock()
+	if state := s.probeMembers[trialFor]; state != nil {
+		o.trialForMembership = state.membershipID
+	}
+	return o
 }

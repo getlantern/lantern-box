@@ -123,7 +123,7 @@ func TestTrySwitchAfterConfirmedFailure(t *testing.T) {
 		// c outranks b, so only the named fallback's answer picks b.
 		{"named fallback answered", func(s *MutableAutoSelect) {
 			recordSuccess(s, "c", 5)
-			s.noteUserResponse("b", s.networkGeneration.Load(), "tcp", "", time.Now(), time.Now())
+			s.noteUserResponse(s.originAt("b", s.networkGeneration.Load()), "tcp", "", time.Now(), time.Now())
 		}, "b"},
 		{"named fallback never answered", func(s *MutableAutoSelect) { recordSuccess(s, "c", 5) }, "c"},
 		{"current selection changed", func(s *MutableAutoSelect) { s.stickyTag.tcp.Store("c") }, ""},
@@ -217,14 +217,14 @@ func TestRecoveryGate_SelectionAndClearing(t *testing.T) {
 func TestRecoveryGate_FallbackDemotionDoesNotRestoreFailedMember(t *testing.T) {
 	s, _ := newConfirmationTestMUR(t, "a", "b")
 	recordSuccess(s, "b", 200)
-	s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp", nil)
+	s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureDial, time.Time{}, "tcp", nil)
 	seedProbe(s, "a", false, 0)
 	switchAfterConfirmedFailure(s, "a", "b")
 	require.Equal(t, "b", loadString(&s.stickyTag.tcp))
 
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.softFailLimit {
-		s.recordUserFailure("b", adapter.UserFailureStall, s.networkGeneration.Load(), time.Time{}, "tcp", nil)
+		s.recordUserFailure(s.originAt("b", s.networkGeneration.Load()), adapter.UserFailureStall, time.Time{}, "tcp", nil)
 	}
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -266,14 +266,14 @@ func TestSplitHealthyFor_RecoveryGate(t *testing.T) {
 func TestRecoveryGate_HardDemotedFallbackRestoresFailedMember(t *testing.T) {
 	s, _ := newConfirmationTestMUR(t, "a", "b")
 	recordSuccess(s, "b", 200)
-	s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load(), time.Time{}, "tcp", nil)
+	s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureDial, time.Time{}, "tcp", nil)
 	seedProbe(s, "a", false, 0)
 	switchAfterConfirmedFailure(s, "a", "b")
 	require.Equal(t, "b", loadString(&s.stickyTag.tcp))
 
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.consecutiveFailLimit {
-		s.recordUserFailure("b", adapter.UserFailureStall, s.networkGeneration.Load(), time.Time{}, "tcp", nil)
+		s.recordUserFailure(s.originAt("b", s.networkGeneration.Load()), adapter.UserFailureStall, time.Time{}, "tcp", nil)
 	}
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -406,7 +406,7 @@ func TestMakeHooks_ConfirmsOnlyPrimaryTCPResetOrNoResponse(t *testing.T) {
 				}
 				obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 
-				s.makeHooks("a", tt.network, tt.route, s.networkGeneration.Load(), "").onFailure(tt.kind, nil)
+				s.makeHooks(s.originAt("a", s.networkGeneration.Load()).on(tt.route), tt.network).onFailure(tt.kind, nil)
 				synctest.Wait()
 
 				uf, _ := userFailures(s, "a")
@@ -475,10 +475,10 @@ func TestConfirmation_SwitchesToASoftDemotedMemberWhenEveryCleanOneFails(t *test
 		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 		generation := s.networkGeneration.Load()
 		for range s.hist.softFailLimit {
-			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			require.True(t, s.recordUserFailure(s.originAt("c", generation), adapter.UserFailureDial, time.Now(), "tcp", nil))
 			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
 		}
-		s.requestFailureConfirmation("a", "", generation)
+		s.requestFailureConfirmation(s.originAt("a", generation), "")
 		time.Sleep(confirmStrikeWindow)
 		synctest.Wait()
 		assert.Equal(t, "c", loadString(&s.stickyTag.tcp), "c is the only member that passes")
@@ -495,7 +495,7 @@ func TestFindProbedReplacement_SoftMemberWaitsForEveryCleanOne(t *testing.T) {
 		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 		generation := s.networkGeneration.Load()
 		for range s.hist.softFailLimit {
-			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			require.True(t, s.recordUserFailure(s.originAt("c", generation), adapter.UserFailureDial, time.Now(), "tcp", nil))
 			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
 		}
 		since := time.Now()
@@ -529,7 +529,7 @@ func TestConfirmation_NoSwitchToASoftMemberPastRetention(t *testing.T) {
 		obs["c"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 		generation := s.networkGeneration.Load()
 		for range s.hist.softFailLimit + 1 {
-			require.True(t, s.recordUserFailure("c", adapter.UserFailureDial, generation, time.Now(), "tcp", nil))
+			require.True(t, s.recordUserFailure(s.originAt("c", generation), adapter.UserFailureDial, time.Now(), "tcp", nil))
 			time.Sleep(s.hist.userFailureDedupeWindow + time.Second)
 		}
 		s.access.Lock()
@@ -539,7 +539,7 @@ func TestConfirmation_NoSwitchToASoftMemberPastRetention(t *testing.T) {
 			}
 		}
 		s.access.Unlock()
-		s.requestFailureConfirmation("a", "", generation)
+		s.requestFailureConfirmation(s.originAt("a", generation), "")
 		time.Sleep(confirmStrikeWindow)
 		synctest.Wait()
 		assert.Equal(t, "a", loadString(&s.stickyTag.tcp), "applyStickiness would release c past retention at once")
