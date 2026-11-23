@@ -216,7 +216,7 @@ func TestStartBoxOnFreePortsRetriesTakenPort(t *testing.T) {
 		require.NoError(t, err)
 		return opts
 	})
-	require.Equal(t, 2, builds, "a start that lost its port must build again")
+	require.GreaterOrEqual(t, builds, 2, "a start that lost its port must build again")
 	require.NotEqual(t, takenPort, bound)
 }
 

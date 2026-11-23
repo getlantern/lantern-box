@@ -302,17 +302,19 @@ func startFreddie(t testing.TB, ctx context.Context, configure func(*freddie.Fre
 
 // waitForFreddie polls the Freddie at freddieURL until its health check
 // answers. It returns the error received on served if the server stops first.
-// Only a body naming Freddie counts, since another server may hold the port.
+// Another server, even another Freddie, may hold the port, so only a body
+// naming Freddie counts, and an error on served by the time it answers wins.
 func waitForFreddie(freddieURL string, served <-chan error, timeout time.Duration) error {
 	client := &http.Client{Timeout: 1 * time.Second}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		ready := isFreddie(client, freddieURL)
 		select {
 		case err := <-served:
 			return err
 		default:
 		}
-		if isFreddie(client, freddieURL) {
+		if ready {
 			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -321,18 +323,33 @@ func waitForFreddie(freddieURL string, served <-chan error, timeout time.Duratio
 }
 
 func TestWaitForFreddieRejectsAnotherServer(t *testing.T) {
-	other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	defer other.Close()
-	addr := other.Listener.Addr().String()
+	t.Run("another server", func(t *testing.T) {
+		other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		defer other.Close()
+		addr := other.Listener.Addr().String()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	f, err := freddie.New(ctx, addr)
-	require.NoError(t, err)
-	served := make(chan error, 1)
-	go func() { served <- f.ListenAndServe() }()
-	require.ErrorIs(t, waitForFreddie("http://"+addr, served, 5*time.Second), syscall.EADDRINUSE,
-		"another server answering on Freddie's port must not pass for Freddie")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		f, err := freddie.New(ctx, addr)
+		require.NoError(t, err)
+		served := make(chan error, 1)
+		go func() { served <- f.ListenAndServe() }()
+		require.ErrorIs(t, waitForFreddie("http://"+addr, served, 5*time.Second), syscall.EADDRINUSE,
+			"another server answering on Freddie's port must not pass for Freddie")
+	})
+
+	t.Run("another freddie", func(t *testing.T) {
+		// The bind fails while the Freddie already on the port answers the
+		// health check, so the failure must win over that answer.
+		served := make(chan error, 1)
+		other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			served <- fmt.Errorf("listen: %w", syscall.EADDRINUSE)
+			io.WriteString(w, "freddie (other)\n")
+		}))
+		defer other.Close()
+		require.ErrorIs(t, waitForFreddie(other.URL, served, 5*time.Second), syscall.EADDRINUSE,
+			"another Freddie on the port must not pass for this one")
+	})
 }
 
 func isFreddie(client *http.Client, freddieURL string) bool {
