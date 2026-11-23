@@ -1231,16 +1231,20 @@ func TestDataPlaneStream_MidStreamReset_AttributesResetKind(t *testing.T) {
 
 func TestDataPlaneStream_Stall_AttributesStallKind(t *testing.T) {
 	// The idle-timeout path must report a stall, complementing the reset path.
-	var got atomic.Value // adapter.UserFailureKind
-	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind, _ error) { got.Store(kind) }})
-	defer d.Close()
-	d.proven.Store(true)
-	d.noteIO(1, nil, false)
-	d.stall()
+	synctest.Test(t, func(t *testing.T) {
+		const idle = time.Second
+		var got atomic.Value // adapter.UserFailureKind
+		d := newDataPlaneStream(stallConn{}, idle, 0, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind, _ error) { got.Store(kind) }})
+		defer d.Close()
+		d.proven.Store(true)
+		d.noteIO(1, nil, false)
+		time.Sleep(2 * idle)
+		synctest.Wait()
 
-	require.NotNil(t, got.Load(), "a stall must attribute a failure")
-	assert.Equal(t, adapter.UserFailureStall, got.Load().(adapter.UserFailureKind),
-		"an idle stall must be recorded as a stall")
+		require.NotNil(t, got.Load(), "a stall must attribute a failure")
+		assert.Equal(t, adapter.UserFailureStall, got.Load().(adapter.UserFailureKind),
+			"an idle stall must be recorded as a stall")
+	})
 }
 
 func TestDataPlaneStream_MidStreamReset_ErrClosed_AttributesFailure(t *testing.T) {

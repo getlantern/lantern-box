@@ -861,7 +861,10 @@ func (w *dataPlaneWatchdog) fireNoResponse() {
 	w.hooks.failure(adapter.UserFailureNoResponse, nil)
 }
 
-// fireStall is the stall timer's callback.
+// fireStall is the stall timer's callback: it demotes a proven conn that went
+// quiet mid-stream, idle having passed since its last non-empty IO, a Write.
+// It decides under ioMu, which IO takes to record itself, so IO either came
+// before and defers the stall or comes after a conn already stalled.
 func (w *dataPlaneWatchdog) fireStall() {
 	w.ioMu.Lock()
 	if quiet := time.Since(w.lastIO); quiet < w.idle && !w.stalled.Load() {
@@ -870,26 +873,12 @@ func (w *dataPlaneWatchdog) fireStall() {
 		return
 	}
 	w.stallArmed = false
-	lastWasWrite := w.lastWasWrite
+	charge := w.lastWasWrite && w.proven.Load() && w.stalled.CompareAndSwap(false, true) &&
+		w.fired.CompareAndSwap(false, true)
 	w.ioMu.Unlock()
-	if lastWasWrite {
-		w.stall()
+	if charge {
+		w.hooks.failure(adapter.UserFailureStall, nil)
 	}
-}
-
-// stall demotes a proven conn that went quiet mid-stream: idle passed since
-// its last non-empty IO, a Write.
-func (w *dataPlaneWatchdog) stall() {
-	if !w.proven.Load() {
-		return
-	}
-	if !w.stalled.CompareAndSwap(false, true) {
-		return
-	}
-	if !w.fired.CompareAndSwap(false, true) {
-		return
-	}
-	w.hooks.failure(adapter.UserFailureStall, nil)
 }
 
 // fireResetFailure attributes a non-excused error once, even on an unproven conn.
