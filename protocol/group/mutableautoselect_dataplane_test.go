@@ -380,3 +380,106 @@ func TestDialContext_NoResponseChargedOnTCPOnly(t *testing.T) {
 		})
 	}
 }
+
+// instantPacketConn sends and receives each datagram at once.
+type instantPacketConn struct{ net.PacketConn }
+
+var instantPeer = &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 53}
+
+func (instantPacketConn) ReadFrom(p []byte) (int, net.Addr, error)  { return len(p), instantPeer, nil }
+func (instantPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
+func (instantPacketConn) Close() error                              { return nil }
+
+func TestDataPlaneStream_StallCountsFromTheLastIO(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idle = time.Second
+		stalledAt := make(chan time.Time, 1)
+		d := newDataPlaneStream(echoConn{}, idle, 1, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind, _ error) {
+			if kind == adapter.UserFailureStall {
+				stalledAt <- time.Now()
+			}
+		}})
+		defer d.Close()
+		p := make([]byte, 1)
+		d.Read(p)
+		d.Write(p)
+		time.Sleep(idle / 2)
+		d.Write(p)
+		lastIO := time.Now()
+
+		time.Sleep(2 * idle)
+		select {
+		case at := <-stalledAt:
+			assert.Equal(t, lastIO.Add(idle), at, "a stall is due idle after the last IO, not the one that armed its timer")
+		default:
+			t.Fatal("a proven conn whose last IO was a write never stalled")
+		}
+	})
+}
+
+func TestDataPlanePacket_ExchangeAfterAnAnsweredOneReportsOnItsOwnDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const after = time.Second
+		type report struct{ at, since time.Time }
+		reports := make(chan report, 2)
+		d := newDataPlanePacket(instantPacketConn{}, time.Hour, 1<<20, dataPlaneHooks{onUnanswered: func(since time.Time, _ string) {
+			reports <- report{time.Now(), since}
+		}})
+		defer d.Close()
+		d.unansweredAfter = after
+		d.unansweredWhileOpen = true
+		p := make([]byte, 1)
+		d.WriteTo(p, instantPeer)
+		d.ReadFrom(p)
+		time.Sleep(after / 2)
+		sent := time.Now()
+		d.WriteTo(p, instantPeer)
+
+		time.Sleep(2 * after)
+		synctest.Wait()
+		select {
+		case r := <-reports:
+			assert.Equal(t, sent, r.since, "the report is for the unanswered exchange")
+			assert.Equal(t, sent.Add(after), r.at, "it is due unansweredAfter after its own send")
+		default:
+			t.Fatal("an exchange left unanswered was never reported")
+		}
+		assert.Empty(t, reports, "the answered exchange is not reported")
+	})
+}
+
+func TestDataPlaneStream_NoResponseFollowsASlowResponse(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const slowAfter, timeout = time.Second, 5 * time.Second
+		slowAt := make(chan time.Time, 1)
+		failedAt := make(chan time.Time, 1)
+		d := newDataPlaneStream(echoConn{}, time.Hour, 1, dataPlaneHooks{
+			onSlowResponse: func() { slowAt <- time.Now() },
+			onFailure: func(kind adapter.UserFailureKind, _ error) {
+				if kind == adapter.UserFailureNoResponse {
+					failedAt <- time.Now()
+				}
+			},
+		})
+		defer d.Close()
+		d.firstResponseTimeout = timeout
+		d.slowResponseAfter = slowAfter
+		wrote := time.Now()
+		d.Write([]byte("x"))
+
+		time.Sleep(2 * timeout)
+		synctest.Wait()
+		select {
+		case at := <-slowAt:
+			assert.Equal(t, wrote.Add(slowAfter), at)
+		default:
+			t.Fatal("no slow response was reported")
+		}
+		select {
+		case at := <-failedAt:
+			assert.Equal(t, wrote.Add(timeout), at, "the missing response is still charged when its own timeout passes")
+		default:
+			t.Fatal("no missing response was charged after the slow one")
+		}
+	})
+}

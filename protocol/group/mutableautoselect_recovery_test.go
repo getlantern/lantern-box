@@ -2224,7 +2224,7 @@ func TestDataPlanePacket_AllSendsFailingEndsTheWait(t *testing.T) {
 		defer d.Close()
 		d.WriteTo([]byte("query"), &net.UDPAddr{})
 		d.ioMu.Lock()
-		waiting := !d.awaitingSince.IsZero()
+		waiting := !d.exchanges.awaitingSince.IsZero()
 		d.ioMu.Unlock()
 		assert.False(t, waiting, "both sends failed, so the wait ended")
 		time.Sleep(2 * defaultUDPUnansweredAfter)

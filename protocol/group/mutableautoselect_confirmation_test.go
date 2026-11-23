@@ -406,7 +406,7 @@ func TestMakeHooks_ConfirmsOnlyPrimaryTCPResetOrNoResponse(t *testing.T) {
 				}
 				obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
 
-				s.makeHooks(s.originAt("a", s.networkGeneration.Load()).on(tt.route), tt.network).onFailure(tt.kind, nil)
+				s.makeHooks(s.originAt("a", s.networkGeneration.Load()).on(tt.route), tt.network).failure(tt.kind, nil)
 				synctest.Wait()
 
 				uf, _ := userFailures(s, "a")

@@ -812,19 +812,15 @@ func (s *MutableAutoSelect) chargeable(tag string, route routeKind) bool {
 // closes.
 func (s *MutableAutoSelect) wrapStream(conn net.Conn, network string, origin connOrigin, release func()) net.Conn {
 	o := origin.out
-	hooks := s.makeHooks(origin, N.NetworkName(network))
-	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, hooks)
+	report := s.makeHooks(origin, N.NetworkName(network))
+	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, report)
 	if N.NetworkName(network) == N.NetworkTCP {
 		wrapped.firstResponseTimeout = s.cfg.dataPlaneFirstResponseTimeout
 		wrapped.unansweredAfter = defaultUnansweredAfter
-		wrapped.slowResponseAfter = earlyConfirmAfter
-		tag := o.Tag()
-		wrapped.hooks.onClose = func() {
-			untrackConn(s, &s.tcpStreams, tag, wrapped)
-			if release != nil {
-				release()
-			}
+		if report.confirms() {
+			wrapped.slowResponseAfter = earlyConfirmAfter
 		}
+		report.stream, report.release = wrapped, release
 	}
 	s.access.Lock()
 	if N.NetworkName(network) == N.NetworkTCP && s.originCurrentLocked(origin) {
@@ -876,31 +872,14 @@ func (s *MutableAutoSelect) originCurrentLocked(origin connOrigin) bool {
 func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, origin connOrigin, destination M.Socksaddr) net.PacketConn {
 	o := origin.out
 	tag := o.Tag()
-	hooks := s.makeHooks(origin, N.NetworkUDP)
-	wrapped := newDataPlanePacket(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, hooks)
+	report := s.makeHooks(origin, N.NetworkUDP)
+	wrapped := newDataPlanePacket(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, report)
 	wrapped.unansweredAfter = defaultUDPUnansweredAfter
 	wrapped.unansweredWhileOpen = true
 	if destination = destination.Unwrap(); destination.IsValid() {
-		wrapped.lastDest = destination.String()
+		wrapped.exchanges.lastDest = destination.String()
 	}
-	wrapped.hooks.onClose = func() { untrackConn(s, &s.udpHandles, tag, wrapped) }
-	if origin.route == trialRoute {
-		var answered atomic.Bool
-		response, unanswered := wrapped.hooks.onResponse, wrapped.hooks.onUnanswered
-		wrapped.hooks.onResponse = func(at time.Time, dest string) {
-			answered.Store(true)
-			response(at, dest)
-		}
-		wrapped.hooks.onUnanswered = func(waitingSince time.Time, dest string) {
-			unanswered(waitingSince, dest)
-			// A trial that never answered closes, so an app holding its
-			// socket sets up again rather than staying on a member that
-			// failed; one that answered serves its app.
-			if !answered.Load() {
-				wrapped.Close()
-			}
-		}
-	}
+	report.packet = wrapped
 	s.access.Lock()
 	if s.originCurrentLocked(origin) {
 		trackConnLocked(&s.udpHandles, tag, wrapped)
