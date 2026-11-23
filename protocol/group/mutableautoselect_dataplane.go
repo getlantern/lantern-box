@@ -251,6 +251,7 @@ func (r *connReport) slowResponse() {
 	}
 }
 
+// reset does nothing: the group charges a reset through failure.
 func (r *connReport) reset() {}
 
 type dataPlaneIO struct {
@@ -343,7 +344,9 @@ type datagramExchanges struct {
 	sentTo, readFrom addrName
 	// The unanswered timer, once created, is pending until unansweredDue,
 	// or not if that is zero. One that fires before its wait is due waits
-	// out the rest, so a wait need not re-arm it.
+	// out the rest, so a wait need not re-arm it. A reply leaves it to lapse
+	// rather than stopping it: a fire per unansweredAfter costs less than a
+	// timer operation per datagram.
 	unansweredTimer *time.Timer
 	unansweredDue   time.Time
 }

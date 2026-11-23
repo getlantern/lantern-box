@@ -622,7 +622,8 @@ func (s *MutableAutoSelect) ListenPacket(ctx context.Context, destination M.Sock
 	return conn, err
 }
 
-// connKind is how setUp sets up and hands out one kind of conn, C.
+// connKind is how setUp sets up and hands out one kind of conn, C. Kinds are
+// values rather than closures, so a setup allocates nothing for them.
 type connKind[C io.Closer] interface {
 	network() string
 	// dial sets up a conn through o, for a trial or a failover.
@@ -807,8 +808,10 @@ func (s *MutableAutoSelect) chargeable(tag string, route routeKind) bool {
 }
 
 // wrapStream enables response tracking for TCP only; a conn from
-// DialContext("udp") is not tracked. A non-nil release runs when a TCP conn
-// closes.
+// DialContext("udp") is not tracked, so no release sweep closes it. sing-box
+// sets up user UDP that way only for routes with udp_connect, and for a DNS
+// server or outbound that dials through the group. A non-nil release runs
+// when a TCP conn closes.
 func (s *MutableAutoSelect) wrapStream(conn net.Conn, network string, origin connOrigin, release func()) net.Conn {
 	o := origin.out
 	report := s.makeHooks(origin, N.NetworkName(network))
@@ -1501,7 +1504,8 @@ func (s *MutableAutoSelect) switchSelectionLocked(network, prev, next string, wh
 }
 
 // clearSelectionLocked drops the selection of any network where it is tag.
-// Caller must hold s.access.
+// Unlike a switch it logs nothing and passes no destinations on, since tag is
+// no longer a member. Caller must hold s.access.
 func (s *MutableAutoSelect) clearSelectionLocked(tag string) {
 	for i := range s.selections {
 		if slot := &s.selections[i].tag; loadString(slot) == tag {
@@ -1806,7 +1810,8 @@ var errAbandonedDial = errors.New("dial abandoned: member failed while it was se
 // over now rather than at its deadline, and cancels the abandoned dial; a
 // conn it returns late is closed. The dial runs under a context derived from
 // ctx, which some outbounds tie their conns to, so a TCP conn comes with a
-// release that cancels it, to run once the conn closes.
+// release that cancels it, to run once the conn closes. The dial runs on its
+// own goroutine so giving up never waits on an outbound that ignores ctx.
 func (s *MutableAutoSelect) dialPrimary(ctx context.Context, origin connOrigin, network string, destination M.Socksaddr, dialed time.Time) (net.Conn, func(), error) {
 	o := origin.out
 	if network != N.NetworkTCP {
