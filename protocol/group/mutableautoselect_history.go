@@ -426,18 +426,11 @@ func (h *localHistory) userFailureCount(now time.Time, window time.Duration) uin
 	return uint32(len(h.userFailures))
 }
 
-func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay uint32, consec uint32, userFails []adapter.UserFailure, gated bool) {
+func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay uint32, consec uint32, userFails int, gated bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.userFailures = pruneUserFailures(h.userFailures, now, window)
-	lastDelay = h.lastSuccessDelayMs
-	consec = h.consecutiveFailures
-	gated = !h.recoveryGateStartedAt.IsZero()
-	if len(h.userFailures) > 0 {
-		userFails = make([]adapter.UserFailure, len(h.userFailures))
-		copy(userFails, h.userFailures)
-	}
-	return
+	return h.lastSuccessDelayMs, h.consecutiveFailures, len(h.userFailures), !h.recoveryGateStartedAt.IsZero()
 }
 
 // toTagHistory snapshots the localHistory into adapter.TagHistory form.

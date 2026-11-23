@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -301,7 +302,7 @@ func TestHydrateLocalHistory_DropsAgedUserFailures(t *testing.T) {
 	h := hydrateLocalHistory(persisted, now, 5*time.Minute)
 	lastDelay, _, userFails, _ := h.snapshot(now, 5*time.Minute)
 	assert.Equal(t, uint32(120), lastDelay)
-	assert.Len(t, userFails, 1, "stale user-failure timestamp must be dropped on hydrate")
+	assert.Equal(t, 1, userFails, "stale user-failure timestamp must be dropped on hydrate")
 }
 
 func TestBehaviorFor_Timeouts(t *testing.T) {
@@ -378,7 +379,13 @@ func userFailures(s *MutableAutoSelect, tag string) ([]adapter.UserFailure, bool
 	if !ok {
 		return nil, false
 	}
-	_, _, uf, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.userFailures = pruneUserFailures(h.userFailures, time.Now(), s.hist.userFailureWindow)
+	var uf []adapter.UserFailure
+	if len(h.userFailures) > 0 {
+		uf = slices.Clone(h.userFailures)
+	}
 	return uf, true
 }
 
@@ -2099,7 +2106,7 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 			require.True(t, ok, "a changed override keeps the member's history")
 			delay, _, uf, gated := h.snapshot(time.Now(), s.hist.userFailureWindow)
 			assert.Equal(t, uint32(100), delay)
-			assert.Len(t, uf, int(s.hist.consecutiveFailLimit))
+			assert.Equal(t, int(s.hist.consecutiveFailLimit), uf)
 			assert.True(t, gated)
 			persisted := s.history.Load("a")
 			require.NotNil(t, persisted)

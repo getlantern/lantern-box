@@ -9,7 +9,6 @@ import (
 	"maps"
 	"net"
 	"slices"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1601,7 +1600,7 @@ func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, netw
 		out = append(out, c)
 	}
 	if bumped {
-		sort.SliceStable(out, func(i, j int) bool { return rankedBefore(out[i], out[j]) })
+		slices.SortStableFunc(out, compareRanked)
 	}
 	var ungated, ungatedUsable, gatedUsable bool
 	for _, c := range out {
@@ -1677,7 +1676,7 @@ func (s *MutableAutoSelect) rankLocked(now time.Time) []rankedCandidate {
 			lastDelay, c, uf, gated := h.snapshot(now, s.hist.userFailureWindow)
 			rawDelay = lastDelay
 			consec = c
-			userFails = uint32(len(uf))
+			userFails = uint32(uf)
 			streaks = h.streakCounts(now, s.hist.userFailureWindow)
 			hasRecoveryGate = gated
 		} else if s.history != nil {
@@ -1741,8 +1740,19 @@ func (s *MutableAutoSelect) rankLocked(now time.Time) []rankedCandidate {
 		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, demote: level, userFails: p.userFails, streaks: p.streaks, probeFailed: p.consec > 0 || s.latestProbeFailedLocked(p.tag), lastResort: p.lastResort, hasRecoveryGate: p.hasRecoveryGate})
 	}
 	s.scratchRanked = out
-	sort.SliceStable(out, func(i, j int) bool { return rankedBefore(out[i], out[j]) })
+	slices.SortStableFunc(out, compareRanked)
 	return out
+}
+
+// compareRanked orders a and b as rankedBefore does, ties equal.
+func compareRanked(a, b rankedCandidate) int {
+	switch {
+	case rankedBefore(a, b):
+		return -1
+	case rankedBefore(b, a):
+		return 1
+	}
+	return 0
 }
 
 func rankedBefore(a, b rankedCandidate) bool {

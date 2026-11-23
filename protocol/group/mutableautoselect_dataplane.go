@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -300,6 +301,8 @@ type dataPlaneWatchdog struct {
 	slowPending   bool
 	noResponseAt  time.Time
 	firstWriteAt  time.Time // guarded by ioMu
+	// wroteFirst is set once firstWriteAt is.
+	wroteFirst atomic.Bool
 	// udp is a UDP handle's exchanges, nil for a stream.
 	udp        *datagramExchanges
 	readBytes  atomic.Uint64
@@ -454,8 +457,11 @@ func (w *dataPlaneWatchdog) noteIOFrom(n int, err error, isRead bool, source M.S
 	}
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
-	w.lastIO = now
-	w.lastWasWrite = !isRead
+	// An IO that took its time getting here doesn't undo a later one, whose
+	// time the stall counts from.
+	if !now.Before(w.lastIO) {
+		w.lastIO, w.lastWasWrite = now, !isRead
+	}
 	// Only a proven conn can stall.
 	if !w.proven.Load() || w.stallArmed || w.stalled.Load() {
 		return
@@ -572,10 +578,14 @@ func (w *dataPlaneWatchdog) noteWriteStarting() {
 }
 
 func (w *dataPlaneWatchdog) noteFirstWrite() {
+	if w.wroteFirst.Load() {
+		return
+	}
 	w.ioMu.Lock()
 	defer w.ioMu.Unlock()
 	if w.firstWriteAt.IsZero() {
 		w.firstWriteAt = time.Now()
+		w.wroteFirst.Store(true)
 	}
 }
 
@@ -842,9 +852,12 @@ func (w *dataPlaneWatchdog) markResponded() {
 	w.stopResponseTimerLocked()
 }
 
+// stopResponseTimerLocked stops the response timer for good, once responded
+// or stalled is set, and drops it so an open conn doesn't keep it.
 func (w *dataPlaneWatchdog) stopResponseTimerLocked() {
 	if w.responseTimer != nil {
 		w.responseTimer.Stop()
+		w.responseTimer = nil
 	}
 }
 
@@ -962,7 +975,7 @@ func (d *dataPlanePacket) ReadFrom(p []byte) (int, net.Addr, error) {
 	n, addr, err := d.PacketConn.ReadFrom(p)
 	var source M.Socksaddr
 	if n > 0 && err == nil && d.unansweredWhileOpen {
-		source = M.SocksaddrFromNet(addr)
+		source = socksaddrFromNet(addr)
 	}
 	d.noteIOFrom(n, err, true, source)
 	return n, addr, err
@@ -971,7 +984,7 @@ func (d *dataPlanePacket) ReadFrom(p []byte) (int, net.Addr, error) {
 func (d *dataPlanePacket) WriteTo(p []byte, addr net.Addr) (int, error) {
 	var started datagramWait
 	if len(p) > 0 {
-		started = d.beginDatagramWait(M.SocksaddrFromNet(addr))
+		started = d.beginDatagramWait(socksaddrFromNet(addr))
 	}
 	n, err := d.PacketConn.WriteTo(p, addr)
 	d.endDatagramSend(started, err == nil && n > 0)
@@ -1011,6 +1024,17 @@ func (d *dataPlanePacket) Close() error {
 }
 
 func (d *dataPlanePacket) Upstream() any { return d.PacketConn }
+
+// socksaddrFromNet is M.SocksaddrFromNet, taking the common *net.UDPAddr
+// without its type switches.
+func socksaddrFromNet(addr net.Addr) M.Socksaddr {
+	if u, ok := addr.(*net.UDPAddr); ok {
+		if a := M.SocksaddrFromNetIP(netip.AddrPortFrom(M.AddrFromIP(u.IP), uint16(u.Port))); a.IsValid() {
+			return a
+		}
+	}
+	return M.SocksaddrFromNet(addr)
+}
 
 var (
 	_ net.Conn        = (*dataPlaneStream)(nil)

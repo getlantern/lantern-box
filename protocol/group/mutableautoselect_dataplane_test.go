@@ -483,3 +483,51 @@ func TestDataPlaneStream_NoResponseFollowsASlowResponse(t *testing.T) {
 		}
 	})
 }
+
+func TestDataPlaneStream_DelayedIODoesNotRewindTheStall(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idle = time.Second
+		start := time.Now()
+		held, release := make(chan struct{}), make(chan struct{})
+		stalledAt := make(chan time.Time, 1)
+		d := newDataPlaneStream(echoConn{}, idle, 1, dataPlaneHooks{
+			// Holds the write made at idle/4 between taking its time and
+			// recording it.
+			onActivity: func(at time.Time) {
+				if at.Sub(start) == idle/4 {
+					close(held)
+					<-release
+				}
+			},
+			onFailure: func(kind adapter.UserFailureKind, _ error) {
+				if kind == adapter.UserFailureStall {
+					stalledAt <- time.Now()
+				}
+			},
+		})
+		defer d.Close()
+		p := make([]byte, 1)
+		d.Read(p)
+		time.Sleep(idle / 4)
+		done := make(chan struct{})
+		go func() {
+			d.Write(p)
+			close(done)
+		}()
+		<-held
+		time.Sleep(idle / 2)
+		d.Write(p)
+		latest := time.Now()
+		close(release)
+		<-done
+
+		time.Sleep(2 * idle)
+		synctest.Wait()
+		select {
+		case at := <-stalledAt:
+			assert.Equal(t, latest.Add(idle), at, "a stall counts from the latest IO, whichever recorded last")
+		default:
+			t.Fatal("a proven conn whose last IO was a write never stalled")
+		}
+	})
+}

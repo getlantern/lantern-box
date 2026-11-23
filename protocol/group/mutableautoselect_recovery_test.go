@@ -174,7 +174,7 @@ func TestLocalHistory_FailureStreak(t *testing.T) {
 	h.addUnanswered(streakTCP, at(5*time.Second), at(time.Second), window)
 	require.EqualValues(t, 2, h.streakCount(streakTCP, at(5*time.Second), window), "a conn opened after the latest failure extends the streak")
 	_, _, failures, _ := h.snapshot(at(5*time.Second), window)
-	require.Empty(t, failures, "unanswered conns never enter the failure window")
+	require.Zero(t, failures, "unanswered conns never enter the failure window")
 
 	h.noteUserResponse(streakTCP, "", at(3*time.Second), at(5*time.Second))
 	require.EqualValues(t, 2, h.streakCount(streakTCP, at(5*time.Second), window), "an answer on an older conn leaves the streak")
@@ -3947,7 +3947,7 @@ func TestDialContext_SetupOutlastingItsMembershipIsNotCharged(t *testing.T) {
 		s.access.Lock()
 		defer s.access.Unlock()
 		_, _, fails, _ := s.historyForLocked("a").snapshot(time.Now(), s.hist.userFailureWindow)
-		assert.Empty(t, fails, "the failed setup was the removed a's")
+		assert.Zero(t, fails, "the failed setup was the removed a's")
 	})
 }
 
@@ -4034,7 +4034,7 @@ func TestDialContext_FallbackOutlastingItsMembershipIsNotCharged(t *testing.T) {
 		s.access.Lock()
 		defer s.access.Unlock()
 		_, _, fails, _ := s.historyForLocked("b").snapshot(time.Now(), s.hist.userFailureWindow)
-		assert.Empty(t, fails, "the failed setup was the removed b's")
+		assert.Zero(t, fails, "the failed setup was the removed b's")
 	})
 }
 
