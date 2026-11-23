@@ -229,7 +229,10 @@ func (h *localHistory) noteUserResponse(network streakNet, dest string, opened, 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	st := &h.streaks[network]
-	st.lastAnswerAt = at
+	// Answers can be reported out of order.
+	if at.After(st.lastAnswerAt) {
+		st.lastAnswerAt = at
+	}
 	if network == streakUDP || opened.After(st.at) {
 		st.count = 0
 	}

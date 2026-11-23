@@ -377,6 +377,11 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 	}
 	// After the need above is settled, so a probe it requests stands.
 	s.settleAfterOutageLocked(attempt.tag, outcome)
+	// A pass since the switch was decided ends the run of failures it rests
+	// on.
+	if p := &s.pendingConfirmedFailure; success && p.tag == attempt.tag && !attempt.started.Before(p.at) {
+		p.tag = ""
+	}
 	s.tryPendingConfirmedSwitchLocked()
 	s.reselectUDPLocked()
 	s.notifyProbesLocked()

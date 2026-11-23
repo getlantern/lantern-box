@@ -4359,7 +4359,9 @@ func TestRemove_SetupFailureStaysWithTheRemovedMembership(t *testing.T) {
 	}()
 	select {
 	case <-readded:
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(5 * time.Second):
+		close(logger.release)
+		t.Fatal("removing a waited on its failed setup")
 	}
 	close(logger.release)
 	<-dialed
@@ -4557,11 +4559,178 @@ func TestRemove_UDPSetupFailureStaysWithTheRemovedMembership(t *testing.T) {
 	}()
 	select {
 	case <-readded:
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(5 * time.Second):
+		close(logger.release)
+		t.Fatal("removing a waited on its failed setup")
 	}
 	close(logger.release)
 	<-set
 	<-readded
 	uf, _ := userFailures(s, "a")
 	assert.Empty(t, uf, "the failed setup was the removed a's")
+}
+
+func TestRemove_ClearsDecisionsWaitingOnTheRemovedMember(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b", "c")
+	now := time.Now()
+	s.access.Lock()
+	s.pendingConfirmedFailure.tag, s.pendingConfirmedFailure.since, s.pendingConfirmedFailure.at = "a", now, now
+	s.afterOutage.tag, s.afterOutage.passed, s.afterOutage.at = "b", "c", now
+	s.access.Unlock()
+
+	_, err := s.Remove("a", "b")
+	require.NoError(t, err)
+	s.access.Lock()
+	defer s.access.Unlock()
+	assert.Empty(t, s.pendingConfirmedFailure.tag, "a's pending switch can't carry over to a member re-added as a")
+	assert.Empty(t, s.afterOutage.tag, "b's post-outage recheck can't carry over to a member re-added as b")
+}
+
+// closeTrackingConn records whether it was closed.
+type closeTrackingConn struct {
+	echoConn
+	closed atomic.Bool
+}
+
+func (c *closeTrackingConn) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+
+func TestDial_CallerCancelDoesNotWaitOnAnOutboundIgnoringIt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newTestMUR(t, "a", "b")
+		recordSuccess(s, "a", 50)
+		recordSuccess(s, "b", 100)
+		unblock := make(chan struct{})
+		late := &closeTrackingConn{}
+		// a's dial ignores its context.
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			<-unblock
+			return late, nil
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		errc := make(chan error, 1)
+		go func() {
+			_, err := s.DialContext(ctx, "tcp", metadata.ParseSocksaddr("x.test:443"))
+			errc <- err
+		}()
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+		synctest.Wait()
+		select {
+		case err := <-errc:
+			assert.ErrorIs(t, err, context.Canceled)
+		default:
+			t.Fatal("a canceled dial waited on an outbound that ignores its context")
+		}
+		close(unblock)
+		synctest.Wait()
+		assert.True(t, late.closed.Load(), "a conn the outbound returns late is closed")
+	})
+}
+
+func TestHistory_AnswersReportedOutOfOrderKeepTheLatest(t *testing.T) {
+	s, _ := newTestMUR(t, "a")
+	s.access.Lock()
+	h := s.historyForLocked("a")
+	s.access.Unlock()
+	start := time.Now()
+	h.noteUserResponse(streakUDP, "", start, start.Add(3*time.Second))
+	h.noteUserResponse(streakUDP, "", start, start.Add(time.Second))
+	assert.True(t, h.answeredSince(streakUDP, start.Add(2*time.Second)), "an answer reported late doesn't hide a later one")
+}
+
+func TestConfirmation_PassingProbeEndsAPendingSwitch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		fail := func(context.Context) (net.Conn, error) { return nil, errors.New("dial timeout") }
+		obs["a"].dial = fail
+		// b's replacement probe passes, once released.
+		release := make(chan struct{})
+		obs["b"].dial = func(ctx context.Context) (net.Conn, error) {
+			select {
+			case <-release:
+				return probeResponderConn(), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		probeA := func() {
+			s.access.Lock()
+			s.requestProbesLocked([]string{"a"}, probeForced, false)
+			s.dispatchProbesLocked()
+			s.access.Unlock()
+			synctest.Wait()
+		}
+		s.requestFailureConfirmation(s.originAt("a", s.networkGeneration.Load()), "")
+		synctest.Wait()
+		s.access.Lock()
+		require.Equal(t, "a", s.pendingConfirmedFailure.tag, "a failed twice; the switch waits on b")
+		s.access.Unlock()
+
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		probeA()
+		obs["a"].dial = fail
+		probeA()
+		close(release)
+		synctest.Wait()
+		assert.Equal(t, "a", loadString(&s.selections[streakTCP].tag), "a passed between its failures, so they aren't two in a row")
+	})
+}
+
+func TestTrial_ObsoleteUnansweredReportDoesNotCount(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	s.selections[streakUDP].tag.Store("a")
+	s.access.Lock()
+	tr := s.trialsLocked("udp")
+	tr.unansweredAt, tr.failures = time.Now(), 1
+	s.access.Unlock()
+	report := s.makeHooks(s.trialOriginAt("b", s.networkGeneration.Load(), "a"), "udp")
+	waitingSince := time.Now().Add(-time.Second)
+	// b answers after its wait began, and then the wait's report, made just
+	// before the answer, lands.
+	report.response(time.Now(), "")
+	report.unanswered(waitingSince, "")
+
+	s.access.Lock()
+	defer s.access.Unlock()
+	tr = s.trialsLocked("udp")
+	assert.Equal(t, "b", tr.pending, "b's answer stays the pending move")
+	assert.Equal(t, 1, tr.failures, "the obsolete report adds no backoff")
+}
+
+func TestDial_SetupDroppedForAFailingMemberIsNotCharged(t *testing.T) {
+	s, obs := newTestMUR(t, "a", "b")
+	recordSuccess(s, "a", 50)
+	recordSuccess(s, "b", 100)
+	obs["b"].dial = func(context.Context) (net.Conn, error) { return echoConn{}, nil }
+	// While a's dial runs, the selection leaves a, whose probe then fails.
+	obs["a"].dial = func(context.Context) (net.Conn, error) {
+		s.selections[streakTCP].tag.Store("b")
+		seedProbe(s, "a", false, 0)
+		return echoConn{}, nil
+	}
+	conn, err := s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+	require.NoError(t, err, "the dial fails over to b")
+	conn.Close()
+	uf, _ := userFailures(s, "a")
+	assert.Empty(t, uf, "a's setup succeeded; only its probe failed")
+}
+
+func TestHardDemotion_ReleaseOfAnUnmeasuredSelectionClosesItsStuckConns(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	// a never passed a probe, then failed enough to be hard-demoted; b passed
+	// one started since.
+	for range s.hist.consecutiveFailLimit {
+		seedProbe(s, "a", false, 0)
+	}
+	seedProbe(s, "b", true, 50)
+	s.selections[streakTCP].tag.Store("a")
+	s.access.Lock()
+	defer s.access.Unlock()
+	pool, forNetwork := s.splitHealthyForLocked(s.rankLocked(time.Now()), "tcp")
+	winner, why := s.applyStickiness("tcp", pool, forNetwork)
+	require.Equal(t, "b", winner.tag)
+	assert.True(t, why.released, "a's release for its hard demotion closes its stuck conns")
 }

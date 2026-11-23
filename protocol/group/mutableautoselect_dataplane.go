@@ -179,7 +179,9 @@ func (r *connReport) noteTrialFailed() {
 }
 
 func (r *connReport) unanswered(waitingSince time.Time, dest string) {
-	r.noteTrialFailed()
+	if r.origin.route == trialRoute {
+		r.s.noteTrialUnanswered(r.origin, r.network, waitingSince, &r.trialFailed)
+	}
 	// A UDP handle carries many exchanges; each counts as a conn opened when
 	// its wait began.
 	exchangeOpened := r.opened
@@ -484,7 +486,10 @@ func (w *dataPlaneWatchdog) noteIOFrom(n int, err error, isRead bool, source M.S
 	if !now.Before(w.lastIO) {
 		w.lastIO, w.lastWasWrite = now, !isRead
 	}
-	// Likewise a write counts unless a later read answered it.
+	// Likewise a write counts unless a later read answered it. A read recorded
+	// after a later write still clears that write's bytes: exact accounting
+	// would need each write's time, and the cost is a stall gone uncharged,
+	// never one charged wrongly.
 	switch {
 	case now.Before(w.lastReadAt):
 	case isRead:

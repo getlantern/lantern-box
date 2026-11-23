@@ -540,6 +540,13 @@ func (s *MutableAutoSelect) Remove(tags ...string) (n int, err error) {
 			s.history.Delete(tag)
 		}
 		s.clearSelectionLocked(tag)
+		// So are decisions waiting on it.
+		if s.pendingConfirmedFailure.tag == tag {
+			s.pendingConfirmedFailure.tag = ""
+		}
+		if s.afterOutage.tag == tag {
+			s.afterOutage.tag = ""
+		}
 		removed[tag] = struct{}{}
 		n++
 	}
@@ -738,6 +745,8 @@ func setUp[C io.Closer, K connKind[C]](ctx context.Context, s *MutableAutoSelect
 		}
 		return none, err
 	}
+	// discarded is set for a setup that succeeded, on a member already failing.
+	discarded := false
 	if err == nil {
 		wrapped := k.wrap(conn, origin, release)
 		// Registered by now, so a release from here on closes it with the
@@ -746,7 +755,7 @@ func setUp[C io.Closer, K connKind[C]](ctx context.Context, s *MutableAutoSelect
 			return wrapped, nil
 		}
 		wrapped.Close()
-		err = errAbandonedDial
+		err, discarded = errAbandonedDial, true
 	}
 	s.logger.ErrorContext(ctx, err)
 	// A caller giving up says nothing about the member, so nothing is
@@ -754,7 +763,9 @@ func setUp[C io.Closer, K connKind[C]](ctx context.Context, s *MutableAutoSelect
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return none, err
 	}
-	s.recordUserFailure(origin, adapter.UserFailureDial, dialed, network, err)
+	if !discarded {
+		s.recordUserFailure(origin, adapter.UserFailureDial, dialed, network, err)
+	}
 
 	// Fast failover: try one alternate from the current rank. The active
 	// 3-min cadence keeps the probe history fresh enough to pick a working
@@ -1143,14 +1154,16 @@ func (s *MutableAutoSelect) applyStickiness(
 		}
 	}
 	switch {
+	// Before the measurement comparison: a hard-demoted selection's release
+	// closes its stuck conns whatever either member's delay.
+	case c.demote == demoteHard && best.demote < demoteHard:
+		return best, switchReason{text: "hard-demoted", released: true}
 	case (c.delayMs == 0) != (best.delayMs == 0) && !streakOnly && !measuredOverFailed:
 		// The tolerance comparison only means something between two real
 		// measurements: delayMs 0 means never measured, and comparing it with
 		// a real delay would let a never-probed sticky's 0ms retain it.
 		// rankLocked already sorts measured members first, so defer to it.
 		return best, switchReason{text: "unmeasured"}
-	case c.demote == demoteHard && best.demote < demoteHard:
-		return best, switchReason{text: "hard-demoted", released: true}
 	case c.lastResort && !best.lastResort && best.demote <= c.demote:
 		return best, switchReason{text: "last resort no longer needed"}
 	case c.demote > best.demote && s.pastRetention(c):
@@ -1810,8 +1823,9 @@ var errAbandonedDial = errors.New("dial abandoned: member failed while it was se
 // over now rather than at its deadline, and cancels the abandoned dial; a
 // conn it returns late is closed. The dial runs under a context derived from
 // ctx, which some outbounds tie their conns to, so a TCP conn comes with a
-// release that cancels it, to run once the conn closes. The dial runs on its
-// own goroutine so giving up never waits on an outbound that ignores ctx.
+// release that cancels it, to run once the conn closes. If ctx ends first, it
+// gives up the same way and returns ctx's error. The dial runs on its own
+// goroutine so giving up never waits on an outbound that ignores ctx.
 func (s *MutableAutoSelect) dialPrimary(ctx context.Context, origin connOrigin, network string, destination M.Socksaddr, dialed time.Time) (net.Conn, func(), error) {
 	o := origin.out
 	if network != N.NetworkTCP {
@@ -1831,18 +1845,21 @@ func (s *MutableAutoSelect) dialPrimary(ctx context.Context, origin connOrigin, 
 	slow := time.NewTimer(earlyConfirmAfter)
 	defer slow.Stop()
 	tag := o.Tag()
+	abandon := func(err error) (net.Conn, func(), error) {
+		cancel()
+		go func() {
+			if r := <-done; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return nil, nil, err
+	}
 	for {
 		s.access.Lock()
 		changed, failed := s.probeChanged, s.failedSinceLocked(tag, N.NetworkTCP, dialed)
 		s.access.Unlock()
 		if failed {
-			cancel()
-			go func() {
-				if r := <-done; r.conn != nil {
-					r.conn.Close()
-				}
-			}()
-			return nil, nil, errAbandonedDial
+			return abandon(errAbandonedDial)
 		}
 		select {
 		case r := <-done:
@@ -1851,6 +1868,8 @@ func (s *MutableAutoSelect) dialPrimary(ctx context.Context, origin connOrigin, 
 				return nil, nil, r.err
 			}
 			return r.conn, cancel, nil
+		case <-ctx.Done():
+			return abandon(ctx.Err())
 		case <-slow.C:
 			s.requestEarlyConfirmation(origin)
 		case <-changed:
@@ -2340,6 +2359,28 @@ func (s *MutableAutoSelect) noteTrialAnswered(origin connOrigin, network string)
 func (s *MutableAutoSelect) noteTrialFailed(origin connOrigin, network string) {
 	s.access.Lock()
 	defer s.access.Unlock()
+	s.noteTrialFailedLocked(origin, network)
+}
+
+// noteTrialUnanswered is noteTrialFailed, once per failed, for a trial on
+// network through origin that went unanswered from waitingSince, unless its
+// member has answered since: the report is then obsolete, as
+// noteUnansweredLocked finds too.
+func (s *MutableAutoSelect) noteTrialUnanswered(origin connOrigin, network string, waitingSince time.Time, failed *atomic.Bool) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if !s.originCurrentLocked(origin) {
+		return
+	}
+	if h, ok := s.peekHistoryLocked(origin.out.Tag()); ok && h.answeredSince(streakNetFor(network), waitingSince) {
+		return
+	}
+	if failed.CompareAndSwap(false, true) {
+		s.noteTrialFailedLocked(origin, network)
+	}
+}
+
+func (s *MutableAutoSelect) noteTrialFailedLocked(origin connOrigin, network string) {
 	if !s.originCurrentLocked(origin) {
 		return
 	}
