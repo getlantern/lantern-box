@@ -172,7 +172,7 @@ func TestDataPlane_ConcurrentFailureClose(t *testing.T) {
 				})
 				defer w.closeWatchdog()
 				w.noteIO(1, nil, true)
-				w.noteIO(1, nil, false)
+				w.noteIO(dataPlaneStallMinUnanswered, nil, false)
 				var wg sync.WaitGroup
 				for range 20 {
 					wg.Go(func() { w.noteIO(0, connResetErr(), true) })
@@ -400,7 +400,7 @@ func TestDataPlaneStream_StallCountsFromTheLastIO(t *testing.T) {
 			}
 		}})
 		defer d.Close()
-		p := make([]byte, 1)
+		p := make([]byte, dataPlaneStallMinUnanswered)
 		d.Read(p)
 		d.Write(p)
 		time.Sleep(idle / 2)
@@ -506,7 +506,7 @@ func TestDataPlaneStream_DelayedIODoesNotRewindTheStall(t *testing.T) {
 			},
 		})
 		defer d.Close()
-		p := make([]byte, 1)
+		p := make([]byte, dataPlaneStallMinUnanswered)
 		d.Read(p)
 		time.Sleep(idle / 4)
 		done := make(chan struct{})
@@ -529,5 +529,113 @@ func TestDataPlaneStream_DelayedIODoesNotRewindTheStall(t *testing.T) {
 		default:
 			t.Fatal("a proven conn whose last IO was a write never stalled")
 		}
+	})
+}
+
+// TestDataPlane_StallNeedsUnansweredBytes checks that going quiet counts as a
+// stall only after enough unanswered writes: an idle keep-alive connection
+// whose last write was one small frame, such as an HTTP/2 WINDOW_UPDATE once a
+// page has loaded, must not be charged.
+func TestDataPlane_StallNeedsUnansweredBytes(t *testing.T) {
+	const idle = time.Second
+	for _, tc := range []struct {
+		name   string
+		io     func(w *dataPlaneWatchdog)
+		stalls bool
+	}{
+		{"small write after a read", func(w *dataPlaneWatchdog) {
+			w.noteIO(4096, nil, true)
+			w.noteIO(38, nil, false)
+		}, false},
+		{"writes add up past the threshold", func(w *dataPlaneWatchdog) {
+			w.noteIO(4096, nil, true)
+			for range 4 {
+				w.noteIO(dataPlaneStallMinUnanswered/4, nil, false)
+			}
+		}, true},
+		{"a read answers earlier writes", func(w *dataPlaneWatchdog) {
+			w.noteIO(4096, nil, true)
+			w.noteIO(dataPlaneStallMinUnanswered, nil, false)
+			w.noteIO(100, nil, true)
+			w.noteIO(38, nil, false)
+		}, false},
+		{"last IO a read", func(w *dataPlaneWatchdog) {
+			w.noteIO(dataPlaneStallMinUnanswered, nil, false)
+			w.noteIO(4096, nil, true)
+		}, false},
+		{"unanswered pings add up across quiet windows", func(w *dataPlaneWatchdog) {
+			// A dead tunnel the app keeps pinging, with no reply between.
+			w.noteIO(4096, nil, true)
+			for range 7 {
+				time.Sleep(2 * idle) // a quiet window passes
+				synctest.Wait()
+				w.noteIO(40, nil, false)
+			}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				failures := make(chan adapter.UserFailureKind, 8)
+				var w dataPlaneWatchdog
+				w.init(idle, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
+					onFailure: func(k adapter.UserFailureKind, _ error) { failures <- k },
+				})
+				defer w.closeWatchdog()
+				tc.io(&w)
+				time.Sleep(2 * idle)
+				synctest.Wait()
+				close(failures)
+				var got []adapter.UserFailureKind
+				for k := range failures {
+					got = append(got, k)
+				}
+				if tc.stalls {
+					assert.Equal(t, []adapter.UserFailureKind{adapter.UserFailureStall}, got)
+				} else {
+					assert.Empty(t, got)
+				}
+			})
+		})
+	}
+}
+
+func TestDataPlaneStream_DelayedWriteStillCountsAsUnanswered(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idle = time.Second
+		start := time.Now()
+		held, release := make(chan struct{}), make(chan struct{})
+		stalled := make(chan struct{}, 1)
+		d := newDataPlaneStream(echoConn{}, idle, 1, dataPlaneHooks{
+			// Holds the write made at idle/4 between taking its time and
+			// recording it.
+			onActivity: func(at time.Time) {
+				if at.Sub(start) == idle/4 {
+					close(held)
+					<-release
+				}
+			},
+			onFailure: func(kind adapter.UserFailureKind, _ error) {
+				if kind == adapter.UserFailureStall {
+					stalled <- struct{}{}
+				}
+			},
+		})
+		defer d.Close()
+		d.Read(make([]byte, 1))
+		time.Sleep(idle / 4)
+		done := make(chan struct{})
+		go func() {
+			d.Write(make([]byte, dataPlaneStallMinUnanswered/2+1))
+			close(done)
+		}()
+		<-held
+		time.Sleep(idle / 4)
+		d.Write(make([]byte, dataPlaneStallMinUnanswered/2))
+		close(release)
+		<-done
+
+		time.Sleep(2 * idle)
+		synctest.Wait()
+		assert.Len(t, stalled, 1, "both writes since the last read went unanswered, the delayed one too")
 	})
 }

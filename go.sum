@@ -295,8 +295,8 @@ github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f/go.mod h1:D5ao98qkA
 github.com/getlantern/ops v0.0.0-20220713155959-1315d978fff7/go.mod h1:D5ao98qkA6pxftxoqzibIBBrLSUli+kYnJqrgBf9cIA=
 github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534 h1:3BwvWj0JZzFEvNNiMhCu4bf60nqcIuQpTYb00Ezm1ag=
 github.com/getlantern/ops v0.0.0-20231025133620-f368ab734534/go.mod h1:ZsLfOY6gKQOTyEcPYNA9ws5/XHZQFroxqCOhHjGcs9Y=
-github.com/getlantern/outline-sdk/x v0.3.0-lantern.1 h1:+/ZrTtSnUtQvHepjkMUkor51s2x/LekbghpRRNPbNlI=
-github.com/getlantern/outline-sdk/x v0.3.0-lantern.1/go.mod h1:d7z0ethd2XO170I2yrVWQIB79UK4RIyJSVG56BbpI5s=
+github.com/getlantern/outline-sdk/x v0.3.0-lantern.2 h1:iS+oBLoH5P+SRFVIZXUFr5L8R8jawCOVa9ayNp9fIco=
+github.com/getlantern/outline-sdk/x v0.3.0-lantern.2/go.mod h1:d7z0ethd2XO170I2yrVWQIB79UK4RIyJSVG56BbpI5s=
 github.com/getlantern/quic-go-unbounded-fork v0.62.1-unbounded h1:vH2G0xioKMdV6NpGI0MbNTeuof0qeOl5RragE3vejqk=
 github.com/getlantern/quic-go-unbounded-fork v0.62.1-unbounded/go.mod h1:RAro2j2yN9a9EiPACLHT9IB2NXCvGQmmo/alT0yYI0w=
 github.com/getlantern/samizdat v0.0.3-0.20261117205503-f66a0285afd9 h1:n0VsLlZWbCYYKGE/s0J5spCAW7WZiMx1U0DpE28PIxA=

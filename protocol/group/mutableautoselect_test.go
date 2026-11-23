@@ -610,8 +610,8 @@ func TestDataPlaneStream_StallSuppressedUntilProven(t *testing.T) {
 
 func TestDataPlaneStream_StallFiresAfterProven(t *testing.T) {
 	// Once cumulative Read bytes cross provedReadBytes AND the most recent
-	// IO was a Write that hasn't been answered, the next idle window
-	// fires onStall exactly once.
+	// IO was at least dataPlaneStallMinUnanswered unanswered bytes of
+	// Writes, the next idle window fires onStall exactly once.
 	var calls atomic.Uint32
 	const provedReadBytes = 50
 	d := newDataPlaneStream(echoConn{}, 30*time.Millisecond, provedReadBytes,
@@ -625,7 +625,7 @@ func TestDataPlaneStream_StallFiresAfterProven(t *testing.T) {
 	require.True(t, d.proven.Load(), "Read should have proven the conn")
 
 	// Drive a Write so the watchdog sees "we sent bytes, no response."
-	_, err = d.Write([]byte("ping"))
+	_, err = d.Write(make([]byte, dataPlaneStallMinUnanswered))
 	require.NoError(t, err, "Write should succeed on echoConn")
 
 	require.True(t, d.snapshotIO().lastWasWrite, "Write should set the last-was-write gate")
@@ -667,8 +667,8 @@ func TestDataPlaneStream_CloseIsIdempotent(t *testing.T) {
 func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
 	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
-	d.proven.Store(true)    // simulate a proven conn so fireStall isn't gated on the proven check
-	d.noteIO(1, nil, false) // ...nor on the write-without-read gate
+	d.proven.Store(true)                              // simulate a proven conn so fireStall isn't gated on the proven check
+	d.noteIO(dataPlaneStallMinUnanswered, nil, false) // ...nor on the unanswered-bytes gate
 	d.Close()
 	d.fireStall()
 	assert.Equal(t, uint32(0), calls.Load(), "no stall callbacks must fire after Close")
@@ -678,7 +678,7 @@ func TestDataPlanePacket_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
 	d := newDataPlanePacket(stallPacketConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	d.proven.Store(true)
-	d.noteIO(1, nil, false)
+	d.noteIO(dataPlaneStallMinUnanswered, nil, false)
 	d.Close()
 	d.fireStall()
 	assert.Equal(t, uint32(0), calls.Load(), "no stall callbacks must fire after Close")
@@ -1244,7 +1244,7 @@ func TestDataPlaneStream_Stall_AttributesStallKind(t *testing.T) {
 		d := newDataPlaneStream(stallConn{}, idle, 0, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind, _ error) { got.Store(kind) }})
 		defer d.Close()
 		d.proven.Store(true)
-		d.noteIO(1, nil, false)
+		d.noteIO(dataPlaneStallMinUnanswered, nil, false)
 		time.Sleep(2 * idle)
 		synctest.Wait()
 

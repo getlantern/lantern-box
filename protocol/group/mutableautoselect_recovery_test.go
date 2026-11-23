@@ -1408,7 +1408,7 @@ func TestDataPlanePacket_StallKeepsExchangesWatched(t *testing.T) {
 		d.WriteTo([]byte("q"), &net.UDPAddr{})
 		c.in <- []byte("r")
 		d.ReadFrom(make([]byte, 64))
-		d.WriteTo([]byte("q"), &net.UDPAddr{})
+		d.WriteTo(make([]byte, dataPlaneStallMinUnanswered), &net.UDPAddr{})
 		time.Sleep(3 * time.Second)
 		synctest.Wait()
 		require.EqualValues(t, 1, stalls.Load(), "the handle stalled")
