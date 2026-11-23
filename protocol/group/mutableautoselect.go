@@ -9,7 +9,6 @@ import (
 	"maps"
 	"net"
 	"slices"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -812,19 +811,15 @@ func (s *MutableAutoSelect) chargeable(tag string, route routeKind) bool {
 // closes.
 func (s *MutableAutoSelect) wrapStream(conn net.Conn, network string, origin connOrigin, release func()) net.Conn {
 	o := origin.out
-	hooks := s.makeHooks(origin, N.NetworkName(network))
-	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, hooks)
+	report := s.makeHooks(origin, N.NetworkName(network))
+	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, report)
 	if N.NetworkName(network) == N.NetworkTCP {
 		wrapped.firstResponseTimeout = s.cfg.dataPlaneFirstResponseTimeout
 		wrapped.unansweredAfter = defaultUnansweredAfter
-		wrapped.slowResponseAfter = earlyConfirmAfter
-		tag := o.Tag()
-		wrapped.hooks.onClose = func() {
-			untrackConn(s, &s.tcpStreams, tag, wrapped)
-			if release != nil {
-				release()
-			}
+		if report.confirms() {
+			wrapped.slowResponseAfter = earlyConfirmAfter
 		}
+		report.stream, report.release = wrapped, release
 	}
 	s.access.Lock()
 	if N.NetworkName(network) == N.NetworkTCP && s.originCurrentLocked(origin) {
@@ -876,31 +871,14 @@ func (s *MutableAutoSelect) originCurrentLocked(origin connOrigin) bool {
 func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, origin connOrigin, destination M.Socksaddr) net.PacketConn {
 	o := origin.out
 	tag := o.Tag()
-	hooks := s.makeHooks(origin, N.NetworkUDP)
-	wrapped := newDataPlanePacket(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, hooks)
+	report := s.makeHooks(origin, N.NetworkUDP)
+	wrapped := newDataPlanePacket(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, report)
 	wrapped.unansweredAfter = defaultUDPUnansweredAfter
 	wrapped.unansweredWhileOpen = true
 	if destination = destination.Unwrap(); destination.IsValid() {
-		wrapped.lastDest = destination.String()
+		wrapped.exchanges.lastDest = destination.String()
 	}
-	wrapped.hooks.onClose = func() { untrackConn(s, &s.udpHandles, tag, wrapped) }
-	if origin.route == trialRoute {
-		var answered atomic.Bool
-		response, unanswered := wrapped.hooks.onResponse, wrapped.hooks.onUnanswered
-		wrapped.hooks.onResponse = func(at time.Time, dest string) {
-			answered.Store(true)
-			response(at, dest)
-		}
-		wrapped.hooks.onUnanswered = func(waitingSince time.Time, dest string) {
-			unanswered(waitingSince, dest)
-			// A trial that never answered closes, so an app holding its
-			// socket sets up again rather than staying on a member that
-			// failed; one that answered serves its app.
-			if !answered.Load() {
-				wrapped.Close()
-			}
-		}
-	}
+	report.packet = wrapped
 	s.access.Lock()
 	if s.originCurrentLocked(origin) {
 		trackConnLocked(&s.udpHandles, tag, wrapped)
@@ -1622,7 +1600,7 @@ func (s *MutableAutoSelect) splitHealthyForLocked(ranked []rankedCandidate, netw
 		out = append(out, c)
 	}
 	if bumped {
-		sort.SliceStable(out, func(i, j int) bool { return rankedBefore(out[i], out[j]) })
+		slices.SortStableFunc(out, compareRanked)
 	}
 	var ungated, ungatedUsable, gatedUsable bool
 	for _, c := range out {
@@ -1698,7 +1676,7 @@ func (s *MutableAutoSelect) rankLocked(now time.Time) []rankedCandidate {
 			lastDelay, c, uf, gated := h.snapshot(now, s.hist.userFailureWindow)
 			rawDelay = lastDelay
 			consec = c
-			userFails = uint32(len(uf))
+			userFails = uint32(uf)
 			streaks = h.streakCounts(now, s.hist.userFailureWindow)
 			hasRecoveryGate = gated
 		} else if s.history != nil {
@@ -1762,8 +1740,19 @@ func (s *MutableAutoSelect) rankLocked(now time.Time) []rankedCandidate {
 		out = append(out, rankedCandidate{outbound: p.o, tag: p.tag, delayMs: p.delayMs, demote: level, userFails: p.userFails, streaks: p.streaks, probeFailed: p.consec > 0 || s.latestProbeFailedLocked(p.tag), lastResort: p.lastResort, hasRecoveryGate: p.hasRecoveryGate})
 	}
 	s.scratchRanked = out
-	sort.SliceStable(out, func(i, j int) bool { return rankedBefore(out[i], out[j]) })
+	slices.SortStableFunc(out, compareRanked)
 	return out
+}
+
+// compareRanked orders a and b as rankedBefore does, ties equal.
+func compareRanked(a, b rankedCandidate) int {
+	switch {
+	case rankedBefore(a, b):
+		return -1
+	case rankedBefore(b, a):
+		return 1
+	}
+	return 0
 }
 
 func rankedBefore(a, b rankedCandidate) bool {

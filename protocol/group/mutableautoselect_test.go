@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -301,7 +302,7 @@ func TestHydrateLocalHistory_DropsAgedUserFailures(t *testing.T) {
 	h := hydrateLocalHistory(persisted, now, 5*time.Minute)
 	lastDelay, _, userFails, _ := h.snapshot(now, 5*time.Minute)
 	assert.Equal(t, uint32(120), lastDelay)
-	assert.Len(t, userFails, 1, "stale user-failure timestamp must be dropped on hydrate")
+	assert.Equal(t, 1, userFails, "stale user-failure timestamp must be dropped on hydrate")
 }
 
 func TestBehaviorFor_Timeouts(t *testing.T) {
@@ -378,7 +379,13 @@ func userFailures(s *MutableAutoSelect, tag string) ([]adapter.UserFailure, bool
 	if !ok {
 		return nil, false
 	}
-	_, _, uf, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.userFailures = pruneUserFailures(h.userFailures, time.Now(), s.hist.userFailureWindow)
+	var uf []adapter.UserFailure
+	if len(h.userFailures) > 0 {
+		uf = slices.Clone(h.userFailures)
+	}
 	return uf, true
 }
 
@@ -784,7 +791,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// one. (Spec change from earlier "one-shot hard demote.")
 	s, _ := newTestMUR(t, "a")
 	s.selections[streakTCP].tag.Store("a")
-	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureStall, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1,
@@ -796,7 +803,7 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
 	s.selections[streakTCP].tag.Store("a")
-	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureReset, nil)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureReset, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -1231,16 +1238,20 @@ func TestDataPlaneStream_MidStreamReset_AttributesResetKind(t *testing.T) {
 
 func TestDataPlaneStream_Stall_AttributesStallKind(t *testing.T) {
 	// The idle-timeout path must report a stall, complementing the reset path.
-	var got atomic.Value // adapter.UserFailureKind
-	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind, _ error) { got.Store(kind) }})
-	defer d.Close()
-	d.proven.Store(true)
-	d.noteIO(1, nil, false)
-	d.fireStall()
+	synctest.Test(t, func(t *testing.T) {
+		const idle = time.Second
+		var got atomic.Value // adapter.UserFailureKind
+		d := newDataPlaneStream(stallConn{}, idle, 0, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind, _ error) { got.Store(kind) }})
+		defer d.Close()
+		d.proven.Store(true)
+		d.noteIO(1, nil, false)
+		time.Sleep(2 * idle)
+		synctest.Wait()
 
-	require.NotNil(t, got.Load(), "a stall must attribute a failure")
-	assert.Equal(t, adapter.UserFailureStall, got.Load().(adapter.UserFailureKind),
-		"an idle stall must be recorded as a stall")
+		require.NotNil(t, got.Load(), "a stall must attribute a failure")
+		assert.Equal(t, adapter.UserFailureStall, got.Load().(adapter.UserFailureKind),
+			"an idle stall must be recorded as a stall")
+	})
 }
 
 func TestDataPlaneStream_MidStreamReset_ErrClosed_AttributesFailure(t *testing.T) {
@@ -1887,7 +1898,7 @@ func TestMakeHooks_IgnoresFailureFromUnselectedTag(t *testing.T) {
 	s.selections[streakTCP].tag.Store("b")
 	s.selections[streakUDP].tag.Store("b")
 
-	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureStall, nil)
 
 	s.access.Lock()
 	_, ok := s.peekHistoryLocked("a")
@@ -1903,7 +1914,7 @@ func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
 	s.selections[streakTCP].tag.Store("b")
 	s.selections[streakUDP].tag.Store("a")
 
-	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureStall, nil)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the udp selection must still be chargeable")
@@ -1915,7 +1926,7 @@ func TestMakeHooks_UnselectedGateDisabledByConfig(t *testing.T) {
 	s.cfg.demoteOnlySelected = false
 	s.selections[streakTCP].tag.Store("b")
 
-	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureStall, nil)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureStall, nil)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the gate must be defeatable for rollback")
@@ -1928,7 +1939,7 @@ func TestMakeHooks_ChargesFallbackRouteEvenWhenUnselected(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	s.selections[streakTCP].tag.Store("a")
 
-	s.makeHooks(s.originAt("b", s.networkGeneration.Load()).on(fallbackRoute), "tcp").onFailure(adapter.UserFailureReset, nil)
+	s.makeHooks(s.originAt("b", s.networkGeneration.Load()).on(fallbackRoute), "tcp").failure(adapter.UserFailureReset, nil)
 
 	uf, ok := userFailures(s, "b")
 	require.True(t, ok, "a fallback-route conn must stay chargeable")
@@ -2032,7 +2043,7 @@ func TestMakeHooks_FailureDoesNotRunLadder(t *testing.T) {
 		obs["a"].dial = denyDial
 		obs["b"].dial = denyDial
 		s.selections[streakTCP].tag.Store("a")
-		s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").onFailure(adapter.UserFailureReset, nil)
+		s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureReset, nil)
 		synctest.Wait()
 		assert.Zero(t, s.lastLadderAt.Load(), "a data-plane failure must not re-probe every member")
 	})
@@ -2095,7 +2106,7 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 			require.True(t, ok, "a changed override keeps the member's history")
 			delay, _, uf, gated := h.snapshot(time.Now(), s.hist.userFailureWindow)
 			assert.Equal(t, uint32(100), delay)
-			assert.Len(t, uf, int(s.hist.consecutiveFailLimit))
+			assert.Equal(t, int(s.hist.consecutiveFailLimit), uf)
 			assert.True(t, gated)
 			persisted := s.history.Load("a")
 			require.NotNil(t, persisted)
