@@ -344,7 +344,7 @@ jobs:
           OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
           OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
         run: |
-          pipx install --quiet oci-cli==3.97.0
+          pipx install --quiet oci-cli==3.96.3
           conf_dir="$RUNNER_TEMP/oci"
           mkdir -p "$conf_dir"
           printf '%s\n' "$OCI_KEY_CONTENT" > "$conf_dir/key.pem"
