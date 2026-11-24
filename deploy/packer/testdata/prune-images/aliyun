@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Fake Alibaba Cloud CLI for prune-images.test.sh.
+echo "$*" >>"$FAKE_DIR/calls.log"
+if [ -n "${FAKE_ALI_FLAKY_ONCE:-}" ] && [ ! -f "$FAKE_DIR/flaked" ]; then
+  touch "$FAKE_DIR/flaked"
+  echo "ERROR: read: connection reset by peer" >&2
+  exit 1
+fi
+region="" image=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    --RegionId | --region) region="${args[$((i + 1))]}" ;;
+    --ImageId) image="${args[$((i + 1))]}" ;;
+  esac
+done
+case "$1 $2" in
+  "ecs DescribeRegions") cat "$FAKE_DIR/ali-regions.json" ;;
+  "ecs DescribeImages")
+    if [ "$region" = "cn-nanjing" ]; then
+      echo "ErrorCode: InvalidRegionId.NotFound Message: The specified RegionId does not exist in our records." >&2
+      exit 1
+    fi
+    f="$FAKE_DIR/ali-images-$region.json"
+    [ -f "$f" ] || f="$FAKE_DIR/ali-images-empty.json"
+    if [ -n "$image" ]; then
+      jq --arg id "$image" '.Images.Image |= map(select(.ImageId == $id))' "$f"
+    else
+      cat "$f"
+    fi
+    ;;
+  "ecs DescribeInstances")
+    if [ "$image" = "m-used" ]; then echo '{"TotalCount":1}'; else echo '{"TotalCount":0}'; fi
+    ;;
+  "ecs DeleteImage") echo '{}' ;;
+  "ecs DeleteSnapshot")
+    [ -n "${FAKE_ALI_SNAPSHOT_FAIL:-}" ] && { echo "ErrorCode: IncorrectSnapshotStatus" >&2; exit 1; }
+    echo '{}'
+    ;;
+  *) echo "fake aliyun: unhandled: $*" >&2; exit 1 ;;
+esac
