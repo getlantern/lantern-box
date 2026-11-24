@@ -107,11 +107,15 @@ prune_oci() {
 
 # --- Alicloud --------------------------------------------------------------
 
-# Retried: mainland endpoints reset connections from CI runners now and then.
+# Usage: ali_cli <region> <product> <action> [args...]
+# The CLI reads the endpoint region from --region, or from a local profile,
+# which CI does not have. Retried: mainland endpoints reset connections from
+# CI runners now and then.
 ali_cli() {
-  local attempt
+  local region=$1 attempt
+  shift
   for attempt in 1 2 3; do
-    if aliyun "$@" --mode AK --access-key-id "$ALICLOUD_ACCESS_KEY" --access-key-secret "$ALICLOUD_SECRET_KEY"; then
+    if aliyun "$@" --region "$region" --mode AK --access-key-id "$ALICLOUD_ACCESS_KEY" --access-key-secret "$ALICLOUD_SECRET_KEY"; then
       return 0
     fi
     [ "$attempt" -lt 3 ] && sleep "$ALICLOUD_RETRY_SECS"
@@ -123,7 +127,7 @@ ali_cli() {
 ali_images() {
   local region=$1 page=1 out all='[]' got
   while :; do
-    out=$(ali_cli ecs DescribeImages --RegionId "$region" --ImageOwnerAlias self --Status Available \
+    out=$(ali_cli "$region" ecs DescribeImages --RegionId "$region" --ImageOwnerAlias self --Status Available \
       --ImageName "${PREFIX}*" --PageSize 100 --PageNumber "$page" 2>"$errfile") || return 1
     all=$(jq -c --argjson acc "$all" '$acc + (.Images.Image // [])' <<<"$out")
     got=$(jq '.Images.Image // [] | length' <<<"$out")
@@ -141,7 +145,7 @@ SNAPSHOT_TAG=lantern-box-prune-image
 # Returns 0 when the image exists, 1 when it does not, 2 when the lookup failed.
 ali_image_exists() {
   local region=$1 id=$2 out n
-  out=$(ali_cli ecs DescribeImages --RegionId "$region" --ImageId "$id" --ImageOwnerAlias self) || return 2
+  out=$(ali_cli "$region" ecs DescribeImages --RegionId "$region" --ImageId "$id" --ImageOwnerAlias self) || return 2
   # Only a well-formed answer may say "gone": callers delete on it.
   n=$(jq -e '.Images.Image | if type == "array" then length else error("no image list") end' <<<"$out") || return 2
   [ "$n" -gt 0 ] && return 0
@@ -152,7 +156,7 @@ ali_delete_image() {
   local region=$1 id=$2 name=$3 snaps=$4 users args i rc
   # DeleteImage would also refuse an image a live instance was created from;
   # checking first keeps that a skip instead of a failure.
-  if ! users=$(ali_cli ecs DescribeInstances --RegionId "$region" --ImageId "$id" | jq '.TotalCount'); then
+  if ! users=$(ali_cli "$region" ecs DescribeInstances --RegionId "$region" --ImageId "$id" | jq '.TotalCount'); then
     fail "Alicloud $region: cannot check instances using $name ($id)"
     return
   fi
@@ -171,14 +175,14 @@ ali_delete_image() {
       args+=("--ResourceId.$i" "$snap")
       i=$((i + 1))
     done
-    if ! ali_cli ecs TagResources --RegionId "$region" --ResourceType snapshot "${args[@]}" \
+    if ! ali_cli "$region" ecs TagResources --RegionId "$region" --ResourceType snapshot "${args[@]}" \
       --Tag.1.Key "$SNAPSHOT_TAG" --Tag.1.Value "$id" >/dev/null; then
       fail "Alicloud $region: cannot tag the snapshots of $name ($id); not deleting it"
       return
     fi
   fi
   echo "  deleting $name ($id)"
-  if ! ali_cli ecs DeleteImage --RegionId "$region" --ImageId "$id" >/dev/null; then
+  if ! ali_cli "$region" ecs DeleteImage --RegionId "$region" --ImageId "$id" >/dev/null; then
     # A retried call fails when the attempt whose response was lost had deleted it.
     rc=0
     ali_image_exists "$region" "$id" || rc=$?
@@ -196,7 +200,7 @@ ali_delete_image() {
 ali_tagged_snapshots() {
   local region=$1 page=1 out all='[]' got
   while :; do
-    out=$(ali_cli ecs DescribeSnapshots --RegionId "$region" --Tag.1.Key "$SNAPSHOT_TAG" \
+    out=$(ali_cli "$region" ecs DescribeSnapshots --RegionId "$region" --Tag.1.Key "$SNAPSHOT_TAG" \
       --PageSize 100 --PageNumber "$page") || return 1
     all=$(jq -c --argjson acc "$all" '$acc + (.Snapshots.Snapshot // [])' <<<"$out")
     got=$(jq '.Snapshots.Snapshot // [] | length' <<<"$out")
@@ -236,7 +240,7 @@ ali_sweep_snapshots() {
     # Alicloud keeps the snapshot locked for a short while after DeleteImage.
     ok=false
     for attempt in 1 2 3 4 5 6; do
-      if ali_cli ecs DeleteSnapshot --region "$region" --SnapshotId "$snap" >/dev/null; then
+      if ali_cli "$region" ecs DeleteSnapshot --SnapshotId "$snap" >/dev/null; then
         ok=true
         break
       fi
@@ -277,7 +281,7 @@ prune_alicloud_region() {
 prune_alicloud() {
   local regions region
   : "${ALICLOUD_ACCESS_KEY:?}" "${ALICLOUD_SECRET_KEY:?}"
-  if ! regions=$(ali_cli ecs DescribeRegions --RegionId "$ALICLOUD_HOME_REGION" | jq -r '.Regions.Region[].RegionId'); then
+  if ! regions=$(ali_cli "$ALICLOUD_HOME_REGION" ecs DescribeRegions --RegionId "$ALICLOUD_HOME_REGION" | jq -r '.Regions.Region[].RegionId'); then
     fail "Alicloud: cannot list regions"
     return
   fi
