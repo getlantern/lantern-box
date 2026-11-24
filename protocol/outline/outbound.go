@@ -36,6 +36,9 @@ type Outbound struct {
 	// createDialer runs a strategy search. A failed search is not cached,
 	// because it can fail transiently, e.g. before the network is up.
 	createDialer func() (transport.StreamDialer, error)
+	// sites gives each site a dialer of its own once its search succeeds; nil
+	// when the per_site option is false.
+	sites *siteDialers
 
 	mu     sync.Mutex
 	dialer transport.StreamDialer
@@ -95,22 +98,30 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 	}
 	registry := newRegistry(&outboundDialer{dialer: sDialer, packetDialer: packetDialer, logger: log})
 
-	finderConfig := smart.NewFinderConfig().
-		SetConfigURLRegistry(registry).
-		SetLogWriter(&logWriter{log})
+	var testTimeout time.Duration
 	if options.TestTimeout != "" {
-		timeout, err := time.ParseDuration(options.TestTimeout)
+		testTimeout, err = time.ParseDuration(options.TestTimeout)
 		if err != nil {
 			return nil, err
 		}
-		if timeout > 0 {
-			finderConfig.SetTestTimeout(timeout)
+	}
+	newFinder := func(cache smart.StrategyResultCache) (smart.Finder, error) {
+		c := smart.NewFinderConfig().
+			SetConfigURLRegistry(registry).
+			SetLogWriter(&logWriter{log})
+		if testTimeout > 0 {
+			c.SetTestTimeout(testTimeout)
 		}
+		if cache != nil {
+			c.SetCache(cache)
+		}
+		return c.New()
 	}
+	var cache smart.StrategyResultCache
 	if options.StrategyCachePath != "" {
-		finderConfig.SetCache(strategyCacheFor(options.StrategyCachePath, log))
+		cache = strategyCacheFor(options.StrategyCachePath, log)
 	}
-	finder, err := finderConfig.New()
+	finder, err := newFinder(cache)
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +140,19 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		}
 		networks = append(networks, N.NetworkUDP)
 	}
+	var sites *siteDialers
+	if options.PerSite == nil || *options.PerSite {
+		// The finder keeps its winner under one cache key, so sites sharing
+		// the outbound's cache would overwrite each other's; site searches
+		// go uncached.
+		siteFinder, err := newFinder(nil)
+		if err != nil {
+			return nil, err
+		}
+		sites = newSiteDialers(ctx, maxSites, func(ctx context.Context, _, host string) (transport.StreamDialer, error) {
+			return siteFinder.NewDialer(ctx, []string{host}, yamlOptions)
+		})
+	}
 	return &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeOutline, tag, networks, options.DialerOptions),
 		logger:  log,
@@ -139,6 +163,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		createDialer: func() (transport.StreamDialer, error) {
 			return finder.NewDialer(ctx, options.Domains, yamlOptions)
 		},
+		sites:          sites,
 		packetListener: packetListener,
 	}, nil
 }
@@ -196,9 +221,15 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, fmt.Errorf("outline: destination %q has no host", destination.String())
 	}
 
-	d, err := o.getDialer(ctx)
-	if err != nil {
-		return nil, err
+	var d transport.StreamDialer
+	if o.sites != nil && addr.IsFqdn() {
+		d = o.sites.dialerFor(addr.Fqdn)
+	}
+	if d == nil {
+		var err error
+		if d, err = o.getDialer(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	md.Outbound = o.Tag()
