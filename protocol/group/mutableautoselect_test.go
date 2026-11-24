@@ -561,7 +561,7 @@ func TestRemove_DeletesURLOverride(t *testing.T) {
 
 func TestSetURLOverrides_KeepsSelectionOffFailedMember(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
-	withPauseManager(s).NetworkPause()
+	pm := withPauseManager(s)
 	s.urlOverrides = map[string]string{"a": "https://override.example/a?token=1", "b": "https://override.example/b?token=1"}
 	recordSuccess(s, "a", 100)
 	recordSuccess(s, "b", 200)
@@ -569,6 +569,8 @@ func TestSetURLOverrides_KeepsSelectionOffFailedMember(t *testing.T) {
 	for range s.hist.consecutiveFailLimit {
 		s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureNoResponse, time.Time{}, "tcp", nil)
 	}
+	// Paused after the failures, which a paused network doesn't charge.
+	pm.NetworkPause()
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.Equal(t, "b", o.Tag())
@@ -2085,7 +2087,7 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _ := newTestMUR(t, "a", "b")
-			withPauseManager(s).NetworkPause()
+			pm := withPauseManager(s)
 			s.urlOverrides = map[string]string{"a": "https://override.example/a?token=1", "b": "https://override.example/b"}
 			recordSuccess(s, "a", 100)
 			recordSuccess(s, "b", 200)
@@ -2093,6 +2095,8 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 			for range s.hist.consecutiveFailLimit {
 				s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureNoResponse, time.Time{}, "tcp", nil)
 			}
+			// Paused after the failures, which a paused network doesn't charge.
+			pm.NetworkPause()
 			s.access.Lock()
 			s.historyForLocked("a").startRecoveryGate(time.Now())
 			s.access.Unlock()

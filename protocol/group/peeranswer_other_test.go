@@ -155,7 +155,7 @@ func TestDataPlaneStream_ResetPassesItsCause(t *testing.T) {
 }
 
 func TestStreak_ReleasedWhenOnlyTheProbesFail(t *testing.T) {
-	reset, aborted := opErr("write", syscall.ECONNRESET), opErr("write", syscall.ECONNABORTED)
+	reset := opErr("write", syscall.ECONNRESET)
 	for _, tc := range []struct {
 		name   string
 		causes []error
@@ -164,8 +164,8 @@ func TestStreak_ReleasedWhenOnlyTheProbesFail(t *testing.T) {
 		want  string
 	}{
 		{"the far end reset the selection's traffic", []error{reset, reset}, false, "b"},
-		{"the selection's traffic failed locally", []error{aborted, aborted}, false, "a"},
-		{"the far end answered only before the streak", []error{reset, aborted}, false, "a"},
+		{"the far end never answered the selection's traffic", []error{nil, nil}, false, "a"},
+		{"the far end answered only before the streak", []error{reset, nil}, false, "a"},
 		// As when every server refuses: b failing too, nothing sets it apart.
 		{"the only other member is in the selection's tier", []error{reset, reset}, true, "a"},
 	} {
@@ -258,4 +258,41 @@ func TestOutage_NoTrialOnceTheSelectionFailsLocallyOrAnswers(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestDial_AlternateTheDeviceFailedIsNotCharged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newDialTestMUR(t)
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return nil, opErr("connect", syscall.ENETUNREACH) }
+		_, err := s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+		require.Error(t, err)
+		synctest.Wait()
+		uf, _ := userFailures(s, "b")
+		assert.Empty(t, uf, "the device, not b, failed b's dial")
+	})
+}
+
+func TestDataPlane_ConnTheDeviceAbortedIsNotCharged(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	s.selections[streakTCP].tag.Store("a")
+	report := s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp")
+	report.failure(adapter.UserFailureReset, opErr("read", syscall.ECONNABORTED))
+	uf, _ := userFailures(s, "a")
+	assert.Empty(t, uf)
+}
+
+func TestDial_MemberTheDeviceCannotRouteToFailsOver(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newDialTestMUR(t)
+		// As with an IPv6 server on an IPv4-only network.
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, opErr("connect", syscall.ENETUNREACH) }
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return echoConn{}, nil }
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+		require.NoError(t, err, "b, which the device can reach, serves")
+		conn.Close()
+		synctest.Wait()
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf, "the device failed a's dial")
+	})
 }

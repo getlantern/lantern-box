@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"log/slog"
 	"maps"
@@ -18,6 +19,7 @@ import (
 	A "github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/log"
+	tun "github.com/sagernet/sing-tun"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
@@ -105,8 +107,10 @@ type MutableAutoSelect struct {
 	ladderWaiter     *probeWaiter
 	periodicTimer    *time.Timer
 	idleTimer        *time.Timer
-	// pauseEpoch is guarded by access.
+	// pauseEpoch and pausedSince are guarded by access. pausedSince is when
+	// the device or network last paused, or zero while neither is.
 	pauseEpoch          uint64
+	pausedSince         time.Time
 	pauseCallbackAccess sync.Mutex
 	probePauseManager   pause.Manager
 	pauseCallback       *list.Element[pause.Callback]
@@ -467,6 +471,33 @@ func (s *MutableAutoSelect) InterfaceUpdated(ctx context.Context) {
 	s.dispatchProbesLocked()
 }
 
+// silentDestination reports whether a conn on network through origin's
+// member, opened at opened, went unanswered for its destination's sake: the
+// member answered a conn opened after it, and dest never answered through the
+// member, as with a P2P peer that never does. A member going silent on a
+// destination it served is still charged.
+func (s *MutableAutoSelect) silentDestination(origin connOrigin, opened time.Time, key uint64) bool {
+	s.access.Lock()
+	defer s.access.Unlock()
+	h, ok := s.peekHistoryLocked(origin.out.Tag())
+	return ok && h.answeredLater(streakTCP, opened) && !h.tcpDestAnswered(key)
+}
+
+// destKeySeed seeds destKey.
+var destKeySeed = maphash.MakeSeed()
+
+// destKey is the key a TCP conn's destination is remembered by, which costs
+// a conn neither a string nor an allocation.
+func destKey(dest M.Socksaddr) uint64 {
+	return maphash.Comparable(destKeySeed, dest)
+}
+
+func (s *MutableAutoSelect) pausedBefore(opened time.Time) bool {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.pausedBeforeLocked(opened)
+}
+
 // paused reports whether the device or network is paused.
 func (s *MutableAutoSelect) paused() bool {
 	pm := service.FromContext[pause.Manager](s.ctx)
@@ -681,7 +712,7 @@ func (k streamKind) dialSelection(ctx context.Context, origin connOrigin, dialed
 }
 
 func (k streamKind) wrap(c net.Conn, origin connOrigin, release func()) net.Conn {
-	return k.s.wrapStream(c, k.net, origin, release)
+	return k.s.wrapStream(c, k.net, k.destination, origin, release)
 }
 
 // recheck holds for TCP only: a UDP conn from DialContext isn't tracked, so
@@ -732,7 +763,7 @@ func setUp[C io.Closer, K connKind[C]](ctx context.Context, s *MutableAutoSelect
 			conn.Close()
 		default:
 			s.logger.ErrorContext(ctx, err)
-			if !errors.Is(ctx.Err(), context.Canceled) {
+			if !errors.Is(ctx.Err(), context.Canceled) && !destinationFailed(err) {
 				s.noteTrialFailed(trial, network)
 			}
 		}
@@ -752,7 +783,7 @@ func setUp[C io.Closer, K connKind[C]](ctx context.Context, s *MutableAutoSelect
 	outerTag, ladderGeneration := origin.out.Tag(), origin.generation
 	dialed := time.Now()
 	conn, release, err := k.dialSelection(ctx, origin, dialed)
-	if !s.noteSelectionSetup(origin, network, err == nil) {
+	if !s.noteSelectionSetup(origin, network, err == nil || destinationFailed(err)) {
 		// The member was removed during the setup: its result is no one's.
 		if err == nil {
 			conn.Close()
@@ -776,9 +807,12 @@ func setUp[C io.Closer, K connKind[C]](ctx context.Context, s *MutableAutoSelect
 		err, discarded = errAbandonedDial, true
 	}
 	s.logger.ErrorContext(ctx, err)
-	// A caller giving up says nothing about the member, so nothing is
-	// charged or probed; its deadline expiring does.
-	if errors.Is(ctx.Err(), context.Canceled) {
+	// A caller giving up says nothing about the member, nor does a server
+	// that answered but couldn't reach the destination, nor a device with no
+	// network to dial on, so nothing is charged or probed; the caller's
+	// deadline expiring does. A device that failed only this member's dial,
+	// as with no route to its address, still tries the alternate.
+	if errors.Is(ctx.Err(), context.Canceled) || destinationFailed(err) || noNetwork(err) {
 		return none, err
 	}
 	if !discarded {
@@ -841,11 +875,15 @@ func (s *MutableAutoSelect) chargeable(tag string, route routeKind) bool {
 // sets up user UDP that way only for routes with udp_connect, and for a DNS
 // server or outbound that dials through the group. A non-nil release runs
 // when a TCP conn closes.
-func (s *MutableAutoSelect) wrapStream(conn net.Conn, network string, origin connOrigin, release func()) net.Conn {
+func (s *MutableAutoSelect) wrapStream(conn net.Conn, network string, destination M.Socksaddr, origin connOrigin, release func()) net.Conn {
 	o := origin.out
 	report := s.makeHooks(origin, N.NetworkName(network))
 	wrapped := newDataPlaneStream(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, report)
+	wrapped.excuseQuietWrites = true
 	if N.NetworkName(network) == N.NetworkTCP {
+		if destination = destination.Unwrap(); destination.IsValid() {
+			report.destKey = destKey(destination)
+		}
 		wrapped.firstResponseTimeout = s.cfg.dataPlaneFirstResponseTimeout
 		wrapped.unansweredAfter = defaultUnansweredAfter
 		if report.confirms() {
@@ -907,6 +945,7 @@ func (s *MutableAutoSelect) wrapPacket(conn net.PacketConn, origin connOrigin, d
 	wrapped := newDataPlanePacket(conn, s.cfg.dataPlaneIdle, s.cfg.dataPlaneProvedRead, report)
 	wrapped.unansweredAfter = defaultUDPUnansweredAfter
 	wrapped.unansweredWhileOpen = true
+	wrapped.excuseQuietWrites = true
 	if destination = destination.Unwrap(); destination.IsValid() {
 		wrapped.exchanges.lastDest = destination.String()
 	}
@@ -1270,6 +1309,15 @@ func (s *MutableAutoSelect) releaseForStreakLocked(network string, pool, forNetw
 	return replacement, true
 }
 
+// probeCutoff is the earliest a probe's outcome counts toward a streak
+// replacement: a pass from since sticky's streak began, a failure from since.
+func probeCutoff(passed bool, since, passedSince time.Time) time.Time {
+	if passed {
+		return passedSince
+	}
+	return since
+}
+
 // closeStuckOnReleaseLocked closes released's stuck UDP sessions or doomed
 // TCP conns when it was released as network's selection for failing.
 // Caller must hold s.access.
@@ -1296,24 +1344,33 @@ func (s *MutableAutoSelect) streakReleaseAllowedLocked(network, sticky string) b
 
 // streakReplacementLocked returns the member to release network's selection,
 // sticky, to for consecutive failures since since: the highest-ranked member
-// in pool whose probe, completed no earlier than since, passed, or when pool
-// is the clean tier and each of its members failed, such a member of
-// forNetwork's soft tier. It requests probes of the others, so a later call
-// may find one. A member that can't be probed counts as reachable, so a group
-// without probing still releases. When every member's fresh probe failed,
-// sticky is probed too unless its result is fresh; then sticky's streak is
-// cleared instead of walking the pool, and if sticky's probe failed as well,
-// nothing is reachable, as in an outage of the device's own network. But when
-// sticky's probe failed and a failure since since showed the far end
-// answered, the device is online and the probes are what fail, so the
-// highest-ranked other member in pool is returned, unless sticky is in pool's
-// tier: nothing then sets that member apart from sticky, and when every
-// member refuses, moving on to it only moves the failures. Caller must hold
-// s.access.
+// in pool that passed a probe since sticky's streak's first failure, or when
+// pool is the clean tier and each of its members failed a probe completed
+// since since, such a member of forNetwork's soft tier. It requests probes of
+// the others, so a later call may find one. A member that can't be probed
+// counts as reachable, so a group without probing still releases. When every
+// member's fresh probe failed, sticky is probed too unless its result is
+// fresh; then sticky's streak is cleared instead of walking the pool, and if
+// sticky's probe failed as well, nothing is reachable, as in an outage of the
+// device's own network. But when sticky's probe failed and a failure since
+// since showed the far end answered, the device is online and the probes are
+// what fail, so the highest-ranked other member in pool is returned, unless
+// sticky is in pool's tier: nothing then sets that member apart from sticky,
+// and when every member refuses, moving on to it only moves the failures.
+// Caller must hold s.access.
 func (s *MutableAutoSelect) streakReplacementLocked(pool, forNetwork []rankedCandidate, network, sticky string, since time.Time) (replacement rankedCandidate, ok, pending bool) {
 	var requested []string
 	failed := 0
 	sameTier := len(pool) > 0 && slices.ContainsFunc(pool, func(c rankedCandidate) bool { return c.tag == sticky })
+	// A member that passed while sticky was failing is as current as one
+	// probed once the streak reached its limit; one that failed then is
+	// probed again, as its failure may have been the same trouble.
+	passedSince := since
+	if h, ok := s.peekHistoryLocked(sticky); ok {
+		if st, live := h.liveStreak(streakNetFor(network), time.Now(), s.hist.userFailureWindow); live && st.firstAt.Before(since) {
+			passedSince = st.firstAt
+		}
+	}
 	for i, tier := range [2][]rankedCandidate{pool, forNetwork} {
 		if i == 1 && (len(pool) == 0 || pool[0].demote != demoteClean) {
 			break
@@ -1331,8 +1388,8 @@ func (s *MutableAutoSelect) streakReplacementLocked(pool, forNetwork []rankedCan
 				}
 				continue
 			}
-			if state := s.probeMembers[c.tag]; state != nil && state.outcome != nil &&
-				!state.outcome.completed.Before(since) && s.outcomeCurrentLocked(c.tag, state.outcome) {
+			if state := s.probeMembers[c.tag]; state != nil && state.outcome != nil && s.outcomeCurrentLocked(c.tag, state.outcome) &&
+				!state.outcome.completed.Before(probeCutoff(state.outcome.success, since, passedSince)) {
 				if !state.outcome.success {
 					failed++
 				} else if usable {
@@ -1404,8 +1461,7 @@ func (s *MutableAutoSelect) streakSinceLocked(tag, network string) time.Time {
 	// too, as in an outage of the device's own network; the streak is for a
 	// selection that passes probes while its traffic fails.
 	if state := s.probeMembers[tag]; state != nil && state.outcome != nil && !state.outcome.success && s.confirmingLocked(tag) {
-		started := h.streakStarted(streakTCP, time.Now(), s.hist.userFailureWindow)
-		if !started.IsZero() && !state.outcome.completed.Before(started) {
+		if st, live := h.liveStreak(streakTCP, time.Now(), s.hist.userFailureWindow); live && !st.started.IsZero() && !state.outcome.completed.Before(st.started) {
 			return time.Time{}
 		}
 	}
@@ -1548,11 +1604,7 @@ type switchReason struct {
 func (s *MutableAutoSelect) switchSelectionLocked(network, prev, next string, why switchReason) {
 	s.selectionFor(network).tag.Store(next)
 	if prev == "" {
-		if why.text == "" {
-			s.logger.Info(network, " select: ", next)
-		} else {
-			s.logger.Info(network, " select: ", next, " (", why.text, ")")
-		}
+		s.logger.Info(network, " select: ", next, " (", why.text, ")")
 		return
 	}
 	s.logger.Info(network, " switch: ", prev, " -> ", next, " (", why.text, ")")
@@ -1960,6 +2012,50 @@ func (s *MutableAutoSelect) failedSinceLocked(tag, network string, since time.Ti
 		state.outcome.completed.After(since) && s.outcomeCurrentLocked(tag, state.outcome)
 }
 
+// deviceFailed reports whether err shows the device failed the conn itself,
+// as failedLocally reports it or as noNetwork does: the member isn't at
+// fault.
+func deviceFailed(err error) bool {
+	return failedLocally(err) || noNetwork(err)
+}
+
+// noNetwork reports whether err is sing-box finding no interface to dial on,
+// which every member would fail alike.
+func noNetwork(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, tun.ErrNoRoute) {
+		return true
+	}
+	// sing-box's network-strategy dialer, as on Android, makes this error
+	// anew each time; a server relaying its own is the server's failure.
+	msg := err.Error()
+	return strings.Contains(msg, "no available network interface") && !strings.Contains(msg, "remote error: ")
+}
+
+// pausedBeforeLocked reports whether the device or network is paused and a
+// conn opened at opened, or a zero time, was open before the pause began:
+// its failure may be the pause's. A conn opened during a pause shows the
+// device can dial, as when sing-box leaves the network paused after it came
+// back. Caller must hold s.access.
+func (s *MutableAutoSelect) pausedBeforeLocked(opened time.Time) bool {
+	return !s.pausedSince.IsZero() && s.paused() && !opened.After(s.pausedSince)
+}
+
+// destinationFailed reports whether err is a server's report that it failed
+// to reach the destination, in the form a sing-box server's router gives,
+// relayed as Hysteria2 relays it: the server answered, so the error says
+// nothing about it.
+func destinationFailed(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "remote error: open connection to ") ||
+		strings.Contains(msg, "remote error: open packet connection to ")
+}
+
 // recordUserFailure reports whether a failure of origin's member, on a
 // network conn opened at opened, was added to its window. A zero opened means
 // unknown. A failure whose cause shows the far end answered ends an outage
@@ -1967,11 +2063,14 @@ func (s *MutableAutoSelect) failedSinceLocked(tag, network string, since time.Ti
 // dropped while outage evidence holds, as is one from another network
 // generation.
 func (s *MutableAutoSelect) recordUserFailure(origin connOrigin, kind adapter.UserFailureKind, opened time.Time, network string, cause error) bool {
-	if s.isClosed() {
+	if s.isClosed() || destinationFailed(cause) || deviceFailed(cause) {
 		return false
 	}
 	s.access.Lock()
 	defer s.access.Unlock()
+	if s.pausedBeforeLocked(opened) {
+		return false
+	}
 	if !s.originCurrentLocked(origin) {
 		return false
 	}
@@ -2006,6 +2105,12 @@ func (s *MutableAutoSelect) recordUserFailure(origin connOrigin, kind adapter.Us
 // opened at opened, answered at at. dest is used for UDP only. What it
 // updates is in-memory only, so nothing is persisted.
 func (s *MutableAutoSelect) noteUserResponse(origin connOrigin, network, dest string, opened, at time.Time) {
+	s.noteAnswer(origin, network, dest, 0, opened, at)
+}
+
+// noteAnswer is noteUserResponse for a TCP conn whose destination has
+// destKey key, or zero if unknown.
+func (s *MutableAutoSelect) noteAnswer(origin connOrigin, network, dest string, key uint64, opened, at time.Time) {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if !s.originCurrentLocked(origin) || !s.matchesGenerationLocked(origin.generation) {
@@ -2013,7 +2118,11 @@ func (s *MutableAutoSelect) noteUserResponse(origin connOrigin, network, dest st
 	}
 	tag := origin.out.Tag()
 	s.hydrateHistoryLocked(tag)
-	s.historyForLocked(tag).noteUserResponse(streakNetFor(network), dest, opened, at)
+	h := s.historyForLocked(tag)
+	h.noteUserResponse(streakNetFor(network), dest, opened, at)
+	if key != 0 {
+		h.noteTCPAnswered(key, at)
+	}
 	s.noteSelectionAnsweredLocked(network, tag)
 	s.endOutageLocked()
 }
@@ -2045,7 +2154,7 @@ func (s *MutableAutoSelect) noteUnansweredOffSelection(origin connOrigin, dest s
 
 // noteUnansweredLocked is noteUnanswered with s.access held.
 func (s *MutableAutoSelect) noteUnansweredLocked(origin connOrigin, network, dest string, opened, waitingSince time.Time) {
-	if s.isClosed() || !s.originCurrentLocked(origin) || !s.matchesGenerationLocked(origin.generation) {
+	if s.isClosed() || s.pausedBeforeLocked(opened) || !s.originCurrentLocked(origin) || !s.matchesGenerationLocked(origin.generation) {
 		return
 	}
 	tag := origin.out.Tag()

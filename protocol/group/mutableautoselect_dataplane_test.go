@@ -13,6 +13,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing/common/metadata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -638,4 +639,75 @@ func TestDataPlaneStream_DelayedWriteStillCountsAsUnanswered(t *testing.T) {
 		synctest.Wait()
 		assert.Len(t, stalled, 1, "both writes since the last read went unanswered, the delayed one too")
 	})
+}
+
+func TestDialContext_QuietWriteExcused(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newTestMUR(t, "a")
+		recordSuccess(s, "a", 10)
+		s.cfg.ladderCooldown = time.Hour
+		s.lastLadderAt.Store(time.Now().UnixNano())
+		writeErr := connResetErr()
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			return &failingConn{firstN: 48, err: writeErr, failWrite: true}, nil
+		}
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		defer conn.Close()
+		_, err = conn.Read(make([]byte, 64))
+		require.NoError(t, err)
+		// The far end closed the conn while it was idle.
+		time.Sleep(defaultDataPlaneResetQuiet)
+		_, err = conn.Write([]byte("next request"))
+		require.Same(t, writeErr, err)
+		synctest.Wait()
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf)
+	})
+}
+
+func TestDataPlaneStream_HedgeChargesAQuietWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var failures []adapter.UserFailureKind
+		writeErr := connResetErr()
+		d := newDataPlaneStream(&failingConn{firstN: 48, err: writeErr, failWrite: true}, time.Hour,
+			defaultDataPlaneProvedReadBytes, dataPlaneHooks{
+				onFailure: func(kind adapter.UserFailureKind, _ error) { failures = append(failures, kind) },
+			})
+		defer d.Close()
+		_, err := d.Read(make([]byte, 64))
+		require.NoError(t, err)
+		time.Sleep(defaultDataPlaneResetQuiet)
+		_, err = d.Write([]byte("next request"))
+		require.Same(t, writeErr, err)
+		synctest.Wait()
+		assert.Equal(t, []adapter.UserFailureKind{adapter.UserFailureReset}, failures, "the hedge counts a reset after a reply as a strike")
+	})
+}
+
+func TestDataPlane_StreamTheServerClosedInOrderIsNoFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		charged bool
+	}{
+		{"closed in order", &quic.StreamError{StreamID: 4, ErrorCode: 0, Remote: true}, false},
+		{"canceled with an error", &quic.StreamError{StreamID: 4, ErrorCode: 1, Remote: true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var failures int
+				writeErr := fmt.Errorf("hysteria2: %w", tc.err)
+				d := newDataPlaneStream(&failingConn{err: writeErr, failWrite: true}, time.Hour,
+					defaultDataPlaneProvedReadBytes, dataPlaneHooks{
+						onFailure: func(adapter.UserFailureKind, error) { failures++ },
+					})
+				defer d.Close()
+				_, err := d.Write([]byte("request"))
+				require.Same(t, writeErr, err)
+				synctest.Wait()
+				assert.Equal(t, tc.charged, failures == 1)
+			})
+		})
+	}
 }

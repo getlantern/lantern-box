@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
@@ -151,6 +152,9 @@ type connReport struct {
 	origin  connOrigin
 	network string
 	opened  time.Time
+	// destKey is a TCP conn's destination's destKey, which its answer
+	// doesn't report, or zero if unknown.
+	destKey uint64
 	// trialFailed is set once a trial's conn reported failing, until it
 	// answers again, so it reports a failure once however many ways it fails.
 	trialFailed atomic.Bool
@@ -168,8 +172,12 @@ func (s *MutableAutoSelect) makeHooks(origin connOrigin, network string) *connRe
 	return &connReport{s: s, origin: origin, network: network, opened: time.Now()}
 }
 
-func (r *connReport) confirms() bool {
-	return r.network == N.NetworkTCP && r.origin.route == primaryRoute
+func (r *connReport) confirms() bool { return confirms(r.origin, r.network) }
+
+// confirms reports whether failures of a conn on network through origin
+// confirm its member: TCP on the selection's own route.
+func confirms(origin connOrigin, network string) bool {
+	return network == N.NetworkTCP && origin.route == primaryRoute
 }
 
 func (r *connReport) noteTrialFailed() {
@@ -188,9 +196,13 @@ func (r *connReport) unanswered(waitingSince time.Time, dest string) {
 	if r.network == N.NetworkUDP {
 		exchangeOpened = waitingSince
 	}
-	if r.s.chargeable(r.origin.out.Tag(), r.origin.route) {
+	switch {
+	case r.network == N.NetworkUDP && r.s.pausedBefore(r.opened):
+		// An exchange on a handle that predates a pause says nothing about
+		// the member, though the exchange began during it.
+	case r.s.chargeable(r.origin.out.Tag(), r.origin.route):
 		r.s.noteUnanswered(r.origin, r.network, dest, exchangeOpened, waitingSince)
-	} else if r.network == N.NetworkUDP {
+	case r.network == N.NetworkUDP:
 		r.s.noteUnansweredOffSelection(r.origin, dest, exchangeOpened, waitingSince)
 	}
 	// A trial that never answered closes, so an app holding its socket sets
@@ -202,12 +214,49 @@ func (r *connReport) unanswered(waitingSince time.Time, dest string) {
 }
 
 func (r *connReport) failure(kind adapter.UserFailureKind, cause error) {
-	r.noteTrialFailed()
-	if !r.s.chargeable(r.origin.out.Tag(), r.origin.route) || !r.s.recordUserFailure(r.origin, kind, r.opened, r.network, cause) {
+	if destinationFailed(cause) {
+		if r.confirms() {
+			r.s.confirmDestinationFailure(r.origin)
+		}
 		return
 	}
-	if r.confirms() && (kind == adapter.UserFailureReset || kind == adapter.UserFailureNoResponse) {
-		r.s.requestFailureConfirmation(r.origin, "")
+	if lostTransport(cause) {
+		// The deferred charge holds only what it needs, not the dead conn.
+		r.noteTrialFailed()
+		s, origin, opened, network := r.s, r.origin, r.opened, r.network
+		s.afterSettle(func() { s.chargeFailure(origin, kind, opened, network, cause) })
+		return
+	}
+	if kind == adapter.UserFailureNoResponse {
+		silent := r.s.silentDestination(r.origin, r.opened, r.destKey)
+		r.s.logger.Debug("no response: tag=", r.origin.out.Tag(), " opened=",
+			time.Since(r.opened).Round(time.Millisecond), " ago, destination's=", silent)
+		if silent {
+			return
+		}
+	}
+	r.charge(kind, cause)
+}
+
+// lostTransport reports whether err is a conn closed under it, as when its
+// member's transport was torn down, with nothing to say what tore it down.
+func lostTransport(err error) bool {
+	return errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed)
+}
+
+func (r *connReport) charge(kind adapter.UserFailureKind, cause error) {
+	r.noteTrialFailed()
+	r.s.chargeFailure(r.origin, kind, r.opened, r.network, cause)
+}
+
+// chargeFailure charges a failure of a conn through origin's member, if it is
+// chargeable, and confirms a TCP selection that reset or went unanswered.
+func (s *MutableAutoSelect) chargeFailure(origin connOrigin, kind adapter.UserFailureKind, opened time.Time, network string, cause error) {
+	if !s.chargeable(origin.out.Tag(), origin.route) || !s.recordUserFailure(origin, kind, opened, network, cause) {
+		return
+	}
+	if confirms(origin, network) && (kind == adapter.UserFailureReset || kind == adapter.UserFailureNoResponse) {
+		s.requestFailureConfirmation(origin, "")
 	}
 }
 
@@ -220,8 +269,11 @@ func (r *connReport) ioError(err error, state dataPlaneIO, excused bool) {
 		}
 	}
 	decision := "candidate"
-	if excused {
+	switch {
+	case excused:
 		decision = "excused"
+	case destinationFailed(err):
+		decision = "destination"
 	}
 	last := "none"
 	if state.hasIO {
@@ -243,7 +295,7 @@ func (r *connReport) response(at time.Time, dest string) {
 		r.trialFailed.Store(false)
 		r.s.noteTrialAnswered(r.origin, r.network)
 	}
-	r.s.noteUserResponse(r.origin, r.network, dest, r.opened, at)
+	r.s.noteAnswer(r.origin, r.network, dest, r.destKey, r.opened, at)
 }
 
 func (r *connReport) closed() {
@@ -302,12 +354,17 @@ type dataPlaneWatchdog struct {
 	unansweredAfter      time.Duration
 	slowResponseAfter    time.Duration
 	unansweredWhileOpen  bool
-	hooks                connHooks
-	provedReadBytes      uint64
-	born                 time.Time
-	ioMu                 sync.Mutex
-	lastIO               time.Time // guarded by ioMu
-	lastWasWrite         bool      // guarded by ioMu
+	// excuseQuietWrites excuses an error on a write, as one on a zero-byte
+	// read is, when it ends a conn quiet since its last read, as when the far
+	// end closed it while idle. The hedge leaves it unset: it counts a reset
+	// after a reply as a strike against the site.
+	excuseQuietWrites bool
+	hooks             connHooks
+	provedReadBytes   uint64
+	born              time.Time
+	ioMu              sync.Mutex
+	lastIO            time.Time // guarded by ioMu
+	lastWasWrite      bool      // guarded by ioMu
 	// Guarded by ioMu: the bytes written since the latest read, which was at
 	// lastReadAt.
 	unanswered uint64
@@ -382,10 +439,18 @@ func (w *dataPlaneWatchdog) init(idle time.Duration, provedReadBytes uint64, hoo
 // isDataPlaneFailure reports whether err should demote the outbound.
 // Clean closes, caller cancellation, and timeouts are ignored.
 func isDataPlaneFailure(err error) bool {
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || closedByServer(err) {
 		return false
 	}
 	return !isTimeout(err)
+}
+
+// closedByServer reports whether err is a QUIC stream the far end canceled
+// with code 0, as a Hysteria2 server does on closing a stream in order, such
+// as when its destination closed: a clean close.
+func closedByServer(err error) bool {
+	se, ok := errors.AsType[*quic.StreamError](err)
+	return ok && se.Remote && se.ErrorCode == 0
 }
 
 func isTimeout(err error) bool {
@@ -393,9 +458,10 @@ func isTimeout(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
-func endsQuietRead(isRead bool, n int, state dataPlaneIO) bool {
-	return isRead && n == 0 && state.hasIO && !state.lastWasWrite &&
-		state.quiet >= defaultDataPlaneResetQuiet
+// endsQuiet reports whether an IO error that moved no bytes ends a conn that
+// has been quiet since its last read.
+func endsQuiet(n int, state dataPlaneIO) bool {
+	return n == 0 && state.hasIO && !state.lastWasWrite && state.quiet >= defaultDataPlaneResetQuiet
 }
 
 func (w *dataPlaneWatchdog) noteIO(n int, err error, isRead bool) {
@@ -461,7 +527,7 @@ func (w *dataPlaneWatchdog) noteIOFrom(n int, err error, isRead bool, source M.S
 	}
 	if isDataPlaneFailure(err) {
 		state := w.snapshotIO()
-		excused := endsQuietRead(isRead, n, state)
+		excused := (isRead || w.excuseQuietWrites) && endsQuiet(n, state)
 		if !excused {
 			w.fireResetFailure(err)
 		}
@@ -714,7 +780,7 @@ func (w *dataPlaneWatchdog) endDatagramSend(wait datagramWait, sent bool) {
 // A reply credits its destination only if it comes back addressed as it was
 // sent, as sing-box's NAT-wrapped conns are; otherwise detection for that
 // destination stays quiet rather than misfiring. The first reply from each of
-// up to maxUDPAnsweredDestinations sources is passed on; others at most once
+// up to maxAnsweredDestinations sources is passed on; others at most once
 // a second.
 func (w *dataPlaneWatchdog) noteDatagramReceived(at time.Time, source M.Socksaddr) (dest string, notify bool) {
 	w.ioMu.Lock()
@@ -730,7 +796,7 @@ func (w *dataPlaneWatchdog) noteDatagramReceived(at time.Time, source M.Socksadd
 	notify = x.lastAnswerNotify.IsZero() || at.Sub(x.lastAnswerNotify) >= time.Second
 	// Past the limit, as on a peer-to-peer socket, new sources share the
 	// once-a-second pass, which bounds the group lock taken per handle.
-	if dest != "" && !x.notifiedSources.has(dest) && x.notifiedSources.len() < maxUDPAnsweredDestinations {
+	if dest != "" && !x.notifiedSources.has(dest) && x.notifiedSources.len() < maxAnsweredDestinations {
 		x.notifiedSources.add(dest)
 		notify = true
 	}

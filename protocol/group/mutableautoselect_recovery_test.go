@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/log"
+	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/service/pause"
 	"github.com/stretchr/testify/assert"
@@ -1769,16 +1770,16 @@ func TestDataPlanePacket_CreditsNewSourcePastTheLimit(t *testing.T) {
 			c.replies <- scriptedDatagram{b: []byte("r"), from: &net.UDPAddr{IP: net.IPv4(192, 0, 2, byte(i)), Port: 53}}
 			d.ReadFrom(make([]byte, 64))
 		}
-		for i := range maxUDPAnsweredDestinations {
+		for i := range maxAnsweredDestinations {
 			reply(i + 1)
 		}
-		require.Len(t, got, maxUDPAnsweredDestinations, "each of the first sources is passed on at once")
+		require.Len(t, got, maxAnsweredDestinations, "each of the first sources is passed on at once")
 		reply(65)
-		require.Len(t, got, maxUDPAnsweredDestinations, "past the limit, a new source waits for the once-a-second pass")
+		require.Len(t, got, maxAnsweredDestinations, "past the limit, a new source waits for the once-a-second pass")
 		time.Sleep(time.Second)
 		reply(65)
 		reply(66)
-		assert.Equal(t, []string{"192.0.2.65:53"}, got[maxUDPAnsweredDestinations:], "then it is passed on, one source a second")
+		assert.Equal(t, []string{"192.0.2.65:53"}, got[maxAnsweredDestinations:], "then it is passed on, one source a second")
 	})
 }
 
@@ -3050,7 +3051,7 @@ func TestRemove_RemovedMembersConnsStopReporting(t *testing.T) {
 		s, obs := newTestMUR(t, "a", "b")
 		generation := s.networkGeneration.Load()
 		c := newScriptedConn()
-		conn := s.wrapStream(c, "tcp", s.originOf(obs["a"], primaryRoute, generation), nil)
+		conn := s.wrapStream(c, "tcp", metadata.Socksaddr{}, s.originOf(obs["a"], primaryRoute, generation), nil)
 		defer conn.Close()
 		conn.Write([]byte("request"))
 		_, err := s.Remove("a")
@@ -3644,7 +3645,7 @@ func TestRemove_ConnSetUpAcrossARemovalDoesNotReport(t *testing.T) {
 		s.access.Unlock()
 		// A dial through the removed a returns only now.
 		c := newScriptedConn()
-		conn := s.wrapStream(c, "tcp", origin, nil)
+		conn := s.wrapStream(c, "tcp", metadata.Socksaddr{}, origin, nil)
 		defer conn.Close()
 		conn.Write([]byte("request"))
 		c.reads <- scriptedRead{data: []byte("reply")}
@@ -3794,7 +3795,7 @@ func TestRemove_SameOutboundReaddedDuringSetupDoesNotReport(t *testing.T) {
 		s.suspectOutageLocked(time.Now())
 		s.access.Unlock()
 		c := newScriptedConn()
-		conn := s.wrapStream(c, "tcp", origin, nil)
+		conn := s.wrapStream(c, "tcp", metadata.Socksaddr{}, origin, nil)
 		defer conn.Close()
 		conn.Write([]byte("request"))
 		c.reads <- scriptedRead{data: []byte("reply")}
@@ -4747,8 +4748,432 @@ func TestClose_ConnsTheShutdownKillsAreNotCharged(t *testing.T) {
 
 	uf, _ := userFailures(s, "a")
 	assert.Empty(t, uf, "a reset from the shutdown isn't a failure of a")
+	assert.Zero(t, streakCountsOf(s, "a")[streakTCP], "nor is a conn the shutdown left unanswered")
+}
+
+// newDialTestMUR is a group of a and b, measured with a the faster, whose
+// ladder doesn't run, for tests of what a dial charges.
+func newDialTestMUR(t *testing.T) (*MutableAutoSelect, map[string]*mockOutbound) {
+	t.Helper()
+	s, obs := newTestMUR(t, "a", "b")
+	recordSuccess(s, "a", 10)
+	recordSuccess(s, "b", 20)
+	s.cfg.ladderCooldown = time.Hour
+	s.lastLadderAt.Store(time.Now().UnixNano())
+	return s, obs
+}
+
+// streakCountsOf returns tag's live failure streak on each network.
+func streakCountsOf(s *MutableAutoSelect, tag string) [2]uint32 {
 	s.access.Lock()
-	h := s.historyForLocked("a")
+	h := s.historyForLocked(tag)
 	s.access.Unlock()
-	assert.Zero(t, h.streakCounts(time.Now(), s.hist.userFailureWindow)[streakTCP], "nor is a conn the shutdown left unanswered")
+	return h.streakCounts(time.Now(), s.hist.userFailureWindow)
+}
+
+// destinationErr is a Hysteria2 client's error for a server that couldn't
+// reach the destination.
+func destinationErr() error {
+	return errors.New("remote error: open connection to x.test:443 using outbound/direct[direct]: lookup x.test: empty result")
+}
+
+func TestDial_DestinationTheServerCouldNotReachIsNotCharged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newDialTestMUR(t)
+		destErr := destinationErr()
+		var bDials atomic.Int32
+		obs["b"].dial = func(context.Context) (net.Conn, error) {
+			bDials.Add(1)
+			return echoConn{}, nil
+		}
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return &failingConn{err: destErr}, nil }
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+		require.NoError(t, err)
+		defer conn.Close()
+		_, err = conn.Read(make([]byte, 8))
+		require.Same(t, destErr, err)
+		synctest.Wait()
+
+		s.selections[streakTCP].tag.Store("a")
+		s.access.Lock()
+		s.trialsLocked("tcp").setupOK = true
+		s.access.Unlock()
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, destErr }
+		_, err = s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+		require.ErrorIs(t, err, destErr)
+		synctest.Wait()
+
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf, "a's server answered; the destination failed")
+		assert.Zero(t, bDials.Load(), "another member would fail the destination too")
+		s.access.Lock()
+		assert.True(t, s.trialsLocked("tcp").setupOK, "a's setup reached its server")
+		s.access.Unlock()
+	})
+}
+
+func TestDial_AlternateThatCouldNotReachTheDestinationIsNotCharged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newDialTestMUR(t)
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return nil, destinationErr() }
+		_, err := s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+		require.Error(t, err)
+		synctest.Wait()
+		uf, _ := userFailures(s, "b")
+		assert.Empty(t, uf)
+	})
+}
+
+func TestTrial_DestinationTheServerCouldNotReachIsNoTrialFailure(t *testing.T) {
+	s, _ := newTestMUR(t, "a", "b")
+	s.selections[streakTCP].tag.Store("a")
+	report := s.makeHooks(s.trialOriginAt("b", s.networkGeneration.Load(), "a"), "tcp")
+	report.failure(adapter.UserFailureReset, destinationErr())
+
+	s.access.Lock()
+	defer s.access.Unlock()
+	assert.Zero(t, s.trialsLocked("tcp").failures)
+}
+
+func TestUDPStreak_ReleasedToAMemberThatPassedWhileTheSelectionFailed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		obs["c"].dial = hangUntilDone
+		s.selections[streakUDP].tag.Store("a")
+		generation := s.networkGeneration.Load()
+		const dest = "198.51.100.1:443"
+		s.noteUserResponse(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		time.Sleep(time.Second)
+		s.noteUnanswered(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		// b passes after a began failing, before a's streak reaches its limit.
+		time.Sleep(500 * time.Millisecond)
+		s.access.Lock()
+		s.forceProbesLocked("b")
+		s.access.Unlock()
+		synctest.Wait()
+		time.Sleep(500 * time.Millisecond)
+		s.noteUnanswered(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+
+		_, _, err := s.selectOutbound("udp", "")
+		require.NoError(t, err)
+		assert.Equal(t, "b", loadString(&s.selections[streakUDP].tag), "b's pass is current; it needn't be probed again")
+	})
+}
+
+func TestDestinationFailure_ProbesTheSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// passedJustNow has a's probe pass just before the destination fails.
+		passedJustNow bool
+		// reachable has a's own probe pass: only the destination is down.
+		reachable  bool
+		want       string
+		wantProbes int32
+	}{
+		{"a server that can reach nothing is left", false, false, "b", 2},
+		{"a server whose probe passes stays", false, true, "a", 1},
+		{"a recent pass answers for the server", true, false, "a", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, obs := newConfirmationTestMUR(t, "a", "b")
+				var aProbes atomic.Int32
+				obs["a"].dialTo = func(_ context.Context, dest metadata.Socksaddr) (net.Conn, error) {
+					if dest.Fqdn == "probe.test" {
+						aProbes.Add(1)
+						if tc.reachable {
+							return probeResponderConn(), nil
+						}
+						return nil, destinationErr()
+					}
+					return &failingConn{err: destinationErr()}, nil
+				}
+				obs["b"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+				if tc.passedJustNow {
+					seedProbe(s, "a", true, 10)
+				}
+				conn, err := s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+				require.NoError(t, err)
+				defer conn.Close()
+				_, err = conn.Read(make([]byte, 8))
+				require.Error(t, err)
+				synctest.Wait()
+				assert.Equal(t, tc.want, loadString(&s.selections[streakTCP].tag))
+				assert.Equal(t, tc.wantProbes, aProbes.Load())
+			})
+		})
+	}
+}
+
+func TestTrial_DialThatCouldNotReachTheDestinationIsNoTrialFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newTrialTestMUR(t, map[string]func() (net.Conn, error){
+			"a": silent,
+			"b": func() (net.Conn, error) { return nil, destinationErr() },
+		}, "a", "b")
+		generation := s.networkGeneration.Load()
+		dialAndRead(s)
+		seedProbe(s, "a", false, 0)
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
+		time.Sleep(3 * time.Second)
+		dialAndRead(s) // b's trial dial fails on the destination
+		synctest.Wait()
+		s.access.Lock()
+		defer s.access.Unlock()
+		tr := s.trialsLocked("tcp")
+		require.False(t, tr.lastAt.IsZero(), "b's trial was made")
+		assert.Zero(t, tr.failures)
+	})
+}
+
+func TestUDPStreak_MemberThatFailedWhileTheSelectionFailedIsProbedAgain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b")
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		var bUp atomic.Bool
+		obs["b"].dial = func(context.Context) (net.Conn, error) {
+			if bUp.Load() {
+				return probeResponderConn(), nil
+			}
+			return nil, errors.New("blip")
+		}
+		s.selections[streakUDP].tag.Store("a")
+		generation := s.networkGeneration.Load()
+		const dest = "198.51.100.1:443"
+		s.noteUserResponse(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		time.Sleep(time.Second)
+		s.noteUnanswered(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		// b fails a probe after a began failing, in the same trouble, and
+		// recovers before a's streak reaches its limit.
+		time.Sleep(500 * time.Millisecond)
+		s.access.Lock()
+		s.forceProbesLocked("b")
+		s.access.Unlock()
+		synctest.Wait()
+		bUp.Store(true)
+		time.Sleep(500 * time.Millisecond)
+		s.noteUnanswered(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		for range 3 {
+			_, _, err := s.selectOutbound("udp", "")
+			require.NoError(t, err)
+			time.Sleep(time.Second)
+			synctest.Wait()
+		}
+		assert.Equal(t, "b", loadString(&s.selections[streakUDP].tag), "b's failure then is probed again, and it passes")
+	})
+}
+
+// noRouteErr is a member's dial error while sing-box finds no default
+// interface, as when the device lost its network.
+func noRouteErr() error {
+	return fmt.Errorf("getting transport: TCP dial to 192.0.2.1:443: %w", &net.OpError{Op: "dial", Net: "tcp", Err: tun.ErrNoRoute})
+}
+
+func TestDial_DeviceWithoutARouteChargesNoMember(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"no default interface", noRouteErr()},
+		// As sing-box's network-strategy dialer reports it, on Android.
+		{"no interface for the strategy", errors.New("getting transport: no available network interface")},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testDialDeviceWithoutARoute(t, tc.err) })
+	}
+}
+
+func testDialDeviceWithoutARoute(t *testing.T, dialErr error) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newDialTestMUR(t)
+		var bDials atomic.Int32
+		obs["b"].dial = func(context.Context) (net.Conn, error) {
+			bDials.Add(1)
+			return echoConn{}, nil
+		}
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, dialErr }
+		_, err := s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+		require.ErrorIs(t, err, dialErr)
+		synctest.Wait()
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf, "the device, not a, failed the dial")
+		assert.Zero(t, bDials.Load(), "every member would fail it alike")
+	})
+}
+
+func TestPause_ConnsOpenedBeforeThePauseAreNotCharged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := newTestMUR(t, "a", "b")
+		s.selections[streakTCP].tag.Store("a")
+		s.selections[streakUDP].tag.Store("a")
+		generation := s.networkGeneration.Load()
+		tcp := s.makeHooks(s.originAt("a", generation), "tcp")
+		udp := s.makeHooks(s.originAt("a", generation), "udp")
+		const dest = "198.51.100.1:443"
+		s.noteUserResponse(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		time.Sleep(time.Second)
+		withPauseManager(s).NetworkPause()
+		time.Sleep(time.Second)
+
+		tcp.failure(adapter.UserFailureStall, nil)
+		tcp.unanswered(time.Now().Add(-500*time.Millisecond), "")
+		// The handle predates the pause though the exchange doesn't.
+		udp.unanswered(time.Now(), dest)
+		synctest.Wait()
+
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf, "a conn open before the pause isn't charged during it")
+		counts := streakCountsOf(s, "a")
+		assert.Zero(t, counts[streakTCP], "nor left unanswered")
+		assert.Zero(t, counts[streakUDP], "nor is an exchange on a UDP handle open before it")
+	})
+}
+
+func TestPause_ConnOpenedDuringAPauseIsCharged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := newTestMUR(t, "a", "b")
+		s.selections[streakTCP].tag.Store("a")
+		// sing-box can leave the network paused after it came back.
+		withPauseManager(s).NetworkPause()
+		time.Sleep(time.Second)
+		report := s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp")
+		report.failure(adapter.UserFailureStall, nil)
+		uf, _ := userFailures(s, "a")
+		assert.Len(t, uf, 1, "a conn set up during the pause shows the device can dial")
+	})
+}
+
+func TestSettle_LostTransportIsChargedOnlyIfTheNetworkHeld(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// during runs within failureSettle of the failure.
+		during  func(s *MutableAutoSelect)
+		charged bool
+	}{
+		{"the network held", func(*MutableAutoSelect) {}, true},
+		{"the network paused", func(s *MutableAutoSelect) {
+			pm := service.FromContext[pause.Manager](s.ctx)
+			pm.NetworkPause()
+			pm.NetworkWake()
+		}, false},
+		{"the network changed", func(s *MutableAutoSelect) { s.InterfaceUpdated(context.Background()) }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, _ := newTestMUR(t, "a", "b")
+				withPauseManager(s)
+				s.selections[streakTCP].tag.Store("a")
+				report := s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp")
+				report.failure(adapter.UserFailureReset, fmt.Errorf("hysteria2: %w", io.ErrClosedPipe))
+				time.Sleep(time.Second)
+				uf, _ := userFailures(s, "a")
+				require.Empty(t, uf, "not charged before the network has had time to pause")
+				tc.during(s)
+				time.Sleep(failureSettle)
+				synctest.Wait()
+				uf, _ = userFailures(s, "a")
+				assert.Equal(t, tc.charged, len(uf) == 1)
+			})
+		})
+	}
+}
+
+func TestPause_ALaterPauseCoversConnsOpenedBeforeIt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := newTestMUR(t, "a", "b")
+		s.selections[streakTCP].tag.Store("a")
+		pm := withPauseManager(s)
+		pm.DevicePause()
+		time.Sleep(time.Second)
+		// Opened while only the device was paused; the network loss then
+		// kills it.
+		report := s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp")
+		time.Sleep(time.Second)
+		pm.NetworkPause()
+		report.failure(adapter.UserFailureStall, nil)
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf)
+	})
+}
+
+func TestPause_GroupRegisteredWhilePausedChargesNoEarlierConn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := newTestMUR(t, "a", "b")
+		s.selections[streakTCP].tag.Store("a")
+		report := s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp")
+		time.Sleep(time.Second)
+		s.ctx = pause.WithDefaultManager(s.ctx)
+		service.FromContext[pause.Manager](s.ctx).NetworkPause()
+		s.registerProbePauseCallback()
+		report.failure(adapter.UserFailureStall, nil)
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf)
+	})
+}
+
+func TestNoResponse_NotChargedForADestinationTheMemberNeverServed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := newTestMUR(t, "a", "b")
+		s.selections[streakTCP].tag.Store("a")
+		s.hist.userFailureDedupeWindow = 0
+		generation := s.networkGeneration.Load()
+		conn := func(dest string) *connReport {
+			r := s.makeHooks(s.originAt("a", generation), "tcp")
+			r.destKey = destKey(metadata.ParseSocksaddr(dest))
+			return r
+		}
+		const web, peer = "web.test:443", "198.51.100.7:6881"
+		// As with a P2P peer that never answers, through a member that
+		// answers the conns opened after it.
+		silent := conn(peer)
+		time.Sleep(time.Second)
+		conn(web).response(time.Now(), "")
+		time.Sleep(9 * time.Second)
+		silent.failure(adapter.UserFailureNoResponse, nil)
+		uf, _ := userFailures(s, "a")
+		require.Empty(t, uf, "a member answering later conns isn't charged for a peer that never answered through it")
+
+		// Silent on a destination it served before: the member's failure.
+		stale := conn(web)
+		time.Sleep(time.Second)
+		conn("other.test:443").response(time.Now(), "")
+		time.Sleep(9 * time.Second)
+		stale.failure(adapter.UserFailureNoResponse, nil)
+		uf, _ = userFailures(s, "a")
+		require.Len(t, uf, 1, "web answered through a before")
+
+		// A member answering nothing opened since is charged, as a dead
+		// member is.
+		time.Sleep(time.Second)
+		later := conn(peer)
+		time.Sleep(10 * time.Second)
+		later.failure(adapter.UserFailureNoResponse, nil)
+		uf, _ = userFailures(s, "a")
+		require.Len(t, uf, 2, "no conn opened after this one was answered")
+
+		// Only silence is excused.
+		silent.failure(adapter.UserFailureStall, nil)
+		uf, _ = userFailures(s, "a")
+		assert.Len(t, uf, 3)
+	})
+}
+
+func TestDial_AnswerRecordsItsDestination(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newDialTestMUR(t)
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return &failingConn{firstN: 48, err: io.EOF}, nil }
+		dest := metadata.ParseSocksaddr("web.test:443")
+		conn, err := s.DialContext(context.Background(), "tcp", dest)
+		require.NoError(t, err)
+		defer conn.Close()
+		_, err = conn.Read(make([]byte, 64))
+		require.NoError(t, err)
+		synctest.Wait()
+		s.access.Lock()
+		h := s.historyForLocked("a")
+		s.access.Unlock()
+		assert.True(t, h.tcpDestAnswered(destKey(dest)))
+		assert.False(t, h.tcpDestAnswered(destKey(metadata.ParseSocksaddr("other.test:443"))))
+	})
 }

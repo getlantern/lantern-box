@@ -318,7 +318,7 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success boo
 		return
 	}
 	state := s.probeMembers[attempt.tag]
-	s.logger.Debug("probe: tag=", attempt.tag, " ok=", success, " delay=", delayMs, "ms")
+	s.logger.Debug("probe: tag=", attempt.tag, " ok=", success, " delay=", delayText(delayMs))
 	outcome := s.recordProbeOutcomeLocked(attempt.tag, &probeOutcome{
 		success:    success,
 		delayMs:    delayMs,
@@ -777,6 +777,42 @@ func (s *MutableAutoSelect) forceProbesLocked(tags ...string) {
 	s.dispatchProbesLocked()
 }
 
+// failureSettle is how long a failure that may be the device's own waits
+// before it is charged: a device losing its network tears down its members'
+// transports up to a second before sing-box pauses the network.
+const failureSettle = 3 * time.Second
+
+// afterSettle runs charge once failureSettle has passed, unless the device or
+// network paused meanwhile. A failure from an earlier network is dropped when
+// charged, as any is.
+func (s *MutableAutoSelect) afterSettle(charge func()) {
+	s.access.Lock()
+	epoch := s.pauseEpoch
+	s.access.Unlock()
+	time.AfterFunc(failureSettle, func() {
+		s.access.Lock()
+		settled := s.pauseEpoch == epoch
+		s.access.Unlock()
+		if settled {
+			charge()
+		}
+	})
+}
+
+// confirmDestinationFailure confirms origin's member, the TCP selection,
+// after it failed to reach a destination, unless it passed a probe within
+// probeFreshnessWindow, so a run of such failures costs at most one probe in
+// that time: a server that can reach nothing fails every destination alike,
+// and only its probe tells it from a destination that is down.
+func (s *MutableAutoSelect) confirmDestinationFailure(origin connOrigin) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	tag := origin.out.Tag()
+	if s.originCurrentLocked(origin) && !s.passedSinceLocked(tag, time.Now().Add(-probeFreshnessWindow)) {
+		s.requestFailureConfirmationLocked(tag, "", origin.generation)
+	}
+}
+
 // requestFailureConfirmation confirms origin's member, the TCP selection, with
 // replacement, if not empty, as the member to move to should it fail.
 func (s *MutableAutoSelect) requestFailureConfirmation(origin connOrigin, replacement string) {
@@ -825,6 +861,12 @@ func (s *MutableAutoSelect) registerProbePauseCallback() {
 	}
 	s.probePauseManager = pm
 	s.pauseCallback = pm.RegisterCallback(s.onProbePause)
+	// The manager reports transitions only, not a pause already under way.
+	if pm.IsDevicePaused() || pm.IsNetworkPaused() {
+		s.access.Lock()
+		s.pausedSince = time.Now()
+		s.access.Unlock()
+	}
 }
 
 // unregisterProbePauseCallback must not be called with s.access held: the
@@ -847,6 +889,7 @@ func (s *MutableAutoSelect) onProbePause(event int) {
 	switch event {
 	case pause.EventDevicePaused, pause.EventNetworkPause:
 		s.pauseEpoch++
+		s.pausedSince = time.Now()
 		s.cancelProbesLocked(false)
 		// Probes are canceled unrecorded, and probes after the pause say
 		// nothing about failures before it.
@@ -857,6 +900,7 @@ func (s *MutableAutoSelect) onProbePause(event int) {
 		}
 	case pause.EventDeviceWake, pause.EventNetworkWake:
 		if !s.paused() {
+			s.pausedSince = time.Time{}
 			s.armPeriodicLocked()
 			if s.outageSuspectedLocked() {
 				s.armOutageRecheckLocked()

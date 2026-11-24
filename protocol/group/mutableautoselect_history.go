@@ -92,10 +92,12 @@ type localHistory struct {
 	// streaks holds each network's consecutive user-traffic failures.
 	// In-memory only.
 	streaks [2]failureStreak
-	// udpAnswered maps a UDP destination to when a handle to it last
-	// answered through this member, keeping the most recent
-	// maxUDPAnsweredDestinations. In-memory only.
+	// udpAnswered maps a UDP destination, and tcpAnswered a TCP one's
+	// destKey, to when a handle or conn to it last answered through this
+	// member, each keeping about the most recent maxAnsweredDestinations.
+	// In-memory only.
 	udpAnswered map[string]time.Time
+	tcpAnswered map[uint64]time.Time
 	// udpInherited holds the destinations that answered through the UDP
 	// selection this member last replaced, so one failing through this
 	// member as well is its failure too. They aren't passed on again, which
@@ -233,32 +235,58 @@ func (h *localHistory) noteUserResponse(network streakNet, dest string, opened, 
 	if at.After(st.lastAnswerAt) {
 		st.lastAnswerAt = at
 	}
+	if opened.After(st.answeredOpened) {
+		st.answeredOpened = opened
+	}
 	if network == streakUDP || opened.After(st.at) {
 		st.count = 0
 	}
 	if network == streakUDP && dest != "" {
-		if h.udpAnswered == nil {
-			h.udpAnswered = make(map[string]time.Time)
-		}
-		if _, ok := h.udpAnswered[dest]; !ok && len(h.udpAnswered) >= maxUDPAnsweredDestinations {
-			h.evictOldestUDPAnsweredLocked()
-		}
-		h.udpAnswered[dest] = at
+		h.udpAnswered = noteAnswered(h.udpAnswered, dest, at)
 	}
 }
 
-// maxUDPAnsweredDestinations bounds the UDP destinations a member remembers.
-const maxUDPAnsweredDestinations = 64
+// noteTCPAnswered records that a TCP conn to the destination with destKey key
+// answered at at.
+func (h *localHistory) noteTCPAnswered(key uint64, at time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.tcpAnswered = noteAnswered(h.tcpAnswered, key, at)
+}
 
-func (h *localHistory) evictOldestUDPAnsweredLocked() {
-	var oldest string
-	var oldestAt time.Time
-	for dest, at := range h.udpAnswered {
-		if oldest == "" || at.Before(oldestAt) {
-			oldest, oldestAt = dest, at
-		}
+// maxAnsweredDestinations bounds the destinations a member remembers per
+// network.
+const maxAnsweredDestinations = 64
+
+// noteAnswered records in answered, made if nil, that dest answered at at.
+// When answered holds maxAnsweredDestinations and dest is new, its oldest
+// entry goes first.
+func noteAnswered[K comparable](answered map[K]time.Time, dest K, at time.Time) map[K]time.Time {
+	if answered == nil {
+		answered = make(map[K]time.Time)
 	}
-	delete(h.udpAnswered, oldest)
+	if _, ok := answered[dest]; !ok && len(answered) >= maxAnsweredDestinations {
+		var oldest K
+		var oldestAt time.Time
+		found := false
+		for d, t := range answered {
+			if !found || t.Before(oldestAt) {
+				oldest, oldestAt, found = d, t, true
+			}
+		}
+		delete(answered, oldest)
+	}
+	answered[dest] = at
+	return answered
+}
+
+// tcpDestAnswered reports whether a TCP conn to the destination with destKey
+// key has answered through the member.
+func (h *localHistory) tcpDestAnswered(key uint64) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, ok := h.tcpAnswered[key]
+	return ok
 }
 
 // udpDestAnswered reports whether a UDP handle to dest has answered through
@@ -334,15 +362,21 @@ func (h *localHistory) limitReachedAt(network streakNet, now time.Time, window t
 	return st.limitAt
 }
 
-// streakStarted returns when network's live streak's first failed conn or
-// exchange started, or zero without a live streak.
-func (h *localHistory) streakStarted(network streakNet, now time.Time, window time.Duration) time.Time {
+// liveStreak returns a copy of network's streak, and whether it is live at
+// now.
+func (h *localHistory) liveStreak(network streakNet, now time.Time, window time.Duration) (failureStreak, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.streaks[network].live(now, window) == 0 {
-		return time.Time{}
-	}
-	return h.streaks[network].started
+	st := h.streaks[network]
+	return st, st.live(now, window) > 0
+}
+
+// answeredLater reports whether a conn on network that opened after opened
+// has had an answer.
+func (h *localHistory) answeredLater(network streakNet, opened time.Time) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.streaks[network].answeredOpened.After(opened)
 }
 
 func (h *localHistory) answeredSince(network streakNet, t time.Time) bool {
@@ -383,10 +417,14 @@ func streakNetFor(network string) streakNet {
 type failureStreak struct {
 	count uint32
 	// at is the latest failure's time and opened its conn's or exchange's
-	// start; started is the first failure's conn's or exchange's start, and
-	// limitAt when count reached consecutiveUserFailureLimit.
-	at, opened, started, limitAt time.Time
-	lastAnswerAt                 time.Time
+	// start; firstAt is the first failure's time and started its conn's or
+	// exchange's start, and limitAt when count reached
+	// consecutiveUserFailureLimit.
+	at, opened, firstAt, started, limitAt time.Time
+	lastAnswerAt                          time.Time
+	// answeredOpened is when the newest conn or exchange that got an answer
+	// opened.
+	answeredOpened time.Time
 }
 
 // extend counts a failure at at, on a conn opened at opened. A failure
@@ -398,11 +436,11 @@ type failureStreak struct {
 func (st *failureStreak) extend(at, opened time.Time, window, retryWindow time.Duration) {
 	switch {
 	case st.live(at, window) == 0:
-		st.count, st.started = 1, opened
+		st.count, st.firstAt, st.started = 1, at, opened
 	case opened.IsZero() || !opened.After(st.at):
 		return
 	case retryWindow > 0 && opened.Sub(st.opened) > retryWindow:
-		st.count, st.started = 1, opened
+		st.count, st.firstAt, st.started = 1, at, opened
 	default:
 		st.count++
 	}
