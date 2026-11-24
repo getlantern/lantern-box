@@ -182,9 +182,14 @@ jobs:
   prune:
     name: Prune old images
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # OCI and Alicloud list every region the account can use, one CLI call each.
+    timeout-minutes: 25
     needs: prepare
     steps:
+      - name: Checkout
+        if: contains(needs.prepare.outputs.matrix, 'oracle-oci') || contains(needs.prepare.outputs.matrix, 'alicloud-ecs')
+        uses: actions/checkout@v6
+
       - name: Prune old Linode images
         if: contains(needs.prepare.outputs.matrix, 'linode')
         # Explicit `shell: bash` for `-eo pipefail`: under the default shell a failed
@@ -325,6 +330,46 @@ jobs:
             echo "::error::${failures} gcore image(s) failed to delete"
             exit 1
           fi
+
+      # The OCI and Alicloud steps run even when an earlier prune step failed:
+      # each provider's backlog is independent.
+      - name: Prune old OCI images
+        if: ${{ !cancelled() && contains(needs.prepare.outputs.matrix, 'oracle-oci') }}
+        shell: bash
+        env:
+          OCI_KEY_CONTENT: ${{ secrets.OCI_KEY_CONTENT }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+        run: |
+          pipx install --quiet oci-cli==3.97.0
+          conf_dir="$RUNNER_TEMP/oci"
+          mkdir -p "$conf_dir"
+          printf '%s\n' "$OCI_KEY_CONTENT" > "$conf_dir/key.pem"
+          chmod 600 "$conf_dir/key.pem"
+          printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=us-ashburn-1\nkey_file=%s\n' \
+            "$OCI_USER_OCID" "$OCI_FINGERPRINT" "$OCI_TENANCY_OCID" "$conf_dir/key.pem" > "$conf_dir/config"
+          chmod 600 "$conf_dir/config"
+          OCI_CLI_CONFIG_FILE="$conf_dir/config" deploy/packer/prune-images.sh oci
+
+      - name: Prune old Alicloud images
+        if: ${{ !cancelled() && contains(needs.prepare.outputs.matrix, 'alicloud-ecs') }}
+        shell: bash
+        env:
+          ALICLOUD_ACCESS_KEY: ${{ secrets.ALICLOUD_ACCESS_KEY }}
+          ALICLOUD_SECRET_KEY: ${{ secrets.ALICLOUD_SECRET_KEY }}
+          ALIYUN_CLI_VERSION: 3.5.4
+          ALIYUN_CLI_SHA256: e1eefcbbe9d772d61f770d4af8595e7297e081a0348b096765d2c41e581c3e72
+        run: |
+          tgz="$RUNNER_TEMP/aliyun-cli.tgz"
+          curl -fsSL --retry 3 -o "$tgz" \
+            "https://github.com/aliyun/aliyun-cli/releases/download/v${ALIYUN_CLI_VERSION}/aliyun-cli-linux-${ALIYUN_CLI_VERSION}-amd64.tgz"
+          echo "${ALIYUN_CLI_SHA256}  $tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$tgz" -C "$RUNNER_TEMP/bin" aliyun
+          PATH="$RUNNER_TEMP/bin:$PATH" deploy/packer/prune-images.sh alicloud
 
   # Build each provider in parallel
   build:
