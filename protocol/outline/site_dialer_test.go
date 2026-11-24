@@ -88,7 +88,7 @@ func TestSiteDialersSearchInBackground(t *testing.T) {
 
 		close(f.release)
 		synctest.Wait()
-		if got := s.dialerFor("m.youtube.com", 443); got != d {
+		if got := s.dialerFor("m.youtube.com", 443); got == nil || got.StreamDialer != d {
 			t.Fatalf("dialerFor after the search = %v, want the site's dialer", got)
 		}
 		if got := f.searched(); len(got) != 1 {
@@ -159,7 +159,7 @@ func TestSiteDialersSearchOnlyFrom443(t *testing.T) {
 		s.dialerFor("mail.gmail.com", 443)
 		synctest.Wait()
 		// Once found, the site's dialer serves its other ports too.
-		if got := s.dialerFor("imap.gmail.com", 993); got != d {
+		if got := s.dialerFor("imap.gmail.com", 993); got == nil || got.StreamDialer != d {
 			t.Fatalf("dialerFor on 993 after a search = %v, want the site's dialer", got)
 		}
 	})
@@ -194,17 +194,21 @@ func TestSiteDialersDropFailingDialer(t *testing.T) {
 		s := newSiteDialers(t.Context(), maxSites, f.search)
 		s.dialerFor("youtube.com", 443)
 		synctest.Wait()
+		sd := s.dialerFor("youtube.com", 443)
+		if sd == nil || sd.StreamDialer != d {
+			t.Fatalf("dialerFor after the search = %v, want the site's dialer", sd)
+		}
 
 		// A success resets the count.
-		s.dialed("youtube.com", d, errDialRefused)
-		s.dialed("youtube.com", d, nil)
+		s.dialed("youtube.com", sd, errDialRefused)
+		s.dialed("youtube.com", sd, nil)
 		for range maxSiteDialFailures - 1 {
-			s.dialed("youtube.com", d, errDialRefused)
+			s.dialed("youtube.com", sd, errDialRefused)
 		}
-		if got := s.dialerFor("youtube.com", 443); got != d {
+		if got := s.dialerFor("youtube.com", 443); got != sd {
 			t.Fatalf("dialerFor after %d failures = %v, want the site's dialer", maxSiteDialFailures-1, got)
 		}
-		s.dialed("youtube.com", d, errDialRefused)
+		s.dialed("youtube.com", sd, errDialRefused)
 		if got := s.dialerFor("youtube.com", 443); got != nil {
 			t.Fatalf("dialerFor after %d failures = %v, want nil", maxSiteDialFailures, got)
 		}
@@ -354,4 +358,107 @@ func TestPerSiteOptionsKeepOnlyEncryptedResolvers(t *testing.T) {
 	if !ok || len(got.DNSResolvers) != 2 || got.DNSResolvers[0].HTTPS == nil || got.DNSResolvers[1].TLS == nil {
 		t.Fatalf("perSiteOptions resolvers = %+v (on %v), want the DoH and DoT entries", got.DNSResolvers, ok)
 	}
+}
+
+// The finder's dialers are func values, which can't be compared.
+func TestSiteDialerFuncDialer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var dials int
+		fd := transport.FuncStreamDialer(func(context.Context, string) (transport.StreamConn, error) {
+			dials++
+			return nil, errDialRefused
+		})
+		f := &fakeSiteSearch{dialer: fd}
+		o := &Outbound{
+			createDialer: func() (transport.StreamDialer, error) { return &recordingDialer{}, nil },
+			sites:        newSiteDialers(t.Context(), maxSites, f.search),
+		}
+		dest := metadata.ParseSocksaddr("www.youtube.com:443")
+		o.DialContext(context.Background(), "tcp", dest)
+		synctest.Wait()
+		for range maxSiteDialFailures {
+			if _, err := o.DialContext(context.Background(), "tcp", dest); !errors.Is(err, errDialRefused) {
+				t.Fatalf("DialContext: got %v, want %v", err, errDialRefused)
+			}
+		}
+		if dials != maxSiteDialFailures {
+			t.Fatalf("site dialer dialed %d times, want %d", dials, maxSiteDialFailures)
+		}
+	})
+}
+
+func TestCancelledSiteDialKeepsDialer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		blocked := transport.FuncStreamDialer(func(ctx context.Context, _ string) (transport.StreamConn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		f := &fakeSiteSearch{dialer: blocked}
+		outboundDialer := &recordingDialer{}
+		o := &Outbound{
+			createDialer: func() (transport.StreamDialer, error) { return outboundDialer, nil },
+			sites:        newSiteDialers(t.Context(), maxSites, f.search),
+		}
+		dest := metadata.ParseSocksaddr("www.youtube.com:443")
+		o.DialContext(context.Background(), "tcp", dest)
+		synctest.Wait()
+		for range maxSiteDialFailures + 1 {
+			ctx, cancel := context.WithCancel(context.Background())
+			go cancel()
+			if _, err := o.DialContext(ctx, "tcp", dest); !errors.Is(err, context.Canceled) {
+				t.Fatalf("DialContext: got %v, want %v", err, context.Canceled)
+			}
+		}
+		if got := o.sites.dialerFor("www.youtube.com", 443); got == nil {
+			t.Fatal("cancelled dials dropped the site's dialer")
+		}
+		if len(outboundDialer.addrs) != 1 {
+			t.Fatalf("outbound's dialer dialed %v, want only the first dial", outboundDialer.addrs)
+		}
+	})
+}
+
+func TestOtherPortsDontEvictSites(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := &recordingDialer{}
+		s := newSiteDialers(t.Context(), 1, (&fakeSiteSearch{dialer: d}).search)
+		s.dialerFor("youtube.com", 443)
+		synctest.Wait()
+		s.dialerFor("imap.example.com", 993)
+		if got := s.dialerFor("youtube.com", 443); got == nil {
+			t.Fatal("a dial to another port evicted a site with a dialer")
+		}
+	})
+}
+
+func TestEvictedSiteNotSearchedTwice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := &recordingDialer{}
+		release := make(chan struct{})
+		var mu sync.Mutex
+		var searched []string
+		search := func(_ context.Context, site, _ string) (transport.StreamDialer, error) {
+			mu.Lock()
+			searched = append(searched, site)
+			mu.Unlock()
+			<-release
+			if site != "youtube.com" {
+				return nil, errDialRefused
+			}
+			return d, nil
+		}
+		s := newSiteDialers(t.Context(), 1, search)
+		s.dialerFor("youtube.com", 443)
+		s.dialerFor("instagram.com", 443) // evicts youtube.com mid-search
+		s.dialerFor("youtube.com", 443)
+		synctest.Wait()
+		if len(searched) != 2 {
+			t.Fatalf("searched %v, want youtube.com once and instagram.com once", searched)
+		}
+		close(release)
+		synctest.Wait()
+		if got := s.dialerFor("youtube.com", 443); got == nil || got.StreamDialer != d {
+			t.Fatalf("dialerFor after the search = %v, want its result despite the eviction", got)
+		}
+	})
 }

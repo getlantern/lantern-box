@@ -33,7 +33,9 @@ const (
 	maxSiteSearches = 4
 	// maxSiteDialFailures is how many dials in a row a site's dialer may fail
 	// before the site goes back to the outbound's dialer and is searched
-	// again, as when a resolver it chose is blocked later.
+	// again, as when a resolver it chose is blocked later. A dial fails only
+	// on resolution or connect: the smart dialer returns once TCP connects,
+	// so a strategy blocked later, at the TLS handshake, isn't counted.
 	maxSiteDialFailures = 3
 )
 
@@ -52,17 +54,24 @@ type siteDialers struct {
 	ctx context.Context
 	now func() time.Time
 
-	mu        sync.Mutex
-	sites     *lru.Cache[string, *siteEntry]
-	searching int
-	limit     int
+	mu    sync.Mutex
+	sites *lru.Cache[string, *siteEntry]
+	// inFlight holds the sites being searched, apart from sites, so an
+	// eviction can't start a second search of a site.
+	inFlight map[string]bool
+	limit    int
+}
+
+// siteDialer is a site's dialer. Dialers are compared by this pointer: the
+// finder's are func values, which panic when compared.
+type siteDialer struct {
+	transport.StreamDialer
 }
 
 // siteEntry is one site's state, guarded by siteDialers.mu.
 type siteEntry struct {
-	dialer       transport.StreamDialer
+	dialer       *siteDialer
 	dialFailures int
-	searching    bool
 	// searchFailures counts failed searches in a row, and failedUntil is
 	// when the site may be searched again.
 	searchFailures int
@@ -75,7 +84,10 @@ func newSiteDialers(ctx context.Context, size int, search func(ctx context.Conte
 		// Only a non-positive size fails, and callers pass a constant.
 		panic(err)
 	}
-	return &siteDialers{search: search, ctx: ctx, now: time.Now, sites: sites, limit: maxSiteSearches}
+	return &siteDialers{
+		search: search, ctx: ctx, now: time.Now,
+		sites: sites, inFlight: map[string]bool{}, limit: maxSiteSearches,
+	}
 }
 
 // dialerFor returns host's site's dialer, or nil when it has none yet. A nil
@@ -83,38 +95,57 @@ func newSiteDialers(ctx context.Context, size int, search func(ctx context.Conte
 // running, the site's last search failed less than its retry delay ago, or
 // maxSiteSearches are already running. Only 443 starts one: a search tests
 // HTTPS on 443, which a host dialed on another port, such as an IMAP server,
-// needn't serve.
-func (s *siteDialers) dialerFor(host string, port uint16) transport.StreamDialer {
+// needn't serve. Dials to other ports don't add the site either, so they
+// can't evict sites that have a dialer.
+func (s *siteDialers) dialerFor(host string, port uint16) *siteDialer {
 	site := siteOf(host)
 	if site == "" {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if port != 443 {
+		if e, ok := s.sites.Get(site); ok {
+			return e.dialer
+		}
+		return nil
+	}
 	e, ok := s.sites.Get(site)
 	if !ok {
 		e = &siteEntry{}
 		s.sites.Add(site, e)
 	}
-	if e.dialer != nil || e.searching || port != 443 || s.now().Before(e.failedUntil) || s.searching >= s.limit {
+	if e.dialer != nil || s.inFlight[site] || s.now().Before(e.failedUntil) || len(s.inFlight) >= s.limit {
 		return e.dialer
 	}
-	e.searching = true
-	s.searching++
-	go s.run(e, site, host)
+	s.inFlight[site] = true
+	go s.run(site, host)
 	return nil
 }
 
-func (s *siteDialers) run(e *siteEntry, site, host string) {
+// run searches site and records the result on the site's entry at the time
+// it finishes. A found dialer gets a new entry if the old one was evicted
+// meanwhile.
+func (s *siteDialers) run(site, host string) {
 	ctx, cancel := context.WithTimeout(s.ctx, siteSearchTimeout)
 	defer cancel()
 	d, err := s.search(ctx, site, host)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e.searching = false
-	s.searching--
-	if err == nil && d != nil {
-		e.dialer, e.dialFailures, e.searchFailures = d, 0, 0
+	delete(s.inFlight, site)
+	found := err == nil && d != nil
+	e, ok := s.sites.Peek(site)
+	if !ok {
+		// The site was evicted during the search. A failure isn't worth
+		// evicting another site to record.
+		if !found {
+			return
+		}
+		e = &siteEntry{}
+		s.sites.Add(site, e)
+	}
+	if found {
+		e.dialer, e.dialFailures, e.searchFailures = &siteDialer{d}, 0, 0
 		return
 	}
 	e.searchFailures++
@@ -124,7 +155,7 @@ func (s *siteDialers) run(e *siteEntry, site, host string) {
 // dialed records how a dial through d, host's site's dialer, went. After
 // maxSiteDialFailures failures in a row the site drops d, goes back to the
 // outbound's dialer and is searched again after siteRetryAfter.
-func (s *siteDialers) dialed(host string, d transport.StreamDialer, err error) {
+func (s *siteDialers) dialed(host string, d *siteDialer, err error) {
 	site := siteOf(host)
 	if site == "" {
 		return

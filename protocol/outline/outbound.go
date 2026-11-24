@@ -263,9 +263,14 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	if o.sites != nil && addr.IsFqdn() {
 		if d := o.sites.dialerFor(addr.Fqdn, addr.Port); d != nil {
 			conn, err := d.DialStream(ctx, addr.String())
-			o.sites.dialed(addr.Fqdn, d, err)
-			if err == nil || ctx.Err() != nil {
+			// A dial cancelled by its caller, as when the hedge's other leg
+			// wins, says nothing about the strategy.
+			if ctx.Err() != nil {
 				return conn, err
+			}
+			o.sites.dialed(addr.Fqdn, d, err)
+			if err == nil {
+				return conn, nil
 			}
 			// The site's strategy failed; the outbound's may still work,
 			// as it would have without the site search.
