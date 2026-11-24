@@ -52,13 +52,16 @@ case "$1 $2" in
         --Tag.1.Value) value="${args[$((i + 1))]}" ;;
       esac
     done
-    for s in "${snaps[@]}"; do printf '%s\t%s\n' "$s" "$value" >>"$FAKE_DIR/tagged"; done
+    for s in "${snaps[@]}"; do printf '%s\t%s\n' "$s" "$value" >>"$FAKE_DIR/tagged-$region"; done
     echo '{}'
     ;;
   "ecs DescribeSnapshots")
     # Snapshots tagged by an earlier run (fixture) plus any tagged in this one.
-    touch "$FAKE_DIR/tagged"
-    jq -n --slurpfile prior "$FAKE_DIR/ali-snapshots-$region.json" --rawfile tagged "$FAKE_DIR/tagged" '
+    # FAKE_ALI_BADTAG swaps in a fixture whose tag value is not an image ID.
+    prior="$FAKE_DIR/ali-snapshots-$region.json"
+    [ -n "${FAKE_ALI_BADTAG:-}" ] && [ -f "$FAKE_DIR/ali-snapshots-$region-badtag.json" ] && prior="$FAKE_DIR/ali-snapshots-$region-badtag.json"
+    touch "$FAKE_DIR/tagged-$region"
+    jq -n --slurpfile prior "$prior" --rawfile tagged "$FAKE_DIR/tagged-$region" '
       {Snapshots: {Snapshot: (($prior[0] // []) + [$tagged | split("\n")[] | select(. != "") | split("\t")
         | {SnapshotId: .[0], Tags: {Tag: [{TagKey: "lantern-box-prune-image", TagValue: .[1]}]}}])}}'
     ;;

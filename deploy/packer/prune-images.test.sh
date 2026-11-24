@@ -146,7 +146,18 @@ else
   failt "alicloud unconfirmed image delete: $(cat "$dir/out")"
 fi
 
-# 9. A transient Alicloud error is retried.
+# 9. A tagged snapshot whose tag value is not an image ID is never deleted.
+dir=$(make_env)
+TMP_DIRS+=("$dir")
+if run_prune "$dir" KEEP=1 FAKE_ALI_BADTAG=1 "$PRUNE" alicloud; then
+  failt "alicloud exited zero with a malformed snapshot tag"
+elif ! grep -q "DeleteSnapshot .*s-badtag" "$dir/calls.log" && grep -q "s-badtag carries" "$dir/out"; then
+  pass "alicloud malformed snapshot tag left alone"
+else
+  failt "alicloud malformed snapshot tag: $(cat "$dir/out")"
+fi
+
+# 10. A transient Alicloud error is retried.
 dir=$(make_env)
 TMP_DIRS+=("$dir")
 if run_prune "$dir" KEEP=1 FAKE_ALI_FLAKY_ONCE=1 "$PRUNE" alicloud && [ "$(deleted_ali_images "$dir")" = "ap-southeast-1:m-old1 " ]; then

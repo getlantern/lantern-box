@@ -142,7 +142,8 @@ SNAPSHOT_TAG=lantern-box-prune-image
 ali_image_exists() {
   local region=$1 id=$2 out n
   out=$(ali_cli ecs DescribeImages --RegionId "$region" --ImageId "$id" --ImageOwnerAlias self) || return 2
-  n=$(jq '.Images.Image | length' <<<"$out") || return 2
+  # Only a well-formed answer may say "gone": callers delete on it.
+  n=$(jq -e '.Images.Image | if type == "array" then length else error("no image list") end' <<<"$out") || return 2
   [ "$n" -gt 0 ] && return 0
   return 1
 }
@@ -199,6 +200,10 @@ ali_sweep_snapshots() {
   fi
   while IFS=$'\t' read -r snap image; do
     [ -n "$snap" ] || continue
+    if ! [[ "$image" =~ ^m-[a-z0-9]+$ ]]; then
+      fail "Alicloud $region: snapshot $snap carries $SNAPSHOT_TAG=\"$image\", not an image ID; leaving it"
+      continue
+    fi
     rc=0
     ali_image_exists "$region" "$image" || rc=$?
     if [ "$rc" -eq 0 ]; then
