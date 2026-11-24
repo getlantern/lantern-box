@@ -15,6 +15,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/log"
 	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/metadata"
@@ -79,6 +80,7 @@ type scriptedConn struct {
 	reads     chan scriptedRead
 	closed    chan struct{}
 	closeOnce sync.Once
+	writeErr  error
 }
 
 type scriptedRead struct {
@@ -90,7 +92,12 @@ func newScriptedConn() *scriptedConn {
 	return &scriptedConn{reads: make(chan scriptedRead, 4), closed: make(chan struct{})}
 }
 
-func (c *scriptedConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *scriptedConn) Write(p []byte) (int, error) {
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	return len(p), nil
+}
 
 func (c *scriptedConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closed) })
@@ -121,6 +128,15 @@ func TestDataPlaneStream_Unanswered(t *testing.T) {
 		d.Read(make([]byte, 8))
 	}
 	closeConn := func(d *dataPlaneStream, _ *scriptedConn) { d.Close() }
+	inOrder := &quic.StreamError{StreamID: 4, ErrorCode: 0, Remote: true}
+	closedInOrder := func(d *dataPlaneStream, c *scriptedConn) {
+		c.reads <- scriptedRead{err: inOrder}
+		d.Read(make([]byte, 8))
+	}
+	writeClosedInOrder := func(d *dataPlaneStream, c *scriptedConn) {
+		c.writeErr = inOrder
+		d.Write([]byte("request"))
+	}
 
 	tests := []struct {
 		name       string
@@ -137,6 +153,9 @@ func TestDataPlaneStream_Unanswered(t *testing.T) {
 		{"EOF before a reply", []step{write, eof, closeConn}, 1, 0},
 		{"EOF after a reply", []step{write, reply, eof, closeConn}, 0, 1},
 		{"EOF after a reply, then a quiet wait", []step{write, reply, eof, wait(3 * time.Second), closeConn}, 0, 1},
+		{"closed in order before a reply", []step{write, closedInOrder, closeConn}, 1, 0},
+		{"closed in order after a reply, then a quiet wait", []step{write, reply, closedInOrder, wait(3 * time.Second), closeConn}, 0, 1},
+		{"closed in order on a write after a reply and a quiet wait", []step{write, reply, wait(3 * time.Second), writeClosedInOrder, closeConn}, 0, 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

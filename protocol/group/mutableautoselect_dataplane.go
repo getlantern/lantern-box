@@ -224,7 +224,7 @@ func (r *connReport) failure(kind adapter.UserFailureKind, cause error) {
 		// The deferred charge holds only what it needs, not the dead conn.
 		r.noteTrialFailed()
 		s, origin, opened, network := r.s, r.origin, r.opened, r.network
-		s.afterSettle(func() { s.chargeFailure(origin, kind, opened, network, cause) })
+		s.afterSettle(func(settled func() bool) { s.chargeFailure(settled, origin, kind, opened, network, cause) })
 		return
 	}
 	if kind == adapter.UserFailureNoResponse {
@@ -246,13 +246,14 @@ func lostTransport(err error) bool {
 
 func (r *connReport) charge(kind adapter.UserFailureKind, cause error) {
 	r.noteTrialFailed()
-	r.s.chargeFailure(r.origin, kind, r.opened, r.network, cause)
+	r.s.chargeFailure(nil, r.origin, kind, r.opened, r.network, cause)
 }
 
 // chargeFailure charges a failure of a conn through origin's member, if it is
-// chargeable, and confirms a TCP selection that reset or went unanswered.
-func (s *MutableAutoSelect) chargeFailure(origin connOrigin, kind adapter.UserFailureKind, opened time.Time, network string, cause error) {
-	if !s.chargeable(origin.out.Tag(), origin.route) || !s.recordUserFailure(origin, kind, opened, network, cause) {
+// chargeable and current allows as recordUserFailureIf does, and confirms a
+// TCP selection that reset or went unanswered.
+func (s *MutableAutoSelect) chargeFailure(current func() bool, origin connOrigin, kind adapter.UserFailureKind, opened time.Time, network string, cause error) {
+	if !s.chargeable(origin.out.Tag(), origin.route) || !s.recordUserFailureIf(current, origin, kind, opened, network, cause) {
 		return
 	}
 	if confirms(origin, network) && (kind == adapter.UserFailureReset || kind == adapter.UserFailureNoResponse) {
@@ -339,8 +340,9 @@ type dataPlaneIO struct {
 // (including EOF) disarm it. Set firstResponseTimeout before the first IO.
 //
 // With a non-zero unansweredAfter as well, a conn is reported unanswered when
-// it reads EOF after writing but before its first response, or when it is
-// closed locally, before reading EOF, after waiting at least unansweredAfter
+// the far end closes it in order, by EOF or as closedByServer reports, after
+// writing but before its first response, or when it is closed locally, before
+// the far end closed it, after waiting at least unansweredAfter
 // since its first write began for a first response, or at least
 // unansweredAfter after the last IO once data has arrived. With
 // unansweredWhileOpen, for UDP, each exchange is
@@ -387,7 +389,7 @@ type dataPlaneWatchdog struct {
 	readBytes  atomic.Uint64
 	responded  atomic.Bool
 	answered   atomic.Bool // set by the first read of data
-	peerClosed atomic.Bool // set by a read of EOF
+	peerClosed atomic.Bool // set once the far end closed the conn in order
 	closed     atomic.Bool
 	proven     atomic.Bool
 	stalled    atomic.Bool
@@ -504,13 +506,13 @@ func (w *dataPlaneWatchdog) noteIOFrom(n int, err error, isRead bool, source M.S
 	if w.stalled.Load() {
 		return
 	}
-	eof := isRead && n == 0 && errors.Is(err, io.EOF)
-	if eof {
+	closed := n == 0 && (isRead && errors.Is(err, io.EOF) || closedByServer(err))
+	if closed {
 		w.peerClosed.Store(true)
 	}
 	if w.needsResponseTracking() {
 		var wroteAt time.Time
-		if eof && w.unansweredAfter > 0 {
+		if closed && w.unansweredAfter > 0 {
 			wroteAt = w.firstWrite()
 		}
 		switch {

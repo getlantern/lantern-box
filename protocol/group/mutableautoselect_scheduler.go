@@ -782,20 +782,16 @@ func (s *MutableAutoSelect) forceProbesLocked(tags ...string) {
 // transports up to a second before sing-box pauses the network.
 const failureSettle = 3 * time.Second
 
-// afterSettle runs charge once failureSettle has passed, unless the device or
-// network paused meanwhile. A failure from an earlier network is dropped when
-// charged, as any is.
-func (s *MutableAutoSelect) afterSettle(charge func()) {
+// afterSettle runs charge once failureSettle has passed. settled, called with
+// s.access held, reports whether the device and network have not paused since
+// afterSettle was called; charge records nothing unless it does. A failure
+// from an earlier network is dropped when charged, as any is.
+func (s *MutableAutoSelect) afterSettle(charge func(settled func() bool)) {
 	s.access.Lock()
 	epoch := s.pauseEpoch
 	s.access.Unlock()
 	time.AfterFunc(failureSettle, func() {
-		s.access.Lock()
-		settled := s.pauseEpoch == epoch
-		s.access.Unlock()
-		if settled {
-			charge()
-		}
+		charge(func() bool { return s.pauseEpoch == epoch })
 	})
 }
 

@@ -2063,12 +2063,19 @@ func destinationFailed(err error) bool {
 // dropped while outage evidence holds, as is one from another network
 // generation.
 func (s *MutableAutoSelect) recordUserFailure(origin connOrigin, kind adapter.UserFailureKind, opened time.Time, network string, cause error) bool {
+	return s.recordUserFailureIf(nil, origin, kind, opened, network, cause)
+}
+
+// recordUserFailureIf is recordUserFailure, except that it records nothing
+// unless current, called with s.access held, reports true. A nil current
+// always does.
+func (s *MutableAutoSelect) recordUserFailureIf(current func() bool, origin connOrigin, kind adapter.UserFailureKind, opened time.Time, network string, cause error) bool {
 	if s.isClosed() || destinationFailed(cause) || deviceFailed(cause) {
 		return false
 	}
 	s.access.Lock()
 	defer s.access.Unlock()
-	if s.pausedBeforeLocked(opened) {
+	if (current != nil && !current()) || s.pausedBeforeLocked(opened) {
 		return false
 	}
 	if !s.originCurrentLocked(origin) {
