@@ -6,6 +6,11 @@
 # lantern-cloud provisions from the newest image in each region, so the older
 # ones are only rollback room.
 #
+# On Alicloud the snapshots backing a deleted image are deleted too. They are
+# tagged with the image ID before the image goes, and every run deletes the
+# tagged snapshots whose image is gone, so a cleanup that failed or was
+# interrupted is finished by the next run.
+#
 # Usage: prune-images.sh oci|alicloud
 #
 # Common env:
@@ -128,8 +133,22 @@ ali_images() {
   echo "$all"
 }
 
+# Tag key on the snapshots backing an image this script deletes; the value is
+# the image ID. DeleteImage leaves those snapshots behind, still billed, and
+# once the image is gone nothing else leads back to them.
+SNAPSHOT_TAG=lantern-box-prune-image
+
+# Returns 0 when the image exists, 1 when it does not, 2 when the lookup failed.
+ali_image_exists() {
+  local region=$1 id=$2 out n
+  out=$(ali_cli ecs DescribeImages --RegionId "$region" --ImageId "$id" --ImageOwnerAlias self) || return 2
+  n=$(jq '.Images.Image | length' <<<"$out") || return 2
+  [ "$n" -gt 0 ] && return 0
+  return 1
+}
+
 ali_delete_image() {
-  local region=$1 id=$2 name=$3 snaps=$4 users snap attempt ok
+  local region=$1 id=$2 name=$3 snaps=$4 users args i rc
   # DeleteImage would also refuse an image a live instance was created from;
   # checking first keeps that a skip instead of a failure.
   if ! users=$(ali_cli ecs DescribeInstances --RegionId "$region" --ImageId "$id" | jq '.TotalCount'); then
@@ -144,18 +163,56 @@ ali_delete_image() {
     echo "  would delete $name ($id) and snapshot(s) [$snaps]"
     return
   fi
+  if [ -n "$snaps" ]; then
+    args=()
+    i=1
+    for snap in $snaps; do
+      args+=("--ResourceId.$i" "$snap")
+      i=$((i + 1))
+    done
+    if ! ali_cli ecs TagResources --RegionId "$region" --ResourceType snapshot "${args[@]}" \
+      --Tag.1.Key "$SNAPSHOT_TAG" --Tag.1.Value "$id" >/dev/null; then
+      fail "Alicloud $region: cannot tag the snapshots of $name ($id); not deleting it"
+      return
+    fi
+  fi
   echo "  deleting $name ($id)"
   if ! ali_cli ecs DeleteImage --RegionId "$region" --ImageId "$id" >/dev/null; then
     # A retried call fails when the attempt whose response was lost had deleted it.
-    if ali_cli ecs DescribeImages --RegionId "$region" --ImageId "$id" --ImageOwnerAlias self \
-      | jq -e '(.Images.Image // []) | length > 0' >/dev/null; then
+    rc=0
+    ali_image_exists "$region" "$id" || rc=$?
+    if [ "$rc" -ne 1 ]; then
       fail "Alicloud $region: failed to delete $name ($id)"
       return
     fi
   fi
   deleted=$((deleted + 1))
-  # DeleteImage leaves the image's backing snapshots behind, still billed.
-  for snap in $snaps; do
+}
+
+# Deletes the snapshots tagged by ali_delete_image whose image is gone,
+# including any a failed or interrupted earlier run left behind.
+ali_sweep_snapshots() {
+  local region=$1 out snap image rc attempt ok
+  if ! out=$(ali_cli ecs DescribeSnapshots --RegionId "$region" --Tag.1.Key "$SNAPSHOT_TAG" --PageSize 100); then
+    fail "Alicloud $region: cannot list snapshots tagged $SNAPSHOT_TAG"
+    return
+  fi
+  while IFS=$'\t' read -r snap image; do
+    [ -n "$snap" ] || continue
+    rc=0
+    ali_image_exists "$region" "$image" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      # Its image survived a failed delete; the snapshot goes once the image does.
+      continue
+    elif [ "$rc" -eq 2 ]; then
+      fail "Alicloud $region: cannot check image $image of snapshot $snap"
+      continue
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "  would delete snapshot $snap of deleted image $image"
+      continue
+    fi
+    # Alicloud keeps the snapshot locked for a short while after DeleteImage.
     ok=false
     for attempt in 1 2 3 4 5 6; do
       if ali_cli ecs DeleteSnapshot --region "$region" --SnapshotId "$snap" >/dev/null; then
@@ -165,11 +222,12 @@ ali_delete_image() {
       [ "$attempt" -lt 6 ] && sleep "$SNAPSHOT_RETRY_SECS"
     done
     if $ok; then
-      echo "    deleted snapshot $snap"
+      echo "  deleted snapshot $snap of deleted image $image"
     else
-      fail "Alicloud $region: failed to delete snapshot $snap of $name"
+      fail "Alicloud $region: failed to delete snapshot $snap of deleted image $image"
     fi
-  done
+  done < <(jq -r --arg k "$SNAPSHOT_TAG" '.Snapshots.Snapshot[]?
+    | [.SnapshotId, (.Tags.Tag[]? | select(.TagKey == $k) | .TagValue)] | @tsv' <<<"$out")
 }
 
 prune_alicloud_region() {
@@ -192,6 +250,7 @@ prune_alicloud_region() {
       | [.DiskDeviceMappings.DiskDeviceMapping[]?.SnapshotId | select(. != "")] | join(" ")' <<<"$all")
     ali_delete_image "$region" "$id" "$name" "$snaps"
   done < <(excess <<<"$images")
+  ali_sweep_snapshots "$region"
 }
 
 prune_alicloud() {

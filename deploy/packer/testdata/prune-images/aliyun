@@ -24,7 +24,13 @@ case "$1 $2" in
     f="$FAKE_DIR/ali-images-$region.json"
     [ -f "$f" ] || f="$FAKE_DIR/ali-images-empty.json"
     if [ -n "$image" ]; then
-      jq --arg id "$image" '.Images.Image |= map(select(.ImageId == $id))' "$f"
+      [ -n "${FAKE_ALI_DELETE_IMAGE_FAIL:-}" ] && { echo "ErrorCode: InternalError" >&2; exit 1; }
+      touch "$FAKE_DIR/deleted-images"
+      if grep -qx "$image" "$FAKE_DIR/deleted-images"; then
+        echo '{"Images":{"Image":[]}}'
+      else
+        jq --arg id "$image" '.Images.Image |= map(select(.ImageId == $id))' "$f"
+      fi
     else
       cat "$f"
     fi
@@ -32,7 +38,30 @@ case "$1 $2" in
   "ecs DescribeInstances")
     if [ "$image" = "m-used" ]; then echo '{"TotalCount":1}'; else echo '{"TotalCount":0}'; fi
     ;;
-  "ecs DeleteImage") echo '{}' ;;
+  "ecs DeleteImage")
+    [ -n "${FAKE_ALI_DELETE_IMAGE_FAIL:-}" ] && { echo "ErrorCode: InternalError" >&2; exit 1; }
+    echo "$image" >>"$FAKE_DIR/deleted-images"
+    echo '{}'
+    ;;
+  "ecs TagResources")
+    [ -n "${FAKE_ALI_TAG_FAIL:-}" ] && { echo "ErrorCode: Forbidden.RAM" >&2; exit 1; }
+    value="" snaps=()
+    for ((i = 0; i < ${#args[@]}; i++)); do
+      case "${args[$i]}" in
+        --ResourceId.*) snaps+=("${args[$((i + 1))]}") ;;
+        --Tag.1.Value) value="${args[$((i + 1))]}" ;;
+      esac
+    done
+    for s in "${snaps[@]}"; do printf '%s\t%s\n' "$s" "$value" >>"$FAKE_DIR/tagged"; done
+    echo '{}'
+    ;;
+  "ecs DescribeSnapshots")
+    # Snapshots tagged by an earlier run (fixture) plus any tagged in this one.
+    touch "$FAKE_DIR/tagged"
+    jq -n --slurpfile prior "$FAKE_DIR/ali-snapshots-$region.json" --rawfile tagged "$FAKE_DIR/tagged" '
+      {Snapshots: {Snapshot: (($prior[0] // []) + [$tagged | split("\n")[] | select(. != "") | split("\t")
+        | {SnapshotId: .[0], Tags: {Tag: [{TagKey: "lantern-box-prune-image", TagValue: .[1]}]}}])}}'
+    ;;
   "ecs DeleteSnapshot")
     [ -n "${FAKE_ALI_SNAPSHOT_FAIL:-}" ] && { echo "ErrorCode: IncorrectSnapshotStatus" >&2; exit 1; }
     echo '{}'

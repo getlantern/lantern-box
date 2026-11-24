@@ -84,14 +84,17 @@ else
   failt "oci unlistable region: $(cat "$dir/out")"
 fi
 
-# 4. Alicloud deletes the old images and their snapshots, and skips one an
-#    instance uses.
+# 4. Alicloud deletes the old images and their snapshots, skips one an instance
+#    uses, and finishes the snapshot of an image an earlier run deleted; the
+#    snapshot of an image that still exists stays.
 dir=$(make_env)
 TMP_DIRS+=("$dir")
 if run_prune "$dir" KEEP=1 "$PRUNE" alicloud; then
   got=$(deleted_ali_images "$dir")
   snaps=$(deleted_snapshots "$dir")
-  if [ "$got" = "ap-southeast-1:m-old1 " ] && [ "$snaps" = "s-old1 " ] && grep -q "skipping lantern-box-2 (m-used)" "$dir/out"; then
+  if [ "$got" = "ap-southeast-1:m-old1 " ] && [ "$snaps" = "s-leftover s-old1 " ] \
+    && grep -q "skipping lantern-box-2 (m-used)" "$dir/out" \
+    && grep -q "ResourceId.1 s-old1 .*Tag.1.Value m-old1" "$dir/calls.log"; then
     pass "alicloud prunes images and snapshots, skips in-use"
   else
     failt "alicloud deleted [$got] snapshots [$snaps]: $(cat "$dir/out")"
@@ -120,7 +123,30 @@ else
   failt "alicloud undeletable snapshot: $(cat "$dir/out")"
 fi
 
-# 7. A transient Alicloud error is retried.
+# 7. When an image's snapshots cannot be tagged, the image is kept, so its
+#    snapshots stay findable.
+dir=$(make_env)
+TMP_DIRS+=("$dir")
+if run_prune "$dir" KEEP=1 FAKE_ALI_TAG_FAIL=1 "$PRUNE" alicloud; then
+  failt "alicloud exited zero with untaggable snapshots"
+elif [ -z "$(deleted_ali_images "$dir")" ] && grep -q "cannot tag the snapshots of lantern-box-1" "$dir/out"; then
+  pass "alicloud untaggable snapshots keep the image"
+else
+  failt "alicloud untaggable snapshots: $(cat "$dir/out")"
+fi
+
+# 8. A failed DeleteImage whose follow-up lookup also fails counts as a failure.
+dir=$(make_env)
+TMP_DIRS+=("$dir")
+if run_prune "$dir" KEEP=1 FAKE_ALI_DELETE_IMAGE_FAIL=1 "$PRUNE" alicloud; then
+  failt "alicloud exited zero with an unconfirmed image delete"
+elif grep -q "failed to delete lantern-box-1 (m-old1)" "$dir/out" && ! grep -q "deleted snapshot s-old1" "$dir/out"; then
+  pass "alicloud unconfirmed image delete fails"
+else
+  failt "alicloud unconfirmed image delete: $(cat "$dir/out")"
+fi
+
+# 9. A transient Alicloud error is retried.
 dir=$(make_env)
 TMP_DIRS+=("$dir")
 if run_prune "$dir" KEEP=1 FAKE_ALI_FLAKY_ONCE=1 "$PRUNE" alicloud && [ "$(deleted_ali_images "$dir")" = "ap-southeast-1:m-old1 " ]; then

@@ -1,0 +1,4 @@
+[
+ {"SnapshotId":"s-leftover","Tags":{"Tag":[{"TagKey":"lantern-box-prune-image","TagValue":"m-gone"}]}},
+ {"SnapshotId":"s-new-kept","Tags":{"Tag":[{"TagKey":"lantern-box-prune-image","TagValue":"m-new"}]}}
+]
