@@ -37,8 +37,10 @@ type Outbound struct {
 	// because it can fail transiently, e.g. before the network is up.
 	createDialer func() (transport.StreamDialer, error)
 	// sites gives each site a dialer of its own once its search succeeds; nil
-	// when the per_site option is false.
+	// when per-site searches are off.
 	sites *siteDialers
+	// cancel ends the site searches.
+	cancel context.CancelFunc
 
 	mu     sync.Mutex
 	dialer transport.StreamDialer
@@ -140,8 +142,16 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		}
 		networks = append(networks, N.NetworkUDP)
 	}
-	var sites *siteDialers
-	if options.PerSite == nil || *options.PerSite {
+	var (
+		sites     *siteDialers
+		searchCtx context.Context
+		cancel    context.CancelFunc
+	)
+	if siteOptions, ok := perSiteOptions(options); ok {
+		siteYAML, err := marshalSmartConfig(siteOptions)
+		if err != nil {
+			return nil, err
+		}
 		// The finder keeps its winner under one cache key, so sites sharing
 		// the outbound's cache would overwrite each other's; site searches
 		// go uncached.
@@ -149,8 +159,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		if err != nil {
 			return nil, err
 		}
-		sites = newSiteDialers(ctx, maxSites, func(ctx context.Context, _, host string) (transport.StreamDialer, error) {
-			return siteFinder.NewDialer(ctx, []string{host}, yamlOptions)
+		// The box's context isn't cancelled when it closes, so the
+		// searches get their own, which Close cancels.
+		searchCtx, cancel = context.WithCancel(ctx)
+		sites = newSiteDialers(searchCtx, maxSites, func(ctx context.Context, _, host string) (transport.StreamDialer, error) {
+			return siteFinder.NewDialer(ctx, []string{host}, siteYAML)
 		})
 	}
 	return &Outbound{
@@ -164,8 +177,31 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 			return finder.NewDialer(ctx, options.Domains, yamlOptions)
 		},
 		sites:          sites,
+		cancel:         cancel,
 		packetListener: packetListener,
 	}, nil
+}
+
+// perSiteOptions returns the options for site searches, and false when
+// per-site searches are off. A search races every resolver for the site's
+// name, where a dial asks only the one its search chose, so site searches
+// use only the encrypted resolvers: a plaintext one would see, and show the
+// network, every site the user reaches. With none, they're off.
+func perSiteOptions(options option.OutboundOutlineOptions) (option.OutboundOutlineOptions, bool) {
+	if options.PerSite != nil && !*options.PerSite {
+		return options, false
+	}
+	var encrypted []option.DNSEntryConfig
+	for _, e := range options.DNSResolvers {
+		if e.HTTPS != nil || e.TLS != nil {
+			encrypted = append(encrypted, e)
+		}
+	}
+	if len(encrypted) == 0 {
+		return options, false
+	}
+	options.DNSResolvers = encrypted
+	return options, true
 }
 
 // newRegistry returns the default config URL registry with every base
@@ -221,21 +257,34 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, fmt.Errorf("outline: destination %q has no host", destination.String())
 	}
 
-	var d transport.StreamDialer
-	if o.sites != nil && addr.IsFqdn() {
-		d = o.sites.dialerFor(addr.Fqdn)
-	}
-	if d == nil {
-		var err error
-		if d, err = o.getDialer(ctx); err != nil {
-			return nil, err
-		}
-	}
-
 	md.Outbound = o.Tag()
 	md.Destination = destination
 
+	if o.sites != nil && addr.IsFqdn() {
+		if d := o.sites.dialerFor(addr.Fqdn, addr.Port); d != nil {
+			conn, err := d.DialStream(ctx, addr.String())
+			o.sites.dialed(addr.Fqdn, d, err)
+			if err == nil || ctx.Err() != nil {
+				return conn, err
+			}
+			// The site's strategy failed; the outbound's may still work,
+			// as it would have without the site search.
+		}
+	}
+
+	d, err := o.getDialer(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return d.DialStream(ctx, addr.String())
+}
+
+// Close ends the outbound's site searches.
+func (o *Outbound) Close() error {
+	if o.cancel != nil {
+		o.cancel()
+	}
+	return nil
 }
 
 // getDialer returns the smart dialer, joining the in-flight search or starting
