@@ -190,11 +190,27 @@ ali_delete_image() {
   deleted=$((deleted + 1))
 }
 
+# Lists every snapshot in one region carrying SNAPSHOT_TAG as one JSON array.
+# All pages are read before anything is deleted, so deletions cannot shift
+# the page boundaries.
+ali_tagged_snapshots() {
+  local region=$1 page=1 out all='[]' got
+  while :; do
+    out=$(ali_cli ecs DescribeSnapshots --RegionId "$region" --Tag.1.Key "$SNAPSHOT_TAG" \
+      --PageSize 100 --PageNumber "$page") || return 1
+    all=$(jq -c --argjson acc "$all" '$acc + (.Snapshots.Snapshot // [])' <<<"$out")
+    got=$(jq '.Snapshots.Snapshot // [] | length' <<<"$out")
+    [ "$got" -lt 100 ] && break
+    page=$((page + 1))
+  done
+  echo "$all"
+}
+
 # Deletes the snapshots tagged by ali_delete_image whose image is gone,
 # including any a failed or interrupted earlier run left behind.
 ali_sweep_snapshots() {
   local region=$1 out snap image rc attempt ok
-  if ! out=$(ali_cli ecs DescribeSnapshots --RegionId "$region" --Tag.1.Key "$SNAPSHOT_TAG" --PageSize 100); then
+  if ! out=$(ali_tagged_snapshots "$region"); then
     fail "Alicloud $region: cannot list snapshots tagged $SNAPSHOT_TAG"
     return
   fi
@@ -231,7 +247,7 @@ ali_sweep_snapshots() {
     else
       fail "Alicloud $region: failed to delete snapshot $snap of deleted image $image"
     fi
-  done < <(jq -r --arg k "$SNAPSHOT_TAG" '.Snapshots.Snapshot[]?
+  done < <(jq -r --arg k "$SNAPSHOT_TAG" '.[]
     | [.SnapshotId, (.Tags.Tag[]? | select(.TagKey == $k) | .TagValue)] | @tsv' <<<"$out")
 }
 

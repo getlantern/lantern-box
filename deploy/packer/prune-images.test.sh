@@ -157,7 +157,17 @@ else
   failt "alicloud malformed snapshot tag: $(cat "$dir/out")"
 fi
 
-# 10. A transient Alicloud error is retried.
+# 10. Tagged snapshots past the first page of 100 are deleted too.
+dir=$(make_env)
+TMP_DIRS+=("$dir")
+if run_prune "$dir" KEEP=1 FAKE_ALI_MANY_SNAPSHOTS=150 "$PRUNE" alicloud \
+  && [ "$(grep -c "DeleteSnapshot --region ap-southeast-1 --SnapshotId s-many-" "$dir/calls.log")" -eq 150 ]; then
+  pass "alicloud tagged snapshots paginated"
+else
+  failt "alicloud pagination: $(grep -c "s-many-" "$dir/calls.log") s-many calls; $(tail -3 "$dir/out")"
+fi
+
+# 11. A transient Alicloud error is retried.
 dir=$(make_env)
 TMP_DIRS+=("$dir")
 if run_prune "$dir" KEEP=1 FAKE_ALI_FLAKY_ONCE=1 "$PRUNE" alicloud && [ "$(deleted_ali_images "$dir")" = "ap-southeast-1:m-old1 " ]; then
