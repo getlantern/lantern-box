@@ -88,6 +88,10 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
+		// A *url.Error's text holds probeURL, whose query can carry credentials.
+		if ue, ok := errors.AsType[*url.Error](err); ok {
+			err = ue.Err
+		}
 		return 0, fmt.Errorf("do request: %w", err)
 	}
 	io.Copy(io.Discard, resp.Body)

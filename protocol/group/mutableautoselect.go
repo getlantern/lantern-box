@@ -492,6 +492,20 @@ func destKey(dest M.Socksaddr) uint64 {
 	return maphash.Comparable(destKeySeed, dest)
 }
 
+// destLogID returns what names a destination in logs, given as a UDP
+// destination dest or a TCP destKey key, or "" if neither is known: the same
+// for a destination throughout the process, but never its address, which
+// logs must not hold.
+func destLogID(dest string, key uint64) string {
+	if key == 0 {
+		if dest == "" {
+			return ""
+		}
+		key = maphash.String(destKeySeed, dest)
+	}
+	return fmt.Sprintf("%08x", uint32(key>>32))
+}
+
 func (s *MutableAutoSelect) pausedBefore(opened time.Time) bool {
 	s.access.Lock()
 	defer s.access.Unlock()
@@ -2142,9 +2156,15 @@ func (s *MutableAutoSelect) noteAnswer(origin connOrigin, network, dest string, 
 // is also dropped unless dest has answered through the member before: a
 // destination that never answers looks the same as a dead relay.
 func (s *MutableAutoSelect) noteUnanswered(origin connOrigin, network, dest string, opened, waitingSince time.Time) {
+	s.noteUnansweredTo(origin, network, dest, 0, opened, waitingSince)
+}
+
+// noteUnansweredTo is noteUnanswered for a TCP conn whose destination has
+// destKey key, or zero if unknown.
+func (s *MutableAutoSelect) noteUnansweredTo(origin connOrigin, network, dest string, key uint64, opened, waitingSince time.Time) {
 	s.access.Lock()
 	defer s.access.Unlock()
-	s.noteUnansweredLocked(origin, network, dest, opened, waitingSince)
+	s.noteUnansweredLocked(origin, network, dest, key, opened, waitingSince)
 }
 
 // noteUnansweredOffSelection is noteUnanswered for a UDP report that isn't
@@ -2155,12 +2175,12 @@ func (s *MutableAutoSelect) noteUnansweredOffSelection(origin connOrigin, dest s
 	s.access.Lock()
 	defer s.access.Unlock()
 	if tag := origin.out.Tag(); s.selected(N.NetworkUDP) != tag && s.failingLocked(tag) {
-		s.noteUnansweredLocked(origin, N.NetworkUDP, dest, opened, waitingSince)
+		s.noteUnansweredLocked(origin, N.NetworkUDP, dest, 0, opened, waitingSince)
 	}
 }
 
 // noteUnansweredLocked is noteUnanswered with s.access held.
-func (s *MutableAutoSelect) noteUnansweredLocked(origin connOrigin, network, dest string, opened, waitingSince time.Time) {
+func (s *MutableAutoSelect) noteUnansweredLocked(origin connOrigin, network, dest string, key uint64, opened, waitingSince time.Time) {
 	if s.isClosed() || s.pausedBeforeLocked(opened) || !s.originCurrentLocked(origin) || !s.matchesGenerationLocked(origin.generation) {
 		return
 	}
@@ -2179,7 +2199,11 @@ func (s *MutableAutoSelect) noteUnansweredLocked(origin connOrigin, network, des
 		return
 	}
 	h.addUnanswered(sn, now, opened, s.hist.userFailureWindow)
-	s.logger.Debug(network, " unanswered: tag=", tag)
+	msg := network + " unanswered: tag=" + tag
+	if id := destLogID(dest, key); id != "" {
+		msg += " dest=" + id
+	}
+	s.logger.Debug(msg + " waited=" + now.Sub(waitingSince).Round(time.Millisecond).String())
 	s.probeStreakReplacementLocked(tag, network)
 	if sn == streakUDP {
 		s.afterUDPFailureLocked(tag)

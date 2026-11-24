@@ -201,7 +201,7 @@ func (r *connReport) unanswered(waitingSince time.Time, dest string) {
 		// An exchange on a handle that predates a pause says nothing about
 		// the member, though the exchange began during it.
 	case r.s.chargeable(r.origin.out.Tag(), r.origin.route):
-		r.s.noteUnanswered(r.origin, r.network, dest, exchangeOpened, waitingSince)
+		r.s.noteUnansweredTo(r.origin, r.network, dest, r.destKey, exchangeOpened, waitingSince)
 	case r.network == N.NetworkUDP:
 		r.s.noteUnansweredOffSelection(r.origin, dest, exchangeOpened, waitingSince)
 	}

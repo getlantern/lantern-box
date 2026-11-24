@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
@@ -264,7 +265,7 @@ func (s *MutableAutoSelect) startProbeLocked(
 	})
 	go func() {
 		delay, err := probe.Run(ctx, out, attempt.url, beh.probeTimeout)
-		s.completeProbe(attempt, err == nil, uint32(max(1, delay/time.Millisecond)))
+		s.completeProbe(attempt, err, uint32(max(1, delay/time.Millisecond)))
 	}()
 }
 
@@ -285,6 +286,8 @@ func (s *MutableAutoSelect) releaseProbeSlotLocked(attempt *probeAttempt) {
 	s.startLadderBudgetLocked()
 }
 
+var errProbeWatchdog = errors.New("probe watchdog expired")
+
 func (s *MutableAutoSelect) timeoutProbeLocked(attempt *probeAttempt) {
 	s.expireLadderLocked()
 	if attempt.stuck {
@@ -292,11 +295,11 @@ func (s *MutableAutoSelect) timeoutProbeLocked(attempt *probeAttempt) {
 	}
 	attempt.stuck = true
 	s.logger.Warn("probe watchdog expired: ", attempt.tag)
-	s.finishProbeLocked(attempt, false, 0)
+	s.finishProbeLocked(attempt, errProbeWatchdog, 0)
 	s.notifyProbesLocked()
 }
 
-func (s *MutableAutoSelect) completeProbe(attempt *probeAttempt, success bool, delayMs uint32) {
+func (s *MutableAutoSelect) completeProbe(attempt *probeAttempt, err error, delayMs uint32) {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if s.inFlightProbes[attempt.outbound] != attempt {
@@ -305,20 +308,25 @@ func (s *MutableAutoSelect) completeProbe(attempt *probeAttempt, success bool, d
 	if !time.Now().Before(attempt.deadline) {
 		s.timeoutProbeLocked(attempt)
 	}
-	s.finishProbeLocked(attempt, success, delayMs)
+	s.finishProbeLocked(attempt, err, delayMs)
 	attempt.watchdog.Stop()
 	delete(s.inFlightProbes, attempt.outbound)
 	s.notifyProbesLocked()
 	s.dispatchProbesLocked()
 }
 
-func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, success bool, delayMs uint32) {
+func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, err error, delayMs uint32) {
 	s.expireLadderLocked()
 	if !s.validProbeLocked(attempt) {
 		return
 	}
 	state := s.probeMembers[attempt.tag]
-	s.logger.Debug("probe: tag=", attempt.tag, " ok=", success, " delay=", delayText(delayMs))
+	success := err == nil
+	if success {
+		s.logger.Debug("probe: tag=" + attempt.tag + " ok=true delay=" + delayText(delayMs))
+	} else {
+		s.logger.Debug("probe: tag=" + attempt.tag + " ok=false after=" + time.Since(attempt.started).Round(time.Millisecond).String() + " err=" + err.Error())
+	}
 	outcome := s.recordProbeOutcomeLocked(attempt.tag, &probeOutcome{
 		success:    success,
 		delayMs:    delayMs,
@@ -416,10 +424,10 @@ func (s *MutableAutoSelect) recordProbeOutcomeLocked(tag string, outcome *probeO
 // cancels it and frees its slot. Call it once the operation returns or the
 // watchdog fires; the attempt stays in inFlightProbes until the operation
 // returns.
-func (s *MutableAutoSelect) finishProbeLocked(attempt *probeAttempt, success bool, delayMs uint32) {
+func (s *MutableAutoSelect) finishProbeLocked(attempt *probeAttempt, err error, delayMs uint32) {
 	if !attempt.finalized {
 		attempt.finalized = true
-		s.acceptProbeLocked(attempt, success, delayMs)
+		s.acceptProbeLocked(attempt, err, delayMs)
 	}
 	attempt.cancel()
 	s.releaseProbeSlotLocked(attempt)
