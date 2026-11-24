@@ -1,8 +1,0 @@
-{"data":[
- {"id":"img-r1-4","display-name":"lantern-box-4-arm64-r1","compartment-id":"ocid1.compartment.ours","time-created":"2026-04-01T00:00:00+00:00"},
- {"id":"img-r1-1","display-name":"lantern-box-1-arm64-r1","compartment-id":"ocid1.compartment.ours","time-created":"2026-01-01T00:00:00+00:00"},
- {"id":"img-r1-3","display-name":"lantern-box-3-arm64-r1","compartment-id":"ocid1.compartment.ours","time-created":"2026-03-01T00:00:00+00:00"},
- {"id":"img-r1-2","display-name":"lantern-box-2-arm64-r1","compartment-id":"ocid1.compartment.ours","time-created":"2026-02-01T00:00:00+00:00"},
- {"id":"img-platform","display-name":"lantern-box-0-platform","compartment-id":null,"time-created":"2025-01-01T00:00:00+00:00"},
- {"id":"img-other","display-name":"ubuntu-custom","compartment-id":"ocid1.compartment.ours","time-created":"2025-01-01T00:00:00+00:00"}
-]}

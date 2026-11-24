@@ -1,5 +1,0 @@
-{"Images":{"Image":[
- {"ImageId":"m-new","ImageName":"lantern-box-3","CreationTime":"2026-03-01T00:00Z","DiskDeviceMappings":{"DiskDeviceMapping":[{"SnapshotId":"s-new"}]}},
- {"ImageId":"m-old1","ImageName":"lantern-box-1","CreationTime":"2026-01-01T00:00Z","DiskDeviceMappings":{"DiskDeviceMapping":[{"SnapshotId":"s-old1"}]}},
- {"ImageId":"m-used","ImageName":"lantern-box-2","CreationTime":"2026-02-01T00:00Z","DiskDeviceMappings":{"DiskDeviceMapping":[{"SnapshotId":"s-used"}]}}
-]}}
