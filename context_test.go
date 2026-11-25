@@ -57,14 +57,16 @@ func localTransport(t *testing.T, ctx context.Context) adapter.DNSTransport {
 	t.Helper()
 	registry := service.FromContext[adapter.DNSTransportRegistry](ctx)
 	require.NotNil(t, registry)
-	ctx = service.ContextWith[adapter.NetworkManager](ctx, stubNetworkManager{})
 	transport, err := registry.CreateDNSTransport(ctx, log.NewNOPFactory().NewLogger("dns"), "local", C.DNSTypeLocal, &option.LocalDNSServerOptions{})
 	require.NoError(t, err)
 	return transport
 }
 
+// localTransportType builds the local transport with a stub network manager,
+// which only a local transport needs.
 func localTransportType(t *testing.T, ctx context.Context) string {
 	t.Helper()
+	ctx = service.ContextWith[adapter.NetworkManager](ctx, stubNetworkManager{})
 	return fmt.Sprintf("%T", localTransport(t, ctx))
 }
 
