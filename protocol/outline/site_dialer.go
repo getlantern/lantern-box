@@ -228,8 +228,10 @@ func perSiteDomains(domains []string) (allowed map[string]bool, rejected []strin
 // punycode.
 func siteName(entry string) string {
 	s := strings.TrimPrefix(strings.TrimSpace(entry), "//")
-	// A scheme only before the path, or a URL in a query would name the site.
-	if i := strings.Index(s, "://"); i >= 0 {
+	// A scheme only before the path, or a URL in a query would name the site,
+	// and only a valid one, or a list joined by commas or spaces would name
+	// its last entry's site.
+	if i := strings.Index(s, "://"); i >= 0 && isScheme(s[:i]) {
 		if cut := strings.IndexAny(s, "/?#"); cut < 0 || i < cut {
 			s = s[i+3:]
 		}
@@ -261,6 +263,18 @@ func siteName(entry string) string {
 		return ""
 	}
 	return siteOf(s)
+}
+
+// isScheme reports whether s is a URL scheme (RFC 3986 section 3.1): a
+// letter, then letters, digits, "+", "-" or ".".
+func isScheme(s string) bool {
+	for i, r := range s {
+		letter := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z'
+		if !letter && (i == 0 || !(r >= '0' && r <= '9' || r == '+' || r == '-' || r == '.')) {
+			return false
+		}
+	}
+	return s != ""
 }
 
 func notHostnameRune(r rune) bool {
