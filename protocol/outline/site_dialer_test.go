@@ -3,6 +3,7 @@ package outline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -88,7 +89,7 @@ func TestSiteDialersSearchInBackground(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := &recordingDialer{}
 		f := &fakeSiteSearch{release: make(chan struct{}), dialer: d}
-		s := newSiteDialers(t.Context(), maxSites, f.search)
+		s := newSiteDialers(t.Context(), maxSites, nil, f.search)
 
 		// Dials during the search get no site dialer, and share one search,
 		// including a sibling subdomain.
@@ -116,7 +117,7 @@ func TestSiteDialersSearchInBackground(t *testing.T) {
 func TestSiteDialersRetryFailedSearchLater(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := &fakeSiteSearch{err: errors.New("no strategy")}
-		s := newSiteDialers(t.Context(), maxSites, f.search)
+		s := newSiteDialers(t.Context(), maxSites, nil, f.search)
 
 		s.dialerFor("www.youtube.com", 443)
 		synctest.Wait()
@@ -166,7 +167,7 @@ func TestSiteDialersSearchOnlyFrom443(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := &recordingDialer{}
 		f := &fakeSiteSearch{dialer: d}
-		s := newSiteDialers(t.Context(), maxSites, f.search)
+		s := newSiteDialers(t.Context(), maxSites, nil, f.search)
 		s.dialerFor("imap.gmail.com", 993)
 		synctest.Wait()
 		if got := f.searched(); len(got) != 0 {
@@ -184,7 +185,7 @@ func TestSiteDialersSearchOnlyFrom443(t *testing.T) {
 func TestSiteDialersCapConcurrentSearches(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := &fakeSiteSearch{release: make(chan struct{}), dialer: &recordingDialer{}}
-		s := newSiteDialers(t.Context(), maxSites, f.search)
+		s := newSiteDialers(t.Context(), maxSites, nil, f.search)
 		for i := range maxSiteSearches + 2 {
 			s.dialerFor(string(rune('a'+i))+"site.com", 443)
 		}
@@ -207,7 +208,7 @@ func TestSiteDialersDropFailingDialer(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := &recordingDialer{}
 		f := &fakeSiteSearch{dialer: d}
-		s := newSiteDialers(t.Context(), maxSites, f.search)
+		s := newSiteDialers(t.Context(), maxSites, nil, f.search)
 		s.dialerFor("youtube.com", 443)
 		synctest.Wait()
 		sd := s.dialerFor("youtube.com", 443)
@@ -244,7 +245,7 @@ func TestSiteDialersDropFailingDialer(t *testing.T) {
 func TestSiteDialersSkipHostsWithoutSite(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := &fakeSiteSearch{dialer: &recordingDialer{}}
-		s := newSiteDialers(t.Context(), maxSites, f.search)
+		s := newSiteDialers(t.Context(), maxSites, nil, f.search)
 		for _, host := range []string{"192.0.2.1", "localhost"} {
 			if got := s.dialerFor(host, 443); got != nil {
 				t.Fatalf("dialerFor(%q) = %v, want nil", host, got)
@@ -260,7 +261,7 @@ func TestSiteDialersSkipHostsWithoutSite(t *testing.T) {
 func TestSiteDialersEvictLeastRecentSite(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := &fakeSiteSearch{dialer: &recordingDialer{}}
-		s := newSiteDialers(t.Context(), 1, f.search)
+		s := newSiteDialers(t.Context(), 1, nil, f.search)
 		s.dialerFor("youtube.com", 443)
 		synctest.Wait()
 		s.dialerFor("instagram.com", 443)
@@ -280,7 +281,7 @@ func TestSiteSearchEndsWithOutbound(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		f := &fakeSiteSearch{release: make(chan struct{}), dialer: &recordingDialer{}}
-		s := newSiteDialers(ctx, maxSites, f.search)
+		s := newSiteDialers(ctx, maxSites, nil, f.search)
 		s.dialerFor("youtube.com", 443)
 		synctest.Wait()
 		cancel()
@@ -299,7 +300,7 @@ func TestDialContextUsesSiteDialerOnceFound(t *testing.T) {
 		f := &fakeSiteSearch{release: make(chan struct{}), dialer: siteDialer}
 		o := &Outbound{
 			createDialer: func() (transport.StreamDialer, error) { return outboundDialer, nil },
-			sites:        newSiteDialers(t.Context(), maxSites, f.search),
+			sites:        newSiteDialers(t.Context(), maxSites, nil, f.search),
 		}
 		dial := func(dest string) {
 			t.Helper()
@@ -410,7 +411,7 @@ func newSiteOutbound(t *testing.T, outbound, site transport.StreamDialer, dest m
 	t.Helper()
 	o := &Outbound{
 		createDialer: func() (transport.StreamDialer, error) { return outbound, nil },
-		sites:        newSiteDialers(t.Context(), maxSites, (&fakeSiteSearch{dialer: site}).search),
+		sites:        newSiteDialers(t.Context(), maxSites, nil, (&fakeSiteSearch{dialer: site}).search),
 	}
 	o.DialContext(context.Background(), "tcp", dest)
 	synctest.Wait()
@@ -520,7 +521,7 @@ func TestSiteDialerFuncDialer(t *testing.T) {
 		f := &fakeSiteSearch{dialer: fd}
 		o := &Outbound{
 			createDialer: func() (transport.StreamDialer, error) { return &recordingDialer{}, nil },
-			sites:        newSiteDialers(t.Context(), maxSites, f.search),
+			sites:        newSiteDialers(t.Context(), maxSites, nil, f.search),
 		}
 		dest := metadata.ParseSocksaddr("www.youtube.com:443")
 		o.DialContext(context.Background(), "tcp", dest)
@@ -546,7 +547,7 @@ func TestCancelledSiteDialKeepsDialer(t *testing.T) {
 		outboundDialer := &recordingDialer{}
 		o := &Outbound{
 			createDialer: func() (transport.StreamDialer, error) { return outboundDialer, nil },
-			sites:        newSiteDialers(t.Context(), maxSites, f.search),
+			sites:        newSiteDialers(t.Context(), maxSites, nil, f.search),
 		}
 		dest := metadata.ParseSocksaddr("www.youtube.com:443")
 		o.DialContext(context.Background(), "tcp", dest)
@@ -570,7 +571,7 @@ func TestCancelledSiteDialKeepsDialer(t *testing.T) {
 func TestOtherPortsDontEvictSites(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := &recordingDialer{}
-		s := newSiteDialers(t.Context(), 1, (&fakeSiteSearch{dialer: d}).search)
+		s := newSiteDialers(t.Context(), 1, nil, (&fakeSiteSearch{dialer: d}).search)
 		s.dialerFor("youtube.com", 443)
 		synctest.Wait()
 		s.dialerFor("imap.example.com", 993)
@@ -596,7 +597,7 @@ func TestEvictedSiteNotSearchedTwice(t *testing.T) {
 			}
 			return d, nil
 		}
-		s := newSiteDialers(t.Context(), 1, search)
+		s := newSiteDialers(t.Context(), 1, nil, search)
 		s.dialerFor("youtube.com", 443)
 		s.dialerFor("instagram.com", 443) // evicts youtube.com mid-search
 		s.dialerFor("youtube.com", 443)
@@ -674,4 +675,140 @@ func TestSiteDialRaceKeepsDeadline(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestPerSiteDomains(t *testing.T) {
+	allowed, rejected, ok := perSiteDomains(nil)
+	if !ok || allowed != nil || rejected != nil {
+		t.Fatalf("perSiteDomains(nil) = %v, %v, %v; want every site", allowed, rejected, ok)
+	}
+	allowed, rejected, ok = perSiteDomains([]string{"www.YouTube.com.", "instagram.com", "nas.lan", "192.0.2.1", ""})
+	if !ok || len(allowed) != 2 || !allowed["youtube.com"] || !allowed["instagram.com"] ||
+		fmt.Sprint(rejected) != fmt.Sprint([]string{"nas.lan", "192.0.2.1", ""}) {
+		t.Fatalf("perSiteDomains(mixed) = %v, %v, %v", allowed, rejected, ok)
+	}
+	allowed, rejected, ok = perSiteDomains([]string{"nas.lan", "", "github.io"})
+	if ok || len(rejected) != 3 {
+		t.Fatalf("perSiteDomains with no site = %v, %v, %v; want per-site off and all rejected", allowed, rejected, ok)
+	}
+}
+
+func TestSiteName(t *testing.T) {
+	for entry, want := range map[string]string{
+		"youtube.com":                          "youtube.com",
+		"www.YouTube.com.":                     "youtube.com",
+		" youtube.com ":                        "youtube.com",
+		".youtube.com":                         "youtube.com",
+		"*.youtube.com":                        "youtube.com",
+		"https://www.youtube.com/watch":        "youtube.com",
+		"youtube.com:443":                      "youtube.com",
+		"youtube.com/":                         "youtube.com",
+		"例え.jp":                                "xn--r8jz45g.jp",
+		"пример.рф":                            "xn--e1afmkfd.xn--p1ai",
+		"user.github.io":                       "user.github.io",
+		"github.io":                            "",
+		"google.com/url?q=https://example.com": "google.com",
+		"youtube.com#https://evil.com":         "youtube.com",
+		"https://user:pass@youtube.com/":       "youtube.com",
+		"user@youtube.com":                     "youtube.com",
+		"media_cdn.example.com":                "example.com",
+		"ПРИМЕР.РФ":                            "xn--e1afmkfd.xn--p1ai",
+		"*.github.io":                          "",
+		"[2001:db8::1]:443":                    "",
+		"2001:db8::1":                          "",
+		"youtube.com:":                         "youtube.com",
+		"r3---sn-n4v7knll.googlevideo.com":     "googlevideo.com",
+		"foo-.example.com":                     "example.com",
+		"a≠b.com":                              "",
+		"youtube.com,instagram.com":            "",
+		"youtube.com instagram.com":            "",
+		"youtube.com,https://instagram.com":    "",
+		"youtube.com https://instagram.com":    "",
+		"://youtube.com":                       "",
+		"1http://youtube.com":                  "",
+		"git+ssh://youtube.com":                "youtube.com",
+		"*youtube.com":                         "",
+		"media_cdn.пример.рф":                  "",
+		"//www.youtube.com/watch":              "youtube.com",
+		"nas.lan":                              "",
+		"192.0.2.1":                            "",
+		"":                                     "",
+	} {
+		if got := siteName(entry); got != want {
+			t.Errorf("siteName(%q) = %q, want %q", entry, got, want)
+		}
+	}
+}
+
+func TestSiteDialersSearchOnlyListedSites(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := &fakeSiteSearch{release: make(chan struct{}), dialer: &recordingDialer{}}
+		s := newSiteDialers(t.Context(), maxSites, map[string]bool{"youtube.com": true}, f.search)
+		if d := s.dialerFor("www.instagram.com", 443); d != nil {
+			t.Fatalf("dialerFor(unlisted) = %v, want nil", d)
+		}
+		s.dialerFor("m.youtube.com", 443)
+		synctest.Wait()
+		if got := f.searched(); len(got) != 1 || got[0] != "m.youtube.com" {
+			t.Fatalf("searched %v, want only the listed site's host", got)
+		}
+		if s.sites.Contains("instagram.com") {
+			t.Fatal("an unlisted site took an LRU entry")
+		}
+		close(f.release)
+		synctest.Wait()
+		if d := s.dialerFor("www.youtube.com", 80); d == nil {
+			t.Fatal("a listed site's dialer isn't used on another port")
+		}
+		if d := s.dialerFor("www.instagram.com", 80); d != nil {
+			t.Fatalf("dialerFor(unlisted, 80) = %v, want nil", d)
+		}
+	})
+}
+
+func TestNewOutboundPerSiteDomains(t *testing.T) {
+	doh := option.DNSEntryConfig{HTTPS: &option.HTTPSEntryConfig{Name: "dns.google"}}
+	for _, tc := range []struct {
+		name    string
+		domains []string
+		on      bool
+		allowed map[string]bool
+	}{
+		{"unset", nil, true, nil},
+		{"listed", []string{"www.youtube.com"}, true, map[string]bool{"youtube.com": true}},
+		{"none valid", []string{"nas.lan"}, false, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := option.OutboundOutlineOptions{Domains: []string{"example.com"}, DNSResolvers: []option.DNSEntryConfig{doh}, PerSiteDomains: tc.domains}
+			out, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "outline", options)
+			if err != nil {
+				t.Fatalf("NewOutbound: %v", err)
+			}
+			o := out.(*Outbound)
+			defer o.Close()
+			if got := o.sites != nil; got != tc.on {
+				t.Fatalf("per-site searches on = %v, want %v", got, tc.on)
+			}
+			if o.sites != nil && fmt.Sprint(o.sites.allowed) != fmt.Sprint(tc.allowed) {
+				t.Fatalf("allowed = %v, want %v", o.sites.allowed, tc.allowed)
+			}
+		})
+	}
+}
+
+func TestLoggableEntry(t *testing.T) {
+	for entry, want := range map[string]string{"youtube": `"youtube"`, `bad"entry`: `"bad\"entry"`} {
+		if got := loggableEntry(entry); got != want {
+			t.Errorf("loggableEntry(%q) = %s, want %s", entry, got, want)
+		}
+	}
+	for _, entry := range []string{
+		"https://alice:secret@localhost/",
+		"https://alice:p/ss@localhost/",
+		"alice@youtube",
+	} {
+		if got := loggableEntry(entry); got != "(an entry with an @, not shown)" {
+			t.Errorf("loggableEntry(%q) = %s, want it not shown", entry, got)
+		}
+	}
 }

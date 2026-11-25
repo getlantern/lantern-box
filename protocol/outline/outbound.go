@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -147,7 +149,22 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		searchCtx context.Context
 		cancel    context.CancelFunc
 	)
-	if siteOptions, ok := perSiteOptions(options); ok {
+	siteOptions, perSite := perSiteOptions(options)
+	allowed, rejected, anySite := perSiteDomains(options.PerSiteDomains)
+	if perSite && len(rejected) > 0 {
+		quoted := make([]string, len(rejected))
+		for i, r := range rejected {
+			quoted[i] = loggableEntry(r)
+		}
+		log.Warn("outline: per_site_domains entries naming no site, ignored: ", strings.Join(quoted, ", "))
+	}
+	if perSite && !anySite {
+		log.Warn("outline: per_site_domains names no site, so per-site searches are off")
+	}
+	if !perSite && len(options.PerSiteDomains) > 0 && (options.PerSite == nil || *options.PerSite) {
+		log.Warn("outline: per_site_domains is set, but per-site searches need an https or tls resolver")
+	}
+	if perSite && anySite {
 		siteYAML, err := marshalSmartConfig(siteOptions)
 		if err != nil {
 			return nil, err
@@ -162,7 +179,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		// The box's context isn't cancelled when it closes, so the
 		// searches get their own, which Close cancels.
 		searchCtx, cancel = context.WithCancel(ctx)
-		sites = newSiteDialers(searchCtx, maxSites, func(ctx context.Context, _, host string) (transport.StreamDialer, error) {
+		sites = newSiteDialers(searchCtx, maxSites, allowed, func(ctx context.Context, _, host string) (transport.StreamDialer, error) {
 			return siteFinder.NewDialer(ctx, []string{host}, siteYAML)
 		})
 	}
@@ -536,4 +553,14 @@ func (w *logWriter) Write(p []byte) (int, error) {
 		w.logger.Debug(string(p))
 	}
 	return len(p), nil
+}
+
+// loggableEntry quotes a rejected per_site_domains entry for a warning, or
+// names it without its text when it holds an "@", which a URL's credentials
+// need. Parsing the userinfo out would miss a password holding "/" or "#".
+func loggableEntry(entry string) string {
+	if strings.Contains(entry, "@") {
+		return "(an entry with an @, not shown)"
+	}
+	return strconv.Quote(entry)
 }

@@ -3,13 +3,16 @@ package outline
 import (
 	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.getoutline.org/sdk/transport"
+	"golang.org/x/net/idna"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -69,6 +72,9 @@ type siteDialers struct {
 	// eviction can't start a second search of a site.
 	inFlight map[string]bool
 	limit    int
+	// allowed, when not nil, holds the only sites that get a dialer of
+	// their own. It isn't changed after construction.
+	allowed map[string]bool
 }
 
 // siteDialer is a site's dialer. Dialers are compared by this pointer: the
@@ -87,7 +93,7 @@ type siteEntry struct {
 	failedUntil    time.Time
 }
 
-func newSiteDialers(ctx context.Context, size int, search func(ctx context.Context, site, host string) (transport.StreamDialer, error)) *siteDialers {
+func newSiteDialers(ctx context.Context, size int, allowed map[string]bool, search func(ctx context.Context, site, host string) (transport.StreamDialer, error)) *siteDialers {
 	sites, err := lru.New[string, *siteEntry](size)
 	if err != nil {
 		// Only a non-positive size fails, and callers pass a constant.
@@ -96,6 +102,7 @@ func newSiteDialers(ctx context.Context, size int, search func(ctx context.Conte
 	return &siteDialers{
 		search: search, ctx: ctx, now: time.Now,
 		sites: sites, inFlight: map[string]bool{}, limit: maxSiteSearches,
+		allowed: allowed,
 	}
 }
 
@@ -108,7 +115,7 @@ func newSiteDialers(ctx context.Context, size int, search func(ctx context.Conte
 // can't evict sites that have a dialer.
 func (s *siteDialers) dialerFor(host string, port uint16) *siteDialer {
 	site := siteOf(host)
-	if site == "" {
+	if site == "" || (s.allowed != nil && !s.allowed[site]) {
 		return nil
 	}
 	s.mu.Lock()
@@ -193,6 +200,85 @@ func retryDelay(failures int) time.Duration {
 		d *= 2
 	}
 	return min(d, siteRetryMax)
+}
+
+// perSiteDomains returns the sites domains name and true; nil and true when
+// domains is empty, meaning every site; and false when domains names no
+// site, so per-site searches are off. rejected holds the entries that name no
+// site.
+func perSiteDomains(domains []string) (allowed map[string]bool, rejected []string, ok bool) {
+	if len(domains) == 0 {
+		return nil, nil, true
+	}
+	allowed = make(map[string]bool, len(domains))
+	for _, d := range domains {
+		if site := siteName(d); site != "" {
+			allowed[site] = true
+		} else {
+			rejected = append(rejected, d)
+		}
+	}
+	return allowed, rejected, len(allowed) > 0
+}
+
+// siteName returns the site, as siteOf, that a configured entry names, or ""
+// for none. It takes the forms an entry is likely written in: with spaces
+// around it, as a URL or with a port, with a "*." or "." prefix as other
+// sing-box options take domains, or in Unicode, which dialed hosts carry as
+// punycode.
+func siteName(entry string) string {
+	s := strings.TrimPrefix(strings.TrimSpace(entry), "//")
+	// A scheme only before the path, or a URL in a query would name the site,
+	// and only a valid one, or a list joined by commas or spaces would name
+	// its last entry's site.
+	if i := strings.Index(s, "://"); i >= 0 && isScheme(s[:i]) {
+		if cut := strings.IndexAny(s, "/?#"); cut < 0 || i < cut {
+			s = s[i+3:]
+		}
+	}
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	if i := strings.LastIndexByte(s, '@'); i >= 0 {
+		s = s[i+1:]
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		s = host
+	}
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "*."), ".")
+	// A name with any Unicode is mapped to the punycode dialed hosts carry,
+	// under IDNA's strict rules for every label, so a hyphenated ASCII label
+	// in it is rejected. An all-ASCII name skips IDNA, whose label checks
+	// would reject hosts dialed in practice, such as
+	// r3---sn-n4v7knll.googlevideo.com.
+	if strings.IndexFunc(s, func(r rune) bool { return r >= utf8.RuneSelf }) >= 0 {
+		ascii, err := idna.Lookup.ToASCII(s)
+		if err != nil {
+			return ""
+		}
+		s = ascii
+	}
+	s = strings.ToLower(s)
+	if strings.IndexFunc(s, notHostnameRune) >= 0 {
+		return ""
+	}
+	return siteOf(s)
+}
+
+// isScheme reports whether s is a URL scheme (RFC 3986 section 3.1): a
+// letter, then letters, digits, "+", "-" or ".".
+func isScheme(s string) bool {
+	for i, r := range s {
+		letter := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z'
+		if !letter && (i == 0 || !(r >= '0' && r <= '9' || r == '+' || r == '-' || r == '.')) {
+			return false
+		}
+	}
+	return s != ""
+}
+
+func notHostnameRune(r rune) bool {
+	return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.')
 }
 
 // specialUseTLDs are top-level names reserved for local or non-DNS use
