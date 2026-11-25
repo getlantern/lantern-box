@@ -31,13 +31,19 @@ func TestSiteOf(t *testing.T) {
 		// Wildcard-only ICANN TLDs, whose bare TLD isn't listed.
 		"www.moi.gov.mm":       "moi.gov.mm",
 		"kathmandupost.com.np": "kathmandupost.com.np",
-		"intranet":             "",
-		"192.0.2.1":            "",
-		"2001:db8::1":          "",
-		"localhost":            "",
-		"nas.lan":              "",
-		"printer.home.arpa":    "",
-		"":                     "",
+		"gov.mm":               "",
+		"x.mm":                 "",
+		"www.ck":               "www.ck",
+		"nas.ck":               "",
+
+		// No registrable domain: IPs, single labels and local names.
+		"intranet":          "",
+		"192.0.2.1":         "",
+		"2001:db8::1":       "",
+		"localhost":         "",
+		"nas.lan":           "",
+		"printer.home.arpa": "",
+		"":                  "",
 	} {
 		if got := siteOf(host); got != want {
 			t.Errorf("siteOf(%q) = %q, want %q", host, got, want)
