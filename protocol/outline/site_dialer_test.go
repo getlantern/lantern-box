@@ -625,3 +625,34 @@ func TestCancelledRaceReturnsPromptly(t *testing.T) {
 		}
 	})
 }
+
+// The SDK's DNS-over-TLS resolver bounds its reads only by the context's
+// deadline, so both legs of a race must keep the caller's.
+func TestSiteDialRaceKeepsDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		seen := map[string]time.Time{}
+		recordDeadline := func(name string) transport.StreamDialer {
+			return transport.FuncStreamDialer(func(ctx context.Context, _ string) (transport.StreamConn, error) {
+				d, _ := ctx.Deadline()
+				mu.Lock()
+				seen[name] = d
+				mu.Unlock()
+				return nil, errDialRefused
+			})
+		}
+		dest := metadata.ParseSocksaddr("www.youtube.com:443")
+		o := newSiteOutbound(t, recordDeadline("outbound"), recordDeadline("site"), dest)
+		deadline := time.Now().Add(time.Minute)
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		o.DialContext(ctx, "tcp", dest)
+		mu.Lock()
+		defer mu.Unlock()
+		for _, leg := range []string{"site", "outbound"} {
+			if !seen[leg].Equal(deadline) {
+				t.Errorf("%s leg's deadline = %v, want the caller's, %v", leg, seen[leg], deadline)
+			}
+		}
+	})
+}

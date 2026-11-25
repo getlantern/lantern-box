@@ -286,14 +286,23 @@ type dialResult struct {
 
 // dialLeg is one dial of a race. Its context ends with the caller's until the
 // leg is settled, and is never cancelled once it wins, since the caller's
-// isn't once its dial has returned.
+// isn't once its dial has returned. It keeps the caller's deadline, which the
+// SDK's DNS-over-TLS resolver relies on to bound its reads.
 type dialLeg struct {
 	cancel context.CancelFunc
 	detach func() bool
 }
 
 func startLeg(ctx context.Context, site bool, results chan<- dialResult, dial func(context.Context) (transport.StreamConn, error)) *dialLeg {
-	legCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	var (
+		legCtx context.Context
+		cancel context.CancelFunc
+	)
+	if deadline, ok := ctx.Deadline(); ok {
+		legCtx, cancel = context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	} else {
+		legCtx, cancel = context.WithCancel(context.WithoutCancel(ctx))
+	}
 	l := &dialLeg{cancel: cancel, detach: context.AfterFunc(ctx, cancel)}
 	go func() {
 		conn, err := dial(legCtx)
