@@ -110,10 +110,12 @@ type MutableAutoSelect struct {
 	ladderWaiter     *probeWaiter
 	periodicTimer    *time.Timer
 	idleTimer        *time.Timer
-	// pauseEpoch and pausedSince are guarded by access. pausedSince is when
-	// the device or network last paused, or zero while neither is.
+	// pauseEpoch, pausedSince and wokeAt are guarded by access. pausedSince
+	// is when the device or network last paused, or zero while neither is;
+	// wokeAt is when the latest pause ended.
 	pauseEpoch          uint64
 	pausedSince         time.Time
+	wokeAt              time.Time
 	pauseCallbackAccess sync.Mutex
 	probePauseManager   pause.Manager
 	pauseCallback       *list.Element[pause.Callback]
@@ -138,6 +140,10 @@ type MutableAutoSelect struct {
 		// requested or running; they may conclude it past
 		// confirmStrikeWindow.
 		awaitingProbes bool
+		// afterOutage marks a switch that follows the selection's failed
+		// probe after an outage; the switch is dropped once the selection
+		// answers traffic after since.
+		afterOutage bool
 	}
 	// Guarded by access: outageSince is set while an outage of the
 	// device's own network is suspected, since the selection and every
@@ -1468,8 +1474,9 @@ func (s *MutableAutoSelect) streakReplacementLocked(pool, forNetwork []rankedCan
 // ranked above it whose probes are still requested or running: each is given
 // replacementWaitFactor times its delay from its probe's start, within
 // [replacementWaitFloor, replacementWaitMax], and none past
-// replacementWaitMax from the pass or the release's start, whichever is
-// later. A real member's slow probes run about thrice its median delay.
+// replacementWaitMax from the pass, the release's start or the end of the
+// latest pause, whichever is latest. A real member's slow probes run about
+// thrice its median delay.
 const (
 	replacementWaitFactor = 4
 	replacementWaitFloor  = 250 * time.Millisecond
@@ -1487,9 +1494,13 @@ func (s *MutableAutoSelect) awaitHigherRankedLocked(above []string, passedAt, be
 		return false
 	}
 	now := time.Now()
+	// A pause cancels the probes waited for, so their wait restarts at the
+	// wake.
 	end := passedAt
-	if began.After(end) {
-		end = began
+	for _, t := range []time.Time{began, s.wokeAt} {
+		if t.After(end) {
+			end = t
+		}
 	}
 	end = end.Add(replacementWaitMax)
 	var until time.Time
@@ -1540,6 +1551,10 @@ func (s *MutableAutoSelect) armReplacementWakeLocked(at time.Time) {
 			return
 		}
 		s.replacementWake = nil
+		// A pause cancels the probes waited for; the wake retries.
+		if s.paused() {
+			return
+		}
 		s.retryWaitingReleasesLocked()
 	})
 	s.replacementWake, s.replacementWakeAt = wake, at
@@ -2367,14 +2382,15 @@ func (s *MutableAutoSelect) trySwitchAfterConfirmedFailureLocked(failedTag, repl
 // whose confirmations failed twice, as replacement probes complete, probing
 // further members while those probed fail. It gives up once the selection
 // has moved, confirmStrikeWindow has passed with no probe left that could
-// decide it, or every member it could move to failed. Caller must hold
-// s.access.
+// decide it, every member it could move to failed, or, for one after an
+// outage, the selection answered traffic. Caller must hold s.access.
 func (s *MutableAutoSelect) tryPendingConfirmedSwitchLocked() {
 	p := &s.pendingConfirmedFailure
 	if p.tag == "" {
 		return
 	}
-	if s.selected(N.NetworkTCP) != p.tag || (time.Since(p.at) > confirmStrikeWindow && !p.awaitingProbes) {
+	if s.selected(N.NetworkTCP) != p.tag || (time.Since(p.at) > confirmStrikeWindow && !p.awaitingProbes) ||
+		(p.afterOutage && s.answeredSinceLocked(p.tag, p.since)) {
 		p.tag = ""
 		return
 	}
@@ -2831,7 +2847,7 @@ func (s *MutableAutoSelect) settleAfterOutageLocked(tag string, outcome *probeOu
 		// A member still being probed may be what holds the switch back; the
 		// pending switch retries it as they complete.
 		p := &s.pendingConfirmedFailure
-		p.tag, p.since, p.at, p.replacementFailed = tag, at, outcome.completed, false
+		p.tag, p.since, p.at, p.replacementFailed, p.afterOutage = tag, at, outcome.completed, false, true
 	}
 }
 

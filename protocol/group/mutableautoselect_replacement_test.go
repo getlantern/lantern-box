@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -210,6 +211,92 @@ func TestDialContext_WaitEndingReleasesAWaitingDial(t *testing.T) {
 	})
 }
 
+func TestStreak_WaitEndingDuringAPauseKeepsTheUDPSelection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		pm := withPauseManager(s)
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(2 * time.Second), nil }
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(100 * time.Millisecond), nil }
+		s.selections[streakUDP].tag.Store("a")
+		generation := s.networkGeneration.Load()
+		s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "udp", nil)
+		time.Sleep(time.Second)
+		s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "udp", nil)
+		time.Sleep(110 * time.Millisecond)
+		synctest.Wait()
+		require.Equal(t, "a", loadString(&s.selections[streakUDP].tag), "c's pass waits for b, ranked above it")
+		pm.NetworkPause()
+		time.Sleep(replacementWaitMax)
+		synctest.Wait()
+		assert.Equal(t, "a", loadString(&s.selections[streakUDP].tag), "a wait ending while paused releases nothing")
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+	})
+}
+
+func TestStreak_WaitRestartsAfterAPause(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		pm := withPauseManager(s)
+		var woke atomic.Bool
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["b"].dial = func(context.Context) (net.Conn, error) {
+			if woke.Load() {
+				return slowProbeResponderConn(100 * time.Millisecond), nil
+			}
+			return slowProbeResponderConn(2 * time.Second), nil
+		}
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(100 * time.Millisecond), nil }
+		s.selections[streakUDP].tag.Store("a")
+		generation := s.networkGeneration.Load()
+		s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "udp", nil)
+		time.Sleep(time.Second)
+		s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "udp", nil)
+		time.Sleep(110 * time.Millisecond)
+		synctest.Wait()
+		require.Equal(t, "a", loadString(&s.selections[streakUDP].tag), "c's pass waits for b, ranked above it")
+		pm.NetworkPause()
+		time.Sleep(2 * replacementWaitMax)
+		woke.Store(true)
+		pm.NetworkWake()
+		synctest.Wait()
+		s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "udp", nil)
+		assert.Equal(t, "a", loadString(&s.selections[streakUDP].tag), "c's pass from before the pause waits for b's probe after it")
+		time.Sleep(150 * time.Millisecond)
+		synctest.Wait()
+		assert.Equal(t, "b", loadString(&s.selections[streakUDP].tag), "the release lands on b once it passes")
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+	})
+}
+
+func TestStreak_WaitAfterAPauseIsBounded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		pm := withPauseManager(s)
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(4 * time.Second), nil }
+		obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(100 * time.Millisecond), nil }
+		s.selections[streakUDP].tag.Store("a")
+		generation := s.networkGeneration.Load()
+		s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "udp", nil)
+		time.Sleep(time.Second)
+		s.recordUserFailure(s.originAt("a", generation), adapter.UserFailureReset, time.Now(), "udp", nil)
+		time.Sleep(110 * time.Millisecond)
+		synctest.Wait()
+		require.Equal(t, "a", loadString(&s.selections[streakUDP].tag), "c's pass waits for b, ranked above it")
+		pm.NetworkPause()
+		time.Sleep(2 * replacementWaitMax)
+		pm.NetworkWake()
+		time.Sleep(replacementWaitMax)
+		synctest.Wait()
+		assert.Equal(t, "c", loadString(&s.selections[streakUDP].tag), "with nothing else retrying it, the release waits no longer than replacementWaitMax from the wake")
+		time.Sleep(4 * time.Second)
+		synctest.Wait()
+	})
+}
+
 func TestAfterOutage_SwitchHeldForAHigherRankedProbeIsRetried(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
@@ -226,6 +313,30 @@ func TestAfterOutage_SwitchHeldForAHigherRankedProbeIsRetried(t *testing.T) {
 		time.Sleep(replacementWaitFloor)
 		synctest.Wait()
 		assert.Equal(t, "c", loadString(&s.selections[streakTCP].tag), "a, failing its probe after the outage, still moves")
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+	})
+}
+
+func TestAfterOutage_HeldSwitchDropsOnceTheSelectionAnswers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("dial timeout") }
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(2 * time.Second), nil }
+		seedProbe(s, "c", true, 30)
+		s.access.Lock()
+		s.forceProbesLocked("b")
+		s.probeSelectionAfterOutageLocked("c", time.Now())
+		s.access.Unlock()
+		synctest.Wait()
+		require.Equal(t, "a", loadString(&s.selections[streakTCP].tag), "c's pass waits for b, ranked above it")
+		time.Sleep(10 * time.Millisecond)
+		s.access.Lock()
+		s.historyForLocked("a").noteUserResponse(streakTCP, "", time.Now(), time.Now())
+		s.access.Unlock()
+		time.Sleep(replacementWaitFloor)
+		synctest.Wait()
+		assert.Equal(t, "a", loadString(&s.selections[streakTCP].tag), "a, answering traffic since c's pass, stays")
 		time.Sleep(2 * time.Second)
 		synctest.Wait()
 	})

@@ -420,7 +420,7 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, err error, 
 			if !named || !s.trySwitchAfterConfirmedFailureLocked(attempt.tag, replacement, first) {
 				p := &s.pendingConfirmedFailure
 				p.tag, p.since, p.at = attempt.tag, first, outcome.completed
-				p.replacementFailed = replacementFailed
+				p.replacementFailed, p.afterOutage = replacementFailed, false
 			}
 		}
 	}
@@ -947,12 +947,14 @@ func (s *MutableAutoSelect) onProbePause(event int) {
 		}
 	case pause.EventDeviceWake, pause.EventNetworkWake:
 		if !s.paused() {
-			s.pausedSince = time.Time{}
+			s.pausedSince, s.wokeAt = time.Time{}, time.Now()
 			s.armPeriodicLocked()
 			if s.outageSuspectedLocked() {
 				s.armOutageRecheckLocked()
 			}
 			s.dispatchProbesLocked()
+			// Releases that waited through the pause wait again, from now.
+			s.retryWaitingReleasesLocked()
 		}
 	}
 }
