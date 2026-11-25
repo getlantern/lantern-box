@@ -3,6 +3,7 @@ package outline
 import (
 	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.getoutline.org/sdk/transport"
+	"golang.org/x/net/idna"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -70,7 +72,7 @@ type siteDialers struct {
 	inFlight map[string]bool
 	limit    int
 	// allowed, when not nil, holds the only sites that get a dialer of
-	// their own. It is set before the first dial and not changed after.
+	// their own. It isn't changed after construction.
 	allowed map[string]bool
 }
 
@@ -90,7 +92,7 @@ type siteEntry struct {
 	failedUntil    time.Time
 }
 
-func newSiteDialers(ctx context.Context, size int, search func(ctx context.Context, site, host string) (transport.StreamDialer, error)) *siteDialers {
+func newSiteDialers(ctx context.Context, size int, allowed map[string]bool, search func(ctx context.Context, site, host string) (transport.StreamDialer, error)) *siteDialers {
 	sites, err := lru.New[string, *siteEntry](size)
 	if err != nil {
 		// Only a non-positive size fails, and callers pass a constant.
@@ -99,6 +101,7 @@ func newSiteDialers(ctx context.Context, size int, search func(ctx context.Conte
 	return &siteDialers{
 		search: search, ctx: ctx, now: time.Now,
 		sites: sites, inFlight: map[string]bool{}, limit: maxSiteSearches,
+		allowed: allowed,
 	}
 }
 
@@ -198,20 +201,47 @@ func retryDelay(failures int) time.Duration {
 	return min(d, siteRetryMax)
 }
 
-// perSiteDomains returns the sites domains name, by registrable domain, and
-// true; nil and true when domains is empty, meaning every site; and false
-// when domains names no valid site, so per-site searches are off.
-func perSiteDomains(domains []string) (map[string]bool, bool) {
+// perSiteDomains returns the sites domains name and true; nil and true when
+// domains is empty, meaning every site; and false when domains names no
+// site, so per-site searches are off. rejected holds the entries that name no
+// site.
+func perSiteDomains(domains []string) (allowed map[string]bool, rejected []string, ok bool) {
 	if len(domains) == 0 {
-		return nil, true
+		return nil, nil, true
 	}
-	allowed := make(map[string]bool, len(domains))
+	allowed = make(map[string]bool, len(domains))
 	for _, d := range domains {
-		if site := siteOf(d); site != "" {
+		if site := siteName(d); site != "" {
 			allowed[site] = true
+		} else {
+			rejected = append(rejected, d)
 		}
 	}
-	return allowed, len(allowed) > 0
+	return allowed, rejected, len(allowed) > 0
+}
+
+// siteName returns the site, as siteOf, that a configured entry names, or ""
+// for none. It takes the forms an entry is likely written in: with spaces
+// around it, as a URL or with a port, with a "*." or "." prefix as other
+// sing-box options take domains, or in Unicode, which dialed hosts carry as
+// punycode.
+func siteName(entry string) string {
+	s := strings.TrimSpace(entry)
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		s = host
+	}
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "*."), ".")
+	ascii, err := idna.Lookup.ToASCII(s)
+	if err != nil {
+		return ""
+	}
+	return siteOf(ascii)
 }
 
 // specialUseTLDs are top-level names reserved for local or non-DNS use

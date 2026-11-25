@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -148,7 +149,13 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		cancel    context.CancelFunc
 	)
 	siteOptions, perSite := perSiteOptions(options)
-	allowed, anySite := perSiteDomains(options.PerSiteDomains)
+	allowed, rejected, anySite := perSiteDomains(options.PerSiteDomains)
+	if perSite && len(rejected) > 0 {
+		log.Warn("outline: per_site_domains entries naming no site, ignored: ", strings.Join(rejected, ", "))
+	}
+	if perSite && !anySite {
+		log.Warn("outline: per_site_domains names no site, so per-site searches are off")
+	}
 	if perSite && anySite {
 		siteYAML, err := marshalSmartConfig(siteOptions)
 		if err != nil {
@@ -164,10 +171,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		// The box's context isn't cancelled when it closes, so the
 		// searches get their own, which Close cancels.
 		searchCtx, cancel = context.WithCancel(ctx)
-		sites = newSiteDialers(searchCtx, maxSites, func(ctx context.Context, _, host string) (transport.StreamDialer, error) {
+		sites = newSiteDialers(searchCtx, maxSites, allowed, func(ctx context.Context, _, host string) (transport.StreamDialer, error) {
 			return siteFinder.NewDialer(ctx, []string{host}, siteYAML)
 		})
-		sites.allowed = allowed
 	}
 	return &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeOutline, tag, networks, options.DialerOptions),

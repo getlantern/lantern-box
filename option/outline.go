@@ -35,10 +35,13 @@ type OutboundOutlineOptions struct {
 	// are none. Unset means true.
 	PerSite *bool `json:"per_site,omitempty"`
 	// PerSiteDomains limits per-site searches to the sites these name, by
-	// registrable domain: www.youtube.com and youtube.com both mean
-	// youtube.com. Every other site uses the Domains search's strategy.
-	// Empty means every site. A list naming no valid site turns per-site
-	// searches off.
+	// registrable domain: www.youtube.com, .youtube.com and youtube.com all
+	// mean youtube.com. A service's other domains are other sites, so
+	// YouTube's video needs googlevideo.com listed too. Under a shared
+	// suffix such as github.io, an entry names one site in full, as
+	// user.github.io. Every other site uses the Domains search's strategy.
+	// Empty means every site. A list naming no site turns per-site searches
+	// off.
 	PerSiteDomains []string `json:"per_site_domains,omitempty"`
 }
 
