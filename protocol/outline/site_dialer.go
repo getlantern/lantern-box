@@ -215,11 +215,17 @@ func siteOf(host string) string {
 	if _, err := netip.ParseAddr(host); err == nil {
 		return ""
 	}
-	// The TLD decides: a name under a private suffix, such as foo.appspot.com,
-	// is a public site, where one under a TLD outside ICANN's list is local.
 	tld := host[strings.LastIndexByte(host, '.')+1:]
-	if _, icann := publicsuffix.PublicSuffix(tld); !icann || specialUseTLDs[tld] {
+	if specialUseTLDs[tld] {
 		return ""
+	}
+	// A name is public if its suffix is ICANN's, which covers wildcard-only
+	// TLDs such as mm, or if its TLD is, which covers private suffixes such
+	// as appspot.com. A name under a TLD outside ICANN's list is local.
+	if _, icann := publicsuffix.PublicSuffix(host); !icann {
+		if _, icann := publicsuffix.PublicSuffix(tld); !icann {
+			return ""
+		}
 	}
 	site, err := publicsuffix.EffectiveTLDPlusOne(host)
 	if err != nil {

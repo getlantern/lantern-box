@@ -25,16 +25,19 @@ func TestSiteOf(t *testing.T) {
 		"WWW.YouTube.com.": "youtube.com",
 		"news.bbc.co.uk":   "bbc.co.uk",
 		// Under a private suffix, each name is its own site.
-		"foo.appspot.com":   "foo.appspot.com",
-		"a.b.github.io":     "b.github.io",
-		"appspot.com":       "",
-		"intranet":          "",
-		"192.0.2.1":         "",
-		"2001:db8::1":       "",
-		"localhost":         "",
-		"nas.lan":           "",
-		"printer.home.arpa": "",
-		"":                  "",
+		"foo.appspot.com": "foo.appspot.com",
+		"a.b.github.io":   "b.github.io",
+		"appspot.com":     "",
+		// Wildcard-only ICANN TLDs, whose bare TLD isn't listed.
+		"www.moi.gov.mm":       "moi.gov.mm",
+		"kathmandupost.com.np": "kathmandupost.com.np",
+		"intranet":             "",
+		"192.0.2.1":            "",
+		"2001:db8::1":          "",
+		"localhost":            "",
+		"nas.lan":              "",
+		"printer.home.arpa":    "",
+		"":                     "",
 	} {
 		if got := siteOf(host); got != want {
 			t.Errorf("siteOf(%q) = %q, want %q", host, got, want)
