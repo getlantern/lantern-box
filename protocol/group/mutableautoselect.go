@@ -156,8 +156,9 @@ type MutableAutoSelect struct {
 	outageSince, outageEvidence time.Time
 	pastOutages                 []timeSpan
 	// Guarded by access: outageRecheck probes for the end of a suspected
-	// outage; afterOutage is the TCP selection probed again once another
-	// member's pass, completed at at, ended one.
+	// outage; afterOutage is the TCP selection probed again once a suspected
+	// outage ended at at, through passed's pass. passed is empty once a pause
+	// interrupted the switch that followed.
 	outageRecheck *time.Timer
 	// recheckNext is where in the replacement pool the next recheck starts,
 	// so successive rechecks cover every member.
@@ -3039,12 +3040,13 @@ func (s *MutableAutoSelect) probeSelectionAfterOutageLocked(passed string, at ti
 	s.forceProbesLocked(sticky)
 }
 
-// settleAfterOutageLocked moves the TCP selection, tag, to the member whose
-// pass ended the outage if tag's probe, started after that pass, failed: the
-// network was up for it as for the pass. A failure of one started earlier
-// may have been the outage's, so tag is probed again. Once tag has answered
-// traffic since the pass, it serves, and it stays. Caller must hold
-// s.access.
+// settleAfterOutageLocked moves the TCP selection, tag, off itself if tag's
+// probe, started after the outage ended, failed: the network was up for it.
+// It moves to the member whose pass ended the outage, if one is recorded and
+// has answered since, or else to one whose probe passed since. A failure of
+// one started earlier may have been the outage's, so tag is probed again.
+// Once tag has answered traffic since the outage ended, it serves, and it
+// stays. Caller must hold s.access.
 func (s *MutableAutoSelect) settleAfterOutageLocked(tag string, outcome *probeOutcome) {
 	a := &s.afterOutage
 	if a.tag == "" || a.tag != tag {
