@@ -2,6 +2,7 @@ package outline
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"strings"
 	"sync"
@@ -37,7 +38,15 @@ const (
 	// on resolution or connect: the smart dialer returns once TCP connects,
 	// so a strategy blocked later, at the TLS handshake, isn't counted.
 	maxSiteDialFailures = 3
+	// siteDialHeadStart is how long a site's dialer has to connect before the
+	// outbound's dialer races it. The hedge gives proxyless a second in all,
+	// so a site's dialer that stalls must leave most of it to the outbound's.
+	siteDialHeadStart = 300 * time.Millisecond
 )
+
+// errSiteDialSlow counts against a site's dialer when the outbound's dialer
+// connected first.
+var errSiteDialSlow = errors.New("outline: the site's dialer lost to the outbound's")
 
 // siteDialers finds a strategy for each site a user reaches. The outbound's
 // own search tests its configured domains and applies the winner to every
@@ -206,10 +215,10 @@ func siteOf(host string) string {
 	if _, err := netip.ParseAddr(host); err == nil {
 		return ""
 	}
-	if _, icann := publicsuffix.PublicSuffix(host); !icann {
-		return ""
-	}
-	if specialUseTLDs[host[strings.LastIndexByte(host, '.')+1:]] {
+	// The TLD decides: a name under a private suffix, such as foo.appspot.com,
+	// is a public site, where one under a TLD outside ICANN's list is local.
+	tld := host[strings.LastIndexByte(host, '.')+1:]
+	if _, icann := publicsuffix.PublicSuffix(tld); !icann || specialUseTLDs[tld] {
 		return ""
 	}
 	site, err := publicsuffix.EffectiveTLDPlusOne(host)

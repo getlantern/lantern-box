@@ -186,7 +186,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 // per-site searches are off. A search races every resolver for the site's
 // name, where a dial asks only the one its search chose, so site searches
 // use only the encrypted resolvers: a plaintext one would see, and show the
-// network, every site the user reaches. With none, they're off.
+// network, every site the user reaches. With none, they're off. An entry that
+// also names a plaintext resolver keeps only its encrypted ones, since the
+// finder would prefer the system resolver.
 func perSiteOptions(options option.OutboundOutlineOptions) (option.OutboundOutlineOptions, bool) {
 	if options.PerSite != nil && !*options.PerSite {
 		return options, false
@@ -194,7 +196,7 @@ func perSiteOptions(options option.OutboundOutlineOptions) (option.OutboundOutli
 	var encrypted []option.DNSEntryConfig
 	for _, e := range options.DNSResolvers {
 		if e.HTTPS != nil || e.TLS != nil {
-			encrypted = append(encrypted, e)
+			encrypted = append(encrypted, option.DNSEntryConfig{HTTPS: e.HTTPS, TLS: e.TLS})
 		}
 	}
 	if len(encrypted) == 0 {
@@ -262,26 +264,120 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 
 	if o.sites != nil && addr.IsFqdn() {
 		if d := o.sites.dialerFor(addr.Fqdn, addr.Port); d != nil {
-			conn, err := d.DialStream(ctx, addr.String())
-			// A dial cancelled by its caller, as when the hedge's other leg
-			// wins, says nothing about the strategy.
-			if ctx.Err() != nil {
-				return conn, err
-			}
-			o.sites.dialed(addr.Fqdn, d, err)
-			if err == nil {
-				return conn, nil
-			}
-			// The site's strategy failed; the outbound's may still work,
-			// as it would have without the site search.
+			return o.dialSite(ctx, d, addr)
 		}
 	}
+	return o.dialOutbound(ctx, addr.String())
+}
 
+func (o *Outbound) dialOutbound(ctx context.Context, addr string) (transport.StreamConn, error) {
 	d, err := o.getDialer(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return d.DialStream(ctx, addr.String())
+	return d.DialStream(ctx, addr)
+}
+
+type dialResult struct {
+	conn transport.StreamConn
+	err  error
+	site bool
+}
+
+// dialLeg is one dial of a race. Its context ends with the caller's until the
+// leg is settled, and is never cancelled once it wins, since the caller's
+// isn't once its dial has returned.
+type dialLeg struct {
+	cancel context.CancelFunc
+	detach func() bool
+}
+
+func startLeg(ctx context.Context, site bool, results chan<- dialResult, dial func(context.Context) (transport.StreamConn, error)) *dialLeg {
+	legCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	l := &dialLeg{cancel: cancel, detach: context.AfterFunc(ctx, cancel)}
+	go func() {
+		conn, err := dial(legCtx)
+		results <- dialResult{conn, err, site}
+	}()
+	return l
+}
+
+// dialSite dials addr through d, its site's dialer. The outbound's dialer
+// dials too once d fails or hasn't connected within siteDialHeadStart, as it
+// would have without the site's search, and the first connection wins. A site
+// dial that fails, or loses to the outbound's, counts against the site, so a
+// strategy that stalls is dropped like one that fails. A dial whose caller
+// cancelled it says nothing about the strategy, and isn't counted.
+func (o *Outbound) dialSite(ctx context.Context, d *siteDialer, addr metadata.Socksaddr) (net.Conn, error) {
+	host, target := addr.Fqdn, addr.String()
+	results := make(chan dialResult, 2)
+	legs := map[bool]*dialLeg{true: startLeg(ctx, true, results, func(ctx context.Context) (transport.StreamConn, error) {
+		return d.DialStream(ctx, target)
+	})}
+	startOutbound := func() {
+		if legs[false] == nil && ctx.Err() == nil {
+			legs[false] = startLeg(ctx, false, results, func(ctx context.Context) (transport.StreamConn, error) {
+				return o.dialOutbound(ctx, target)
+			})
+		}
+	}
+	timer := time.NewTimer(siteDialHeadStart)
+	defer timer.Stop()
+
+	var lastErr error
+	for pending := 1; pending > 0; {
+		select {
+		case <-timer.C:
+			if legs[false] == nil {
+				startOutbound()
+				if legs[false] != nil {
+					pending++
+				}
+			}
+			continue
+		case r := <-results:
+			pending--
+			legs[r.site].detach()
+			if r.err == nil {
+				if r.site {
+					o.sites.dialed(host, d, nil)
+				} else if pending > 0 && ctx.Err() == nil {
+					// The site's dial is still running: it lost.
+					o.sites.dialed(host, d, errSiteDialSlow)
+				}
+				// Cancel and close whatever is still running.
+				for site, l := range legs {
+					if site != r.site {
+						l.detach()
+						l.cancel()
+					}
+				}
+				go func(n int) {
+					for range n {
+						if late := <-results; late.conn != nil {
+							late.conn.Close()
+						}
+					}
+				}(pending)
+				return r.conn, nil
+			}
+			legs[r.site].cancel()
+			lastErr = r.err
+			if r.site {
+				if ctx.Err() == nil {
+					o.sites.dialed(host, d, r.err)
+				}
+				// The site's strategy failed; the outbound's may still work.
+				if legs[false] == nil {
+					startOutbound()
+					if legs[false] != nil {
+						pending++
+					}
+				}
+			}
+		}
+	}
+	return nil, lastErr
 }
 
 // Close ends the outbound's site searches.

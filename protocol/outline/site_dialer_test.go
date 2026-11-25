@@ -3,7 +3,9 @@ package outline
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -17,11 +19,16 @@ import (
 
 func TestSiteOf(t *testing.T) {
 	for host, want := range map[string]string{
-		"www.youtube.com":   "youtube.com",
-		"m.youtube.com":     "youtube.com",
-		"youtube.com":       "youtube.com",
-		"WWW.YouTube.com.":  "youtube.com",
-		"news.bbc.co.uk":    "bbc.co.uk",
+		"www.youtube.com":  "youtube.com",
+		"m.youtube.com":    "youtube.com",
+		"youtube.com":      "youtube.com",
+		"WWW.YouTube.com.": "youtube.com",
+		"news.bbc.co.uk":   "bbc.co.uk",
+		// Under a private suffix, each name is its own site.
+		"foo.appspot.com":   "foo.appspot.com",
+		"a.b.github.io":     "b.github.io",
+		"appspot.com":       "",
+		"intranet":          "",
 		"192.0.2.1":         "",
 		"2001:db8::1":       "",
 		"localhost":         "",
@@ -354,10 +361,133 @@ func TestPerSiteOptionsKeepOnlyEncryptedResolvers(t *testing.T) {
 	doh := option.DNSEntryConfig{HTTPS: &option.HTTPSEntryConfig{Name: "dns.google"}}
 	dot := option.DNSEntryConfig{TLS: &option.TLSEntryConfig{Name: "dns.google"}}
 	udp := option.DNSEntryConfig{UDP: &option.UDPEntryConfig{Address: "8.8.8.8:53"}}
-	got, ok := perSiteOptions(option.OutboundOutlineOptions{DNSResolvers: []option.DNSEntryConfig{udp, doh, dot}})
-	if !ok || len(got.DNSResolvers) != 2 || got.DNSResolvers[0].HTTPS == nil || got.DNSResolvers[1].TLS == nil {
-		t.Fatalf("perSiteOptions resolvers = %+v (on %v), want the DoH and DoT entries", got.DNSResolvers, ok)
+	mixed := option.DNSEntryConfig{System: &struct{}{}, UDP: udp.UDP, HTTPS: doh.HTTPS}
+	got, ok := perSiteOptions(option.OutboundOutlineOptions{DNSResolvers: []option.DNSEntryConfig{udp, doh, dot, mixed}})
+	if !ok || len(got.DNSResolvers) != 3 || got.DNSResolvers[0].HTTPS == nil || got.DNSResolvers[1].TLS == nil {
+		t.Fatalf("perSiteOptions resolvers = %+v (on %v), want the DoH, DoT and mixed entries", got.DNSResolvers, ok)
 	}
+	if m := got.DNSResolvers[2]; m.HTTPS == nil || m.System != nil || m.UDP != nil {
+		t.Fatalf("mixed entry kept as %+v, want only its DoH resolver", m)
+	}
+}
+
+// fakeStreamConn records whether it was closed.
+type fakeStreamConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (c *fakeStreamConn) Close() error      { c.closed.Store(true); return nil }
+func (c *fakeStreamConn) CloseRead() error  { return nil }
+func (c *fakeStreamConn) CloseWrite() error { return nil }
+
+func connDialer(c *fakeStreamConn) transport.StreamDialer {
+	return transport.FuncStreamDialer(func(context.Context, string) (transport.StreamConn, error) { return c, nil })
+}
+
+// newSiteOutbound returns an outbound whose dialer is outbound, and whose
+// sites' searches find site, once dest has been dialed to start one.
+func newSiteOutbound(t *testing.T, outbound, site transport.StreamDialer, dest metadata.Socksaddr) *Outbound {
+	t.Helper()
+	o := &Outbound{
+		createDialer: func() (transport.StreamDialer, error) { return outbound, nil },
+		sites:        newSiteDialers(t.Context(), maxSites, (&fakeSiteSearch{dialer: site}).search),
+	}
+	o.DialContext(context.Background(), "tcp", dest)
+	synctest.Wait()
+	if o.sites.dialerFor(dest.Fqdn, dest.Port) == nil {
+		t.Fatal("site search found no dialer")
+	}
+	return o
+}
+
+func TestStalledSiteDialerRacesOutbound(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var siteDials atomic.Int32
+		stalled := transport.FuncStreamDialer(func(ctx context.Context, _ string) (transport.StreamConn, error) {
+			siteDials.Add(1)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		outConn := &fakeStreamConn{}
+		dest := metadata.ParseSocksaddr("www.youtube.com:443")
+		o := newSiteOutbound(t, connDialer(outConn), stalled, dest)
+		for range maxSiteDialFailures {
+			start := time.Now()
+			conn, err := o.DialContext(context.Background(), "tcp", dest)
+			if err != nil || conn != net.Conn(outConn) {
+				t.Fatalf("DialContext = %v, %v; want the outbound's connection", conn, err)
+			}
+			if took := time.Since(start); took != siteDialHeadStart {
+				t.Fatalf("dial took %v, want the head start, %v", took, siteDialHeadStart)
+			}
+		}
+		synctest.Wait()
+		if got := siteDials.Load(); got != maxSiteDialFailures {
+			t.Fatalf("site dialer dialed %d times, want %d", got, maxSiteDialFailures)
+		}
+		if outConn.closed.Load() {
+			t.Fatal("the winning connection was closed")
+		}
+		if o.sites.dialerFor("www.youtube.com", 443) != nil {
+			t.Fatal("a site dialer that lost every race kept its dialer")
+		}
+	})
+}
+
+func TestFastSiteDialerSkipsOutbound(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		siteConn := &fakeStreamConn{}
+		outboundDialer := &recordingDialer{}
+		dest := metadata.ParseSocksaddr("www.youtube.com:443")
+		o := newSiteOutbound(t, outboundDialer, connDialer(siteConn), dest)
+		conn, err := o.DialContext(context.Background(), "tcp", dest)
+		if err != nil || conn != net.Conn(siteConn) {
+			t.Fatalf("DialContext = %v, %v; want the site's connection", conn, err)
+		}
+		time.Sleep(2 * siteDialHeadStart)
+		synctest.Wait()
+		if len(outboundDialer.addrs) != 1 {
+			t.Fatalf("outbound's dialer dialed %v, want only the dial that started the search", outboundDialer.addrs)
+		}
+	})
+}
+
+func TestLateSiteConnectionClosed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		late := &fakeStreamConn{}
+		// Ignores its context, as a dialer stuck in a syscall would.
+		slow := transport.FuncStreamDialer(func(context.Context, string) (transport.StreamConn, error) {
+			time.Sleep(2 * siteDialHeadStart)
+			return late, nil
+		})
+		outConn := &fakeStreamConn{}
+		dest := metadata.ParseSocksaddr("www.youtube.com:443")
+		o := newSiteOutbound(t, connDialer(outConn), slow, dest)
+		if conn, err := o.DialContext(context.Background(), "tcp", dest); err != nil || conn != net.Conn(outConn) {
+			t.Fatalf("DialContext = %v, %v; want the outbound's connection", conn, err)
+		}
+		time.Sleep(2 * siteDialHeadStart)
+		synctest.Wait()
+		if !late.closed.Load() {
+			t.Fatal("the site's connection that lost the race was left open")
+		}
+	})
+}
+
+func TestFailedSiteDialFallsBackAtOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		outConn := &fakeStreamConn{}
+		dest := metadata.ParseSocksaddr("www.youtube.com:443")
+		o := newSiteOutbound(t, connDialer(outConn), &recordingDialer{}, dest)
+		start := time.Now()
+		if conn, err := o.DialContext(context.Background(), "tcp", dest); err != nil || conn != net.Conn(outConn) {
+			t.Fatalf("DialContext = %v, %v; want the outbound's connection", conn, err)
+		}
+		if took := time.Since(start); took != 0 {
+			t.Fatalf("fallback after the site's dialer failed took %v, want no wait", took)
+		}
+	})
 }
 
 // The finder's dialers are func values, which can't be compared.
