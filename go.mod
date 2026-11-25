@@ -18,12 +18,20 @@ replace github.com/refraction-networking/water => github.com/getlantern/water v0
 
 replace github.com/quic-go/quic-go => github.com/getlantern/quic-go-unbounded-fork v0.62.1-unbounded
 
-// x/v0.3.0 plus a one-line fix so x/httpconnect builds against quic-go >= v0.53
-// (quic.EarlyConnection became *quic.Conn), which the quic-go replace above
-// resolves to, and getlantern/outline-sdk#2, so disorder finds the TCP socket
-// under the outline outbound's tracked connections. Drop once an upstream x
-// release includes both OutlineFoundation/outline-sdk#657 and that fix.
-replace golang.getoutline.org/sdk/x => github.com/getlantern/outline-sdk/x v0.3.0-lantern.2
+// x/v0.3.0 plus Lantern's fixes on getlantern/outline-sdk's lantern/x-v0.3.0:
+// x builds against quic-go >= v0.53 (quic.EarlyConnection became *quic.Conn,
+// as the quic-go replace above resolves to), disorder finds the TCP socket
+// under the outline outbound's tracked connections (#2), and a strategy
+// probe's connection closes when its test times out (#3). Drop once upstream
+// x releases include them.
+replace golang.getoutline.org/sdk/x => github.com/getlantern/outline-sdk/x v0.3.0-lantern.3
+
+// v0.1.0 plus getlantern/outline-sdk#5: DNS queries end when their context is
+// cancelled, a failed DNS-over-TLS handshake closes its socket, and idle
+// DNS-over-HTTPS connections close. The per-site strategy searches make many
+// resolvers, so these would otherwise hold sockets. Drop once an upstream
+// release includes them.
+replace golang.getoutline.org/sdk => github.com/getlantern/outline-sdk v0.1.0-lantern.1
 
 // sing-box/sing-tun/tailscale need gvisor's v0.0.0-20260727.0-sing-box-mod.1
 // API (WritePacketDirect, the new udp.NewForwarder signature). That tag's first
