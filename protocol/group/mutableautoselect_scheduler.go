@@ -1,8 +1,11 @@
 package group
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"math"
+	"slices"
 	"time"
 
 	A "github.com/sagernet/sing-box/adapter"
@@ -61,6 +64,10 @@ type memberProbeState struct {
 	// waiters from the earlier membership are rejected.
 	membershipID uint64
 	need         probeNeed
+	// forceRank is tag's lowest position in the forceProbesLocked calls
+	// behind its pending forced probe; forced probes are dispatched by it.
+	// One forced any other way has math.MaxInt.
+	forceRank int
 	// confirmationPending waits for an attempt sequenced after confirmSequence;
 	// two failed ones in a row may switch TCP selection to replacement.
 	confirmationPending bool
@@ -162,10 +169,43 @@ func (s *MutableAutoSelect) requestProbesLocked(tags []string, need probeNeed, o
 		if beh.excludeFromPool || (ordinaryOnly && beh.lastResort) {
 			continue
 		}
-		if state := s.probeMembers[tag]; state != nil && need > state.need {
+		state := s.probeMembers[tag]
+		if state == nil {
+			continue
+		}
+		if need == probeForced && state.need < probeForced {
+			state.forceRank = math.MaxInt
+		}
+		if need > state.need {
 			state.need = need
 		}
 	}
+}
+
+// dispatchOrderLocked returns the members in the order their pending probes
+// take free slots: forced ones by forceRank, then the rest, each in member
+// order. Caller must hold s.access; the result aliases s.scratchDispatch or
+// s.tags and must not be modified.
+func (s *MutableAutoSelect) dispatchOrderLocked() []string {
+	order := s.scratchDispatch[:0]
+	for _, tag := range s.tags {
+		if state := s.probeMembers[tag]; state != nil && state.need == probeForced {
+			order = append(order, tag)
+		}
+	}
+	if len(order) == 0 {
+		return s.tags
+	}
+	slices.SortStableFunc(order, func(a, b string) int {
+		return cmp.Compare(s.probeMembers[a].forceRank, s.probeMembers[b].forceRank)
+	})
+	for _, tag := range s.tags {
+		if state := s.probeMembers[tag]; state == nil || state.need != probeForced {
+			order = append(order, tag)
+		}
+	}
+	s.scratchDispatch = order
+	return order
 }
 
 func (s *MutableAutoSelect) hasFreshProbeOutcomeLocked(tag string, now time.Time) bool {
@@ -200,7 +240,7 @@ func (s *MutableAutoSelect) dispatchProbesLocked() {
 	}
 	s.startLadderBudgetLocked()
 	now := time.Now()
-	for _, tag := range s.tags {
+	for _, tag := range s.dispatchOrderLocked() {
 		state := s.probeMembers[tag]
 		if state == nil || state.need == probeNotNeeded {
 			continue
@@ -391,9 +431,7 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, err error, 
 	if p := &s.pendingConfirmedFailure; success && p.tag == attempt.tag && !attempt.started.Before(p.at) {
 		p.tag = ""
 	}
-	s.tryPendingConfirmedSwitchLocked()
-	s.reselectUDPLocked()
-	s.notifyProbesLocked()
+	s.retryWaitingReleasesLocked()
 }
 
 // recordProbeOutcomeLocked sequences outcome, makes it tag's latest, and
@@ -774,14 +812,19 @@ func (s *MutableAutoSelect) probeTCPReplacementsLocked(tag string, since time.Ti
 	return len(tags) > 0
 }
 
-// forceProbesLocked probes tags now, if there are any. Caller must hold
-// s.access.
+// forceProbesLocked probes tags now, if there are any, taking free slots in
+// their order. Caller must hold s.access.
 func (s *MutableAutoSelect) forceProbesLocked(tags ...string) {
 	// requestProbesLocked reads nil as every member.
 	if len(tags) == 0 {
 		return
 	}
 	s.requestProbesLocked(tags, probeForced, false)
+	for i, tag := range tags {
+		if state := s.probeMembers[tag]; state != nil && state.need == probeForced && i < state.forceRank {
+			state.forceRank = i
+		}
+	}
 	s.dispatchProbesLocked()
 }
 
@@ -997,6 +1040,9 @@ func (s *MutableAutoSelect) closeProbesLocked() {
 	if s.outageRecheck != nil {
 		s.outageRecheck.Stop()
 	}
+	if s.replacementWake != nil {
+		s.replacementWake.Stop()
+	}
 	if s.idleTimer != nil {
 		s.idleTimer.Stop()
 	}
@@ -1032,6 +1078,7 @@ func (s *MutableAutoSelect) advanceNetworkLocked() {
 	// Probes on the new network decide whether it is down too.
 	s.outageSince = time.Time{}
 	for _, h := range s.histories {
+		h.staleDelays()
 		h.clearStreaks()
 	}
 	for i := range s.selections {

@@ -4213,7 +4213,7 @@ func TestHardDemotion_ReleaseNotUndoneByAProbeFromBefore(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
 		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("unreachable") }
-		obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(300 * time.Millisecond), nil }
+		obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(2 * time.Second), nil }
 		// b's probe is under way before a fails, and passes only after a's
 		// release to c.
 		s.access.Lock()
@@ -4227,8 +4227,12 @@ func TestHardDemotion_ReleaseNotUndoneByAProbeFromBefore(t *testing.T) {
 		seedProbe(s, "c", true, 2000)
 		_, _, err := s.selectOutbound("tcp", "")
 		require.NoError(t, err)
-		require.Equal(t, "c", loadString(&s.selections[streakTCP].tag))
-		time.Sleep(time.Second)
+		require.Equal(t, "a", loadString(&s.selections[streakTCP].tag), "the release waits for b, ranked above c")
+		time.Sleep(replacementWaitMax)
+		_, _, err = s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		require.Equal(t, "c", loadString(&s.selections[streakTCP].tag), "b's probe outlasting the wait doesn't hold the release")
+		time.Sleep(2 * time.Second)
 		synctest.Wait()
 		_, _, err = s.selectOutbound("tcp", "")
 		require.NoError(t, err)

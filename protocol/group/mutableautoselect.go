@@ -92,6 +92,9 @@ type MutableAutoSelect struct {
 	scratchPres   []preCandidate
 	scratchRanked []rankedCandidate
 	scratchSplit  []rankedCandidate
+	// scratchDispatch is dispatchProbesLocked's, which never runs inside
+	// itself.
+	scratchDispatch []string
 
 	// selections holds each network's selection, indexed by streakNet.
 	selections [2]networkSelection
@@ -158,6 +161,10 @@ type MutableAutoSelect struct {
 	// Guarded by access: when a failure's cause last showed the far end
 	// answered, which shows the device's own network was up.
 	peerAnsweredAt time.Time
+	// Guarded by access: replacementWake retries releases that wait on
+	// higher-ranked members' probes, at replacementWakeAt.
+	replacementWake   *time.Timer
+	replacementWakeAt time.Time
 	// udpHandles holds each member's open UDP handles, so a member released
 	// as the UDP selection for failing can have its stuck sessions closed.
 	// Guarded by access.
@@ -1263,21 +1270,26 @@ func (s *MutableAutoSelect) applyStickiness(
 // hardDemotionReleaseLocked decides the release of sticky, the selection,
 // hard-demoted by a probe that failed: it holds until a member of pool
 // passes a probe started since that one, requesting the probes, and
-// returns that member to release to. A device that lost its own network
-// fails every probe, so releasing sticky then only walks the selection off
-// a member that may still work, and a pass from before says nothing of now;
-// failures it gathers meanwhile are forgiven once the outage is suspected.
-// A member that can't be probed counts as passing. Caller must hold
-// s.access.
+// returns that member to release to once awaitHigherRankedLocked allows. A
+// device that lost its own network fails every probe, so releasing sticky
+// then only walks the selection off a member that may still work, and a
+// pass from before says nothing of now; failures it gathers meanwhile are
+// forgiven once the outage is suspected. A member that can't be probed
+// counts as passing. Caller must hold s.access.
 func (s *MutableAutoSelect) hardDemotionReleaseLocked(sticky string, pool []rankedCandidate) (passed rankedCandidate, hold bool) {
 	if !s.latestProbeFailedLocked(sticky) {
 		return rankedCandidate{}, false
 	}
 	since := s.probeMembers[sticky].outcome.started
 	var requested []string
+	var passedAt time.Time
 	found := false
 	for _, c := range pool {
-		if s.passedStartedSinceLocked(c.tag, since) || probe.ValidateURL(s.probeURLForLocked(c.tag)) != nil {
+		if s.passedStartedSinceLocked(c.tag, since) {
+			passed, found, passedAt = c, true, s.probeMembers[c.tag].outcome.completed
+			break
+		}
+		if probe.ValidateURL(s.probeURLForLocked(c.tag)) != nil {
 			passed, found = c, true
 			break
 		}
@@ -1292,6 +1304,10 @@ func (s *MutableAutoSelect) hardDemotionReleaseLocked(sticky string, pool []rank
 		requested = requested[:maxReplacementProbes]
 	}
 	s.forceProbesLocked(requested...)
+	// One that can't be probed is released to at once.
+	if !passedAt.IsZero() && s.awaitHigherRankedLocked(requested, passedAt, since) {
+		return rankedCandidate{}, true
+	}
 	return passed, !found
 }
 
@@ -1361,7 +1377,8 @@ func (s *MutableAutoSelect) streakReleaseAllowedLocked(network, sticky string) b
 // in pool that passed a probe since sticky's streak's first failure, or when
 // pool is the clean tier and each of its members failed a probe completed
 // since since, such a member of forNetwork's soft tier. It requests probes of
-// the others, so a later call may find one. A member that can't be probed
+// the others, so a later call may find one, and reports pending while
+// awaitHigherRankedLocked holds that member back. A member that can't be probed
 // counts as reachable, so a group without probing still releases. When every
 // member's fresh probe failed, sticky is probed too unless its result is
 // fresh; then sticky's streak is cleared instead of walking the pool, and if
@@ -1407,6 +1424,10 @@ func (s *MutableAutoSelect) streakReplacementLocked(pool, forNetwork []rankedCan
 				if !state.outcome.success {
 					failed++
 				} else if usable {
+					s.forceProbesLocked(requested...)
+					if s.awaitHigherRankedLocked(requested, state.outcome.completed, since) {
+						return rankedCandidate{}, false, true
+					}
 					return c, true, false
 				}
 				continue
@@ -1441,6 +1462,96 @@ func (s *MutableAutoSelect) streakReplacementLocked(pool, forNetwork []rankedCan
 		}
 	}
 	return rankedCandidate{}, false, len(requested) > 0
+}
+
+// Bounds on how long a release waits, after a member passed, for members
+// ranked above it whose probes are still requested or running: each is given
+// replacementWaitFactor times its delay from its probe's start, within
+// [replacementWaitFloor, replacementWaitMax], and none past
+// replacementWaitMax from the pass or the release's start, whichever is
+// later. A real member's slow probes run about thrice its median delay.
+const (
+	replacementWaitFactor = 4
+	replacementWaitFloor  = 250 * time.Millisecond
+	replacementWaitMax    = time.Second
+)
+
+// awaitHigherRankedLocked reports whether a release that began at began, to
+// a member that passed at passedAt, should wait for above, the members
+// ranked over that one without a probe outcome since began. Only those whose
+// probes are requested or running count. While it waits, it arms
+// replacementWake to retry the release when the earliest wait ends. Caller
+// must hold s.access.
+func (s *MutableAutoSelect) awaitHigherRankedLocked(above []string, passedAt, began time.Time) bool {
+	if len(above) == 0 {
+		return false
+	}
+	now := time.Now()
+	end := passedAt
+	if began.After(end) {
+		end = began
+	}
+	end = end.Add(replacementWaitMax)
+	var until time.Time
+	for _, tag := range above {
+		attempt := s.runningProbeLocked(tag)
+		if state := s.probeMembers[tag]; attempt == nil && (state == nil || state.need == probeNotNeeded) {
+			continue
+		}
+		// One whose probe started before began must be probed again.
+		start := now
+		if attempt != nil && !attempt.started.Before(began) {
+			start = attempt.started
+		}
+		var delayMs uint32
+		if h, ok := s.peekHistoryLocked(tag); ok {
+			delayMs = h.rankDelayMs()
+		}
+		wait := min(max(replacementWaitFactor*time.Duration(delayMs)*time.Millisecond, replacementWaitFloor), replacementWaitMax)
+		deadline := start.Add(wait)
+		if deadline.After(end) {
+			deadline = end
+		}
+		if deadline.After(now) && (until.IsZero() || deadline.Before(until)) {
+			until = deadline
+		}
+	}
+	if until.IsZero() {
+		return false
+	}
+	s.armReplacementWakeLocked(until)
+	return true
+}
+
+// armReplacementWakeLocked retries waiting releases at at, unless a retry
+// is already due no later. Caller must hold s.access.
+func (s *MutableAutoSelect) armReplacementWakeLocked(at time.Time) {
+	if s.replacementWake != nil {
+		if !s.replacementWakeAt.After(at) {
+			return
+		}
+		s.replacementWake.Stop()
+	}
+	var wake *time.Timer
+	wake = time.AfterFunc(time.Until(at), func() {
+		s.access.Lock()
+		defer s.access.Unlock()
+		if s.replacementWake != wake || s.isClosed() {
+			return
+		}
+		s.replacementWake = nil
+		s.retryWaitingReleasesLocked()
+	})
+	s.replacementWake, s.replacementWakeAt = wake, at
+}
+
+// retryWaitingReleasesLocked retries what waits on probes: a pending
+// confirmed-failure switch, a UDP selection's streak release, and, through
+// probeChanged, dials in awaitStreakReplacement. Caller must hold s.access.
+func (s *MutableAutoSelect) retryWaitingReleasesLocked() {
+	s.tryPendingConfirmedSwitchLocked()
+	s.reselectUDPLocked()
+	s.notifyProbesLocked()
 }
 
 // probeStreakReplacementLocked starts the probes a release of tag as
@@ -2715,8 +2826,12 @@ func (s *MutableAutoSelect) settleAfterOutageLocked(tag string, outcome *probeOu
 	}
 	passed, at := a.passed, a.at
 	a.tag = ""
-	if !outcome.success {
-		s.trySwitchAfterConfirmedFailureLocked(tag, passed, at)
+	if !outcome.success && !s.trySwitchAfterConfirmedFailureLocked(tag, passed, at) &&
+		s.pendingConfirmedFailure.tag == "" && s.replacementProbesPendingLocked(tag) {
+		// A member still being probed may be what holds the switch back; the
+		// pending switch retries it as they complete.
+		p := &s.pendingConfirmedFailure
+		p.tag, p.since, p.at, p.replacementFailed = tag, at, outcome.completed, false
 	}
 }
 
@@ -2784,10 +2899,21 @@ func (s *MutableAutoSelect) probePendingLocked(tag string) bool {
 	if state := s.probeMembers[tag]; state != nil && state.need != probeNotNeeded {
 		return true
 	}
+	return s.runningProbeLocked(tag) != nil
+}
+
+// runningProbeLocked returns tag's probe attempt still running, or nil. The
+// attempt being accepted is still in flight but finalized, so not running.
+// Caller must hold s.access.
+func (s *MutableAutoSelect) runningProbeLocked(tag string) *probeAttempt {
 	out, member := s.members.Load(tag)
-	// The attempt being accepted is still in flight but finalized.
-	attempt := s.inFlightProbes[out]
-	return member && attempt != nil && !attempt.finalized
+	if !member {
+		return nil
+	}
+	if attempt := s.inFlightProbes[out]; attempt != nil && !attempt.finalized {
+		return attempt
+	}
+	return nil
 }
 
 // eligibleReplacementLocked requires membership, no recovery gate, and a
@@ -2845,20 +2971,34 @@ func (s *MutableAutoSelect) answeredSinceLocked(tag string, since time.Time) boo
 
 // findProbedReplacementLocked returns the highest-ranked member of
 // replacementPoolLocked whose latest probe passed no earlier than since and
-// that has no recovery gate, or "" if there is none. A soft-demoted member is
+// that has no recovery gate, or "" if there is none or
+// awaitHigherRankedLocked holds it back. A soft-demoted member is
 // returned only once every clean one has a probe outcome since since. Caller
 // must hold s.access.
 func (s *MutableAutoSelect) findProbedReplacementLocked(now time.Time, network, excludeTag string, since time.Time) string {
 	cleanUndecided := false
+	var above []string
 	for _, c := range s.replacementPoolLocked(now, network, excludeTag) {
+		state := s.probeMembers[c.tag]
+		undecided := state == nil || state.outcome == nil || state.outcome.completed.Before(since)
 		if c.demote == demoteClean {
-			state := s.probeMembers[c.tag]
-			cleanUndecided = cleanUndecided || state == nil || state.outcome == nil || state.outcome.completed.Before(since)
+			cleanUndecided = cleanUndecided || undecided
 		} else if cleanUndecided {
 			break
 		}
 		if s.eligibleReplacementLocked(now, c.tag) && s.passedSinceLocked(c.tag, since) {
+			// A zero since passes a member with no outcome.
+			passedAt := now
+			if !undecided {
+				passedAt = state.outcome.completed
+			}
+			if s.awaitHigherRankedLocked(above, passedAt, since) {
+				return ""
+			}
 			return c.tag
+		}
+		if undecided {
+			above = append(above, c.tag)
 		}
 	}
 	return ""

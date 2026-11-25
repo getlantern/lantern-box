@@ -66,7 +66,7 @@ func defaultHistoryParams() historyParams {
 
 // localHistory is the in-memory selection history for one server tag.
 //
-// The probe-outcome scalars (lastSuccessDelayMs, lastOutcomeAt,
+// The probe-outcome scalars (delays, lastOutcomeAt,
 // consecutiveFailures) and the user-traffic userFailures window are
 // kept on separate tracks. A probe success never clears userFailures,
 // so a censor that lets the probe URL through while dropping the
@@ -78,8 +78,17 @@ func defaultHistoryParams() historyParams {
 // breaks the circular dependency where a hard-demoted candidate would
 // otherwise need a successful Read it could never get to recover.
 type localHistory struct {
-	mu                  sync.Mutex
-	lastSuccessDelayMs  uint32
+	mu sync.Mutex
+	// delays holds the latest nDelays successful probe delays, oldest
+	// first; once delaysStale is set, the next one replaces them. Only the
+	// latest is persisted.
+	delays      [delaySamples]uint32
+	nDelays     int
+	delaysStale bool
+	// rankDelay is the lower median of delays, or 0 without one. Probe noise
+	// only ever adds delay, so a single slow sample, even one of two,
+	// doesn't move a member's rank.
+	rankDelay           uint32
 	lastOutcomeAt       time.Time
 	consecutiveFailures uint32
 	// failureTimes holds when the latest of consecutiveFailures happened,
@@ -122,7 +131,7 @@ func (h *localHistory) recordProbe(success bool, delayMs uint32, now time.Time) 
 func (h *localHistory) recordProbeSuccess(delayMs uint32, now time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.lastSuccessDelayMs = delayMs
+	h.addDelaySampleLocked(delayMs)
 	h.lastOutcomeAt = now
 	h.consecutiveFailures, h.failureTimes = 0, h.failureTimes[:0]
 	if !h.recoveryGateStartedAt.IsZero() && now.Sub(h.recoveryGateStartedAt) >= recoveryGateMinDuration {
@@ -130,9 +139,50 @@ func (h *localHistory) recordProbeSuccess(delayMs uint32, now time.Time) {
 	}
 }
 
+// delaySamples is how many successful probe delays a member is ranked by.
+const delaySamples = 5
+
+func (h *localHistory) addDelaySampleLocked(delayMs uint32) {
+	if h.delaysStale {
+		h.nDelays, h.delaysStale = 0, false
+	}
+	if h.nDelays == delaySamples {
+		copy(h.delays[:], h.delays[1:])
+		h.nDelays--
+	}
+	h.delays[h.nDelays] = delayMs
+	h.nDelays++
+	sorted := h.delays
+	slices.Sort(sorted[:h.nDelays])
+	h.rankDelay = sorted[(h.nDelays-1)/2]
+}
+
+// latestDelayLocked returns the latest successful probe delay, or 0 without
+// one.
+func (h *localHistory) latestDelayLocked() uint32 {
+	if h.nDelays == 0 {
+		return 0
+	}
+	return h.delays[h.nDelays-1]
+}
+
+func (h *localHistory) rankDelayMs() uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.rankDelay
+}
+
+// staleDelays makes the next successful probe's delay replace the earlier
+// ones, which were measured on another network.
+func (h *localHistory) staleDelays() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.delaysStale = h.nDelays > 0
+}
+
 // recordProbeFailure increments the consecutive-failure counter and
-// updates lastOutcomeAt. lastSuccessDelayMs is NOT cleared so a member
-// with one transient failure still has a real delay to rank by.
+// updates lastOutcomeAt. delays are NOT cleared, so a member with one
+// transient failure still has a real delay to rank by.
 func (h *localHistory) recordProbeFailure(now time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -467,11 +517,13 @@ func (h *localHistory) userFailureCount(now time.Time, window time.Duration) uin
 	return uint32(len(h.userFailures))
 }
 
-func (h *localHistory) snapshot(now time.Time, window time.Duration) (lastDelay uint32, consec uint32, userFails int, gated bool) {
+// snapshot returns delay as the median of recent successful probes, not the
+// latest one.
+func (h *localHistory) snapshot(now time.Time, window time.Duration) (delay uint32, consec uint32, userFails int, gated bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.userFailures = pruneUserFailures(h.userFailures, now, window)
-	return h.lastSuccessDelayMs, h.consecutiveFailures, len(h.userFailures), !h.recoveryGateStartedAt.IsZero()
+	return h.rankDelay, h.consecutiveFailures, len(h.userFailures), !h.recoveryGateStartedAt.IsZero()
 }
 
 // toTagHistory snapshots the localHistory into adapter.TagHistory form.
@@ -486,7 +538,7 @@ func (h *localHistory) toTagHistory(updatedAt time.Time, p historyParams) *adapt
 	h.userFailures = pruneUserFailures(h.userFailures, updatedAt, p.userFailureWindow)
 	hard, _, _ := demoted(h.consecutiveFailures, uint32(len(h.userFailures)), 0, 0, p)
 	out := &adapter.TagHistory{
-		LastSuccessDelayMs:  h.lastSuccessDelayMs,
+		LastSuccessDelayMs:  h.latestDelayLocked(),
 		LastOutcomeAt:       h.lastOutcomeAt,
 		ConsecutiveFailures: h.consecutiveFailures,
 		HardDemoted:         hard,
@@ -556,7 +608,9 @@ func hydrateLocalHistory(t *adapter.TagHistory, now time.Time, window time.Durat
 	if t == nil {
 		return h
 	}
-	h.lastSuccessDelayMs = t.LastSuccessDelayMs
+	if t.LastSuccessDelayMs > 0 {
+		h.addDelaySampleLocked(t.LastSuccessDelayMs)
+	}
 	h.lastOutcomeAt = t.LastOutcomeAt
 	h.consecutiveFailures = t.ConsecutiveFailures
 	if len(t.UserFailures) > 0 {
