@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.getoutline.org/sdk/transport"
@@ -243,17 +244,22 @@ func siteName(entry string) string {
 		s = host
 	}
 	s = strings.TrimPrefix(strings.TrimPrefix(s, "*."), ".")
-	ascii, err := siteIDNA.ToASCII(s)
-	if err != nil || strings.IndexFunc(ascii, notHostnameRune) >= 0 {
+	// A Unicode name is mapped to the punycode dialed hosts carry, under
+	// IDNA's strict rules. An ASCII one skips IDNA, whose label checks would
+	// reject hosts dialed in practice, such as r3---sn-n4v7knll.googlevideo.com.
+	if strings.IndexFunc(s, func(r rune) bool { return r >= utf8.RuneSelf }) >= 0 {
+		ascii, err := idna.Lookup.ToASCII(s)
+		if err != nil {
+			return ""
+		}
+		s = ascii
+	}
+	s = strings.ToLower(s)
+	if strings.IndexFunc(s, notHostnameRune) >= 0 {
 		return ""
 	}
-	return siteOf(ascii)
+	return siteOf(s)
 }
-
-// siteIDNA maps a configured name to the ASCII form dialed hosts carry. Its
-// domain-name rules are off, so an underscore, which siteOf and dialed hosts
-// allow, gets through; notHostnameRune rejects what they would have.
-var siteIDNA = idna.New(idna.MapForLookup(), idna.Transitional(false), idna.StrictDomainName(false))
 
 func notHostnameRune(r rune) bool {
 	return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.')
