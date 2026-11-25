@@ -53,6 +53,9 @@ func (stubNetworkManager) AutoDetectInterfaceFunc() control.Func    { return nil
 func (stubNetworkManager) ProtectFunc() control.Func                { return nil }
 func (stubNetworkManager) AutoRedirectOutputMarkFunc() control.Func { return nil }
 
+// localTransport creates the "local" DNS server from ctx's registry. For
+// sing-box's own *local.Transport on darwin and windows, ctx must carry a
+// network manager, as localTransportType adds.
 func localTransport(t *testing.T, ctx context.Context) adapter.DNSTransport {
 	t.Helper()
 	registry := service.FromContext[adapter.DNSTransportRegistry](ctx)
@@ -62,8 +65,8 @@ func localTransport(t *testing.T, ctx context.Context) adapter.DNSTransport {
 	return transport
 }
 
-// localTransportType builds the local transport with a stub network manager,
-// which only a local transport needs.
+// localTransportType builds sing-box's *local.Transport with a stub network
+// manager, which only that transport needs.
 func localTransportType(t *testing.T, ctx context.Context) string {
 	t.Helper()
 	ctx = service.ContextWith[adapter.NetworkManager](ctx, stubNetworkManager{})
@@ -80,6 +83,10 @@ func TestContextWithDNSTransport(t *testing.T) {
 		assert.Nil(t, service.FromContext[filemanager.Manager](ctx))
 		transport := localTransport(t, ctx)
 		assert.Equal(t, "*libbox.platformTransport", fmt.Sprintf("%T", transport))
+		// Built with no network manager, which its environment checks for.
+		env, ok := transport.(adapter.DNSTransportWithEnvironment)
+		require.True(t, ok)
+		assert.Nil(t, env.Environment())
 
 		query := new(dns.Msg)
 		query.SetQuestion("example.com.", dns.TypeA)
