@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.getoutline.org/sdk/transport"
@@ -227,21 +228,32 @@ func perSiteDomains(domains []string) (allowed map[string]bool, rejected []strin
 // punycode.
 func siteName(entry string) string {
 	s := strings.TrimSpace(entry)
+	// A scheme only before the path, or a URL in a query would name the site.
 	if i := strings.Index(s, "://"); i >= 0 {
-		s = s[i+3:]
+		if cut := strings.IndexAny(s, "/?#"); cut < 0 || i < cut {
+			s = s[i+3:]
+		}
 	}
 	if i := strings.IndexAny(s, "/?#"); i >= 0 {
 		s = s[:i]
+	}
+	if i := strings.LastIndexByte(s, '@'); i >= 0 {
+		s = s[i+1:]
 	}
 	if host, _, err := net.SplitHostPort(s); err == nil {
 		s = host
 	}
 	s = strings.TrimPrefix(strings.TrimPrefix(s, "*."), ".")
-	ascii, err := idna.Lookup.ToASCII(s)
-	if err != nil {
-		return ""
+	// Only a Unicode name needs IDNA, whose strict rules would also reject
+	// an underscore that siteOf, and dialed hosts, allow.
+	if strings.IndexFunc(s, func(r rune) bool { return r >= utf8.RuneSelf }) >= 0 {
+		ascii, err := idna.Lookup.ToASCII(s)
+		if err != nil {
+			return ""
+		}
+		s = ascii
 	}
-	return siteOf(ascii)
+	return siteOf(s)
 }
 
 // specialUseTLDs are top-level names reserved for local or non-DNS use

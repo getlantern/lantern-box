@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -151,10 +152,17 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 	siteOptions, perSite := perSiteOptions(options)
 	allowed, rejected, anySite := perSiteDomains(options.PerSiteDomains)
 	if perSite && len(rejected) > 0 {
-		log.Warn("outline: per_site_domains entries naming no site, ignored: ", strings.Join(rejected, ", "))
+		quoted := make([]string, len(rejected))
+		for i, r := range rejected {
+			quoted[i] = strconv.Quote(r)
+		}
+		log.Warn("outline: per_site_domains entries naming no site, ignored: ", strings.Join(quoted, ", "))
 	}
 	if perSite && !anySite {
 		log.Warn("outline: per_site_domains names no site, so per-site searches are off")
+	}
+	if !perSite && len(options.PerSiteDomains) > 0 && (options.PerSite == nil || *options.PerSite) {
+		log.Warn("outline: per_site_domains is set, but per-site searches need a https or tls resolver")
 	}
 	if perSite && anySite {
 		siteYAML, err := marshalSmartConfig(siteOptions)

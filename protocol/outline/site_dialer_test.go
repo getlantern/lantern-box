@@ -682,6 +682,11 @@ func TestPerSiteDomains(t *testing.T) {
 	if !ok || allowed != nil || rejected != nil {
 		t.Fatalf("perSiteDomains(nil) = %v, %v, %v; want every site", allowed, rejected, ok)
 	}
+	allowed, rejected, ok = perSiteDomains([]string{"www.YouTube.com.", "instagram.com", "nas.lan", "192.0.2.1", ""})
+	if !ok || len(allowed) != 2 || !allowed["youtube.com"] || !allowed["instagram.com"] ||
+		fmt.Sprint(rejected) != fmt.Sprint([]string{"nas.lan", "192.0.2.1", ""}) {
+		t.Fatalf("perSiteDomains(mixed) = %v, %v, %v", allowed, rejected, ok)
+	}
 	allowed, rejected, ok = perSiteDomains([]string{"nas.lan", "", "github.io"})
 	if ok || len(rejected) != 3 {
 		t.Fatalf("perSiteDomains with no site = %v, %v, %v; want per-site off and all rejected", allowed, rejected, ok)
@@ -690,21 +695,31 @@ func TestPerSiteDomains(t *testing.T) {
 
 func TestSiteName(t *testing.T) {
 	for entry, want := range map[string]string{
-		"youtube.com":                   "youtube.com",
-		"www.YouTube.com.":              "youtube.com",
-		" youtube.com ":                 "youtube.com",
-		".youtube.com":                  "youtube.com",
-		"*.youtube.com":                 "youtube.com",
-		"https://www.youtube.com/watch": "youtube.com",
-		"youtube.com:443":               "youtube.com",
-		"youtube.com/":                  "youtube.com",
-		"例え.jp":                         "xn--r8jz45g.jp",
-		"пример.рф":                     "xn--e1afmkfd.xn--p1ai",
-		"user.github.io":                "user.github.io",
-		"github.io":                     "",
-		"nas.lan":                       "",
-		"192.0.2.1":                     "",
-		"":                              "",
+		"youtube.com":                          "youtube.com",
+		"www.YouTube.com.":                     "youtube.com",
+		" youtube.com ":                        "youtube.com",
+		".youtube.com":                         "youtube.com",
+		"*.youtube.com":                        "youtube.com",
+		"https://www.youtube.com/watch":        "youtube.com",
+		"youtube.com:443":                      "youtube.com",
+		"youtube.com/":                         "youtube.com",
+		"例え.jp":                                "xn--r8jz45g.jp",
+		"пример.рф":                            "xn--e1afmkfd.xn--p1ai",
+		"user.github.io":                       "user.github.io",
+		"github.io":                            "",
+		"google.com/url?q=https://example.com": "google.com",
+		"youtube.com#https://evil.com":         "youtube.com",
+		"https://user:pass@youtube.com/":       "youtube.com",
+		"user@youtube.com":                     "youtube.com",
+		"media_cdn.example.com":                "example.com",
+		"ПРИМЕР.РФ":                            "xn--e1afmkfd.xn--p1ai",
+		"*.github.io":                          "",
+		"[2001:db8::1]:443":                    "",
+		"2001:db8::1":                          "",
+		"youtube.com:":                         "youtube.com",
+		"nas.lan":                              "",
+		"192.0.2.1":                            "",
+		"":                                     "",
 	} {
 		if got := siteName(entry); got != want {
 			t.Errorf("siteName(%q) = %q, want %q", entry, got, want)
