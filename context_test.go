@@ -83,7 +83,8 @@ func TestContextWithDNSTransport(t *testing.T) {
 		assert.Nil(t, service.FromContext[filemanager.Manager](ctx))
 		transport := localTransport(t, ctx)
 		assert.Equal(t, "*libbox.platformTransport", fmt.Sprintf("%T", transport))
-		// Built with no network manager, which its environment checks for.
+		// Built with no network manager. Were the stub to leak in, this would
+		// panic, since the stub doesn't implement DefaultNetworkInterface.
 		env, ok := transport.(adapter.DNSTransportWithEnvironment)
 		require.True(t, ok)
 		assert.Nil(t, env.Environment())
