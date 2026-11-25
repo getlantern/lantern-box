@@ -244,9 +244,11 @@ func siteName(entry string) string {
 		s = host
 	}
 	s = strings.TrimPrefix(strings.TrimPrefix(s, "*."), ".")
-	// A Unicode name is mapped to the punycode dialed hosts carry, under
-	// IDNA's strict rules. An ASCII one skips IDNA, whose label checks would
-	// reject hosts dialed in practice, such as r3---sn-n4v7knll.googlevideo.com.
+	// A name with any Unicode is mapped to the punycode dialed hosts carry,
+	// under IDNA's strict rules for every label, so a hyphenated ASCII label
+	// in it is rejected. An all-ASCII name skips IDNA, whose label checks
+	// would reject hosts dialed in practice, such as
+	// r3---sn-n4v7knll.googlevideo.com.
 	if strings.IndexFunc(s, func(r rune) bool { return r >= utf8.RuneSelf }) >= 0 {
 		ascii, err := idna.Lookup.ToASCII(s)
 		if err != nil {
