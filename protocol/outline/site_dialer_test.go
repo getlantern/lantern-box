@@ -3,6 +3,7 @@ package outline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -674,4 +675,68 @@ func TestSiteDialRaceKeepsDeadline(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestPerSiteDomains(t *testing.T) {
+	allowed, ok := perSiteDomains(nil)
+	if !ok || allowed != nil {
+		t.Fatalf("perSiteDomains(nil) = %v, %v; want every site", allowed, ok)
+	}
+	allowed, ok = perSiteDomains([]string{"www.YouTube.com.", "instagram.com", "nas.lan", "192.0.2.1", ""})
+	if !ok || len(allowed) != 2 || !allowed["youtube.com"] || !allowed["instagram.com"] {
+		t.Fatalf("perSiteDomains = %v, %v; want youtube.com and instagram.com", allowed, ok)
+	}
+	if allowed, ok = perSiteDomains([]string{"nas.lan", ""}); ok {
+		t.Fatalf("perSiteDomains with no valid site = %v, %v; want per-site off", allowed, ok)
+	}
+}
+
+func TestSiteDialersSearchOnlyListedSites(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := &fakeSiteSearch{release: make(chan struct{})}
+		s := newSiteDialers(t.Context(), maxSites, f.search)
+		s.allowed = map[string]bool{"youtube.com": true}
+		if d := s.dialerFor("www.instagram.com", 443); d != nil {
+			t.Fatalf("dialerFor(unlisted) = %v, want nil", d)
+		}
+		s.dialerFor("m.youtube.com", 443)
+		synctest.Wait()
+		if got := f.searched(); len(got) != 1 || got[0] != "m.youtube.com" {
+			t.Fatalf("searched %v, want only the listed site's host", got)
+		}
+		if s.sites.Contains("instagram.com") {
+			t.Fatal("an unlisted site took an LRU entry")
+		}
+		close(f.release)
+	})
+}
+
+func TestNewOutboundPerSiteDomains(t *testing.T) {
+	doh := option.DNSEntryConfig{HTTPS: &option.HTTPSEntryConfig{Name: "dns.google"}}
+	for _, tc := range []struct {
+		name    string
+		domains []string
+		on      bool
+		allowed map[string]bool
+	}{
+		{"unset", nil, true, nil},
+		{"listed", []string{"www.youtube.com"}, true, map[string]bool{"youtube.com": true}},
+		{"none valid", []string{"nas.lan"}, false, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := option.OutboundOutlineOptions{Domains: []string{"example.com"}, DNSResolvers: []option.DNSEntryConfig{doh}, PerSiteDomains: tc.domains}
+			out, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "outline", options)
+			if err != nil {
+				t.Fatalf("NewOutbound: %v", err)
+			}
+			o := out.(*Outbound)
+			defer o.Close()
+			if got := o.sites != nil; got != tc.on {
+				t.Fatalf("per-site searches on = %v, want %v", got, tc.on)
+			}
+			if o.sites != nil && fmt.Sprint(o.sites.allowed) != fmt.Sprint(tc.allowed) {
+				t.Fatalf("allowed = %v, want %v", o.sites.allowed, tc.allowed)
+			}
+		})
+	}
 }

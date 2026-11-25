@@ -147,7 +147,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		searchCtx context.Context
 		cancel    context.CancelFunc
 	)
-	if siteOptions, ok := perSiteOptions(options); ok {
+	siteOptions, perSite := perSiteOptions(options)
+	allowed, anySite := perSiteDomains(options.PerSiteDomains)
+	if perSite && anySite {
 		siteYAML, err := marshalSmartConfig(siteOptions)
 		if err != nil {
 			return nil, err
@@ -165,6 +167,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		sites = newSiteDialers(searchCtx, maxSites, func(ctx context.Context, _, host string) (transport.StreamDialer, error) {
 			return siteFinder.NewDialer(ctx, []string{host}, siteYAML)
 		})
+		sites.allowed = allowed
 	}
 	return &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeOutline, tag, networks, options.DialerOptions),

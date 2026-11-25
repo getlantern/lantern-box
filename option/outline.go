@@ -34,6 +34,12 @@ type OutboundOutlineOptions struct {
 	// searches use only the https and tls resolvers, and are off when there
 	// are none. Unset means true.
 	PerSite *bool `json:"per_site,omitempty"`
+	// PerSiteDomains limits per-site searches to the sites these name, by
+	// registrable domain: www.youtube.com and youtube.com both mean
+	// youtube.com. Every other site uses the Domains search's strategy.
+	// Empty means every site. A list naming no valid site turns per-site
+	// searches off.
+	PerSiteDomains []string `json:"per_site_domains,omitempty"`
 }
 
 // DNSEntryConfig specifies a list of resolvers to test and they can be one of

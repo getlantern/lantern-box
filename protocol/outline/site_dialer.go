@@ -69,6 +69,9 @@ type siteDialers struct {
 	// eviction can't start a second search of a site.
 	inFlight map[string]bool
 	limit    int
+	// allowed, when not nil, holds the only sites that get a dialer of
+	// their own. It is set before the first dial and not changed after.
+	allowed map[string]bool
 }
 
 // siteDialer is a site's dialer. Dialers are compared by this pointer: the
@@ -108,7 +111,7 @@ func newSiteDialers(ctx context.Context, size int, search func(ctx context.Conte
 // can't evict sites that have a dialer.
 func (s *siteDialers) dialerFor(host string, port uint16) *siteDialer {
 	site := siteOf(host)
-	if site == "" {
+	if site == "" || (s.allowed != nil && !s.allowed[site]) {
 		return nil
 	}
 	s.mu.Lock()
@@ -193,6 +196,22 @@ func retryDelay(failures int) time.Duration {
 		d *= 2
 	}
 	return min(d, siteRetryMax)
+}
+
+// perSiteDomains returns the sites domains name, by registrable domain, and
+// true; nil and true when domains is empty, meaning every site; and false
+// when domains names no valid site, so per-site searches are off.
+func perSiteDomains(domains []string) (map[string]bool, bool) {
+	if len(domains) == 0 {
+		return nil, true
+	}
+	allowed := make(map[string]bool, len(domains))
+	for _, d := range domains {
+		if site := siteOf(d); site != "" {
+			allowed[site] = true
+		}
+	}
+	return allowed, len(allowed) > 0
 }
 
 // specialUseTLDs are top-level names reserved for local or non-DNS use
