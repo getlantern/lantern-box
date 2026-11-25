@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.getoutline.org/sdk/transport"
@@ -227,7 +226,7 @@ func perSiteDomains(domains []string) (allowed map[string]bool, rejected []strin
 // sing-box options take domains, or in Unicode, which dialed hosts carry as
 // punycode.
 func siteName(entry string) string {
-	s := strings.TrimSpace(entry)
+	s := strings.TrimPrefix(strings.TrimSpace(entry), "//")
 	// A scheme only before the path, or a URL in a query would name the site.
 	if i := strings.Index(s, "://"); i >= 0 {
 		if cut := strings.IndexAny(s, "/?#"); cut < 0 || i < cut {
@@ -244,16 +243,20 @@ func siteName(entry string) string {
 		s = host
 	}
 	s = strings.TrimPrefix(strings.TrimPrefix(s, "*."), ".")
-	// Only a Unicode name needs IDNA, whose strict rules would also reject
-	// an underscore that siteOf, and dialed hosts, allow.
-	if strings.IndexFunc(s, func(r rune) bool { return r >= utf8.RuneSelf }) >= 0 {
-		ascii, err := idna.Lookup.ToASCII(s)
-		if err != nil {
-			return ""
-		}
-		s = ascii
+	ascii, err := siteIDNA.ToASCII(s)
+	if err != nil || strings.IndexFunc(ascii, notHostnameRune) >= 0 {
+		return ""
 	}
-	return siteOf(s)
+	return siteOf(ascii)
+}
+
+// siteIDNA maps a configured name to the ASCII form dialed hosts carry. Its
+// domain-name rules are off, so an underscore, which siteOf and dialed hosts
+// allow, gets through; notHostnameRune rejects what they would have.
+var siteIDNA = idna.New(idna.MapForLookup(), idna.Transitional(false), idna.StrictDomainName(false))
+
+func notHostnameRune(r rune) bool {
+	return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.')
 }
 
 // specialUseTLDs are top-level names reserved for local or non-DNS use

@@ -162,7 +162,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		log.Warn("outline: per_site_domains names no site, so per-site searches are off")
 	}
 	if !perSite && len(options.PerSiteDomains) > 0 && (options.PerSite == nil || *options.PerSite) {
-		log.Warn("outline: per_site_domains is set, but per-site searches need a https or tls resolver")
+		log.Warn("outline: per_site_domains is set, but per-site searches need an https or tls resolver")
 	}
 	if perSite && anySite {
 		siteYAML, err := marshalSmartConfig(siteOptions)
