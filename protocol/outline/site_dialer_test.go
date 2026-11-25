@@ -371,7 +371,17 @@ func TestPerSiteOptionsKeepOnlyEncryptedResolvers(t *testing.T) {
 	dot := option.DNSEntryConfig{TLS: &option.TLSEntryConfig{Name: "dns.google"}}
 	udp := option.DNSEntryConfig{UDP: &option.UDPEntryConfig{Address: "8.8.8.8:53"}}
 	mixed := option.DNSEntryConfig{System: &struct{}{}, UDP: udp.UDP, HTTPS: doh.HTTPS}
-	got, ok := perSiteOptions(option.OutboundOutlineOptions{DNSResolvers: []option.DNSEntryConfig{udp, doh, dot, mixed}})
+	in := option.OutboundOutlineOptions{
+		DNSResolvers: []option.DNSEntryConfig{udp, doh, dot, mixed},
+		Fallback:     []string{"tlsfrag:1"},
+	}
+	got, ok := perSiteOptions(in)
+	if got.Fallback != nil {
+		t.Fatalf("perSiteOptions kept fallbacks %v, which resolve with the system resolver", got.Fallback)
+	}
+	if len(in.Fallback) != 1 {
+		t.Fatalf("perSiteOptions changed the outbound's fallbacks to %v", in.Fallback)
+	}
 	if !ok || len(got.DNSResolvers) != 3 || got.DNSResolvers[0].HTTPS == nil || got.DNSResolvers[1].TLS == nil {
 		t.Fatalf("perSiteOptions resolvers = %+v (on %v), want the DoH, DoT and mixed entries", got.DNSResolvers, ok)
 	}

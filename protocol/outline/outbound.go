@@ -203,6 +203,11 @@ func perSiteOptions(options option.OutboundOutlineOptions) (option.OutboundOutli
 		return options, false
 	}
 	options.DNSResolvers = encrypted
+	// A fallback dials through the plain base dialer, which resolves the
+	// site's name with the system resolver, so a site search leaves them out.
+	// A site with no strategy of its own uses the outbound's dialer, which
+	// keeps them.
+	options.Fallback = nil
 	return options, true
 }
 
