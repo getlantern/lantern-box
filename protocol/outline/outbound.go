@@ -36,6 +36,11 @@ type Outbound struct {
 	// createDialer runs a strategy search. A failed search is not cached,
 	// because it can fail transiently, e.g. before the network is up.
 	createDialer func() (transport.StreamDialer, error)
+	// sites gives each site a dialer of its own once its search succeeds; nil
+	// when per-site searches are off.
+	sites *siteDialers
+	// cancel ends the site searches.
+	cancel context.CancelFunc
 
 	mu     sync.Mutex
 	dialer transport.StreamDialer
@@ -95,22 +100,30 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 	}
 	registry := newRegistry(&outboundDialer{dialer: sDialer, packetDialer: packetDialer, logger: log})
 
-	finderConfig := smart.NewFinderConfig().
-		SetConfigURLRegistry(registry).
-		SetLogWriter(&logWriter{log})
+	var testTimeout time.Duration
 	if options.TestTimeout != "" {
-		timeout, err := time.ParseDuration(options.TestTimeout)
+		testTimeout, err = time.ParseDuration(options.TestTimeout)
 		if err != nil {
 			return nil, err
 		}
-		if timeout > 0 {
-			finderConfig.SetTestTimeout(timeout)
+	}
+	newFinder := func(cache smart.StrategyResultCache) (smart.Finder, error) {
+		c := smart.NewFinderConfig().
+			SetConfigURLRegistry(registry).
+			SetLogWriter(&logWriter{log})
+		if testTimeout > 0 {
+			c.SetTestTimeout(testTimeout)
 		}
+		if cache != nil {
+			c.SetCache(cache)
+		}
+		return c.New()
 	}
+	var cache smart.StrategyResultCache
 	if options.StrategyCachePath != "" {
-		finderConfig.SetCache(strategyCacheFor(options.StrategyCachePath, log))
+		cache = strategyCacheFor(options.StrategyCachePath, log)
 	}
-	finder, err := finderConfig.New()
+	finder, err := newFinder(cache)
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +142,30 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		}
 		networks = append(networks, N.NetworkUDP)
 	}
+	var (
+		sites     *siteDialers
+		searchCtx context.Context
+		cancel    context.CancelFunc
+	)
+	if siteOptions, ok := perSiteOptions(options); ok {
+		siteYAML, err := marshalSmartConfig(siteOptions)
+		if err != nil {
+			return nil, err
+		}
+		// The finder keeps its winner under one cache key, so sites sharing
+		// the outbound's cache would overwrite each other's; site searches
+		// go uncached.
+		siteFinder, err := newFinder(nil)
+		if err != nil {
+			return nil, err
+		}
+		// The box's context isn't cancelled when it closes, so the
+		// searches get their own, which Close cancels.
+		searchCtx, cancel = context.WithCancel(ctx)
+		sites = newSiteDialers(searchCtx, maxSites, func(ctx context.Context, _, host string) (transport.StreamDialer, error) {
+			return siteFinder.NewDialer(ctx, []string{host}, siteYAML)
+		})
+	}
 	return &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeOutline, tag, networks, options.DialerOptions),
 		logger:  log,
@@ -139,8 +176,39 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 		createDialer: func() (transport.StreamDialer, error) {
 			return finder.NewDialer(ctx, options.Domains, yamlOptions)
 		},
+		sites:          sites,
+		cancel:         cancel,
 		packetListener: packetListener,
 	}, nil
+}
+
+// perSiteOptions returns the options for site searches, and false when
+// per-site searches are off. A search races every resolver for the site's
+// name, where a dial asks only the one its search chose, so site searches
+// use only the encrypted resolvers: a plaintext one would see, and show the
+// network, every site the user reaches. With none, they're off. An entry that
+// also names a plaintext resolver keeps only its encrypted ones, since the
+// finder would prefer the system resolver.
+func perSiteOptions(options option.OutboundOutlineOptions) (option.OutboundOutlineOptions, bool) {
+	if options.PerSite != nil && !*options.PerSite {
+		return options, false
+	}
+	var encrypted []option.DNSEntryConfig
+	for _, e := range options.DNSResolvers {
+		if e.HTTPS != nil || e.TLS != nil {
+			encrypted = append(encrypted, option.DNSEntryConfig{HTTPS: e.HTTPS, TLS: e.TLS})
+		}
+	}
+	if len(encrypted) == 0 {
+		return options, false
+	}
+	options.DNSResolvers = encrypted
+	// A fallback dials through the plain base dialer, which resolves the
+	// site's name with the system resolver, so a site search leaves them out.
+	// A site with no strategy of its own uses the outbound's dialer, which
+	// keeps them.
+	options.Fallback = nil
+	return options, true
 }
 
 // newRegistry returns the default config URL registry with every base
@@ -196,15 +264,150 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, fmt.Errorf("outline: destination %q has no host", destination.String())
 	}
 
+	md.Outbound = o.Tag()
+	md.Destination = destination
+
+	if o.sites != nil && addr.IsFqdn() {
+		if d := o.sites.dialerFor(addr.Fqdn, addr.Port); d != nil {
+			return o.dialSite(ctx, d, addr)
+		}
+	}
+	return o.dialOutbound(ctx, addr.String())
+}
+
+func (o *Outbound) dialOutbound(ctx context.Context, addr string) (transport.StreamConn, error) {
 	d, err := o.getDialer(ctx)
 	if err != nil {
 		return nil, err
 	}
+	return d.DialStream(ctx, addr)
+}
 
-	md.Outbound = o.Tag()
-	md.Destination = destination
+type dialResult struct {
+	conn transport.StreamConn
+	err  error
+	site bool
+}
 
-	return d.DialStream(ctx, addr.String())
+// dialLeg is one dial of a race. Its context ends with the caller's until the
+// leg is settled, and is never cancelled once it wins, since the caller's
+// isn't once its dial has returned. It keeps the caller's deadline, which the
+// SDK's DNS-over-TLS resolver relies on to bound its reads.
+type dialLeg struct {
+	cancel context.CancelFunc
+	detach func() bool
+}
+
+func startLeg(ctx context.Context, site bool, results chan<- dialResult, dial func(context.Context) (transport.StreamConn, error)) *dialLeg {
+	var (
+		legCtx context.Context
+		cancel context.CancelFunc
+	)
+	if deadline, ok := ctx.Deadline(); ok {
+		legCtx, cancel = context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	} else {
+		legCtx, cancel = context.WithCancel(context.WithoutCancel(ctx))
+	}
+	l := &dialLeg{cancel: cancel, detach: context.AfterFunc(ctx, cancel)}
+	go func() {
+		conn, err := dial(legCtx)
+		results <- dialResult{conn, err, site}
+	}()
+	return l
+}
+
+// dialSite dials addr through d, its site's dialer. The outbound's dialer
+// dials too once d fails or hasn't connected within siteDialHeadStart, as it
+// would have without the site's search, and the first connection wins. A site
+// dial that fails, or loses to the outbound's, counts against the site, so a
+// strategy that stalls is dropped like one that fails. A dial whose caller
+// cancelled it says nothing about the strategy, and isn't counted.
+func (o *Outbound) dialSite(ctx context.Context, d *siteDialer, addr metadata.Socksaddr) (net.Conn, error) {
+	host, target := addr.Fqdn, addr.String()
+	results := make(chan dialResult, 2)
+	legs := map[bool]*dialLeg{true: startLeg(ctx, true, results, func(ctx context.Context) (transport.StreamConn, error) {
+		return d.DialStream(ctx, target)
+	})}
+	startOutbound := func() {
+		if legs[false] == nil && ctx.Err() == nil {
+			legs[false] = startLeg(ctx, false, results, func(ctx context.Context) (transport.StreamConn, error) {
+				return o.dialOutbound(ctx, target)
+			})
+		}
+	}
+	// release cancels every leg but keep, which may be nil, and closes any
+	// connection the n still running return.
+	release := func(keep *dialLeg, n int) {
+		for _, l := range legs {
+			if l != keep {
+				l.detach()
+				l.cancel()
+			}
+		}
+		go func() {
+			for range n {
+				if late := <-results; late.conn != nil {
+					late.conn.Close()
+				}
+			}
+		}()
+	}
+	timer := time.NewTimer(siteDialHeadStart)
+	defer timer.Stop()
+
+	var lastErr error
+	for pending := 1; pending > 0; {
+		select {
+		case <-ctx.Done():
+			// A leg that ignores its context mustn't hold the caller.
+			release(nil, pending)
+			return nil, ctx.Err()
+		case <-timer.C:
+			if legs[false] == nil {
+				startOutbound()
+				if legs[false] != nil {
+					pending++
+				}
+			}
+			continue
+		case r := <-results:
+			pending--
+			legs[r.site].detach()
+			if r.err == nil {
+				if r.site {
+					o.sites.dialed(host, d, nil)
+				} else if pending > 0 && ctx.Err() == nil {
+					// The site's dial is still running: it lost.
+					o.sites.dialed(host, d, errSiteDialSlow)
+				}
+				release(legs[r.site], pending)
+				return r.conn, nil
+			}
+			legs[r.site].cancel()
+			lastErr = r.err
+			if r.site {
+				if ctx.Err() == nil {
+					o.sites.dialed(host, d, r.err)
+				}
+				// The site's strategy failed; the outbound's may still work.
+				if legs[false] == nil {
+					startOutbound()
+					if legs[false] != nil {
+						pending++
+					}
+				}
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+// Close ends the outbound's site searches.
+func (o *Outbound) Close() error {
+	if o.cancel != nil {
+		o.cancel()
+	}
+	return nil
 }
 
 // getDialer returns the smart dialer, joining the in-flight search or starting

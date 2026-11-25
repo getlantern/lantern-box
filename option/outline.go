@@ -27,6 +27,13 @@ type OutboundOutlineOptions struct {
 	// StrategyCachePath is a file that keeps the strategies found to work, so
 	// a restart reuses them instead of searching again. Unset disables it.
 	StrategyCachePath string `json:"strategy_cache_path,omitempty"`
+	// PerSite gives each site a user reaches over port 443 its own strategy
+	// search, which tests that site rather than Domains. Until a site's
+	// search succeeds, after one fails, and whenever the site's strategy
+	// fails a dial, its dials use the Domains search's strategy. Site
+	// searches use only the https and tls resolvers, and are off when there
+	// are none. Unset means true.
+	PerSite *bool `json:"per_site,omitempty"`
 }
 
 // DNSEntryConfig specifies a list of resolvers to test and they can be one of
