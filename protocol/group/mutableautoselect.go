@@ -1302,7 +1302,8 @@ func (s *MutableAutoSelect) hardDemotionReleaseLocked(sticky string, pool []rank
 		// One ranked above the member passing is probed too, so its delay
 		// from before isn't taken at face value on the next dial.
 		state := s.probeMembers[c.tag]
-		if state == nil || state.outcome == nil || state.outcome.started.Before(since) {
+		if state == nil || state.outcome == nil || state.outcome.started.Before(since) ||
+			!s.outcomeCurrentLocked(c.tag, state.outcome) {
 			requested = append(requested, c.tag)
 		}
 	}
@@ -2996,7 +2997,8 @@ func (s *MutableAutoSelect) findProbedReplacementLocked(now time.Time, network, 
 	var above []string
 	for _, c := range s.replacementPoolLocked(now, network, excludeTag) {
 		state := s.probeMembers[c.tag]
-		undecided := state == nil || state.outcome == nil || state.outcome.completed.Before(since)
+		undecided := state == nil || state.outcome == nil || state.outcome.completed.Before(since) ||
+			!s.outcomeCurrentLocked(c.tag, state.outcome)
 		if c.demote == demoteClean {
 			cleanUndecided = cleanUndecided || undecided
 		} else if cleanUndecided {

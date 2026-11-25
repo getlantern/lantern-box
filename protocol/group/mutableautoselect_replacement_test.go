@@ -176,6 +176,57 @@ func TestHardDemotion_ReleaseWaitsForAHigherRankedProbe(t *testing.T) {
 	})
 }
 
+// probeThenMoveB probes b and c, then changes b's probe URL, so the pass of
+// b's old URL is obsolete while its new probe runs. b stays ranked above c.
+func probeThenMoveB(t *testing.T, s *MutableAutoSelect, obs map[string]*mockOutbound) {
+	t.Helper()
+	obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(50 * time.Millisecond), nil }
+	obs["c"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(100 * time.Millisecond), nil }
+	s.access.Lock()
+	s.forceProbesLocked("b", "c")
+	s.access.Unlock()
+	time.Sleep(110 * time.Millisecond)
+	synctest.Wait()
+	obs["b"].dial = func(context.Context) (net.Conn, error) { return slowProbeResponderConn(25 * time.Millisecond), nil }
+	s.SetURLOverrides(map[string]string{"b": "http://probe.test/moved"})
+}
+
+func TestConfirmedFailure_ReplacementWaitsForAProbeOfANewURL(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		since := time.Now()
+		probeThenMoveB(t, s, obs)
+		find := func() string {
+			s.access.Lock()
+			defer s.access.Unlock()
+			return s.findProbedReplacementLocked(time.Now(), "tcp", "a", since)
+		}
+		assert.Empty(t, find(), "b's pass of its old URL is no outcome; c's pass waits for its new probe")
+		time.Sleep(100 * time.Millisecond)
+		synctest.Wait()
+		assert.Equal(t, "b", find())
+	})
+}
+
+func TestHardDemotion_ReleaseWaitsForAProbeOfANewURL(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		obs["a"].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("unreachable") }
+		for range s.hist.consecutiveFailLimit {
+			seedProbe(s, "a", false, 0)
+		}
+		probeThenMoveB(t, s, obs)
+		_, _, err := s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		require.Equal(t, "a", loadString(&s.selections[streakTCP].tag), "b's pass of its old URL is no outcome; c's pass waits for its new probe")
+		time.Sleep(100 * time.Millisecond)
+		synctest.Wait()
+		_, _, err = s.selectOutbound("tcp", "")
+		require.NoError(t, err)
+		assert.Equal(t, "b", loadString(&s.selections[streakTCP].tag))
+	})
+}
+
 func TestConfirmedFailure_WaitEndsWithoutAProbeCompleting(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
