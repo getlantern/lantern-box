@@ -790,3 +790,20 @@ func TestNewOutboundPerSiteDomains(t *testing.T) {
 		})
 	}
 }
+
+func TestLoggableEntry(t *testing.T) {
+	for entry, want := range map[string]string{"youtube": `"youtube"`, `bad"entry`: `"bad\"entry"`} {
+		if got := loggableEntry(entry); got != want {
+			t.Errorf("loggableEntry(%q) = %s, want %s", entry, got, want)
+		}
+	}
+	for _, entry := range []string{
+		"https://alice:secret@localhost/",
+		"https://alice:p/ss@localhost/",
+		"alice@youtube",
+	} {
+		if got := loggableEntry(entry); got != "(an entry with an @, not shown)" {
+			t.Errorf("loggableEntry(%q) = %s, want it not shown", entry, got)
+		}
+	}
+}

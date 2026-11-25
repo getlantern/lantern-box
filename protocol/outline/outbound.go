@@ -154,7 +154,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, log log.ContextLogg
 	if perSite && len(rejected) > 0 {
 		quoted := make([]string, len(rejected))
 		for i, r := range rejected {
-			quoted[i] = strconv.Quote(r)
+			quoted[i] = loggableEntry(r)
 		}
 		log.Warn("outline: per_site_domains entries naming no site, ignored: ", strings.Join(quoted, ", "))
 	}
@@ -553,4 +553,14 @@ func (w *logWriter) Write(p []byte) (int, error) {
 		w.logger.Debug(string(p))
 	}
 	return len(p), nil
+}
+
+// loggableEntry quotes a rejected per_site_domains entry for a warning, or
+// names it without its text when it holds an "@", which a URL's credentials
+// need. Parsing the userinfo out would miss a password holding "/" or "#".
+func loggableEntry(entry string) string {
+	if strings.Contains(entry, "@") {
+		return "(an entry with an @, not shown)"
+	}
+	return strconv.Quote(entry)
 }
