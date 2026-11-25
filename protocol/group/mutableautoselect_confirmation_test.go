@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -223,14 +224,14 @@ func TestRecoveryGate_SelectionAndClearing(t *testing.T) {
 func TestRecoveryGate_FallbackDemotionDoesNotRestoreFailedMember(t *testing.T) {
 	s, _ := newConfirmationTestMUR(t, "a", "b")
 	recordSuccess(s, "b", 200)
-	s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load())
+	s.recordUserFailure("a", N.NetworkTCP, adapter.UserFailureDial, s.networkGeneration.Load())
 	seedProbe(s, "a", false, 0)
 	switchAfterConfirmedFailure(s, "a", "b")
 	require.Equal(t, "b", loadString(&s.stickyTag.tcp))
 
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.softFailLimit {
-		s.recordUserFailure("b", adapter.UserFailureStall, s.networkGeneration.Load())
+		s.recordUserFailure("b", N.NetworkTCP, adapter.UserFailureStall, s.networkGeneration.Load())
 	}
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -272,14 +273,14 @@ func TestSplitHealthyFor_RecoveryGate(t *testing.T) {
 func TestRecoveryGate_HardDemotedFallbackRestoresFailedMember(t *testing.T) {
 	s, _ := newConfirmationTestMUR(t, "a", "b")
 	recordSuccess(s, "b", 200)
-	s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load())
+	s.recordUserFailure("a", N.NetworkTCP, adapter.UserFailureDial, s.networkGeneration.Load())
 	seedProbe(s, "a", false, 0)
 	switchAfterConfirmedFailure(s, "a", "b")
 	require.Equal(t, "b", loadString(&s.stickyTag.tcp))
 
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.consecutiveFailLimit {
-		s.recordUserFailure("b", adapter.UserFailureStall, s.networkGeneration.Load())
+		s.recordUserFailure("b", N.NetworkTCP, adapter.UserFailureStall, s.networkGeneration.Load())
 	}
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
