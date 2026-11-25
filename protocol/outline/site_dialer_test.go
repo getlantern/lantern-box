@@ -592,3 +592,36 @@ func TestEvictedSiteNotSearchedTwice(t *testing.T) {
 		}
 	})
 }
+
+func TestCancelledRaceReturnsPromptly(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		late := &fakeStreamConn{}
+		// Ignores its context, as a dialer stuck in a syscall would.
+		stuck := transport.FuncStreamDialer(func(context.Context, string) (transport.StreamConn, error) {
+			time.Sleep(4 * siteDialHeadStart)
+			return late, nil
+		})
+		dest := metadata.ParseSocksaddr("www.youtube.com:443")
+		o := newSiteOutbound(t, &recordingDialer{}, stuck, dest)
+		for range maxSiteDialFailures {
+			late.closed.Store(false)
+			ctx, cancel := context.WithCancel(context.Background())
+			time.AfterFunc(2*siteDialHeadStart, cancel)
+			start := time.Now()
+			if _, err := o.DialContext(ctx, "tcp", dest); !errors.Is(err, context.Canceled) {
+				t.Fatalf("DialContext: got %v, want %v", err, context.Canceled)
+			}
+			if took := time.Since(start); took != 2*siteDialHeadStart {
+				t.Fatalf("cancelled dial returned after %v, want %v", took, 2*siteDialHeadStart)
+			}
+			time.Sleep(4 * siteDialHeadStart)
+			synctest.Wait()
+			if !late.closed.Load() {
+				t.Fatal("the connection the stuck leg returned after the cancel was left open")
+			}
+		}
+		if o.sites.dialerFor("www.youtube.com", 443) == nil {
+			t.Fatal("cancelled dials counted against the site")
+		}
+	})
+}

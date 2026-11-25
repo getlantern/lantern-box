@@ -321,12 +321,33 @@ func (o *Outbound) dialSite(ctx context.Context, d *siteDialer, addr metadata.So
 			})
 		}
 	}
+	// release cancels every leg but keep, which may be nil, and closes any
+	// connection the n still running return.
+	release := func(keep *dialLeg, n int) {
+		for _, l := range legs {
+			if l != keep {
+				l.detach()
+				l.cancel()
+			}
+		}
+		go func() {
+			for range n {
+				if late := <-results; late.conn != nil {
+					late.conn.Close()
+				}
+			}
+		}()
+	}
 	timer := time.NewTimer(siteDialHeadStart)
 	defer timer.Stop()
 
 	var lastErr error
 	for pending := 1; pending > 0; {
 		select {
+		case <-ctx.Done():
+			// A leg that ignores its context mustn't hold the caller.
+			release(nil, pending)
+			return nil, ctx.Err()
 		case <-timer.C:
 			if legs[false] == nil {
 				startOutbound()
@@ -345,20 +366,7 @@ func (o *Outbound) dialSite(ctx context.Context, d *siteDialer, addr metadata.So
 					// The site's dial is still running: it lost.
 					o.sites.dialed(host, d, errSiteDialSlow)
 				}
-				// Cancel and close whatever is still running.
-				for site, l := range legs {
-					if site != r.site {
-						l.detach()
-						l.cancel()
-					}
-				}
-				go func(n int) {
-					for range n {
-						if late := <-results; late.conn != nil {
-							late.conn.Close()
-						}
-					}
-				}(pending)
+				release(legs[r.site], pending)
 				return r.conn, nil
 			}
 			legs[r.site].cancel()
