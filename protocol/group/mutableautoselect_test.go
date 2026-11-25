@@ -79,11 +79,12 @@ func newTestMUR(t *testing.T, tags ...string) (*MutableAutoSelect, map[string]*m
 }
 
 // recordSuccess writes a single fresh probe success to a member's
-// history, returning the timestamp so callers can compute a cycleStart
-// that includes (or excludes) the entry.
+// history, as its only delay sample, returning the timestamp so callers can
+// compute a cycleStart that includes (or excludes) the entry.
 func recordSuccess(s *MutableAutoSelect, tag string, delay uint32) time.Time {
 	now := time.Now()
 	h := s.historyForLocked(tag)
+	h.staleDelays()
 	h.recordProbeSuccess(delay, now)
 	return now
 }
@@ -2052,13 +2053,16 @@ func TestMakeHooks_FailureDoesNotRunLadder(t *testing.T) {
 }
 
 // seedProbe records an outcome for tag as a probe of its current URL on the
-// current network would.
+// current network would; a success becomes its only delay sample.
 func seedProbe(s *MutableAutoSelect, tag string, success bool, delayMs uint32) {
 	s.access.Lock()
 	defer s.access.Unlock()
 	out, ok := s.members.Load(tag)
 	if !ok {
 		return
+	}
+	if success {
+		s.historyForLocked(tag).staleDelays()
 	}
 	s.recordProbeOutcomeLocked(tag, &probeOutcome{
 		success:    success,
