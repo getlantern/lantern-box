@@ -509,12 +509,14 @@ func TestFindProbedReplacement_SoftMemberWaitsForEveryCleanOne(t *testing.T) {
 		}
 		probe("c")
 		s.access.Lock()
-		assert.Empty(t, s.findProbedReplacementLocked(time.Now(), "tcp", "a", since), "b hasn't been probed since")
+		tag, _ := s.findProbedReplacementLocked(time.Now(), "tcp", "a", since)
+		assert.Empty(t, tag, "b hasn't been probed since")
 		s.access.Unlock()
 		probe("b")
 		s.access.Lock()
 		defer s.access.Unlock()
-		assert.Equal(t, "c", s.findProbedReplacementLocked(time.Now(), "tcp", "a", since), "every clean member failed")
+		tag, _ = s.findProbedReplacementLocked(time.Now(), "tcp", "a", since)
+		assert.Equal(t, "c", tag, "every clean member failed")
 	})
 }
 

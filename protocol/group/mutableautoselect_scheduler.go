@@ -1,10 +1,8 @@
 package group
 
 import (
-	"cmp"
 	"context"
 	"errors"
-	"math"
 	"slices"
 	"time"
 
@@ -64,10 +62,9 @@ type memberProbeState struct {
 	// waiters from the earlier membership are rejected.
 	membershipID uint64
 	need         probeNeed
-	// forceRank is tag's lowest position in the forceProbesLocked calls
-	// behind its pending forced probe; forced probes are dispatched by it.
-	// One forced any other way has math.MaxInt.
-	forceRank int
+	// inForceQueue is set only while dispatchOrderLocked runs, for a tag
+	// in forceQueue.
+	inForceQueue bool
 	// confirmationPending waits for an attempt sequenced after confirmSequence;
 	// two failed ones in a row may switch TCP selection to replacement.
 	confirmationPending bool
@@ -174,7 +171,7 @@ func (s *MutableAutoSelect) requestProbesLocked(tags []string, need probeNeed, o
 			continue
 		}
 		if need == probeForced && state.need < probeForced {
-			state.forceRank = math.MaxInt
+			s.forceQueue = slices.DeleteFunc(s.forceQueue, func(t string) bool { return t == tag })
 		}
 		if need > state.need {
 			state.need = need
@@ -183,24 +180,36 @@ func (s *MutableAutoSelect) requestProbesLocked(tags []string, need probeNeed, o
 }
 
 // dispatchOrderLocked returns the members in the order their pending probes
-// take free slots: forced ones by forceRank, then the rest, each in member
-// order. Caller must hold s.access; the result aliases s.scratchDispatch or
-// s.tags and must not be modified.
+// take free slots: forced ones in forceQueue, then the other forced ones,
+// then the rest, each in member order. Caller must hold s.access; the result
+// aliases s.scratchDispatch or s.tags and must not be modified.
 func (s *MutableAutoSelect) dispatchOrderLocked() []string {
-	order := s.scratchDispatch[:0]
+	forced := func(tag string) bool {
+		state := s.probeMembers[tag]
+		return state != nil && state.need == probeForced
+	}
+	s.forceQueue = slices.DeleteFunc(s.forceQueue, func(tag string) bool {
+		state := s.probeMembers[tag]
+		if state == nil || state.need != probeForced {
+			return true
+		}
+		state.inForceQueue = true
+		return false
+	})
+	order := append(s.scratchDispatch[:0], s.forceQueue...)
 	for _, tag := range s.tags {
-		if state := s.probeMembers[tag]; state != nil && state.need == probeForced {
+		if state := s.probeMembers[tag]; state != nil && state.need == probeForced && !state.inForceQueue {
 			order = append(order, tag)
 		}
+	}
+	for _, tag := range s.forceQueue {
+		s.probeMembers[tag].inForceQueue = false
 	}
 	if len(order) == 0 {
 		return s.tags
 	}
-	slices.SortStableFunc(order, func(a, b string) int {
-		return cmp.Compare(s.probeMembers[a].forceRank, s.probeMembers[b].forceRank)
-	})
 	for _, tag := range s.tags {
-		if state := s.probeMembers[tag]; state == nil || state.need != probeForced {
+		if !forced(tag) {
 			order = append(order, tag)
 		}
 	}
@@ -417,7 +426,11 @@ func (s *MutableAutoSelect) acceptProbeLocked(attempt *probeAttempt, err error, 
 			replacementFailed := s.replacementFailedSinceLocked(attempt.tag, first)
 			named := replacement != "" && s.eligibleReplacementLocked(time.Now(), replacement) &&
 				s.answeredSinceLocked(replacement, first) && !replacementFailed
-			if !named || !s.trySwitchAfterConfirmedFailureLocked(attempt.tag, replacement, first) {
+			switched := false
+			if named {
+				switched, _ = s.trySwitchAfterConfirmedFailureLocked(attempt.tag, replacement, first)
+			}
+			if !switched {
 				p := &s.pendingConfirmedFailure
 				p.tag, p.since, p.at = attempt.tag, first, outcome.completed
 				p.replacementFailed, p.afterOutage = replacementFailed, false
@@ -442,10 +455,16 @@ func (s *MutableAutoSelect) recordProbeOutcomeLocked(tag string, outcome *probeO
 	outcome.completed = time.Now()
 	s.probeMembers[tag].outcome = outcome
 	forgiven := !outcome.success && s.startedInOutageLocked(outcome.started)
+	// A last-resort probe started on an earlier network doesn't measure this
+	// one.
+	earlier := !s.matchesGenerationLocked(outcome.generation)
 	s.mutateHistoryLocked(tag, func(h *localHistory, now time.Time) bool {
-		if forgiven {
+		switch {
+		case forgiven:
 			h.recordForgivenProbeFailure(now)
-		} else {
+		case outcome.success && earlier:
+			h.recordEarlierNetworkSuccess(outcome.delayMs, now)
+		default:
 			h.recordProbe(outcome.success, outcome.delayMs, now)
 		}
 		return true
@@ -820,12 +839,72 @@ func (s *MutableAutoSelect) forceProbesLocked(tags ...string) {
 		return
 	}
 	s.requestProbesLocked(tags, probeForced, false)
-	for i, tag := range tags {
-		if state := s.probeMembers[tag]; state != nil && state.need == probeForced && i < state.forceRank {
-			state.forceRank = i
+	s.queueForcedLocked(tags)
+	s.dispatchProbesLocked()
+}
+
+// forceQueueHoldsLocked reports whether forceQueue holds tags' forced
+// probes in tags' order. Caller must hold s.access.
+func (s *MutableAutoSelect) forceQueueHoldsLocked(tags []string) bool {
+	q := 0
+	for _, tag := range tags {
+		if state := s.probeMembers[tag]; state == nil || state.need != probeForced {
+			continue
+		}
+		for q < len(s.forceQueue) && s.forceQueue[q] != tag {
+			q++
+		}
+		if q == len(s.forceQueue) {
+			return false
+		}
+		q++
+	}
+	return true
+}
+
+// queueForcedLocked adds tags' forced probes to forceQueue. One new to the
+// queue goes ahead of the first tag after it in tags that is queued, or else
+// last; then the queued tags in tags take the places they hold in tags'
+// order, leaving the others where they are. It takes time quadratic in the
+// members. Caller must hold s.access.
+func (s *MutableAutoSelect) queueForcedLocked(tags []string) {
+	// Nothing changes when the queue already holds them in this order, as
+	// for dials repeating a waiting release's request.
+	if s.forceQueueHoldsLocked(tags) {
+		return
+	}
+	var named []string
+	for _, tag := range tags {
+		if state := s.probeMembers[tag]; state != nil && state.need == probeForced && !slices.Contains(named, tag) {
+			named = append(named, tag)
 		}
 	}
-	s.dispatchProbesLocked()
+	queued := func(tag string) bool { return slices.Contains(s.forceQueue, tag) }
+	// newBefore returns the tags new to the queue that go just ahead of
+	// named[j], or of the queue's end when j is len(named).
+	newBefore := func(j int) []string {
+		k := j
+		for k > 0 && !queued(named[k-1]) {
+			k--
+		}
+		return named[k:j]
+	}
+	merged := make([]string, 0, len(s.forceQueue)+len(named))
+	for _, tag := range s.forceQueue {
+		if j := slices.Index(named, tag); j >= 0 {
+			merged = append(merged, newBefore(j)...)
+		}
+		merged = append(merged, tag)
+	}
+	merged = append(merged, newBefore(len(named))...)
+	next := 0
+	for i, tag := range merged {
+		if slices.Contains(named, tag) {
+			merged[i] = named[next]
+			next++
+		}
+	}
+	s.forceQueue = merged
 }
 
 // failureSettle is how long a failure that may be the device's own waits
@@ -909,11 +988,13 @@ func (s *MutableAutoSelect) registerProbePauseCallback() {
 	s.probePauseManager = pm
 	s.pauseCallback = pm.RegisterCallback(s.onProbePause)
 	// The manager reports transitions only, not a pause already under way.
-	if pm.IsDevicePaused() || pm.IsNetworkPaused() {
-		s.access.Lock()
+	// Read under access, a wake handled meanwhile can't leave pausedSince
+	// set.
+	s.access.Lock()
+	if s.paused() {
 		s.pausedSince = time.Now()
-		s.access.Unlock()
 	}
+	s.access.Unlock()
 }
 
 // unregisterProbePauseCallback must not be called with s.access held: the
@@ -938,6 +1019,12 @@ func (s *MutableAutoSelect) onProbePause(event int) {
 		s.pauseEpoch++
 		s.pausedSince = time.Now()
 		s.cancelProbesLocked(false)
+		// A switch held after an outage goes back to probing the selection
+		// once awake.
+		if p := s.pendingConfirmedFailure; p.tag != "" && p.afterOutage {
+			s.afterOutage.tag, s.afterOutage.passed, s.afterOutage.at = p.tag, "", p.since
+			s.requestProbesLocked([]string{p.tag}, probeForced, false)
+		}
 		// Probes are canceled unrecorded, and probes after the pause say
 		// nothing about failures before it.
 		s.resetConfirmationsLocked()
@@ -947,13 +1034,14 @@ func (s *MutableAutoSelect) onProbePause(event int) {
 		}
 	case pause.EventDeviceWake, pause.EventNetworkWake:
 		if !s.paused() {
-			s.pausedSince, s.wokeAt = time.Time{}, time.Now()
+			s.pausedSince = time.Time{}
 			s.armPeriodicLocked()
 			if s.outageSuspectedLocked() {
 				s.armOutageRecheckLocked()
 			}
 			s.dispatchProbesLocked()
 			// Releases that waited through the pause wait again, from now.
+			clear(s.releaseAnchors)
 			s.retryWaitingReleasesLocked()
 		}
 	}

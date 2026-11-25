@@ -129,9 +129,20 @@ func (h *localHistory) recordProbe(success bool, delayMs uint32, now time.Time) 
 // delayMs has already been clamped to ≥1 ms by the caller so the
 // "no measurement" sentinel (0) stays unambiguous.
 func (h *localHistory) recordProbeSuccess(delayMs uint32, now time.Time) {
+	h.recordSuccess(delayMs, now, true)
+}
+
+// recordEarlierNetworkSuccess is recordProbeSuccess for a probe started on
+// an earlier network: its delay counts, but delays marked stale stay so
+// until a probe on this network passes.
+func (h *localHistory) recordEarlierNetworkSuccess(delayMs uint32, now time.Time) {
+	h.recordSuccess(delayMs, now, false)
+}
+
+func (h *localHistory) recordSuccess(delayMs uint32, now time.Time, current bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.addDelaySampleLocked(delayMs)
+	h.addDelaySampleLocked(delayMs, current)
 	h.lastOutcomeAt = now
 	h.consecutiveFailures, h.failureTimes = 0, h.failureTimes[:0]
 	if !h.recoveryGateStartedAt.IsZero() && now.Sub(h.recoveryGateStartedAt) >= recoveryGateMinDuration {
@@ -142,9 +153,17 @@ func (h *localHistory) recordProbeSuccess(delayMs uint32, now time.Time) {
 // delaySamples is how many successful probe delays a member is ranked by.
 const delaySamples = 5
 
-func (h *localHistory) addDelaySampleLocked(delayMs uint32) {
-	if h.delaysStale {
+// addDelaySampleLocked adds delayMs to the samples, first dropping those
+// marked stale. One that isn't current is dropped itself when current ones
+// exist; otherwise it joins those marked stale, and is marked stale too.
+func (h *localHistory) addDelaySampleLocked(delayMs uint32, current bool) {
+	switch {
+	case current && h.delaysStale:
 		h.nDelays, h.delaysStale = 0, false
+	case !current && h.nDelays > 0 && !h.delaysStale:
+		return
+	case !current:
+		h.delaysStale = true
 	}
 	if h.nDelays == delaySamples {
 		copy(h.delays[:], h.delays[1:])
@@ -173,7 +192,7 @@ func (h *localHistory) rankDelayMs() uint32 {
 }
 
 // staleDelays makes the next successful probe's delay replace the earlier
-// ones, which were measured on another network.
+// ones, which were measured on another network or to another probe URL.
 func (h *localHistory) staleDelays() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -609,7 +628,9 @@ func hydrateLocalHistory(t *adapter.TagHistory, now time.Time, window time.Durat
 		return h
 	}
 	if t.LastSuccessDelayMs > 0 {
-		h.addDelaySampleLocked(t.LastSuccessDelayMs)
+		// It ranks the member until a live probe passes, whose delay, on
+		// this network and probe endpoint, replaces it.
+		h.addDelaySampleLocked(t.LastSuccessDelayMs, false)
 	}
 	h.lastOutcomeAt = t.LastOutcomeAt
 	h.consecutiveFailures = t.ConsecutiveFailures
