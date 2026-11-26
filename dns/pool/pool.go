@@ -12,6 +12,7 @@ import (
 
 	mDNS "github.com/miekg/dns"
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/log"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -82,19 +83,10 @@ func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, opt
 	return t, nil
 }
 
-func (t *Transport) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStateStart {
-		return nil
-	}
-	manager := service.FromContext[adapter.DNSTransportManager](t.ctx)
-	if manager == nil {
-		return E.New("missing DNS transport manager")
-	}
-	for _, server := range t.servers {
-		if _, found := manager.Transport(server); !found {
-			return E.New("DNS server not found: ", server)
-		}
-	}
+// Start does nothing. The manager checks the servers exist (Dependencies),
+// and looking them up here would deadlock a pool created at runtime: the
+// manager holds its lock while it starts one.
+func (t *Transport) Start(adapter.StartStage) error {
 	return nil
 }
 
@@ -130,6 +122,12 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 			results <- result{index: index, err: E.New("DNS server not found: ", t.servers[index])}
 			return
 		}
+		// A fake IP answered through a pool would be taken as real: the
+		// router recognizes fake answers by the answering server's type.
+		if server.Type() == C.DNSTypeFakeIP {
+			results <- result{index: index, err: E.New("fakeip server in a pool: ", t.servers[index])}
+			return
+		}
 		go func() {
 			exchangeCtx, exchangeCancel := context.WithTimeout(ctx, t.timeout)
 			defer exchangeCancel()
@@ -154,7 +152,10 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 	for pending > 0 {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			if fallback != nil {
+				return fallback, nil
+			}
+			return nil, E.Cause(errors.Join(append(errs, ctx.Err())...), "DNS pool")
 		case <-stagger.C:
 			if next < len(order) {
 				launch()
@@ -163,7 +164,12 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 		case r := <-results:
 			pending--
 			if r.err == nil && acceptable(r.response) {
-				t.setWinner(r.index)
+				// Only an answer makes a server the winner: a censor's or
+				// a hosts server's resolver answers NXDOMAIN fast, and must
+				// not go first for every later query.
+				if r.response.Rcode == mDNS.RcodeSuccess {
+					t.setWinner(r.index)
+				}
 				return r.response, nil
 			}
 			if r.err != nil {

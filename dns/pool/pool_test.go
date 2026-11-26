@@ -9,6 +9,7 @@ import (
 
 	mDNS "github.com/miekg/dns"
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -199,6 +200,45 @@ func TestOptionsAreChecked(t *testing.T) {
 	tr, err := NewTransport(service.ContextWith[adapter.DNSTransportManager](ctx, m), logger, "pool",
 		option.DNSPoolServerOptions{Servers: []string{"missing"}})
 	require.NoError(t, err)
-	assert.ErrorContains(t, tr.Start(adapter.StartStateStart), "not found")
-	assert.Equal(t, []string{"missing"}, tr.Dependencies(), "servers start before the pool")
+	assert.Equal(t, []string{"missing"}, tr.Dependencies(), "the manager checks the servers exist and starts them first")
+	_, err = tr.Exchange(ctx, query())
+	assert.ErrorContains(t, err, "not found")
+}
+
+func TestNXDOMAINIsReturnedButDoesNotWin(t *testing.T) {
+	a := newFakeServer("a", 0, mDNS.RcodeNameError, nil)
+	b := newFakeServer("b", 0, mDNS.RcodeSuccess, nil)
+	p := newPool(t, a, b)
+	response, err := p.Exchange(context.Background(), query())
+	require.NoError(t, err)
+	assert.Equal(t, mDNS.RcodeNameError, response.Rcode)
+	assert.Equal(t, []int{0, 1}, p.order(), "a fast NXDOMAIN, such as a censor's, must not go first for every query")
+}
+
+type fakeIPServer struct{ *fakeServer }
+
+func (fakeIPServer) Type() string { return C.DNSTypeFakeIP }
+
+func TestFakeIPServerIsNotUsed(t *testing.T) {
+	fake := fakeIPServer{newFakeServer("fake", 0, mDNS.RcodeSuccess, nil)}
+	b := newFakeServer("b", 0, mDNS.RcodeSuccess, nil)
+	m := &fakeManager{servers: map[string]adapter.DNSTransport{"fake": fake, "b": b}}
+	tr, err := NewTransport(service.ContextWith[adapter.DNSTransportManager](context.Background(), m),
+		log.NewNOPFactory().Logger(), "pool", option.DNSPoolServerOptions{Servers: []string{"fake", "b"}})
+	require.NoError(t, err)
+	response, err := tr.Exchange(context.Background(), query())
+	require.NoError(t, err)
+	assert.Equal(t, "b", from(t, response))
+	assert.Zero(t, fake.calls.Load(), "a fake answer through a pool would be taken as real")
+}
+
+func TestCallerCancelReturnsARefusalAlreadyReceived(t *testing.T) {
+	a := newFakeServer("a", 0, mDNS.RcodeServerFailure, nil)
+	b := newFakeServer("b", time.Second, mDNS.RcodeSuccess, nil)
+	p := newPool(t, a, b)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	response, err := p.Exchange(ctx, query())
+	require.NoError(t, err)
+	assert.Equal(t, mDNS.RcodeServerFailure, response.Rcode)
 }

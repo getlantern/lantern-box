@@ -8,6 +8,7 @@ import (
 	"github.com/miekg/dns"
 	sbox "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/getlantern/lantern-box/constant"
+	lbO "github.com/getlantern/lantern-box/option"
 )
 
 // TestDNSPoolRegistered checks every context lantern-box builds knows the
@@ -46,7 +48,7 @@ func TestDNSPoolInABox(t *testing.T) {
 			"servers": [
 				{"type": "udp", "tag": "dead", "server": "127.0.0.1", "server_port": 9},
 				{"type": "hosts", "tag": "hosts", "predefined": {"example.com": "192.0.2.7"}},
-				{"type": "pool", "tag": "pool", "servers": ["dead", "hosts"], "stagger": "50ms", "timeout": "1s"}
+				{"type": "dnspool", "tag": "pool", "servers": ["dead", "hosts"], "stagger": "50ms", "timeout": "1s"}
 			],
 			"final": "pool"
 		}
@@ -69,4 +71,23 @@ func TestDNSPoolInABox(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, response.Answer, 1)
 	assert.Equal(t, "192.0.2.7", response.Answer[0].(*dns.A).A.String())
+
+	// A pool created while the box runs must not deadlock the manager,
+	// which holds its lock while it starts the new server.
+	created := make(chan error, 1)
+	go func() {
+		created <- manager.Create(ctx, log.NewNOPFactory().NewLogger("dns"), "pool2", constant.TypeDNSPool,
+			&lbO.DNSPoolServerOptions{Servers: []string{"hosts"}})
+	}()
+	select {
+	case err := <-created:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("creating a pool at runtime deadlocked the DNS manager")
+	}
+	pool2, ok := manager.Transport("pool2")
+	require.True(t, ok)
+	response, err = pool2.Exchange(exchangeCtx, query)
+	require.NoError(t, err)
+	require.Len(t, response.Answer, 1)
 }
