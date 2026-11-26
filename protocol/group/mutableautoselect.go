@@ -1088,8 +1088,15 @@ func (s *MutableAutoSelect) failingLocked(tag string) bool {
 // app holding one socket never makes. Caller must hold s.access.
 func (s *MutableAutoSelect) reselectUDPLocked() {
 	sticky := s.selected(N.NetworkUDP)
-	if sticky == "" || s.streakSinceLocked(sticky, N.NetworkUDP).IsZero() {
+	if sticky == "" {
 		return
+	}
+	since := s.streakSinceLocked(sticky, N.NetworkUDP)
+	if since.IsZero() {
+		return
+	}
+	if !s.streakReleaseAllowedLocked(N.NetworkUDP, sticky, since) {
+		s.probeHeldStreakLocked(sticky, since)
 	}
 	pool, forNetwork := s.splitHealthyForLocked(s.rankLocked(time.Now()), N.NetworkUDP)
 	if len(pool) == 0 {
@@ -1299,8 +1306,11 @@ func (s *MutableAutoSelect) hardDemotionReleaseLocked(sticky string, pool []rank
 // failure streak's limit and may be released for it. Caller must hold
 // s.access.
 func (s *MutableAutoSelect) streakReleaseDueLocked(network string, c rankedCandidate) bool {
-	return c.streak >= consecutiveUserFailureLimit && s.streakReleaseAllowedLocked(network, c.tag) &&
-		!s.streakSinceLocked(c.tag, network).IsZero()
+	if c.streak < consecutiveUserFailureLimit {
+		return false
+	}
+	since := s.streakSinceLocked(c.tag, network)
+	return !since.IsZero() && s.streakReleaseAllowedLocked(network, c.tag, since)
 }
 
 // releaseForStreakLocked releases network's selection, sticky, for
@@ -1344,16 +1354,48 @@ func (s *MutableAutoSelect) closeStuckOnReleaseLocked(network, released string) 
 }
 
 // streakReleaseAllowedLocked reports whether network's selection, sticky,
-// may be released for consecutive failures: once streakSwitchCooldown has
-// passed since the last such release, or at once if sticky hasn't answered
-// since. Caller must hold s.access.
-func (s *MutableAutoSelect) streakReleaseAllowedLocked(network, sticky string) bool {
+// may be released for its failure streak, at the limit since since: once
+// streakSwitchCooldown has passed since the last such release, at once if
+// sticky hasn't answered since then, and otherwise once a probe of sticky
+// started since since has failed, which a chance pair of failures on a
+// member that works doesn't bring. Caller must hold s.access.
+func (s *MutableAutoSelect) streakReleaseAllowedLocked(network, sticky string, since time.Time) bool {
 	last := s.selectionFor(network).lastStreakSwitch
 	if last.IsZero() || time.Since(last) >= streakSwitchCooldown {
 		return true
 	}
 	h, ok := s.peekHistoryLocked(sticky)
-	return !ok || !h.answeredSince(streakNetFor(network), last)
+	if !ok || !h.answeredSince(streakNetFor(network), last) {
+		return true
+	}
+	o := s.streakProbeLocked(sticky, since)
+	return o != nil && !o.success
+}
+
+// streakProbeLocked returns sticky's latest current probe outcome if that
+// probe started no earlier than since, when its failure streak reached the
+// limit, or else nil. Caller must hold s.access.
+func (s *MutableAutoSelect) streakProbeLocked(sticky string, since time.Time) *probeOutcome {
+	state := s.probeMembers[sticky]
+	if state == nil || state.outcome == nil || state.outcome.started.Before(since) || !s.outcomeCurrentLocked(sticky, state.outcome) {
+		return nil
+	}
+	return state.outcome
+}
+
+// probeHeldStreakLocked probes sticky, a selection whose release for its
+// failure streak, at the limit since since, streakSwitchCooldown holds back,
+// unless a probe of it started since then has completed. It reports whether
+// that probe is still to complete. Caller must hold s.access.
+func (s *MutableAutoSelect) probeHeldStreakLocked(sticky string, since time.Time) bool {
+	if s.probeMembers[sticky] == nil || s.streakProbeLocked(sticky, since) != nil ||
+		probe.ValidateURL(s.probeURLForLocked(sticky)) != nil {
+		return false
+	}
+	// A probe started before since completing drops this request, so
+	// each later failure, dial and UDP reselection requests it again.
+	s.forceProbesLocked(sticky)
+	return true
 }
 
 // streakReplacementLocked returns the member to release network's selection,
@@ -1418,7 +1460,9 @@ func (s *MutableAutoSelect) streakReplacementLocked(pool, forNetwork []rankedCan
 		s.forceProbesLocked(requested...)
 	} else if failed > 0 {
 		own := s.probeMembers[sticky]
-		fresh := own != nil && own.outcome != nil && !own.outcome.completed.Before(since) && s.outcomeCurrentLocked(sticky, own.outcome)
+		// sticky's own probe must start since since, as within
+		// streakSwitchCooldown only such a probe decides its release.
+		fresh := own != nil && own.outcome != nil && !own.outcome.started.Before(since) && s.outcomeCurrentLocked(sticky, own.outcome)
 		if !fresh && own != nil && probe.ValidateURL(s.probeURLForLocked(sticky)) == nil {
 			s.forceProbesLocked(sticky)
 			return rankedCandidate{}, false, true
@@ -1445,11 +1489,16 @@ func (s *MutableAutoSelect) streakReplacementLocked(pool, forNetwork []rankedCan
 
 // probeStreakReplacementLocked starts the probes a release of tag as
 // network's selection for consecutive failures waits on, as soon as the
-// streak allows the release, so they are likely done by the next dial.
+// streak reaches its limit, so they are likely done by the next dial: with
+// them, within streakSwitchCooldown, a probe of tag that decides whether it
+// is released.
 // Caller must hold s.access.
 func (s *MutableAutoSelect) probeStreakReplacementLocked(tag, network string) {
 	since := s.streakSinceLocked(tag, network)
-	if since.IsZero() || s.selected(network) != tag || !s.streakReleaseAllowedLocked(network, tag) {
+	if since.IsZero() || s.selected(network) != tag {
+		return
+	}
+	if !s.streakReleaseAllowedLocked(network, tag, since) && !s.probeHeldStreakLocked(tag, since) {
 		return
 	}
 	pool, forNetwork := s.splitHealthyForLocked(s.rankLocked(time.Now()), network)
@@ -1539,15 +1588,20 @@ func (s *MutableAutoSelect) awaitStreakReplacement(ctx context.Context, network 
 // network's selection when applyStickiness would release it for consecutive
 // failures: it requests the probes that decide the replacement, or clears the
 // selection's streak if every fresh probe failed and no failure since the
-// streak began showed the far end answered. It reports whether the
-// release is still waiting on probes. Caller must hold s.access.
+// streak began showed the far end answered. Within streakSwitchCooldown, it
+// also probes the selection, as probeHeldStreakLocked does. It reports
+// whether the release is still waiting on probes. Caller must hold s.access.
 func (s *MutableAutoSelect) startStreakReplacementLocked(network string) bool {
 	sticky := s.selected(network)
 	if sticky == "" {
 		return false
 	}
 	since := s.streakSinceLocked(sticky, network)
-	if since.IsZero() || !s.streakReleaseAllowedLocked(network, sticky) {
+	if since.IsZero() {
+		return false
+	}
+	held := !s.streakReleaseAllowedLocked(network, sticky, since)
+	if held && !s.probeHeldStreakLocked(sticky, since) {
 		return false
 	}
 	pool, forNetwork := s.splitHealthyForLocked(s.rankLocked(time.Now()), network)
@@ -1556,7 +1610,23 @@ func (s *MutableAutoSelect) startStreakReplacementLocked(network string) bool {
 		return false
 	}
 	_, _, pending := s.streakReplacementLocked(pool, forNetwork, network, sticky, since)
-	return pending
+	// A held release holds dials too, when there is a member to release to:
+	// one that comes once the selection's probe has failed goes to it
+	// instead of failing on the selection. No probe runs while paused, so
+	// nothing is waited on then.
+	return (pending || held && hasStreakReplacement(pool, forNetwork, sticky, s.pastRetention)) && !s.paused()
+}
+
+// hasStreakReplacement reports whether pool, or, when pool is the clean tier,
+// forNetwork's soft tier, holds a member other than sticky that
+// streakReplacementLocked could release sticky to.
+func hasStreakReplacement(pool, forNetwork []rankedCandidate, sticky string, pastRetention func(rankedCandidate) bool) bool {
+	if slices.ContainsFunc(pool, func(c rankedCandidate) bool { return c.tag != sticky }) {
+		return true
+	}
+	return len(pool) > 0 && pool[0].demote == demoteClean && slices.ContainsFunc(forNetwork, func(c rankedCandidate) bool {
+		return c.tag != sticky && c.demote == demoteSoft && !pastRetention(c)
+	})
 }
 
 func (s *MutableAutoSelect) selectionFor(network string) *networkSelection {

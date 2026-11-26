@@ -37,7 +37,8 @@ const (
 	// network. Two failures in a row also happen by chance on a member that
 	// mostly works, and releasing on each such pair walks the selection
 	// across working members; a member that hasn't answered since the last
-	// release is released at once, as a broken pick.
+	// release is released at once, as a broken pick, and so is one whose
+	// probe fails once its streak reaches the limit, as it is down.
 	streakSwitchCooldown = 5 * time.Minute
 	// udpRetryWindow bounds the gap between the starts of consecutive failed
 	// UDP exchanges: an app recovering from a dead relay retries within

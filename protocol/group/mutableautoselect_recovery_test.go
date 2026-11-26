@@ -440,6 +440,212 @@ func TestSelectOutbound_StreakReleaseSkipsCooldownForSilentPick(t *testing.T) {
 	})
 }
 
+// streakWithinCooldown puts a, network's selection, at its failure streak's
+// limit within streakSwitchCooldown of the network's last streak release,
+// after a answered following that release. b and c pass their probes; a
+// passes its own if aUp.
+func streakWithinCooldown(t *testing.T, network string, aUp bool) (*MutableAutoSelect, *atomic.Int32) {
+	t.Helper()
+	s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+	var aProbes atomic.Int32
+	obs["a"].dialTo = func(_ context.Context, dest metadata.Socksaddr) (net.Conn, error) {
+		if dest.Fqdn == "probe.test" {
+			aProbes.Add(1)
+		}
+		if aUp {
+			return probeResponderConn(), nil
+		}
+		return nil, errors.New("blocked")
+	}
+	for _, tag := range []string{"b", "c"} {
+		obs[tag].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+	}
+	sel := s.selectionFor(network)
+	sel.tag.Store("a")
+	sel.lastStreakSwitch = time.Now()
+	generation := s.networkGeneration.Load()
+	const dest = "198.51.100.1:443"
+	time.Sleep(time.Second)
+	s.noteUserResponse(s.originAt("a", generation), network, dest, time.Now(), time.Now())
+	time.Sleep(time.Minute)
+	s.noteUnanswered(s.originAt("a", generation), network, dest, time.Now(), time.Now())
+	time.Sleep(time.Second)
+	s.noteUnanswered(s.originAt("a", generation), network, dest, time.Now(), time.Now())
+	return s, &aProbes
+}
+
+func TestUDPStreak_FailedProbeReleasesWithinTheCooldown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, aProbes := streakWithinCooldown(t, "udp", false)
+		synctest.Wait()
+		assert.Equal(t, int32(1), aProbes.Load(), "a is probed at its streak's limit")
+		assert.NotEqual(t, "a", loadString(&s.selections[streakUDP].tag), "a's failed probe shows it down, not unlucky")
+	})
+}
+
+func TestUDPStreak_PassingProbeKeepsTheCooldown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, aProbes := streakWithinCooldown(t, "udp", true)
+		synctest.Wait()
+		assert.Equal(t, int32(1), aProbes.Load(), "a is probed at its streak's limit")
+		assert.Equal(t, "a", loadString(&s.selections[streakUDP].tag), "two failures with a passing probe may be chance")
+	})
+}
+
+func TestDialContext_FailedProbeReleasesAStreakWithinTheCooldown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, aProbes := streakWithinCooldown(t, "tcp", false)
+		synctest.Wait()
+		require.Equal(t, int32(1), aProbes.Load(), "a is probed at its streak's limit")
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+		require.NoError(t, err)
+		conn.Close()
+		assert.NotEqual(t, "a", loadString(&s.selections[streakTCP].tag), "a's failed probe shows it down, not unlucky")
+	})
+}
+
+func TestDialContext_PassingProbeKeepsTheCooldown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, aProbes := streakWithinCooldown(t, "tcp", true)
+		synctest.Wait()
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+		require.NoError(t, err)
+		conn.Close()
+		assert.Equal(t, int32(1), aProbes.Load(), "a is probed at its streak's limit")
+		assert.Equal(t, "a", loadString(&s.selections[streakTCP].tag), "two failures with a passing probe may be chance")
+	})
+}
+
+func TestDialContext_HeldStreakWithNoReplacementHoldsNoDial(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a")
+		obs["a"].dialTo = func(ctx context.Context, dest metadata.Socksaddr) (net.Conn, error) {
+			if dest.Fqdn == "probe.test" {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return probeResponderConn(), nil
+		}
+		s.selections[streakTCP].lastStreakSwitch = time.Now()
+		generation := s.networkGeneration.Load()
+		time.Sleep(time.Second)
+		s.noteUserResponse(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
+		time.Sleep(time.Minute)
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
+		time.Sleep(time.Second)
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
+		start := time.Now()
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+		require.NoError(t, err)
+		conn.Close()
+		assert.Zero(t, time.Since(start), "a, the only member, gains nothing from waiting on its probe")
+	})
+}
+
+func TestDialContext_HeldStreakHoldsNoDialWhilePaused(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		obs["a"].dialTo = func(_ context.Context, dest metadata.Socksaddr) (net.Conn, error) {
+			if dest.Fqdn == "probe.test" {
+				return nil, errors.New("blocked")
+			}
+			return probeResponderConn(), nil
+		}
+		for _, tag := range []string{"b", "c"} {
+			obs[tag].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		}
+		s.selections[streakTCP].lastStreakSwitch = time.Now()
+		generation := s.networkGeneration.Load()
+		time.Sleep(time.Second)
+		s.noteUserResponse(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
+		time.Sleep(time.Minute)
+		// sing-box can leave the network paused after it came back.
+		withPauseManager(s).NetworkPause()
+		time.Sleep(time.Second)
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
+		time.Sleep(time.Second)
+		s.noteUnanswered(s.originAt("a", generation), "tcp", "", time.Now(), time.Now())
+		start := time.Now()
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.ParseSocksaddr("x.test:443"))
+		require.NoError(t, err)
+		conn.Close()
+		assert.Zero(t, time.Since(start), "a's probe can't run while paused")
+	})
+}
+
+func TestUDPStreak_ProbeStartedBeforeTheLimitKeepsTheStreak(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			time.Sleep(500 * time.Millisecond)
+			return nil, errors.New("blocked")
+		}
+		for _, tag := range []string{"b", "c"} {
+			obs[tag].dial = func(context.Context) (net.Conn, error) { return nil, errors.New("blocked") }
+		}
+		s.selections[streakUDP].tag.Store("a")
+		s.selections[streakUDP].lastStreakSwitch = time.Now()
+		generation := s.networkGeneration.Load()
+		const dest = "198.51.100.1:443"
+		time.Sleep(time.Second)
+		s.noteUserResponse(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		time.Sleep(time.Minute)
+		s.noteUnanswered(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		time.Sleep(900 * time.Millisecond)
+		s.access.Lock()
+		s.forceProbesLocked("a")
+		s.access.Unlock()
+		time.Sleep(100 * time.Millisecond)
+		s.noteUnanswered(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		time.Sleep(450 * time.Millisecond)
+		synctest.Wait()
+		s.access.Lock()
+		s.startStreakReplacementLocked("udp")
+		live := !s.streakSinceLocked("a", "udp").IsZero()
+		s.access.Unlock()
+		assert.True(t, live, "a's probe from before its streak's limit, failed with every other member's, doesn't end the streak")
+		time.Sleep(time.Second)
+		synctest.Wait()
+	})
+}
+
+func TestUDPStreak_ProbeStartedBeforeTheLimitDoesNotDecide(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newConfirmationTestMUR(t, "a", "b", "c")
+		var aProbes atomic.Int32
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			aProbes.Add(1)
+			time.Sleep(500 * time.Millisecond)
+			return nil, errors.New("blocked")
+		}
+		for _, tag := range []string{"b", "c"} {
+			obs[tag].dial = func(context.Context) (net.Conn, error) { return probeResponderConn(), nil }
+		}
+		s.selections[streakUDP].tag.Store("a")
+		s.selections[streakUDP].lastStreakSwitch = time.Now()
+		generation := s.networkGeneration.Load()
+		const dest = "198.51.100.1:443"
+		time.Sleep(time.Second)
+		s.noteUserResponse(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		time.Sleep(time.Minute)
+		s.noteUnanswered(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		time.Sleep(900 * time.Millisecond)
+		s.access.Lock()
+		s.forceProbesLocked("a")
+		s.access.Unlock()
+		time.Sleep(100 * time.Millisecond)
+		s.noteUnanswered(s.originAt("a", generation), "udp", dest, time.Now(), time.Now())
+		time.Sleep(450 * time.Millisecond)
+		synctest.Wait()
+		assert.Equal(t, "a", loadString(&s.selections[streakUDP].tag), "a's probe from before its streak's limit doesn't decide the release")
+		assert.Equal(t, int32(2), aProbes.Load(), "its completion leaves a probed again")
+		time.Sleep(time.Second)
+		synctest.Wait()
+		assert.NotEqual(t, "a", loadString(&s.selections[streakUDP].tag), "a's probe since the limit failed")
+		assert.Equal(t, int32(2), aProbes.Load())
+	})
+}
+
 func TestNoteUnanswered_IgnoredWhenMemberAnsweredMeanwhile(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, _ := newTestMUR(t, "a", "b")
