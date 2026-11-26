@@ -242,3 +242,58 @@ func TestCallerCancelReturnsARefusalAlreadyReceived(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, mDNS.RcodeServerFailure, response.Rcode)
 }
+
+func TestEmptyAnswerDoesNotWin(t *testing.T) {
+	a := newFakeServer("a", 0, 0, errors.New("blocked"))
+	b := &emptyServer{newFakeServer("b", 0, mDNS.RcodeSuccess, nil)}
+	m := &fakeManager{servers: map[string]adapter.DNSTransport{"a": a, "b": b}}
+	tr, err := NewTransport(service.ContextWith[adapter.DNSTransportManager](context.Background(), m),
+		log.NewNOPFactory().Logger(), "pool", option.DNSPoolServerOptions{Servers: []string{"a", "b"}})
+	require.NoError(t, err)
+	p := tr.(*Transport)
+	response, err := p.Exchange(context.Background(), query())
+	require.NoError(t, err)
+	assert.Empty(t, response.Answer, "NODATA is still the answer")
+	assert.Equal(t, []int{0, 1}, p.order(), "but no records make no winner")
+}
+
+// emptyServer answers NOERROR with no records.
+type emptyServer struct{ *fakeServer }
+
+func (s *emptyServer) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+	response, err := s.fakeServer.Exchange(ctx, message)
+	if response != nil {
+		response.Answer = nil
+	}
+	return response, err
+}
+
+func TestRcodeErrorIsAnAnswer(t *testing.T) {
+	a := newFakeServer("a", 0, 0, dns.RcodeNameError)
+	b := newFakeServer("b", time.Second, mDNS.RcodeSuccess, nil)
+	p := newPool(t, a, b)
+	started := time.Now()
+	response, err := p.Exchange(context.Background(), query())
+	require.NoError(t, err)
+	assert.Equal(t, mDNS.RcodeNameError, response.Rcode, "a status reported as an error settles the query")
+	assert.Less(t, time.Since(started), time.Second)
+}
+
+type envServer struct {
+	*fakeServer
+	env []string
+}
+
+func (s *envServer) Environment() []string { return s.env }
+
+func TestEnvironmentCombinesTheServers(t *testing.T) {
+	a := &envServer{newFakeServer("a", 0, mDNS.RcodeSuccess, nil), []string{"wifi"}}
+	b := newFakeServer("b", 0, mDNS.RcodeSuccess, nil)
+	m := &fakeManager{servers: map[string]adapter.DNSTransport{"a": a, "b": b}}
+	tr, err := NewTransport(service.ContextWith[adapter.DNSTransportManager](context.Background(), m),
+		log.NewNOPFactory().Logger(), "pool", option.DNSPoolServerOptions{Servers: []string{"a", "b"}})
+	require.NoError(t, err)
+	env, ok := tr.(adapter.DNSTransportWithEnvironment)
+	require.True(t, ok, "the DNS client keys cached answers to the network only for a transport with an environment")
+	assert.Equal(t, []string{"a=wifi"}, env.Environment())
+}

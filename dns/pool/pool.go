@@ -31,7 +31,10 @@ func RegisterTransport(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[option.DNSPoolServerOptions](registry, constant.TypeDNSPool, NewTransport)
 }
 
-var _ adapter.DNSTransport = (*Transport)(nil)
+var (
+	_ adapter.DNSTransport                = (*Transport)(nil)
+	_ adapter.DNSTransportWithEnvironment = (*Transport)(nil)
+)
 
 // Transport tries its servers in order, starting the next one each time the
 // stagger passes or a server fails, and answers with the first acceptable
@@ -94,6 +97,29 @@ func (t *Transport) Close() error {
 	return nil
 }
 
+// Environment identifies the servers' environments, so the DNS client keys
+// the pool's cached answers to them and to the network, as it would each
+// server's: answers from before a network change aren't reused after it.
+func (t *Transport) Environment() []string {
+	manager := service.FromContext[adapter.DNSTransportManager](t.ctx)
+	if manager == nil {
+		return nil
+	}
+	var environment []string
+	for _, tag := range t.servers {
+		server, found := manager.Transport(tag)
+		if !found {
+			continue
+		}
+		if withEnvironment, ok := server.(adapter.DNSTransportWithEnvironment); ok {
+			for _, entry := range withEnvironment.Environment() {
+				environment = append(environment, tag+"="+entry)
+			}
+		}
+	}
+	return environment
+}
+
 // Reset forgets the last winner. The servers reset their own connections.
 func (t *Transport) Reset() {
 	t.winner.Store(-1)
@@ -128,10 +154,19 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 			results <- result{index: index, err: E.New("fakeip server in a pool: ", t.servers[index])}
 			return
 		}
+		// Copied before the worker starts: Exchange may return, and its
+		// caller reuse the message, before the worker runs.
+		request := message.Copy()
 		go func() {
 			exchangeCtx, exchangeCancel := context.WithTimeout(ctx, t.timeout)
 			defer exchangeCancel()
-			response, err := server.Exchange(exchangeCtx, message.Copy())
+			response, err := server.Exchange(exchangeCtx, request)
+			// A transport may report a DNS status as an error, as sing-box's
+			// DNS client expects; it is an answer like any other.
+			var rcodeError dns.RcodeError
+			if errors.As(err, &rcodeError) {
+				response, err = dns.FixedResponseStatus(request, int(rcodeError)), nil
+			}
 			results <- result{index: index, response: response, err: err}
 		}()
 	}
@@ -164,10 +199,10 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 		case r := <-results:
 			pending--
 			if r.err == nil && acceptable(r.response) {
-				// Only an answer makes a server the winner: a censor's or
-				// a hosts server's resolver answers NXDOMAIN fast, and must
-				// not go first for every later query.
-				if r.response.Rcode == mDNS.RcodeSuccess {
+				// Only records make a server the winner: a censor's or a
+				// hosts server's resolver answers NXDOMAIN or no records
+				// fast, and must not go first for every later query.
+				if r.response.Rcode == mDNS.RcodeSuccess && len(r.response.Answer) > 0 {
 					t.setWinner(r.index)
 				}
 				return r.response, nil
