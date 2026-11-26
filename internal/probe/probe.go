@@ -65,7 +65,7 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	})
 	req, err := http.NewRequestWithContext(traceCtx, http.MethodGet, probeURL, nil)
 	if err != nil {
-		return 0, fmt.Errorf("new request: %w", err)
+		return 0, fmt.Errorf("new request: %w", withoutURL(err))
 	}
 	if tp := req.URL.Query().Get("tp"); tp != "" {
 		req.Header.Set("traceparent", tp)
@@ -88,11 +88,7 @@ func Run(ctx context.Context, out A.Outbound, probeURL string, timeout time.Dura
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
-		// A *url.Error's text holds probeURL, whose query can carry credentials.
-		if ue, ok := errors.AsType[*url.Error](err); ok {
-			err = ue.Err
-		}
-		return 0, fmt.Errorf("do request: %w", err)
+		return 0, fmt.Errorf("do request: %w", withoutURL(err))
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
@@ -118,7 +114,7 @@ func probeDestination(probeURL string) (M.Socksaddr, error) {
 	}
 	linkURL, err := url.Parse(probeURL)
 	if err != nil {
-		return M.Socksaddr{}, fmt.Errorf("%w: %w", ErrUnusableInput, err)
+		return M.Socksaddr{}, fmt.Errorf("%w: %w", ErrUnusableInput, withoutURL(err))
 	}
 	hostname := linkURL.Hostname()
 	port := linkURL.Port()
@@ -131,9 +127,19 @@ func probeDestination(probeURL string) (M.Socksaddr, error) {
 		}
 	}
 	if hostname == "" || port == "" {
-		return M.Socksaddr{}, fmt.Errorf("%w: no host or port in probe URL %q", ErrUnusableInput, probeURL)
+		return M.Socksaddr{}, fmt.Errorf("%w: no host or port in probe URL", ErrUnusableInput)
 	}
 	return M.ParseSocksaddrHostPortStr(hostname, port), nil
+}
+
+// withoutURL returns the error a *url.Error in err's chain wraps, or else
+// err: a *url.Error's text holds the whole probe URL, whose query can carry
+// credentials.
+func withoutURL(err error) error {
+	if ue, ok := errors.AsType[*url.Error](err); ok {
+		return ue.Err
+	}
+	return err
 }
 
 // writeTimedConn records when its most recent Write returned, counting only
