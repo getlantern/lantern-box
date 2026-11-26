@@ -155,13 +155,15 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 		return nil, E.New("missing DNS transport manager")
 	}
 	// A pool replaced at runtime can form a cycle the manager doesn't check
-	// for; an exchange that comes back to this pool fails at once.
+	// for; an exchange that comes back to this pool fails at once. (A
+	// member's own lookups through the router that come back here are
+	// already refused by sing-box's DNS client as a loopback.)
 	visiting, _ := ctx.Value(visitingKey{}).([]string)
 	if slices.Contains(visiting, t.Tag()) {
 		return nil, E.New("DNS pool cycle: ", strings.Join(visiting, " -> "), " -> ", t.Tag())
 	}
-	// Clipped, so concurrent exchanges below this one, which share it,
-	// never append into the same spare capacity.
+	// Members share the chain, so it is never appended to in place: every
+	// append starts from a clipped slice, and the stored one is clipped too.
 	ctx = context.WithValue(ctx, visitingKey{}, slices.Clip(append(slices.Clip(visiting), t.Tag())))
 	order := t.order()
 	ctx, cancel := context.WithCancel(ctx)

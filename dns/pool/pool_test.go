@@ -314,7 +314,7 @@ func TestCycleFailsInsteadOfRecursing(t *testing.T) {
 	assert.Empty(t, a.(adapter.DNSTransportWithEnvironment).Environment(), "no stack overflow")
 	started := time.Now()
 	_, err = a.Exchange(context.Background(), query())
-	assert.ErrorContains(t, err, "DNS pool cycle")
+	assert.ErrorContains(t, err, "DNS pool cycle: a -> b -> a")
 	assert.Less(t, time.Since(started), time.Second, "fails at once, not after timeouts")
 }
 
@@ -331,6 +331,7 @@ func TestCycleThroughSeveralMembers(t *testing.T) {
 	}
 	for range 20 {
 		_, err := m.servers["a"].Exchange(context.Background(), query())
-		assert.ErrorContains(t, err, "DNS pool cycle")
+		assert.ErrorContains(t, err, "DNS pool cycle: a -> b -> c -> a")
+		assert.ErrorContains(t, err, "DNS pool cycle: a -> b -> c -> b")
 	}
 }
