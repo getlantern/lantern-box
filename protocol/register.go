@@ -11,11 +11,13 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	boxService "github.com/sagernet/sing-box/adapter/service"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/experimental/libbox"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/service"
 
 	"github.com/getlantern/lantern-box/constant"
+	dnspool "github.com/getlantern/lantern-box/dns/pool"
 	"github.com/getlantern/lantern-box/protocol/algeneva"
 	"github.com/getlantern/lantern-box/protocol/amnezia"
 	"github.com/getlantern/lantern-box/protocol/banditprobe"
@@ -65,6 +67,10 @@ func init() {
 	if !with_ts {
 		delete(protocolSet, C.TypeTailscale)
 	}
+	// lantern-box's own DNS server types, so lantern-cloud sends them only to
+	// clients that can build them: a client rejects a config with an unknown
+	// type outright. sing-box's built-in DNS types are not listed.
+	protocolSet[constant.TypeDNSPool] = struct{}{}
 	supportedProtocols = slices.Collect(maps.Keys(protocolSet))
 }
 
@@ -90,6 +96,11 @@ func RegisterProtocols(ctx context.Context) context.Context {
 	if registry := service.FromContext[adapter.ServiceRegistry](ctx); registry != nil {
 		if reg, ok := registry.(*boxService.Registry); ok {
 			registerServices(reg)
+		}
+	}
+	if registry := service.FromContext[adapter.DNSTransportRegistry](ctx); registry != nil {
+		if reg, ok := common.Cast[*dns.TransportRegistry](registry); ok {
+			registerDNSTransports(reg)
 		}
 	}
 	return ctx
@@ -135,6 +146,10 @@ func registerEndpoints(registry *endpoint.Registry) {
 
 func registerServices(registry *boxService.Registry) {
 	unbounded.RegisterService(registry)
+}
+
+func registerDNSTransports(registry *dns.TransportRegistry) {
+	dnspool.RegisterTransport(registry)
 }
 
 func SupportedProtocols() []string {

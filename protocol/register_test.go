@@ -4,6 +4,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/getlantern/lantern-box/constant"
 	"github.com/getlantern/lantern-box/protocol"
 )
 
@@ -52,5 +53,14 @@ func TestSupportedProtocolsIncludesSamizdatReverse(t *testing.T) {
 			t.Errorf("protocol.SupportedProtocols() does not include %q — "+
 				"register it in protocol/register.go", want)
 		}
+	}
+}
+
+// TestSupportedProtocolsIncludesDNSPool checks the pool DNS server type is
+// advertised: lantern-cloud sends a pool only to clients that list it, since
+// a client rejects a config naming a DNS server type it can't build.
+func TestSupportedProtocolsIncludesDNSPool(t *testing.T) {
+	if !slices.Contains(protocol.SupportedProtocols(), constant.TypeDNSPool) {
+		t.Errorf("protocol.SupportedProtocols() does not include %q", constant.TypeDNSPool)
 	}
 }

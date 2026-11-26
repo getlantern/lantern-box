@@ -24,6 +24,7 @@ const (
 
 const (
 	TypeBanditProbe       = "banditprobe"
+	TypeDNSPool           = "dnspool"
 	TypeFallback          = "fallback"
 	TypeHedge             = "hedge"
 	TypeMutableSelector   = "mutableselector"
