@@ -297,3 +297,23 @@ func TestEnvironmentCombinesTheServers(t *testing.T) {
 	require.True(t, ok, "the DNS client keys cached answers to the network only for a transport with an environment")
 	assert.Equal(t, []string{"a=wifi"}, env.Environment())
 }
+
+// TestCycleFailsInsteadOfRecursing builds two pools that list each other,
+// as replacing a server at runtime can: the manager checks for cycles only
+// at startup.
+func TestCycleFailsInsteadOfRecursing(t *testing.T) {
+	m := &fakeManager{servers: map[string]adapter.DNSTransport{}}
+	ctx := service.ContextWith[adapter.DNSTransportManager](context.Background(), m)
+	logger := log.NewNOPFactory().Logger()
+	a, err := NewTransport(ctx, logger, "a", option.DNSPoolServerOptions{Servers: []string{"b"}})
+	require.NoError(t, err)
+	b, err := NewTransport(ctx, logger, "b", option.DNSPoolServerOptions{Servers: []string{"a"}})
+	require.NoError(t, err)
+	m.servers["a"], m.servers["b"] = a, b
+
+	assert.Empty(t, a.(adapter.DNSTransportWithEnvironment).Environment(), "no stack overflow")
+	started := time.Now()
+	_, err = a.Exchange(context.Background(), query())
+	assert.ErrorContains(t, err, "DNS pool cycle")
+	assert.Less(t, time.Since(started), time.Second, "fails at once, not after timeouts")
+}

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -101,24 +102,39 @@ func (t *Transport) Close() error {
 // the pool's cached answers to them and to the network, as it would each
 // server's: answers from before a network change aren't reused after it.
 func (t *Transport) Environment() []string {
+	return t.environment(nil)
+}
+
+// environment is Environment for a pool reached through the pools in
+// visiting, which it doesn't enter again: a server replaced at runtime
+// isn't checked for cycles, as servers are at startup.
+func (t *Transport) environment(visiting []string) []string {
 	manager := service.FromContext[adapter.DNSTransportManager](t.ctx)
-	if manager == nil {
+	if manager == nil || slices.Contains(visiting, t.Tag()) {
 		return nil
 	}
+	visiting = append(slices.Clip(visiting), t.Tag())
 	var environment []string
 	for _, tag := range t.servers {
 		server, found := manager.Transport(tag)
 		if !found {
 			continue
 		}
-		if withEnvironment, ok := server.(adapter.DNSTransportWithEnvironment); ok {
-			for _, entry := range withEnvironment.Environment() {
-				environment = append(environment, tag+"="+entry)
-			}
+		var entries []string
+		if pool, ok := server.(*Transport); ok {
+			entries = pool.environment(visiting)
+		} else if withEnvironment, ok := server.(adapter.DNSTransportWithEnvironment); ok {
+			entries = withEnvironment.Environment()
+		}
+		for _, entry := range entries {
+			environment = append(environment, tag+"="+entry)
 		}
 	}
 	return environment
 }
+
+// visitingKey keys the tags of the pools an exchange has passed through.
+type visitingKey struct{}
 
 // Reset forgets the last winner. The servers reset their own connections.
 func (t *Transport) Reset() {
@@ -138,6 +154,13 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 	if manager == nil {
 		return nil, E.New("missing DNS transport manager")
 	}
+	// A pool replaced at runtime can form a cycle the manager doesn't check
+	// for; an exchange that comes back to this pool fails at once.
+	visiting, _ := ctx.Value(visitingKey{}).([]string)
+	if slices.Contains(visiting, t.Tag()) {
+		return nil, E.New("DNS pool cycle: ", strings.Join(append(visiting, t.Tag()), " -> "))
+	}
+	ctx = context.WithValue(ctx, visitingKey{}, append(slices.Clip(visiting), t.Tag()))
 	order := t.order()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
