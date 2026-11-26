@@ -67,6 +67,10 @@ func init() {
 	if !with_ts {
 		delete(protocolSet, C.TypeTailscale)
 	}
+	// lantern-box's own DNS server types, so lantern-cloud sends them only to
+	// clients that can build them: a client rejects a config with an unknown
+	// type outright. sing-box's built-in DNS types are not listed.
+	protocolSet[constant.TypeDNSPool] = struct{}{}
 	supportedProtocols = slices.Collect(maps.Keys(protocolSet))
 }
 
