@@ -317,3 +317,20 @@ func TestCycleFailsInsteadOfRecursing(t *testing.T) {
 	assert.ErrorContains(t, err, "DNS pool cycle")
 	assert.Less(t, time.Since(started), time.Second, "fails at once, not after timeouts")
 }
+
+// TestCycleThroughSeveralMembers checks a cycle reached through more than
+// one member of a pool (c's members a and b both lead back) fails too.
+func TestCycleThroughSeveralMembers(t *testing.T) {
+	m := &fakeManager{servers: map[string]adapter.DNSTransport{}}
+	ctx := service.ContextWith[adapter.DNSTransportManager](context.Background(), m)
+	logger := log.NewNOPFactory().Logger()
+	for tag, servers := range map[string][]string{"a": {"b"}, "b": {"c"}, "c": {"a", "b"}} {
+		pool, err := NewTransport(ctx, logger, tag, option.DNSPoolServerOptions{Servers: servers, Stagger: badoption.Duration(time.Millisecond)})
+		require.NoError(t, err)
+		m.servers[tag] = pool
+	}
+	for range 20 {
+		_, err := m.servers["a"].Exchange(context.Background(), query())
+		assert.ErrorContains(t, err, "DNS pool cycle")
+	}
+}

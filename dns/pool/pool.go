@@ -113,7 +113,7 @@ func (t *Transport) environment(visiting []string) []string {
 	if manager == nil || slices.Contains(visiting, t.Tag()) {
 		return nil
 	}
-	visiting = append(slices.Clip(visiting), t.Tag())
+	visiting = slices.Clip(append(slices.Clip(visiting), t.Tag()))
 	var environment []string
 	for _, tag := range t.servers {
 		server, found := manager.Transport(tag)
@@ -158,9 +158,11 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 	// for; an exchange that comes back to this pool fails at once.
 	visiting, _ := ctx.Value(visitingKey{}).([]string)
 	if slices.Contains(visiting, t.Tag()) {
-		return nil, E.New("DNS pool cycle: ", strings.Join(append(visiting, t.Tag()), " -> "))
+		return nil, E.New("DNS pool cycle: ", strings.Join(visiting, " -> "), " -> ", t.Tag())
 	}
-	ctx = context.WithValue(ctx, visitingKey{}, append(slices.Clip(visiting), t.Tag()))
+	// Clipped, so concurrent exchanges below this one, which share it,
+	// never append into the same spare capacity.
+	ctx = context.WithValue(ctx, visitingKey{}, slices.Clip(append(slices.Clip(visiting), t.Tag())))
 	order := t.order()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
