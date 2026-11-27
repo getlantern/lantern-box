@@ -13,6 +13,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing/common/metadata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -58,7 +59,7 @@ func TestDataPlane_QuietReadPolicy(t *testing.T) {
 					var observed dataPlaneIO
 					var activity, observations int
 					w.init(time.Hour, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
-						onFailure:  func(kind adapter.UserFailureKind) { failures = append(failures, kind) },
+						onFailure:  func(kind adapter.UserFailureKind, _ error) { failures = append(failures, kind) },
 						onActivity: func(time.Time) { activity++ },
 						onError: func(err error, state dataPlaneIO, excused bool) {
 							assert.Same(t, readErr, err)
@@ -108,7 +109,7 @@ func TestDataPlane_ExcusedFailureThenLiveResetChargedOnce(t *testing.T) {
 				var decisions []bool
 				var w dataPlaneWatchdog
 				w.init(time.Hour, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
-					onFailure: func(kind adapter.UserFailureKind) { failures = append(failures, kind) },
+					onFailure: func(kind adapter.UserFailureKind, _ error) { failures = append(failures, kind) },
 					onError:   func(_ error, _ dataPlaneIO, excused bool) { decisions = append(decisions, excused) },
 				})
 				defer w.closeWatchdog()
@@ -132,7 +133,7 @@ func TestDataPlane_NoDiagnosticsAfterClose(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var w dataPlaneWatchdog
 		w.init(time.Hour, 0, dataPlaneHooks{
-			onFailure: func(adapter.UserFailureKind) { t.Error("failure after close") },
+			onFailure: func(adapter.UserFailureKind, error) { t.Error("failure after close") },
 			onError:   func(error, dataPlaneIO, bool) { t.Error("diagnostic after close") },
 		})
 		w.closeWatchdog()
@@ -168,7 +169,7 @@ func TestDataPlane_ConcurrentFailureClose(t *testing.T) {
 				var calls atomic.Uint32
 				var w dataPlaneWatchdog
 				w.init(time.Hour, 1, dataPlaneHooks{
-					onFailure: func(adapter.UserFailureKind) { calls.Add(1) },
+					onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) },
 				})
 				defer w.closeWatchdog()
 				w.noteIO(1, nil, true)
@@ -329,7 +330,7 @@ func TestDataPlane_NoResponse(t *testing.T) {
 				var failures []adapter.UserFailureKind
 				var w dataPlaneWatchdog
 				w.init(time.Hour, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
-					onFailure: func(kind adapter.UserFailureKind) { failures = append(failures, kind) },
+					onFailure: func(kind adapter.UserFailureKind, _ error) { failures = append(failures, kind) },
 				})
 				if !tt.disabled {
 					w.firstResponseTimeout = timeout
@@ -381,11 +382,163 @@ func TestDialContext_NoResponseChargedOnTCPOnly(t *testing.T) {
 	}
 }
 
+// instantPacketConn sends and receives each datagram at once.
+type instantPacketConn struct{ net.PacketConn }
+
+var instantPeer = &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 53}
+
+func (instantPacketConn) ReadFrom(p []byte) (int, net.Addr, error)  { return len(p), instantPeer, nil }
+func (instantPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
+func (instantPacketConn) Close() error                              { return nil }
+
+func TestDataPlaneStream_StallCountsFromTheLastIO(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idle = time.Second
+		stalledAt := make(chan time.Time, 1)
+		d := newDataPlaneStream(echoConn{}, idle, 1, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind, _ error) {
+			if kind == adapter.UserFailureStall {
+				stalledAt <- time.Now()
+			}
+		}})
+		defer d.Close()
+		p := make([]byte, dataPlaneStallMinUnanswered)
+		d.Read(p)
+		d.Write(p)
+		time.Sleep(idle / 2)
+		d.Write(p)
+		lastIO := time.Now()
+
+		time.Sleep(2 * idle)
+		select {
+		case at := <-stalledAt:
+			assert.Equal(t, lastIO.Add(idle), at, "a stall is due idle after the last IO, not the one that armed its timer")
+		default:
+			t.Fatal("a proven conn whose last IO was a write never stalled")
+		}
+	})
+}
+
+func TestDataPlanePacket_ExchangeAfterAnAnsweredOneReportsOnItsOwnDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const after = time.Second
+		type report struct{ at, since time.Time }
+		reports := make(chan report, 2)
+		d := newDataPlanePacket(instantPacketConn{}, time.Hour, 1<<20, dataPlaneHooks{onUnanswered: func(since time.Time, _ string) {
+			reports <- report{time.Now(), since}
+		}})
+		defer d.Close()
+		d.unansweredAfter = after
+		d.unansweredWhileOpen = true
+		p := make([]byte, 1)
+		d.WriteTo(p, instantPeer)
+		d.ReadFrom(p)
+		time.Sleep(after / 2)
+		sent := time.Now()
+		d.WriteTo(p, instantPeer)
+
+		time.Sleep(2 * after)
+		synctest.Wait()
+		select {
+		case r := <-reports:
+			assert.Equal(t, sent, r.since, "the report is for the unanswered exchange")
+			assert.Equal(t, sent.Add(after), r.at, "it is due unansweredAfter after its own send")
+		default:
+			t.Fatal("an exchange left unanswered was never reported")
+		}
+		assert.Empty(t, reports, "the answered exchange is not reported")
+	})
+}
+
+func TestDataPlaneStream_NoResponseFollowsASlowResponse(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const slowAfter, timeout = time.Second, 5 * time.Second
+		slowAt := make(chan time.Time, 1)
+		failedAt := make(chan time.Time, 1)
+		d := newDataPlaneStream(echoConn{}, time.Hour, 1, dataPlaneHooks{
+			onSlowResponse: func() { slowAt <- time.Now() },
+			onFailure: func(kind adapter.UserFailureKind, _ error) {
+				if kind == adapter.UserFailureNoResponse {
+					failedAt <- time.Now()
+				}
+			},
+		})
+		defer d.Close()
+		d.firstResponseTimeout = timeout
+		d.slowResponseAfter = slowAfter
+		wrote := time.Now()
+		d.Write([]byte("x"))
+
+		time.Sleep(2 * timeout)
+		synctest.Wait()
+		select {
+		case at := <-slowAt:
+			assert.Equal(t, wrote.Add(slowAfter), at)
+		default:
+			t.Fatal("no slow response was reported")
+		}
+		select {
+		case at := <-failedAt:
+			assert.Equal(t, wrote.Add(timeout), at, "the missing response is still charged when its own timeout passes")
+		default:
+			t.Fatal("no missing response was charged after the slow one")
+		}
+	})
+}
+
+func TestDataPlaneStream_DelayedIODoesNotRewindTheStall(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idle = time.Second
+		start := time.Now()
+		held, release := make(chan struct{}), make(chan struct{})
+		stalledAt := make(chan time.Time, 1)
+		d := newDataPlaneStream(echoConn{}, idle, 1, dataPlaneHooks{
+			// Holds the write made at idle/4 between taking its time and
+			// recording it.
+			onActivity: func(at time.Time) {
+				if at.Sub(start) == idle/4 {
+					close(held)
+					<-release
+				}
+			},
+			onFailure: func(kind adapter.UserFailureKind, _ error) {
+				if kind == adapter.UserFailureStall {
+					stalledAt <- time.Now()
+				}
+			},
+		})
+		defer d.Close()
+		p := make([]byte, dataPlaneStallMinUnanswered)
+		d.Read(p)
+		time.Sleep(idle / 4)
+		done := make(chan struct{})
+		go func() {
+			d.Write(p)
+			close(done)
+		}()
+		<-held
+		time.Sleep(idle / 2)
+		d.Write(p)
+		latest := time.Now()
+		close(release)
+		<-done
+
+		time.Sleep(2 * idle)
+		synctest.Wait()
+		select {
+		case at := <-stalledAt:
+			assert.Equal(t, latest.Add(idle), at, "a stall counts from the latest IO, whichever recorded last")
+		default:
+			t.Fatal("a proven conn whose last IO was a write never stalled")
+		}
+	})
+}
+
 // TestDataPlane_StallNeedsUnansweredBytes checks that going quiet counts as a
 // stall only after enough unanswered writes: an idle keep-alive connection
 // whose last write was one small frame, such as an HTTP/2 WINDOW_UPDATE once a
 // page has loaded, must not be charged.
 func TestDataPlane_StallNeedsUnansweredBytes(t *testing.T) {
+	const idle = time.Second
 	for _, tc := range []struct {
 		name   string
 		io     func(w *dataPlaneWatchdog)
@@ -415,25 +568,146 @@ func TestDataPlane_StallNeedsUnansweredBytes(t *testing.T) {
 			// A dead tunnel the app keeps pinging, with no reply between.
 			w.noteIO(4096, nil, true)
 			for range 7 {
-				w.fireStall() // a quiet window passes
+				time.Sleep(2 * idle) // a quiet window passes
+				synctest.Wait()
 				w.noteIO(40, nil, false)
 			}
 		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var failures []adapter.UserFailureKind
-			var w dataPlaneWatchdog
-			w.init(time.Hour, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
-				onFailure: func(k adapter.UserFailureKind) { failures = append(failures, k) },
+			synctest.Test(t, func(t *testing.T) {
+				failures := make(chan adapter.UserFailureKind, 8)
+				var w dataPlaneWatchdog
+				w.init(idle, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
+					onFailure: func(k adapter.UserFailureKind, _ error) { failures <- k },
+				})
+				defer w.closeWatchdog()
+				tc.io(&w)
+				time.Sleep(2 * idle)
+				synctest.Wait()
+				close(failures)
+				var got []adapter.UserFailureKind
+				for k := range failures {
+					got = append(got, k)
+				}
+				if tc.stalls {
+					assert.Equal(t, []adapter.UserFailureKind{adapter.UserFailureStall}, got)
+				} else {
+					assert.Empty(t, got)
+				}
 			})
-			defer w.closeWatchdog()
-			tc.io(&w)
-			w.fireStall()
-			if tc.stalls {
-				assert.Equal(t, []adapter.UserFailureKind{adapter.UserFailureStall}, failures)
-			} else {
-				assert.Empty(t, failures)
-			}
+		})
+	}
+}
+
+func TestDataPlaneStream_DelayedWriteStillCountsAsUnanswered(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idle = time.Second
+		start := time.Now()
+		held, release := make(chan struct{}), make(chan struct{})
+		stalled := make(chan struct{}, 1)
+		d := newDataPlaneStream(echoConn{}, idle, 1, dataPlaneHooks{
+			// Holds the write made at idle/4 between taking its time and
+			// recording it.
+			onActivity: func(at time.Time) {
+				if at.Sub(start) == idle/4 {
+					close(held)
+					<-release
+				}
+			},
+			onFailure: func(kind adapter.UserFailureKind, _ error) {
+				if kind == adapter.UserFailureStall {
+					stalled <- struct{}{}
+				}
+			},
+		})
+		defer d.Close()
+		d.Read(make([]byte, 1))
+		time.Sleep(idle / 4)
+		done := make(chan struct{})
+		go func() {
+			d.Write(make([]byte, dataPlaneStallMinUnanswered/2+1))
+			close(done)
+		}()
+		<-held
+		time.Sleep(idle / 4)
+		d.Write(make([]byte, dataPlaneStallMinUnanswered/2))
+		close(release)
+		<-done
+
+		time.Sleep(2 * idle)
+		synctest.Wait()
+		assert.Len(t, stalled, 1, "both writes since the last read went unanswered, the delayed one too")
+	})
+}
+
+func TestDialContext_QuietWriteExcused(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, obs := newTestMUR(t, "a")
+		recordSuccess(s, "a", 10)
+		s.cfg.ladderCooldown = time.Hour
+		s.lastLadderAt.Store(time.Now().UnixNano())
+		writeErr := connResetErr()
+		obs["a"].dial = func(context.Context) (net.Conn, error) {
+			return &failingConn{firstN: 48, err: writeErr, failWrite: true}, nil
+		}
+		conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
+		require.NoError(t, err)
+		defer conn.Close()
+		_, err = conn.Read(make([]byte, 64))
+		require.NoError(t, err)
+		// The far end closed the conn while it was idle.
+		time.Sleep(defaultDataPlaneResetQuiet)
+		_, err = conn.Write([]byte("next request"))
+		require.Same(t, writeErr, err)
+		synctest.Wait()
+		uf, _ := userFailures(s, "a")
+		assert.Empty(t, uf)
+	})
+}
+
+func TestDataPlaneStream_HedgeChargesAQuietWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var failures []adapter.UserFailureKind
+		writeErr := connResetErr()
+		d := newDataPlaneStream(&failingConn{firstN: 48, err: writeErr, failWrite: true}, time.Hour,
+			defaultDataPlaneProvedReadBytes, dataPlaneHooks{
+				onFailure: func(kind adapter.UserFailureKind, _ error) { failures = append(failures, kind) },
+			})
+		defer d.Close()
+		_, err := d.Read(make([]byte, 64))
+		require.NoError(t, err)
+		time.Sleep(defaultDataPlaneResetQuiet)
+		_, err = d.Write([]byte("next request"))
+		require.Same(t, writeErr, err)
+		synctest.Wait()
+		assert.Equal(t, []adapter.UserFailureKind{adapter.UserFailureReset}, failures, "the hedge counts a reset after a reply as a strike")
+	})
+}
+
+func TestDataPlane_StreamTheServerClosedInOrderIsNoFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		charged bool
+	}{
+		{"closed in order", &quic.StreamError{StreamID: 4, ErrorCode: 0, Remote: true}, false},
+		{"canceled with an error", &quic.StreamError{StreamID: 4, ErrorCode: 1, Remote: true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var failures int
+				writeErr := fmt.Errorf("hysteria2: %w", tc.err)
+				d := newDataPlaneStream(&failingConn{err: writeErr, failWrite: true}, time.Hour,
+					defaultDataPlaneProvedReadBytes, dataPlaneHooks{
+						onFailure: func(adapter.UserFailureKind, error) { failures++ },
+					})
+				defer d.Close()
+				_, err := d.Write([]byte("request"))
+				require.Same(t, writeErr, err)
+				synctest.Wait()
+				assert.Equal(t, tc.charged, failures == 1)
+			})
 		})
 	}
 }

@@ -20,6 +20,11 @@ type mockOutbound struct {
 	// on the second probe. It receives the caller's context so a stub can
 	// honor the probe deadline the way a real outbound does.
 	dial func(context.Context) (net.Conn, error)
+	// dialTo, when set, supersedes dial for a stub that tells probes from
+	// user traffic by destination.
+	dialTo func(context.Context, metadata.Socksaddr) (net.Conn, error)
+	// listen, when set, supersedes the mock expectation for ListenPacket.
+	listen func(context.Context) (net.PacketConn, error)
 }
 
 func (m *mockOutbound) Tag() string { return m.tag }
@@ -31,6 +36,9 @@ func (m *mockOutbound) Network() []string {
 }
 
 func (m *mockOutbound) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
+	if m.dialTo != nil {
+		return m.dialTo(ctx, destination)
+	}
 	if m.dial != nil {
 		return m.dial(ctx)
 	}
@@ -40,6 +48,9 @@ func (m *mockOutbound) DialContext(ctx context.Context, network string, destinat
 }
 
 func (m *mockOutbound) ListenPacket(ctx context.Context, destination metadata.Socksaddr) (net.PacketConn, error) {
+	if m.listen != nil {
+		return m.listen(ctx)
+	}
 	args := m.Called()
 	pc, _ := args.Get(0).(net.PacketConn)
 	return pc, args.Error(1)

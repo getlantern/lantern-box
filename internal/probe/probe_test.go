@@ -119,6 +119,17 @@ func TestRun_UnusableInputNeverDials(t *testing.T) {
 	}
 }
 
+func TestRun_UnusableURLErrorHoldsNoCredentials(t *testing.T) {
+	for _, probeURL := range []string{
+		"https://probe.test/%zz?token=secret",
+		"https:///x?token=secret",
+	} {
+		_, err := Run(context.Background(), &stubOutbound{}, probeURL, time.Second)
+		require.ErrorIs(t, err, ErrUnusableInput)
+		assert.NotContains(t, err.Error(), "secret", probeURL)
+	}
+}
+
 func TestRun_DialFailureWrapsTheOutboundsError(t *testing.T) {
 	denied := errors.New("dial denied")
 	out := &stubOutbound{dial: func(context.Context) (net.Conn, error) {

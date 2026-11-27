@@ -216,7 +216,7 @@ func (h *Hedge) route(ctx context.Context, network string, destination M.Socksad
 }
 
 func (h *Hedge) markBad(ctx context.Context, key hedgeKey, why any) {
-	h.logger.DebugContext(ctx, "hedge: ", h.firstTag, " failed for ", key.site, "/", key.network, " (", why, "), using ", h.thenTag)
+	h.logger.DebugContext(ctx, "hedge: ", h.firstTag, " failed for ", key.site, "/", key.network, " (", fmt.Sprint(why), "), using ", h.thenTag)
 	h.cache.mark(key, hedgeBad, h.cfg.failureTTL)
 }
 

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -227,14 +228,14 @@ func TestToTagHistory_HardDemoted(t *testing.T) {
 	// are not hard demoted.
 	soft := newLocalHistory()
 	for i := uint32(0); i < p.softFailLimit; i++ {
-		soft.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, p.userFailureWindow, 0)
+		soft.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, p.userFailureWindow, 0)
 	}
 	assert.False(t, soft.toTagHistory(now, p).HardDemoted,
 		"user failures below the hard limit are not hard demoted")
 
 	userHard := newLocalHistory()
 	for i := uint32(0); i < p.consecutiveFailLimit; i++ {
-		userHard.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, p.userFailureWindow, 0)
+		userHard.addUserFailure(adapter.UserFailure{At: now.Add(-time.Duration(i) * time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, p.userFailureWindow, 0)
 	}
 	assert.True(t, userHard.toTagHistory(now, p).HardDemoted,
 		"user failures at the hard limit are hard demoted")
@@ -247,8 +248,8 @@ func TestLocalHistory_UserFailuresIndependentOfProbeOutcomes(t *testing.T) {
 	// laundered to clean by a passing probe.
 	h := newLocalHistory()
 	now := time.Now()
-	h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
-	h.addUserFailure(adapter.UserFailure{At: now.Add(time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now.Add(time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, 0)
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(2*time.Second), 5*time.Minute))
 	h.recordProbeSuccess(100, now.Add(3*time.Second))
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(4*time.Second), 5*time.Minute),
@@ -261,8 +262,8 @@ func TestLocalHistory_UserFailuresAgeOut(t *testing.T) {
 	// regardless of whether traffic gets routed through it.
 	h := newLocalHistory()
 	now := time.Now()
-	h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
-	h.addUserFailure(adapter.UserFailure{At: now.Add(time.Minute), Kind: adapter.UserFailureStall}, 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, 0)
+	h.addUserFailure(adapter.UserFailure{At: now.Add(time.Minute), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, 0)
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(time.Minute), 5*time.Minute))
 	// Six minutes later, both are stale.
 	assert.Equal(t, uint32(0), h.userFailureCount(now.Add(6*time.Minute), 5*time.Minute),
@@ -278,12 +279,12 @@ func TestLocalHistory_AddUserFailureDedupesBurst(t *testing.T) {
 	now := time.Now()
 	dedupe := 30 * time.Second
 
-	require.True(t, h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "first failure must record")
-	require.False(t, h.addUserFailure(adapter.UserFailure{At: now.Add(time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "burst within dedupe must drop")
-	require.False(t, h.addUserFailure(adapter.UserFailure{At: now.Add(29 * time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "still within dedupe must drop")
+	require.True(t, h.addUserFailure(adapter.UserFailure{At: now, Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, dedupe), "first failure must record")
+	require.False(t, h.addUserFailure(adapter.UserFailure{At: now.Add(time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, dedupe), "burst within dedupe must drop")
+	require.False(t, h.addUserFailure(adapter.UserFailure{At: now.Add(29 * time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, dedupe), "still within dedupe must drop")
 	assert.Equal(t, uint32(1), h.userFailureCount(now.Add(30*time.Second), 5*time.Minute), "burst collapsed to one")
 
-	require.True(t, h.addUserFailure(adapter.UserFailure{At: now.Add(30 * time.Second), Kind: adapter.UserFailureStall}, 5*time.Minute, dedupe), "at-or-past dedupe must record")
+	require.True(t, h.addUserFailure(adapter.UserFailure{At: now.Add(30 * time.Second), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, 5*time.Minute, dedupe), "at-or-past dedupe must record")
 	assert.Equal(t, uint32(2), h.userFailureCount(now.Add(30*time.Second), 5*time.Minute))
 }
 
@@ -301,7 +302,7 @@ func TestHydrateLocalHistory_DropsAgedUserFailures(t *testing.T) {
 	h := hydrateLocalHistory(persisted, now, 5*time.Minute)
 	lastDelay, _, userFails, _ := h.snapshot(now, 5*time.Minute)
 	assert.Equal(t, uint32(120), lastDelay)
-	assert.Len(t, userFails, 1, "stale user-failure timestamp must be dropped on hydrate")
+	assert.Equal(t, 1, userFails, "stale user-failure timestamp must be dropped on hydrate")
 }
 
 func TestBehaviorFor_Timeouts(t *testing.T) {
@@ -378,7 +379,13 @@ func userFailures(s *MutableAutoSelect, tag string) ([]adapter.UserFailure, bool
 	if !ok {
 		return nil, false
 	}
-	_, _, uf, _ := h.snapshot(time.Now(), s.hist.userFailureWindow)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.userFailures = pruneUserFailures(h.userFailures, time.Now(), s.hist.userFailureWindow)
+	var uf []adapter.UserFailure
+	if len(h.userFailures) > 0 {
+		uf = slices.Clone(h.userFailures)
+	}
 	return uf, true
 }
 
@@ -389,7 +396,7 @@ func addUserFailureN(s *MutableAutoSelect, tag string, n int) {
 	h := s.historyForLocked(tag)
 	now := time.Now()
 	for i := 0; i < n; i++ {
-		h.addUserFailure(adapter.UserFailure{At: now.Add(time.Duration(i) * time.Millisecond), Kind: adapter.UserFailureStall}, s.hist.userFailureWindow, 0)
+		h.addUserFailure(adapter.UserFailure{At: now.Add(time.Duration(i) * time.Millisecond), Kind: adapter.UserFailureStall}, streakTCP, time.Time{}, s.hist.userFailureWindow, 0)
 	}
 }
 
@@ -460,7 +467,7 @@ func TestSelectOutbound_SwitchTolerance(t *testing.T) {
 			s.cfg.switchTolerancePercent = tt.percent
 			recordSuccess(s, "alpha", tt.alphaDelay)
 			recordSuccess(s, "beta", tt.betaDelay)
-			s.stickyTag.tcp.Store("alpha")
+			s.selections[streakTCP].tag.Store("alpha")
 			got, _, err := s.selectOutbound("tcp", "")
 			require.NoError(t, err)
 			require.NotNil(t, got)
@@ -473,7 +480,7 @@ func TestSelectOutbound_ForcedSwitchWhenStickyNotInPool(t *testing.T) {
 	s, _ := newTestMUR(t, "alpha", "beta")
 	recordSuccess(s, "beta", 120)
 	addUserFailureN(s, "alpha", int(s.hist.consecutiveFailLimit))
-	s.stickyTag.tcp.Store("alpha")
+	s.selections[streakTCP].tag.Store("alpha")
 
 	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -487,20 +494,20 @@ func TestSelectOutbound_RecordsStickyAfterPick(t *testing.T) {
 	recordSuccess(s, "a", 50)
 	_, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
-	assert.Equal(t, "a", loadString(&s.stickyTag.tcp))
+	assert.Equal(t, "a", loadString(&s.selections[streakTCP].tag))
 }
 
 func TestSelectOutboundExcluding_SkipsTargetAndDoesNotMutateSticky(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	recordSuccess(s, "a", 30)
 	recordSuccess(s, "b", 50)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	got, _, err := s.selectOutbound("tcp", "a")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Tag(), "fast-failover must skip the excluded tag")
-	assert.Equal(t, "a", loadString(&s.stickyTag.tcp),
+	assert.Equal(t, "a", loadString(&s.selections[streakTCP].tag),
 		"a fast-failover pick must not poison the sticky tag")
 }
 
@@ -554,14 +561,16 @@ func TestRemove_DeletesURLOverride(t *testing.T) {
 
 func TestSetURLOverrides_KeepsSelectionOffFailedMember(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
-	withPauseManager(s).NetworkPause()
+	pm := withPauseManager(s)
 	s.urlOverrides = map[string]string{"a": "https://override.example/a?token=1", "b": "https://override.example/b?token=1"}
 	recordSuccess(s, "a", 100)
 	recordSuccess(s, "b", 200)
 	s.hist.userFailureDedupeWindow = 0
 	for range s.hist.consecutiveFailLimit {
-		s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load())
+		s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureNoResponse, time.Time{}, "tcp", nil)
 	}
+	// Paused after the failures, which a paused network doesn't charge.
+	pm.NetworkPause()
 	o, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
 	require.Equal(t, "b", o.Tag())
@@ -594,7 +603,7 @@ func TestDataPlaneStream_StallSuppressedUntilProven(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 100
 	d := newDataPlaneStream(stallConn{}, 10*time.Millisecond, provedReadBytes,
-		dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+		dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, uint32(0), calls.Load(),
@@ -608,7 +617,7 @@ func TestDataPlaneStream_StallFiresAfterProven(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 50
 	d := newDataPlaneStream(echoConn{}, 30*time.Millisecond, provedReadBytes,
-		dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+		dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	// Drive enough Read bytes to prove the conn.
@@ -638,7 +647,7 @@ func TestDataPlaneStream_StallSuppressedOnReadOnlyIdle(t *testing.T) {
 	var calls atomic.Uint32
 	const provedReadBytes = 50
 	d := newDataPlaneStream(echoConn{}, 30*time.Millisecond, provedReadBytes,
-		dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+		dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	_, err := d.Read(make([]byte, provedReadBytes))
@@ -659,7 +668,7 @@ func TestDataPlaneStream_CloseIsIdempotent(t *testing.T) {
 
 func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
-	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	d.proven.Store(true)                              // simulate a proven conn so fireStall isn't gated on the proven check
 	d.noteIO(dataPlaneStallMinUnanswered, nil, false) // ...nor on the unanswered-bytes gate
 	d.Close()
@@ -669,7 +678,7 @@ func TestDataPlaneStream_NoStallAfterClose(t *testing.T) {
 
 func TestDataPlanePacket_NoStallAfterClose(t *testing.T) {
 	var calls atomic.Uint32
-	d := newDataPlanePacket(stallPacketConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlanePacket(stallPacketConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	d.proven.Store(true)
 	d.noteIO(dataPlaneStallMinUnanswered, nil, false)
 	d.Close()
@@ -762,8 +771,8 @@ func TestLateProbeAfterRemoveRecordsNothing(t *testing.T) {
 
 func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	assert.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load()), "first call must persist")
-	assert.False(t, s.recordUserFailure("a", adapter.UserFailureStall, s.networkGeneration.Load()), "immediate burst must return false (deduped)")
+	assert.True(t, s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureDial, time.Time{}, "tcp", nil), "first call must persist")
+	assert.False(t, s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureStall, time.Time{}, "tcp", nil), "immediate burst must return false (deduped)")
 	s.access.Lock()
 	h, ok := s.peekHistoryLocked("a")
 	s.access.Unlock()
@@ -771,7 +780,7 @@ func TestRecordUserFailure_AppendsAndBoundedByMembership(t *testing.T) {
 	assert.Equal(t, uint32(1), h.userFailureCount(time.Now(), s.hist.userFailureWindow),
 		"successive calls within dedupe window must collapse")
 
-	assert.False(t, s.recordUserFailure("nonexistent", adapter.UserFailureDial, s.networkGeneration.Load()), "non-member must return false")
+	assert.False(t, s.recordUserFailure(s.originAt("nonexistent", s.networkGeneration.Load()), adapter.UserFailureDial, time.Time{}, "tcp", nil), "non-member must return false")
 	s.access.Lock()
 	_, exists := s.peekHistoryLocked("nonexistent")
 	s.access.Unlock()
@@ -783,8 +792,8 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 	// error. The demote rule hits hard at three failures in window, not
 	// one. (Spec change from earlier "one-shot hard demote.")
 	s, _ := newTestMUR(t, "a")
-	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
+	s.selections[streakTCP].tag.Store("a")
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureStall, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1,
@@ -795,8 +804,8 @@ func TestMakeHooks_StallAppendsSingleUserFailure(t *testing.T) {
 
 func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	s.stickyTag.tcp.Store("a")
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset)
+	s.selections[streakTCP].tag.Store("a")
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureReset, nil)
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -806,7 +815,7 @@ func TestMakeHooks_PropagatesFailureKind(t *testing.T) {
 
 func TestRecordUserFailure_AttributesDialKind(t *testing.T) {
 	s, _ := newTestMUR(t, "a")
-	require.True(t, s.recordUserFailure("a", adapter.UserFailureDial, s.networkGeneration.Load()))
+	require.True(t, s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureDial, time.Time{}, "tcp", nil))
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok)
 	require.Len(t, uf, 1)
@@ -820,7 +829,7 @@ func TestRecordUserFailure_SoftDemotedStickyStillLosesOnDelay(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	recordSuccess(s, "a", 200)
 	recordSuccess(s, "b", 100)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	// addUserFailureN bypasses the dedupe window, so the soft-limit
 	// failures land deterministically without depending on wall time.
@@ -839,7 +848,7 @@ func TestRecordUserFailure_SoftDemotedStickyKeptOverSlowerPeer(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	recordSuccess(s, "a", 50)
 	recordSuccess(s, "b", 100)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	addUserFailureN(s, "a", int(s.hist.softFailLimit))
 
@@ -858,7 +867,7 @@ func TestRecordUserFailure_HardDemotedStickyDropsRegardlessOfDelay(t *testing.T)
 	// hard-demote limit is not doubled; see the boost case below.
 	recordSuccess(s, "a", 100)
 	recordSuccess(s, "b", 200)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	addUserFailureN(s, "a", int(s.hist.consecutiveFailLimit))
 
@@ -875,7 +884,7 @@ func TestRecordUserFailure_RetentionBoundedBySoftLimit(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	recordSuccess(s, "a", 10)
 	recordSuccess(s, "b", 900)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	addUserFailureN(s, "a", int(s.hist.softFailLimit))
 	got, _, err := s.selectOutbound("tcp", "")
@@ -893,7 +902,7 @@ func TestRecordUserFailure_RetentionBoundedBySoftLimit(t *testing.T) {
 func TestApplyStickiness_DepartedStickyFallsToBest(t *testing.T) {
 	s, _ := newTestMUR(t, "b")
 	recordSuccess(s, "b", 100)
-	s.stickyTag.tcp.Store("gone")
+	s.selections[streakTCP].tag.Store("gone")
 
 	got, _, err := s.selectOutbound("tcp", "")
 	require.NoError(t, err)
@@ -966,7 +975,7 @@ func TestSelectOutbound_PreservesStickyAfterUnrelatedRemove(t *testing.T) {
 	recordSuccess(s, "a", 200)
 	recordSuccess(s, "b", 150)
 	recordSuccess(s, "c", 50)
-	s.stickyTag.tcp.Store("c")
+	s.selections[streakTCP].tag.Store("c")
 	_, err := s.Remove("b")
 	require.NoError(t, err)
 
@@ -981,7 +990,7 @@ func TestSelectOutbound_RepicksWhenStickyGone(t *testing.T) {
 	recordSuccess(s, "a", 100)
 	recordSuccess(s, "b", 50)
 	recordSuccess(s, "c", 200)
-	s.stickyTag.tcp.Store("b")
+	s.selections[streakTCP].tag.Store("b")
 	_, err := s.Remove("b")
 	require.NoError(t, err)
 
@@ -989,7 +998,7 @@ func TestSelectOutbound_RepicksWhenStickyGone(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Contains(t, []string{"a", "c"}, got.Tag())
-	assert.NotEqual(t, "b", loadString(&s.stickyTag.tcp))
+	assert.NotEqual(t, "b", loadString(&s.selections[streakTCP].tag))
 }
 
 func TestSelectOutbound_PrefersLowestSeededDelay(t *testing.T) {
@@ -1140,7 +1149,7 @@ func TestDataPlanePacket_WritePacketReset_AttributesFailure(t *testing.T) {
 	// WritePacket shares noteIO with WriteTo, so a reset on it is charged.
 	var calls atomic.Uint32
 	inner := &addressedPacketConn{writeErr: connResetErr()}
-	d := newDataPlanePacket(inner, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlanePacket(inner, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	b := buf.NewSize(128)
@@ -1176,7 +1185,7 @@ func TestDataPlaneStream_MidStreamReset_ConnReset_AttributesFailure(t *testing.T
 	var calls atomic.Uint32
 	const provedReadBytes = 1 << 20 // never reached by the 16-byte read below
 	c := &failingConn{err: connResetErr(), firstN: 16}
-	d := newDataPlaneStream(c, time.Hour, provedReadBytes, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, provedReadBytes, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1214,7 +1223,7 @@ func TestDataPlaneStream_MidStreamReset_AttributesResetKind(t *testing.T) {
 	// mid-stream failure modes stay separable downstream.
 	var got atomic.Value // adapter.UserFailureKind
 	c := &failingConn{err: connResetErr(), firstN: 16}
-	d := newDataPlaneStream(c, time.Hour, 1<<20, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind) { got.Store(kind) }})
+	d := newDataPlaneStream(c, time.Hour, 1<<20, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind, _ error) { got.Store(kind) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1231,16 +1240,20 @@ func TestDataPlaneStream_MidStreamReset_AttributesResetKind(t *testing.T) {
 
 func TestDataPlaneStream_Stall_AttributesStallKind(t *testing.T) {
 	// The idle-timeout path must report a stall, complementing the reset path.
-	var got atomic.Value // adapter.UserFailureKind
-	d := newDataPlaneStream(stallConn{}, time.Hour, 0, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind) { got.Store(kind) }})
-	defer d.Close()
-	d.proven.Store(true)
-	d.noteIO(dataPlaneStallMinUnanswered, nil, false)
-	d.fireStall()
+	synctest.Test(t, func(t *testing.T) {
+		const idle = time.Second
+		var got atomic.Value // adapter.UserFailureKind
+		d := newDataPlaneStream(stallConn{}, idle, 0, dataPlaneHooks{onFailure: func(kind adapter.UserFailureKind, _ error) { got.Store(kind) }})
+		defer d.Close()
+		d.proven.Store(true)
+		d.noteIO(dataPlaneStallMinUnanswered, nil, false)
+		time.Sleep(2 * idle)
+		synctest.Wait()
 
-	require.NotNil(t, got.Load(), "a stall must attribute a failure")
-	assert.Equal(t, adapter.UserFailureStall, got.Load().(adapter.UserFailureKind),
-		"an idle stall must be recorded as a stall")
+		require.NotNil(t, got.Load(), "a stall must attribute a failure")
+		assert.Equal(t, adapter.UserFailureStall, got.Load().(adapter.UserFailureKind),
+			"an idle stall must be recorded as a stall")
+	})
 }
 
 func TestDataPlaneStream_MidStreamReset_ErrClosed_AttributesFailure(t *testing.T) {
@@ -1248,7 +1261,7 @@ func TestDataPlaneStream_MidStreamReset_ErrClosed_AttributesFailure(t *testing.T
 	// inner outbound tore its own fd down — a broken tunnel, so demote.
 	var calls atomic.Uint32
 	c := &failingConn{err: net.ErrClosed, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1266,7 +1279,7 @@ func TestDataPlaneStream_MidStreamReset_WritePath_AttributesFailure(t *testing.T
 	// The failure path must fire on a reset Write too, not just Read.
 	var calls atomic.Uint32
 	c := &failingConn{err: connResetErr(), failWrite: true}
-	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	_, err := d.Write([]byte("req"))
@@ -1281,7 +1294,7 @@ func TestDataPlanePacket_MidStreamReset_AttributesFailure(t *testing.T) {
 	// the same way as the stream path.
 	var calls atomic.Uint32
 	c := &failingPacketConn{err: connResetErr()}
-	d := newDataPlanePacket(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlanePacket(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	_, _, err := d.ReadFrom(make([]byte, 32))
@@ -1295,7 +1308,7 @@ func TestDataPlaneStream_EOFDoesNotAttribute(t *testing.T) {
 	// io.EOF is an ordinary stream end, not a tunnel failure.
 	var calls atomic.Uint32
 	c := &failingConn{err: io.EOF, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1314,7 +1327,7 @@ func TestDataPlaneStream_TimeoutDoesNotAttribute(t *testing.T) {
 	// double-count and usurp that role.
 	var calls atomic.Uint32
 	c := &failingConn{err: timeoutErr{}, firstN: 8}
-	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 4, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	buf := make([]byte, 32)
@@ -1334,7 +1347,7 @@ func TestDataPlaneStream_NoAttributeAfterClose(t *testing.T) {
 	// failure.
 	var calls atomic.Uint32
 	c := &failingConn{err: net.ErrClosed}
-	d := newDataPlaneStream(c, time.Hour, 1, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 1, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	require.True(t, d.closeWatchdog(), "first close")
 
 	_, err := d.Read(make([]byte, 8))
@@ -1348,7 +1361,7 @@ func TestDataPlaneStream_FailureFiresOnce(t *testing.T) {
 	// Repeated errored reads attribute at most once per conn (the fired CAS).
 	var calls atomic.Uint32
 	c := &failingConn{err: connResetErr()}
-	d := newDataPlaneStream(c, time.Hour, 1, dataPlaneHooks{onFailure: func(adapter.UserFailureKind) { calls.Add(1) }})
+	d := newDataPlaneStream(c, time.Hour, 1, dataPlaneHooks{onFailure: func(adapter.UserFailureKind, error) { calls.Add(1) }})
 	defer d.Close()
 
 	for i := range 3 {
@@ -1884,10 +1897,10 @@ func TestMakeHooks_IgnoresFailureFromUnselectedTag(t *testing.T) {
 	// Stale conns from a tag that is no longer selected should not keep that
 	// tag demoted after traffic has moved elsewhere.
 	s, _ := newTestMUR(t, "a", "b")
-	s.stickyTag.tcp.Store("b")
-	s.stickyTag.udp.Store("b")
+	s.selections[streakTCP].tag.Store("b")
+	s.selections[streakUDP].tag.Store("b")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureStall, nil)
 
 	s.access.Lock()
 	_, ok := s.peekHistoryLocked("a")
@@ -1900,10 +1913,10 @@ func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
 	// The gate spans both networks: a member carrying UDP is still
 	// selected even when TCP has moved elsewhere.
 	s, _ := newTestMUR(t, "a", "b")
-	s.stickyTag.tcp.Store("b")
-	s.stickyTag.udp.Store("a")
+	s.selections[streakTCP].tag.Store("b")
+	s.selections[streakUDP].tag.Store("a")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureStall, nil)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the udp selection must still be chargeable")
@@ -1913,9 +1926,9 @@ func TestMakeHooks_RecordsFailureFromUDPSelectionOnly(t *testing.T) {
 func TestMakeHooks_UnselectedGateDisabledByConfig(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
 	s.cfg.demoteOnlySelected = false
-	s.stickyTag.tcp.Store("b")
+	s.selections[streakTCP].tag.Store("b")
 
-	s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureStall)
+	s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureStall, nil)
 
 	uf, ok := userFailures(s, "a")
 	require.True(t, ok, "the gate must be defeatable for rollback")
@@ -1926,9 +1939,9 @@ func TestMakeHooks_ChargesFallbackRouteEvenWhenUnselected(t *testing.T) {
 	// Fast-failover conns are fresh traffic and remain chargeable even though
 	// selecting an alternate does not make it sticky.
 	s, _ := newTestMUR(t, "a", "b")
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
-	s.makeHooks("b", "tcp", fallbackRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset)
+	s.makeHooks(s.originAt("b", s.networkGeneration.Load()).on(fallbackRoute), "tcp").failure(adapter.UserFailureReset, nil)
 
 	uf, ok := userFailures(s, "b")
 	require.True(t, ok, "a fallback-route conn must stay chargeable")
@@ -1951,7 +1964,7 @@ func TestDialContext_FastFailoverConnStaysChargeable(t *testing.T) {
 
 	conn, err := s.DialContext(context.Background(), "tcp", metadata.Socksaddr{})
 	require.NoError(t, err, "fast failover should have produced b's conn")
-	require.Equal(t, "a", loadString(&s.stickyTag.tcp),
+	require.Equal(t, "a", loadString(&s.selections[streakTCP].tag),
 		"fast failover must not move the sticky tag")
 
 	_, err = conn.Write([]byte("x"))
@@ -1969,7 +1982,7 @@ func TestApplyStickiness_UnmeasuredStickyLosesToMeasuredPeer(t *testing.T) {
 	// peer should outrank an unmeasured soft-demoted sticky.
 	s, _ := newTestMUR(t, "a", "b")
 	recordSuccess(s, "b", 300)
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 	addUserFailureN(s, "a", int(s.hist.softFailLimit))
 
 	got, _, err := s.selectOutbound("tcp", "")
@@ -1981,7 +1994,7 @@ func TestApplyStickiness_UnmeasuredStickyLosesToMeasuredPeer(t *testing.T) {
 
 func TestChargeable_Policy(t *testing.T) {
 	s, _ := newTestMUR(t, "a", "b")
-	s.stickyTag.tcp.Store("a")
+	s.selections[streakTCP].tag.Store("a")
 
 	assert.True(t, s.chargeable("a", primaryRoute), "the selection is chargeable")
 	assert.False(t, s.chargeable("b", primaryRoute), "an unselected primary conn is not")
@@ -2031,8 +2044,8 @@ func TestMakeHooks_FailureDoesNotRunLadder(t *testing.T) {
 		s.defaultURL = "http://probe.test/"
 		obs["a"].dial = denyDial
 		obs["b"].dial = denyDial
-		s.stickyTag.tcp.Store("a")
-		s.makeHooks("a", "tcp", primaryRoute, s.networkGeneration.Load()).onFailure(adapter.UserFailureReset)
+		s.selections[streakTCP].tag.Store("a")
+		s.makeHooks(s.originAt("a", s.networkGeneration.Load()), "tcp").failure(adapter.UserFailureReset, nil)
 		synctest.Wait()
 		assert.Zero(t, s.lastLadderAt.Load(), "a data-plane failure must not re-probe every member")
 	})
@@ -2050,6 +2063,7 @@ func seedProbe(s *MutableAutoSelect, tag string, success bool, delayMs uint32) {
 	s.recordProbeOutcomeLocked(tag, &probeOutcome{
 		success:    success,
 		delayMs:    delayMs,
+		started:    time.Now(),
 		generation: s.networkGeneration.Load(),
 		url:        s.probeURLForLocked(tag),
 		lastResort: behaviorFor(out.Type()).lastResort,
@@ -2059,7 +2073,7 @@ func seedProbe(s *MutableAutoSelect, tag string, success bool, delayMs uint32) {
 func switchAfterConfirmedFailure(s *MutableAutoSelect, failedTag, replacementTag string) {
 	s.access.Lock()
 	defer s.access.Unlock()
-	s.trySwitchAfterConfirmedFailureLocked(failedTag, replacementTag)
+	s.trySwitchAfterConfirmedFailureLocked(failedTag, replacementTag, time.Time{})
 }
 
 func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
@@ -2073,14 +2087,16 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _ := newTestMUR(t, "a", "b")
-			withPauseManager(s).NetworkPause()
+			pm := withPauseManager(s)
 			s.urlOverrides = map[string]string{"a": "https://override.example/a?token=1", "b": "https://override.example/b"}
 			recordSuccess(s, "a", 100)
 			recordSuccess(s, "b", 200)
 			s.hist.userFailureDedupeWindow = 0
 			for range s.hist.consecutiveFailLimit {
-				s.recordUserFailure("a", adapter.UserFailureNoResponse, s.networkGeneration.Load())
+				s.recordUserFailure(s.originAt("a", s.networkGeneration.Load()), adapter.UserFailureNoResponse, time.Time{}, "tcp", nil)
 			}
+			// Paused after the failures, which a paused network doesn't charge.
+			pm.NetworkPause()
 			s.access.Lock()
 			s.historyForLocked("a").startRecoveryGate(time.Now())
 			s.access.Unlock()
@@ -2094,7 +2110,7 @@ func TestSetURLOverrides_MarksChangedMembersStale(t *testing.T) {
 			require.True(t, ok, "a changed override keeps the member's history")
 			delay, _, uf, gated := h.snapshot(time.Now(), s.hist.userFailureWindow)
 			assert.Equal(t, uint32(100), delay)
-			assert.Len(t, uf, int(s.hist.consecutiveFailLimit))
+			assert.Equal(t, int(s.hist.consecutiveFailLimit), uf)
 			assert.True(t, gated)
 			persisted := s.history.Load("a")
 			require.NotNil(t, persisted)
@@ -2298,4 +2314,45 @@ func TestProbeTimeoutOverrides(t *testing.T) {
 
 	tor := s.behavior(C.TypeTor)
 	assert.True(t, tor.excludeFromPool, "an override never brings an excluded type into the pool")
+}
+
+func (s *MutableAutoSelect) selectOutbound(network, excludeTag string) (sbAdapter.Outbound, uint64, error) {
+	origin, err := s.selectOrigin(network, excludeTag, primaryRoute)
+	return origin.out, origin.generation, err
+}
+
+// originOf returns the origin of a conn about to be set up through o.
+func (s *MutableAutoSelect) originOf(o sbAdapter.Outbound, route routeKind, generation uint64) connOrigin {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.originOfLocked(o, route, generation)
+}
+
+// originAt returns the origin, on network generation generation, of a conn
+// set up through tag's member, or through an outbound that never was one if
+// tag isn't a member.
+func (s *MutableAutoSelect) originAt(tag string, generation uint64) connOrigin {
+	if out, ok := s.members.Load(tag); ok {
+		return s.originOf(out, primaryRoute, generation)
+	}
+	return connOrigin{out: &mockOutbound{tag: tag}, generation: generation}
+}
+
+// on returns o for a conn on route.
+func (o connOrigin) on(route routeKind) connOrigin {
+	o.route = route
+	return o
+}
+
+// trialOriginAt returns the origin, on network generation generation, of a
+// trial conn through tag's member made for trialFor, the selection now.
+func (s *MutableAutoSelect) trialOriginAt(tag string, generation uint64, trialFor string) connOrigin {
+	o := s.originAt(tag, generation).on(trialRoute)
+	o.trialFor = trialFor
+	s.access.Lock()
+	defer s.access.Unlock()
+	if state := s.probeMembers[trialFor]; state != nil {
+		o.trialForMembership = state.membershipID
+	}
+	return o
 }

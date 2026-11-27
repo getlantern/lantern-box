@@ -593,7 +593,7 @@ func newHedgeStream(h *Hedge, ctx context.Context, key hedgeKey, network string,
 	s := &hedgeStream{}
 	s.init(h, ctx, key, network, dest, stats)
 	w := newDataPlaneStream(first, defaultDataPlaneIdle, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
-		onFailure: func(kind lAdapter.UserFailureKind) { s.firstFailed(kind, s.move) },
+		onFailure: func(kind lAdapter.UserFailureKind, _ error) { s.firstFailed(kind, s.move) },
 		onReset:   s.noteReset,
 	})
 	s.cur = w
@@ -953,7 +953,7 @@ func newHedgePacket(h *Hedge, ctx context.Context, key hedgeKey, dest M.Socksadd
 	// neither commits the connection nor counts as First's reply.
 	filtered := &vnFilter{PacketConn: first, ours: p.ownsCID}
 	w := newDataPlanePacket(filtered, defaultDataPlaneIdle, defaultDataPlaneProvedReadBytes, dataPlaneHooks{
-		onFailure: func(kind lAdapter.UserFailureKind) { p.firstFailed(kind, p.move) },
+		onFailure: func(kind lAdapter.UserFailureKind, _ error) { p.firstFailed(kind, p.move) },
 		onReset:   p.noteReset,
 	})
 	p.cur, p.curRaw = w, w
