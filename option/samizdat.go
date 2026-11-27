@@ -28,7 +28,9 @@ type SamizdatOutboundOptions struct {
 	// Connection-start shaping: the first TLS records follow sizes and
 	// directions drawn from a model of real TLS (enabled by default; set to
 	// true to disable). The server must accept shaping, as samizdat servers
-	// do unless their inbound sets disable_shaping.
+	// do unless their inbound sets disable_shaping, and be from this version
+	// of lantern-box or later: older servers don't accept the shaping these
+	// clients send, whose records span full-size packets.
 	DisableShaping bool `json:"disable_shaping,omitempty"`
 
 	// LegacyAuth sends samizdat's version 1 SessionID instead of version 2,
